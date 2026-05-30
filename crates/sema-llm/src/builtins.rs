@@ -4234,9 +4234,11 @@ fn run_tool_loop(
                 event_map.insert(Value::keyword("event"), Value::string("end"));
                 event_map.insert(Value::keyword("tool"), Value::string(&tc.name));
                 event_map.insert(Value::keyword("args"), args_value);
-                // Truncate result for the callback to avoid huge payloads
+                // Truncate result for the callback to avoid huge payloads.
+                // Use char-boundary truncation: a byte slice (`&result[..200]`)
+                // panics when byte 200 lands inside a multi-byte character.
                 let result_preview = if result.len() > 200 {
-                    format!("{}...", &result[..200])
+                    format!("{}...", sema_core::truncate_chars(&result, 200))
                 } else {
                     result.clone()
                 };

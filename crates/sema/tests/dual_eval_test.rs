@@ -1306,3 +1306,11 @@ dual_eval_error_tests! {
     // VM-3 (VM NTH opcode; tree-walker nth already guards)
     nth_negative_index: "(nth (list 1 2 3) -1)" => "non-negative",
 }
+
+// 2026-05-29 audit — Pattern B: UTF-8 byte slicing must not split a char.
+// STD-3: text/chunk overlap on multibyte text previously panicked
+// ("byte index N is not a char boundary"). It must return a list of strings.
+dual_eval_tests! {
+    text_chunk_multibyte_overlap_no_panic:
+        r#"(list? (text/chunk "λλλ λλλ λλλ λλλ λλλ λλλ" {:size 12 :overlap 3}))"# => Value::bool(true),
+}
