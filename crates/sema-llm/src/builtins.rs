@@ -632,30 +632,76 @@ fn is_internal_host(host: &str) -> bool {
         return true;
     }
     match h.parse::<std::net::IpAddr>() {
-        Ok(std::net::IpAddr::V4(v4)) => {
-            v4.is_loopback()
-                || v4.is_private()
-                || v4.is_link_local()
-                || v4.is_unspecified()
-                || v4.is_broadcast()
-                || v4.octets()[0] == 0
-        }
+        Ok(std::net::IpAddr::V4(v4)) => ipv4_is_internal(v4),
         Ok(std::net::IpAddr::V6(v6)) => {
             if v6.is_loopback() || v6.is_unspecified() {
                 return true;
             }
             // IPv4-mapped (::ffff:a.b.c.d) — re-check against v4 rules.
             if let Some(v4) = v6.to_ipv4_mapped() {
-                return v4.is_loopback()
-                    || v4.is_private()
-                    || v4.is_link_local()
-                    || v4.is_unspecified();
+                return ipv4_is_internal(v4);
             }
             let seg0 = v6.segments()[0];
             (seg0 & 0xfe00) == 0xfc00 // fc00::/7 unique-local
                 || (seg0 & 0xffc0) == 0xfe80 // fe80::/10 link-local
         }
-        Err(_) => false, // a public hostname; DNS-rebinding is out of scope
+        // `IpAddr::parse` only accepts canonical dotted-decimal, but
+        // `getaddrinfo` (what reqwest ultimately calls) also accepts the
+        // inet_aton forms: decimal (`2130706433`), octal (`0177.0.0.1`),
+        // hex (`0x7f.0.0.1`), and short (`127.1`). Decode those and re-check,
+        // so e.g. `http://2130706433/` can't smuggle loopback past the gate.
+        Err(_) => parse_loose_ipv4(&h).map(ipv4_is_internal).unwrap_or(false),
+    }
+}
+
+/// Internal/private/loopback test shared by every IPv4 path.
+fn ipv4_is_internal(v4: std::net::Ipv4Addr) -> bool {
+    v4.is_loopback()
+        || v4.is_private()
+        || v4.is_link_local()
+        || v4.is_unspecified()
+        || v4.is_broadcast()
+        || v4.octets()[0] == 0
+}
+
+/// Parse the loose `inet_aton` IPv4 forms that `getaddrinfo` accepts but
+/// `Ipv4Addr::from_str` rejects: 1–4 dot-separated parts, each decimal,
+/// octal (`0` prefix), or hex (`0x` prefix); a trailing dot is allowed.
+/// Returns `None` for anything that isn't such a numeric address (i.e. a real
+/// hostname), so non-numeric public hosts fall through to "not internal".
+fn parse_loose_ipv4(host: &str) -> Option<std::net::Ipv4Addr> {
+    let host = host.strip_suffix('.').unwrap_or(host);
+    let parts: Vec<&str> = host.split('.').collect();
+    if parts.is_empty() || parts.len() > 4 {
+        return None;
+    }
+    let nums: Vec<u32> = parts
+        .iter()
+        .map(|p| parse_uint_part(p))
+        .collect::<Option<Vec<_>>>()?;
+    let addr: u32 = match nums.as_slice() {
+        [a] => *a,
+        [a, b] if *a <= 0xff && *b <= 0x00ff_ffff => (a << 24) | b,
+        [a, b, c] if *a <= 0xff && *b <= 0xff && *c <= 0xffff => (a << 24) | (b << 16) | c,
+        [a, b, c, d] if [a, b, c, d].iter().all(|x| **x <= 0xff) => {
+            (a << 24) | (b << 16) | (c << 8) | d
+        }
+        _ => return None, // a part overflowed its field — not a valid packed address
+    };
+    Some(std::net::Ipv4Addr::from(addr))
+}
+
+/// Parse a single inet_aton numeric part: hex (`0x..`), octal (`0..`), decimal.
+fn parse_uint_part(s: &str) -> Option<u32> {
+    if let Some(hex) = s.strip_prefix("0x") {
+        if hex.is_empty() {
+            return None;
+        }
+        u32::from_str_radix(hex, 16).ok()
+    } else if s.len() > 1 && s.starts_with('0') {
+        u32::from_str_radix(&s[1..], 8).ok()
+    } else {
+        s.parse::<u32>().ok()
     }
 }
 
@@ -4574,6 +4620,37 @@ mod tests {
     fn public_hosts_are_allowed() {
         for h in ["api.openai.com", "api.anthropic.com", "8.8.8.8", "1.1.1.1"] {
             assert!(!is_internal_host(h), "{h} should be allowed");
+        }
+    }
+
+    #[test]
+    fn internal_hosts_flagged_through_inet_aton_encodings() {
+        // getaddrinfo accepts these and resolves them to loopback/internal,
+        // but Ipv4Addr::from_str rejects them — the SSRF bypass.
+        for h in [
+            "2130706433", // decimal 127.0.0.1
+            "0177.0.0.1", // octal first octet
+            "0x7f.0.0.1", // hex first octet
+            "0x7f000001", // single hex 32-bit 127.0.0.1
+            "127.1",      // short form -> 127.0.0.1
+            "127.0.0.1.", // trailing dot
+            "0xA9FEA9FE", // 169.254.169.254 cloud metadata
+        ] {
+            assert!(is_internal_host(h), "{h} should be flagged internal");
+        }
+    }
+
+    #[test]
+    fn public_numeric_encodings_still_allowed() {
+        // Numeric forms that decode to genuinely public addresses must not be
+        // over-blocked (don't break legit numeric base-urls).
+        for h in [
+            "134744072",  // decimal 8.8.8.8
+            "0x08080808", // hex 8.8.8.8
+            "8.8.8.8.",   // trailing dot, public
+            "010.0.0.1",  // octal 8.0.0.1 -> public
+        ] {
+            assert!(!is_internal_host(h), "{h} should be allowed (public)");
         }
     }
 

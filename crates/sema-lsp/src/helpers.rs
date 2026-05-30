@@ -136,7 +136,14 @@ pub fn utf16_to_char_col(line: &str, utf16_offset: usize) -> usize {
 
 /// Convert a 1-indexed Sema `Span` to a 0-indexed LSP `Range`, mapping columns
 /// from char indices to UTF-16 code units using `lines` (the document's lines).
-/// Pass `&[]` to fall back to char indices (correct for BMP-only source).
+///
+/// FOOTGUN: passing `&[]` (or lines that don't contain the span's line) silently
+/// falls back to emitting char-index columns instead of UTF-16 code units. That
+/// is only correct for BMP-only text — any astral-plane char (emoji, etc.) on or
+/// before the span on its line will yield wrong LSP positions. Only pass `&[]`
+/// when the returned `Range` is immediately discarded (e.g. callers that use just
+/// the symbol names). For any range that reaches the client, pass the real lines
+/// (e.g. `cached.source.lines().collect()` or `text.lines().collect()`).
 pub fn span_to_range(span: &Span, lines: &[&str]) -> Range {
     let start_line = span.line.saturating_sub(1);
     let end_line = span.end_line.saturating_sub(1);

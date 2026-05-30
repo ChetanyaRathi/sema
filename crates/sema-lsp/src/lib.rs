@@ -1300,6 +1300,10 @@ struct CachedParse {
     span_map: SpanMap,
     symbol_spans: Vec<(String, Span)>,
     scope_tree: scope::ScopeTree,
+    /// Source text of the document at parse time, retained so ranges can be
+    /// mapped from char columns to UTF-16 code units (LSP `Position`).
+    /// Mirrors `ImportCache::source`. See `span_to_range`.
+    source: String,
 }
 
 // ── Semantic token legend ─────────────────────────────────────────
@@ -1522,21 +1526,18 @@ impl BackendState {
 
     fn handle_code_lens(&self, uri: &Url) -> Vec<CodeLens> {
         let uri_str = uri.as_str();
-        let lines: Vec<&str> = self
-            .documents
-            .get(uri_str)
-            .map(|t| t.lines().collect())
-            .unwrap_or_default();
 
         // Prefer the cached parse populated by didChange; only re-parse if
         // the cache misses (should be rare for open documents).
         let indexed_ranges = if let Some(cached) = self.cached_parses.get(uri_str) {
+            let lines: Vec<&str> = cached.source.lines().collect();
             top_level_ranges(&cached.ast, &cached.span_map, &lines)
         } else {
             let text = match self.documents.get(uri_str) {
                 Some(t) => t,
                 None => return vec![],
             };
+            let lines: Vec<&str> = text.lines().collect();
             let (exprs, span_map) = match sema_reader::read_many_with_spans(text) {
                 Ok(r) => r,
                 Err(_) => return vec![],
@@ -1588,8 +1589,7 @@ impl BackendState {
 
         // Phase 3b: Check if cursor is on a user-defined symbol
         let line_idx = position.line as usize;
-        let text = self.documents.get(uri_str)?;
-        let lines: Vec<&str> = text.lines().collect();
+        let lines: Vec<&str> = cached.source.lines().collect();
         let line = lines.get(line_idx).copied()?;
         let byte_offset = utf16_to_byte_offset(line, position.character);
         let symbol = extract_symbol_at(line, byte_offset).to_string();
@@ -1759,8 +1759,8 @@ impl BackendState {
         position: &Position,
     ) -> Option<Vec<DocumentHighlight>> {
         let uri_str = uri.as_str();
-        let text = self.documents.get(uri_str)?;
-        let lines: Vec<&str> = text.lines().collect();
+        let cached = self.cached_parses.get(uri_str)?;
+        let lines: Vec<&str> = cached.source.lines().collect();
         let line_idx = position.line as usize;
         let line = lines.get(line_idx).copied()?;
         let byte_offset = utf16_to_byte_offset(line, position.character);
@@ -1769,7 +1769,6 @@ impl BackendState {
             return None;
         }
 
-        let cached = self.cached_parses.get(uri_str)?;
         let sema_line = position.line as usize + 1;
         let sema_col = utf16_to_char_col(line, position.character as usize);
 
@@ -2120,11 +2119,7 @@ impl BackendState {
             Some(c) => c,
             None => return DocumentSymbolResponse::Nested(vec![]),
         };
-        let lines: Vec<&str> = self
-            .documents
-            .get(uri.as_str())
-            .map(|t| t.lines().collect())
-            .unwrap_or_default();
+        let lines: Vec<&str> = cached.source.lines().collect();
         let symbols =
             document_symbols_from_ast(&cached.ast, &cached.span_map, &cached.symbol_spans, &lines);
         DocumentSymbolResponse::Nested(symbols)
@@ -2694,8 +2689,9 @@ impl BackendState {
         uri: &Url,
         position: &Position,
     ) -> Option<PrepareRenameResponse> {
-        let text = self.documents.get(uri.as_str())?;
-        let lines: Vec<&str> = text.lines().collect();
+        // Find the symbol occurrence at this cursor position using cached parse
+        let cached = self.cached_parses.get(uri.as_str())?;
+        let lines: Vec<&str> = cached.source.lines().collect();
         let line_idx = position.line as usize;
         let line = lines.get(line_idx).copied()?;
         let byte_offset = utf16_to_byte_offset(line, position.character);
@@ -2709,8 +2705,6 @@ impl BackendState {
             return None;
         }
 
-        // Find the symbol occurrence at this cursor position using cached parse
-        let cached = self.cached_parses.get(uri.as_str())?;
         for (name, span) in &cached.symbol_spans {
             if name == symbol {
                 let range = span_to_range(span, &lines);
@@ -3355,6 +3349,7 @@ pub async fn run_server() {
                             span_map,
                             symbol_spans,
                             scope_tree,
+                            source: text.clone(),
                         },
                     );
                     state.documents.insert(uri_str, text);

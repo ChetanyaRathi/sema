@@ -1572,6 +1572,22 @@ mod tests {
         }
     }
 
+    #[test]
+    fn registry_install_locked_rejects_path_traversal_name() {
+        // The lock-file restore path must guard the name too, before any
+        // network/filesystem work reaches `pkg_dir.join(name)`.
+        for bad in ["../../etc/cron.d", "..", "/etc/passwd", "a/../../b"] {
+            let err = registry_install_locked(bad, "1.0.0", "http://localhost:0", "deadbeef")
+                .unwrap_err();
+            assert!(
+                err.contains("path traversal")
+                    || err.contains("absolute paths")
+                    || err.contains("invalid package spec"),
+                "name {bad:?} should be rejected, got: {err}"
+            );
+        }
+    }
+
     fn tmpdir(name: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!("sema-pkg-test-{name}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&d);
