@@ -17,6 +17,7 @@ Source text
   → Reader       (tokenize + parse → Value AST)
   → Macro expand  (tree-walker evaluates macros)
   → Lower         (Value AST → CoreExpr IR)
+  → Optimize      (constant folding + simplification on CoreExpr)
   → Resolve        (CoreExpr → ResolvedExpr with slot/upvalue/global analysis)
   → Compile        (ResolvedExpr → bytecode Chunks)
   → VM execution   (dispatch loop)
@@ -24,7 +25,7 @@ Source text
 
 ### Phase 1: Lowering (Value → CoreExpr)
 
-The lowering pass converts the `Value` AST into `CoreExpr`, a desugared intermediate representation. All ~40 special forms are lowered to ~55 CoreExpr variants. Several forms desugar into simpler ones:
+The lowering pass converts the `Value` AST into `CoreExpr`, a desugared intermediate representation. All ~40 special forms are lowered to ~35 CoreExpr variants. Several forms desugar into simpler ones:
 
 | Source Form | Lowers To                                 |
 | ----------- | ----------------------------------------- |
@@ -33,6 +34,7 @@ The lowering pass converts the `Value` AST into `CoreExpr`, a desugared intermed
 | `unless`    | `If` with swapped branches                |
 | `case`      | `Let` + nested `If` with `Or` comparisons |
 | `defun`     | `Define` + `Lambda`                       |
+| Named `let` | `Letrec` + `Lambda`                       |
 
 **Tail position analysis** happens during lowering. The `Call` node carries a `tail: bool` flag, set based on position:
 
@@ -81,7 +83,7 @@ The compiler (`compiler.rs`) transforms `ResolvedExpr` into bytecode `Chunk`s. T
 - **Lambdas**: compiled to separate `Function` templates, referenced by `MakeClosure` instruction with upvalue descriptors.
 - **`do` loops**: compile to backward `Jump` with `JumpIfTrue` for exit test.
 - **`try`/`catch`**: adds entries to the chunk's exception table, no inline opcodes.
-- **Named let**: compiled as `MakeClosure` + `Call` — the loop body becomes a function.
+- **Named let**: desugared to `letrec` + `lambda` during lowering — the loop body becomes a closure compiled via `MakeClosure`.
 
 **Runtime-delegated forms** — forms that can't be compiled to pure bytecode are compiled as calls to `__vm-*` global functions registered by `sema-eval`:
 
@@ -92,7 +94,7 @@ The compiler (`compiler.rs`) transforms `ResolvedExpr` into bytecode `Chunk`s. T
 | `load`                                                    | `__vm-load`                                                  |
 | `defmacro`                                                | `__vm-defmacro-form` (passes entire form as quoted constant) |
 | `define-record-type`                                      | `__vm-define-record-type`                                    |
-| `delay`                                                   | `__vm-delay` (passes unevaluated body as quoted constant)    |
+| `delay`                                                   | `__vm-delay` (body wrapped in a zero-arg lambda thunk)       |
 | `force`                                                   | `__vm-force`                                                 |
 | `prompt`, `message`, `deftool`, `defagent`, `macroexpand` | Corresponding `__vm-*` delegates                             |
 
@@ -100,9 +102,9 @@ The compiler (`compiler.rs`) transforms `ResolvedExpr` into bytecode `Chunk`s. T
 
 ### Compiler Optimizations
 
-- **Intrinsic recognition**: Known builtins are compiled to inline opcodes instead of function calls, eliminating global lookup, `Rc` downcast, argument `Vec` allocation, and function pointer dispatch. Arithmetic/comparison: `+`, `-`, `*`, `/`, `<`, `>`, `<=`, `>=`, `=`, `not`. List/predicates: `car`/`first`, `cdr`/`rest`, `cons`, `null?`, `pair?`, `list?`, `number?`, `string?`, `symbol?`, `length`.
+- **Intrinsic recognition**: Known builtins are compiled to inline opcodes instead of function calls, eliminating global lookup, `Rc` downcast, argument `Vec` allocation, and function pointer dispatch. Arithmetic/comparison: `+`, `-`, `*`, `/`, `<`, `>`, `<=`, `>=`, `=`, `not`. List/predicates: `car`/`first`, `cdr`/`rest`, `cons`, `null?`, `pair?`, `list?`, `number?`, `string?`, `symbol?`, `length`. Collections: `append` (2-arg), `get`, `contains?`, `nth`, `mod`/`modulo`.
 - **Peephole: `(if (not X) ...)`**: The pattern `(if (not X) A B)` compiles to `JumpIfTrue` instead of `Not` + `JumpIfFalse`, eliminating one instruction.
-- **Fused `CallGlobal`**: Non-tail calls to global functions use a fused `CallGlobal` instruction that combines `LoadGlobal` + `Call` into a single opcode with `(u32 spur, u16 argc)` operands.
+- **Fused `CallGlobal`**: Non-tail calls to global functions use a fused `CallGlobal` instruction that combines `LoadGlobal` + `Call` into a single opcode with `(u32 spur, u16 argc, u16 cache_slot)` operands.
 - **Specialized `LoadLocal`/`StoreLocal`**: Slots 0–3 have dedicated zero-operand opcodes (`LoadLocal0`..`LoadLocal3`, `StoreLocal0`..`StoreLocal3`), saving 2 bytes per instruction for the most frequently accessed locals.
 
 ### Phase 4: VM Execution
@@ -112,15 +114,15 @@ The VM (`vm.rs`) is a stack-based dispatch loop.
 **Core structs:**
 
 ```rust
-VM { stack: Vec<Value>, frames: Vec<CallFrame>, globals: Rc<Env>, functions: Vec<Rc<Function>> }
-CallFrame { closure: Rc<Closure>, pc: usize, base: usize, open_upvalues: Vec<Option<Rc<UpvalueCell>>> }
+VM { stack: Vec<Value>, frames: Vec<CallFrame>, globals: Rc<Env>, functions: Rc<Vec<Rc<Function>>>, inline_cache: Vec<(u32, u64, Value)>, native_fns: Vec<Rc<NativeFn>> }
+CallFrame { closure: Rc<Closure>, pc: usize, base: usize, open_upvalues: Option<Vec<Option<Rc<UpvalueCell>>>>, cache_base: usize }
 ```
 
 **Key design points:**
 
-- **Unsafe hot path**: The dispatch loop uses `unsafe` unchecked stack operations (`pop_unchecked`) and raw pointer bytecode reads via `read_u16!`/`read_i32!`/`read_u32!` macros for performance. Opcode decoding uses `std::mem::transmute` on the `#[repr(u8)]` `Op` enum. Debug builds retain bounds checks via `debug_assert!`.
-- **Closure interop**: VM closures are wrapped as `Value::NativeFn` values so the tree-walker can call them. Each NativeFn carries an `Rc<dyn Any>` payload containing `VmClosurePayload` (closure + function table), and the VM uses `raw_tag()` + `downcast_ref` to avoid `Rc` refcount bumps on the hot path. Each NativeFn wrapper creates a fresh VM instance to execute the closure's bytecode.
-- **Upvalue cells**: `UpvalueCell` with `Rc<RefCell<Value>>` for shared mutable state — `StoreLocal` syncs to open upvalue cells, `LoadLocal` reads from cells when present.
+- **Unsafe hot path**: The dispatch loop uses `unsafe` unchecked stack operations (`pop_unchecked`) and raw pointer bytecode reads via `read_u16!`/`read_i32!`/`read_u32!` macros for performance. Opcodes are dispatched by matching the raw byte against `u8` constants (the `op` module), avoiding decode overhead; `std::mem::transmute` is used only to reconstruct `Spur` handles from `u32` operands. Debug builds retain bounds checks via `debug_assert!`.
+- **Closure interop**: VM closures are wrapped as `Value::NativeFn` values so the tree-walker can call them. Each NativeFn carries an `Rc<dyn Any>` payload containing `VmClosurePayload` (closure + function table), and the VM uses `raw_tag()` + `downcast_ref` to avoid `Rc` refcount bumps on the hot path. When called from outside the VM (tree-walker, stdlib callbacks), the NativeFn wrapper creates a fresh VM instance to execute the closure's bytecode; in-VM calls unwrap the payload and run in the same VM.
+- **Upvalue cells**: Lua-style open upvalues. `UpvalueCell` holds a `RefCell<UpvalueState>` — `Open { frame_base, slot }` points into the VM stack while the defining frame is alive; `Closed(Value)` owns the value after the frame exits. Locals are read and written directly on the stack (no cell indirection); cells are closed when a frame returns, tail-calls, unwinds — and before any non-VM call (see Current Limitations).
 - **Exception handling**: `Throw` opcode triggers handler search via the chunk's exception table. Stack is restored to saved depth, error value pushed, PC jumps to handler.
 
 **Entry points**: `VM::execute()` takes a closure and `EvalContext`. `compile_program()` is the pipeline for normal compilation: `Value AST → lower → optimize → resolve → compile → CompiledProgram`. `compile_program_with_spans()` adds span/source-file support for debug (DAP breakpoints).
@@ -129,7 +131,7 @@ CallFrame { closure: Rc<Closure>, pc: usize, base: usize, open_upvalues: Vec<Opt
 
 - **Two-level dispatch loop**: An outer loop caches frame-local state (code pointer, constants pointer, base offset) into local variables. The inner loop dispatches opcodes without re-fetching frame data. Frame state is only reloaded when control flow changes frames (`Call`, `TailCall`, `Return`, exceptions).
 - **NaN-boxed int fast paths**: `AddInt`/`SubInt`/`MulInt`/`LtInt`/`EqInt` operate directly on raw NaN-boxed bits — sign-extending the payload, performing the arithmetic, and re-boxing, without ever constructing a `Value`.
-- **16-entry direct-mapped global cache**: Global lookups are cached in a `[(spur, env_version, Value); 16]` array indexed by `spur & 0xF`. Cache hits skip the `Env` map/new lookup entirely; cache lines are invalidated by env version mismatch.
+- **Per-instruction global inline cache**: Every `LoadGlobal`/`CallGlobal` instruction carries a `u16` cache-slot operand indexing into a per-VM `Vec<(spur, env_version, Value)>`. A hit (matching spur + env version) skips the `Env` lookup entirely; entries are invalidated by env version mismatch when a global is redefined.
 - **Raw pointer bytecode reads**: `read_u16!`, `read_i32!`, and `read_u32!` macros read operands via raw pointer arithmetic on the code buffer, avoiding bounds checks in release builds.
 - **Unsafe unchecked stack operations**: `pop_unchecked` skips length checks (the compiler guarantees stack correctness). `debug_assert!` guards catch violations in debug builds.
 - **Cold path factoring**: The `handle_err!` macro factors exception handling out of the hot instruction sequence, keeping the fast path compact for better instruction-cache behavior.
@@ -157,7 +159,7 @@ The VM uses a stack-based instruction set with variable-length encoding. Each op
 | `StoreLocal`   | u16 slot  | `locals[slot] = pop`         |
 | `LoadUpvalue`  | u16 index | Push `upvalues[index].get()` |
 | `StoreUpvalue` | u16 index | `upvalues[index].set(pop)`   |
-| `LoadGlobal`   | u32 spur  | Push `globals[spur]`         |
+| `LoadGlobal`   | u32 spur, u16 cache_slot | Push `globals[spur]` (inline-cached) |
 | `StoreGlobal`  | u32 spur  | `globals[spur] = pop`        |
 | `DefineGlobal` | u32 spur  | Define new global binding    |
 | `LoadLocal0`..`LoadLocal3` | — | Push `locals[0..3]` (zero-operand fast path) |
@@ -180,7 +182,7 @@ The VM uses a stack-based instruction set with variable-length encoding. Each op
 | `Return`      | —                                | Return top of stack                   |
 | `MakeClosure` | u16 func_id, u16 n_upvalues, ... | Create closure from function template |
 | `CallNative`  | u16 native_id, u16 argc          | Direct native function call (no env lookup) |
-| `CallGlobal`  | u32 spur, u16 argc               | Fused global lookup + call            |
+| `CallGlobal`  | u32 spur, u16 argc, u16 cache_slot | Fused global lookup + call (inline-cached) |
 
 ### Data Constructors
 
@@ -200,6 +202,17 @@ The VM uses a stack-based instruction set with variable-length encoding. Each op
 | `Eq`, `Lt`, `Gt`, `Le`, `Ge` | Generic comparison                    |
 | `AddInt`, `SubInt`, `MulInt` | Specialized int fast paths            |
 | `LtInt`, `EqInt`             | Specialized int comparison            |
+
+### Inline Intrinsics
+
+Zero-operand opcodes emitted by intrinsic recognition (bypass `CallGlobal` overhead):
+
+| Opcode                                                       | Description                              |
+| ------------------------------------------------------------ | ---------------------------------------- |
+| `Car`, `Cdr`, `Cons`                                          | List operations                          |
+| `IsNull`, `IsPair`, `IsList`, `IsNumber`, `IsString`, `IsSymbol` | Type predicates                       |
+| `Length`, `Append`, `Get`, `ContainsQ`, `Nth`                 | Collection operations                    |
+| `Mod`                                                         | Integer modulo fast path                 |
 
 ### Exception Handling
 
@@ -223,7 +236,7 @@ sema-core ← sema-reader ← sema-vm ← sema-eval
 
 | File           | Purpose                                                           |
 | -------------- | ----------------------------------------------------------------- |
-| `opcodes.rs`   | `Op` enum — 64 bytecode opcodes                                   |
+| `opcodes.rs`   | `Op` enum — 66 bytecode opcodes                                   |
 | `chunk.rs`     | `Chunk` (bytecode + constants + spans), `Function`, `UpvalueDesc` |
 | `emit.rs`      | `Emitter` — bytecode builder with jump backpatching               |
 | `disasm.rs`    | Human-readable bytecode disassembler                              |
@@ -232,13 +245,31 @@ sema-core ← sema-reader ← sema-vm ← sema-eval
 | `resolve.rs`   | Variable resolution (local/upvalue/global analysis)               |
 | `compiler.rs`  | Bytecode compiler (ResolvedExpr → Chunk)                          |
 | `vm.rs`        | VM dispatch loop, call frames, closures, exception handling       |
-| `optimize.rs`  | Constant folding and dead code elimination on CoreExpr IR         |
+| `optimize.rs`  | Constant folding and simplification on CoreExpr IR                |
 | `serialize.rs` | Bytecode serialization/deserialization for `.semac` file format   |
+| `scheduler.rs` | Cooperative async task scheduler (VM-per-task, yield signals)     |
+| `debug.rs`     | VM debug hooks for DAP (breakpoints, stepping, state queries)     |
+
+## Async Execution (VM-Only)
+
+Async/await and channels are implemented entirely in the VM — the tree-walker returns a clear error (`async requires the VM backend`) rather than maintaining a second implementation.
+
+The model is **VM-per-task with cooperative scheduling**:
+
+- Each `async/spawn` creates a **new VM instance** that shares the parent's global `Env` (`Rc<Env>`) and function table (`Rc<Vec<Rc<Function>>>`). Tasks are cheap: no threads, no work stealing — everything stays single-threaded.
+- A cooperative scheduler in `scheduler.rs` runs tasks **round-robin**. A task runs until it yields (e.g. `await` on a pending promise, channel operations, `async/sleep`).
+- Yielding is signaled via a thread-local **yield signal** (`sema-core/src/async_signal.rs`), not an error variant. The VM checks the signal after every native call (`CallNative`, `CallGlobal`).
+- On yield, the VM leaves a `nil` placeholder on the stack and advances the PC past the call. On resume, the scheduler swaps the placeholder for the wake value (`replace_stack_top`), so from bytecode's perspective the call simply returned.
+
+This replaced an earlier replay-based design that re-executed entire task bodies on resume (corrupting side effects). Promises support cancellation (`PromiseState::Cancelled`), and task wake-ups preserve FIFO order.
+
+Yield-aware native functions must work on both closure paths (in-VM and the fresh-VM fallback described under Current Limitations) — see `vm_async_test.rs` for the VM-only test suite.
 
 ## Current Limitations
 
-- The compiler emits inline opcodes for common builtins (`+`, `-`, `*`, `/`, `<`, `>`, `<=`, `>=`, `=`, `not`, `car`/`first`, `cdr`/`rest`, `cons`, `null?`, `pair?`, `list?`, `number?`, `string?`, `symbol?`, `length`) via intrinsic recognition. If a user redefines these globals, the intrinsic will still fire (these are treated as non-rebindable primitives).
+- The compiler emits inline opcodes for common builtins (`+`, `-`, `*`, `/`, `<`, `>`, `<=`, `>=`, `=`, `not`, `car`/`first`, `cdr`/`rest`, `cons`, `null?`, `pair?`, `list?`, `number?`, `string?`, `symbol?`, `length`, `append`, `get`, `contains?`, `nth`, `mod`/`modulo`) via intrinsic recognition. Redefining one of these names in the same program suppresses the intrinsic for that program, but a redefinition from a separate compilation unit (e.g., an earlier REPL entry) does not — the intrinsic still fires.
 - `CallNative` optimization requires passing `known_natives` at compile time (done automatically by `eval_str_compiled`); without it, all global calls use `CallGlobal`
+- `set!` to a captured local is silently lost when the closure is invoked through a stdlib higher-order function (`map`, `filter`, `for-each`, …) on the VM backend — upvalue cells are closed to snapshots before every non-VM call, so the callback mutates a detached copy. Globals and in-VM calls are unaffected. Use the tree-walker (`--tw`) or `foldl` with explicit accumulator threading as a workaround.
 
 ## CLI Usage
 

@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- **`sema-fmt` public API consolidated into a single entry point** (breaking for Rust consumers of the `sema-fmt` crate; `sema fmt` CLI flags, `sema.toml` config, LSP formatting, and the playground's `formatCode` JS API are all unchanged). `format_source(input, width)` and `format_source_opts(input, width, indent, align)` are replaced by `format_source(input: &str, opts: &FormatOptions)`. `FormatOptions { width, indent, align }` implements `Default` (width 80, indent 2, align off) and is now the single source of truth for formatter defaults — the CLI's `sema.toml` fallbacks and the LSP's formatting handler both derive from it instead of repeating the values.
+- **`sema-fmt` internals cleaned up**: the test suite moved from an in-file `#[cfg(test)]` module to `crates/sema-fmt/tests/formatter_test.rs` (public-API integration tests), `formatter.rs` gained module- and method-level documentation describing the formatting pipeline and per-form layouts, and duplicated flat-rendering helpers were consolidated.
+
 ## 1.16.0
 
 REPL + security-hardening release. The REPL foundation moved from rustyline to reedline (no user-facing flag changes, no script breakage), gaining syntax highlighting, bracket matching, ghost-text completion hints, an arrow-key value inspector, and the `,disasm` / `,apropos` commands. Alongside that, a whole-codebase security/correctness audit (`docs/bugs/2026-05-29-*`) was triaged and its P0 and P1 findings fixed — closing two denial-of-service / secret-leak P0s and a cluster of SSRF, path-traversal, UB, and editor-correctness P1s.
@@ -108,7 +115,7 @@ Legacy names stay registered as aliases; new code should prefer the canonical fo
 - **`sema notebook` (no subcommand) prints a proper error line** before help. Previously: exited 2 with help text and no `error:` line.
 - **`sema build` pre-flights `--output` writability.** Previously it ran four of five steps before failing on permission denied.
 - **`sema -e EXPR <FILE>` is now an explicit clap conflict.** Previously the positional file was silently dropped.
-- **`--vm` is a hidden no-op alias** so muscle memory from older docs doesn't get "unexpected argument" (VM is the default since v1.13).
+- **`--vm` is a hidden no-op alias** so muscle memory from older docs doesn't get "unexpected argument" (VM is the default since v1.14).
 - **REPL silent-define fixed.** `(define x …)` now prints `; defined x` (dim) instead of nothing.
 - **REPL EOF on unterminated input** now reports `error: unterminated input at EOF` and exits 1 (was: silently dropped the buffered form).
 - **REPL `,env`** snapshots prelude keys at start and filters them out — shows only user-added bindings.

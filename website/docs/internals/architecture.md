@@ -1,55 +1,52 @@
 # Architecture Overview
 
-Sema is a Lisp with first-class LLM primitives, implemented in Rust. The primary execution path is a tree-walking interpreter — the evaluator walks the AST directly via a trampoline loop for tail-call optimization. A [bytecode VM](./bytecode-vm.md) is available as an opt-in execution path (via `--vm`) for faster execution of compute-heavy workloads. The runtime is single-threaded (`Rc`, not `Arc`), with deterministic destruction via reference counting instead of a garbage collector.
+Sema is a Lisp with first-class LLM primitives, implemented in Rust. The default execution path is a [bytecode VM](./bytecode-vm.md). A tree-walking interpreter — which walks the AST directly via a trampoline loop for tail-call optimization — is available via the `--tw` flag, and still serves as the macro expansion engine. The runtime is single-threaded (`Rc`, not `Arc`), with deterministic destruction via reference counting instead of a garbage collector.
 
-The entire implementation is ~70k lines of Rust spread across 12 crates, each with a clear responsibility and strict dependency ordering.
+The entire implementation is ~125k lines of Rust spread across 12 crates, each with a clear responsibility and strict dependency ordering.
 
 ## Crate Map
 
 ```
-                ┌─────────────────────────────────────┐
+                ┌──────────────────────────────────────┐
                 │              sema                    │
                 │  (binary: CLI, REPL, embedding API)  │
-                └──┬───────┬──────────────┬────────────┘
-                   │       │              │
-                   │  ┌────▼───────┐ ┌────▼──────────┐
-                   │  │ sema-stdlib│ │   sema-llm    │
-                   │  │ native fns │ │ LLM providers │
-                   │  │ functions  │ │ + embeddings  │
-                   │  └────┬───────┘ └─────┬─────────┘
-                   │       │               │
-     ┌─────────────▼──┐    │  ┌────────────┘
-     │ sema-notebook  │    │  │
-     │ notebook UI +  │    │  │
-     │ server         │ ┌──▼──▼────┐
-     └────────────────┘ │ sema-eval│
-                        │trampoline│
-                        │evaluator │
-                        └────┬─────┘
-                             │
-                    ┌────────▼───────┐
-                    │    sema-vm     │
-                    │  bytecode VM   │
-                    │  (opt-in)      │
-                    └────────┬───────┘
-                             │
-                    ┌────────▼───────┐
-                    │  sema-reader   │
-                    │  lexer/parser  │
-                    └────────┬───────┘
-                             │
-                    ┌────────▼───────┐
-                    │   sema-core    │
-                    │  Value, Env,   │
-                    │  SemaError     │
-                    └────────────────┘
+                └──┬─────────────────┬─────────────────┘
+                   │                 │
+     ┌─────────────▼──┐         ┌────▼─────┐
+     │ sema-notebook  │         │ sema-eval│
+     │ notebook UI +  ├────────►│trampoline│
+     │ server         │         │evaluator │
+     └────────────────┘         └─┬───┬──┬─┘
+                                  │   │  │
+                 ┌────────────────▼┐  │ ┌▼──────────────┐
+                 │  sema-stdlib    │  │ │   sema-llm    │
+                 │  native fns     │  │ │ LLM providers │
+                 └────────┬────────┘  │ │ + embeddings  │
+                          │           │ └───────┬───────┘
+                          │      ┌────▼─────┐   │
+                          │      │ sema-vm  │   │
+                          │      │ bytecode │   │
+                          │      │VM        │   │
+                          │      │(default) │   │
+                          │      └────┬─────┘   │
+                          │           │         │
+                     ┌────▼───────────▼──┐      │
+                     │   sema-reader     │      │
+                     │   lexer/parser    │      │
+                     └────────┬──────────┘      │
+                              │                 │
+                     ┌────────▼───────┐         │
+                     │   sema-core    │◄────────┘
+                     │  Value, Env,   │
+                     │  SemaError     │
+                     └────────────────┘
 ```
 
-**Dependency flow:** `sema-core ← sema-reader ← sema-vm ← sema-eval ← sema-stdlib / sema-llm ← sema`
+**Dependency flow:** `sema-core ← sema-reader ← sema-vm ← sema-eval ← sema` — with `sema-eval` also pulling in `sema-stdlib` (to register builtins) and `sema-llm`, both of which depend only on `sema-core` (plus `sema-reader` for stdlib).
 
 The critical constraint: **sema-stdlib and sema-llm depend on sema-core, not on sema-eval.** This avoids circular dependencies but creates a problem — both crates sometimes need to evaluate user code. They solve it via dependency inversion:
 
-- **sema-stdlib** invokes the real evaluator via thread-local callbacks (`call_callback`/`eval_callback`) registered by `sema-eval` at startup
+- **sema-stdlib** invokes the real evaluator via callbacks (`call_callback`/`eval_callback`) registered by `sema-eval` at startup — stored on the `EvalContext` and a shared thread-local stdlib context
 - **sema-llm** uses its own eval callback for legacy reasons, plus the core callbacks
 
 This is discussed in detail in [The Circular Dependency Problem](#the-circular-dependency-problem).
@@ -60,7 +57,7 @@ This is discussed in detail in [The Circular Dependency Problem](#the-circular-d
 | --------------- | ------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
 | **sema-core**   | Shared types                    | `Value` (NaN-boxed 8-byte), `Env`, `SemaError`, string interner, `NativeFn`, `Lambda`, `Macro`, `Record`, LLM types                       |
 | **sema-reader** | Parsing                         | `Lexer` (24 token types) + recursive descent `Parser` → `Value` AST + `SpanMap`                                                           |
-| **sema-vm**     | Bytecode VM (opt-in via `--vm`) | `CoreExpr`, `ResolvedExpr`, `Op`, `Chunk`, `Emitter` — lowering, resolution, compilation, VM dispatch                                     |
+| **sema-vm**     | Bytecode VM (default backend)   | `CoreExpr`, `ResolvedExpr`, `Op`, `Chunk`, `Emitter` — lowering, resolution, compilation, VM dispatch                                     |
 | **sema-eval**   | Evaluation                      | Trampoline-based evaluator, special forms, module system, call stack + span table                                                         |
 | **sema-stdlib** | Standard library                | Native functions across a comprehensive standard library                                                                                  |
 | **sema-llm**    | LLM integration                 | `LlmProvider` trait, native providers (Anthropic, OpenAI, Gemini, Ollama), OpenAI-compatible shim, embedding providers, cost tracking     |
@@ -88,9 +85,9 @@ pub struct Value(u64);
 //   Nil, Bool, Char, Symbol(Spur), Keyword(Spur), IntSmall(±2^44)
 //
 // Heap types (Rc pointer in 45-bit payload):
-//   String, List, Vector, Map, HashMap, Lambda, Macro, NativeFn,
+//   IntBig, String, List, Vector, Map, HashMap, Lambda, Macro, NativeFn,
 //   Prompt, Message, Conversation, ToolDef, Agent, Thunk, Record, Bytevector,
-//   AsyncPromise, Channel
+//   MultiMethod, Stream, F64Array, I64Array, AsyncPromise, Channel
 //
 // Pattern matching via val.view() → ValueView enum
 ```
@@ -138,7 +135,7 @@ Clojure takes a third approach: persistent vectors backed by wide (32-way branch
 
 `Value::Map` uses `BTreeMap` (sorted, deterministic iteration order) rather than `HashMap`. This matters for:
 
-- **Deterministic equality:** Two maps with the same entries compare identically via the derived `PartialEq`, and iteration order is independent of insertion order — important for consistent hashing and display
+- **Deterministic equality:** Two maps with the same entries compare identically via `PartialEq`, and iteration order is independent of insertion order — important for consistent hashing and display
 - **Printing:** `{:a 1 :b 2}` always prints in the same order, making test assertions reliable
 - **Usable as keys:** Maps can be keys in other `BTreeMap`s because `Value` implements `Ord`. Since `Map` variants compare by sorted content, two maps with the same entries are always equal under `Ord`, regardless of construction order
 
@@ -168,13 +165,13 @@ where
 }
 ```
 
-This makes symbol equality O(1) (integer comparison instead of string comparison) and environment lookup faster (integer keys in the `BTreeMap`). It also means special form dispatch — the hottest path in the evaluator — compares `u32` values against pre-cached constants rather than resolving strings.
+This makes symbol equality O(1) (integer comparison instead of string comparison) and environment lookup faster (integer keys in the env's hash map). It also means special form dispatch — the hottest path in the evaluator — compares `u32` values against pre-cached constants rather than resolving strings.
 
 String interning is as old as Lisp itself. McCarthy's original LISP 1.5 (1962) interned atoms in the "object list" (oblist). The key difference: Sema uses a separate interner rather than pointer identity, so interning is explicit via `intern()` rather than implicit.
 
 ### LLM Types as First-Class Values
 
-`Prompt`, `Message`, `Conversation`, `ToolDef`, and `Agent` sit in the `Value` enum at the same level as `List` and `Map`. They're not encoded as maps-with-conventions — they're distinct types with their own constructors, pattern matching, and display representations:
+`Prompt`, `Message`, `Conversation`, `ToolDef`, and `Agent` sit in the `Value` type at the same level as `List` and `Map`. They're not encoded as maps-with-conventions — they're distinct types with their own constructors, pattern matching, and display representations:
 
 ```sema
 ;; These are values, not strings or maps
@@ -193,10 +190,11 @@ The environment is a linked list of scopes, each holding a `SpurMap<Spur, Value>
 pub struct Env {
     pub bindings: Rc<RefCell<SpurMap<Spur, Value>>>,
     pub parent: Option<Rc<Env>>,
+    pub version: Cell<u64>,
 }
 ```
 
-Variable lookup walks the parent chain until it finds a binding or reaches the root. This is the standard lexical scoping model — a closure captures a reference to its defining environment, and lookups resolve outward through enclosing scopes.
+The `version` counter is bumped on every mutation; the bytecode VM's per-instruction inline caches use it to detect stale global lookups. Variable lookup walks the parent chain until it finds a binding or reaches the root. This is the standard lexical scoping model — a closure captures a reference to its defining environment, and lookups resolve outward through enclosing scopes.
 
 ### Operations
 
@@ -205,13 +203,13 @@ Variable lookup walks the parent chain until it finds a binding or reaches the r
 | `get(spur)`               | Walk parent chain, return first match         | Variable lookup             |
 | `set(spur, val)`          | Insert in current scope                       | `define`, parameter binding |
 | `set_existing(spur, val)` | Walk chain, update where found                | `set!` (mutation)           |
-| `update(spur, val)`       | Overwrite in current scope, no key allocation | Hot-path env reuse          |
+| `update(spur, val)`       | Overwrite in current scope                    | Hot-path env reuse          |
 | `take(spur)`              | Remove from current scope, return value       | COW optimization            |
 | `take_anywhere(spur)`     | Remove from any scope in chain                | COW optimization            |
 
 `take` and `take_anywhere` exist for the copy-on-write optimization: by _removing_ a value from the environment before passing it to a function, the `Rc` refcount drops to 1, enabling in-place mutation. See [Performance Internals](./performance.md#_1-copy-on-write-map-mutation).
 
-`update` exists for the lambda environment reuse optimization: when reusing an environment across iterations of a hot loop, `update` overwrites an existing binding without the overhead of `BTreeMap::insert`'s key allocation path. See [Performance Internals](./performance.md#_2-lambda-environment-reuse).
+`update` exists for the lambda environment reuse optimization: when reusing an environment across iterations of a hot loop, `update` overwrites an existing binding in place instead of going through the full insert path. See [Performance Internals](./performance.md#_2-lambda-environment-reuse).
 
 ## Error Handling
 
@@ -259,6 +257,11 @@ pub fn with_stack_trace(self, trace: StackTrace) -> Self {
     }
     match self {
         SemaError::WithTrace { .. } => self,  // already wrapped, don't double-wrap
+        SemaError::WithContext { inner, hint, note } => SemaError::WithContext {
+            inner: Box::new(inner.with_stack_trace(trace)),  // wrap inside the context
+            hint,
+            note,
+        },
         other => SemaError::WithTrace {
             inner: Box::new(other),
             trace,
@@ -284,8 +287,15 @@ Sema's evaluator state is held in an explicit `EvalContext` struct, defined in `
 | `call_stack`        | `RefCell<Vec<CallFrame>>`           | Call frames for error traces                 |
 | `span_table`        | `RefCell<HashMap<usize, Span>>`     | Rc pointer address → source span             |
 | `eval_depth`        | `Cell<usize>`                       | Recursion depth counter                      |
+| `max_eval_depth`    | `Cell<usize>`                       | High-water mark of eval depth                |
 | `eval_step_limit`   | `Cell<usize>`                       | Step limit for fuzz targets                  |
 | `eval_steps`        | `Cell<usize>`                       | Current step counter                         |
+| `eval_deadline`     | `Cell<Option<Instant>>`             | Wall-clock budget (used by the notebook)     |
+| `sandbox`           | `Sandbox`                           | Capability sandbox                           |
+| `user_context` / `hidden_context` | `RefCell<Vec<BTreeMap<Value, Value>>>` | Dynamic context frames        |
+| `context_stacks`    | `RefCell<BTreeMap<Value, Vec<Value>>>` | Named context stacks                      |
+| `eval_fn` / `call_fn` | `Cell<Option<fn(...)>>`           | Registered evaluator callbacks               |
+| `interactive`       | `Cell<bool>`                        | REPL/interactive mode flag                   |
 
 ### Remaining Thread-Locals
 
@@ -294,8 +304,6 @@ Some state remains in thread-local storage — either because it's a pure perfor
 | Location                     | Thread-local        | Purpose                                       |
 | ---------------------------- | ------------------- | --------------------------------------------- |
 | `sema-core/value.rs`         | `INTERNER`          | String interner (`lasso::Rodeo`)              |
-| `sema-core/context.rs`       | `EVAL_FN`           | Evaluator callback                            |
-| `sema-core/context.rs`       | `CALL_FN`           | Call-value callback                           |
 | `sema-core/context.rs`       | `STDLIB_CTX`        | Shared `EvalContext` for stdlib callbacks     |
 | `sema-eval/special_forms.rs` | `SF`                | Cached `SpecialFormSpurs` (performance cache) |
 | `sema-llm/builtins.rs`       | `PROVIDER_REGISTRY` | Registered LLM providers                      |
@@ -323,6 +331,7 @@ Sema compiles to WebAssembly with conditional compilation gates. The `#[cfg(not(
 - `system` — process execution, environment variables, exit
 - `http` — HTTP client (`http/get`, `http/post`, etc.)
 - `terminal` — terminal control (colors, cursor, raw mode)
+- `kv`, `pdf`, `serial`, `server`, `sqlite` — other OS-dependent modules
 
 **From sema-eval:**
 
@@ -375,9 +384,9 @@ At startup, the binary crate detects available API keys and registers providers:
 
 - `ANTHROPIC_API_KEY` → Anthropic (Claude)
 - `OPENAI_API_KEY` → OpenAI (GPT)
-- `GEMINI_API_KEY` → Gemini
-- `OLLAMA_HOST` → Ollama (local)
+- `GOOGLE_API_KEY` → Gemini
 - `GROQ_API_KEY`, `XAI_API_KEY`, `MISTRAL_API_KEY`, `MOONSHOT_API_KEY` → OpenAI-compatible shim
+- Ollama (local) is always registered — no auth needed; `OLLAMA_HOST` overrides the default `http://localhost:11434`
 
 Embedding providers (Jina, Voyage, Cohere) are registered separately and selected via `(llm/set-embedding-provider)`.
 
@@ -412,31 +421,35 @@ sema-stdlib ──CANNOT depend on──► sema-eval  (would create a cycle)
 
 ### Solution 1: Callback Architecture (sema-core + sema-stdlib)
 
-`sema-core` defines thread-local callback storage in `context.rs` that bridges the dependency gap using dependency inversion:
+`sema-core` defines callback storage in `context.rs` that bridges the dependency gap using dependency inversion — function-pointer slots on `EvalContext`, plus a shared thread-local context for stdlib functions that don't receive a `ctx` parameter:
 
 ```rust
-pub type EvalCallback = fn(&EvalContext, &Value, &Env) -> Result<Value, SemaError>;
-pub type CallCallback = fn(&EvalContext, &Value, &[Value], &Env) -> Result<Value, SemaError>;
+pub type EvalCallbackFn = fn(&EvalContext, &Value, &Env) -> Result<Value, SemaError>;
+pub type CallCallbackFn = fn(&EvalContext, &Value, &[Value]) -> Result<Value, SemaError>;
+
+pub struct EvalContext {
+    // ...
+    pub eval_fn: Cell<Option<EvalCallbackFn>>,
+    pub call_fn: Cell<Option<CallCallbackFn>>,
+}
 
 thread_local! {
-    static EVAL_FN: Cell<Option<EvalCallback>> = Cell::new(None);
-    static CALL_FN: Cell<Option<CallCallback>> = Cell::new(None);
-    static STDLIB_CTX: RefCell<Option<EvalContext>> = RefCell::new(None);
+    static STDLIB_CTX: EvalContext = EvalContext::new();
 }
 ```
 
-At startup, `sema-eval` registers the real evaluator and call dispatch functions:
+At startup, `sema-eval` registers the real evaluator and call dispatch functions (into both the interpreter's context and the shared `STDLIB_CTX`):
 
 ```rust
-sema_core::set_eval_callback(eval_value);
-sema_core::set_call_callback(call_value);
+sema_core::set_eval_callback(&ctx, eval_value);
+sema_core::set_call_callback(&ctx, call_value);
 ```
 
 All stdlib higher-order functions (`map`, `filter`, `fold`, `sort-by`, `for-each`, `file/fold-lines`, etc.) invoke user-provided lambdas through `sema_core::call_callback`, which dispatches to the real evaluator:
 
 ```rust
 // In sema-stdlib, e.g. map implementation
-let result = sema_core::call_callback(&func, &[elem], env)?;
+let result = sema_core::call_callback(ctx, &func, &[elem])?;
 ```
 
 The `with_stdlib_ctx` function provides a shared `EvalContext` for stdlib callbacks, avoiding per-call allocation of a new context.
@@ -489,4 +502,4 @@ An alternative would be to define an `Evaluator` trait in `sema-core` and have `
 
 ### Architectural Lesson
 
-The circular dependency constraint forced a callback architecture that turned out to be a better design than having direct access to the evaluator would have been. The dependency inversion through `sema-core` callbacks gives a single, canonical evaluator used everywhere — stdlib HOFs, LLM tool handlers, and the main interpreter all run the same code paths with full feature support. This also provides a clean seam for future work: with the bytecode VM now available via `--vm`, only the callback registrations needed to change — all call sites in stdlib and llm remained untouched, validating this design. Sometimes constraints lead to better designs than unconstrained freedom would have.
+The circular dependency constraint forced a callback architecture that turned out to be a better design than having direct access to the evaluator would have been. The dependency inversion through `sema-core` callbacks gives a single, canonical evaluator used everywhere — stdlib HOFs, LLM tool handlers, and the main interpreter all run the same code paths with full feature support. This also provides a clean seam for future work: when the bytecode VM became the default backend, only the callback registrations needed to change — all call sites in stdlib and llm remained untouched, validating this design. Sometimes constraints lead to better designs than unconstrained freedom would have.

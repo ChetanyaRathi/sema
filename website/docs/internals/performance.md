@@ -169,6 +169,8 @@ Value::Symbol(Spur)  // u32
 env: BTreeMap<Spur, Value>
 ```
 
+(`Env` bindings have since moved from `BTreeMap` to `hashbrown::HashMap`, still keyed by `Spur`.)
+
 Special form dispatch uses pre-cached `Spur` constants:
 
 ```rust
@@ -340,7 +342,7 @@ Not everything we tried worked:
 
 | Approach                                  | Result       | Why                                                                                                                                                                                 |
 | ----------------------------------------- | ------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **HashMap for Env**                       | Slower       | `BTreeMap` is faster for the very small maps (1–3 entries) typical of `let` scopes. HashMap's hashing overhead exceeds BTreeMap's few integer comparisons at that size.             |
+| **HashMap for Env**                       | Slower (later adopted) | At the time, hashing overhead exceeded BTreeMap's few integer comparisons on the very small maps (1–3 entries) typical of `let` scopes. The verdict was later reversed: `Env` bindings now use `hashbrown::HashMap<Spur, Value>`.               |
 | **im-rc / rpds (persistent collections)** | Slower       | Structural sharing fights the COW optimization — the whole point is to _avoid_ sharing and mutate in place when refcount is 1.                                                      |
 | **bumpalo / typed-arena**                 | Incompatible | Values need to escape the arena (returned from functions, stored in environments). Arena allocation only works for temporaries.                                                     |
 | **compact_str / smol_str**                | Redundant    | Once symbols/keywords are interned as `Spur`, small-string optimization for them is pointless. String _values_ are still `Rc<String>` but they're not in the hot path for dispatch. |

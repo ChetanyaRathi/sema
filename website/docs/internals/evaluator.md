@@ -1,6 +1,6 @@
 # Evaluator Internals
 
-Sema's primary execution path is a tree-walking interpreter. A [bytecode VM](./bytecode-vm.md) is available as an alternative execution path (via the `--vm` CLI flag), but the tree-walker remains the default and serves as the macro expansion engine and `eval` fallback. This page documents the tree-walking evaluator. There is no JIT, no CPS transform — just an AST represented as `Value` nodes that get recursively evaluated. The key trick is a **trampoline** that turns tail calls into a loop, giving us tail-call optimization without growing the native Rust stack.
+Sema has two evaluators: a [bytecode VM](./bytecode-vm.md) — the default execution path — and a tree-walking interpreter, selected via the `--tw` CLI flag, which also serves as the macro expansion engine and `eval` fallback. This page documents the tree-walking evaluator. There is no JIT, no CPS transform — just an AST represented as `Value` nodes that get recursively evaluated. The key trick is a **trampoline** that turns tail calls into a loop, giving us tail-call optimization without growing the native Rust stack.
 
 If you're familiar with the metacircular evaluator from [SICP](https://mitpress.mit.edu/9780262510875/structure-and-interpretation-of-computer-programs/) (Abelson & Sussman, 1996), Sema's evaluator is structurally similar — `eval` dispatches on expression type, `apply` handles function calls — but with two critical differences: the trampoline for TCO, and a mutable environment model instead of substitution.
 
@@ -83,7 +83,7 @@ The key insight: `if` is a special form that returns `Trampoline::Eval` for its 
 ### How This Differs From Other Approaches
 
 - **CPS (Continuation-Passing Style):** Some Scheme compilers (such as earlier versions of Orbit and Rabbit) use CPS as an intermediate representation, making every call a tail call. This supports `call/cc` naturally but requires a whole-program transformation. Modern compilers like Chez Scheme use other strategies (nanopass compilation with explicit stack frames). Sema doesn't do CPS; only calls in tail position are optimized.
-- **Bytecode VM:** CPython and Lua compile to bytecode and run a `switch`-dispatch loop. The VM's instruction pointer replaces the trampoline. Bytecode is faster (smaller dispatch overhead, better cache behavior) but more complex to implement. Sema now has its own bytecode VM in `sema-vm`, available via `--vm` — see [Bytecode VM](./bytecode-vm.md) for details.
+- **Bytecode VM:** CPython and Lua compile to bytecode and run a `switch`-dispatch loop. The VM's instruction pointer replaces the trampoline. Bytecode is faster (smaller dispatch overhead, better cache behavior) but more complex to implement. Sema now has its own bytecode VM in `sema-vm`, which is the default backend — see [Bytecode VM](./bytecode-vm.md) for details.
 - **Direct recursion:** The metacircular evaluator in SICP chapter 4 just calls `eval` recursively. Simple, but blows the stack on deep tail recursion. Sema started this way and migrated to the trampoline.
 
 ## eval_step: A Single Step
@@ -93,24 +93,24 @@ The key insight: `if` is a special form that returns `Trampoline::Eval` for its 
 ```rust
 // crates/sema-eval/src/eval.rs
 fn eval_step(ctx: &EvalContext, expr: &Value, env: &Env) -> Result<Trampoline, SemaError> {
-    match expr {
+    match expr.view() {
         // Self-evaluating forms
-        Value::Nil | Value::Bool(_) | Value::Int(_) | Value::Float(_)
-        | Value::String(_) | Value::Char(_) | Value::Keyword(_)
-        | Value::Thunk(_) | Value::Bytevector(_) | Value::HashMap(_)
+        ValueView::Nil | ValueView::Bool(_) | ValueView::Int(_) | ValueView::Float(_)
+        | ValueView::String(_) | ValueView::Char(_) | ValueView::Keyword(_)
+        | ValueView::Thunk(_) | ValueView::Bytevector(_) | ValueView::HashMap(_)
             => Ok(Trampoline::Value(expr.clone())),
 
         // Symbol lookup
-        Value::Symbol(spur) => env.get(*spur)
+        ValueView::Symbol(spur) => env.get(spur)
             .map(Trampoline::Value)
-            .ok_or_else(|| SemaError::Unbound(resolve(*spur))),
+            .ok_or_else(|| SemaError::Unbound(resolve(spur))),
 
         // Vector/Map: evaluate elements recursively
-        Value::Vector(items) => { /* eval each element */ }
-        Value::Map(map)      => { /* eval each key and value */ }
+        ValueView::Vector(items) => { /* eval each element */ }
+        ValueView::Map(map)      => { /* eval each key and value */ }
 
         // List: special forms, then function application
-        Value::List(items) => { /* see below */ }
+        ValueView::List(items) => { /* see below */ }
     }
 }
 ```
@@ -128,22 +128,23 @@ When `eval_step` encounters a list `(head arg1 arg2 ...)`:
 
 ```rust
 // Check head for a special form (O(1) integer comparison)
-if let Value::Symbol(spur) = head {
-    if let Some(result) = special_forms::try_eval_special(*spur, args, env) {
+if let Some(spur) = head.as_symbol_spur() {
+    if let Some(result) = special_forms::try_eval_special(spur, args, env, ctx) {
         return result;
     }
 }
 
 // Not a special form — evaluate the head to get the callable
-let func = eval_value(head, env)?;
+let func = eval_value(ctx, head, env)?;
 
 // Dispatch on callable type
-match &func {
-    Value::NativeFn(native) => { /* evaluate args, call Rust fn */ }
-    Value::Lambda(lambda)   => { /* evaluate args, apply_lambda */ }
-    Value::Macro(mac)       => { /* pass unevaluated args, expand */ }
-    Value::Keyword(spur)    => { /* keyword-as-function: (:key map) */ }
-    other                   => Err("not callable")
+match func.view() {
+    ValueView::NativeFn(native)  => { /* evaluate args, call Rust fn */ }
+    ValueView::Lambda(lambda)    => { /* evaluate args, apply_lambda */ }
+    ValueView::Macro(mac)        => { /* pass unevaluated args, expand */ }
+    ValueView::Keyword(spur)     => { /* keyword-as-function: (:key map) */ }
+    ValueView::MultiMethod(mm)   => { /* evaluate args, dispatch on value */ }
+    _                            => Err("not callable")
 }
 ```
 
@@ -161,7 +162,7 @@ struct SpecialFormSpurs {
     cond: Spur,
     define: Spur,
     lambda: Spur,
-    // ... 36 more
+    // ... 41 more
 }
 ```
 
@@ -191,16 +192,18 @@ pub fn try_eval_special(
     head_spur: Spur,
     args: &[Value],
     env: &Env,
+    ctx: &EvalContext,
 ) -> Option<Result<Trampoline, SemaError>> {
     let sf = special_forms();
-    if head_spur == sf.quote {
-        Some(eval_quote(args))
-    } else if head_spur == sf.if_ {
-        Some(eval_if(args, env))
-    } else if head_spur == sf.define {
-        Some(eval_define(args, env))
+    // Hot-path forms checked first
+    if head_spur == sf.if_ {
+        Some(eval_if(args, env, ctx))
+    } else if head_spur == sf.define || head_spur == sf.def {
+        Some(eval_define(args, env, ctx))
+    } else if head_spur == sf.let_ {
+        Some(eval_let(args, env, ctx))
     }
-    // ... 36 more branches
+    // ... more branches
     else {
         None  // not a special form
     }
@@ -217,14 +220,14 @@ The function returns `Option<Result<...>>` — `None` means "not a special form,
 
 ## Function Application
 
-There are four callable types, each handled differently:
+There are five callable types — native functions, lambdas, macros, keywords, and multimethods — each handled differently:
 
 ### NativeFn
 
-Native functions are Rust closures wrapped in `Value::NativeFn`. They receive evaluated arguments and return a `Value`:
+Native functions are Rust closures wrapped in a `NativeFn` value. They receive evaluated arguments and return a `Value`:
 
 ```rust
-Value::NativeFn(native) => {
+ValueView::NativeFn(native) => {
     let mut eval_args = Vec::with_capacity(args.len());
     for arg in args {
         eval_args.push(eval_value(ctx, arg, env)?);
@@ -248,17 +251,17 @@ Lambdas are the heart of TCO. After evaluating arguments, `apply_lambda` binds p
 
 ```rust
 // crates/sema-eval/src/eval.rs
-fn apply_lambda(ctx: &EvalContext, lambda: &Lambda, args: &[Value]) -> Result<Trampoline, SemaError> {
+fn apply_lambda(ctx: &EvalContext, lambda: &Rc<Lambda>, args: &[Value]) -> Result<Trampoline, SemaError> {
     let new_env = Env::with_parent(Rc::new(lambda.env.clone()));
 
-    // Bind parameters (with rest-param support)
+    // Bind parameters — params are pre-interned Spurs (with rest-param support)
     for (param, arg) in lambda.params.iter().zip(args.iter()) {
-        new_env.set(sema_core::intern(param), arg.clone());
+        new_env.set(*param, arg.clone());
     }
 
-    // Self-reference for recursion
-    if let Some(ref name) = lambda.name {
-        new_env.set(sema_core::intern(name), Value::Lambda(Rc::new(lambda.clone())));
+    // Self-reference for recursion — just clone the Rc pointer
+    if let Some(name) = lambda.name {
+        new_env.set(name, Value::lambda_from_rc(Rc::clone(lambda)));
     }
 
     // Evaluate all body exprs except the last
@@ -280,8 +283,8 @@ Named lambdas bind themselves in the new environment, enabling direct recursion 
 Macros receive unevaluated arguments, evaluate their body to produce an expansion, and then return `Trampoline::Eval` to evaluate the expansion in the caller's environment:
 
 ```rust
-Value::Macro(mac) => {
-    let expanded = apply_macro(mac, args, env)?;
+ValueView::Macro(mac) => {
+    let expanded = apply_macro(ctx, &mac, args, env)?;
     Ok(Trampoline::Eval(expanded, env.clone()))
 }
 ```
@@ -292,6 +295,10 @@ This means macro expansion is always in tail position — the expanded code gets
 
 Keywords can be used as functions for map lookup: `(:name person)` is equivalent to `(get person :name)`. This is syntactic sugar evaluated directly in `eval_step`, not a general callable mechanism.
 
+### Multimethod
+
+Multimethods (`defmulti`/`defmethod`) evaluate their arguments, call the dispatch function on them, and look up the handler registered for the resulting dispatch value (falling back to a `:default` handler if present). The chosen handler is then invoked via `call_value`.
+
 ## `call_value`: Calling Functions from Stdlib
 
 The `call_value` function is the public API for calling any callable `Value` with pre-evaluated arguments. It's the entry point used by stdlib higher-order functions (`map`, `filter`, `fold`, etc.) when they need to invoke a user-supplied callback:
@@ -299,37 +306,34 @@ The `call_value` function is the public API for calling any callable `Value` wit
 ```rust
 // crates/sema-eval/src/eval.rs
 pub fn call_value(ctx: &EvalContext, func: &Value, args: &[Value]) -> EvalResult {
-    match func {
-        Value::NativeFn(native) => (native.func)(ctx, args),
-        Value::Lambda(lambda) => {
-            // Create env, bind params (with rest-param support), eval body
-            let new_env = Env::with_parent(Rc::new(lambda.env.clone()));
-            // ... parameter binding ...
-            let mut result = Value::Nil;
-            for expr in &lambda.body {
-                result = eval_value(ctx, expr, &new_env)?;
-            }
-            Ok(result)
+    match func.view() {
+        ValueView::NativeFn(native) => (native.func)(ctx, args),
+        ValueView::Lambda(lambda) => {
+            // Bind params via apply_lambda, then run the resulting
+            // trampoline to completion iteratively
+            let trampoline = apply_lambda(ctx, &lambda, args)?;
+            run_trampoline(ctx, trampoline)
         }
-        Value::Keyword(spur) => {
+        ValueView::Keyword(spur) => {
             // Keyword-as-function: (:key map) => map lookup
             // ...
         }
-        other => Err(SemaError::eval("not callable")),
+        ValueView::MultiMethod(mm) => call_multimethod(ctx, &mm, args),
+        _ => Err(SemaError::eval("not callable")),
     }
 }
 ```
 
-Unlike `apply_lambda` (used by `eval_step` during normal evaluation), `call_value` does **not** use the trampoline — it evaluates the lambda body directly via `eval_value`, including the last expression. This is intentional: `call_value` is called from Rust code (stdlib native functions) that needs a `Value` result, not a `Trampoline`. The trade-off is that callbacks invoked through `call_value` don't get TCO on their own body — but in practice this doesn't matter, because stdlib HOFs like `map` and `filter` iterate externally rather than recursing.
+Like `eval_step` during normal evaluation, `call_value` goes through `apply_lambda` and a trampoline loop (`run_trampoline`), which drives the returned `Trampoline` to completion iteratively. Callbacks invoked through `call_value` therefore get full TCO on their own body, and stdlib HOF callbacks (`map`, `for-each`, etc.) don't grow the Rust call stack per evaluation step — which matters especially on WASM, where the call stack is limited.
 
 ### Callback Architecture
 
-Stdlib functions live in `sema-stdlib`, which depends on `sema-core` but **not** on `sema-eval`. This means stdlib can't call `eval_value` or `call_value` directly. Instead, `sema-core` provides thread-local callback slots:
+Stdlib functions live in `sema-stdlib`, which depends on `sema-core` but **not** on `sema-eval`. This means stdlib can't call `eval_value` or `call_value` directly. Instead, `sema-core` provides callback slots on `EvalContext` (mirrored into a shared thread-local `STDLIB_CTX` for stdlib functions that don't receive a context):
 
 ```rust
-// sema-core: thread-local function pointers
-sema_core::set_eval_callback(eval_value);   // registered by sema-eval at init
-sema_core::set_call_callback(call_value);   // registered by sema-eval at init
+// sema-core: function-pointer slots on EvalContext
+sema_core::set_eval_callback(&ctx, eval_value);   // registered by sema-eval at init
+sema_core::set_call_callback(&ctx, call_value);   // registered by sema-eval at init
 ```
 
 When a stdlib HOF like `map` needs to call a user function, it calls `sema_core::call_callback(ctx, func, args)`, which dispatches to the registered `call_value`. This indirection preserves the dependency invariant (`core ← eval ← stdlib`) while giving stdlib full access to the evaluator.
@@ -353,7 +357,7 @@ Each `CallFrame` captures the function name, current file, and source span:
 // crates/sema-core
 pub struct CallFrame {
     pub name: String,
-    pub file: Option<String>,
+    pub file: Option<std::path::PathBuf>,
     pub span: Option<Span>,
 }
 ```
@@ -364,12 +368,11 @@ Source spans are tracked using a pointer-identity trick. The reader stores `Span
 
 ```rust
 fn span_of_expr(ctx: &EvalContext, expr: &Value) -> Option<Span> {
-    match expr {
-        Value::List(items) => {
-            let ptr = Rc::as_ptr(items) as usize;
-            ctx.lookup_span(ptr)
-        }
-        _ => None,
+    if let Some(items) = expr.as_list_rc() {
+        let ptr = Rc::as_ptr(&items) as usize;
+        ctx.lookup_span(ptr)
+    } else {
+        None
     }
 }
 ```
@@ -425,20 +428,23 @@ Without this trimming, a tail-recursive loop of 1M iterations would accumulate 1
 The evaluator tracks nesting depth via the `eval_depth` field in `EvalContext`, incremented on every `eval_value` call and decremented on return. However, `eval_value` has a **fast path** at the top that short-circuits self-evaluating forms and symbol lookups _before_ any depth tracking or step counting:
 
 ```rust
+#[cfg(target_arch = "wasm32")]
+const MAX_EVAL_DEPTH: usize = 256;   // WASM has a much smaller call stack
+#[cfg(not(target_arch = "wasm32"))]
 const MAX_EVAL_DEPTH: usize = 1024;
 
 pub fn eval_value(ctx: &EvalContext, expr: &Value, env: &Env) -> EvalResult {
     // Fast path: self-evaluating forms skip depth/step tracking entirely.
-    match expr {
-        Value::Nil | Value::Bool(_) | Value::Int(_) | Value::Float(_)
-        | Value::String(_) | Value::Char(_) | Value::Keyword(_)
-        | Value::Thunk(_) | Value::Bytevector(_) | Value::NativeFn(_)
-        | Value::Lambda(_) | Value::HashMap(_) => return Ok(expr.clone()),
-        Value::Symbol(spur) => {
-            if let Some(val) = env.get(*spur) {
+    match expr.view() {
+        ValueView::Nil | ValueView::Bool(_) | ValueView::Int(_) | ValueView::Float(_)
+        | ValueView::String(_) | ValueView::Char(_) | ValueView::Keyword(_)
+        | ValueView::Thunk(_) | ValueView::Bytevector(_) | ValueView::NativeFn(_)
+        | ValueView::Lambda(_) | ValueView::HashMap(_) => return Ok(expr.clone()),
+        ValueView::Symbol(spur) => {
+            if let Some(val) = env.get(spur) {
                 return Ok(val);
             }
-            return Err(SemaError::Unbound(resolve(*spur)));
+            return Err(SemaError::Unbound(resolve(spur)));
         }
         _ => {}
     }
@@ -481,10 +487,11 @@ Sema uses a linked-list scope chain, where each scope is a `hashbrown::HashMap` 
 pub struct Env {
     pub bindings: Rc<RefCell<SpurMap<Spur, Value>>>,
     pub parent: Option<Rc<Env>>,
+    pub version: Cell<u64>,
 }
 ```
 
-`Rc<RefCell<...>>` makes each scope mutable and reference-counted. `BTreeMap<Spur, Value>` provides deterministic ordering (important for printing and testing) and is faster than `HashMap` for the very small maps (1–5 entries) typical of `let` and `lambda` scopes — at that size, a few integer comparisons in the B-tree node are cheaper than computing a hash (see the [Performance Internals](performance.md#rejected-optimizations) page for the benchmark).
+`Rc<RefCell<...>>` makes each scope mutable and reference-counted. `SpurMap` is an alias for `hashbrown::HashMap` — keys are interned `Spur` handles (`u32`), so hashing is cheap integer hashing rather than string hashing. The `version` counter is bumped on every mutation; the bytecode VM's inline caches use it to invalidate stale global lookups.
 
 ### Operations
 
@@ -495,7 +502,7 @@ pub struct Env {
 | `set_existing(spur, val)` | Walk the chain, update where found (for `set!`)               |
 | `take(spur)`              | Remove from current scope only (for COW optimization)         |
 | `take_anywhere(spur)`     | Remove from any scope in the chain                            |
-| `update(spur, val)`       | Overwrite in current scope without re-hashing (for hot loops) |
+| `update(spur, val)`       | Overwrite an existing binding in the current scope (for hot loops) |
 
 The `take` method is critical for the copy-on-write map optimization described in the Performance page — by removing a value from the environment before passing it to a function, the `Rc` reference count drops to 1, enabling in-place mutation.
 

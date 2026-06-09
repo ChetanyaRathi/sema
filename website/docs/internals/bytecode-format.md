@@ -13,7 +13,7 @@ The `.semac` bytecode file format is implemented and available via `sema compile
 Sema supports compiling source files to bytecode files (`.semac`) for faster loading and distribution without source. The compilation pipeline is:
 
 ```
-Source (.sema) → Reader → Lower → Resolve → Compile → Serialize → .semac file
+Source (.sema) → Reader → Lower → Optimize → Resolve → Compile → Serialize → .semac file
 ```
 
 Loading a `.semac` file skips parsing, lowering, resolution, and compilation — the VM directly deserializes and executes the pre-compiled bytecode.
@@ -81,7 +81,7 @@ All multi-byte integers are **little-endian**. All strings are **UTF-8**.
 | Offset | Size | Field | Description |
 |--------|------|-------|-------------|
 | 0 | 4 | `magic` | `\x00SEM` (`0x00`, `0x53`, `0x45`, `0x4D`) |
-| 4 | 2 | `format_version` | Bytecode format version (currently `1`) |
+| 4 | 2 | `format_version` | Bytecode format version (currently `2`) |
 | 6 | 2 | `flags` | Bit flags (see below) |
 | 8 | 2 | `sema_major` | Sema version major that produced this file |
 | 10 | 2 | `sema_minor` | Sema version minor |
@@ -107,7 +107,7 @@ The magic bytes `\x00SEM` serve two purposes:
 | 2 | `HAS_BREAKPOINTS` | File contains a Breakpoints section |
 | 3–15 | — | Reserved (must be 0) |
 
-When `--strip` is used during compilation, bits 0–2 are cleared and debug sections are omitted.
+The current serializer always writes `flags = 0` — debug sections (and a `--strip` flag to omit them) are not yet implemented.
 
 ## Section Format
 
@@ -155,7 +155,7 @@ The string table contains all unique strings referenced by the bytecode, includi
 └────────────────────────────┘
 ```
 
-On load, each string is interned into the global `lasso::ThreadedRodeo`, producing a fresh `Spur`. The loader builds a **remap table** (`Vec<Spur>`) mapping file-local string indices to process-local Spurs.
+On load, each string is interned into the process-local `lasso::Rodeo` (a thread-local interner), producing a fresh `Spur`. The loader builds a **remap table** (`Vec<Spur>`) mapping file-local string indices to process-local Spurs.
 
 String index `0` is reserved and must be the empty string `""`.
 
@@ -179,6 +179,7 @@ The main chunk contains the top-level bytecode and its constant pool.
 ├────────────────────────────────┤
 │  max_stack: u16                │
 │  n_locals: u16                 │
+│  n_global_cache_slots: u16     │  Inline cache slots for global lookups
 ├────────────────────────────────┤
 │  n_exceptions: u16             │
 │  exceptions: [ExceptionEntry]  │  Exception table
@@ -259,7 +260,7 @@ The following `ValueView` variants are **runtime-only** and must never appear in
 - `Thunk` — created by `delay`
 - `Record` — constructed by `define-record-type`
 - `AsyncPromise` (tag 28) — created by `async/spawn`, runtime-only
-- `Channel` (tag 29) — created by `chan/new`, runtime-only
+- `Channel` (tag 29) — created by `channel/new`, runtime-only
 
 If the serializer encounters any of these in a constant pool, it should emit a compile error.
 
@@ -269,7 +270,7 @@ Sema uses `lasso::Spur` (process-local interned string handles) for symbols, key
 
 ### In the bytecode stream
 
-Global variable opcodes (`LoadGlobal`, `StoreGlobal`, `DefineGlobal`) encode Spur values as `u32`. On serialization:
+Global variable opcodes (`LoadGlobal`, `StoreGlobal`, `DefineGlobal`, `CallGlobal`) encode Spur values as `u32`. `LoadGlobal` additionally carries a `u16` inline-cache slot operand, and `CallGlobal` carries `u16 argc` + `u16` cache slot — these are copied through unchanged; only the `u32` Spur operand is remapped. On serialization:
 
 1. The serializer collects all Spurs referenced in the bytecode (globals, function names, local names)
 2. Each Spur's string is added to the string table, getting a file-local index
@@ -279,7 +280,7 @@ On deserialization:
 
 1. The string table is loaded and each string is interned → new process-local Spurs
 2. A remap table maps file-local indices to process-local Spurs
-3. The bytecode is walked: `LoadGlobal`/`StoreGlobal`/`DefineGlobal` operands are rewritten with the new Spur u32 values
+3. The bytecode is walked: `LoadGlobal`/`StoreGlobal`/`DefineGlobal`/`CallGlobal` operands are rewritten with the new Spur u32 values
 
 This is the same approach Lua uses for upvalue names, and Guile uses for its symbol table.
 
@@ -386,14 +387,19 @@ Debug scopes will map PC ranges to lexical scopes, enabling:
 When loading a `.semac` file, the loader performs these checks:
 
 1. **Magic number** — must be `\x00SEM`
-2. **Format version** — must be supported by this Sema version
-3. **Section completeness** — all three required sections must be present
-4. **String table bounds** — all string table indices in the file must be in range
-5. **Function table bounds** — all `func_id` references in `MakeClosure` must be valid
-6. **Constant pool types** — no runtime-only value types in the constant pool
-7. **Bytecode well-formedness** — opcodes must be valid, operand sizes must be correct
+2. **Format version** — must exactly match the version this Sema build supports
+3. **Reserved header field** — must be zero
+4. **Section completeness** — all three required sections must be present (and string index 0 must be `""`)
+5. **String table bounds** — all string table indices in the file must be in range
+6. **Function table bounds** — all `func_id` references in `MakeClosure` must be valid
+7. **Constant pool types** — no runtime-only value types in the constant pool
+8. **Bytecode well-formedness** — opcodes must be valid, operand sizes must be correct, constant/local/upvalue indices must be in bounds, and jump targets must land on instruction boundaries
 
 If validation fails, the loader returns a `SemaError` with a descriptive message.
+
+::: warning Structural checks only
+Validation does not verify stack discipline — a hand-crafted `.semac` with unbalanced stack operations can cause undefined behavior in the VM's unchecked hot path. Treat `.semac` files as trusted input. A stack-depth verifier is proposed (ADR #56).
+:::
 
 ## Example
 
@@ -413,19 +419,19 @@ The compiled `.semac` would contain:
 ```
 0000  CONST         0    ; "Hello, World!" (string constant)
 0003  DEFINE_GLOBAL 1    ; greeting (string table index → Spur)
-0008  LOAD_GLOBAL   2    ; println
-0013  LOAD_GLOBAL   1    ; greeting
-0018  CALL          1
-0021  RETURN
+0008  LOAD_GLOBAL   2    ; println (+ u16 inline-cache slot)
+0015  LOAD_GLOBAL   1    ; greeting (+ u16 inline-cache slot)
+0022  CALL          1
+0025  RETURN
 ```
 
 **Function Table**: (empty — no inner functions)
 
 ## Versioning Strategy
 
-- `format_version` starts at `1` and increments on any breaking change to the binary format
+- `format_version` started at `1` and increments on any breaking change to the binary format (current version: `2`, which added `n_global_cache_slots` and the inline-cache operands)
 - `sema_major`/`sema_minor`/`sema_patch` record the compiler version for diagnostics
-- A newer Sema can refuse to load bytecode from an older format version with a clear error: `"Bytecode format v1 not supported by this Sema version (expected v2+). Recompile from source."`
+- The loader requires an exact `format_version` match and refuses anything else with a clear error: `"unsupported bytecode format version 1 (expected 2). Recompile from source."`
 - Within the same `format_version`, new section types can be added without breaking older loaders (unknown sections are skipped)
 
 ## Comparison with Other Languages

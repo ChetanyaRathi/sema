@@ -44,7 +44,7 @@ How does Sema stack up against other Lisps and Lisp-adjacent languages as a prac
 
 | Feature | Sema | Janet | Racket | Clojure | Fennel | Guile | SBCL |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| Stdlib functions | 570+ | 600+ | 1000+ | 700+ | ~50 (+ Lua) | 500+ | 900+ |
+| Stdlib functions | 700+ | 600+ | 1000+ | 700+ | ~50 (+ Lua) | 500+ | 900+ |
 | HTTP client | ✅ built-in | ⚠️ via library | ✅ built-in | ⚠️ via library | ⚠️ via Lua | ✅ `(web client)` | ⚠️ via library |
 | JSON | ✅ built-in | ⚠️ via spork | ✅ built-in | ⚠️ via library | ❌ | ⚠️ via library | ⚠️ via library |
 | Regex | ✅ built-in | ✅ PEGs | ✅ built-in | ✅ built-in | ✅ Lua patterns | ✅ built-in | ⚠️ via library |
@@ -55,6 +55,7 @@ How does Sema stack up against other Lisps and Lisp-adjacent languages as a prac
 | Date/time | ✅ built-in | ✅ built-in | ✅ built-in | ✅ via Java | ✅ via Lua | ✅ built-in | ⚠️ via library |
 | Shell execution | ✅ built-in | ✅ built-in | ✅ built-in | ✅ built-in | ✅ via Lua | ✅ built-in | ✅ built-in |
 | KV store | ✅ built-in | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
+| SQLite | ✅ built-in | ⚠️ via library | ✅ `db` collection | ⚠️ via JDBC | ⚠️ via Lua | ⚠️ via library | ⚠️ via library |
 | TOML | ✅ built-in | ⚠️ via library | ❌ | ⚠️ via library | ❌ | ❌ | ⚠️ via library |
 | Web server | ✅ built-in (axum) | ⚠️ via library | ✅ built-in | ⚠️ Ring/Jetty | ⚠️ via Lua | ✅ `(web server)` | ⚠️ via library |
 | Terminal styling | ✅ built-in | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
@@ -104,10 +105,12 @@ This is Sema's primary differentiator. No other Lisp has LLM primitives as first
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | REPL | ✅ | ✅ | ✅ DrRacket | ✅ nREPL | ✅ | ✅ | ✅ SLIME/Sly |
 | Tab completion | ✅ | ✅ | ✅ | ✅ | ✅ | ⚠️ | ✅ |
-| Editor support | VS Code, Vim, Emacs, Helix | VS Code, Vim, Emacs | DrRacket, Emacs, VS Code | Emacs, VS Code, IntelliJ | Emacs, Vim, VS Code | Emacs (Geiser) | Emacs (SLIME/Sly) |
+| Editor support | VS Code, IntelliJ, Zed, Vim, Emacs, Helix | VS Code, Vim, Emacs | DrRacket, Emacs, VS Code | Emacs, VS Code, IntelliJ | Emacs, Vim, VS Code | Emacs (Geiser) | Emacs (SLIME/Sly) |
 | Package manager | ⚠️ git-based | ✅ `jpm` | ✅ `raco` | ✅ deps.edn/Lein | ❌ (uses Lua) | ⚠️ Guix | ✅ Quicklisp |
 | Code formatter | ✅ `sema fmt` | ❌ | ✅ `raco fmt` | ✅ cljfmt | ❌ | ❌ | ❌ |
-| Debugger | ❌ | ✅ | ✅ | ✅ | ❌ | ✅ | ✅ |
+| Debugger | ✅ `sema dap` (DAP) | ✅ | ✅ | ✅ | ❌ | ✅ | ✅ |
+| LSP server | ✅ `sema lsp` | ⚠️ community | ✅ racket-langserver | ✅ clojure-lsp | ⚠️ fennel-ls | ⚠️ community | ⚠️ community |
+| Notebook | ✅ `sema notebook` | ❌ | ⚠️ Jupyter kernel | ✅ Clerk | ❌ | ⚠️ Jupyter kernel | ⚠️ Jupyter kernel |
 | Documentation site | ✅ sema-lang.com | ✅ janet-lang.org | ✅ docs.racket-lang.org | ✅ clojure.org | ✅ fennel-lang.org | ✅ gnu.org/guile | ✅ cliki.net |
 | Startup time | ~5ms | ~5ms | ~200ms | ~1–2s | ~5ms | ~50ms | ~50ms |
 
