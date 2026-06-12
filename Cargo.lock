@@ -2938,6 +2938,7 @@ dependencies = [
  "sema-fmt",
  "sema-llm",
  "sema-lsp",
+ "sema-mcp",
  "sema-notebook",
  "sema-reader",
  "sema-stdlib",
@@ -2985,6 +2986,24 @@ dependencies = [
  "serde_json",
  "tokio",
  "tower-lsp",
+]
+
+[[package]]
+name = "sema-mcp"
+version = "1.16.0"
+dependencies = [
+ "crc32fast",
+ "gag",
+ "sema-core",
+ "sema-eval",
+ "sema-fmt",
+ "sema-notebook",
+ "sema-reader",
+ "sema-vm",
+ "serde",
+ "serde_json",
+ "tokio",
+ "uuid",
 ]
 
 [[package]]

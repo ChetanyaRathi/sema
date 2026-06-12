@@ -521,6 +521,11 @@ impl Compiler {
             }
         }
 
+        let mut local_names = Vec::with_capacity(def.params.len());
+        for (i, param) in def.params.iter().enumerate() {
+            local_names.push((i as u16, *param));
+        }
+
         let func = Function {
             name: def.name,
             chunk,
