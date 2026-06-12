@@ -213,7 +213,7 @@ messages = [{<span class="c-str">"role"</span>: <span class="c-str">"user"</span
             </li>
             <li>
               <strong>The whole language fits in context.</strong>
-              Point your agent at <a href="/llms.txt"><code>llms.txt</code></a> —
+              Point your agent at <a href="/llms.txt"><mark>llms.txt</mark></a> —
               where Sema diverges from the dialects it already knows, and nothing else.
               Constraints, not a textbook.
             </li>
@@ -917,7 +917,7 @@ section {
   margin-bottom: 3px;
 }
 
-.claims code {
+.claims code, .claims mark {
   font-family: var(--font-mono);
   font-size: 12.5px;
   color: var(--gold-bright);

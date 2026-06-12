@@ -171,16 +171,10 @@ export default defineConfig({
           collapsed: false,
           items: [
             { text: 'Introduction', link: '/docs/' },
-            { text: 'CLI Reference', link: '/docs/cli' },
-            { text: 'Formatter', link: '/docs/formatter' },
-            { text: 'Shell Completions', link: '/docs/shell-completions' },
-            { text: 'Editor Support', link: '/docs/editors' },
-            { text: 'Language Server (LSP)', link: '/docs/lsp' },
-            { text: 'Debugger (DAP)', link: '/docs/dap' },
-            { text: 'Notebook', link: '/docs/notebook' },
-            { text: 'Embedding in Rust', link: '/docs/embedding' },
-            { text: 'Embedding in JavaScript', link: '/docs/embedding-js' },
-            { text: 'Packages', link: '/docs/packages' }
+            { text: 'Quickstart', link: '/docs/quickstart' },
+            { text: 'Basic Syntax', link: '/docs/tutorial/basics' },
+            { text: 'Functions & Scope', link: '/docs/tutorial/functions' },
+            { text: 'Concurrency & Async', link: '/docs/tutorial/concurrency' }
           ]
         },
         {
@@ -190,6 +184,28 @@ export default defineConfig({
             { text: 'Data Types', link: '/docs/language/data-types' },
             { text: 'Special Forms', link: '/docs/language/special-forms' },
             { text: 'Macros & Modules', link: '/docs/language/macros-modules' }
+          ]
+        },
+        {
+          text: 'Tooling & Workspace',
+          collapsed: false,
+          items: [
+            { text: 'CLI Commands', link: '/docs/cli' },
+            { text: 'Code Formatter', link: '/docs/formatter' },
+            { text: 'Shell Completions', link: '/docs/shell-completions' },
+            { text: 'Editor Integration', link: '/docs/editors' },
+            { text: 'Language Server (LSP)', link: '/docs/lsp' },
+            { text: 'Debugger (DAP)', link: '/docs/dap' },
+            { text: 'Notebooks', link: '/docs/notebook' },
+            { text: 'Packages & Modules', link: '/docs/packages' }
+          ]
+        },
+        {
+          text: 'Integration & Embedding',
+          collapsed: false,
+          items: [
+            { text: 'Embedding in Rust', link: '/docs/embedding' },
+            { text: 'Embedding in JavaScript', link: '/docs/embedding-js' }
           ]
         }
       ]
