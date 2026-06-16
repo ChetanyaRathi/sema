@@ -51,10 +51,11 @@ pub fn warn_load_bypass_once(form: &str, path: &str) {
         return;
     }
     sema_core::write_stderr(&format!(
-        "Debugger: code reached via ({form} \"{path}\") runs on the tree-walking \
-         evaluator and is not stepped by the debugger. Breakpoints set in \
-         dynamically loaded or imported files will not be hit. (This warning is \
-         shown once per debug session.)\n"
+        "Debugger: code reached via ({form} \"{path}\") is not stepped by the \
+         debugger (it runs outside the attached debug session), so breakpoints \
+         set in dynamically loaded or imported files are not hit. Stepping the \
+         main program is unaffected. (This warning is shown once per debug \
+         session.)\n"
     ));
 }
 

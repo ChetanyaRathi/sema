@@ -2246,7 +2246,12 @@ impl Env {
         }
     }
 
-    fn bump_version(&self) {
+    /// Bump the environment's version counter. The VM's inline global cache is
+    /// keyed on this version, so call this after mutating `bindings` through a
+    /// different `Env` handle that shares the same `bindings` Rc but has its own
+    /// version cell (e.g. a `load`ed module body run on a cloned-Env VM), so a
+    /// VM observing this `Env` re-reads instead of serving a stale cached value.
+    pub fn bump_version(&self) {
         self.version.set(self.version.get().wrapping_add(1));
     }
 

@@ -1672,7 +1672,7 @@ fn eval_load(args: &[Value], env: &Env, ctx: &EvalContext) -> Result<Trampoline,
                 SemaError::Io(format!("load {path_str}: invalid UTF-8 in VFS: {e}"))
             })?;
             let (exprs, spans) = sema_reader::read_many_with_spans(&content)?;
-            ctx.merge_span_table(spans);
+            ctx.merge_span_table(spans.clone());
 
             // Push resolved VFS path so nested load/import resolves correctly.
             // Determine which VFS key matched: direct or base-dir-relative.
@@ -1683,26 +1683,19 @@ fn eval_load(args: &[Value], env: &Env, ctx: &EvalContext) -> Result<Trampoline,
             } else {
                 std::path::PathBuf::from(path_str)
             };
-            ctx.push_file_path(vfs_path);
+            ctx.push_file_path(vfs_path.clone());
 
-            let mut result = Value::nil();
-            let eval_result = (|| {
-                for expr in &exprs {
-                    result = eval::eval_value(ctx, expr, env)?;
-                }
-                Ok(result.clone())
-            })();
+            let eval_result = eval_load_body(ctx, env, &exprs, &spans, Some(vfs_path));
 
             ctx.pop_file_path();
-            eval_result?;
-            return Ok(Trampoline::Value(result));
+            return Ok(Trampoline::Value(eval_result?));
         }
     }
 
     let content = std::fs::read_to_string(&resolved)
         .map_err(|e| SemaError::Io(format!("load {}: {e}", resolved.display())))?;
     let (exprs, spans) = sema_reader::read_many_with_spans(&content)?;
-    ctx.merge_span_table(spans);
+    ctx.merge_span_table(spans.clone());
 
     // Push the file path so nested load/import resolves correctly
     let canonical = resolved.canonicalize().ok();
@@ -1710,21 +1703,38 @@ fn eval_load(args: &[Value], env: &Env, ctx: &EvalContext) -> Result<Trampoline,
         ctx.push_file_path(path);
     }
 
-    let mut result = Value::nil();
-    let eval_result = (|| {
-        for expr in &exprs {
-            result = eval::eval_value(ctx, expr, env)?;
-        }
-        Ok(result.clone())
-    })();
+    let eval_result = eval_load_body(ctx, env, &exprs, &spans, canonical.clone());
 
     // Pop regardless of success/failure
     if canonical.is_some() {
         ctx.pop_file_path();
     }
 
-    eval_result?;
-    Ok(Trampoline::Value(result))
+    Ok(Trampoline::Value(eval_result?))
+}
+
+/// Evaluate a `load`ed file's top-level forms in `env`, dispatching on the active
+/// backend: on the VM, compile + run each form (so async/channels work in loaded
+/// files and code runs at VM speed); on the tree-walker, eval each form. `import`
+/// is deliberately NOT routed through here — its module isolation needs lexical
+/// env capture the VM does not yet provide (see
+/// docs/plans/2026-06-16-vm-module-loading.md). Returns the value of the last form.
+fn eval_load_body(
+    ctx: &EvalContext,
+    env: &Env,
+    exprs: &[Value],
+    spans: &sema_core::SpanMap,
+    source_file: Option<std::path::PathBuf>,
+) -> Result<Value, SemaError> {
+    if ctx.vm_backend() {
+        eval::eval_module_body_vm(ctx, env, exprs, spans, source_file)
+    } else {
+        let mut result = Value::nil();
+        for expr in exprs {
+            result = eval::eval_value(ctx, expr, env)?;
+        }
+        Ok(result)
+    }
 }
 
 /// (case key-expr ((datum ...) body ...) ... (else body ...))

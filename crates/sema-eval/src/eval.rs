@@ -115,6 +115,9 @@ impl Interpreter {
     }
 
     pub fn eval(&self, expr: &Value) -> EvalResult {
+        // Tree-walker entry: ensure a stale vm_backend flag from a prior VM call
+        // doesn't make a `(load ...)` here run its body on the VM.
+        self.ctx.set_vm_backend(false);
         eval_value(&self.ctx, expr, &Env::with_parent(self.global_env.clone()))
     }
 
@@ -124,6 +127,7 @@ impl Interpreter {
 
     /// Evaluate in the global environment so that `define` persists across calls.
     pub fn eval_in_global(&self, expr: &Value) -> EvalResult {
+        self.ctx.set_vm_backend(false);
         eval_value(&self.ctx, expr, &self.global_env)
     }
 
@@ -134,6 +138,9 @@ impl Interpreter {
 
     /// Parse, compile to bytecode, and execute via the VM.
     pub fn eval_str_compiled(&self, input: &str) -> EvalResult {
+        // VM is the active backend: `(load ...)` compiles + runs loaded bodies on
+        // the VM (async/channels work in loaded files; code runs at VM speed).
+        self.ctx.set_vm_backend(true);
         let (exprs, spans) = sema_reader::read_many_with_spans(input)?;
         self.ctx.merge_span_table(spans);
         if exprs.is_empty() {
@@ -189,73 +196,131 @@ impl Interpreter {
     /// Evaluates `defmacro` forms via the tree-walker to register macros,
     /// then expands macro calls in all other forms.
     pub fn expand_for_vm(&self, expr: &Value) -> EvalResult {
-        if let Some(items) = expr.as_list() {
-            if let Some(s) = items.first().and_then(|v| v.as_symbol_spur()) {
-                let name = resolve(s);
-                if name == "defmacro" {
-                    eval_value(&self.ctx, expr, &self.global_env)?;
-                    return Ok(Value::nil());
-                }
-                if name == "begin" || name == "progn" {
-                    let mut new_items = vec![Value::symbol_from_spur(s)];
-                    let mut changed = false;
-                    for item in &items[1..] {
-                        let expanded = self.expand_for_vm(item)?;
-                        if expanded.raw_bits() != item.raw_bits() {
-                            changed = true;
-                        }
-                        new_items.push(expanded);
-                    }
-                    if !changed {
-                        return Ok(expr.clone());
-                    }
-                    return Ok(Value::list(new_items));
-                }
-            }
-        }
-        self.expand_macros(expr)
+        expand_for_vm_in(&self.ctx, &self.global_env, expr)
     }
+}
 
-    /// Recursively expand macro calls in an expression.
-    /// Preserves Rc pointer identity when no actual expansion occurs,
-    /// so that span lookups (keyed by Rc pointer) remain valid.
-    fn expand_macros(&self, expr: &Value) -> EvalResult {
-        if let Some(items) = expr.as_list() {
-            if !items.is_empty() {
-                if let Some(s) = items.first().and_then(|v| v.as_symbol_spur()) {
-                    let name = resolve(s);
-                    if name == "quote" {
-                        return Ok(expr.clone());
+/// Pre-process a top-level expression for VM compilation, expanding macro calls
+/// and eagerly registering `defmacro` forms — against `env` rather than a fixed
+/// global env. For top-level code `env` is the global env (unchanged behavior);
+/// for a `load`ed module body it is the same shared global env, so a `defmacro`
+/// registers where `expand_macros_in` looks it up and inherited macros still
+/// resolve via the parent chain.
+pub fn expand_for_vm_in(ctx: &EvalContext, env: &Env, expr: &Value) -> EvalResult {
+    if let Some(items) = expr.as_list() {
+        if let Some(s) = items.first().and_then(|v| v.as_symbol_spur()) {
+            let name = resolve(s);
+            if name == "defmacro" {
+                eval_value(ctx, expr, env)?;
+                return Ok(Value::nil());
+            }
+            if name == "begin" || name == "progn" {
+                let mut new_items = vec![Value::symbol_from_spur(s)];
+                let mut changed = false;
+                for item in &items[1..] {
+                    let expanded = expand_for_vm_in(ctx, env, item)?;
+                    if expanded.raw_bits() != item.raw_bits() {
+                        changed = true;
                     }
-                    if let Some(mac_val) = self.global_env.get(s) {
-                        if let Some(mac) = mac_val.as_macro_rc() {
-                            let expanded =
-                                apply_macro(&self.ctx, &mac, &items[1..], &self.global_env)?;
-                            return self.expand_macros(&expanded);
-                        }
-                    }
+                    new_items.push(expanded);
                 }
-                let expanded: Vec<Value> = items
-                    .iter()
-                    .map(|v| self.expand_macros(v))
-                    .collect::<Result<_, _>>()?;
-                // If no item changed, return original to preserve Rc identity (and spans)
-                let changed = expanded
-                    .iter()
-                    .zip(items.iter())
-                    .any(|(a, b)| a.raw_bits() != b.raw_bits());
                 if !changed {
                     return Ok(expr.clone());
                 }
-                return Ok(Value::list(expanded));
+                return Ok(Value::list(new_items));
             }
         }
-        Ok(expr.clone())
     }
+    expand_macros_in(ctx, env, expr)
+}
+
+/// Recursively expand macro calls, resolving macros via `env` (walking the
+/// parent chain). Preserves Rc pointer identity when no expansion occurs so span
+/// lookups (keyed by Rc pointer) remain valid.
+fn expand_macros_in(ctx: &EvalContext, env: &Env, expr: &Value) -> EvalResult {
+    if let Some(items) = expr.as_list() {
+        if !items.is_empty() {
+            if let Some(s) = items.first().and_then(|v| v.as_symbol_spur()) {
+                let name = resolve(s);
+                if name == "quote" {
+                    return Ok(expr.clone());
+                }
+                if let Some(mac_val) = env.get(s) {
+                    if let Some(mac) = mac_val.as_macro_rc() {
+                        let expanded = apply_macro(ctx, &mac, &items[1..], env)?;
+                        return expand_macros_in(ctx, env, &expanded);
+                    }
+                }
+            }
+            let expanded: Vec<Value> = items
+                .iter()
+                .map(|v| expand_macros_in(ctx, env, v))
+                .collect::<Result<_, _>>()?;
+            let changed = expanded
+                .iter()
+                .zip(items.iter())
+                .any(|(a, b)| a.raw_bits() != b.raw_bits());
+            if !changed {
+                return Ok(expr.clone());
+            }
+            return Ok(Value::list(expanded));
+        }
+    }
+    Ok(expr.clone())
+}
+
+/// Compile and run a `load`ed module body on the VM, one top-level form at a
+/// time so a `defmacro` / nested `load` that registers a macro is visible to
+/// later forms before they compile. `env` is the caller's shared global env, so
+/// defines land in the global scope (matching `load` semantics). Returns the
+/// value of the last form (nil for an empty body).
+///
+/// Only used for `load` (not `import`): `load` shares the global env, so module
+/// functions resolve their globals against the same env every VM uses — avoiding
+/// the per-module-globals problem that makes VM-backed `import` incorrect (see
+/// docs/plans/2026-06-16-vm-module-loading.md). Does NOT (re)initialize the async
+/// scheduler — it reuses the one installed by the top-level VM driver.
+pub fn eval_module_body_vm(
+    ctx: &EvalContext,
+    env: &Env,
+    exprs: &[Value],
+    span_map: &sema_core::SpanMap,
+    source_file: Option<std::path::PathBuf>,
+) -> EvalResult {
+    let mut result = Value::nil();
+    for expr in exprs {
+        let expanded = expand_for_vm_in(ctx, env, expr)?;
+        // `defmacro` (and forms that expand to nothing) are applied by expansion;
+        // there is nothing to compile/run for them.
+        if expanded.is_nil() {
+            continue;
+        }
+        let prog = sema_vm::compile_program_with_spans(
+            std::slice::from_ref(&expanded),
+            span_map,
+            source_file.clone(),
+        )?;
+        let globals = Rc::new(env.clone());
+        let mut vm = sema_vm::VM::new(
+            globals,
+            prog.functions,
+            &prog.native_table,
+            prog.main_cache_slots,
+        )?;
+        result = vm.execute(prog.closure, ctx)?;
+    }
+    // Each per-form VM ran on a clone of `env` with its own version cell, so any
+    // globals (re)defined by the body did not bump `env`'s version. Bump it now
+    // so the calling VM (whose globals share `env`'s bindings) invalidates its
+    // inline global cache and re-reads, rather than serving stale cached values.
+    env.bump_version();
+    Ok(result)
 }
 
 /// Evaluate a string containing one or more expressions.
 pub fn eval_string(ctx: &EvalContext, input: &str, env: &Env) -> EvalResult {
+    // Tree-walker entry point: loaded bodies are tree-walked.
+    ctx.set_vm_backend(false);
     let (exprs, spans) = sema_reader::read_many_with_spans(input)?;
     ctx.merge_span_table(spans);
     ctx.max_eval_depth.set(0);

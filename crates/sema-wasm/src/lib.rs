@@ -1909,6 +1909,9 @@ impl WasmInterpreter {
     /// Returns JSON: { status: "stopped"|"finished"|"error"|"http_needed", ... }
     #[wasm_bindgen(js_name = debugStart)]
     pub fn debug_start(&self, code: &str, breakpoint_lines: &js_sys::Array) -> JsValue {
+        // The debugger always executes on the VM, so a `(load ...)` runs the
+        // loaded body on the VM regardless of which eval the playground ran last.
+        self.inner.ctx.set_vm_backend(true);
         // End any existing session
         DEBUG_SESSION.with(|s| {
             *s.borrow_mut() = None;

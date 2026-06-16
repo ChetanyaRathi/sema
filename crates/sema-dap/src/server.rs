@@ -884,6 +884,12 @@ fn backend_thread(
                     // the thread-local flag is observed by the evaluator. See
                     // §7.4 #4.
                     sema_eval::set_debug_session_active(true);
+                    // VM is the active backend under DAP, so (load ...) runs the
+                    // loaded file's body on the VM (async/channels work in loaded
+                    // files). It runs on a separate, non-debug VM, so breakpoints
+                    // inside loaded files still don't hit — the bypass warning
+                    // above remains accurate.
+                    interpreter.ctx.set_vm_backend(true);
 
                     let result = vm_inst.execute_debug(cl.clone(), &interpreter.ctx, ds);
 
