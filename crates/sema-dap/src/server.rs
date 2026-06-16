@@ -554,12 +554,18 @@ async fn handle_request(
             }
         }
         "continue" => {
-            if state.vm_active {
+            // Resume commands are only meaningful while the VM is parked in its
+            // command loop (vm_suspended). The running-mode poll silently drops
+            // any command that arrives mid-execution, so sending one then would
+            // clear vm_suspended without the VM ever acting on it (DAP-5). When
+            // the VM is already running we treat the request as advisory and
+            // simply acknowledge it without mutating state.
+            if state.vm_active && state.vm_suspended {
                 if let Some(ref tx) = state.dbg_cmd_tx {
                     let _ = tx.send(DebugCommand::Continue);
                 }
+                state.vm_suspended = false;
             }
-            state.vm_suspended = false;
             send_response(
                 stdout,
                 seq,
@@ -570,30 +576,30 @@ async fn handle_request(
             .await;
         }
         "next" => {
-            if state.vm_active {
+            if state.vm_active && state.vm_suspended {
                 if let Some(ref tx) = state.dbg_cmd_tx {
                     let _ = tx.send(DebugCommand::StepOver);
                 }
+                state.vm_suspended = false;
             }
-            state.vm_suspended = false;
             send_response(stdout, seq, msg.seq, "next", None).await;
         }
         "stepIn" => {
-            if state.vm_active {
+            if state.vm_active && state.vm_suspended {
                 if let Some(ref tx) = state.dbg_cmd_tx {
                     let _ = tx.send(DebugCommand::StepInto);
                 }
+                state.vm_suspended = false;
             }
-            state.vm_suspended = false;
             send_response(stdout, seq, msg.seq, "stepIn", None).await;
         }
         "stepOut" => {
-            if state.vm_active {
+            if state.vm_active && state.vm_suspended {
                 if let Some(ref tx) = state.dbg_cmd_tx {
                     let _ = tx.send(DebugCommand::StepOut);
                 }
+                state.vm_suspended = false;
             }
-            state.vm_suspended = false;
             send_response(stdout, seq, msg.seq, "stepOut", None).await;
         }
         "pause" => {
@@ -871,10 +877,19 @@ fn backend_thread(
                         });
                     })));
 
+                    // Mark a debug session active so that tree-walker-evaluated
+                    // load/import (which bypass the VM debug loop) can emit a
+                    // one-time warning that breakpoints in those files won't
+                    // hit. Runs on the same backend thread as execute_debug, so
+                    // the thread-local flag is observed by the evaluator. See
+                    // §7.4 #4.
+                    sema_eval::set_debug_session_active(true);
+
                     let result = vm_inst.execute_debug(cl.clone(), &interpreter.ctx, ds);
 
                     // Clear the hooks immediately after execution so any server-side
                     // prints (e.g. error logging) go back to the real stdout/stderr.
+                    sema_eval::set_debug_session_active(false);
                     sema_core::set_stdout_hook(None);
                     sema_core::set_stderr_hook(None);
 
@@ -936,25 +951,72 @@ fn clean_path(path_str: &str) -> PathBuf {
     PathBuf::from(clean)
 }
 
+/// Decode percent-escapes in a URI path.
+///
+/// Percent-escapes are decoded into raw bytes (not chars), then the whole byte
+/// sequence is interpreted as UTF-8. This is required for correctness with
+/// multi-byte UTF-8 characters, which are percent-encoded one byte at a time
+/// (e.g. "é" → "%C3%A9"). Decoding each escape directly to a `char` would
+/// corrupt such sequences (DAP-9). If the decoded bytes are not valid UTF-8 we
+/// fall back to a lossy conversion so a malformed path never aborts the
+/// session.
 fn decode_percent(s: &str) -> String {
-    let mut result = String::new();
-    let mut chars = s.chars();
-    while let Some(c) = chars.next() {
-        if c == '%' {
-            if let (Some(h1), Some(h2)) = (chars.next(), chars.next()) {
-                if let Some(digit) = hex_to_byte(h1, h2) {
-                    result.push(digit as char);
-                    continue;
-                }
+    let bytes = s.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let Some(byte) = hex_to_byte(bytes[i + 1] as char, bytes[i + 2] as char) {
+                out.push(byte);
+                i += 3;
+                continue;
             }
         }
-        result.push(c);
+        out.push(bytes[i]);
+        i += 1;
     }
-    result
+    String::from_utf8(out).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned())
 }
 
 fn hex_to_byte(h1: char, h2: char) -> Option<u8> {
     let b1 = h1.to_digit(16)? as u8;
     let b2 = h2.to_digit(16)? as u8;
     Some((b1 << 4) | b2)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decode_percent_ascii() {
+        assert_eq!(decode_percent("a%20b"), "a b");
+        assert_eq!(decode_percent("/path/to/file.sema"), "/path/to/file.sema");
+    }
+
+    #[test]
+    fn decode_percent_multibyte_utf8() {
+        // "é" is U+00E9, UTF-8 0xC3 0xA9, percent-encoded one byte at a time.
+        assert_eq!(decode_percent("caf%C3%A9.sema"), "café.sema");
+        // A 3-byte char: "€" (U+20AC) → 0xE2 0x82 0xAC.
+        assert_eq!(decode_percent("%E2%82%AC.sema"), "€.sema");
+        // A 4-byte char: "🦀" (U+1F980) → 0xF0 0x9F 0xA6 0x80.
+        assert_eq!(decode_percent("%F0%9F%A6%80.sema"), "🦀.sema");
+    }
+
+    #[test]
+    fn decode_percent_invalid_escape_passthrough() {
+        // Non-hex after % is left literal.
+        assert_eq!(decode_percent("100%zz"), "100%zz");
+        // Trailing percent with no following bytes.
+        assert_eq!(decode_percent("abc%"), "abc%");
+        // Trailing percent with a single byte.
+        assert_eq!(decode_percent("abc%C"), "abc%C");
+    }
+
+    #[test]
+    fn clean_path_decodes_file_uri_multibyte() {
+        let p = clean_path("file:///tmp/caf%C3%A9/main.sema");
+        assert_eq!(p, PathBuf::from("/tmp/café/main.sema"));
+    }
 }

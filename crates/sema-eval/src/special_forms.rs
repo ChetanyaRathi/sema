@@ -1412,6 +1412,11 @@ fn eval_import(args: &[Value], env: &Env, ctx: &EvalContext) -> Result<Trampolin
         .as_str()
         .ok_or_else(|| SemaError::type_error("string", path_val.type_name()))?;
 
+    // Imported modules run on the tree-walker and bypass the VM debug loop, so
+    // breakpoints in them never hit. Warn once per debug session (no-op outside
+    // a session). See §7.4 #4.
+    crate::debug_session::warn_load_bypass_once("import", path_str);
+
     // Selective import names
     let selective: Vec<String> = args[1..]
         .iter()
@@ -1640,6 +1645,11 @@ fn eval_load(args: &[Value], env: &Env, ctx: &EvalContext) -> Result<Trampoline,
     let path_str = path_val
         .as_str()
         .ok_or_else(|| SemaError::type_error("string", path_val.type_name()))?;
+
+    // Loaded code runs on the tree-walker and bypasses the VM debug loop, so
+    // breakpoints in it never hit. Warn once per debug session (no-op outside a
+    // session). See §7.4 #4.
+    crate::debug_session::warn_load_bypass_once("load", path_str);
 
     // Resolve path relative to current file
     let resolved = if std::path::Path::new(path_str).is_absolute() {

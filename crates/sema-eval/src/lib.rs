@@ -1,9 +1,11 @@
 #![allow(clippy::mutable_key_type)]
+mod debug_session;
 mod destructure;
 mod eval;
 mod prelude;
 mod special_forms;
 
+pub use debug_session::{is_debug_session_active, set_debug_session_active};
 pub use eval::{
     call_value, create_module_env, eval, eval_string, eval_value, EvalResult, Interpreter,
     Trampoline,
