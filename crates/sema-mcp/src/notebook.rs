@@ -7,27 +7,35 @@ use std::rc::Rc;
 
 pub type NotebookCache = Rc<RefCell<BTreeMap<PathBuf, Rc<RefCell<Engine>>>>>;
 
+/// Resolve a notebook path to a stable cache key.
+///
+/// We canonicalize the *parent directory* and append the raw filename rather
+/// than canonicalizing the full path. This yields the same key for a given path
+/// string whether or not the file exists yet — avoiding the bug where the
+/// pre-create call (file absent) and a later call (file present) produced
+/// different canonical keys, leaving two divergent cached engines for one
+/// logical file when the path involved a symlink.
+fn canonicalize_notebook_path(path_str: &str) -> Result<PathBuf, String> {
+    let path = PathBuf::from(path_str);
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let canonical_parent = parent
+        .canonicalize()
+        .map_err(|e| format!("Invalid parent directory {}: {e}", parent.display()))?;
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| "Path must have a filename".to_string())?;
+    Ok(canonical_parent.join(file_name))
+}
+
 /// Resolves a path to a canonical path and obtains/caches its Engine.
 pub fn get_or_create_engine(
     cache: &NotebookCache,
     path_str: &str,
 ) -> Result<(PathBuf, Rc<RefCell<Engine>>), String> {
-    let path = PathBuf::from(path_str);
-    // If the file doesn't exist yet, we can't canonicalize it directly,
-    // so we canonicalize its parent directory first.
-    let canonical = if path.exists() {
-        path.canonicalize()
-            .map_err(|e| format!("Invalid path {}: {e}", path.display()))?
-    } else {
-        let parent = path.parent().unwrap_or(Path::new("."));
-        let canonical_parent = parent
-            .canonicalize()
-            .map_err(|e| format!("Invalid parent directory {}: {e}", parent.display()))?;
-        let file_name = path
-            .file_name()
-            .ok_or_else(|| "Path must have a filename".to_string())?;
-        canonical_parent.join(file_name)
-    };
+    let canonical = canonicalize_notebook_path(path_str)?;
 
     let mut map = cache.borrow_mut();
     if let Some(engine) = map.get(&canonical) {
@@ -50,12 +58,28 @@ pub fn create_notebook(
     cache: &NotebookCache,
     path_str: &str,
     title: Option<&str>,
+    overwrite: bool,
 ) -> Result<PathBuf, String> {
+    // Refuse to clobber an existing notebook unless explicitly asked: this is a
+    // tool named "new", and silently overwriting a populated .sema-nb on disk
+    // is irreversible data loss.
+    let canonical = canonicalize_notebook_path(path_str)?;
+    if canonical.exists() && !overwrite {
+        return Err(format!(
+            "Notebook already exists at {}; pass overwrite=true to replace it",
+            canonical.display()
+        ));
+    }
+
     let (canonical, engine_rc) = get_or_create_engine(cache, path_str)?;
     let mut engine = engine_rc.borrow_mut();
 
     let t = title.unwrap_or("Untitled");
-    engine.notebook = Notebook::new(t);
+    // Replace the whole Engine, not just its notebook field, so the interpreter
+    // env, snapshot, and cell timeout are all reset. A cached engine for this
+    // path would otherwise leak bindings/state from the previous notebook into
+    // the freshly created one.
+    *engine = Engine::new(Notebook::new(t));
     engine.notebook.save(&canonical)?;
     Ok(canonical)
 }

@@ -1,5 +1,15 @@
 use std::path::PathBuf;
 use std::sync::mpsc as std_mpsc;
+use std::time::Duration;
+
+/// Upper bound on how long a frontend request waits for the debug VM to reply
+/// over a `DebugCommand` channel. The VM polls the command channel frequently
+/// while running and services commands immediately while stopped, so a live VM
+/// replies near-instantly. The timeout exists so that if the VM has already
+/// returned from `execute_debug` (e.g. the program terminated) and can no
+/// longer service the command, the request degrades to an empty/error response
+/// instead of blocking the DAP session forever on a reply that never comes.
+const DEBUG_REPLY_TIMEOUT: Duration = Duration::from_secs(2);
 
 use tokio::io::BufReader;
 use tokio::sync::mpsc as tokio_mpsc;
@@ -207,9 +217,13 @@ async fn handle_request(
                         lines: lines.clone(),
                         reply: reply_tx,
                     });
-                    tokio::task::spawn_blocking(move || reply_rx.recv().unwrap_or_default())
-                        .await
-                        .unwrap_or_default()
+                    tokio::task::spawn_blocking(move || {
+                        reply_rx
+                            .recv_timeout(DEBUG_REPLY_TIMEOUT)
+                            .unwrap_or_default()
+                    })
+                    .await
+                    .unwrap_or_default()
                 } else {
                     Vec::new()
                 }
@@ -261,9 +275,13 @@ async fn handle_request(
                 if let Some(ref tx) = state.dbg_cmd_tx {
                     let (reply_tx, reply_rx) = std_mpsc::sync_channel(1);
                     let _ = tx.send(DebugCommand::GetStackTrace { reply: reply_tx });
-                    tokio::task::spawn_blocking(move || reply_rx.recv().unwrap_or_default())
-                        .await
-                        .unwrap_or_default()
+                    tokio::task::spawn_blocking(move || {
+                        reply_rx
+                            .recv_timeout(DEBUG_REPLY_TIMEOUT)
+                            .unwrap_or_default()
+                    })
+                    .await
+                    .unwrap_or_default()
                 } else {
                     Vec::new()
                 }
@@ -317,9 +335,13 @@ async fn handle_request(
                         frame_id,
                         reply: reply_tx,
                     });
-                    tokio::task::spawn_blocking(move || reply_rx.recv().unwrap_or_default())
-                        .await
-                        .unwrap_or_default()
+                    tokio::task::spawn_blocking(move || {
+                        reply_rx
+                            .recv_timeout(DEBUG_REPLY_TIMEOUT)
+                            .unwrap_or_default()
+                    })
+                    .await
+                    .unwrap_or_default()
                 } else {
                     Vec::new()
                 }
@@ -359,9 +381,13 @@ async fn handle_request(
                         reference,
                         reply: reply_tx,
                     });
-                    tokio::task::spawn_blocking(move || reply_rx.recv().unwrap_or_default())
-                        .await
-                        .unwrap_or_default()
+                    tokio::task::spawn_blocking(move || {
+                        reply_rx
+                            .recv_timeout(DEBUG_REPLY_TIMEOUT)
+                            .unwrap_or_default()
+                    })
+                    .await
+                    .unwrap_or_default()
                 } else {
                     Vec::new()
                 }
@@ -435,7 +461,7 @@ async fn handle_request(
             });
             let result = tokio::task::spawn_blocking(move || {
                 reply_rx
-                    .recv()
+                    .recv_timeout(DEBUG_REPLY_TIMEOUT)
                     .unwrap_or_else(|_| Err("debug VM did not reply".to_string()))
             })
             .await
@@ -516,7 +542,7 @@ async fn handle_request(
             });
             let result = tokio::task::spawn_blocking(move || {
                 reply_rx
-                    .recv()
+                    .recv_timeout(DEBUG_REPLY_TIMEOUT)
                     .unwrap_or_else(|_| Err("debug VM did not reply".to_string()))
             })
             .await

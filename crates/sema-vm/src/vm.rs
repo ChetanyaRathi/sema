@@ -302,6 +302,14 @@ impl VM {
                     ));
                 }
                 crate::debug::VmExecResult::Stopped(info) => {
+                    // Per the DAP spec, variablesReferences are only valid until
+                    // the next stop. Reset the handle map on each stop so Values
+                    // expanded in prior stops are not retained for the whole
+                    // session (otherwise debug_values grows unbounded across a
+                    // long stepping session, pinning the underlying heap).
+                    self.debug_values.clear();
+                    self.next_debug_value_ref = DEBUG_VALUE_REF_BASE;
+
                     let _ = debug.event_tx.send(crate::debug::DebugEvent::Stopped {
                         reason: info.reason,
                         description: None,
@@ -354,7 +362,7 @@ impl VM {
                                 let result = sema_reader::read(&expression)
                                     .map_err(|e| e.to_string())
                                     .and_then(|expr| {
-                                        self.debug_evaluate(frame_id, &expr, ctx, debug)
+                                        self.debug_evaluate_mut(frame_id, &expr, ctx, debug)
                                             .map(|value| {
                                                 self.debug_value_to_variable("result", value)
                                             })
@@ -2340,9 +2348,24 @@ impl VM {
             return Vec::new();
         };
         let base = frame.base;
+        let pc = frame.pc as u32;
         let local_names = frame.closure.func.local_names.clone();
+        let local_scopes = frame.closure.func.local_scopes.clone();
         let mut vars = Vec::new();
         for (slot, spur) in local_names {
+            // If this slot has recorded block scopes (from a let/do binding),
+            // only show it while pc is within one of them — hiding not-yet-bound
+            // and already-exited block locals. Params and slots without scope
+            // info (e.g. functions loaded from bytecode) are always shown.
+            let mut slot_scopes = local_scopes
+                .iter()
+                .filter(|(s, _, _)| *s == slot)
+                .peekable();
+            if slot_scopes.peek().is_some()
+                && !slot_scopes.any(|(_, start, end)| pc >= *start && pc < *end)
+            {
+                continue;
+            }
             let idx = base + slot as usize;
             let val = self.stack.get(idx).cloned().unwrap_or(Value::nil());
             vars.push(self.debug_value_to_variable(&sema_core::resolve(spur), val));
@@ -2399,6 +2422,92 @@ impl VM {
             None => Vec::new(),
             Some(crate::debug::ScopeKind::Locals(frame_id)) => self.debug_locals(frame_id),
             Some(crate::debug::ScopeKind::Upvalues(frame_id)) => self.debug_upvalues(frame_id),
+        }
+    }
+
+    /// Evaluate a debugger expression, writing through any top-level
+    /// `(set! <local-or-upvalue> <value>)` to the real frame.
+    ///
+    /// Plain `debug_evaluate` runs in a throwaway env that copies locals/upvalues
+    /// by value, so a `set!` on a local would only mutate that scratch env and
+    /// silently fail to persist. This mut variant detects that case and routes
+    /// the assignment through the same write-back path as `setVariable`, keeping
+    /// the two requests consistent.
+    pub fn debug_evaluate_mut(
+        &mut self,
+        frame_id: usize,
+        expr: &Value,
+        ctx: &EvalContext,
+        debug: &crate::debug::DebugState,
+    ) -> Result<Value, SemaError> {
+        if let Some((target, value_expr)) = Self::as_local_set(expr) {
+            let name = sema_core::resolve(target);
+            if self.frame_has_binding(frame_id, &name) {
+                let value = self.debug_evaluate(frame_id, &value_expr, ctx, debug)?;
+                self.debug_set_named(frame_id, &name, value.clone())?;
+                return Ok(value);
+            }
+        }
+        self.debug_evaluate(frame_id, expr, ctx, debug)
+    }
+
+    /// If `expr` is `(set! <symbol> <value-expr>)`, return the target symbol and
+    /// the value expression.
+    fn as_local_set(expr: &Value) -> Option<(Spur, Value)> {
+        let items = expr.as_list()?;
+        if items.len() != 3 {
+            return None;
+        }
+        let head = items[0].as_symbol_spur()?;
+        if sema_core::resolve(head) != "set!" {
+            return None;
+        }
+        let target = items[1].as_symbol_spur()?;
+        Some((target, items[2].clone()))
+    }
+
+    /// True if `name` is a local or upvalue of the given frame.
+    fn frame_has_binding(&self, frame_id: usize, name: &str) -> bool {
+        let Some(frame) = self.frames.get(frame_id) else {
+            return false;
+        };
+        frame
+            .closure
+            .func
+            .local_names
+            .iter()
+            .any(|(_, spur)| sema_core::resolve(*spur) == name)
+            || frame
+                .closure
+                .func
+                .upvalue_names
+                .iter()
+                .any(|spur| sema_core::resolve(*spur) == name)
+    }
+
+    /// Write `value` back to the local (preferred) or upvalue named `name`.
+    fn debug_set_named(
+        &mut self,
+        frame_id: usize,
+        name: &str,
+        value: Value,
+    ) -> Result<crate::debug::DapVariable, SemaError> {
+        let is_local = self
+            .frames
+            .get(frame_id)
+            .map(|frame| {
+                frame
+                    .closure
+                    .func
+                    .local_names
+                    .iter()
+                    .any(|(_, spur)| sema_core::resolve(*spur) == name)
+            })
+            .unwrap_or(false);
+        if is_local {
+            self.debug_set_local(frame_id, name, value)
+        } else {
+            self.debug_set_upvalue(frame_id, name, value)
         }
     }
 
@@ -2903,6 +3012,7 @@ pub fn compile_program_with_spans(
             has_rest: false,
             local_names: Vec::new(),
             source_file,
+            local_scopes: Vec::new(),
             cache_offset: 0,
         }),
         upvalues: Vec::new(),
@@ -3036,6 +3146,7 @@ pub fn compile_program(
             has_rest: false,
             local_names: Vec::new(),
             source_file: None,
+            local_scopes: Vec::new(),
             cache_offset: 0,
         }),
         upvalues: Vec::new(),
@@ -3138,6 +3249,7 @@ mod tests {
             has_rest: false,
             local_names: vec![],
             source_file: None,
+            local_scopes: Vec::new(),
             cache_offset: 0,
         });
         let closure = Rc::new(Closure {
@@ -3660,6 +3772,7 @@ mod tests {
             has_rest: false,
             local_names: vec![],
             source_file: None,
+            local_scopes: Vec::new(),
             cache_offset: 0,
         });
         let closure = Rc::new(Closure {
@@ -3699,6 +3812,7 @@ mod tests {
             has_rest: false,
             local_names: vec![],
             source_file: None,
+            local_scopes: Vec::new(),
             cache_offset: 0,
         });
         let closure = Rc::new(Closure {
@@ -3817,6 +3931,7 @@ mod tests {
             has_rest: false,
             local_names: vec![],
             source_file: None,
+            local_scopes: Vec::new(),
             cache_offset: 0,
         });
         let closure = Rc::new(Closure {
@@ -4200,6 +4315,7 @@ mod tests {
             local_names: vec![],
             upvalue_names: vec![],
             source_file: Some(source_a.clone()),
+            local_scopes: Vec::new(),
             cache_offset: 0,
         });
 
@@ -4222,6 +4338,7 @@ mod tests {
             local_names: vec![],
             upvalue_names: vec![],
             source_file: Some(source_b.clone()),
+            local_scopes: Vec::new(),
             cache_offset: 0,
         });
 
@@ -4298,6 +4415,7 @@ mod tests {
             has_rest: false,
             local_names: vec![],
             source_file: None,
+            local_scopes: Vec::new(),
             cache_offset: 0,
         });
         let closure = Rc::new(Closure {

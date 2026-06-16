@@ -200,9 +200,11 @@ pub fn run_bytecode_bytes(
             name: None,
             chunk: result.chunk,
             upvalue_descs: Vec::new(),
+            upvalue_names: Vec::new(),
             arity: 0,
             has_rest: false,
             local_names: Vec::new(),
+            local_scopes: Vec::new(),
             source_file: None,
             cache_offset: 0,
         }),
@@ -232,8 +234,7 @@ pub fn list_mcp_tools(
             "type": "object",
             "properties": {
                 "file_path": { "type": "string", "description": "Path to the Sema file (relative to CWD or absolute)." },
-                "arguments": { "type": "array", "items": { "type": "string" }, "description": "Optional positional arguments to pass to the script." },
-                "sandbox": { "type": "string", "enum": ["strict", "no-shell", "no-network", "allow-all"], "description": "Optional sandbox override mode." }
+                "arguments": { "type": "array", "items": { "type": "string" }, "description": "Optional positional arguments to pass to the script." }
             },
             "required": ["file_path"]
         })),
@@ -248,8 +249,7 @@ pub fn list_mcp_tools(
         ("eval", "Evaluate a single Sema expression string and return the result and captured stdout/stderr.", json!({
             "type": "object",
             "properties": {
-                "code": { "type": "string", "description": "The Sema expression to evaluate (e.g., '(+ 1 2)')." },
-                "sandbox": { "type": "string", "enum": ["strict", "no-shell", "no-network", "allow-all"], "description": "Optional sandbox override mode." }
+                "code": { "type": "string", "description": "The Sema expression to evaluate (e.g., '(+ 1 2)')." }
             },
             "required": ["code"]
         })),
@@ -304,7 +304,8 @@ pub fn list_mcp_tools(
             "type": "object",
             "properties": {
                 "path": { "type": "string", "description": "Destination path for the new notebook file (e.g. 'notes.sema-nb')." },
-                "title": { "type": "string", "description": "Optional title for the notebook (defaults to 'Untitled')." }
+                "title": { "type": "string", "description": "Optional title for the notebook (defaults to 'Untitled')." },
+                "overwrite": { "type": "boolean", "description": "Replace an existing notebook at this path. Defaults to false; creation fails if the file already exists." }
             },
             "required": ["path"]
         })),
@@ -458,7 +459,6 @@ pub fn call_mcp_tool(
                 None => return error_result("Missing required parameter: file_path"),
             };
             let args = arguments.get("arguments").and_then(|v| v.as_array());
-            let _sandbox = arguments.get("sandbox").and_then(|v| v.as_str()); // sandbox configs can be supported if desired
 
             let path = Path::new(file_path);
             let bytes = match std::fs::read(path) {
@@ -623,7 +623,12 @@ pub fn call_mcp_tool(
                     Ok(c) => c,
                     Err(e) => return error_result(format!("Failed to read {file}: {e}")),
                 };
-                let formatted = match sema_fmt::format_source_opts(&content, 80, 2, false) {
+                let fmt_opts = sema_fmt::FormatOptions {
+                    width: 80,
+                    indent: 2,
+                    align: false,
+                };
+                let formatted = match sema_fmt::format_source(&content, &fmt_opts) {
                     Ok(f) => f,
                     Err(e) => return error_result(format!("Format error: {e}")),
                 };
@@ -632,7 +637,12 @@ pub fn call_mcp_tool(
                 }
                 success_result(format!("Formatted file {file} in-place successfully."))
             } else if let Some(src) = code {
-                match sema_fmt::format_source_opts(src, 80, 2, false) {
+                let fmt_opts = sema_fmt::FormatOptions {
+                    width: 80,
+                    indent: 2,
+                    align: false,
+                };
+                match sema_fmt::format_source(src, &fmt_opts) {
                     Ok(formatted) => success_result(formatted),
                     Err(e) => error_result(format!("Format error: {e}")),
                 }
@@ -732,8 +742,12 @@ pub fn call_mcp_tool(
                 None => return error_result("Missing required parameter: path"),
             };
             let title = arguments.get("title").and_then(|v| v.as_str());
+            let overwrite = arguments
+                .get("overwrite")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
 
-            match crate::notebook::create_notebook(notebook_cache, path_str, title) {
+            match crate::notebook::create_notebook(notebook_cache, path_str, title, overwrite) {
                 Ok(canonical) => success_result(format!(
                     "Created new empty notebook at {}",
                     canonical.display()

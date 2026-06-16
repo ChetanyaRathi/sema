@@ -36,21 +36,33 @@ where
     W: tokio::io::AsyncWrite + Unpin,
 {
     let mut stdin = BufReader::new(reader);
-    let mut line = String::new();
+    // Read raw bytes per line: a single non-UTF-8 byte must NOT tear down the
+    // server (it should produce a JSON-RPC parse error and continue), so we
+    // cannot use `read_line` which fails the whole read on invalid UTF-8.
+    let mut buf: Vec<u8> = Vec::new();
 
     let notebook_cache: NotebookCache = Rc::new(RefCell::new(BTreeMap::new()));
 
     eprintln!("Sema MCP server starting stdio loop...");
 
     loop {
-        line.clear();
+        buf.clear();
         let bytes_read = stdin
-            .read_line(&mut line)
+            .read_until(b'\n', &mut buf)
             .await
             .map_err(|e| format!("Failed to read stdin: {e}"))?;
         if bytes_read == 0 {
             break; // EOF
         }
+
+        // Decode as UTF-8. A malformed line is a recoverable parse error.
+        let line = match std::str::from_utf8(&buf) {
+            Ok(s) => s,
+            Err(_) => {
+                write_parse_error(&mut writer, "request was not valid UTF-8".to_string()).await;
+                continue;
+            }
+        };
 
         let line_trimmed = line.trim();
         if line_trimmed.is_empty() {
@@ -60,15 +72,7 @@ where
         let request: JsonRpcRequest = match serde_json::from_str(line_trimmed) {
             Ok(req) => req,
             Err(e) => {
-                let err_resp = JsonRpcResponse {
-                    jsonrpc: "2.0".to_string(),
-                    result: None,
-                    error: Some(JsonRpcError::new(-32700, format!("Parse error: {e}"))),
-                    id: None,
-                };
-                let resp_str = format!("{}\n", serde_json::to_string(&err_resp).unwrap());
-                writer.write_all(resp_str.as_bytes()).await.ok();
-                writer.flush().await.ok();
+                write_parse_error(&mut writer, format!("{e}")).await;
                 continue;
             }
         };
@@ -98,6 +102,25 @@ where
     Ok(())
 }
 
+/// Write a JSON-RPC parse-error (-32700) response with a null id and flush.
+/// Used for unrecoverable per-line decode failures (invalid UTF-8 or invalid
+/// JSON) that must not terminate the server loop.
+async fn write_parse_error<W>(writer: &mut W, message: String)
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    let err_resp = JsonRpcResponse {
+        jsonrpc: "2.0".to_string(),
+        result: None,
+        error: Some(JsonRpcError::new(-32700, format!("Parse error: {message}"))),
+        id: None,
+    };
+    if let Ok(s) = serde_json::to_string(&err_resp) {
+        writer.write_all(format!("{s}\n").as_bytes()).await.ok();
+        writer.flush().await.ok();
+    }
+}
+
 fn handle_request(
     req: JsonRpcRequest,
     interpreter: &Interpreter,
@@ -105,6 +128,12 @@ fn handle_request(
     include_tools: Option<&[String]>,
     exclude_tools: Option<&[String]>,
 ) -> Option<JsonRpcResponse> {
+    // Per JSON-RPC 2.0, a request without an `id` is a notification: the server
+    // MUST NOT reply to it. Bailing out with None here keeps us silent for every
+    // notification method (e.g. notifications/cancelled, notifications/progress)
+    // instead of emitting a spurious `id: null` response.
+    req.id.as_ref()?;
+
     let method = req.method.as_str();
     let id = req.id.clone();
 

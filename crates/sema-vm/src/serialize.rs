@@ -666,6 +666,9 @@ pub fn deserialize_function(
         arity,
         has_rest,
         local_names,
+        // Not serialized — bytecode carries no block-scope debug metadata, so
+        // the debugger falls back to showing all locals for loaded functions.
+        local_scopes: Vec::new(),
         source_file: None,
         cache_offset: 0,
     })
@@ -1626,6 +1629,7 @@ mod tests {
             has_rest: true,
             local_names: vec![(0, intern("x")), (1, intern("y"))],
             source_file: None,
+            local_scopes: Vec::new(),
             cache_offset: 0,
         };
 
@@ -1669,6 +1673,7 @@ mod tests {
             has_rest: false,
             local_names: vec![],
             source_file: None,
+            local_scopes: Vec::new(),
             cache_offset: 0,
         };
 
@@ -1734,6 +1739,7 @@ mod tests {
             has_rest: false,
             local_names: vec![(0, intern("x"))],
             source_file: None,
+            local_scopes: Vec::new(),
             cache_offset: 0,
         };
 

@@ -2135,6 +2135,7 @@ fn run_bytecode_bytes(
             arity: 0,
             has_rest: false,
             local_names: Vec::new(),
+            local_scopes: Vec::new(),
             source_file: None,
             cache_offset: 0,
         }),

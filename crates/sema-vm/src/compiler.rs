@@ -77,7 +77,7 @@ pub fn compile(
         compiler.emit.emit_op(Op::Nil);
     }
     compiler.emit.emit_op(Op::Return);
-    let (chunk, functions, native_table, _local_names) = compiler.finish();
+    let (chunk, functions, native_table, _local_names, _local_scopes) = compiler.finish();
     Ok(CompileResult {
         chunk,
         functions,
@@ -178,9 +178,18 @@ struct Compiler {
     redefined_globals: HashSet<Spur>,
     /// Local slot names for debugger scope inspection.
     local_names: Vec<(u16, Spur)>,
+    /// Block scope `(slot, start_pc, end_pc)` of each block-introduced local, so
+    /// the debugger can hide locals that are out of scope at the current pc.
+    local_scopes: Vec<(u16, u32, u32)>,
 }
 
-type CompilerFinish = (Chunk, Vec<Function>, Vec<Spur>, Vec<(u16, Spur)>);
+type CompilerFinish = (
+    Chunk,
+    Vec<Function>,
+    Vec<Spur>,
+    Vec<(u16, Spur)>,
+    Vec<(u16, u32, u32)>,
+);
 
 impl Compiler {
     fn new() -> Self {
@@ -197,6 +206,7 @@ impl Compiler {
             next_cache_slot: 0,
             redefined_globals: HashSet::new(),
             local_names: Vec::new(),
+            local_scopes: Vec::new(),
         }
     }
 
@@ -211,13 +221,34 @@ impl Compiler {
         chunk.n_locals = self.n_locals;
         chunk.exception_table = self.exception_entries;
         chunk.n_global_cache_slots = self.next_cache_slot;
-        (chunk, self.functions, self.native_table, self.local_names)
+        (
+            chunk,
+            self.functions,
+            self.native_table,
+            self.local_names,
+            self.local_scopes,
+        )
     }
 
     fn record_local_name(&mut self, vr: &VarRef) {
         if let VarResolution::Local { slot } = vr.resolution {
             if !self.local_names.iter().any(|(s, _)| *s == slot) {
                 self.local_names.push((slot, vr.name));
+            }
+        }
+    }
+
+    /// Record the block scope (`[start_pc, end_pc)`) of each local introduced by
+    /// a binding form, so the debugger only shows it while pc is in range.
+    fn record_local_scopes(
+        &mut self,
+        bindings: &[(VarRef, ResolvedExpr)],
+        start_pc: u32,
+        end_pc: u32,
+    ) {
+        for (vr, _) in bindings {
+            if let VarResolution::Local { slot } = vr.resolution {
+                self.local_scopes.push((slot, start_pc, end_pc));
             }
         }
     }
@@ -508,7 +539,8 @@ impl Compiler {
         inner.emit.emit_op(Op::Return);
 
         let func_id = self.functions.len() as u16;
-        let (mut chunk, mut child_functions, _inner_natives, local_names) = inner.finish();
+        let (mut chunk, mut child_functions, _inner_natives, local_names, local_scopes) =
+            inner.finish();
 
         // The inner compiler assigned func_ids starting from 0, but child functions
         // will be placed starting at func_id + 1 in our functions vec.
@@ -521,11 +553,6 @@ impl Compiler {
             }
         }
 
-        let mut local_names = Vec::with_capacity(def.params.len());
-        for (i, param) in def.params.iter().enumerate() {
-            local_names.push((i as u16, *param));
-        }
-
         let func = Function {
             name: def.name,
             chunk,
@@ -534,6 +561,7 @@ impl Compiler {
             arity: def.params.len() as u16,
             has_rest: def.rest.is_some(),
             local_names,
+            local_scopes,
             source_file: None,
             cache_offset: 0,
         };
@@ -715,8 +743,12 @@ impl Compiler {
         for (vr, _) in bindings.iter().rev() {
             self.compile_var_store(vr);
         }
-        // Compile body
-        self.compile_begin(body)
+        // Compile body; the bindings are in scope for its full pc range.
+        let body_start = self.emit.current_pc();
+        self.compile_begin(body)?;
+        let body_end = self.emit.current_pc();
+        self.record_local_scopes(bindings, body_start, body_end);
+        Ok(())
     }
 
     fn compile_let_star(
@@ -729,7 +761,11 @@ impl Compiler {
             self.compile_expr(init)?;
             self.compile_var_store(vr);
         }
-        self.compile_begin(body)
+        let body_start = self.emit.current_pc();
+        self.compile_begin(body)?;
+        let body_end = self.emit.current_pc();
+        self.record_local_scopes(bindings, body_start, body_end);
+        Ok(())
     }
 
     fn compile_letrec(
@@ -747,7 +783,11 @@ impl Compiler {
             self.compile_expr(init)?;
             self.compile_var_store(vr);
         }
-        self.compile_begin(body)
+        let body_start = self.emit.current_pc();
+        self.compile_begin(body)?;
+        let body_end = self.emit.current_pc();
+        self.record_local_scopes(bindings, body_start, body_end);
+        Ok(())
     }
 
     // compile_named_let removed — named-let is desugared to letrec+lambda in lowering (Decision #52).
@@ -804,6 +844,14 @@ impl Compiler {
                 if i < do_loop.result.len() - 1 {
                     self.emit.emit_op(Op::Pop);
                 }
+            }
+        }
+
+        // The loop vars are in scope from the loop top through the result exprs.
+        let do_end = self.emit.current_pc();
+        for var in &do_loop.vars {
+            if let VarResolution::Local { slot } = var.name.resolution {
+                self.local_scopes.push((slot, loop_top, do_end));
             }
         }
 
