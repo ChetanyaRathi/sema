@@ -502,6 +502,7 @@ fn lower_define(args: &[Value]) -> Result<CoreExpr, SemaError> {
                     rest,
                     body,
                     upvalues: vec![],
+                    upvalue_names: vec![],
                     n_locals: 0,
                 })),
             ))
@@ -543,6 +544,7 @@ fn lower_defun(args: &[Value]) -> Result<CoreExpr, SemaError> {
             rest,
             body,
             upvalues: vec![],
+            upvalue_names: vec![],
             n_locals: 0,
         })),
     ))
@@ -614,6 +616,7 @@ fn lower_lambda(args: &[Value], name: Option<Spur>) -> Result<CoreExpr, SemaErro
             rest: rest_spur,
             body,
             upvalues: vec![],
+            upvalue_names: vec![],
             n_locals: 0,
         }))
     } else {
@@ -627,6 +630,7 @@ fn lower_lambda(args: &[Value], name: Option<Spur>) -> Result<CoreExpr, SemaErro
             rest,
             body,
             upvalues: vec![],
+            upvalue_names: vec![],
             n_locals: 0,
         }))
     }
@@ -668,6 +672,7 @@ fn lower_let(args: &[Value], tail: bool) -> Result<CoreExpr, SemaError> {
                     rest: None,
                     body,
                     upvalues: vec![],
+                    upvalue_names: vec![],
                     n_locals: 0,
                 }),
             )],
@@ -908,6 +913,7 @@ fn lower_async(args: &[Value]) -> Result<CoreExpr, SemaError> {
         rest: None,
         body,
         upvalues: vec![],
+        upvalue_names: vec![],
         n_locals: 0,
     });
     Ok(CoreExpr::Call {
@@ -1557,6 +1563,7 @@ fn lower_delay(args: &[Value]) -> Result<CoreExpr, SemaError> {
         rest: None,
         body: vec![body],
         upvalues: vec![],
+        upvalue_names: vec![],
         n_locals: 0,
     });
     Ok(CoreExpr::Call {

@@ -248,6 +248,7 @@ impl Clone for Channel {
 #[derive(Debug, Clone)]
 pub struct Record {
     pub type_tag: Spur,
+    pub field_names: Vec<Spur>,
     pub fields: Vec<Value>,
 }
 
@@ -2547,6 +2548,34 @@ mod tests {
         assert_eq!(Value::string("a"), Value::string("a"));
         assert_ne!(Value::string("a"), Value::string("b"));
         assert_eq!(Value::symbol("x"), Value::symbol("x"));
+    }
+
+    #[test]
+    fn record_field_names_do_not_affect_language_semantics() {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        let a = Value::record(Record {
+            type_tag: intern("point"),
+            field_names: vec![intern("x"), intern("y")],
+            fields: vec![Value::int(1), Value::int(2)],
+        });
+        let b = Value::record(Record {
+            type_tag: intern("point"),
+            field_names: vec![intern("left"), intern("top")],
+            fields: vec![Value::int(1), Value::int(2)],
+        });
+
+        assert_eq!(a, b);
+        assert_eq!(a.cmp(&b), std::cmp::Ordering::Equal);
+        assert_eq!(format!("{a}"), "#<record point 1 2>");
+        assert_eq!(format!("{a}"), format!("{b}"));
+
+        let mut a_hasher = DefaultHasher::new();
+        a.hash(&mut a_hasher);
+        let mut b_hasher = DefaultHasher::new();
+        b.hash(&mut b_hasher);
+        assert_eq!(a_hasher.finish(), b_hasher.finish());
     }
 
     #[test]

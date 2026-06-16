@@ -74,7 +74,7 @@ class SemaDebugAdapterDescriptorFactory : DebugAdapterDescriptorFactory() {
                   "name": "Debug Sema file",
                   "program": "${'$'}{file}",
                   "cwd": "${'$'}{workspaceFolder}",
-                  "stopOnEntry": true
+                  "stopOnEntry": false
                 }
                 """.trimIndent(),
                 DebugMode.LAUNCH,
@@ -119,7 +119,7 @@ class SemaDebugAdapterDescriptorFactory : DebugAdapterDescriptorFactory() {
                 "request" to "launch",
                 "program" to program,
                 "cwd" to cwd,
-                "stopOnEntry" to true,
+                "stopOnEntry" to false,
             )
     }
 }

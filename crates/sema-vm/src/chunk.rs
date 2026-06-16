@@ -50,6 +50,7 @@ pub struct Function {
     pub name: Option<Spur>,
     pub chunk: Chunk,
     pub upvalue_descs: Vec<UpvalueDesc>,
+    pub upvalue_names: Vec<Spur>,
     pub arity: u16,
     pub has_rest: bool,
     pub local_names: Vec<(u16, Spur)>,

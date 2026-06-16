@@ -1,15 +1,17 @@
 use std::cell::RefCell;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::rc::Rc;
 
 use sema_core::{
     error::{suggest_similar, veteran_hint},
-    resolve as resolve_spur, Env, EvalContext, NativeFn, SemaError, Spur, Value,
+    resolve as resolve_spur, Env, EvalContext, NativeFn, SemaError, Spur, Value, ValueView,
     NAN_INT_SMALL_PATTERN, NAN_PAYLOAD_BITS, NAN_PAYLOAD_MASK, NAN_TAG_MASK, TAG_NATIVE_FN,
 };
 
 use crate::chunk::Function;
 use crate::opcodes::op;
+
+const DEBUG_VALUE_REF_BASE: u64 = crate::debug::DEBUG_VALUE_REF_BASE;
 
 /// State of a captured variable (upvalue).
 #[derive(Debug)]
@@ -116,6 +118,8 @@ pub struct VM {
     /// Resolved native function table: native_id → (NativeFn Rc, name).
     /// Populated at VM creation from the compiler's native_table + global env.
     native_fns: Vec<Rc<NativeFn>>,
+    debug_values: HashMap<u64, Value>,
+    next_debug_value_ref: u64,
 }
 
 /// Close all open upvalues in the given open_upvalues vec, reading from the stack.
@@ -176,6 +180,8 @@ impl VM {
             functions: Rc::new(functions),
             inline_cache: vec![(u32::MAX, 0, Value::nil()); total_cache_slots],
             native_fns,
+            debug_values: HashMap::new(),
+            next_debug_value_ref: DEBUG_VALUE_REF_BASE,
         })
     }
 
@@ -224,6 +230,8 @@ impl VM {
             functions,
             inline_cache: vec![(u32::MAX, 0, Value::nil()); total_cache_slots],
             native_fns: Vec::new(),
+            debug_values: HashMap::new(),
+            next_debug_value_ref: DEBUG_VALUE_REF_BASE,
         }
     }
 
@@ -245,6 +253,8 @@ impl VM {
             functions,
             inline_cache: vec![(u32::MAX, 0, Value::nil()); total_cache_slots],
             native_fns,
+            debug_values: HashMap::new(),
+            next_debug_value_ref: DEBUG_VALUE_REF_BASE,
         })
     }
 
@@ -335,6 +345,54 @@ impl VM {
                             }
                             Ok(crate::debug::DebugCommand::GetVariables { reference, reply }) => {
                                 let _ = reply.send(self.debug_variables(reference));
+                            }
+                            Ok(crate::debug::DebugCommand::Evaluate {
+                                frame_id,
+                                expression,
+                                reply,
+                            }) => {
+                                let result = sema_reader::read(&expression)
+                                    .map_err(|e| e.to_string())
+                                    .and_then(|expr| {
+                                        self.debug_evaluate(frame_id, &expr, ctx, debug)
+                                            .map(|value| {
+                                                self.debug_value_to_variable("result", value)
+                                            })
+                                            .map_err(|e| e.to_string())
+                                    });
+                                let _ = reply.send(result);
+                            }
+                            Ok(crate::debug::DebugCommand::SetVariable {
+                                variables_reference,
+                                name,
+                                value_expression,
+                                reply,
+                            }) => {
+                                let result =
+                                    match crate::debug::decode_scope_ref(variables_reference) {
+                                        Some(crate::debug::ScopeKind::Locals(frame_id))
+                                        | Some(crate::debug::ScopeKind::Upvalues(frame_id)) => {
+                                            sema_reader::read(&value_expression)
+                                                .map_err(|e| e.to_string())
+                                                .and_then(|expr| {
+                                                    self.debug_evaluate(frame_id, &expr, ctx, debug)
+                                                        .map_err(|e| e.to_string())
+                                                })
+                                                .and_then(|value| {
+                                                    self.debug_set_variable(
+                                                        variables_reference,
+                                                        &name,
+                                                        value,
+                                                    )
+                                                    .map_err(|e| e.to_string())
+                                                })
+                                        }
+                                        None => {
+                                            Err("setVariable: invalid variablesReference"
+                                                .to_string())
+                                        }
+                                    };
+                                let _ = reply.send(result);
                             }
                             Ok(crate::debug::DebugCommand::Disconnect) => {
                                 return Ok(Value::nil());
@@ -666,6 +724,18 @@ impl VM {
                                 }
                                 crate::debug::DebugCommand::GetVariables { reference, reply } => {
                                     let _ = reply.send(self.debug_variables(reference));
+                                }
+                                crate::debug::DebugCommand::Evaluate { reply, .. } => {
+                                    let _ = reply.send(Err(
+                                        "evaluate is only available while execution is stopped"
+                                            .to_string(),
+                                    ));
+                                }
+                                crate::debug::DebugCommand::SetVariable { reply, .. } => {
+                                    let _ = reply.send(Err(
+                                        "setVariable is only available while execution is stopped"
+                                            .to_string(),
+                                    ));
                                 }
                                 // Step/Continue have no paused frame to act on
                                 // while running; ignore them.
@@ -2265,32 +2335,28 @@ impl VM {
             .collect()
     }
 
-    pub fn debug_locals(&self, frame_idx: usize) -> Vec<crate::debug::DapVariable> {
+    pub fn debug_locals(&mut self, frame_idx: usize) -> Vec<crate::debug::DapVariable> {
         let Some(frame) = self.frames.get(frame_idx) else {
             return Vec::new();
         };
-        let func = &frame.closure.func;
+        let base = frame.base;
+        let local_names = frame.closure.func.local_names.clone();
         let mut vars = Vec::new();
-        for &(slot, spur) in &func.local_names {
-            let idx = frame.base + slot as usize;
+        for (slot, spur) in local_names {
+            let idx = base + slot as usize;
             let val = self.stack.get(idx).cloned().unwrap_or(Value::nil());
-            vars.push(crate::debug::DapVariable {
-                name: sema_core::resolve(spur),
-                value: sema_core::pretty_print(&val, 80),
-                type_name: val.type_name().to_string(),
-                variables_reference: 0,
-            });
+            vars.push(self.debug_value_to_variable(&sema_core::resolve(spur), val));
         }
         vars
     }
 
-    pub fn debug_upvalues(&self, frame_idx: usize) -> Vec<crate::debug::DapVariable> {
+    pub fn debug_upvalues(&mut self, frame_idx: usize) -> Vec<crate::debug::DapVariable> {
         let Some(frame) = self.frames.get(frame_idx) else {
             return Vec::new();
         };
-        frame
-            .closure
-            .upvalues
+        let upvalues = frame.closure.upvalues.clone();
+        let names = frame.closure.func.upvalue_names.clone();
+        upvalues
             .iter()
             .enumerate()
             .map(|(i, uv)| {
@@ -2300,17 +2366,16 @@ impl VM {
                         self.stack[*frame_base + *slot].clone()
                     }
                 };
-                crate::debug::DapVariable {
-                    name: format!("upvalue_{i}"),
-                    value: sema_core::pretty_print(&val, 80),
-                    type_name: val.type_name().to_string(),
-                    variables_reference: 0,
-                }
+                let name = names
+                    .get(i)
+                    .map(|spur| sema_core::resolve(*spur))
+                    .unwrap_or_else(|| format!("upvalue_{i}"));
+                self.debug_value_to_variable(&name, val)
             })
             .collect()
     }
 
-    pub fn debug_scopes(&self, frame_id: usize) -> Vec<crate::debug::DapScope> {
+    pub fn debug_scopes(&mut self, frame_id: usize) -> Vec<crate::debug::DapScope> {
         let mut scopes = vec![crate::debug::DapScope {
             name: "Locals".to_string(),
             variables_reference: crate::debug::scope_locals_ref(frame_id),
@@ -2326,11 +2391,57 @@ impl VM {
         scopes
     }
 
-    pub fn debug_variables(&self, reference: u64) -> Vec<crate::debug::DapVariable> {
+    pub fn debug_variables(&mut self, reference: u64) -> Vec<crate::debug::DapVariable> {
+        if let Some(value) = self.debug_values.get(&reference).cloned() {
+            return self.debug_children(value);
+        }
         match crate::debug::decode_scope_ref(reference) {
             None => Vec::new(),
             Some(crate::debug::ScopeKind::Locals(frame_id)) => self.debug_locals(frame_id),
             Some(crate::debug::ScopeKind::Upvalues(frame_id)) => self.debug_upvalues(frame_id),
+        }
+    }
+
+    pub fn debug_evaluate(
+        &self,
+        frame_id: usize,
+        expr: &Value,
+        ctx: &EvalContext,
+        _debug: &crate::debug::DebugState,
+    ) -> Result<Value, SemaError> {
+        let env = self.debug_env_for_frame(frame_id)?;
+        match sema_core::eval_callback(ctx, expr, &env) {
+            Ok(value) => Ok(value),
+            Err(_) if ctx.eval_fn.get().is_none() => {
+                let prog = compile_program(std::slice::from_ref(expr), None)?;
+                let mut vm = VM::new(
+                    env,
+                    prog.functions,
+                    &prog.native_table,
+                    prog.main_cache_slots,
+                )?;
+                vm.execute(prog.closure, ctx)
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    pub fn debug_set_variable(
+        &mut self,
+        variables_reference: u64,
+        name: &str,
+        value: Value,
+    ) -> Result<crate::debug::DapVariable, SemaError> {
+        match crate::debug::decode_scope_ref(variables_reference) {
+            Some(crate::debug::ScopeKind::Locals(frame_id)) => {
+                self.debug_set_local(frame_id, name, value)
+            }
+            Some(crate::debug::ScopeKind::Upvalues(frame_id)) => {
+                self.debug_set_upvalue(frame_id, name, value)
+            }
+            None => Err(SemaError::eval(
+                "setVariable: invalid variablesReference".to_string(),
+            )),
         }
     }
 
@@ -2348,6 +2459,210 @@ impl VM {
                 (span.line as u64, span.col as u64 + 1)
             }
             _ => (0, 0),
+        }
+    }
+
+    fn debug_env_for_frame(&self, frame_id: usize) -> Result<Rc<Env>, SemaError> {
+        let frame = self.frames.get(frame_id).ok_or_else(|| {
+            SemaError::eval(format!("debug evaluate: invalid frame id {frame_id}"))
+        })?;
+        let env = Rc::new(Env::with_parent(self.globals.clone()));
+
+        for (i, upvalue) in frame.closure.upvalues.iter().enumerate() {
+            let value = self.debug_upvalue_value(upvalue);
+            env.set(sema_core::intern(&format!("upvalue_{i}")), value.clone());
+            if let Some(name) = frame.closure.func.upvalue_names.get(i) {
+                env.set(*name, value);
+            }
+        }
+
+        for &(slot, spur) in &frame.closure.func.local_names {
+            let idx = frame.base + slot as usize;
+            if let Some(value) = self.stack.get(idx) {
+                env.set(spur, value.clone());
+            }
+        }
+
+        Ok(env)
+    }
+
+    fn debug_upvalue_value(&self, upvalue: &UpvalueCell) -> Value {
+        match &*upvalue.state.borrow() {
+            UpvalueState::Closed(value) => value.clone(),
+            UpvalueState::Open { frame_base, slot } => self
+                .stack
+                .get(*frame_base + *slot)
+                .cloned()
+                .unwrap_or_else(Value::nil),
+        }
+    }
+
+    fn debug_set_local(
+        &mut self,
+        frame_id: usize,
+        name: &str,
+        value: Value,
+    ) -> Result<crate::debug::DapVariable, SemaError> {
+        let frame = self
+            .frames
+            .get(frame_id)
+            .ok_or_else(|| SemaError::eval(format!("setVariable: invalid frame id {frame_id}")))?;
+        let Some((slot, _)) = frame
+            .closure
+            .func
+            .local_names
+            .iter()
+            .find(|(_, spur)| sema_core::resolve(*spur) == name)
+            .copied()
+        else {
+            return Err(SemaError::eval(format!(
+                "setVariable: local '{name}' not found"
+            )));
+        };
+
+        let idx = frame.base + slot as usize;
+        let Some(slot_value) = self.stack.get_mut(idx) else {
+            return Err(SemaError::eval(format!(
+                "setVariable: local '{name}' is out of range"
+            )));
+        };
+        *slot_value = value.clone();
+        Ok(self.debug_value_to_variable(name, value))
+    }
+
+    fn debug_set_upvalue(
+        &mut self,
+        frame_id: usize,
+        name: &str,
+        value: Value,
+    ) -> Result<crate::debug::DapVariable, SemaError> {
+        let frame = self
+            .frames
+            .get(frame_id)
+            .ok_or_else(|| SemaError::eval(format!("setVariable: invalid frame id {frame_id}")))?;
+        let index = if let Some(index) = name
+            .strip_prefix("upvalue_")
+            .and_then(|suffix| suffix.parse::<usize>().ok())
+        {
+            index
+        } else if let Some(index) = frame
+            .closure
+            .func
+            .upvalue_names
+            .iter()
+            .position(|spur| sema_core::resolve(*spur) == name)
+        {
+            index
+        } else {
+            return Err(SemaError::eval(format!(
+                "setVariable: upvalue '{name}' not found"
+            )));
+        };
+        let Some(upvalue) = frame.closure.upvalues.get(index) else {
+            return Err(SemaError::eval(format!(
+                "setVariable: upvalue '{name}' not found"
+            )));
+        };
+
+        {
+            let mut state = upvalue.state.borrow_mut();
+            match &mut *state {
+                UpvalueState::Closed(slot_value) => {
+                    *slot_value = value.clone();
+                }
+                UpvalueState::Open { frame_base, slot } => {
+                    let Some(slot_value) = self.stack.get_mut(*frame_base + *slot) else {
+                        return Err(SemaError::eval(format!(
+                            "setVariable: upvalue '{name}' is out of range"
+                        )));
+                    };
+                    *slot_value = value.clone();
+                }
+            }
+        }
+
+        Ok(self.debug_value_to_variable(name, value))
+    }
+
+    fn debug_value_to_variable(&mut self, name: &str, value: Value) -> crate::debug::DapVariable {
+        let variables_reference = self.debug_expandable_ref(&value);
+        crate::debug::DapVariable {
+            name: name.to_string(),
+            value: sema_core::pretty_print(&value, 80),
+            type_name: value.type_name().to_string(),
+            variables_reference,
+        }
+    }
+
+    fn debug_expandable_ref(&mut self, value: &Value) -> u64 {
+        if !Self::is_debug_expandable(value) {
+            return 0;
+        }
+        let reference = self.next_debug_value_ref;
+        self.next_debug_value_ref += 1;
+        self.debug_values.insert(reference, value.clone());
+        reference
+    }
+
+    fn is_debug_expandable(value: &Value) -> bool {
+        matches!(
+            value.view(),
+            ValueView::List(_)
+                | ValueView::Vector(_)
+                | ValueView::Map(_)
+                | ValueView::HashMap(_)
+                | ValueView::Record(_)
+                | ValueView::Bytevector(_)
+        )
+    }
+
+    fn debug_children(&mut self, value: Value) -> Vec<crate::debug::DapVariable> {
+        match value.view() {
+            ValueView::List(items) | ValueView::Vector(items) => items
+                .iter()
+                .enumerate()
+                .map(|(i, child)| self.debug_value_to_variable(&format!("[{i}]"), child.clone()))
+                .collect(),
+            ValueView::Map(map) => map
+                .iter()
+                .map(|(key, child)| {
+                    self.debug_value_to_variable(&sema_core::pretty_print(key, 80), child.clone())
+                })
+                .collect(),
+            ValueView::HashMap(map) => {
+                let mut entries: Vec<_> = map.iter().collect();
+                entries.sort_by_key(|(key, _)| (*key).clone());
+                entries
+                    .into_iter()
+                    .map(|(key, child)| {
+                        self.debug_value_to_variable(
+                            &sema_core::pretty_print(key, 80),
+                            child.clone(),
+                        )
+                    })
+                    .collect()
+            }
+            ValueView::Record(record) => record
+                .fields
+                .iter()
+                .enumerate()
+                .map(|(i, child)| {
+                    let name = if record.field_names.len() == record.fields.len() {
+                        sema_core::resolve(record.field_names[i])
+                    } else {
+                        format!("field_{i}")
+                    };
+                    self.debug_value_to_variable(&name, child.clone())
+                })
+                .collect(),
+            ValueView::Bytevector(bytes) => bytes
+                .iter()
+                .enumerate()
+                .map(|(i, byte)| {
+                    self.debug_value_to_variable(&format!("[{i}]"), Value::int(*byte as i64))
+                })
+                .collect(),
+            _ => Vec::new(),
         }
     }
 }
@@ -2583,6 +2898,7 @@ pub fn compile_program_with_spans(
             name: None,
             chunk: result.chunk,
             upvalue_descs: Vec::new(),
+            upvalue_names: Vec::new(),
             arity: 0,
             has_rest: false,
             local_names: Vec::new(),
@@ -2604,6 +2920,9 @@ pub fn compile_program_with_spans(
 /// Includes spans from the main chunk and all sub-functions.
 pub fn valid_breakpoint_lines(closure: &Closure, functions: &[Rc<Function>]) -> Vec<u32> {
     let mut lines = std::collections::BTreeSet::new();
+    for file_lines in valid_breakpoint_lines_by_file(closure, functions).values() {
+        lines.extend(file_lines.iter().copied());
+    }
     for (_, s) in &closure.func.chunk.spans {
         lines.insert(s.line as u32);
     }
@@ -2613,6 +2932,36 @@ pub fn valid_breakpoint_lines(closure: &Closure, functions: &[Rc<Function>]) -> 
         }
     }
     lines.into_iter().collect()
+}
+
+/// Extract executable source lines grouped by canonical source file.
+pub fn valid_breakpoint_lines_by_file(
+    closure: &Closure,
+    functions: &[Rc<Function>],
+) -> BTreeMap<std::path::PathBuf, Vec<u32>> {
+    let mut lines_by_file: BTreeMap<std::path::PathBuf, std::collections::BTreeSet<u32>> =
+        BTreeMap::new();
+    collect_function_breakpoint_lines(&closure.func, &mut lines_by_file);
+    for function in functions {
+        collect_function_breakpoint_lines(function, &mut lines_by_file);
+    }
+    lines_by_file
+        .into_iter()
+        .map(|(file, lines)| (file, lines.into_iter().collect()))
+        .collect()
+}
+
+fn collect_function_breakpoint_lines(
+    function: &Function,
+    lines_by_file: &mut BTreeMap<std::path::PathBuf, std::collections::BTreeSet<u32>>,
+) {
+    let Some(source_file) = &function.source_file else {
+        return;
+    };
+    let lines = lines_by_file.entry(source_file.clone()).or_default();
+    for (_, span) in &function.chunk.spans {
+        lines.insert(span.line as u32);
+    }
 }
 
 /// Snap a requested breakpoint line to the nearest valid line with bytecode spans.
@@ -2682,6 +3031,7 @@ pub fn compile_program(
             name: None,
             chunk: result.chunk,
             upvalue_descs: Vec::new(),
+            upvalue_names: Vec::new(),
             arity: 0,
             has_rest: false,
             local_names: Vec::new(),
@@ -2783,6 +3133,7 @@ mod tests {
             name: None,
             chunk,
             upvalue_descs: vec![],
+            upvalue_names: vec![],
             arity: 0,
             has_rest: false,
             local_names: vec![],
@@ -3304,6 +3655,7 @@ mod tests {
             name: None,
             chunk: e.into_chunk(),
             upvalue_descs: vec![],
+            upvalue_names: vec![],
             arity: 0,
             has_rest: false,
             local_names: vec![],
@@ -3342,6 +3694,7 @@ mod tests {
             name: None,
             chunk: e.into_chunk(),
             upvalue_descs: vec![],
+            upvalue_names: vec![],
             arity: 0,
             has_rest: false,
             local_names: vec![],
@@ -3459,6 +3812,7 @@ mod tests {
             name: None,
             chunk: e.into_chunk(),
             upvalue_descs: vec![],
+            upvalue_names: vec![],
             arity: 0,
             has_rest: false,
             local_names: vec![],
@@ -3581,6 +3935,307 @@ mod tests {
     }
 
     #[test]
+    fn test_debug_evaluate_uses_paused_frame_locals_over_globals() {
+        use crate::debug::{DebugState, StepMode, VmExecResult};
+        use std::path::PathBuf;
+
+        let globals = make_test_env();
+        globals.set(sema_core::intern("x"), Value::int(1));
+        let ctx = EvalContext::new();
+
+        let input = "(define (f x)\n  ; body line\n  (+ x 1))\n(f 10)";
+        let (vals, span_map) = sema_reader::read_many_with_spans(input).unwrap();
+        let source_file = PathBuf::from("<debug-eval>");
+        let prog = compile_program_with_spans(&vals, &span_map, Some(source_file.clone())).unwrap();
+
+        let mut vm = VM::new(globals, prog.functions, &[], prog.main_cache_slots).unwrap();
+        let mut debug = DebugState::new_headless();
+        debug.set_breakpoints(&source_file, &[3]);
+        debug.step_mode = StepMode::Continue;
+
+        let result = vm
+            .start_cooperative(prog.closure, &ctx, &mut debug)
+            .unwrap();
+        assert!(matches!(result, VmExecResult::Stopped(_)));
+        let frame_id = vm.debug_stack_trace().first().unwrap().id as usize;
+
+        let expr = sema_reader::read("(+ x 5)").unwrap();
+        let value = vm.debug_evaluate(frame_id, &expr, &ctx, &debug).unwrap();
+        assert_eq!(value, Value::int(15));
+    }
+
+    #[test]
+    fn test_debug_set_local_updates_paused_stack_slot() {
+        use crate::debug::{DebugState, StepMode, VmExecResult};
+        use std::path::PathBuf;
+
+        let globals = make_test_env();
+        let ctx = EvalContext::new();
+
+        let input = "(define (f x)\n  ; body line\n  (+ x 1))\n(f 10)";
+        let (vals, span_map) = sema_reader::read_many_with_spans(input).unwrap();
+        let source_file = PathBuf::from("<debug-set>");
+        let prog = compile_program_with_spans(&vals, &span_map, Some(source_file.clone())).unwrap();
+
+        let mut vm = VM::new(globals, prog.functions, &[], prog.main_cache_slots).unwrap();
+        let mut debug = DebugState::new_headless();
+        debug.set_breakpoints(&source_file, &[3]);
+        debug.step_mode = StepMode::Continue;
+
+        let result = vm
+            .start_cooperative(prog.closure, &ctx, &mut debug)
+            .unwrap();
+        assert!(matches!(result, VmExecResult::Stopped(_)));
+        let frame_id = vm.debug_stack_trace().first().unwrap().id as usize;
+
+        let updated = vm
+            .debug_set_variable(
+                crate::debug::scope_locals_ref(frame_id),
+                "x",
+                Value::int(32),
+            )
+            .unwrap();
+        assert_eq!(updated.value, "32");
+
+        let expr = sema_reader::read("(+ x 5)").unwrap();
+        let value = vm.debug_evaluate(frame_id, &expr, &ctx, &debug).unwrap();
+        assert_eq!(value, Value::int(37));
+    }
+
+    #[test]
+    fn test_debug_upvalues_use_lexical_names_and_support_closed_mutation() {
+        use crate::debug::{DebugState, StepMode, VmExecResult};
+        use std::path::PathBuf;
+
+        let globals = make_test_env();
+        let ctx = EvalContext::new();
+        let input = "(define (make-adder base)\n  (lambda (x)\n    (+ base x)))\n(define add5 (make-adder 5))\n(add5 10)";
+        let (vals, span_map) = sema_reader::read_many_with_spans(input).unwrap();
+        let source_file = PathBuf::from("<debug-closed-upvalue>");
+        let prog = compile_program_with_spans(&vals, &span_map, Some(source_file.clone())).unwrap();
+
+        let mut vm = VM::new(globals, prog.functions, &[], prog.main_cache_slots).unwrap();
+        let mut debug = DebugState::new_headless();
+        debug.set_breakpoints(&source_file, &[3]);
+        debug.step_mode = StepMode::Continue;
+
+        let result = vm
+            .start_cooperative(prog.closure, &ctx, &mut debug)
+            .unwrap();
+        assert!(matches!(result, VmExecResult::Stopped(_)));
+        let frame_id = vm.debug_stack_trace().first().unwrap().id as usize;
+
+        let upvalues = vm.debug_variables(crate::debug::scope_upvalues_ref(frame_id));
+        assert!(
+            upvalues
+                .iter()
+                .any(|var| var.name == "base" && var.value == "5"),
+            "expected lexical upvalue name in debug variables: {upvalues:?}"
+        );
+
+        let expr = sema_reader::read("(+ base x)").unwrap();
+        assert_eq!(
+            vm.debug_evaluate(frame_id, &expr, &ctx, &debug).unwrap(),
+            Value::int(15)
+        );
+
+        let updated = vm
+            .debug_set_variable(
+                crate::debug::scope_upvalues_ref(frame_id),
+                "base",
+                Value::int(20),
+            )
+            .unwrap();
+        assert_eq!(updated.name, "base");
+        assert_eq!(updated.value, "20");
+        assert_eq!(
+            vm.debug_evaluate(frame_id, &expr, &ctx, &debug).unwrap(),
+            Value::int(30)
+        );
+    }
+
+    #[test]
+    fn test_debug_upvalues_support_open_mutation_by_lexical_name() {
+        use crate::debug::{DebugState, StepMode, VmExecResult};
+        use std::path::PathBuf;
+
+        let globals = make_test_env();
+        let ctx = EvalContext::new();
+        let input =
+            "(define (outer base)\n  (define f (lambda (x)\n    (+ base x)))\n  (f 10))\n(outer 5)";
+        let (vals, span_map) = sema_reader::read_many_with_spans(input).unwrap();
+        let source_file = PathBuf::from("<debug-open-upvalue>");
+        let prog = compile_program_with_spans(&vals, &span_map, Some(source_file.clone())).unwrap();
+
+        let mut vm = VM::new(globals, prog.functions, &[], prog.main_cache_slots).unwrap();
+        let mut debug = DebugState::new_headless();
+        debug.set_breakpoints(&source_file, &[3]);
+        debug.step_mode = StepMode::Continue;
+
+        let result = vm
+            .start_cooperative(prog.closure, &ctx, &mut debug)
+            .unwrap();
+        assert!(matches!(result, VmExecResult::Stopped(_)));
+        let frame_id = vm.debug_stack_trace().first().unwrap().id as usize;
+
+        vm.debug_set_variable(
+            crate::debug::scope_upvalues_ref(frame_id),
+            "base",
+            Value::int(40),
+        )
+        .unwrap();
+        let expr = sema_reader::read("(+ base x)").unwrap();
+        assert_eq!(
+            vm.debug_evaluate(frame_id, &expr, &ctx, &debug).unwrap(),
+            Value::int(50)
+        );
+    }
+
+    #[test]
+    fn test_debug_variables_expand_compound_values_lazily() {
+        use crate::debug::{DebugState, StepMode, VmExecResult};
+        use std::path::PathBuf;
+
+        let globals = make_test_env();
+        let ctx = EvalContext::new();
+        let input = "(define (f xs)\n  (list xs))\n(f (list 1 (list 2 3)))";
+        let (vals, span_map) = sema_reader::read_many_with_spans(input).unwrap();
+        let source_file = PathBuf::from("<debug-expand>");
+        let prog = compile_program_with_spans(&vals, &span_map, Some(source_file.clone())).unwrap();
+
+        let mut vm = VM::new(globals, prog.functions, &[], prog.main_cache_slots).unwrap();
+        let mut debug = DebugState::new_headless();
+        debug.set_breakpoints(&source_file, &[2]);
+        debug.step_mode = StepMode::Continue;
+
+        let result = vm
+            .start_cooperative(prog.closure, &ctx, &mut debug)
+            .unwrap();
+        assert!(matches!(result, VmExecResult::Stopped(_)));
+        let frame_id = vm.debug_stack_trace().first().unwrap().id as usize;
+
+        let locals = vm.debug_variables(crate::debug::scope_locals_ref(frame_id));
+        let xs = locals
+            .iter()
+            .find(|var| var.name == "xs")
+            .expect("xs local should be visible");
+        assert!(
+            xs.variables_reference > 0,
+            "xs should be expandable: {xs:?}"
+        );
+
+        let children = vm.debug_variables(xs.variables_reference);
+        assert_eq!(children.len(), 2);
+        assert_eq!(children[0].name, "[0]");
+        assert_eq!(children[0].value, "1");
+        assert_eq!(children[1].name, "[1]");
+        assert!(children[1].variables_reference > 0);
+
+        let nested = vm.debug_variables(children[1].variables_reference);
+        assert_eq!(nested.len(), 2);
+        assert_eq!(nested[0].value, "2");
+        assert_eq!(nested[1].value, "3");
+    }
+
+    #[test]
+    fn test_debug_variables_expand_records_with_field_names() {
+        let mut vm = VM::new(make_test_env(), vec![], &[], 0).unwrap();
+        let point_value = Value::record(sema_core::Record {
+            type_tag: intern("point"),
+            field_names: vec![intern("x"), intern("y")],
+            fields: vec![Value::int(3), Value::int(4)],
+        });
+        let point = vm.debug_value_to_variable("p", point_value);
+        assert!(
+            point.variables_reference > 0,
+            "record local should be expandable: {point:?}"
+        );
+
+        let fields = vm.debug_variables(point.variables_reference);
+        assert_eq!(fields.len(), 2);
+        assert_eq!(fields[0].name, "x");
+        assert_eq!(fields[0].value, "3");
+        assert_eq!(fields[1].name, "y");
+        assert_eq!(fields[1].value, "4");
+    }
+
+    #[test]
+    fn test_debug_variables_expand_records_with_fallback_field_names() {
+        let mut vm = VM::new(make_test_env(), vec![], &[], 0).unwrap();
+        let point_value = Value::record(sema_core::Record {
+            type_tag: intern("point"),
+            field_names: Vec::new(),
+            fields: vec![Value::int(3), Value::int(4)],
+        });
+        let point = vm.debug_value_to_variable("p", point_value);
+
+        let fields = vm.debug_variables(point.variables_reference);
+        assert_eq!(fields.len(), 2);
+        assert_eq!(fields[0].name, "field_0");
+        assert_eq!(fields[1].name, "field_1");
+    }
+
+    #[test]
+    fn test_valid_breakpoint_lines_are_grouped_by_source_file() {
+        use std::path::PathBuf;
+
+        let source_a = PathBuf::from("/tmp/sema-debug-a.sema");
+        let source_b = PathBuf::from("/tmp/sema-debug-b.sema");
+        let mut chunk_a = Chunk::new();
+        chunk_a.spans.push((
+            0,
+            sema_core::Span {
+                line: 10,
+                col: 0,
+                end_line: 10,
+                end_col: 1,
+            },
+        ));
+        let func_a = Rc::new(Function {
+            name: None,
+            chunk: chunk_a,
+            upvalue_descs: vec![],
+            arity: 0,
+            has_rest: false,
+            local_names: vec![],
+            upvalue_names: vec![],
+            source_file: Some(source_a.clone()),
+            cache_offset: 0,
+        });
+
+        let mut chunk_b = Chunk::new();
+        chunk_b.spans.push((
+            0,
+            sema_core::Span {
+                line: 20,
+                col: 0,
+                end_line: 20,
+                end_col: 1,
+            },
+        ));
+        let func_b = Rc::new(Function {
+            name: None,
+            chunk: chunk_b,
+            upvalue_descs: vec![],
+            arity: 0,
+            has_rest: false,
+            local_names: vec![],
+            upvalue_names: vec![],
+            source_file: Some(source_b.clone()),
+            cache_offset: 0,
+        });
+
+        let main = Rc::new(Closure {
+            func: func_a.clone(),
+            upvalues: vec![],
+        });
+        let lines = valid_breakpoint_lines_by_file(&main, &[func_a, func_b]);
+
+        assert_eq!(lines.get(&source_a), Some(&vec![10]));
+        assert_eq!(lines.get(&source_b), Some(&vec![20]));
+    }
+
+    #[test]
     fn test_global_redefinition_is_idempotent() {
         // Issue #3: The HTTP replay-restart strategy re-executes side effects.
         // Verify that re-defining globals doesn't error — (define x ...) twice
@@ -3638,6 +4293,7 @@ mod tests {
             name: None,
             chunk: e.into_chunk(),
             upvalue_descs: vec![],
+            upvalue_names: vec![],
             arity: 0,
             has_rest: false,
             local_names: vec![],

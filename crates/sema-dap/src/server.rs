@@ -4,7 +4,7 @@ use std::sync::mpsc as std_mpsc;
 use tokio::io::BufReader;
 use tokio::sync::mpsc as tokio_mpsc;
 
-use sema_vm::debug::{DebugCommand, DebugEvent, DebugState};
+use sema_vm::debug::{DapBreakpoint, DebugCommand, DebugEvent, DebugState};
 
 use crate::protocol::{DapEvent, DapMessage, DapResponse};
 use crate::transport;
@@ -20,10 +20,16 @@ enum BackendRequest {
     SetBreakpoints {
         file: PathBuf,
         lines: Vec<u32>,
-        reply: tokio_mpsc::Sender<Vec<u32>>,
+        reply: tokio_mpsc::Sender<Vec<DapBreakpoint>>,
     },
     ConfigurationDone,
     Disconnect,
+}
+
+struct FrontendState {
+    vm_active: bool,
+    vm_suspended: bool,
+    dbg_cmd_tx: Option<std_mpsc::Sender<DebugCommand>>,
 }
 
 pub async fn run() {
@@ -34,9 +40,11 @@ pub async fn run() {
     let mut seq: u64 = 1;
     let (backend_tx, backend_rx) = tokio_mpsc::channel::<BackendRequest>(32);
     let (event_bridge_tx, mut event_bridge_rx) = tokio_mpsc::channel::<DebugEvent>(32);
-    let mut launched = false;
-    let mut vm_active = false;
-    let mut dbg_cmd_tx: Option<std_mpsc::Sender<DebugCommand>> = None;
+    let mut state = FrontendState {
+        vm_active: false,
+        vm_suspended: false,
+        dbg_cmd_tx: None,
+    };
 
     // Spawn the backend thread
     let event_bridge_tx_clone = event_bridge_tx.clone();
@@ -59,9 +67,7 @@ pub async fn run() {
                             &mut stdout,
                             &mut seq,
                             &backend_tx,
-                            &mut dbg_cmd_tx,
-                            &mut launched,
-                            &mut vm_active,
+                            &mut state,
                         ).await;
                         if !handled {
                             break;
@@ -77,6 +83,7 @@ pub async fn run() {
             Some(event) = event_bridge_rx.recv() => {
                 let dap_event = match event {
                     DebugEvent::Stopped { reason, description } => {
+                        state.vm_suspended = true;
                         let reason_str = match reason {
                             sema_vm::debug::StopReason::Breakpoint => "breakpoint",
                             sema_vm::debug::StopReason::Step => "step",
@@ -91,7 +98,8 @@ pub async fn run() {
                         })))
                     }
                     DebugEvent::Terminated => {
-                        vm_active = false;
+                        state.vm_active = false;
+                        state.vm_suspended = false;
                         DapEvent::new(seq, "terminated", None)
                     }
                     DebugEvent::Output { category, output } => {
@@ -114,9 +122,7 @@ async fn handle_request(
     stdout: &mut tokio::io::Stdout,
     seq: &mut u64,
     backend_tx: &tokio_mpsc::Sender<BackendRequest>,
-    dbg_cmd_tx: &mut Option<std_mpsc::Sender<DebugCommand>>,
-    launched: &mut bool,
-    vm_active: &mut bool,
+    state: &mut FrontendState,
 ) -> bool {
     let Some(ref command) = msg.command else {
         return true;
@@ -129,7 +135,8 @@ async fn handle_request(
                 "supportsFunctionBreakpoints": false,
                 "supportsConditionalBreakpoints": false,
                 "supportsStepBack": false,
-                "supportsSetVariable": false,
+                "supportsSetVariable": true,
+                "supportsEvaluateForHovers": true,
                 "supportsRestartFrame": false,
                 "supportsModulesRequest": false,
                 "supportsExceptionInfoRequest": false,
@@ -164,8 +171,7 @@ async fn handle_request(
                         cmd_rx,
                     })
                     .await;
-                *dbg_cmd_tx = Some(cmd_tx);
-                *launched = true;
+                state.dbg_cmd_tx = Some(cmd_tx);
                 send_response(stdout, seq, msg.seq, "launch", None).await;
             } else {
                 send_error(stdout, seq, msg.seq, "launch", "missing 'program' argument").await;
@@ -192,8 +198,8 @@ async fn handle_request(
                 })
                 .unwrap_or_default();
 
-            let verified_ids = if *vm_active {
-                if let Some(ref tx) = dbg_cmd_tx {
+            let resolved_breakpoints = if state.vm_active {
+                if let Some(ref tx) = state.dbg_cmd_tx {
                     // VM is running or stopped — send via DebugCommand
                     let (reply_tx, reply_rx) = std_mpsc::sync_channel(1);
                     let _ = tx.send(DebugCommand::SetBreakpoints {
@@ -219,16 +225,9 @@ async fn handle_request(
                     .await;
                 reply_rx.recv().await.unwrap_or_default()
             };
-            let breakpoints: Vec<serde_json::Value> = lines
+            let breakpoints: Vec<serde_json::Value> = resolved_breakpoints
                 .iter()
-                .zip(verified_ids.iter())
-                .map(|(line, id)| {
-                    serde_json::json!({
-                        "id": id,
-                        "verified": true,
-                        "line": line,
-                    })
-                })
+                .map(breakpoint_to_json)
                 .collect();
             send_response(
                 stdout,
@@ -241,7 +240,8 @@ async fn handle_request(
         }
         "configurationDone" => {
             let _ = backend_tx.send(BackendRequest::ConfigurationDone).await;
-            *vm_active = true;
+            state.vm_active = true;
+            state.vm_suspended = false;
             send_response(stdout, seq, msg.seq, "configurationDone", None).await;
         }
         "threads" => {
@@ -257,8 +257,8 @@ async fn handle_request(
             .await;
         }
         "stackTrace" => {
-            let frames = if *vm_active {
-                if let Some(ref tx) = dbg_cmd_tx {
+            let frames = if state.vm_active {
+                if let Some(ref tx) = state.dbg_cmd_tx {
                     let (reply_tx, reply_rx) = std_mpsc::sync_channel(1);
                     let _ = tx.send(DebugCommand::GetStackTrace { reply: reply_tx });
                     tokio::task::spawn_blocking(move || reply_rx.recv().unwrap_or_default())
@@ -310,8 +310,8 @@ async fn handle_request(
                 .and_then(|a| a.get("frameId"))
                 .and_then(|f| f.as_u64())
                 .unwrap_or(0) as usize;
-            let scopes = if *vm_active {
-                if let Some(ref tx) = dbg_cmd_tx {
+            let scopes = if state.vm_active {
+                if let Some(ref tx) = state.dbg_cmd_tx {
                     let (reply_tx, reply_rx) = std_mpsc::sync_channel(1);
                     let _ = tx.send(DebugCommand::GetScopes {
                         frame_id,
@@ -352,8 +352,8 @@ async fn handle_request(
                 .and_then(|a| a.get("variablesReference"))
                 .and_then(|v| v.as_u64())
                 .unwrap_or(0);
-            let vars = if *vm_active {
-                if let Some(ref tx) = dbg_cmd_tx {
+            let vars = if state.vm_active {
+                if let Some(ref tx) = state.dbg_cmd_tx {
                     let (reply_tx, reply_rx) = std_mpsc::sync_channel(1);
                     let _ = tx.send(DebugCommand::GetVariables {
                         reference,
@@ -388,12 +388,167 @@ async fn handle_request(
             )
             .await;
         }
+        "evaluate" => {
+            if !(state.vm_active && state.vm_suspended) {
+                send_error(
+                    stdout,
+                    seq,
+                    msg.seq,
+                    "evaluate",
+                    "evaluate is only available while execution is stopped",
+                )
+                .await;
+                return true;
+            }
+
+            let expression = msg
+                .arguments
+                .as_ref()
+                .and_then(|a| a.get("expression"))
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            let frame_id = msg
+                .arguments
+                .as_ref()
+                .and_then(|a| a.get("frameId"))
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0) as usize;
+
+            let Some(ref tx) = state.dbg_cmd_tx else {
+                send_error(
+                    stdout,
+                    seq,
+                    msg.seq,
+                    "evaluate",
+                    "debug VM is not available",
+                )
+                .await;
+                return true;
+            };
+
+            let (reply_tx, reply_rx) = std_mpsc::sync_channel(1);
+            let _ = tx.send(DebugCommand::Evaluate {
+                frame_id,
+                expression,
+                reply: reply_tx,
+            });
+            let result = tokio::task::spawn_blocking(move || {
+                reply_rx
+                    .recv()
+                    .unwrap_or_else(|_| Err("debug VM did not reply".to_string()))
+            })
+            .await
+            .unwrap_or_else(|e| Err(format!("evaluate task failed: {e}")));
+
+            match result {
+                Ok(var) => {
+                    send_response(
+                        stdout,
+                        seq,
+                        msg.seq,
+                        "evaluate",
+                        Some(serde_json::json!({
+                            "result": var.value,
+                            "type": var.type_name,
+                            "variablesReference": var.variables_reference,
+                        })),
+                    )
+                    .await;
+                }
+                Err(message) => {
+                    send_error(stdout, seq, msg.seq, "evaluate", &message).await;
+                }
+            }
+        }
+        "setVariable" => {
+            if !(state.vm_active && state.vm_suspended) {
+                send_error(
+                    stdout,
+                    seq,
+                    msg.seq,
+                    "setVariable",
+                    "setVariable is only available while execution is stopped",
+                )
+                .await;
+                return true;
+            }
+
+            let variables_reference = msg
+                .arguments
+                .as_ref()
+                .and_then(|a| a.get("variablesReference"))
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let name = msg
+                .arguments
+                .as_ref()
+                .and_then(|a| a.get("name"))
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            let value_expression = msg
+                .arguments
+                .as_ref()
+                .and_then(|a| a.get("value"))
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+
+            let Some(ref tx) = state.dbg_cmd_tx else {
+                send_error(
+                    stdout,
+                    seq,
+                    msg.seq,
+                    "setVariable",
+                    "debug VM is not available",
+                )
+                .await;
+                return true;
+            };
+
+            let (reply_tx, reply_rx) = std_mpsc::sync_channel(1);
+            let _ = tx.send(DebugCommand::SetVariable {
+                variables_reference,
+                name,
+                value_expression,
+                reply: reply_tx,
+            });
+            let result = tokio::task::spawn_blocking(move || {
+                reply_rx
+                    .recv()
+                    .unwrap_or_else(|_| Err("debug VM did not reply".to_string()))
+            })
+            .await
+            .unwrap_or_else(|e| Err(format!("setVariable task failed: {e}")));
+
+            match result {
+                Ok(var) => {
+                    send_response(
+                        stdout,
+                        seq,
+                        msg.seq,
+                        "setVariable",
+                        Some(serde_json::json!({
+                            "value": var.value,
+                            "type": var.type_name,
+                            "variablesReference": var.variables_reference,
+                        })),
+                    )
+                    .await;
+                }
+                Err(message) => {
+                    send_error(stdout, seq, msg.seq, "setVariable", &message).await;
+                }
+            }
+        }
         "continue" => {
-            if *vm_active {
-                if let Some(ref tx) = dbg_cmd_tx {
+            if state.vm_active {
+                if let Some(ref tx) = state.dbg_cmd_tx {
                     let _ = tx.send(DebugCommand::Continue);
                 }
             }
+            state.vm_suspended = false;
             send_response(
                 stdout,
                 seq,
@@ -404,40 +559,43 @@ async fn handle_request(
             .await;
         }
         "next" => {
-            if *vm_active {
-                if let Some(ref tx) = dbg_cmd_tx {
+            if state.vm_active {
+                if let Some(ref tx) = state.dbg_cmd_tx {
                     let _ = tx.send(DebugCommand::StepOver);
                 }
             }
+            state.vm_suspended = false;
             send_response(stdout, seq, msg.seq, "next", None).await;
         }
         "stepIn" => {
-            if *vm_active {
-                if let Some(ref tx) = dbg_cmd_tx {
+            if state.vm_active {
+                if let Some(ref tx) = state.dbg_cmd_tx {
                     let _ = tx.send(DebugCommand::StepInto);
                 }
             }
+            state.vm_suspended = false;
             send_response(stdout, seq, msg.seq, "stepIn", None).await;
         }
         "stepOut" => {
-            if *vm_active {
-                if let Some(ref tx) = dbg_cmd_tx {
+            if state.vm_active {
+                if let Some(ref tx) = state.dbg_cmd_tx {
                     let _ = tx.send(DebugCommand::StepOut);
                 }
             }
+            state.vm_suspended = false;
             send_response(stdout, seq, msg.seq, "stepOut", None).await;
         }
         "pause" => {
-            if *vm_active {
-                if let Some(ref tx) = dbg_cmd_tx {
+            if state.vm_active {
+                if let Some(ref tx) = state.dbg_cmd_tx {
                     let _ = tx.send(DebugCommand::Pause);
                 }
             }
             send_response(stdout, seq, msg.seq, "pause", None).await;
         }
         "disconnect" => {
-            if *vm_active {
-                if let Some(ref tx) = dbg_cmd_tx {
+            if state.vm_active {
+                if let Some(ref tx) = state.dbg_cmd_tx {
                     let _ = tx.send(DebugCommand::Disconnect);
                 }
             }
@@ -470,6 +628,21 @@ async fn send_response(
     *seq += 1;
     let json = serde_json::to_string(&resp).unwrap();
     let _ = transport::write_message(stdout, &json).await;
+}
+
+fn breakpoint_to_json(bp: &DapBreakpoint) -> serde_json::Value {
+    let mut value = serde_json::json!({
+        "id": bp.id,
+        "verified": bp.verified,
+        "line": bp.line,
+    });
+    if let Some(message) = &bp.message {
+        value
+            .as_object_mut()
+            .unwrap()
+            .insert("message".to_string(), serde_json::json!(message));
+    }
+    value
 }
 
 async fn send_error(
@@ -555,6 +728,10 @@ fn backend_thread(
 
                 // Use the command receiver from the frontend
                 let mut ds = DebugState::new(dbg_event_tx, cmd_rx);
+                ds.set_valid_breakpoint_lines(sema_vm::valid_breakpoint_lines_by_file(
+                    &prog.closure,
+                    &prog.functions,
+                ));
 
                 if stop_on_entry {
                     ds.step_mode = sema_vm::StepMode::StepInto;
@@ -600,17 +777,29 @@ fn backend_thread(
             }
 
             BackendRequest::SetBreakpoints { file, lines, reply } => {
-                // Only used before launch (pending breakpoints)
                 if let Some(ref mut ds) = debug_state {
-                    let ids = ds.set_breakpoints(&file, &lines);
-                    let _ = reply.blocking_send(ids);
+                    let breakpoints = ds.set_breakpoints(&file, &lines);
+                    let _ = reply.blocking_send(breakpoints);
                 } else {
                     // Store for application at launch time, reply immediately
-                    // with placeholder IDs so the frontend doesn't block
+                    // with pending breakpoints so the frontend doesn't block.
                     let count = lines.len();
+                    let pending: Vec<DapBreakpoint> = lines
+                        .iter()
+                        .enumerate()
+                        .map(|(idx, &line)| DapBreakpoint {
+                            id: (idx + 1) as u32,
+                            verified: false,
+                            requested_line: line,
+                            line,
+                            message: Some(
+                                "Breakpoint pending until program is compiled".to_string(),
+                            ),
+                        })
+                        .collect();
                     pending_breakpoints.push((file, lines));
-                    let ids: Vec<u32> = (1..=count as u32).collect();
-                    let _ = reply.blocking_send(ids);
+                    debug_assert_eq!(pending.len(), count);
+                    let _ = reply.blocking_send(pending);
                 }
             }
 

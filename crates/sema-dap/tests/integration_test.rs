@@ -104,6 +104,20 @@ fn wait_for_event(
     false
 }
 
+fn wait_for_event_message(
+    reader: &mut BufReader<impl Read>,
+    event_name: &str,
+    max_messages: usize,
+) -> Option<serde_json::Value> {
+    for _ in 0..max_messages {
+        let msg = read_dap(reader)?;
+        if msg["type"] == "event" && msg["event"] == event_name {
+            return Some(msg);
+        }
+    }
+    None
+}
+
 #[test]
 fn test_dap_initialize_and_disconnect() {
     let binary = sema_binary();
@@ -251,7 +265,7 @@ fn test_dap_breakpoint_and_continue() {
         "setBreakpoints",
         Some(serde_json::json!({
             "source": { "path": program_path.to_string_lossy() },
-            "breakpoints": [{ "line": 2 }],
+            "breakpoints": [{ "line": 3 }],
         })),
     );
     let resp = read_dap(&mut reader).unwrap();
@@ -358,7 +372,7 @@ fn test_dap_breakpoint_after_launch() {
         "setBreakpoints",
         Some(serde_json::json!({
             "source": { "path": program_path.to_string_lossy() },
-            "breakpoints": [{ "line": 2 }],
+            "breakpoints": [{ "line": 3 }],
         })),
     );
     // If it deadlocks, this read will timeout (return None)
@@ -393,6 +407,640 @@ fn test_dap_breakpoint_after_launch() {
     send_dap(&mut stdin, 6, "disconnect", None);
     let _ = read_dap(&mut reader);
 
+    let status = child.wait().expect("failed to wait for child");
+    assert!(status.success());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_dap_breakpoint_on_blank_line_slides_to_executable_line() {
+    let binary = sema_binary();
+
+    let dir = unique_temp_dir("bp_slide");
+    let program_path = dir.join("test_bp_slide.sema");
+    std::fs::write(&program_path, "(define x 1)\n\n; comment\n(+ x 2)\n").unwrap();
+
+    let mut child = Command::new(&binary)
+        .arg("dap")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap_or_else(|e| panic!("failed to spawn {binary}: {e}"));
+
+    let mut stdin = child.stdin.take().unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let mut reader = BufReader::new(stdout);
+
+    send_dap(&mut stdin, 1, "initialize", Some(serde_json::json!({})));
+    let _resp = read_dap(&mut reader).unwrap();
+    let _event = read_dap(&mut reader).unwrap();
+
+    send_dap(
+        &mut stdin,
+        2,
+        "launch",
+        Some(serde_json::json!({
+            "program": program_path.to_string_lossy(),
+        })),
+    );
+    let resp = read_dap(&mut reader).unwrap();
+    assert_eq!(resp["command"], "launch");
+    assert_eq!(resp["success"], true);
+
+    send_dap(
+        &mut stdin,
+        3,
+        "setBreakpoints",
+        Some(serde_json::json!({
+            "source": { "path": program_path.to_string_lossy() },
+            "breakpoints": [{ "line": 3 }],
+        })),
+    );
+    let resp = read_dap(&mut reader).unwrap();
+    assert_eq!(resp["command"], "setBreakpoints");
+    assert_eq!(resp["success"], true);
+    let bp = &resp["body"]["breakpoints"][0];
+    assert_eq!(bp["verified"], true);
+    assert_eq!(bp["line"], 4);
+    assert!(
+        bp["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("line 4"),
+        "slid breakpoint should explain resolved line: {bp}"
+    );
+
+    send_dap(&mut stdin, 4, "configurationDone", None);
+    let resp = read_dap(&mut reader).unwrap();
+    assert_eq!(resp["command"], "configurationDone");
+    assert_eq!(resp["success"], true);
+
+    let event = wait_for_event_message(&mut reader, "stopped", 50)
+        .expect("should receive stopped event at slid breakpoint");
+    assert_eq!(event["body"]["reason"], "breakpoint");
+
+    send_dap(&mut stdin, 5, "continue", Some(serde_json::json!({})));
+    let _resp = read_dap(&mut reader).unwrap();
+    assert!(wait_for_event(&mut reader, "terminated", 50));
+
+    send_dap(&mut stdin, 6, "disconnect", None);
+    let _ = read_dap(&mut reader);
+    let status = child.wait().expect("failed to wait for child");
+    assert!(status.success());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_dap_evaluate_and_set_variable_while_stopped() {
+    let binary = sema_binary();
+
+    let dir = unique_temp_dir("eval_set");
+    let program_path = dir.join("test_eval_set.sema");
+    std::fs::write(
+        &program_path,
+        "(define global 5)\n(define (f x)\n  (+ x global))\n(f 10)\n",
+    )
+    .unwrap();
+
+    let mut child = Command::new(&binary)
+        .arg("dap")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap_or_else(|e| panic!("failed to spawn {binary}: {e}"));
+
+    let mut stdin = child.stdin.take().unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let mut reader = BufReader::new(stdout);
+
+    send_dap(&mut stdin, 1, "initialize", Some(serde_json::json!({})));
+    let init = read_dap(&mut reader).unwrap();
+    assert_eq!(init["body"]["supportsEvaluateForHovers"], true);
+    assert_eq!(init["body"]["supportsSetVariable"], true);
+    let _event = read_dap(&mut reader).unwrap();
+
+    send_dap(
+        &mut stdin,
+        2,
+        "setBreakpoints",
+        Some(serde_json::json!({
+            "source": { "path": program_path.to_string_lossy() },
+            "breakpoints": [{ "line": 3 }],
+        })),
+    );
+    let _resp = read_dap(&mut reader).unwrap();
+
+    send_dap(
+        &mut stdin,
+        3,
+        "launch",
+        Some(serde_json::json!({
+            "program": program_path.to_string_lossy(),
+        })),
+    );
+    let resp = read_dap(&mut reader).unwrap();
+    assert_eq!(resp["command"], "launch");
+    assert_eq!(resp["success"], true);
+
+    send_dap(&mut stdin, 4, "configurationDone", None);
+    let resp = read_dap(&mut reader).unwrap();
+    assert_eq!(resp["command"], "configurationDone");
+    assert_eq!(resp["success"], true);
+    wait_for_event_message(&mut reader, "stopped", 50).expect("should stop at breakpoint");
+
+    send_dap(&mut stdin, 5, "stackTrace", Some(serde_json::json!({})));
+    let resp = read_dap(&mut reader).unwrap();
+    let frame_id = resp["body"]["stackFrames"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|frame| frame["name"] == "f")
+        .and_then(|frame| frame["id"].as_u64())
+        .expect("stack trace should include f frame");
+
+    send_dap(
+        &mut stdin,
+        6,
+        "evaluate",
+        Some(serde_json::json!({
+            "expression": "(+ x global)",
+            "frameId": frame_id,
+            "context": "watch",
+        })),
+    );
+    let resp = read_dap(&mut reader).unwrap();
+    assert_eq!(resp["command"], "evaluate");
+    assert_eq!(resp["success"], true);
+    assert_eq!(resp["body"]["result"], "15");
+    assert_eq!(resp["body"]["type"], "int");
+
+    send_dap(
+        &mut stdin,
+        7,
+        "scopes",
+        Some(serde_json::json!({ "frameId": frame_id })),
+    );
+    let resp = read_dap(&mut reader).unwrap();
+    let locals_ref = resp["body"]["scopes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|scope| scope["name"] == "Locals")
+        .and_then(|scope| scope["variablesReference"].as_u64())
+        .expect("locals scope should exist");
+
+    send_dap(
+        &mut stdin,
+        8,
+        "setVariable",
+        Some(serde_json::json!({
+            "variablesReference": locals_ref,
+            "name": "x",
+            "value": "32",
+        })),
+    );
+    let resp = read_dap(&mut reader).unwrap();
+    assert_eq!(resp["command"], "setVariable");
+    assert_eq!(resp["success"], true);
+    assert_eq!(resp["body"]["value"], "32");
+    assert_eq!(resp["body"]["type"], "int");
+
+    send_dap(
+        &mut stdin,
+        9,
+        "evaluate",
+        Some(serde_json::json!({
+            "expression": "(+ x global)",
+            "frameId": frame_id,
+            "context": "watch",
+        })),
+    );
+    let resp = read_dap(&mut reader).unwrap();
+    assert_eq!(resp["success"], true);
+    assert_eq!(resp["body"]["result"], "37");
+
+    send_dap(&mut stdin, 10, "continue", Some(serde_json::json!({})));
+    let _resp = read_dap(&mut reader).unwrap();
+    assert!(wait_for_event(&mut reader, "terminated", 50));
+
+    send_dap(&mut stdin, 11, "disconnect", None);
+    let _ = read_dap(&mut reader);
+    let status = child.wait().expect("failed to wait for child");
+    assert!(status.success());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_dap_evaluate_before_execution_returns_error() {
+    let binary = sema_binary();
+
+    let mut child = Command::new(&binary)
+        .arg("dap")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap_or_else(|e| panic!("failed to spawn {binary}: {e}"));
+
+    let mut stdin = child.stdin.take().unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let mut reader = BufReader::new(stdout);
+
+    send_dap(&mut stdin, 1, "initialize", Some(serde_json::json!({})));
+    let _resp = read_dap(&mut reader).unwrap();
+    let _event = read_dap(&mut reader).unwrap();
+
+    send_dap(
+        &mut stdin,
+        2,
+        "evaluate",
+        Some(serde_json::json!({
+            "expression": "x",
+            "frameId": 0,
+        })),
+    );
+    let resp = read_dap_timeout(&mut reader, Duration::from_secs(2))
+        .expect("evaluate before execution should return immediately");
+    assert_eq!(resp["command"], "evaluate");
+    assert_eq!(resp["success"], false);
+
+    send_dap(&mut stdin, 3, "disconnect", None);
+    let _ = read_dap(&mut reader);
+    let status = child.wait().expect("failed to wait for child");
+    assert!(status.success());
+}
+
+#[test]
+fn test_dap_named_upvalue_evaluate_and_set_variable_while_stopped() {
+    let binary = sema_binary();
+
+    let dir = unique_temp_dir("named_upvalue");
+    let program_path = dir.join("test_named_upvalue.sema");
+    std::fs::write(
+        &program_path,
+        "(define (make-adder base)\n  (lambda (x)\n    (+ base x)))\n(define add5 (make-adder 5))\n(add5 10)\n",
+    )
+    .unwrap();
+
+    let mut child = Command::new(&binary)
+        .arg("dap")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap_or_else(|e| panic!("failed to spawn {binary}: {e}"));
+
+    let mut stdin = child.stdin.take().unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let mut reader = BufReader::new(stdout);
+
+    send_dap(&mut stdin, 1, "initialize", Some(serde_json::json!({})));
+    let _resp = read_dap(&mut reader).unwrap();
+    let _event = read_dap(&mut reader).unwrap();
+
+    send_dap(
+        &mut stdin,
+        2,
+        "setBreakpoints",
+        Some(serde_json::json!({
+            "source": { "path": program_path.to_string_lossy() },
+            "breakpoints": [{ "line": 3 }],
+        })),
+    );
+    let _resp = read_dap(&mut reader).unwrap();
+
+    send_dap(
+        &mut stdin,
+        3,
+        "launch",
+        Some(serde_json::json!({
+            "program": program_path.to_string_lossy(),
+        })),
+    );
+    let resp = read_dap(&mut reader).unwrap();
+    assert_eq!(resp["success"], true);
+
+    send_dap(&mut stdin, 4, "configurationDone", None);
+    let resp = read_dap(&mut reader).unwrap();
+    assert_eq!(resp["success"], true);
+    wait_for_event_message(&mut reader, "stopped", 50).expect("should stop at breakpoint");
+
+    send_dap(&mut stdin, 5, "stackTrace", Some(serde_json::json!({})));
+    let resp = read_dap(&mut reader).unwrap();
+    let frame_id = resp["body"]["stackFrames"][0]["id"].as_u64().unwrap();
+
+    send_dap(
+        &mut stdin,
+        6,
+        "scopes",
+        Some(serde_json::json!({ "frameId": frame_id })),
+    );
+    let resp = read_dap(&mut reader).unwrap();
+    let closure_ref = resp["body"]["scopes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|scope| scope["name"] == "Closure")
+        .and_then(|scope| scope["variablesReference"].as_u64())
+        .expect("closure scope should exist");
+
+    send_dap(
+        &mut stdin,
+        7,
+        "variables",
+        Some(serde_json::json!({ "variablesReference": closure_ref })),
+    );
+    let resp = read_dap(&mut reader).unwrap();
+    let upvalues = resp["body"]["variables"].as_array().unwrap();
+    assert!(
+        upvalues
+            .iter()
+            .any(|var| var["name"] == "base" && var["value"] == "5"),
+        "Closure scope should expose lexical upvalue name: {upvalues:?}"
+    );
+
+    send_dap(
+        &mut stdin,
+        8,
+        "evaluate",
+        Some(serde_json::json!({
+            "expression": "(+ base x)",
+            "frameId": frame_id,
+            "context": "watch",
+        })),
+    );
+    let resp = read_dap(&mut reader).unwrap();
+    assert_eq!(resp["success"], true);
+    assert_eq!(resp["body"]["result"], "15");
+
+    send_dap(
+        &mut stdin,
+        9,
+        "setVariable",
+        Some(serde_json::json!({
+            "variablesReference": closure_ref,
+            "name": "base",
+            "value": "20",
+        })),
+    );
+    let resp = read_dap(&mut reader).unwrap();
+    assert_eq!(resp["success"], true);
+    assert_eq!(resp["body"]["value"], "20");
+
+    send_dap(
+        &mut stdin,
+        10,
+        "evaluate",
+        Some(serde_json::json!({
+            "expression": "(+ base x)",
+            "frameId": frame_id,
+            "context": "watch",
+        })),
+    );
+    let resp = read_dap(&mut reader).unwrap();
+    assert_eq!(resp["success"], true);
+    assert_eq!(resp["body"]["result"], "30");
+
+    send_dap(&mut stdin, 11, "continue", Some(serde_json::json!({})));
+    let _resp = read_dap(&mut reader).unwrap();
+    assert!(wait_for_event(&mut reader, "terminated", 50));
+
+    send_dap(&mut stdin, 12, "disconnect", None);
+    let _ = read_dap(&mut reader);
+    let status = child.wait().expect("failed to wait for child");
+    assert!(status.success());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_dap_variables_expand_evaluate_result_lazily() {
+    let binary = sema_binary();
+
+    let dir = unique_temp_dir("compound_expand");
+    let program_path = dir.join("test_compound_expand.sema");
+    std::fs::write(
+        &program_path,
+        "(define (f xs)\n  (list xs))\n(f (list 1 (list 2 3)))\n",
+    )
+    .unwrap();
+
+    let mut child = Command::new(&binary)
+        .arg("dap")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap_or_else(|e| panic!("failed to spawn {binary}: {e}"));
+
+    let mut stdin = child.stdin.take().unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let mut reader = BufReader::new(stdout);
+
+    send_dap(&mut stdin, 1, "initialize", Some(serde_json::json!({})));
+    let _resp = read_dap(&mut reader).unwrap();
+    let _event = read_dap(&mut reader).unwrap();
+
+    send_dap(
+        &mut stdin,
+        2,
+        "setBreakpoints",
+        Some(serde_json::json!({
+            "source": { "path": program_path.to_string_lossy() },
+            "breakpoints": [{ "line": 2 }],
+        })),
+    );
+    let _resp = read_dap(&mut reader).unwrap();
+
+    send_dap(
+        &mut stdin,
+        3,
+        "launch",
+        Some(serde_json::json!({
+            "program": program_path.to_string_lossy(),
+        })),
+    );
+    let resp = read_dap(&mut reader).unwrap();
+    assert_eq!(resp["success"], true);
+
+    send_dap(&mut stdin, 4, "configurationDone", None);
+    let resp = read_dap(&mut reader).unwrap();
+    assert_eq!(resp["success"], true);
+    wait_for_event_message(&mut reader, "stopped", 50).expect("should stop at breakpoint");
+
+    send_dap(&mut stdin, 5, "stackTrace", Some(serde_json::json!({})));
+    let resp = read_dap(&mut reader).unwrap();
+    let frame_id = resp["body"]["stackFrames"][0]["id"].as_u64().unwrap();
+
+    send_dap(
+        &mut stdin,
+        6,
+        "evaluate",
+        Some(serde_json::json!({
+            "expression": "xs",
+            "frameId": frame_id,
+            "context": "watch",
+        })),
+    );
+    let resp = read_dap(&mut reader).unwrap();
+    assert_eq!(resp["success"], true);
+    let xs_ref = resp["body"]["variablesReference"]
+        .as_u64()
+        .expect("evaluate result should include variablesReference");
+    assert!(
+        xs_ref > 0,
+        "compound evaluate result should be expandable: {resp}"
+    );
+
+    send_dap(
+        &mut stdin,
+        7,
+        "variables",
+        Some(serde_json::json!({ "variablesReference": xs_ref })),
+    );
+    let resp = read_dap(&mut reader).unwrap();
+    let children = resp["body"]["variables"].as_array().unwrap();
+    assert_eq!(children.len(), 2);
+    assert_eq!(children[0]["name"], "[0]");
+    assert_eq!(children[0]["value"], "1");
+    assert_eq!(children[1]["name"], "[1]");
+    let nested_ref = children[1]["variablesReference"].as_u64().unwrap();
+    assert!(nested_ref > 0);
+
+    send_dap(
+        &mut stdin,
+        8,
+        "variables",
+        Some(serde_json::json!({ "variablesReference": nested_ref })),
+    );
+    let resp = read_dap(&mut reader).unwrap();
+    let nested = resp["body"]["variables"].as_array().unwrap();
+    assert_eq!(nested.len(), 2);
+    assert_eq!(nested[0]["value"], "2");
+    assert_eq!(nested[1]["value"], "3");
+
+    send_dap(&mut stdin, 9, "continue", Some(serde_json::json!({})));
+    let _resp = read_dap(&mut reader).unwrap();
+    assert!(wait_for_event(&mut reader, "terminated", 50));
+
+    send_dap(&mut stdin, 10, "disconnect", None);
+    let _ = read_dap(&mut reader);
+    let status = child.wait().expect("failed to wait for child");
+    assert!(status.success());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_dap_variables_expand_record_fields_by_name() {
+    let binary = sema_binary();
+
+    let dir = unique_temp_dir("record_expand");
+    let program_path = dir.join("test_record_expand.sema");
+    std::fs::write(
+        &program_path,
+        "\
+(define-record-type point (make-point x y) point? (x point-x) (y point-y))
+(define (f p)
+  p)
+(f (make-point 3 4))
+",
+    )
+    .unwrap();
+
+    let mut child = Command::new(&binary)
+        .arg("dap")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap_or_else(|e| panic!("failed to spawn {binary}: {e}"));
+
+    let mut stdin = child.stdin.take().unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let mut reader = BufReader::new(stdout);
+
+    send_dap(&mut stdin, 1, "initialize", Some(serde_json::json!({})));
+    let _resp = read_dap(&mut reader).unwrap();
+    let _event = read_dap(&mut reader).unwrap();
+
+    send_dap(
+        &mut stdin,
+        2,
+        "setBreakpoints",
+        Some(serde_json::json!({
+            "source": { "path": program_path.to_string_lossy() },
+            "breakpoints": [{ "line": 3 }],
+        })),
+    );
+    let _resp = read_dap(&mut reader).unwrap();
+
+    send_dap(
+        &mut stdin,
+        3,
+        "launch",
+        Some(serde_json::json!({
+            "program": program_path.to_string_lossy(),
+        })),
+    );
+    let resp = read_dap(&mut reader).unwrap();
+    assert_eq!(resp["success"], true);
+
+    send_dap(&mut stdin, 4, "configurationDone", None);
+    let resp = read_dap(&mut reader).unwrap();
+    assert_eq!(resp["success"], true);
+    wait_for_event_message(&mut reader, "stopped", 50).expect("should stop at breakpoint");
+
+    send_dap(&mut stdin, 5, "stackTrace", Some(serde_json::json!({})));
+    let resp = read_dap(&mut reader).unwrap();
+    let frame_id = resp["body"]["stackFrames"][0]["id"].as_u64().unwrap();
+
+    send_dap(
+        &mut stdin,
+        6,
+        "evaluate",
+        Some(serde_json::json!({
+            "expression": "(make-point 3 4)",
+            "frameId": frame_id,
+            "context": "watch",
+        })),
+    );
+    let resp = read_dap(&mut reader).unwrap();
+    assert_eq!(resp["success"], true);
+    let point_ref = resp["body"]["variablesReference"]
+        .as_u64()
+        .expect("record evaluate result should include variablesReference");
+    assert!(
+        point_ref > 0,
+        "record evaluate result should be expandable: {resp}"
+    );
+
+    send_dap(
+        &mut stdin,
+        7,
+        "variables",
+        Some(serde_json::json!({ "variablesReference": point_ref })),
+    );
+    let resp = read_dap(&mut reader).unwrap();
+    assert_eq!(resp["success"], true);
+    let fields = resp["body"]["variables"].as_array().unwrap();
+    assert_eq!(fields.len(), 2);
+    assert_eq!(fields[0]["name"], "x");
+    assert_eq!(fields[0]["value"], "3");
+    assert_eq!(fields[1]["name"], "y");
+    assert_eq!(fields[1]["value"], "4");
+
+    send_dap(&mut stdin, 8, "continue", Some(serde_json::json!({})));
+    let _resp = read_dap(&mut reader).unwrap();
+    assert!(wait_for_event(&mut reader, "terminated", 50));
+
+    send_dap(&mut stdin, 9, "disconnect", None);
+    let _ = read_dap(&mut reader);
     let status = child.wait().expect("failed to wait for child");
     assert!(status.success());
 

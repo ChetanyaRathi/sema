@@ -165,6 +165,7 @@ pub struct LambdaDef<V> {
     pub rest: Option<Spur>,
     pub body: Vec<Expr<V>>,
     pub upvalues: Vec<UpvalueDesc>,
+    pub upvalue_names: Vec<Spur>,
     pub n_locals: u16,
 }
 

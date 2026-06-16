@@ -73,7 +73,7 @@ class SemaDebugAdapterDescriptorFactoryTest : LightPlatformTestCase() {
         assertEquals("launch", params["request"])
         assertEquals("/work/main.sema", params["program"])
         assertEquals("/work", params["cwd"])
-        assertEquals(true, params["stopOnEntry"])
+        assertEquals(false, params["stopOnEntry"])
     }
 
     @Test
@@ -84,7 +84,7 @@ class SemaDebugAdapterDescriptorFactoryTest : LightPlatformTestCase() {
         assertTrue("should be a launch request", content.contains("\"request\": \"launch\""))
         assertTrue("program should resolve to the open file", content.contains("\"program\": \"\${file}\""))
         assertTrue("cwd should resolve to the workspace folder", content.contains("\"cwd\": \"\${workspaceFolder}\""))
-        assertTrue("should stop on entry", content.contains("\"stopOnEntry\": true"))
+        assertTrue("should not stop on entry by default", content.contains("\"stopOnEntry\": false"))
         assertTrue("should target the Sema DAP server", content.contains("\"type\": \"sema-dap\""))
     }
 }

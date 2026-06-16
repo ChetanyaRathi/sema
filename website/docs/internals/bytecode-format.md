@@ -81,7 +81,7 @@ All multi-byte integers are **little-endian**. All strings are **UTF-8**.
 | Offset | Size | Field | Description |
 |--------|------|-------|-------------|
 | 0 | 4 | `magic` | `\x00SEM` (`0x00`, `0x53`, `0x45`, `0x4D`) |
-| 4 | 2 | `format_version` | Bytecode format version (currently `2`) |
+| 4 | 2 | `format_version` | Bytecode format version (currently `3`) |
 | 6 | 2 | `flags` | Bit flags (see below) |
 | 8 | 2 | `sema_major` | Sema version major that produced this file |
 | 10 | 2 | `sema_minor` | Sema version minor |
@@ -208,6 +208,8 @@ The main chunk contains the top-level bytecode and its constant pool.
 │    has_rest: u8                │  0 or 1
 │    n_upvalue_descs: u16        │
 │    upvalue_descs: [UpvalueDesc]│
+│    n_upvalue_names: u16        │
+│    upvalue_names: [u32 name]   │  Lexical names aligned with upvalue_descs
 │    chunk: [Chunk data]         │  Same format as Main Chunk
 │    n_local_names: u16          │
 │    local_names: [(u16 slot,    │  Local variable debug info

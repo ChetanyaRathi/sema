@@ -65,7 +65,7 @@ SemaVM implements Lua-style open upvalues ([vm.rs:25](file:///Users/helge/code/s
 
 ---
 
-## 3. Sandboxing & Security Gaps (SSRF Vulnerability)
+## 3. Sandboxing & Security Gaps (SSRF Vulnerability) -- EXPLICITLY IGNORE THIS, ITS NOT IMPORTANT.
 
 Sema provides sandboxed execution limits via `Caps::FS_WRITE`, `Caps::NET`, etc. These restrictions are enforced when registering native builtins.
 

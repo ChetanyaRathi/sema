@@ -34,6 +34,7 @@ fn eval_roundtrip(input: &str) -> Value {
             name: None,
             chunk: deserialized.chunk,
             upvalue_descs: Vec::new(),
+            upvalue_names: Vec::new(),
             arity: 0,
             has_rest: false,
             local_names: Vec::new(),

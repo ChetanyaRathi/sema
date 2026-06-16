@@ -1,3 +1,4 @@
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::mpsc;
 
@@ -27,6 +28,17 @@ pub struct DapScope {
     pub expensive: bool,
 }
 
+#[derive(Debug, Clone)]
+pub struct DapBreakpoint {
+    pub id: u32,
+    pub verified: bool,
+    pub requested_line: u32,
+    pub line: u32,
+    pub message: Option<String>,
+}
+
+pub const DEBUG_VALUE_REF_BASE: u64 = 1_000_000;
+
 /// Current stepping mode for the debugger.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StepMode {
@@ -50,7 +62,7 @@ pub enum DebugCommand {
     SetBreakpoints {
         file: PathBuf,
         lines: Vec<u32>,
-        reply: mpsc::SyncSender<Vec<u32>>,
+        reply: mpsc::SyncSender<Vec<DapBreakpoint>>,
     },
     GetStackTrace {
         reply: mpsc::SyncSender<Vec<DapStackFrame>>,
@@ -62,6 +74,17 @@ pub enum DebugCommand {
     GetVariables {
         reference: u64,
         reply: mpsc::SyncSender<Vec<DapVariable>>,
+    },
+    Evaluate {
+        frame_id: usize,
+        expression: String,
+        reply: mpsc::SyncSender<Result<DapVariable, String>>,
+    },
+    SetVariable {
+        variables_reference: u64,
+        name: String,
+        value_expression: String,
+        reply: mpsc::SyncSender<Result<DapVariable, String>>,
     },
     Disconnect,
 }
@@ -84,7 +107,7 @@ pub fn scope_upvalues_ref(frame_id: usize) -> u64 {
 
 /// Decode a scope variable reference into frame ID and kind.
 pub fn decode_scope_ref(reference: u64) -> Option<ScopeKind> {
-    if reference == 0 {
+    if reference == 0 || reference >= DEBUG_VALUE_REF_BASE {
         return None;
     }
     if reference % 2 == 1 {
@@ -119,7 +142,9 @@ pub enum StopReason {
 /// Mutable debugger state carried alongside the VM.
 pub struct DebugState {
     /// Active breakpoints: (file_path, line) → breakpoint ID
-    pub breakpoints: std::collections::HashMap<(PathBuf, u32), u32>,
+    pub breakpoints: HashMap<(PathBuf, u32), u32>,
+    /// Valid executable source lines for the currently debugged program, keyed by source file.
+    pub valid_breakpoint_lines: BTreeMap<PathBuf, Vec<u32>>,
     /// Current step mode
     pub step_mode: StepMode,
     /// Frame depth when stepping was initiated
@@ -148,7 +173,8 @@ impl DebugState {
         command_rx: mpsc::Receiver<DebugCommand>,
     ) -> Self {
         DebugState {
-            breakpoints: std::collections::HashMap::new(),
+            breakpoints: HashMap::new(),
+            valid_breakpoint_lines: BTreeMap::new(),
             step_mode: StepMode::Continue,
             step_frame_depth: 0,
             last_stop_line: None,
@@ -168,7 +194,8 @@ impl DebugState {
         let (event_tx, _) = mpsc::channel();
         let (_, command_rx) = mpsc::channel();
         DebugState {
-            breakpoints: std::collections::HashMap::new(),
+            breakpoints: HashMap::new(),
+            valid_breakpoint_lines: BTreeMap::new(),
             step_mode: StepMode::Continue,
             step_frame_depth: 0,
             last_stop_line: None,
@@ -211,11 +238,26 @@ impl DebugState {
     }
 
     /// Set breakpoints for a file, replacing any existing ones for that file.
-    pub fn set_breakpoints(&mut self, file: &PathBuf, lines: &[u32]) -> Vec<u32> {
+    pub fn set_breakpoints(&mut self, file: &PathBuf, lines: &[u32]) -> Vec<DapBreakpoint> {
         let file = std::fs::canonicalize(file).unwrap_or_else(|_| file.clone());
         self.breakpoints.retain(|(f, _), _| f != &file);
 
-        lines
+        let valid_lines = self.valid_breakpoint_lines.get(&file);
+        let resolved: Vec<(u32, Option<u32>)> = lines
+            .iter()
+            .map(|&line| {
+                let resolved = match valid_lines {
+                    Some(valid) => crate::vm::snap_breakpoint_line(line, valid),
+                    None => Some(line),
+                };
+                (line, resolved)
+            })
+            .collect();
+        let resolved_lines: Vec<u32> = resolved
+            .iter()
+            .filter_map(|(_, resolved_line)| *resolved_line)
+            .collect();
+        let ids: Vec<u32> = resolved_lines
             .iter()
             .map(|&line| {
                 let id = self.next_bp_id;
@@ -223,7 +265,33 @@ impl DebugState {
                 self.breakpoints.insert((file.clone(), line), id);
                 id
             })
+            .collect();
+        let mut ids = ids.into_iter();
+
+        resolved
+            .into_iter()
+            .map(|(requested_line, resolved_line)| match resolved_line {
+                Some(line) => DapBreakpoint {
+                    id: ids.next().unwrap_or(0),
+                    verified: true,
+                    requested_line,
+                    line,
+                    message: (line != requested_line)
+                        .then(|| format!("Breakpoint moved to nearest executable line {line}")),
+                },
+                None => DapBreakpoint {
+                    id: 0,
+                    verified: false,
+                    requested_line,
+                    line: requested_line,
+                    message: Some("No executable line exists in this source".to_string()),
+                },
+            })
             .collect()
+    }
+
+    pub fn set_valid_breakpoint_lines(&mut self, lines: BTreeMap<PathBuf, Vec<u32>>) {
+        self.valid_breakpoint_lines = lines;
     }
 }
 

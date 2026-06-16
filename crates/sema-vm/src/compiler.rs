@@ -77,7 +77,7 @@ pub fn compile(
         compiler.emit.emit_op(Op::Nil);
     }
     compiler.emit.emit_op(Op::Return);
-    let (chunk, functions, native_table) = compiler.finish();
+    let (chunk, functions, native_table, _local_names) = compiler.finish();
     Ok(CompileResult {
         chunk,
         functions,
@@ -176,7 +176,11 @@ struct Compiler {
     /// Global names that are (re)defined in this program — intrinsics must not
     /// be emitted for these since the user may have changed the binding.
     redefined_globals: HashSet<Spur>,
+    /// Local slot names for debugger scope inspection.
+    local_names: Vec<(u16, Spur)>,
 }
+
+type CompilerFinish = (Chunk, Vec<Function>, Vec<Spur>, Vec<(u16, Spur)>);
 
 impl Compiler {
     fn new() -> Self {
@@ -192,6 +196,7 @@ impl Compiler {
             native_id_map: hashbrown::HashMap::new(),
             next_cache_slot: 0,
             redefined_globals: HashSet::new(),
+            local_names: Vec::new(),
         }
     }
 
@@ -201,12 +206,20 @@ impl Compiler {
         c
     }
 
-    fn finish(self) -> (Chunk, Vec<Function>, Vec<Spur>) {
+    fn finish(self) -> CompilerFinish {
         let mut chunk = self.emit.into_chunk();
         chunk.n_locals = self.n_locals;
         chunk.exception_table = self.exception_entries;
         chunk.n_global_cache_slots = self.next_cache_slot;
-        (chunk, self.functions, self.native_table)
+        (chunk, self.functions, self.native_table, self.local_names)
+    }
+
+    fn record_local_name(&mut self, vr: &VarRef) {
+        if let VarResolution::Local { slot } = vr.resolution {
+            if !self.local_names.iter().any(|(s, _)| *s == slot) {
+                self.local_names.push((slot, vr.name));
+            }
+        }
     }
 
     /// Allocate a cache slot and return its index.
@@ -373,6 +386,7 @@ impl Compiler {
     }
 
     fn compile_var_store(&mut self, vr: &VarRef) {
+        self.record_local_name(vr);
         match vr.resolution {
             VarResolution::Local { slot } => match slot {
                 0 => self.emit.emit_op(Op::StoreLocal0),
@@ -473,6 +487,12 @@ impl Compiler {
         // Compile the lambda body into a separate function
         let mut inner = Compiler::new();
         inner.n_locals = def.n_locals;
+        for (slot, &name) in def.params.iter().enumerate() {
+            inner.local_names.push((slot as u16, name));
+        }
+        if let Some(rest) = def.rest {
+            inner.local_names.push((def.params.len() as u16, rest));
+        }
 
         // Compile body
         if def.body.is_empty() {
@@ -488,7 +508,7 @@ impl Compiler {
         inner.emit.emit_op(Op::Return);
 
         let func_id = self.functions.len() as u16;
-        let (mut chunk, mut child_functions, _inner_natives) = inner.finish();
+        let (mut chunk, mut child_functions, _inner_natives, local_names) = inner.finish();
 
         // The inner compiler assigned func_ids starting from 0, but child functions
         // will be placed starting at func_id + 1 in our functions vec.
@@ -505,9 +525,10 @@ impl Compiler {
             name: def.name,
             chunk,
             upvalue_descs: def.upvalues.clone(),
+            upvalue_names: def.upvalue_names.clone(),
             arity: def.params.len() as u16,
             has_rest: def.rest.is_some(),
-            local_names: Vec::new(),
+            local_names,
             source_file: None,
             cache_offset: 0,
         };

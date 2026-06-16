@@ -526,6 +526,14 @@ pub fn serialize_function(
     // has_rest: u8
     buf.push(if func.has_rest { 1 } else { 0 });
 
+    if func.upvalue_names.len() != func.upvalue_descs.len() {
+        return Err(SemaError::eval(format!(
+            "function upvalue debug name count ({}) does not match upvalue descriptor count ({})",
+            func.upvalue_names.len(),
+            func.upvalue_descs.len()
+        )));
+    }
+
     // upvalue descriptors
     let n_upvalues = checked_u16(func.upvalue_descs.len(), "upvalue descriptor count")?;
     buf.extend_from_slice(&n_upvalues.to_le_bytes());
@@ -540,6 +548,12 @@ pub fn serialize_function(
                 buf.extend_from_slice(&idx.to_le_bytes());
             }
         }
+    }
+    let n_upvalue_names = checked_u16(func.upvalue_names.len(), "upvalue name count")?;
+    buf.extend_from_slice(&n_upvalue_names.to_le_bytes());
+    for &spur in &func.upvalue_names {
+        let idx = stb.intern_spur(spur);
+        buf.extend_from_slice(&idx.to_le_bytes());
     }
 
     // chunk
@@ -608,6 +622,24 @@ pub fn deserialize_function(
             }
         }
     }
+    let n_upvalue_names = read_u16_le(buf, cursor)? as usize;
+    let mut upvalue_names = Vec::with_capacity(n_upvalue_names);
+    for _ in 0..n_upvalue_names {
+        let name_idx = read_u32_le(buf, cursor)? as usize;
+        if name_idx >= remap.len() {
+            return Err(SemaError::eval(format!(
+                "upvalue name string table index {name_idx} out of range"
+            )));
+        }
+        upvalue_names.push(remap[name_idx]);
+    }
+    if upvalue_names.len() != upvalue_descs.len() {
+        return Err(SemaError::eval(format!(
+            "upvalue name count ({}) does not match upvalue descriptor count ({})",
+            upvalue_names.len(),
+            upvalue_descs.len()
+        )));
+    }
 
     // chunk
     let chunk = deserialize_chunk(buf, cursor, table, remap)?;
@@ -630,6 +662,7 @@ pub fn deserialize_function(
         name,
         chunk,
         upvalue_descs,
+        upvalue_names,
         arity,
         has_rest,
         local_names,
@@ -760,7 +793,7 @@ pub fn remap_indices_to_spurs(code: &mut [u8], remap: &[Spur]) -> Result<(), Sem
 // ── File format constants ─────────────────────────────────────────
 
 const MAGIC: [u8; 4] = [0x00, b'S', b'E', b'M'];
-const FORMAT_VERSION: u16 = 2;
+const FORMAT_VERSION: u16 = 3;
 const SECTION_STRING_TABLE: u16 = 0x01;
 const SECTION_FUNCTION_TABLE: u16 = 0x02;
 const SECTION_MAIN_CHUNK: u16 = 0x03;
@@ -1588,6 +1621,7 @@ mod tests {
             name: Some(intern("my-func")),
             chunk,
             upvalue_descs: vec![UpvalueDesc::ParentLocal(0), UpvalueDesc::ParentUpvalue(1)],
+            upvalue_names: vec![intern("outer-x"), intern("outer-y")],
             arity: 2,
             has_rest: true,
             local_names: vec![(0, intern("x")), (1, intern("y"))],
@@ -1607,9 +1641,12 @@ mod tests {
         assert_eq!(func2.arity, 2);
         assert!(func2.has_rest);
         assert_eq!(func2.upvalue_descs.len(), 2);
+        assert_eq!(func2.upvalue_names.len(), 2);
         assert_eq!(func2.local_names.len(), 2);
         assert!(func2.name.is_some());
         assert_eq!(sema_core::resolve(func2.name.unwrap()), "my-func");
+        assert_eq!(sema_core::resolve(func2.upvalue_names[0]), "outer-x");
+        assert_eq!(sema_core::resolve(func2.upvalue_names[1]), "outer-y");
         assert_eq!(sema_core::resolve(func2.local_names[0].1), "x");
         assert_eq!(sema_core::resolve(func2.local_names[1].1), "y");
     }
@@ -1627,6 +1664,7 @@ mod tests {
             name: None,
             chunk,
             upvalue_descs: vec![],
+            upvalue_names: vec![],
             arity: 0,
             has_rest: false,
             local_names: vec![],
@@ -1691,6 +1729,7 @@ mod tests {
             name: Some(intern("add-one")),
             chunk: fe.into_chunk(),
             upvalue_descs: vec![],
+            upvalue_names: vec![],
             arity: 1,
             has_rest: false,
             local_names: vec![(0, intern("x"))],
@@ -1860,7 +1899,7 @@ mod tests {
         // Valid header but n_sections=0 → missing all required sections
         let mut bytes = vec![0u8; 24];
         bytes[0..4].copy_from_slice(&[0x00, b'S', b'E', b'M']);
-        bytes[4..6].copy_from_slice(&2u16.to_le_bytes()); // format version 2
+        bytes[4..6].copy_from_slice(&FORMAT_VERSION.to_le_bytes());
         bytes[14..16].copy_from_slice(&0u16.to_le_bytes()); // 0 sections
         let result = deserialize_from_bytes(&bytes);
         match &result {
@@ -2027,7 +2066,7 @@ mod tests {
 
         let mut bytes = vec![0u8; 24];
         bytes[0..4].copy_from_slice(&[0x00, b'S', b'E', b'M']);
-        bytes[4..6].copy_from_slice(&1u16.to_le_bytes()); // format version
+        bytes[4..6].copy_from_slice(&FORMAT_VERSION.to_le_bytes());
         bytes[14..16].copy_from_slice(&1u16.to_le_bytes()); // 1 section
                                                             // Section header
         bytes.extend_from_slice(&0x01u16.to_le_bytes()); // string table
@@ -2055,7 +2094,7 @@ mod tests {
         let mut bad_bytes = Vec::new();
         // Header
         bad_bytes.extend_from_slice(&[0x00, b'S', b'E', b'M']); // magic
-        bad_bytes.extend_from_slice(&2u16.to_le_bytes()); // format version
+        bad_bytes.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
         bad_bytes.extend_from_slice(&0u16.to_le_bytes()); // flags
         bad_bytes.extend_from_slice(&0u16.to_le_bytes()); // sema_major
         bad_bytes.extend_from_slice(&0u16.to_le_bytes()); // sema_minor
@@ -2132,7 +2171,7 @@ mod tests {
 
         let mut out = Vec::new();
         out.extend_from_slice(&[0x00, b'S', b'E', b'M']);
-        out.extend_from_slice(&2u16.to_le_bytes()); // format version 2
+        out.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
         out.extend_from_slice(&0u16.to_le_bytes());
         out.extend_from_slice(&0u16.to_le_bytes());
         out.extend_from_slice(&0u16.to_le_bytes());

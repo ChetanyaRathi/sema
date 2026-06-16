@@ -2101,8 +2101,8 @@ impl WasmInterpreter {
     #[wasm_bindgen(js_name = debugGetLocals)]
     pub fn debug_get_locals(&self) -> JsValue {
         DEBUG_SESSION.with(|s| {
-            let session = s.borrow();
-            let Some(ref sess) = *session else {
+            let mut session = s.borrow_mut();
+            let Some(ref mut sess) = *session else {
                 return JsValue::NULL;
             };
             let frame_idx = sess.vm.frame_count().saturating_sub(1);

@@ -2025,6 +2025,7 @@ fn eval_define_record_type(args: &[Value], env: &Env) -> Result<Trampoline, Sema
                 .ok_or_else(|| SemaError::eval("define-record-type: field name must be a symbol"))
         })
         .collect::<Result<_, _>>()?;
+    let field_name_spurs: Vec<Spur> = field_names.iter().map(|name| intern(name)).collect();
     let field_count = field_names.len();
 
     let pred_name = args[2]
@@ -2032,6 +2033,7 @@ fn eval_define_record_type(args: &[Value], env: &Env) -> Result<Trampoline, Sema
         .ok_or_else(|| SemaError::eval("define-record-type: predicate must be a symbol"))?;
 
     let ctor_name_clone = ctor_name.clone();
+    let record_field_names = field_name_spurs.clone();
     env.set_str(
         &ctor_name,
         Value::native_fn(sema_core::NativeFn::simple(
@@ -2046,6 +2048,7 @@ fn eval_define_record_type(args: &[Value], env: &Env) -> Result<Trampoline, Sema
                 }
                 Ok(Value::record(Record {
                     type_tag,
+                    field_names: record_field_names.clone(),
                     fields: args.to_vec(),
                 }))
             },

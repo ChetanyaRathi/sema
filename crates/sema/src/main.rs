@@ -2018,6 +2018,7 @@ fn run_bytecode_bytes(
             name: None,
             chunk: result.chunk,
             upvalue_descs: Vec::new(),
+            upvalue_names: Vec::new(),
             arity: 0,
             has_rest: false,
             local_names: Vec::new(),
