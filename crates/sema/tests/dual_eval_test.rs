@@ -1333,3 +1333,14 @@ dual_eval_error_tests! {
     // previously folded `(+ 1 2)` to 3 and returned it.
     optimizer_rest_param_shadows_builtin: "((lambda (x . +) (+ 1 2)) 9 5)",
 }
+
+// Wide-integer runtime arithmetic: operands beyond the ±2^44 small-int fast-path
+// range, applied via a lambda so the optimizer cannot constant-fold them. This
+// exercises the vm_add/vm_sub/vm_mul fallback helpers at runtime (the small-int
+// fast path and constant folding otherwise hide them). Regression for a coverage
+// gap found by mutation testing (2026-06).
+dual_eval_tests! {
+    wide_int_sub_runtime: "((fn (a b) (- a b)) 100000000000000 1)" => Value::int(99999999999999),
+    wide_int_add_runtime: "((fn (a b) (+ a b)) 100000000000000 1)" => Value::int(100000000000001),
+    wide_int_mul_runtime: "((fn (a b) (* a b)) 100000000000000 2)" => Value::int(200000000000000),
+}
