@@ -141,6 +141,12 @@ const SPECIAL = [
       domain: 'sema.run',
     },
   },
+  {
+    // GitHub repo header / social preview — the brand hero (template defaults).
+    slug: 'github',
+    out: join(WEBSITE, '..', 'assets', 'og-github.jpg'),
+    params: { variant: 'homepage' },
+  },
 ]
 
 mkdirSync(OUT_DIR, { recursive: true })

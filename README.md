@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="https://raw.githubusercontent.com/helgesverre/sema/main/assets/logo.png" alt="Sema" width="640">
+  <img src="https://raw.githubusercontent.com/helgesverre/sema/main/assets/og-github.jpg" alt="Sema — Stop rewriting the agent loop." width="800">
 </p>
 
 <p align="center">
@@ -13,7 +13,9 @@
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-c8a855?style=flat" alt="License"></a>
 </p>
 
-Sema is a Scheme-like Lisp where **prompts are s-expressions**, **conversations are persistent data structures**, and **LLM calls are just another form of evaluation**. It combines a Scheme core with Clojure-style keywords (`:foo`), map literals (`{:key val}`), and vector literals (`[1 2 3]`).
+**Stop rewriting the agent loop.** Every LLM script grows the same scaffolding — retries, caching, cost caps, rate limits, tool dispatch, conversation state. Sema makes that scaffolding the runtime: your script stays the size of its idea, ships as a single binary, and your coding agent already speaks the language.
+
+Sema is a Scheme-like Lisp where **prompts are s-expressions**, **conversations are persistent data structures**, and **LLM calls are just another form of evaluation** — with Clojure-style keywords (`:foo`), map literals (`{:key val}`), and vector literals (`[1 2 3]`).
 
 ## What It Looks Like
 
@@ -288,6 +290,21 @@ Cells share a persistent environment — definitions in earlier cells are visibl
 
 > 📖 Full notebook documentation: **[sema-lang.com/docs/notebook](https://sema-lang.com/docs/notebook.html)**
 
+### Language Tooling
+
+A full toolchain ships in the box — no plugins to assemble:
+
+```bash
+sema fmt script.sema     # Canonical code formatter
+sema lsp                 # Language Server (completions, hover, go-to-def, rename)
+sema dap                 # Debug Adapter (breakpoints, stepping, variable inspection)
+sema mcp                 # Model Context Protocol server for LLM clients
+```
+
+The **MCP server** lets LLM clients (Claude Desktop, Cursor, Claude Code) compile, format, evaluate, and build Sema code — and call your own `deftool` Lisp tools — directly in your environment.
+
+> 📖 [Formatter](https://sema-lang.com/docs/formatter.html) · [LSP](https://sema-lang.com/docs/lsp.html) · [Debugger](https://sema-lang.com/docs/dap.html) · [MCP](https://sema-lang.com/docs/mcp.html)
+
 ## Example Programs
 
 The [`examples/`](https://github.com/helgesverre/sema/tree/main/examples) directory has 50+ programs:
@@ -324,6 +341,7 @@ The [`examples/`](https://github.com/helgesverre/sema/tree/main/examples) direct
 - **Practical Lisp** — closures, TCO, macros, modules, error handling, HTTP, file I/O, regex, JSON, and a comprehensive stdlib
 - **Standalone executables** — `sema build` compiles programs into self-contained binaries with auto-traced imports and bundled assets
 - **Embeddable** — [available on crates.io](https://crates.io/crates/sema-lang), clean Rust crate structure with a builder API
+- **Full toolchain** — formatter, language server (LSP), debugger (DAP), and an MCP server for LLM clients, all built in
 - **Developer-friendly** — REPL with tab completion, structured error messages with hints, and 50+ example programs
 
 ### Why Not Sema?
@@ -345,6 +363,11 @@ crates/
   sema-eval/     Trampoline-based evaluator, special forms, modules
   sema-stdlib/   Built-in functions across many modules
   sema-llm/      LLM provider trait + multi-provider clients
+  sema-docs/     Canonical builtin docs (powers LSP hover + REPL apropos)
+  sema-lsp/      Language Server Protocol implementation
+  sema-dap/      Debug Adapter Protocol server
+  sema-fmt/      Source code formatter
+  sema-mcp/      Model Context Protocol server
   sema-notebook/ Jupyter-inspired notebook interface with browser UI
   sema-wasm/     WebAssembly build for sema.run playground
   sema/          CLI binary: REPL + file runner + standalone builder
