@@ -891,6 +891,13 @@ fn backend_thread(
                     // above remains accurate.
                     interpreter.ctx.set_vm_backend(true);
 
+                    // Initialize the async scheduler so async/await and channels
+                    // work in a debugged program. The program was compiled with
+                    // `compile_program_with_spans`, which yields an empty native
+                    // table; task VMs resolve natives via the shared global env,
+                    // so an empty native table is correct here.
+                    sema_vm::init_scheduler(interpreter.global_env.clone(), Vec::new());
+
                     let result = vm_inst.execute_debug(cl.clone(), &interpreter.ctx, ds);
 
                     // Clear the hooks immediately after execution so any server-side

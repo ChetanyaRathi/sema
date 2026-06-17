@@ -10478,6 +10478,47 @@ fn test_run_semac_file() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A `.semac` program that uses async must run to completion: the bytecode
+/// `run_bytecode_bytes` path initializes the async scheduler before executing,
+/// so `(await (async ...))` resolves instead of erroring with "no async
+/// scheduler registered".
+#[test]
+fn test_run_semac_file_async() {
+    let dir = std::env::temp_dir().join("sema_test_run_semac_async");
+    let _ = std::fs::create_dir_all(&dir);
+    let src = dir.join("async.sema");
+    std::fs::write(&src, r#"(println (await (async (+ 1 2))))"#).unwrap();
+
+    // Compile to a .semac
+    let output = sema_cmd()
+        .args(["compile", src.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "compile failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Run the .semac file (auto-detected). Without the scheduler init this
+    // would fail with "no async scheduler registered".
+    let semac = dir.join("async.semac");
+    let output = sema_cmd().arg(semac.to_str().unwrap()).output().unwrap();
+    assert!(
+        output.status.success(),
+        "running async .semac failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains('3'),
+        "stdout: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn test_disasm_subcommand() {
     let dir = std::env::temp_dir().join("sema_test_disasm");

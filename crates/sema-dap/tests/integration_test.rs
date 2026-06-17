@@ -1117,3 +1117,93 @@ fn test_dap_inspection_after_termination_does_not_hang() {
     let _ = child.wait();
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A debugged program that uses async must run to termination: the DAP backend
+/// initializes the async scheduler before `execute_debug`, so `(await (async
+/// ...))` resolves instead of erroring with "no async scheduler registered".
+#[test]
+fn test_dap_async_program_runs_to_termination() {
+    let binary = sema_binary();
+
+    let dir = unique_temp_dir("async");
+    let program_path = dir.join("test.sema");
+    std::fs::write(&program_path, "(println (await (async (+ 1 2))))\n").unwrap();
+
+    let mut child = Command::new(&binary)
+        .arg("dap")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap_or_else(|e| panic!("failed to spawn {binary}: {e}"));
+
+    let mut stdin = child.stdin.take().unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let mut reader = BufReader::new(stdout);
+
+    // Initialize
+    send_dap(&mut stdin, 1, "initialize", Some(serde_json::json!({})));
+    let _resp = read_dap(&mut reader).unwrap(); // response
+    let _event = read_dap(&mut reader).unwrap(); // initialized event
+
+    // Launch
+    send_dap(
+        &mut stdin,
+        2,
+        "launch",
+        Some(serde_json::json!({
+            "program": program_path.to_string_lossy(),
+        })),
+    );
+    let resp = read_dap(&mut reader).unwrap();
+    assert_eq!(resp["command"], "launch");
+    assert_eq!(resp["success"], true);
+
+    // ConfigurationDone — triggers execution.
+    send_dap(&mut stdin, 3, "configurationDone", None);
+    let resp = read_dap(&mut reader).unwrap();
+    assert_eq!(resp["command"], "configurationDone");
+    assert_eq!(resp["success"], true);
+
+    // Scan messages until terminated, collecting any stdout output. The async
+    // program must complete (no "no async scheduler registered" error on stderr)
+    // and print the resolved value "3".
+    let mut saw_terminated = false;
+    let mut stdout_text = String::new();
+    for _ in 0..50 {
+        let Some(msg) = read_dap(&mut reader) else {
+            break;
+        };
+        if msg["type"] == "event" {
+            match msg["event"].as_str() {
+                Some("output") => {
+                    let category = msg["body"]["category"].as_str().unwrap_or("");
+                    if let Some(out) = msg["body"]["output"].as_str() {
+                        if category != "stderr" {
+                            stdout_text.push_str(out);
+                        }
+                        assert!(
+                            !out.contains("no async scheduler registered"),
+                            "async program emitted a scheduler error: {out}"
+                        );
+                    }
+                }
+                Some("terminated") => {
+                    saw_terminated = true;
+                    break;
+                }
+                _ => {}
+            }
+        }
+    }
+    assert!(saw_terminated, "should receive terminated event");
+    assert!(
+        stdout_text.contains('3'),
+        "async program should print resolved value 3, got: {stdout_text:?}"
+    );
+
+    send_dap(&mut stdin, 4, "disconnect", None);
+    let _ = read_dap(&mut reader);
+    let _ = child.wait();
+    let _ = std::fs::remove_dir_all(&dir);
+}
