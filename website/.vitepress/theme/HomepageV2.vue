@@ -425,7 +425,7 @@ messages = [{<span class="c-str">"role"</span>: <span class="c-str">"user"</span
 
     <footer>
       <div class="wrap foot-in">
-        <span><span style="color:var(--gold)">(</span>sema<span style="color:var(--gold)">)</span> — MIT</span>
+        <span><span style="color:var(--gold)">(</span>sema<span style="color:var(--gold)">)</span></span>
         <span>
         <a href="/docs/">Docs</a> ·
         <a href="/docs/internals/lisp-comparison.html">Benchmarks</a> ·
