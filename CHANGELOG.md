@@ -1,6 +1,8 @@
 # Changelog
 
-## Unreleased
+## 1.17.0
+
+Tooling + VM release. Adds a built-in **MCP server** (`sema mcp`) so LLM clients can drive Sema in the host environment, makes the **DAP debugger** usable by default with verified breakpoints, evaluate/setVariable, and richer variable inspection, and runs **`(load …)` on the bytecode VM** so async/channels work in loaded files. The bytecode format moves to **v4** (now stack-verified on load, closing a memory-safety hole for untrusted `.semac`). Hardening across the new MCP/DAP surfaces and the formatter API followed an adversarial review and two rounds of mutation testing.
 
 ### Fixed
 
