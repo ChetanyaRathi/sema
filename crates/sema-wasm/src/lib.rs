@@ -1988,8 +1988,14 @@ impl WasmInterpreter {
             debug.set_breakpoints(&source_file, &snapped_bp_lines);
         }
 
-        // Stop on entry
-        debug.step_mode = sema_vm::StepMode::StepInto;
+        // If breakpoints are set, run straight to the first one. With no
+        // breakpoints, stop on entry so the user can step from the top
+        // (otherwise Debug would behave identically to Run).
+        debug.step_mode = if snapped_bp_lines.is_empty() {
+            sema_vm::StepMode::StepInto
+        } else {
+            sema_vm::StepMode::Continue
+        };
         debug.instructions_remaining = WASM_DEBUG_INSTRUCTION_BUDGET;
 
         // Helper: attach validLines and breakpoints to a debug response
