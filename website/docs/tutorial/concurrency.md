@@ -77,12 +77,23 @@ Create a channel with a specific buffer capacity. The default capacity is 1:
 ```sema
 (define ch (channel/new 1))
 
-(async
-  (channel/send ch "message from worker"))
+;; A worker task sends a message:
+(async (channel/send ch "message from worker"))
 
-(define msg (channel/recv ch))
-(println msg) ; => "message from worker"
+;; `channel/recv` only blocks (yields) inside an async task, so receive
+;; from within one and await the result:
+(await
+  (async
+    (let ((msg (channel/recv ch)))
+      (println msg) ; => "message from worker"
+      msg)))
 ```
+
+> [!NOTE]
+> Channel operations only block by yielding to the scheduler, which runs
+> async tasks. Calling `channel/recv` on an empty channel (or `channel/send`
+> on a full one) from the **top level** — outside any `async` task — raises an
+> error instead of waiting, because there is no task to suspend.
 
 ### Closing Channels (`channel/close`)
 When you are finished sending data, close the channel. Any subsequent sends will raise an error. Receivers waiting on a closed, empty channel will receive `nil`:
@@ -117,12 +128,13 @@ Here is a complete example of a producer task sending a series of numbers to a c
 
 ## 5. Async inside Higher-Order Functions
 
-Sema's standard library functions like `map`, `filter`, and `for-each` support async callbacks. However, if you are passing a yielding function directly (like `channel/recv`), you must wrap it in a lambda:
+Sema's standard library functions like `map`, `filter`, and `for-each` support async callbacks. However, if you pass a *yielding* native (like `channel/recv`) directly and it actually needs to suspend, the runtime cannot yield through it. Wrap it in a lambda so the yield can suspend cleanly:
 
 ```sema
-;; ❌ This will raise an error (yielding native passed directly):
-(map channel/recv (list ch1 ch2))
+;; ❌ Inside an async task, if `channel/recv` must wait for a value it raises:
+;;    "yielding native passed directly to a higher-order function"
+(async (map channel/recv (list ch1 ch2)))
 
-;;  This works (wrapped in a lambda):
-(map (fn (c) (channel/recv c)) (list ch1 ch2))
+;; ✓ Wrap the yielding call in a lambda:
+(async (map (fn (c) (channel/recv c)) (list ch1 ch2)))
 ```
