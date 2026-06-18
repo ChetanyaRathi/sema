@@ -1,66 +1,72 @@
-# Open bug items
+# Open bug items — decided plan (2026-06-18)
 
-The single list of genuinely-open findings as of 2026-06-18, after the triage
-(`2026-06-18-triage.md`) and the two fix passes that closed 22 findings. Every
-other entry from the 2026-05-29 audit and the old standalone write-ups is
-**fixed** — see git history + the triage record. Items below are split into
-"needs a decision" (we want your call before touching them) and "planned, just
-needs doing".
+Remaining findings after the triage (`2026-06-18-triage.md`) and the two fix
+passes that closed 22 findings. Directions below were decided with the maintainer
+on 2026-06-18. Everything not listed here is fixed (see git history + triage).
 
 ---
 
-## Needs a decision
+## Quick — doc / config only
 
-### C1 — `set!` through stdlib HOF callbacks silently lost on the VM  ·  HIGH
-`crates/sema-vm/src/vm.rs`. `(let ((c 0)) (map (fn (x) (set! c (+ c x))) '(1 2 3)) c)` returns `6` on the tree-walker but `0` on the VM: the VM closes open upvalues before every non-VM call, so mutations made inside stdlib HOF callbacks don't flow back. Silent wrong results + backend divergence.
-- **Option 1** — stop closing upvalues before non-VM calls; rely on the open-cell check on every upvalue access. Smaller change, reintroduces a per-access branch (needs perf measurement).
-- **Option 2** — route HOF callbacks in-VM (extend `call_callback` to carry VM context), eliminating the fresh-VM fallback. Architecturally cleaner, larger.
+### time/parse naive datetimes  →  **document as UTC**
+`crates/sema-stdlib/src/datetime.rs`. No behavior change. Document that naive
+(offset-less) strings are interpreted as UTC; recommend explicit-offset strings
+for other zones. Update `website/docs/stdlib/datetime.md`. (The old masking test
+range can stay; add a test asserting UTC interpretation explicitly.)
 
-### CORE-2 — every named `define` creates an Rc cycle (env → lambda → env)  ·  memory leak
-`crates/sema-eval/src/special_forms.rs` (eval_define) + `crates/sema-core/src/value.rs` (Env). Self-referential closures never drop → unbounded growth in long REPL/notebook/server sessions.
-- **(A)** `Weak` ref for the lambda's captured env (preserves self-recursion + clean semantics; most complex).
-- **(B)** post-define patch removing the lambda from its own captured env (loses self-recursion).
-- **(C)** accept the cycle as intended GC-free design, document it, add a REPL memory-bound test.
+### NB-2 notebook auth  →  **localhost-only + document**
+`crates/sema-notebook/src/server.rs`. Bind to `127.0.0.1` by default; document
+that the notebook server is a trusted-local tool and exposing it to a network is
+the operator's responsibility. No auth layer.
 
-### time/parse treats all naive datetimes as UTC  ·  correctness
-`crates/sema-stdlib/src/datetime.rs:36-42`. `(time/parse "2024-01-15 12:30:00")` returns the same timestamp regardless of `$TZ`. The old `test_time_parse` was widened to *mask* this rather than fix it.
-- **(A)** document that naive strings are interpreted as UTC (no code change; predictable, simplest).
-- **(B)** add an optional timezone argument, defaulting to UTC.
-- **(C)** interpret naive strings in the machine's local timezone (matches some user intuition; non-deterministic across machines/CI).
-
-### NB-2 — notebook server has no auth on mutating endpoints  ·  security
-`crates/sema-notebook/src/server.rs`. `/vfs/write` and other mutating routes are unauthenticated. Fine for trusted localhost, dangerous if bound to a non-loopback interface.
-- **(A)** document as localhost-only + bind to 127.0.0.1 by default (no auth; minimal).
-- **(B)** add a token/secret gate on mutating endpoints.
-
-### WASM-4 — `register_wasm_io` is a single ~1093-line function  ·  reliability
-`crates/sema-wasm/src/lib.rs`. Large single function carries a known V8 Turboshaft large-function miscompilation/crash risk on ARM64 (see the chromium-wasm-crash note). Pure refactor (split into smaller fns), no behavior change, but large and touches the hot WASM registration path.
-- **(A)** refactor now (mitigates the crash risk; large diff, careful review).
-- **(B)** defer until/unless the crash recurs.
-
-### STD-10 — `db/exec-batch` is an SQL-injection surface  ·  security (design)
-`crates/sema-stdlib/src/*` (sqlite). Batch exec takes raw SQL with no parameterization.
-- **(A)** document it's only for static SQL + steer users to `db/exec` with params (no code change).
-- **(B)** add guardrails / reject interpolated input (harder; may break legitimate uses).
-
-### eval-tw oracle circularity in dual-eval tests  ·  test integrity
-`crates/sema/tests/dual_eval_*.rs`. Many tests use the tree-walker to build the *expected* value, so a shared reader/fundamental-op bug would be invisible. Partial fix exists.
-- **(A)** complete the conversion of foundational ops to hand-constructed literal expected values (~23 ops; medium).
-- **(B)** accept + document as a known limitation (the VM variant still catches divergence on higher-level ops).
-
-### platform-specific-windows — tests assume Unix  ·  portability
-`crates/sema/tests/integration_test.rs` (path_join, `/tmp` hardcodes). No Windows CI today.
-- **(A)** invest now (cfg-gate or normalize separators + temp_dir).
-- **(B)** defer until Windows support is on the roadmap.
-
-### fragile-error-message-matching — permission errors still string-matched  ·  test quality (minor)
-~26 `.contains("Permission denied")` / `.contains("outside allowed directories")` checks remain; could match `SemaError::PermissionDenied`/`PathDenied` structurally.
-- **(A)** extend structured matching (small, mechanical).
-- **(B)** accept current state (Eval catch-all matching is already documented as acceptable).
+### STD-10 db/exec-batch SQL injection  →  **document + steer to params**
+Document that `db/exec-batch` is for static SQL only; point users to
+parameterized `db/exec`. No code change. (Consistent with the opt-in-safety stance.)
 
 ---
 
-## Planned — just needs doing (no decision required)
+## Scoped code fixes
 
-### VM-1 — `.semac` bytecode verifier has no `CallNative` arm  ·  P0
-`crates/sema-vm/src/serialize.rs` `validate_chunk_bytecode`. A crafted `.semac` with an out-of-range `native_id` passes validation (only a `debug_assert!` guards it at runtime → release panic / OOB). Fix: thread the native-table length into the verifier and add a `CallNative` arm validating `native_id < n_natives`. Small, high-value — slated for the next fix pass.
+### VM-1 — `.semac` verifier missing `CallNative` arm  ·  P0  →  **fix**
+`crates/sema-vm/src/serialize.rs` `validate_chunk_bytecode`. Thread the native-
+table length in and add a `CallNative` arm validating `native_id < n_natives`.
+Add a malformed-`.semac` regression test. Small, high value.
+
+### eval-tw oracle circularity  →  **complete literal expected values**
+`crates/sema/tests/dual_eval_*.rs`. Convert the ~23 foundational list/collection
+ops to hand-constructed literal expected values so the oracle no longer depends
+on the tree-walker. Medium mechanical effort.
+
+### platform-specific-windows  →  **invest now**
+`crates/sema/tests/integration_test.rs`. cfg-gate shell/`sh` tests, normalize
+path separators in path/join assertions (or have path/join return `/` uniformly),
+and replace `/tmp` hardcodes with `std::env::temp_dir()`. ~20+ sites.
+
+### fragile-error-message-matching  →  **extend structured matching** (minor)
+Replace the remaining `.contains("Permission denied")` / `"outside allowed
+directories"` checks (~26 sites) with `matches!(err.inner(), SemaError::PermissionDenied{..} | ..::PathDenied{..})`.
+
+---
+
+## Large — each warrants its own focused change + review
+
+### C1 — `set!` through stdlib HOF callbacks lost on VM  ·  HIGH  →  **route HOF callbacks in-VM**
+Extend `call_callback` / the HOF dispatch so stdlib higher-order functions invoke
+closures inside the VM instead of the fresh-VM fallback, eliminating the
+upvalue-close-before-call divergence. Larger change across the stdlib↔VM boundary;
+needs its own plan + dual-eval regression coverage. (Chosen over the smaller
+"stop early-closing upvalues" option for a clean, no-per-access-cost fix.)
+
+### CORE-2 — Rc cycle on every named define (memory leak)  →  **Weak captured-env ref**
+`crates/sema-eval/src/special_forms.rs` + `crates/sema-core/src/value.rs`. Store
+the lambda's captured env as `Weak`, reconstructing the parent chain on call, so
+self-referential closures can be freed. Preserves self-recursion + semantics;
+intricate — needs its own plan + thorough recursion/closure/memory tests.
+
+---
+
+## Deferred (revisit when triggered)
+
+### WASM-4 — `register_wasm_io` ~1093-line function  →  **defer**
+Latent V8 ARM64 large-function crash risk. Pure refactor; revisit if the crash
+recurs in the playground. No action now.
