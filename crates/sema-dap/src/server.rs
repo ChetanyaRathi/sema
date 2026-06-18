@@ -889,7 +889,6 @@ fn backend_thread(
                     // files). It runs on a separate, non-debug VM, so breakpoints
                     // inside loaded files still don't hit — the bypass warning
                     // above remains accurate.
-                    interpreter.ctx.set_vm_backend(true);
 
                     // Initialize the async scheduler so async/await and channels
                     // work in a debugged program. The program was compiled with

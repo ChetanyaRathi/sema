@@ -1235,8 +1235,7 @@ fn alias_time_now_ms_vm() {
 /// See docs/plans/2026-06-18-c1-vm-hof-in-vm.md.
 ///
 /// Reproduction (from the audit):
-///   sema --tw -e '(let ((c 0)) (map (fn (x) (set! c (+ c x))) (list 1 2 3)) c)'  -> 6
-///   sema      -e '(let ((c 0)) (map (fn (x) (set! c (+ c x))) (list 1 2 3)) c)'  -> 6
+///   sema -e '(let ((c 0)) (map (fn (x) (set! c (+ c x))) (list 1 2 3)) c)'  -> 6
 #[test]
 fn vm_set_through_map_hof_propagates() {
     let src = "(let ((c 0)) (map (fn (x) (set! c (+ c x))) (list 1 2 3)) c)";

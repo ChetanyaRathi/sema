@@ -513,7 +513,6 @@ pub fn run_bytecode_bytes(
     interpreter: &Interpreter,
     bytes: &[u8],
 ) -> Result<sema_core::Value, SemaError> {
-    interpreter.ctx.set_vm_backend(true);
     let result = sema_vm::deserialize_from_bytes(bytes)?;
 
     let functions: Vec<std::rc::Rc<sema_vm::Function>> =

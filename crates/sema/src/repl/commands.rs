@@ -3,7 +3,7 @@ use std::collections::HashSet;
 use sema_core::{pretty_print, Env, Spur, ValueView};
 use sema_eval::{Interpreter, SPECIAL_FORM_NAMES};
 
-use crate::{colors, eval_with_mode_repl, print_error, LAST_FILE, LAST_SOURCE};
+use crate::{colors, print_error, LAST_FILE, LAST_SOURCE};
 
 pub const REPL_COMMANDS: &[&str] = &[
     ",quit",
@@ -37,7 +37,6 @@ pub fn dispatch(
     interpreter: &Interpreter,
     env: &Env,
     prelude_keys: &HashSet<Spur>,
-    use_vm: bool,
 ) -> CommandOutcome {
     let trimmed = line.trim();
 
@@ -84,7 +83,7 @@ pub fn dispatch(
     if let Some(rest) = trimmed.strip_prefix(",inspect ") {
         let rest = rest.trim();
         record_source(rest);
-        match eval_with_mode_repl(interpreter, rest, use_vm) {
+        match interpreter.eval_str_in_global(rest) {
             Ok(val) => {
                 if let Err(e) = super::inspector::run(val, rest) {
                     eprintln!("inspector error: {e}");
@@ -97,7 +96,7 @@ pub fn dispatch(
 
     if let Some(expr) = trimmed.strip_prefix(",type ") {
         record_source(expr);
-        match eval_with_mode_repl(interpreter, expr, use_vm) {
+        match interpreter.eval_str_in_global(expr) {
             Ok(val) => {
                 let type_name = match val.view() {
                     ValueView::Record(r) => format!(":{}", sema_core::resolve(r.type_tag)),
@@ -113,7 +112,7 @@ pub fn dispatch(
     if let Some(expr) = trimmed.strip_prefix(",time ") {
         record_source(expr);
         let start = std::time::Instant::now();
-        match eval_with_mode_repl(interpreter, expr, use_vm) {
+        match interpreter.eval_str_in_global(expr) {
             Ok(val) => {
                 let elapsed = start.elapsed();
                 if !val.is_nil() {

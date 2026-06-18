@@ -36,14 +36,6 @@ pub struct EvalContext {
     pub eval_fn: Cell<Option<EvalCallbackFn>>,
     pub call_fn: Cell<Option<CallCallbackFn>>,
     pub interactive: Cell<bool>,
-    /// Whether the bytecode VM is the active backend. When true, `(load ...)`
-    /// compiles and runs the loaded file's body on the VM (so async/channels work
-    /// in loaded files and the code runs at VM speed); when false (the
-    /// tree-walker, e.g. `--tw`), the body is tree-walked. Defaults to false so
-    /// embedders that never set it keep the tree-walker path. NOTE: `import` is
-    /// always tree-walked regardless (its module isolation needs lexical env
-    /// capture the VM does not yet provide — see docs/plans/2026-06-16-vm-module-loading.md).
-    pub vm_backend: Cell<bool>,
 }
 
 impl EvalContext {
@@ -67,7 +59,6 @@ impl EvalContext {
             eval_fn: Cell::new(None),
             call_fn: Cell::new(None),
             interactive: Cell::new(false),
-            vm_backend: Cell::new(false),
         }
     }
 
@@ -91,18 +82,7 @@ impl EvalContext {
             eval_fn: Cell::new(None),
             call_fn: Cell::new(None),
             interactive: Cell::new(false),
-            vm_backend: Cell::new(false),
         }
-    }
-
-    /// Mark whether the bytecode VM is the active backend (see `vm_backend`).
-    pub fn set_vm_backend(&self, on: bool) {
-        self.vm_backend.set(on);
-    }
-
-    /// Whether the bytecode VM is the active backend.
-    pub fn vm_backend(&self) -> bool {
-        self.vm_backend.get()
     }
 
     pub fn push_file_path(&self, path: PathBuf) {

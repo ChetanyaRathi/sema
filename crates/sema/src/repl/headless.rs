@@ -17,7 +17,7 @@ use std::io::BufRead;
 use sema_core::{intern, pretty_print, Spur, Value};
 use sema_eval::Interpreter;
 
-use crate::{drain_async_scheduler, eval_with_mode_repl, print_error, LAST_FILE, LAST_SOURCE};
+use crate::{drain_async_scheduler, print_error, LAST_FILE, LAST_SOURCE};
 
 use super::commands::{self, CommandOutcome};
 use super::validator::is_input_complete;
@@ -33,7 +33,6 @@ pub fn run<R: BufRead>(
     interpreter: &Interpreter,
     env: &sema_core::Env,
     prelude_keys: &HashSet<Spur>,
-    use_vm: bool,
 ) -> Result<(), String> {
     let mut buffer = String::new();
     let mut in_multiline = false;
@@ -64,7 +63,7 @@ pub fn run<R: BufRead>(
                 continue;
             }
 
-            let outcome = commands::dispatch(trimmed, interpreter, env, prelude_keys, use_vm);
+            let outcome = commands::dispatch(trimmed, interpreter, env, prelude_keys);
             match outcome {
                 CommandOutcome::Quit => return Ok(()),
                 CommandOutcome::Handled => continue,
@@ -91,7 +90,7 @@ pub fn run<R: BufRead>(
         LAST_SOURCE.with(|s| *s.borrow_mut() = Some(submitted.clone()));
         LAST_FILE.with(|f| *f.borrow_mut() = None);
 
-        match eval_with_mode_repl(interpreter, &submitted, use_vm) {
+        match interpreter.eval_str_in_global(&submitted) {
             Ok(val) => {
                 drain_async_scheduler(interpreter);
                 super::rotate_result_slots(env, val.clone());

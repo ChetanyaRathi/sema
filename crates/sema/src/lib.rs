@@ -238,7 +238,6 @@ impl Interpreter {
         let module_env = Rc::new(Env::with_parent(self.inner.global_env.clone()));
         self.inner.ctx.clear_module_exports();
 
-        self.inner.ctx.set_vm_backend(true);
         let empty_spans = std::collections::HashMap::new();
         let eval_result = sema_eval::eval_module_body_vm(
             &self.inner.ctx,

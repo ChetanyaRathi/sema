@@ -60,9 +60,8 @@ pub const SPECIAL_FORM_NAMES: &[&str] = &[
 ];
 
 /// Build a `ToolDefinition` from already-evaluated values and bind it in `env`.
-/// Shared by the tree-walker `deftool` special form and the VM's `__vm-deftool`
-/// native (which receives pre-evaluated description/parameters/handler), so the
-/// VM path needs no tree-walker round-trip.
+/// The VM's `__vm-deftool` native passes the pre-evaluated description /
+/// parameters / handler straight here.
 pub(crate) fn register_tool(
     name: &str,
     description: Value,
@@ -85,9 +84,7 @@ pub(crate) fn register_tool(
 }
 
 /// Build an `Agent` from an already-evaluated options map and bind it in `env`.
-/// Shared by the tree-walker `defagent` special form and the VM's `__vm-defagent`
-/// native (which receives the pre-evaluated options map), so the VM path needs
-/// no tree-walker round-trip.
+/// The VM's `__vm-defagent` native passes the pre-evaluated options map here.
 pub(crate) fn register_agent(name: &str, opts: Value, env: &Env) -> Result<Value, SemaError> {
     let opts_map = opts
         .as_map_rc()
@@ -141,18 +138,17 @@ pub(crate) fn eval_import(
     if args.is_empty() {
         return Err(SemaError::arity("import", "1+", 0));
     }
-    // Gate filesystem/VFS access behind the sandbox, mirroring eval_load and the
-    // __vm-import delegate (EVAL-3). Without this, a restricted sandbox could be
-    // bypassed by importing a module on the tree-walker backend.
+    // Gate filesystem/VFS access behind the sandbox (EVAL-3). Without this, a
+    // restricted sandbox could be bypassed by importing a module.
     ctx.sandbox.check(sema_core::Caps::FS_READ, "import")?;
     let path_val = args[0].clone(); // already evaluated by the VM (`__vm-import`/`__vm-load`)
     let path_str = path_val
         .as_str()
         .ok_or_else(|| SemaError::type_error("string", path_val.type_name()))?;
 
-    // Imported modules run on the tree-walker and bypass the VM debug loop, so
-    // breakpoints in them never hit. Warn once per debug session (no-op outside
-    // a session). See §7.4 #4.
+    // Imported modules run on a separate VM (per-form) and bypass the debug
+    // loop, so breakpoints in them never hit. Warn once per debug session
+    // (no-op outside a session). See §7.4 #4.
     crate::debug_session::warn_load_bypass_once("import", path_str);
 
     // Selective import names
@@ -380,7 +376,7 @@ pub(crate) fn eval_load(
         .as_str()
         .ok_or_else(|| SemaError::type_error("string", path_val.type_name()))?;
 
-    // Loaded code runs on the tree-walker and bypasses the VM debug loop, so
+    // Loaded code runs on a separate VM (per-form) and bypasses the debug loop, so
     // breakpoints in it never hit. Warn once per debug session (no-op outside a
     // session). See §7.4 #4.
     crate::debug_session::warn_load_bypass_once("load", path_str);
@@ -447,12 +443,10 @@ pub(crate) fn eval_load(
     Ok(Trampoline::Value(eval_result?))
 }
 
-/// Evaluate a `load`ed file's top-level forms in `env`, dispatching on the active
-/// backend: on the VM, compile + run each form (so async/channels work in loaded
-/// files and code runs at VM speed); on the tree-walker, eval each form. `import`
-/// is deliberately NOT routed through here — its module isolation needs lexical
-/// env capture the VM does not yet provide (see
-/// docs/plans/2026-06-16-vm-module-loading.md). Returns the value of the last form.
+/// Evaluate a `load`ed file's top-level forms in `env` by compiling + running
+/// each on the VM (so async/channels work in loaded files and code runs at VM
+/// speed). `load` shares the caller's env; `import` uses `eval_import_body` for
+/// module isolation. Returns the value of the last form.
 fn eval_load_body(
     ctx: &EvalContext,
     env: &Env,
@@ -464,15 +458,13 @@ fn eval_load_body(
     eval::eval_module_body_vm(ctx, env, exprs, spans, source_file)
 }
 
-/// Evaluate an imported module's top-level forms in its isolated `module_env`.
-///
-/// On the VM backend the body is compiled and run on the bytecode VM rooted at
-/// `module_env` (so the module's top-level `define`s are *that env's* globals).
-/// Combined with M1 closure home-globals, an exported closure that calls a
-/// private module helper resolves the helper against `module_env` even when the
-/// closure is copied into and called from the importer — giving the same module
-/// isolation the tree-walker provides, while letting modules use VM-only
-/// features (async/channels). (Part of M4 / Phase 1b.)
+/// Evaluate an imported module's top-level forms in its isolated `module_env`,
+/// compiling + running each on the VM rooted at `module_env` (so the module's
+/// top-level `define`s are *that env's* globals). Combined with closure
+/// home-globals, an exported closure that calls a private module helper resolves
+/// the helper against `module_env` even when the closure is copied into and
+/// called from the importer — giving full module isolation while letting modules
+/// use async/channels.
 fn eval_import_body(
     ctx: &EvalContext,
     module_env: &Env,

@@ -1911,7 +1911,6 @@ impl WasmInterpreter {
     pub fn debug_start(&self, code: &str, breakpoint_lines: &js_sys::Array) -> JsValue {
         // The debugger always executes on the VM, so a `(load ...)` runs the
         // loaded body on the VM regardless of which eval the playground ran last.
-        self.inner.ctx.set_vm_backend(true);
         // End any existing session
         DEBUG_SESSION.with(|s| {
             *s.borrow_mut() = None;
@@ -2385,7 +2384,6 @@ impl WasmInterpreter {
             let module_env = std::rc::Rc::new(Env::with_parent(self.inner.global_env.clone()));
             self.inner.ctx.clear_module_exports();
 
-            self.inner.ctx.set_vm_backend(true);
             let empty_spans = std::collections::HashMap::new();
             let eval_result = sema_eval::eval_module_body_vm(
                 &self.inner.ctx,

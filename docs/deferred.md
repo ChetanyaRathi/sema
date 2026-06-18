@@ -28,13 +28,9 @@ Verified 2026-06-09: U6 ("did you mean" hints — shipped via `suggest_similar` 
 
 ---
 
-## TW-3 — Remove the dead tree-walker source
+## TW-3 — Remove the dead tree-walker source — ✅ DONE (2026-06-18)
 
-**Today:** the tree-walker is functionally retired — no entry point reaches `eval_value`/`eval_step`/the trampoline/`try_eval_special`/the pure-eval special forms; they are unreachable dead code. The `--tw` flag is a hidden no-op.
-
-**Remaining cleanup:** physically delete `eval_value`/`eval_value_inner`/`eval_step`/`apply_lambda`/`run_trampoline`/the eval-based `apply_macro`/`eval_string` from `sema-eval/src/eval.rs`, and the pure-eval special forms + `try_eval_special` from `special_forms.rs` (keeping the module/definitional *drivers* `eval_load`/`eval_import`/`register_tool`/`register_agent`/`eval_define_record_type`/`collect_module_exports`/`copy_exports_to_env`/`parse_params`, after removing their residual `eval_value` calls). Relocate `SPECIAL_FORM_NAMES` out of `special_forms.rs` first (the REPL + all of `sema-lsp` import it). Flip `debug_evaluate` (DAP) and the `force`/thunk fallback off `eval_callback`.
-
-**Why deferred:** large, compiler-guided-but-interdependent deletion needing a per-special-form audit (VM-native vs TW-only — e.g. `defmulti`/`defmethod`) to avoid breaking VM features. Harmless as dead code meanwhile. Does **not** close CORE-2 (the recursive-closure Rc cycle persists on the VM — separate GC effort).
+**Resolved.** The dead tree-walker source has been deleted (~2180 lines net): `eval_value`/`eval_value_inner`/`eval_step`/the trampoline/`apply_lambda`/the eval-based `apply_macro`/`eval`/`eval_string` from `eval.rs`, and `try_eval_special` + all the pure-eval special forms + the `SpecialFormSpurs` registry + quasiquote/error helpers from `special_forms.rs`. The module/definitional drivers stayed (`eval_load`/`eval_import`/`register_tool`/`register_agent`/`eval_define_record_type`/`collect_module_exports`/`copy_exports_to_env`/`parse_params`), with their residual `eval_value` calls removed (path args arrive pre-evaluated; the `_body` helpers always run on the VM). `call_value`'s raw-`Lambda` arm now errors (VM closures are native-fn-wrapped). The eval callbacks (sema-core + sema-llm) and the `force`/thunk fallback use `eval_value_vm`; `debug_evaluate` already routes through it. `SPECIAL_FORM_NAMES` did **not** need relocating — `special_forms.rs` survives as the driver module and still exports it. No special form was lost (every one compiles to a VM opcode or a `__vm-*` native). Full suite green + lint clean. Does **not** close CORE-2 (the recursive-closure Rc cycle persists on the VM — separate GC effort).
 
 ---
 

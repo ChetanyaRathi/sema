@@ -110,13 +110,11 @@ impl Interpreter {
 
     /// Evaluate in the global environment so that `define` persists across calls.
     pub fn eval_in_global(&self, expr: &Value) -> EvalResult {
-        self.ctx.set_vm_backend(true);
         self.run_exprs_on_vm(std::slice::from_ref(expr), &self.global_env)
     }
 
     /// Parse and evaluate in the global environment so that `define` persists across calls.
     pub fn eval_str_in_global(&self, input: &str) -> EvalResult {
-        self.ctx.set_vm_backend(true);
         let (exprs, spans) = sema_reader::read_many_with_spans(input)?;
         self.ctx.merge_span_table(spans);
         if exprs.is_empty() {
@@ -127,7 +125,6 @@ impl Interpreter {
 
     /// Parse, compile to bytecode, and execute via the VM (global env, persists).
     pub fn eval_str_compiled(&self, input: &str) -> EvalResult {
-        self.ctx.set_vm_backend(true);
         let (exprs, spans) = sema_reader::read_many_with_spans(input)?;
         self.ctx.merge_span_table(spans);
         if exprs.is_empty() {
@@ -181,9 +178,8 @@ impl Interpreter {
         ))
     }
 
-    /// Pre-process a top-level expression for VM compilation.
-    /// Evaluates `defmacro` forms via the tree-walker to register macros,
-    /// then expands macro calls in all other forms.
+    /// Pre-process a top-level expression for VM compilation: register any
+    /// `defmacro` forms, then expand macro calls in all other forms.
     pub fn expand_for_vm(&self, expr: &Value) -> EvalResult {
         expand_for_vm_in(&self.ctx, &self.global_env, expr)
     }

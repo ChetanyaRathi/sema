@@ -13,7 +13,7 @@ use reedline::Signal;
 use sema_core::{intern, pretty_print, Spur, Value};
 use sema_eval::Interpreter;
 
-use crate::{drain_async_scheduler, eval_with_mode_repl, print_error, LAST_FILE, LAST_SOURCE};
+use crate::{drain_async_scheduler, print_error, LAST_FILE, LAST_SOURCE};
 
 mod apropos;
 mod commands;
@@ -32,7 +32,7 @@ use commands::CommandOutcome;
 use prompt::SemaPrompt;
 
 /// Entry point — replaces the inline `repl()` that used to live in main.rs.
-pub fn run(interpreter: Interpreter, quiet: bool, sandbox_mode: Option<&str>, use_vm: bool) {
+pub fn run(interpreter: Interpreter, quiet: bool, sandbox_mode: Option<&str>) {
     let env = interpreter.global_env.clone();
 
     // Snapshot the prelude / builtin keys so `,env` can hide them and only
@@ -67,7 +67,7 @@ pub fn run(interpreter: Interpreter, quiet: bool, sandbox_mode: Option<&str>, us
     if !std::io::stdin().is_terminal() {
         let stdin = std::io::stdin();
         let reader = stdin.lock();
-        match headless::run(reader, &interpreter, &env, &prelude_keys, use_vm) {
+        match headless::run(reader, &interpreter, &env, &prelude_keys) {
             Ok(()) => {
                 println!("Goodbye!");
             }
@@ -91,8 +91,7 @@ pub fn run(interpreter: Interpreter, quiet: bool, sandbox_mode: Option<&str>, us
                     continue;
                 }
 
-                let outcome =
-                    commands::dispatch(&trimmed, &interpreter, &env, &prelude_keys, use_vm);
+                let outcome = commands::dispatch(&trimmed, &interpreter, &env, &prelude_keys);
 
                 match outcome {
                     CommandOutcome::Quit => break,
@@ -103,7 +102,7 @@ pub fn run(interpreter: Interpreter, quiet: bool, sandbox_mode: Option<&str>, us
                 LAST_SOURCE.with(|s| *s.borrow_mut() = Some(trimmed.clone()));
                 LAST_FILE.with(|f| *f.borrow_mut() = None);
 
-                match eval_with_mode_repl(&interpreter, &trimmed, use_vm) {
+                match interpreter.eval_str_in_global(&trimmed) {
                     Ok(val) => {
                         drain_async_scheduler(&interpreter);
                         rotate_result_slots(&env, val.clone());

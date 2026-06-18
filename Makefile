@@ -1,4 +1,4 @@
-.PHONY: all build release install uninstall test test-lsp test-embedding-bench test-http test-llm check clippy fmt fmt-check clean run lint lint-links docs docs-check update-pricing examples examples-vm smoke-bytecode test-providers fuzz fuzz-reader fuzz-eval setup bench-1m bench-10m bench-100m site-dev site-build site-preview site-deploy deploy coverage coverage-html bench bench-vm bench-save bench-suite bench-closure bench-numeric bench-compare bench-baseline profile profile-vm ts-setup ts-generate ts-test ts-playground js-lib-build js-lib-dev
+.PHONY: all build release install uninstall test test-lsp test-embedding-bench test-http test-llm check clippy fmt fmt-check clean run lint lint-links docs docs-check update-pricing examples smoke-bytecode test-providers fuzz fuzz-reader fuzz-eval setup bench-1m bench-10m bench-100m site-dev site-build site-preview site-deploy deploy coverage coverage-html bench bench-vm bench-save bench-suite bench-closure bench-numeric bench-compare bench-baseline profile profile-vm ts-setup ts-generate ts-test ts-playground js-lib-build js-lib-dev
 build:
 	cargo build
 
@@ -74,10 +74,6 @@ lint-links:
 # never hangs; exits non-zero if any runnable example fails.
 examples: release
 	@EXAMPLE_TIMEOUT=30 ./scripts/run-examples.sh
-
-# Back-compat alias: the tree-walker is retired, so `--tw`/`--vm` are no-ops and
-# there is only one evaluator to run examples on.
-examples-vm: examples
 
 example-notebook: build
 	@echo "=== Running example notebook ==="
@@ -199,34 +195,34 @@ BENCH_SUITE ?= all
 
 # The bytecode VM is the sole evaluator; `bench` == `bench-vm`.
 bench: release
-	@./scripts/bench.sh --mode vm --suite $(BENCH_SUITE) --runs $(BENCH_RUNS) --warmup $(BENCH_WARMUP)
+	@./scripts/bench.sh --suite $(BENCH_SUITE) --runs $(BENCH_RUNS) --warmup $(BENCH_WARMUP)
 
 bench-vm: release
-	@./scripts/bench.sh --mode vm --suite $(BENCH_SUITE) --runs $(BENCH_RUNS) --warmup $(BENCH_WARMUP)
+	@./scripts/bench.sh --suite $(BENCH_SUITE) --runs $(BENCH_RUNS) --warmup $(BENCH_WARMUP)
 
 bench-save: release
 	@mkdir -p target/bench
-	@./scripts/bench.sh --mode vm --suite $(BENCH_SUITE) --runs $(BENCH_RUNS) --warmup $(BENCH_WARMUP) \
+	@./scripts/bench.sh --suite $(BENCH_SUITE) --runs $(BENCH_RUNS) --warmup $(BENCH_WARMUP) \
 		--export target/bench/bench-$$(git rev-parse --short HEAD 2>/dev/null || echo "nogit").json
 
 bench-suite: release
-	@./scripts/bench.sh --mode vm --suite $(BENCH_SUITE) --runs $(BENCH_RUNS) --warmup $(BENCH_WARMUP)
+	@./scripts/bench.sh --suite $(BENCH_SUITE) --runs $(BENCH_RUNS) --warmup $(BENCH_WARMUP)
 
 bench-closure: release
-	@./scripts/bench.sh --mode vm --suite closure --runs $(BENCH_RUNS) --warmup $(BENCH_WARMUP)
+	@./scripts/bench.sh --suite closure --runs $(BENCH_RUNS) --warmup $(BENCH_WARMUP)
 
 bench-numeric: release
-	@./scripts/bench.sh --mode vm --suite numeric --runs $(BENCH_RUNS) --warmup $(BENCH_WARMUP)
+	@./scripts/bench.sh --suite numeric --runs $(BENCH_RUNS) --warmup $(BENCH_WARMUP)
 
 bench-compare: release
 	@mkdir -p target/bench
-	@./scripts/bench.sh --mode vm --runs $(BENCH_RUNS) --warmup $(BENCH_WARMUP) \
+	@./scripts/bench.sh --runs $(BENCH_RUNS) --warmup $(BENCH_WARMUP) \
 		--export target/bench/current.json \
 		--compare target/bench/baseline.json
 
 bench-baseline: release
 	@mkdir -p target/bench
-	@./scripts/bench.sh --mode vm --runs $(BENCH_RUNS) --warmup $(BENCH_WARMUP) \
+	@./scripts/bench.sh --runs $(BENCH_RUNS) --warmup $(BENCH_WARMUP) \
 		--export target/bench/baseline.json
 
 # Profiling (requires: cargo install samply)

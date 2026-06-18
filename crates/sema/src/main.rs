@@ -152,15 +152,6 @@ struct Cli {
     #[arg(long, value_name = "DIRS")]
     allowed_paths: Option<String>,
 
-    /// No-op: the tree-walker has been retired; the bytecode VM is the sole
-    /// evaluator. Accepted for backward compatibility, but ignored.
-    #[arg(long, hide = true)]
-    tw: bool,
-
-    /// No-op: use the bytecode VM (this is already the default). Accepted for compatibility.
-    #[arg(long, hide = true)]
-    vm: bool,
-
     /// Arguments passed to the script (after --)
     #[arg(last = true)]
     script_args: Vec<String>,
@@ -327,10 +318,6 @@ enum Commands {
         /// Disable LLM features
         #[arg(long)]
         no_llm: bool,
-
-        /// Use tree-walker interpreter instead of bytecode VM
-        #[arg(long)]
-        tw: bool,
     },
 }
 
@@ -675,9 +662,8 @@ fn main() {
                 timeout: _timeout,
                 sandbox,
                 no_llm,
-                tw,
             } => {
-                run_eval(stdin, expr, json, path, sandbox, no_llm, !tw);
+                run_eval(stdin, expr, json, path, sandbox, no_llm);
             }
         }
         return;
@@ -719,7 +705,7 @@ fn main() {
             Ok(content) => {
                 LAST_SOURCE.with(|s| *s.borrow_mut() = Some(content.clone()));
                 LAST_FILE.with(|f| *f.borrow_mut() = Some(PathBuf::from(load_file)));
-                match eval_with_mode(&interpreter, &content, !cli.tw) {
+                match interpreter.eval_str_compiled(&content) {
                     Ok(_) => {
                         interpreter.ctx.pop_file_path();
                         drain_async_scheduler(&interpreter);
@@ -743,7 +729,7 @@ fn main() {
     if let Some(expr) = &cli.eval {
         LAST_SOURCE.with(|s| *s.borrow_mut() = Some(expr.clone()));
         LAST_FILE.with(|f| *f.borrow_mut() = None);
-        match eval_with_mode(&interpreter, expr, !cli.tw) {
+        match interpreter.eval_str_compiled(expr) {
             Ok(val) => {
                 drain_async_scheduler(&interpreter);
                 if !val.is_nil() {
@@ -756,7 +742,7 @@ fn main() {
             }
         }
         if cli.interactive {
-            repl::run(interpreter, cli.quiet, cli.sandbox.as_deref(), !cli.tw);
+            repl::run(interpreter, cli.quiet, cli.sandbox.as_deref());
         }
         return;
     }
@@ -765,7 +751,7 @@ fn main() {
     if let Some(expr) = &cli.print {
         LAST_SOURCE.with(|s| *s.borrow_mut() = Some(expr.clone()));
         LAST_FILE.with(|f| *f.borrow_mut() = None);
-        match eval_with_mode(&interpreter, expr, !cli.tw) {
+        match interpreter.eval_str_compiled(expr) {
             Ok(val) => {
                 drain_async_scheduler(&interpreter);
                 println!("{val}");
@@ -776,7 +762,7 @@ fn main() {
             }
         }
         if cli.interactive {
-            repl::run(interpreter, cli.quiet, cli.sandbox.as_deref(), !cli.tw);
+            repl::run(interpreter, cli.quiet, cli.sandbox.as_deref());
         }
         return;
     }
@@ -798,7 +784,7 @@ fn main() {
                     }
                 }
                 if cli.interactive {
-                    repl::run(interpreter, cli.quiet, cli.sandbox.as_deref(), !cli.tw);
+                    repl::run(interpreter, cli.quiet, cli.sandbox.as_deref());
                 }
                 return;
             }
@@ -811,7 +797,7 @@ fn main() {
             Ok(content) => {
                 LAST_SOURCE.with(|s| *s.borrow_mut() = Some(content.clone()));
                 LAST_FILE.with(|f| *f.borrow_mut() = Some(PathBuf::from(file)));
-                match eval_with_mode(&interpreter, &content, !cli.tw) {
+                match interpreter.eval_str_compiled(&content) {
                     Ok(_) => {
                         interpreter.ctx.pop_file_path();
                         drain_async_scheduler(&interpreter);
@@ -829,33 +815,13 @@ fn main() {
             }
         }
         if cli.interactive {
-            repl::run(interpreter, cli.quiet, cli.sandbox.as_deref(), !cli.tw);
+            repl::run(interpreter, cli.quiet, cli.sandbox.as_deref());
         }
         return;
     }
 
     // REPL mode
-    repl::run(interpreter, cli.quiet, cli.sandbox.as_deref(), !cli.tw);
-}
-
-fn eval_with_mode(
-    interpreter: &Interpreter,
-    input: &str,
-    _use_vm: bool,
-) -> Result<sema_core::Value, sema_core::SemaError> {
-    // The tree-walker is retired; the VM is the sole evaluator. `_use_vm` is
-    // ignored (the legacy `--tw` flag is a no-op).
-    interpreter.eval_str_compiled(input)
-}
-
-/// REPL eval. Runs in the global env so top-level `define`s persist across lines.
-pub(crate) fn eval_with_mode_repl(
-    interpreter: &Interpreter,
-    input: &str,
-    _use_vm: bool,
-) -> Result<sema_core::Value, sema_core::SemaError> {
-    // The tree-walker is retired; the VM is the sole evaluator.
-    interpreter.eval_str_in_global(input)
+    repl::run(interpreter, cli.quiet, cli.sandbox.as_deref());
 }
 
 /// Drain any pending async tasks scheduled by a top-level form.
@@ -864,10 +830,10 @@ pub(crate) fn eval_with_mode_repl(
 /// so their side effects would silently vanish on exit unless we explicitly
 /// run the scheduler. This drains all pending tasks (target = `All`).
 ///
-/// The scheduler callback is only registered when the VM backend is active,
-/// so we silently ignore the "no async scheduler registered" error from the
-/// tree-walker path. Other scheduler errors are reported to stderr as
-/// warnings but do not fail the program — the side effects already ran.
+/// The scheduler callback is only registered once an eval has run, so we
+/// silently ignore the "no async scheduler registered" error (nothing async was
+/// scheduled). Other scheduler errors are reported to stderr as warnings but do
+/// not fail the program — the side effects already ran.
 pub(crate) fn drain_async_scheduler(interpreter: &Interpreter) {
     if let Err(e) = sema_core::call_run_scheduler(&interpreter.ctx, None) {
         let msg = e.to_string();
@@ -997,7 +963,6 @@ fn run_eval(
     path: Option<String>,
     sandbox_arg: Option<String>,
     no_llm: bool,
-    use_vm: bool,
 ) {
     // Get the program text
     let program = if use_stdin {
@@ -1095,7 +1060,7 @@ fn run_eval(
     }
 
     let start = std::time::Instant::now();
-    let result = eval_with_mode(&interpreter, &program, use_vm);
+    let result = interpreter.eval_str_compiled(&program);
     if result.is_ok() {
         drain_async_scheduler(&interpreter);
     }
@@ -2118,9 +2083,6 @@ fn run_bytecode_bytes(
     interpreter: &Interpreter,
     bytes: &[u8],
 ) -> Result<sema_core::Value, SemaError> {
-    // The VM is the active backend, so a `(load ...)` in the bytecode compiles +
-    // runs the loaded file's body on the VM rather than tree-walking it.
-    interpreter.ctx.set_vm_backend(true);
     let result = sema_vm::deserialize_from_bytes(bytes)?;
 
     let functions: Vec<std::rc::Rc<sema_vm::Function>> =
