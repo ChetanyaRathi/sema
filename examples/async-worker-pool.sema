@@ -1,0 +1,57 @@
+;; async-worker-pool.sema — Producer / worker-pool / collector over channels
+;;
+;; A classic concurrency pattern, fully on Sema's cooperative VM scheduler:
+;;   producer  --> jobs channel  --> N workers --> results channel --> collector
+;;
+;; Channels are bounded, so `channel/send` applies backpressure (it yields when
+;; the buffer is full) and `channel/recv` yields when empty. Everything runs in
+;; one thread, interleaving at those yield points.
+
+(define n-jobs 12)
+(define n-workers 4)
+
+(define jobs (channel/new 4))       ; bounded work queue (backpressure at 4)
+(define results (channel/new n-jobs))
+
+;; Producer: enqueue n-jobs, then close so workers know when to stop.
+(define producer
+  (async
+    (for-range (i 1 (+ n-jobs 1))
+      (channel/send jobs i))
+    (channel/close jobs)))
+
+;; Worker: pull jobs until the channel is drained+closed; "process" each
+;; (here: square it, with a tiny sleep to force interleaving) and emit a result.
+(define (make-worker id)
+  (async
+    (let ((more #t))
+      (while more
+        (let ((job (channel/try-recv jobs)))
+          (cond
+            ;; got a job
+            ((not (nil? job))
+             (async/sleep 1)
+             (channel/send results {:worker id :job job :result (* job job)}))
+            ;; nothing buffered but channel still open — yield and retry
+            ((not (channel/closed? jobs)) (async/sleep 0))
+            ;; drained and closed — done
+            (else (set! more #f))))))))
+
+(define workers (map make-worker (range 1 (+ n-workers 1))))
+
+;; Wait for the producer and all workers to finish.
+(async/all (cons producer workers))
+
+;; Drain the results channel and summarize.
+(define collected
+  (let loop ((acc (list)))
+    (let ((r (channel/try-recv results)))
+      (if (nil? r) (reverse acc) (loop (cons r acc))))))
+
+(println "=== Worker pool: " n-workers " workers, " n-jobs " jobs ===")
+(for-each
+  (fn (r) (println "  worker " (:worker r) " did job " (:job r) " -> " (:result r)))
+  collected)
+
+(define total (foldl (fn (acc r) (+ acc (:result r))) 0 collected))
+(println "processed " (length collected) " jobs; sum of results = " total)  ; 1+4+...+144 = 650
