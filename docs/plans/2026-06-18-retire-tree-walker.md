@@ -3,18 +3,43 @@
 > ## ⏩ SESSION HANDOFF — start here next time
 > **Decision (locked 2026-06-18):** retire the tree-walker; do not maintain two evaluators.
 > Every TW-backed feature must become VM-native first.
-> **Status:** planning complete, **no implementation started.** The plan was Opus-reviewed
-> (the first fast-model draft was 1 unsound + 6 needs-revision — corrections are baked in).
-> **Next action: M1 — Closure home-globals** (the keystone enabler; see Roadmap below + the
-> per-phase detail in `2026-06-18-retire-tree-walker-impl.md`).
-> **Critical path:** M1 → (M2 macros, M3 eval-bridge, M4 import) → M5 gate → M6 API → M7 tests
-> → M8 delete → M9 docs. Each lands behind the dual-eval suite (parity) until M7 collapses it.
-> **Watch out:** (1) M1 is required before import-on-VM (M4) can be correct — VM closures
-> carry no home-globals pointer today. (2) M6 is an embedder-breaking API change. (3) **CORE-2
-> is NOT solved by this** — the recursive-closure Rc cycle persists on the VM; separate GC
-> effort, see `docs/deferred.md`. (4) ultracode is appropriate for M7 (tests) and M9 (docs)
-> only — Block 1 (M1–M5) is sequential foundational work.
-> **Spike already done:** VM macro expansion is feasible (details below) — M2 is de-risked.
+>
+> **Progress (2026-06-18, Block 1 nearly done — all green, committed per milestone):**
+> - ✅ **M1 — Closure home-globals.** `vm::Closure.globals: Option<Rc<Env>>`; the dispatch
+>   loop captures the frame's home globals per activation; global opcodes resolve against it.
+>   Commit `dc86709`.
+> - ✅ **M2 — VM macro expansion.** `apply_macro_vm` (compile+run transformer on the VM, no
+>   cache, rooted at caller_env); `expand_macros_in`/`__vm-macroexpand` repointed;
+>   `expand_for_vm_in` defmacro + `load_prelude` register via `register_defmacro` (TW-free).
+>   Commit `39dea23`.
+> - ✅ **M3 — VM eval bridge.** `__vm-eval` macro-expands + compiles + runs on the VM (async
+>   inside `(eval ...)` proves it); `apply` already VM-native via call_callback. Commit `97d0394`.
+> - ✅ **M4 — import on the VM.** Added `vm::Closure.functions` (home function table); the
+>   dispatch loop restores `self.functions` per frame (fixes the cross-table MakeClosure bug);
+>   `eval_import` runs module bodies on the VM rooted at the isolated module_env. Adversarial
+>   tests (name collision, interleaved fns+map, async-in-module) pass. Commit `2ea190e`.
+> - ✅ **pre-M5 cleanup:** `__vm-define-record-type` + `__vm-defmacro-form` now call the pure
+>   destructures directly (no eval_callback). `__vm-force` was already VM-native (delay lowers
+>   to a lambda → call_callback). Commits `b72e966`, `b16cf68`.
+>
+> **Next action — finish M5 (eval_value has no live VM-path callers), then M6→M9:**
+> Remaining `eval_callback`→`eval_value` callers on the VM path: **`__vm-deftool` /
+> `__vm-defagent`** (LLM forms — `eval_deftool`/`eval_defagent` evaluate handler/param exprs,
+> so NOT pure; the args already arrive evaluated from the VM, so build the Tool/Agent value
+> directly) and **sema-llm's `set_eval_callback(eval_value)`** (eval.rs:91,109). `__vm-load`/
+> `__vm-import` only invoke the Rust import/load *driver* (body is VM-native) — fine.
+> Then **M5** checkpoint (grep-gate: no `eval_value` on a live path), **M6** (sema::Interpreter
+> builder + route eval entry points to VM + drop sema-wasm Tree toggle — embedder-breaking),
+> **M7** (collapse dual_eval → vm_eval; flip integration/http/server `eval()` to VM — large),
+> **M8** (relocate `SPECIAL_FORM_NAMES`; grep-gate; delete `eval_value`/trampoline/TW
+> special_forms; remove `--tw`/REPL `use_vm`/`eval_tw`), **M9** (docs).
+>
+> **Watch out:** (1) M6 is an embedder-breaking API change. (2) **CORE-2 is NOT solved by
+> this** — the recursive-closure Rc cycle persists on the VM; separate GC effort, see
+> `docs/deferred.md`. (3) The hot dispatch loop now does two Rc clones per frame activation
+> (frame_globals + self.functions) — verify with `make bench-vm` before M9; optimize if needed.
+> (4) ultracode is appropriate for M7 (tests) and M9 (docs).
+> **Spike already done:** VM macro expansion is feasible (details below) — M2 was de-risked.
 
 **Status:** scoping / not started. **Phase-1a feasibility gate: PASSED** (spike 2026-06-18). **Size:** large, multi-phase (not a single PR).
 
