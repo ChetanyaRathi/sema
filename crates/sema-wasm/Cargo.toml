@@ -16,7 +16,6 @@ wasm-bindgen.workspace = true
 sema-core.workspace = true
 sema-reader.workspace = true
 sema-eval.workspace = true
-sema-stdlib.workspace = true
 sema-fmt.workspace = true
 sema-vm.workspace = true
 js-sys.workspace = true
@@ -34,3 +33,9 @@ web-sys = { workspace = true, features = [
     "AbortController",
     "AbortSignal",
 ] }
+
+[package.metadata.cargo-machete]
+# No direct code references — present only to turn on the wasm RNG feature flags
+# (getrandom "wasm_js", uuid "js") so uuid v4 works on wasm32. Removing them
+# breaks the playground build.
+ignored = ["getrandom", "uuid"]

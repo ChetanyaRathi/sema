@@ -9,7 +9,6 @@ description = "MCP (Model Context Protocol) server for Sema"
 
 [dependencies]
 sema-core.workspace = true
-sema-reader.workspace = true
 sema-eval.workspace = true
 sema-vm.workspace = true
 sema-fmt.workspace = true
