@@ -1779,3 +1779,30 @@ fn vm_macro_quasiquote_and_gensym_oracle() {
         ])
     );
 }
+
+// === M3: VM-native runtime eval/apply (no tree-walker) ===
+
+#[test]
+fn vm_eval_apply_oracle() {
+    assert_eq!(eval_vm("(eval '(+ 1 2))"), Value::int(3));
+    assert_eq!(eval_vm("(apply + '(1 2 3 4))"), Value::int(10));
+    // A closure created inside the eval'd form runs on the VM.
+    assert_eq!(
+        eval_vm("(eval '(map (fn (x) (* x x)) '(1 2 3)))"),
+        Value::list(vec![Value::int(1), Value::int(4), Value::int(9)])
+    );
+    // eval'd defines persist in the global env.
+    assert_eq!(
+        eval_vm("(begin (eval '(define ev-x 7)) (* ev-x 6))"),
+        Value::int(42)
+    );
+}
+
+#[test]
+fn vm_eval_is_vm_native_runs_async() {
+    // The decisive proof that `__vm-eval` runs on the VM, not the tree-walker:
+    // async/await is a VM-only feature, so this only succeeds if the eval'd form
+    // is compiled and executed on the bytecode VM (the tree-walker errors with
+    // "await requires the VM backend").
+    assert_eq!(eval_vm("(eval '(await (async (+ 40 2))))"), Value::int(42));
+}

@@ -1006,7 +1006,10 @@ fn load_prelude(ctx: &EvalContext, env: &Rc<Env>) {
 }
 
 fn register_vm_delegates(env: &Rc<Env>) {
-    // __vm-eval: evaluate an expression via the tree-walker
+    // __vm-eval: macro-expand, compile, and run the expression on the bytecode
+    // VM (rooted at the global env so top-level `define`s persist). The runtime
+    // `(eval ...)` meta path is thus VM-native — it no longer round-trips
+    // through the tree-walker's `eval_value` (M3 / Phase 1c).
     let eval_env = env.clone();
     env.set(
         intern("__vm-eval"),
@@ -1014,7 +1017,15 @@ fn register_vm_delegates(env: &Rc<Env>) {
             if args.len() != 1 {
                 return Err(SemaError::arity("eval", "1", args.len()));
             }
-            sema_core::eval_callback(ctx, &args[0], &eval_env)
+            let expanded = expand_for_vm_in(ctx, &eval_env, &args[0])?;
+            // A form that expands to nothing (e.g. a `defmacro`) yields nil.
+            if expanded.is_nil() {
+                return Ok(Value::nil());
+            }
+            let prog = sema_vm::compile_program(std::slice::from_ref(&expanded), None)?;
+            let mut vm =
+                sema_vm::VM::new(eval_env.clone(), prog.functions, &[], prog.main_cache_slots)?;
+            vm.execute(prog.closure, ctx)
         })),
     );
 
