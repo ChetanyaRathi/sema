@@ -1,6 +1,16 @@
 # Plan: Retire the tree-walker (VM becomes the only evaluator)
 
-**Status:** scoping / not started. **Size:** large, multi-phase (not a single PR).
+**Status:** scoping / not started. **Phase-1a feasibility gate: PASSED** (spike 2026-06-18). **Size:** large, multi-phase (not a single PR).
+
+## Phase-1a spike result (2026-06-18) — macro expansion on the VM is feasible
+A macro is `{params, body}` with no captured env, and `apply_macro` is exactly
+`((fn (params… . rest) body…) 'arg…)` (args passed as data). Ran that shape on the VM
+for the hard cases — all correct: list/cons transformers, quasiquote + `unquote-splicing`
+in the body, transformer bodies calling global helpers, and auto-gensym (`tmp#` →
+consistent `tmp__0`). Real `defmacro`+use is already end-to-end green on the VM. So the
+make-or-break subsystem is validated: **no standalone "mini tree-walker" is needed** — the
+VM can apply macro transformers directly.
+
 **Goal:** the bytecode VM is the sole evaluator. Remove the tree-walking interpreter,
 the `--tw` flag, the dual-backend test harness, and all "two backends" framing in
 the docs.
@@ -73,9 +83,13 @@ prelude loading, and the `Interpreter` API live once the TW is gone? Likely: a s
 VM; or fold these into `sema-vm`. Decide crate boundaries first.
 
 **Phase 1 — Make the VM self-sufficient (the hard engineering).**
-- 1a. **Macro expansion without the TW.** Either compile+run `defmacro` bodies on the VM
-  to produce the expander, or build a small dedicated macro evaluator. Must preserve
-  quasiquote/unquote/splicing, `macroexpand`, auto-gensym, and prelude macros.
+- 1a. **Macro expansion without the TW.** *(Approach validated by the spike.)* Replace
+  the `eval_value` call in `apply_macro` with a VM run of the transformer
+  `((fn (params… . rest) body…) 'arg…)` (or compile the body with params bound), and
+  replace `eval_defmacro`'s TW registration with a pure destructure (it does no real
+  evaluation today). Cache the compiled transformer per macro (compile once, run per call
+  site). Recurse on the result for nested/recursive expansion (as `expand_macros_in`
+  already does). Preserve `macroexpand`, auto-gensym, and prelude macros.
 - 1b. **`load`/`import` on the VM** — replace the `__vm-load`/`__vm-import`→TW delegation
   with VM-native module evaluation (the load-on-VM groundwork exists; finish import).
 - 1c. **eval/call bridge → VM** — repoint `set_eval_callback`/`set_call_callback` (and the
@@ -101,9 +115,9 @@ architecture/performance/lisp-comparison/bytecode-vm and CLAUDE.md to a single-e
 story.
 
 ## Risks / open questions
-- **Macro expansion is the make-or-break.** If running `defmacro` bodies on the VM is
-  awkward, a minimal standalone macro interpreter may be needed — which is "a small
-  tree-walker" by another name. Validate this approach in a Phase-1 spike before committing.
+- ~~**Macro expansion is the make-or-break.**~~ **RESOLVED by the 2026-06-18 spike** — the
+  VM applies macro transformers directly (incl. quasiquote/splicing, helpers, gensym). No
+  standalone macro interpreter needed.
 - **Loss of differential testing.** Dual-eval's value was catching TW↔VM divergence.
   Going VM-only, literal expected values (already started for foundational ops) and
   fuzzing become the correctness strategy.
@@ -113,5 +127,9 @@ story.
   corner) will be gone — acceptable, but inventory during Phase 3.
 
 ## Recommendation
-Do **Phase 1a (macro-expansion spike)** first as a feasibility gate — everything else is
-mechanical once the VM can expand macros standalone. Treat Phases 1–5 as separate PRs.
+The Phase-1a feasibility gate has **passed** — the make-or-break (macro expansion) works on
+the VM. The remaining work is large but mostly mechanical. Proceed as separate PRs in
+dependency order: 1b/1c/1d (load/import, eval-call bridge, prelude on the VM) → 1a
+(wire VM macro expansion) → 2 (consumers) → 3 (tests) → 4 (delete TW, closes CORE-2) →
+5 (docs). Land 1a–1d behind the existing dual-eval suite so parity is proven before any
+deletion.
