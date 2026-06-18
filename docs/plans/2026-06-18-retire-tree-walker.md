@@ -106,9 +106,15 @@ anchor). Switch `integration_test`/`http`/`server` `eval()` to the VM; fix fallo
 (genuinely TW-only behaviors, if any, surface here).
 
 **Phase 4 — Delete the tree-walker.** Remove `eval_value`/trampoline + TW `special_forms`
-paths, `--tw`, REPL `use_vm`, `eval_tw`. **This closes CORE-2** — the Rc env↔closure leak
-is a tree-walker whole-`Env`-capture artifact and dies with it (the VM captures
-per-variable upvalue cells, so the cycle can't form). No GC needed.
+paths, `--tw`, REPL `use_vm`, `eval_tw`. **CORRECTION (Opus review):** this does **NOT**
+close CORE-2. It removes the TW's whole-`Env`-capture cycle, but the VM has its *own*
+Rc cycle — a local/returned recursive closure captures its own name as an upvalue cell
+whose `Closed(Value)` holds the closure (`resolve.rs:280-297`; see
+`2026-02-16-compilation-strategy-investigation.md:1014-1016`). CORE-2 remains open and its
+real fix is cycle collection / a GC (see `docs/deferred.md`). Also: relocate the TW-free
+`SPECIAL_FORM_NAMES` constant out of `special_forms.rs` before deleting it (the REPL and
+all of `sema-lsp` import it), and gate deletion on a grep that `eval_value` has no
+remaining callers.
 
 **Phase 5 — Docs.** Remove all `--tw`; rewrite/retire `internals/evaluator.md`; reframe
 architecture/performance/lisp-comparison/bytecode-vm and CLAUDE.md to a single-evaluator
@@ -130,6 +136,6 @@ story.
 The Phase-1a feasibility gate has **passed** — the make-or-break (macro expansion) works on
 the VM. The remaining work is large but mostly mechanical. Proceed as separate PRs in
 dependency order: 1b/1c/1d (load/import, eval-call bridge, prelude on the VM) → 1a
-(wire VM macro expansion) → 2 (consumers) → 3 (tests) → 4 (delete TW, closes CORE-2) →
+(wire VM macro expansion) → 2 (consumers) → 3 (tests) → 4 (delete TW) →
 5 (docs). Land 1a–1d behind the existing dual-eval suite so parity is proven before any
 deletion.
