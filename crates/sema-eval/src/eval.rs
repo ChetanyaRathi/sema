@@ -211,7 +211,9 @@ pub fn expand_for_vm_in(ctx: &EvalContext, env: &Env, expr: &Value) -> EvalResul
         if let Some(s) = items.first().and_then(|v| v.as_symbol_spur()) {
             let name = resolve(s);
             if name == "defmacro" {
-                eval_value(ctx, expr, env)?;
+                // Register the macro directly (pure destructure) — the VM macro
+                // path must not route through the tree-walker's `eval_value`.
+                register_defmacro(items, env)?;
                 return Ok(Value::nil());
             }
             if name == "begin" || name == "progn" {
@@ -247,7 +249,9 @@ fn expand_macros_in(ctx: &EvalContext, env: &Env, expr: &Value) -> EvalResult {
                 }
                 if let Some(mac_val) = env.get(s) {
                     if let Some(mac) = mac_val.as_macro_rc() {
-                        let expanded = apply_macro(ctx, &mac, &items[1..], env)?;
+                        // VM-native expansion: apply the transformer on the VM,
+                        // not the tree-walker.
+                        let expanded = apply_macro_vm(ctx, &mac, &items[1..], env)?;
                         return expand_macros_in(ctx, env, &expanded);
                     }
                 }
@@ -884,15 +888,120 @@ pub fn apply_macro(
     Ok(result)
 }
 
+/// Apply a macro by evaluating its body on the **bytecode VM** (no tree-walker).
+///
+/// This is the VM-native counterpart of [`apply_macro`]. The macro's
+/// (unevaluated) arguments are bound — together with a possible rest list — as
+/// *globals* in a transient child env of `caller_env`; the transformer body is
+/// then compiled fresh per call site (so auto-gensym stays hygienic — a cached
+/// transformer would reuse the same gensym across call sites) and run on a VM
+/// rooted at that env. Rooting at `caller_env` lets transformer bodies call
+/// global helpers and reference module-level bindings, and binding params as
+/// globals lets the compiled body resolve them via `GetGlobal`.
+///
+/// Used by the VM macro pre-expansion path (`expand_macros_in`) and
+/// `__vm-macroexpand`. The tree-walker's own lazy expansion keeps using
+/// [`apply_macro`] until the tree-walker is retired.
+pub fn apply_macro_vm(
+    ctx: &EvalContext,
+    mac: &sema_core::Macro,
+    args: &[Value],
+    caller_env: &Env,
+) -> Result<Value, SemaError> {
+    let env = Rc::new(Env::with_parent(Rc::new(caller_env.clone())));
+
+    // Bind parameters to unevaluated forms (same arity rules as apply_macro).
+    if let Some(rest) = mac.rest_param {
+        if args.len() < mac.params.len() {
+            return Err(SemaError::arity(
+                resolve(mac.name),
+                format!("{}+", mac.params.len()),
+                args.len(),
+            ));
+        }
+        for (param, arg) in mac.params.iter().zip(args.iter()) {
+            env.set(*param, arg.clone());
+        }
+        env.set(rest, Value::list(args[mac.params.len()..].to_vec()));
+    } else {
+        if args.len() != mac.params.len() {
+            return Err(SemaError::arity(
+                resolve(mac.name),
+                mac.params.len().to_string(),
+                args.len(),
+            ));
+        }
+        for (param, arg) in mac.params.iter().zip(args.iter()) {
+            env.set(*param, arg.clone());
+        }
+    }
+
+    // Compile and run each body form on the VM, fresh per call site (no cache)
+    // to keep auto-gensym hygienic. The body is the *transformer* code; it is
+    // NOT macro-pre-expanded here — quasiquote templates inside it (which may
+    // legitimately mention the macro's own name, as the recursive threading
+    // macros do) must be compiled as data, not re-expanded. Any macro call the
+    // transformer *produces* is re-expanded by the caller (`expand_macros_in`
+    // recurses on the returned form). `compile_program` lowers quasiquote /
+    // unquote / unquote-splicing directly, matching the tree-walker's
+    // `eval_value` over the same body.
+    let mut result = Value::nil();
+    for expr in &mac.body {
+        let prog = sema_vm::compile_program(std::slice::from_ref(expr), None)?;
+        let mut vm = sema_vm::VM::new(env.clone(), prog.functions, &[], prog.main_cache_slots)?;
+        result = vm.execute(prog.closure, ctx)?;
+    }
+    Ok(result)
+}
+
+/// Register a `defmacro` form's macro in `env` **without** the tree-walker — a
+/// pure destructure mirroring `special_forms::eval_defmacro`. Used by the VM
+/// pre-expansion path so registering a macro never routes through `eval_value`.
+fn register_defmacro(items: &[Value], env: &Env) -> Result<(), SemaError> {
+    // items[0] is the `defmacro` symbol; the rest are name, params, body…
+    let args = &items[1..];
+    if args.len() < 3 {
+        return Err(SemaError::arity("defmacro", "3+", args.len()));
+    }
+    let name_spur = args[0]
+        .as_symbol_spur()
+        .ok_or_else(|| SemaError::eval("defmacro: name must be a symbol"))?;
+    let param_list = args[1]
+        .as_list()
+        .ok_or_else(|| SemaError::eval("defmacro: params must be a list"))?;
+    let param_names: Vec<sema_core::Spur> = param_list
+        .iter()
+        .map(|v| {
+            v.as_symbol_spur()
+                .ok_or_else(|| SemaError::eval("defmacro: parameter must be a symbol"))
+        })
+        .collect::<Result<_, _>>()?;
+    let (params, rest_param) = special_forms::parse_params(&param_names);
+    let body = args[2..].to_vec();
+    env.set(
+        name_spur,
+        Value::macro_val(Macro {
+            params,
+            rest_param,
+            body,
+            name: name_spur,
+        }),
+    );
+    Ok(())
+}
+
 /// Register `__vm-*` native functions that the bytecode VM calls back into
 /// the tree-walker for forms that cannot be fully compiled.
 /// Load built-in macros (threading, when-let, if-let) into the global environment.
 fn load_prelude(ctx: &EvalContext, env: &Rc<Env>) {
     let exprs = sema_reader::read_many(crate::prelude::PRELUDE)
         .unwrap_or_else(|e| panic!("internal: prelude failed to parse: {e}"));
+    // The prelude is exclusively `defmacro` forms. Register them via the
+    // VM-native pre-expansion path so prelude loading never routes macro
+    // registration through the tree-walker's `eval_value`.
     for expr in &exprs {
-        eval_value(ctx, expr, env)
-            .unwrap_or_else(|e| panic!("internal: prelude failed to eval: {e}"));
+        expand_for_vm_in(ctx, env, expr)
+            .unwrap_or_else(|e| panic!("internal: prelude failed to load: {e}"));
     }
 }
 
@@ -1091,7 +1200,8 @@ fn register_vm_delegates(env: &Rc<Env>) {
                     if let Some(spur) = items[0].as_symbol_spur() {
                         if let Some(mac_val) = me_env.get(spur) {
                             if let Some(mac) = mac_val.as_macro_rc() {
-                                return apply_macro(ctx, &mac, &items[1..], &me_env);
+                                // VM-native: expand the transformer on the VM.
+                                return apply_macro_vm(ctx, &mac, &items[1..], &me_env);
                             }
                         }
                     }

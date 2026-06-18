@@ -2175,7 +2175,7 @@ fn eval_define_record_type(args: &[Value], env: &Env) -> Result<Trampoline, Sema
 }
 
 /// Parse parameter list, handling rest params (e.g., `(a b . rest)`)
-fn parse_params(names: &[Spur]) -> (Vec<Spur>, Option<Spur>) {
+pub(crate) fn parse_params(names: &[Spur]) -> (Vec<Spur>, Option<Spur>) {
     let dot = intern(".");
     if let Some(pos) = names.iter().position(|s| *s == dot) {
         let params = names[..pos].to_vec();

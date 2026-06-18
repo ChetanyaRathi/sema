@@ -1678,3 +1678,104 @@ fn test_vm_compiler_depth_limit() {
     let err = result.unwrap_err().to_string();
     assert!(err.contains("depth"), "expected depth error, got: {err}");
 }
+
+// === M2: VM-native macro expansion (no tree-walker) ===
+//
+// These are *absolute oracle* tests pinned to literal values, run on the VM
+// backend. They guard the M2 change that made macro expansion (`apply_macro_vm`)
+// and prelude/`defmacro` registration VM-native — the dual-eval suite cannot
+// distinguish this on its own because both backends share `load_prelude`.
+
+#[test]
+fn vm_prelude_threading_macros_oracle() {
+    // -> and ->> are prelude macros; expanding them on the VM must be exact.
+    assert_eq!(eval_vm("(-> 5 (+ 3) (* 2))"), Value::int(16));
+    assert_eq!(eval_vm("(->> 5 (+ 3) (* 2))"), Value::int(16));
+    assert_eq!(
+        eval_vm("(-> 10 (- 3) (- 2))"),
+        Value::int(5),
+        "threading is left-to-right, first-arg insertion"
+    );
+}
+
+#[test]
+fn vm_prelude_binding_macros_oracle() {
+    // when-let / if-let short-circuit on `nil` (they test `nil?`, not falsiness).
+    assert_eq!(eval_vm("(when-let (x (+ 1 2)) (* x 10))"), Value::int(30));
+    assert_eq!(eval_vm("(when-let (x nil) (* x 10))"), Value::nil());
+    assert_eq!(eval_vm("(if-let (x 7) (* x 2) -1)"), Value::int(14));
+    assert_eq!(eval_vm("(if-let (x nil) (* x 2) -1)"), Value::int(-1));
+}
+
+#[test]
+fn vm_prelude_loop_macros_oracle() {
+    assert_eq!(
+        eval_vm("(let ((acc 0)) (dotimes (i 5) (set! acc (+ acc i))) acc)"),
+        Value::int(10),
+        "dotimes sums 0+1+2+3+4"
+    );
+    assert_eq!(
+        eval_vm("(let ((acc 0)) (for-range (i 1 5) (set! acc (+ acc i))) acc)"),
+        Value::int(10),
+        "for-range sums 1+2+3+4"
+    );
+}
+
+#[test]
+fn vm_user_macro_calls_global_helper_oracle() {
+    // A transformer body that calls a *user-defined* global helper while
+    // building the expansion — proves apply_macro_vm roots the VM run at the
+    // caller env so user globals (not just builtins) resolve.
+    //
+    // The VM expands macros ahead-of-time at compile, so the helper must exist
+    // at expansion time: we define it on a first eval (persists in the global
+    // env), then use the macro on a second eval of the same interpreter.
+    let interp = Interpreter::new();
+    interp
+        .eval_str_compiled("(define (wrap-begin forms) (cons 'begin forms))")
+        .expect("define helper");
+    interp
+        .eval_str_compiled("(defmacro run-all (. body) (wrap-begin body))")
+        .expect("define macro");
+    interp
+        .eval_str_compiled("(define counter 0)")
+        .expect("define counter");
+    interp
+        .eval_str_compiled("(run-all (set! counter (+ counter 1)) (set! counter (+ counter 10)))")
+        .expect("use macro");
+    assert_eq!(
+        interp.eval_str_compiled("counter").expect("read counter"),
+        Value::int(11),
+        "transformer-built (begin ...) must run both set! forms"
+    );
+}
+
+#[test]
+fn vm_macro_quasiquote_and_gensym_oracle() {
+    // Quasiquote + unquote-splicing in a transformer body, plus auto-gensym
+    // hygiene across two expansions of the same macro (the tmp# binding must
+    // not collide). Both `swap!` uses expand independently and correctly.
+    let src = r#"
+        (begin
+          (defmacro my-swap! (a b)
+            `(let ((tmp# ,a))
+               (set! ,a ,b)
+               (set! ,b tmp#)))
+          (define p 1)
+          (define q 2)
+          (define r 3)
+          (define s 4)
+          (my-swap! p q)
+          (my-swap! r s)
+          (list p q r s))
+    "#;
+    assert_eq!(
+        eval_vm(src),
+        Value::list(vec![
+            Value::int(2),
+            Value::int(1),
+            Value::int(4),
+            Value::int(3)
+        ])
+    );
+}
