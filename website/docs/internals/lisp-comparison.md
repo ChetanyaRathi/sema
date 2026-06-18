@@ -23,7 +23,18 @@ How does Sema compare to other Lisp dialects on a real-world I/O-heavy workload?
 | **Kawa**          | JVM (JIT)                | 16,521    | 8.5x     | JIT-compiled |
 | **Sema**          | Bytecode VM              | 21,101    | 10.9x    | Interpreted  |
 | **Gauche**        | Bytecode VM              | 21,786    | 11.2x    | Interpreted  |
-| **Sema**          | Tree-walking (retired)   | 44,479    | 22.9x    | Interpreted  |
+| **Sema**          | Tree-walking (removed)   | 44,479    | 22.9x    | Interpreted  |
+
+::: info Tree-walker removed; Sema VM re-verified
+The Sema tree-walking row is **historical** — that evaluator was retired and its
+code deleted (2026-06-18); the bytecode VM is now Sema's sole evaluator. The
+other dialects' numbers are from the original Docker/Rosetta run and are
+unchanged. Sema's VM result was re-measured after the retirement to confirm it
+still holds: ~11.5 s native for 10 M rows on Apple Silicon (consistent with the
+21.1 s figure above, which is under x86-64 emulation — emulation is ~1.7× slower
+than native here). The retirement is call-overhead-neutral for this I/O- and
+hashmap-heavy workload.
+:::
 
 Racket was excluded — we encountered crashes with both the CS (Chez Scheme) and BC (bytecode) backends in our Docker Desktop x86-64 emulation setup on Apple Silicon. This appears to be a [Docker/Rosetta emulation issue](https://racket.discourse.group/t/racket-docker-m1-rosetta/2947), not a Racket performance issue; Racket CS would likely land between Chez and Clojure.
 
@@ -156,7 +167,7 @@ To measure raw language runtime speed — independent of implementation tricks �
 | **Emacs Lisp**    | Bytecode VM              | 21,779    | 7.0x     | 1.8x slower  |
 | **Gauche**        | Bytecode VM              | 21,849    | 7.0x     | ~same        |
 | **Sema**          | Bytecode VM              | 25,999    | 8.4x     | 1.2x slower  |
-| **Sema**          | Tree-walking (retired)   | 49,770    | 16.0x    | 1.1x slower  |
+| **Sema**          | Tree-walking (removed)   | 49,770    | 16.0x    | 1.1x slower  |
 
 The simple results are normalized to Fennel (the fastest simple implementation) rather than SBCL, since SBCL benefits the most from its optimizations.
 

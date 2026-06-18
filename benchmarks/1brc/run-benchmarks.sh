@@ -94,8 +94,9 @@ run_bench "fennel"   fennel --lua luajit /bench/1brc.fnl "$DATA_FILE"
 run_bench "clojure"  clojure -M /bench/1brc.clj "$DATA_FILE"
 run_bench "kawa"     kawa --script /bench/1brc.kawa.scm "$DATA_FILE"
 
-# ── Tree-walking interpreters ──
-run_bench "sema"     sema --no-llm --tw /bench/1brc.sema -- "$DATA_FILE"
+# ── Sema (bytecode VM — the sole evaluator) ──
+# The tree-walker was retired (2026-06-18); the old `--tw` "sema" row is gone
+# (--tw is now a no-op that would just duplicate the VM result).
 run_bench "sema-vm"  sema --no-llm /bench/1brc.sema -- "$DATA_FILE"
 
 # ── Bytecode VMs / Interpreters ──
