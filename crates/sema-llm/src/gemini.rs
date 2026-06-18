@@ -31,7 +31,7 @@ impl GeminiProvider {
         Ok(GeminiProvider {
             api_key,
             base_url: "https://generativelanguage.googleapis.com/v1beta".to_string(),
-            default_model: default_model.unwrap_or_else(|| "gemini-2.0-flash".to_string()),
+            default_model: default_model.unwrap_or_else(|| "gemini-3.5-flash".to_string()),
             client: crate::http::create_client(None)?,
             runtime,
         })
@@ -411,7 +411,7 @@ mod tests {
     fn build_url_omits_api_key() {
         let url = build_url(
             "https://generativelanguage.googleapis.com/v1beta",
-            "gemini-2.0-flash",
+            "gemini-3.5-flash",
             "generateContent",
         )
         .unwrap();
@@ -419,7 +419,7 @@ mod tests {
             !url.contains("key="),
             "API key must not appear in URL: {url}"
         );
-        assert!(url.contains("gemini-2.0-flash"));
+        assert!(url.contains("gemini-3.5-flash"));
         assert!(url.ends_with(":generateContent"));
     }
 

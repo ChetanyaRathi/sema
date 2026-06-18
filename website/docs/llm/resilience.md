@@ -15,6 +15,30 @@ Wraps a thunk with a fallback chain of providers. If the LLM call fails with one
   (lambda () (llm/complete "Hello")))
 ```
 
+#### Model selection across the chain
+
+Model ids are provider-specific (a Claude id is meaningless to OpenAI), so each chain entry resolves its own model:
+
+- A **bare provider keyword** (e.g. `:anthropic`) uses that provider's [default model](./providers#default-models), or whatever you set via `(llm/configure :anthropic {:default-model "..."})`. This is the recommended form — leave the body's `(llm/complete ...)` **unpinned** so every provider gets a model id valid for itself.
+- If the body pins a `:model`, that exact string is sent to **every** provider in the chain. That's fine for a homogeneous chain, but pinning a provider-specific id (e.g. a Claude model) will fail on any other provider it falls back to.
+
+#### Per-provider model overrides
+
+To target a different model per provider within a single chain, give chain entries as `[provider model]` pairs or `{:provider :model}` maps. A per-provider override **wins over any `:model` pinned in the body**:
+
+```sema
+;; Anthropic uses Opus, OpenAI uses GPT-5.5, Groq uses its default
+(llm/with-fallback [[:anthropic "claude-opus-4-8"]
+                    [:openai    "gpt-5.5"]
+                    :groq]
+  (lambda () (llm/complete "Hello")))
+
+;; Map form is equivalent and lets you omit :model to use the provider default
+(llm/with-fallback [{:provider :anthropic :model "claude-opus-4-8"}
+                    {:provider :openai}]
+  (lambda () (llm/complete "Hello")))
+```
+
 ## Rate Limiting
 
 ### `llm/with-rate-limit`

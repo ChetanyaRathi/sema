@@ -56,6 +56,18 @@ struct CachedResponse {
     cached_at: i64,
 }
 
+/// One entry in an `llm/with-fallback` chain: a provider name plus an optional
+/// per-provider model override. When `model` is `Some`, that model id is used for
+/// this provider regardless of any model pinned in the call body (chain override
+/// wins) — this lets a chain target a different model per provider, e.g. Opus on
+/// Anthropic but a GPT model on OpenAI. When `None`, the provider's configured
+/// default model is used.
+#[derive(Debug, Clone)]
+struct FallbackEntry {
+    provider: String,
+    model: Option<String>,
+}
+
 thread_local! {
     static PRICING_WARNING_SHOWN: Cell<bool> = const { Cell::new(false) };
     static LISP_PROVIDERS: RefCell<std::collections::HashMap<String, LispProviderCallbacks>> = RefCell::new(std::collections::HashMap::new());
@@ -65,11 +77,24 @@ thread_local! {
     static CACHE_TTL_SECS: Cell<i64> = const { Cell::new(3600) };
     static CACHE_HITS: Cell<u64> = const { Cell::new(0) };
     static CACHE_MISSES: Cell<u64> = const { Cell::new(0) };
-    static FALLBACK_CHAIN: RefCell<Option<Vec<String>>> = const { RefCell::new(None) };
+    static FALLBACK_CHAIN: RefCell<Option<Vec<FallbackEntry>>> = const { RefCell::new(None) };
     static VECTOR_STORES: RefCell<std::collections::HashMap<String, VectorStore>> =
         RefCell::new(std::collections::HashMap::new());
     static RATE_LIMIT_RPS: Cell<Option<f64>> = const { Cell::new(None) };
     static RATE_LIMIT_LAST: Cell<u64> = const { Cell::new(0) };
+    // Name of the provider that served the most recent `do_complete` response, so cost
+    // tracking can price the model as served by that provider (resellers/gateways can list
+    // the same model id at a different rate). Set at the dispatch choke points, consumed +
+    // cleared by `track_usage`. `None` → canonical first-party price.
+    static LAST_SERVING_PROVIDER: RefCell<Option<String>> = const { RefCell::new(None) };
+}
+
+fn set_serving_provider(name: &str) {
+    LAST_SERVING_PROVIDER.with(|p| *p.borrow_mut() = Some(name.to_string()));
+}
+
+fn take_serving_provider() -> Option<String> {
+    LAST_SERVING_PROVIDER.with(|p| p.borrow_mut().take())
 }
 
 struct LispProviderCallbacks {
@@ -109,7 +134,8 @@ pub fn reset_runtime_state() {
     VECTOR_STORES.with(|s| s.borrow_mut().clear());
     RATE_LIMIT_RPS.with(|r| r.set(None));
     RATE_LIMIT_LAST.with(|r| r.set(0));
-    pricing::clear_fetched_pricing();
+    LAST_SERVING_PROVIDER.with(|p| *p.borrow_mut() = None);
+    pricing::clear_custom_pricing();
 }
 
 /// Evaluate an expression using the registered full evaluator.
@@ -177,7 +203,10 @@ where
 }
 
 fn track_usage(usage: &Usage) -> Result<(), SemaError> {
-    let cost = pricing::calculate_cost(usage);
+    // Price the model as served by the provider that produced this response (falls back to
+    // the canonical first-party price when the serving provider is unknown).
+    let provider = take_serving_provider().unwrap_or_default();
+    let cost = pricing::calculate_cost_for(&provider, usage);
     let total_tokens = (usage.prompt_tokens + usage.completion_tokens) as u64;
 
     LAST_USAGE.with(|u| *u.borrow_mut() = Some(usage.clone()));
@@ -308,6 +337,60 @@ pub fn pop_budget_scope() {
 fn get_opt_string(opts: &BTreeMap<Value, Value>, key: &str) -> Option<String> {
     opts.get(&Value::keyword(key))
         .and_then(|v| v.as_str().map(|s| s.to_string()))
+}
+
+/// Parse one `llm/with-fallback` chain element into a [`FallbackEntry`].
+///
+/// Accepted shapes:
+/// - `:provider` / `"provider"` — bare name, uses the provider's default model
+/// - `[:provider "model"]` — pair, with a per-provider model override
+/// - `{:provider :name :model "model"}` — map form, `:model` optional
+fn parse_fallback_entry(v: &Value) -> Result<FallbackEntry, SemaError> {
+    // Bare keyword or string.
+    if let Some(name) = v.as_keyword().or_else(|| v.as_str().map(|s| s.to_string())) {
+        return Ok(FallbackEntry {
+            provider: name,
+            model: None,
+        });
+    }
+    // Map form: {:provider .. :model ..}. The :provider value may be a keyword or
+    // a string.
+    if let Some(map) = v.as_map_ref() {
+        let provider = map
+            .get(&Value::keyword("provider"))
+            .and_then(|p| p.as_keyword().or_else(|| p.as_str().map(|s| s.to_string())))
+            .ok_or_else(|| {
+                SemaError::eval("fallback map entry must have a :provider key (keyword or string)")
+            })?;
+        return Ok(FallbackEntry {
+            provider,
+            model: get_opt_string(map, "model"),
+        });
+    }
+    // Pair form: [:provider "model"].
+    if let Some(seq) = v.as_seq() {
+        if seq.len() != 2 {
+            return Err(SemaError::eval(
+                "fallback pair entry must be [provider model]",
+            ));
+        }
+        let provider = seq[0]
+            .as_keyword()
+            .or_else(|| seq[0].as_str().map(|s| s.to_string()))
+            .ok_or_else(|| SemaError::type_error("keyword or string", seq[0].type_name()))?;
+        let model = seq[1]
+            .as_str()
+            .map(|s| s.to_string())
+            .ok_or_else(|| SemaError::type_error("string model", seq[1].type_name()))?;
+        return Ok(FallbackEntry {
+            provider,
+            model: Some(model),
+        });
+    }
+    Err(SemaError::type_error(
+        "keyword, string, [provider model] pair, or map",
+        v.type_name(),
+    ))
 }
 
 fn get_opt_f64(opts: &BTreeMap<Value, Value>, key: &str) -> Option<f64> {
@@ -800,7 +883,7 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
                         .clone()
                         .ok_or_else(|| SemaError::Llm("missing :api-key".to_string()))?;
                     let model = get_opt_string(&opts, "default-model")
-                        .unwrap_or_else(|| "grok-3-mini-fast".to_string());
+                        .unwrap_or_else(|| "grok-4.3".to_string());
                     let base_url = get_opt_string(&opts, "base-url")
                         .unwrap_or_else(|| "https://api.x.ai/v1".to_string());
                     let provider =
@@ -814,7 +897,7 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
                         .clone()
                         .ok_or_else(|| SemaError::Llm("missing :api-key".to_string()))?;
                     let model = get_opt_string(&opts, "default-model")
-                        .unwrap_or_else(|| "mistral-small-latest".to_string());
+                        .unwrap_or_else(|| "mistral-large-latest".to_string());
                     let base_url = get_opt_string(&opts, "base-url")
                         .unwrap_or_else(|| "https://api.mistral.ai/v1".to_string());
                     let provider = OpenAiProvider::named(
@@ -833,7 +916,7 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
                         .clone()
                         .ok_or_else(|| SemaError::Llm("missing :api-key".to_string()))?;
                     let model = get_opt_string(&opts, "default-model")
-                        .unwrap_or_else(|| "moonshot-v1-8k".to_string());
+                        .unwrap_or_else(|| "kimi-k2.6".to_string());
                     let base_url = get_opt_string(&opts, "base-url")
                         .unwrap_or_else(|| "https://api.moonshot.ai/v1".to_string());
                     let provider = OpenAiProvider::named(
@@ -1063,7 +1146,7 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
             // Try xAI
             if let Ok(key) = std::env::var("XAI_API_KEY") {
                 if !key.is_empty() {
-                    let model = model_for!("xai").unwrap_or_else(|| "grok-3-mini-fast".to_string());
+                    let model = model_for!("xai").unwrap_or_else(|| "grok-4.3".to_string());
                     let provider = OpenAiProvider::named(
                         "xai".to_string(),
                         key,
@@ -1083,7 +1166,7 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
             if let Ok(key) = std::env::var("MISTRAL_API_KEY") {
                 if !key.is_empty() {
                     let model =
-                        model_for!("mistral").unwrap_or_else(|| "mistral-small-latest".to_string());
+                        model_for!("mistral").unwrap_or_else(|| "mistral-large-latest".to_string());
                     let provider = OpenAiProvider::named(
                         "mistral".to_string(),
                         key,
@@ -1102,8 +1185,7 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
             // Try Moonshot
             if let Ok(key) = std::env::var("MOONSHOT_API_KEY") {
                 if !key.is_empty() {
-                    let model =
-                        model_for!("moonshot").unwrap_or_else(|| "moonshot-v1-8k".to_string());
+                    let model = model_for!("moonshot").unwrap_or_else(|| "kimi-k2.6".to_string());
                     let provider = OpenAiProvider::named(
                         "moonshot".to_string(),
                         key,
@@ -1254,9 +1336,6 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
                 None => Ok(Value::nil()),
             }
         })?;
-
-        // Best-effort pricing refresh (outside PROVIDER_REGISTRY borrow)
-        pricing::refresh_pricing(pricing::default_cache_path().as_deref());
 
         Ok(result)
     });
@@ -3292,13 +3371,9 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
         if body_fn.as_lambda_rc().is_none() && body_fn.as_native_fn_rc().is_none() {
             return Err(SemaError::type_error("function", body_fn.type_name()));
         }
-        let chain: Vec<String> = providers
+        let chain: Vec<FallbackEntry> = providers
             .iter()
-            .map(|v| {
-                v.as_keyword()
-                    .or_else(|| v.as_str().map(|s| s.to_string()))
-                    .ok_or_else(|| SemaError::type_error("keyword or string", v.type_name()))
-            })
+            .map(parse_fallback_entry)
             .collect::<Result<_, _>>()?;
         let prev = FALLBACK_CHAIN.with(|c| c.borrow().clone());
         FALLBACK_CHAIN.with(|c| *c.borrow_mut() = Some(chain));
@@ -4024,38 +4099,71 @@ fn is_cache_valid(cached: &CachedResponse) -> bool {
 }
 
 /// Send a ChatRequest via the default provider with caching, fallback, and rate-limit retry.
-fn do_complete(mut request: ChatRequest) -> Result<ChatResponse, SemaError> {
+fn do_complete(request: ChatRequest) -> Result<ChatResponse, SemaError> {
+    // Reset the serving-provider stamp so a cache hit (which serves no provider) doesn't
+    // inherit a stale name from a prior completion.
+    LAST_SERVING_PROVIDER.with(|p| *p.borrow_mut() = None);
     let cache_enabled = CACHE_ENABLED.with(|c| c.get());
-    if cache_enabled {
-        if request.model.is_empty() {
-            let default_model = with_provider(|p| Ok(p.default_model().to_string()))?;
-            request.model = default_model;
-        }
-        let cache_key = compute_cache_key(&request);
-        if let Some(cached) = load_cached(&cache_key) {
-            if is_cache_valid(&cached) {
-                CACHE_HITS.with(|c| c.set(c.get() + 1));
-                return Ok(ChatResponse {
-                    content: cached.content,
-                    role: "assistant".to_string(),
-                    model: cached.model,
-                    tool_calls: vec![],
-                    usage: Usage {
-                        prompt_tokens: cached.prompt_tokens,
-                        completion_tokens: cached.completion_tokens,
-                        model: request.model.clone(),
-                    },
-                    stop_reason: Some("cache_hit".to_string()),
-                });
-            }
-        }
-        CACHE_MISSES.with(|c| c.set(c.get() + 1));
-        let response = do_complete_inner(request)?;
-        store_cached(&cache_key, &response);
-        Ok(response)
-    } else {
-        do_complete_inner(request)
+    if !cache_enabled {
+        return do_complete_inner(request);
     }
+    // Compute the cache key from the model the request will *logically* use, but
+    // without mutating the request that flows into the fallback loop. Pre-filling
+    // `request.model` here would make it non-empty and defeat the per-provider
+    // default/override substitution in `do_complete_with_provider` — sending the
+    // wrong provider's model id down the chain (the original cache+fallback bug).
+    let key_model = if request.model.is_empty() {
+        primary_model_for_cache()?
+    } else {
+        request.model.clone()
+    };
+    let mut key_request = request.clone();
+    key_request.model = key_model;
+    let cache_key = compute_cache_key(&key_request);
+    if let Some(cached) = load_cached(&cache_key) {
+        if is_cache_valid(&cached) {
+            CACHE_HITS.with(|c| c.set(c.get() + 1));
+            return Ok(ChatResponse {
+                content: cached.content,
+                role: "assistant".to_string(),
+                model: cached.model,
+                tool_calls: vec![],
+                usage: Usage {
+                    prompt_tokens: cached.prompt_tokens,
+                    completion_tokens: cached.completion_tokens,
+                    model: key_request.model.clone(),
+                },
+                stop_reason: Some("cache_hit".to_string()),
+            });
+        }
+    }
+    CACHE_MISSES.with(|c| c.set(c.get() + 1));
+    let response = do_complete_inner(request)?;
+    store_cached(&cache_key, &response);
+    Ok(response)
+}
+
+/// Resolve the model id used for the cache key when the caller pinned none. With an
+/// active fallback chain, the "logical" model is the first chain entry's model (its
+/// override if present, else that provider's default); otherwise it's the default
+/// provider's default model.
+fn primary_model_for_cache() -> Result<String, SemaError> {
+    let first_entry =
+        FALLBACK_CHAIN.with(|c| c.borrow().as_ref().and_then(|chain| chain.first().cloned()));
+    if let Some(entry) = first_entry {
+        if let Some(model) = entry.model {
+            return Ok(model);
+        }
+        return PROVIDER_REGISTRY.with(|reg| {
+            let reg = reg.borrow();
+            reg.get(&entry.provider)
+                .map(|p| p.default_model().to_string())
+                .ok_or_else(|| {
+                    SemaError::Llm(format!("fallback provider '{}' not found", entry.provider))
+                })
+        });
+    }
+    with_provider(|p| Ok(p.default_model().to_string()))
 }
 
 fn do_complete_inner(request: ChatRequest) -> Result<ChatResponse, SemaError> {
@@ -4063,11 +4171,14 @@ fn do_complete_inner(request: ChatRequest) -> Result<ChatResponse, SemaError> {
     match fallback_chain {
         Some(chain) if !chain.is_empty() => {
             let mut last_error = None;
-            for provider_name in &chain {
-                match do_complete_with_provider(provider_name, request.clone()) {
+            for entry in &chain {
+                match do_complete_with_provider(entry, request.clone()) {
                     Ok(resp) => return Ok(resp),
                     Err(e) => {
-                        eprintln!("Provider '{}' failed: {}, trying next...", provider_name, e);
+                        eprintln!(
+                            "Provider '{}' failed: {}, trying next...",
+                            entry.provider, e
+                        );
                         last_error = Some(e);
                     }
                 }
@@ -4079,27 +4190,36 @@ fn do_complete_inner(request: ChatRequest) -> Result<ChatResponse, SemaError> {
 }
 
 fn do_complete_with_provider(
-    provider_name: &str,
+    entry: &FallbackEntry,
     mut request: ChatRequest,
 ) -> Result<ChatResponse, SemaError> {
     PROVIDER_REGISTRY.with(|reg| {
         let reg = reg.borrow();
-        let provider = reg.get(provider_name).ok_or_else(|| {
-            SemaError::Llm(format!("fallback provider '{}' not found", provider_name))
+        let provider = reg.get(&entry.provider).ok_or_else(|| {
+            SemaError::Llm(format!("fallback provider '{}' not found", entry.provider))
         })?;
-        if request.model.is_empty() {
+        // A per-provider chain override wins over any model pinned in the call body
+        // (so the chain can target a different model per provider); otherwise fall
+        // back to the provider's own default when nothing was pinned. Either way each
+        // provider receives a model id valid for itself.
+        if let Some(model) = &entry.model {
+            request.model = model.clone();
+        } else if request.model.is_empty() {
             request.model = provider.default_model().to_string();
         }
         let mut retries = 0;
         loop {
             match provider.complete(request.clone()) {
-                Ok(resp) => return Ok(resp),
+                Ok(resp) => {
+                    set_serving_provider(&entry.provider);
+                    return Ok(resp);
+                }
                 Err(crate::types::LlmError::RateLimited { retry_after_ms }) => {
                     retries += 1;
                     if retries > 3 {
                         return Err(SemaError::Llm(format!(
                             "provider '{}' rate limited after 3 retries",
-                            provider_name
+                            entry.provider
                         )));
                     }
                     let wait = std::cmp::min(retry_after_ms, 30000);
@@ -4122,7 +4242,10 @@ fn do_complete_uncached(mut request: ChatRequest) -> Result<ChatResponse, SemaEr
         let max_retries = 3;
         loop {
             match p.complete(request.clone()) {
-                Ok(resp) => return Ok(resp),
+                Ok(resp) => {
+                    set_serving_provider(p.name());
+                    return Ok(resp);
+                }
                 Err(crate::types::LlmError::RateLimited { retry_after_ms }) => {
                     retries += 1;
                     if retries > max_retries {
@@ -4933,9 +5056,53 @@ mod tests {
     fn test_fallback_chain_thread_local() {
         FALLBACK_CHAIN.with(|chain| {
             assert!(chain.borrow().is_none());
-            *chain.borrow_mut() = Some(vec!["openai".to_string(), "anthropic".to_string()]);
+            *chain.borrow_mut() = Some(vec![
+                FallbackEntry {
+                    provider: "openai".to_string(),
+                    model: None,
+                },
+                FallbackEntry {
+                    provider: "anthropic".to_string(),
+                    model: None,
+                },
+            ]);
             assert_eq!(chain.borrow().as_ref().unwrap().len(), 2);
             *chain.borrow_mut() = None;
         });
+    }
+
+    #[test]
+    fn test_parse_fallback_entry_bare_keyword() {
+        let entry = parse_fallback_entry(&Value::keyword("anthropic")).unwrap();
+        assert_eq!(entry.provider, "anthropic");
+        assert_eq!(entry.model, None);
+    }
+
+    #[test]
+    fn test_parse_fallback_entry_pair() {
+        let v = Value::vector(vec![Value::keyword("openai"), Value::string("gpt-5.5")]);
+        let entry = parse_fallback_entry(&v).unwrap();
+        assert_eq!(entry.provider, "openai");
+        assert_eq!(entry.model.as_deref(), Some("gpt-5.5"));
+    }
+
+    #[test]
+    fn test_parse_fallback_entry_map() {
+        let mut map = BTreeMap::new();
+        map.insert(Value::keyword("provider"), Value::keyword("anthropic"));
+        map.insert(Value::keyword("model"), Value::string("claude-opus-4-8"));
+        let entry = parse_fallback_entry(&Value::map(map)).unwrap();
+        assert_eq!(entry.provider, "anthropic");
+        assert_eq!(entry.model.as_deref(), Some("claude-opus-4-8"));
+    }
+
+    #[test]
+    fn test_parse_fallback_entry_bad_pair_len() {
+        let v = Value::vector(vec![
+            Value::keyword("openai"),
+            Value::string("a"),
+            Value::string("b"),
+        ]);
+        assert!(parse_fallback_entry(&v).is_err());
     }
 }

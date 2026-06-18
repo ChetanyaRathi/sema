@@ -26,7 +26,7 @@ impl OpenAiProvider {
             "openai".to_string(),
             api_key,
             base_url.unwrap_or_else(|| "https://api.openai.com/v1".to_string()),
-            default_model.unwrap_or_else(|| "gpt-4o".to_string()),
+            default_model.unwrap_or_else(|| "gpt-5.5".to_string()),
             true,
         )
     }

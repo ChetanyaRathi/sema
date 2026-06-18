@@ -67,7 +67,7 @@ Send a message with a different system prompt for one turn only. The override ap
 ```sema
 ;; With a prompt value — uses its system message for this turn
 (define argue-for (prompt (system "You argue IN FAVOR of Lisp.")))
-(define conv (conversation/new {:model "claude-sonnet-4-20250514"}))
+(define conv (conversation/new {:model "claude-sonnet-4-6"}))
 (define conv (conversation/say-as conv argue-for "Make your case."))
 
 ;; With a plain string — treated as system content

@@ -175,7 +175,7 @@ The `:tool-calls` list contains maps with `:id` (string), `:name` (string), and 
          (begin (llm/set-default :openai)
                 (llm/complete (:content (last (:messages req))) {:model model})))
         (else (error (string/append "Unknown model: " model))))))
-   :default-model "claude-sonnet-4-20250514"})
+   :default-model "claude-sonnet-4-6"})
 ```
 
 ### Switching Between Providers
@@ -211,7 +211,7 @@ List all configured providers.
 Get the currently active provider and model.
 
 ```sema
-(llm/current-provider)   ; => {:name :anthropic :model "claude-sonnet-4-20250514"}
+(llm/current-provider)   ; => {:name :anthropic :model "claude-sonnet-4-6"}
 (llm/default-provider)   ; => same (alias)
 ```
 
@@ -246,6 +246,23 @@ All providers are auto-configured from environment variables. Use `(llm/configur
 ¹ Streaming falls back to non-streaming (sends complete response as a single chunk).
 
 ² Vision requires a vision-capable model (e.g., `gemma3:4b`, `llava`).
+
+### Default Models
+
+When you don't pass `:default-model` to `llm/configure` (or pin `:model` on a call), each provider uses the following default. These are also what `llm/with-fallback` substitutes per provider when the body doesn't pin a model.
+
+| Provider     | Default model                |
+| ------------ | ---------------------------- |
+| `:anthropic` | `claude-sonnet-4-6`          |
+| `:openai`    | `gpt-5.5`                    |
+| `:gemini`    | `gemini-3.5-flash`           |
+| `:ollama`    | `gemma4`                     |
+| `:groq`      | `llama-3.3-70b-versatile`    |
+| `:xai`       | `grok-4.3`                   |
+| `:mistral`   | `mistral-large-latest`       |
+| `:moonshot`  | `kimi-k2.6`                  |
+
+Override any of these per provider with `:default-model`, globally via `SEMA_CHAT_MODEL`, or per call with `:model`.
 
 ## Environment Variables
 

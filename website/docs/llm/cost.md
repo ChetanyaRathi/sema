@@ -32,23 +32,21 @@ Reset session usage counters.
 
 ## Pricing Sources
 
-Sema tracks LLM costs using pricing data from multiple sources, checked in this order:
+Sema tracks LLM costs using pricing data from these sources, checked in this order:
 
 1. **Custom pricing** — set via `(llm/set-pricing "model" input output)`, always wins
-2. **Dynamic pricing** — fetched from [llm-prices.com](https://www.llm-prices.com) during `(llm/auto-configure)`, cached locally at `~/.sema/pricing-cache.json`
-3. **Built-in estimates** — hardcoded fallback table (may be outdated)
-4. **Unknown** — if no source matches, cost tracking returns `nil` and budget enforcement is best-effort
+2. **Embedded snapshot** — a [models.dev](https://models.dev) price list (2,400+ models) vendored and compiled into the binary, so cost tracking works fully offline with no runtime network calls
+3. **Unknown** — if no source matches, cost tracking returns `nil` and budget enforcement is best-effort
 
-Dynamic pricing is fetched with a short timeout (2s) and failures are silently ignored. The language works fully offline — the cache persists between sessions.
+The embedded snapshot is refreshed by maintainers with `make update-pricing` and shipped in patch releases. Prices are matched by model id, preferring the canonical first-party listing; when the serving provider is known (e.g. inside an `llm/with-fallback` chain), a reseller/gateway that lists the same model at a different rate is priced correctly.
 
 ### `llm/pricing-status`
 
-Check which pricing source is active and when it was last updated.
+Check the pricing source and the snapshot date.
 
 ```sema
 (llm/pricing-status)
-; => {:source fetched :updated-at "2025-10-10"}
-; or {:source hardcoded} if no dynamic pricing is available
+; => {:source "embedded" :updated-at "2026-06-18"}
 ```
 
 ## Budget Enforcement

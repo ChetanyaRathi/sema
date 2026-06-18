@@ -60,7 +60,7 @@ impl OllamaProvider {
                 std::env::var("OLLAMA_HOST")
                     .unwrap_or_else(|_| "http://localhost:11434".to_string())
             }),
-            default_model: default_model.unwrap_or_else(|| "qwen3:8b".to_string()),
+            default_model: default_model.unwrap_or_else(|| "gemma4".to_string()),
             client,
             runtime,
         })

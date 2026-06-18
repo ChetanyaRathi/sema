@@ -177,7 +177,7 @@ String interning is as old as Lisp itself. McCarthy's original LISP 1.5 (1962) i
 ;; These are values, not strings or maps
 (define msg (message :user "Hello"))    ; => <message user "Hello">
 (define p (prompt msg))                 ; => <prompt 1 messages>
-(define conv (conversation p :model "claude-sonnet-4-20250514")) ; => <conversation 1 messages>
+(define conv (conversation p :model "claude-sonnet-4-6")) ; => <conversation 1 messages>
 ```
 
 This means the type system catches errors like passing a string where a message is expected, and tools like `complete` can dispatch on the actual type rather than checking for the presence of magic keys in a map.

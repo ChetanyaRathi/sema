@@ -15,8 +15,7 @@ impl AnthropicProvider {
         let runtime = crate::http::create_runtime()?;
         Ok(AnthropicProvider {
             api_key,
-            default_model: default_model
-                .unwrap_or_else(|| "claude-sonnet-4-5-20250929".to_string()),
+            default_model: default_model.unwrap_or_else(|| "claude-sonnet-4-6".to_string()),
             client: crate::http::create_client(None)?,
             runtime,
         })

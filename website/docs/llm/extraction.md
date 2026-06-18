@@ -148,7 +148,7 @@ Supported image formats (detected automatically via magic bytes): PNG, JPEG, GIF
 `llm/extract-from-image` accepts an optional third argument — an options map:
 
 ```sema
-(llm/extract-from-image schema source {:model "gpt-4o"})
+(llm/extract-from-image schema source {:model "gpt-5.5"})
 ```
 
 | Option   | Type   | Default | Description                |

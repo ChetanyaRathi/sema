@@ -232,10 +232,10 @@ Hidden context is **not** included in log output.
 (context/set :model "claude-sonnet")
 
 ;; Override for a specific block
-(context/with {:model "gpt-4o" :temperature 0.9}
+(context/with {:model "gpt-5.5" :temperature 0.9}
   (lambda ()
     ;; Code here sees the overridden values
-    (context/get :model)))       ; => "gpt-4o"
+    (context/get :model)))       ; => "gpt-5.5"
 
 (context/get :model)             ; => "claude-sonnet"
 ```

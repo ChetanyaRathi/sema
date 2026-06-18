@@ -1,4 +1,4 @@
-.PHONY: all build release install uninstall test test-lsp test-embedding-bench test-http test-llm check clippy fmt fmt-check clean run lint lint-links docs docs-check examples examples-vm smoke-bytecode test-providers fuzz fuzz-reader fuzz-eval setup bench-1m bench-10m bench-100m site-dev site-build site-preview site-deploy deploy coverage coverage-html bench bench-vm bench-tree bench-save bench-suite bench-closure bench-numeric bench-compare bench-baseline profile profile-vm profile-tree ts-setup ts-generate ts-test ts-playground js-lib-build js-lib-dev
+.PHONY: all build release install uninstall test test-lsp test-embedding-bench test-http test-llm check clippy fmt fmt-check clean run lint lint-links docs docs-check update-pricing examples examples-vm smoke-bytecode test-providers fuzz fuzz-reader fuzz-eval setup bench-1m bench-10m bench-100m site-dev site-build site-preview site-deploy deploy coverage coverage-html bench bench-vm bench-tree bench-save bench-suite bench-closure bench-numeric bench-compare bench-baseline profile profile-vm profile-tree ts-setup ts-generate ts-test ts-playground js-lib-build js-lib-dev
 build:
 	cargo build
 
@@ -51,6 +51,12 @@ lint: fmt-check clippy
 # structured source in crates/sema-docs/entries/stdlib + special-forms.
 docs:
 	cargo run -q -p sema-docs -- gen
+
+# Regenerate the vendored LLM pricing snapshot (crates/sema-llm/src/pricing-data.json) from
+# models.dev. Run this and commit the diff to ship updated prices in a patch release; we embed
+# the snapshot at build time and do not fetch pricing at runtime.
+update-pricing:
+	./scripts/update-pricing.sh
 
 # CI gate: every entry must have a summary (--strict), the committed index must be up to date with
 # the source, and every registered builtin/special form must be documented (coverage test).

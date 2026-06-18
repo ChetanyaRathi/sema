@@ -7712,6 +7712,29 @@ fn test_llm_default_provider_none() {
     assert!(is_valid, "expected nil or keyword, got: {result}");
 }
 
+#[test]
+fn test_llm_with_fallback_accepts_bare_and_override_entries() {
+    // The chain may mix bare provider keywords with per-provider [provider model]
+    // overrides and {:provider :model} maps. A body that doesn't call an LLM runs
+    // without any provider configured, so this exercises chain parsing + execution.
+    let result = eval(
+        r#"(llm/with-fallback
+              [:anthropic
+               [:openai "gpt-5.5"]
+               {:provider :groq :model "llama-3.3-70b-versatile"}]
+              (lambda () 42))"#,
+    );
+    assert_eq!(result, Value::int(42));
+}
+
+#[test]
+fn test_llm_with_fallback_rejects_malformed_entry() {
+    let interp = Interpreter::new();
+    // A 3-element vector is not a valid [provider model] pair.
+    let result = interp.eval_str(r#"(llm/with-fallback [[:openai "a" "b"]] (lambda () 1))"#);
+    assert!(result.is_err(), "expected error for malformed chain entry");
+}
+
 // --- Vector store tests ---
 
 #[test]

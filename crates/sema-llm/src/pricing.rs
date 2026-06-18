@@ -1,12 +1,35 @@
+//! Model pricing lookup.
+//!
+//! Pricing comes from a single source of truth: a snapshot of [models.dev](https://models.dev)
+//! (MIT-licensed data) vendored at `pricing-data.json` and embedded at build time via
+//! `include_str!`. Refresh it with `make update-pricing` (see
+//! `scripts/update-pricing.sh`) and ship the diff in a patch release — we deliberately do
+//! not fetch pricing at runtime (no dependency on a third-party endpoint we don't control;
+//! see `docs/done/plans/2026-06-18-llm-pricing-models-dev.md`).
+//!
+//! Resolution order in [`model_pricing`]:
+//! 1. Custom per-pattern overrides set via `(llm/set-pricing ...)`.
+//! 2. The embedded models.dev snapshot.
+//!
+//! All prices are USD per 1,000,000 tokens.
+
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::sync::OnceLock;
 
 use crate::types::Usage;
 
+/// Vendored pricing snapshot, generated from models.dev by `make update-pricing`.
+const EMBEDDED_PRICING_JSON: &str = include_str!("pricing-data.json");
+
 #[derive(Debug, serde::Deserialize)]
-struct PricingResponse {
+struct PricingData {
     updated_at: String,
     prices: Vec<PricingEntry>,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -14,154 +37,134 @@ struct PricingEntry {
     id: String,
     vendor: String,
     #[allow(dead_code)]
+    #[serde(default)]
     name: String,
     input: f64,
     output: f64,
     #[allow(dead_code)]
+    #[serde(default)]
     input_cached: Option<f64>,
+    /// True for the canonical first-party listing of this id (the lab over resellers).
+    /// Bare-id lookups use canonical entries; every vendor listing is still kept for
+    /// provider-qualified lookups.
+    #[serde(default = "default_true")]
+    canonical: bool,
 }
 
-struct FetchedPricing {
-    entries: Vec<(String, String, f64, f64)>, // (id, vendor, input, output)
+/// Parsed, indexed form of the embedded snapshot.
+struct EmbeddedPricing {
     updated_at: String,
+    /// Bare `id` → price, canonical (first-party) listing only.
+    by_id: HashMap<String, (f64, f64)>,
+    /// `"vendor/id"` → price, for every vendor listing (resellers/gateways included).
+    by_qualified: HashMap<String, (f64, f64)>,
+    /// `(id, input, output)` for longest-substring fallback matching (canonical only).
+    entries: Vec<(String, f64, f64)>,
+}
+
+static EMBEDDED: OnceLock<EmbeddedPricing> = OnceLock::new();
+
+fn embedded() -> &'static EmbeddedPricing {
+    EMBEDDED.get_or_init(|| {
+        // Invariant: pricing-data.json is vendored, compiled in, and validated by
+        // `test_embedded_pricing_parses` — a parse failure here means a broken build.
+        let data: PricingData = serde_json::from_str(EMBEDDED_PRICING_JSON)
+            .expect("embedded pricing-data.json must be valid JSON (run `make update-pricing`)");
+        let mut by_id = HashMap::new();
+        let mut by_qualified = HashMap::with_capacity(data.prices.len());
+        let mut entries = Vec::new();
+        for e in &data.prices {
+            by_qualified.insert(format!("{}/{}", e.vendor, e.id), (e.input, e.output));
+            if e.canonical {
+                by_id.insert(e.id.clone(), (e.input, e.output));
+                entries.push((e.id.clone(), e.input, e.output));
+            }
+        }
+        EmbeddedPricing {
+            updated_at: data.updated_at,
+            by_id,
+            by_qualified,
+            entries,
+        }
+    })
 }
 
 thread_local! {
     static CUSTOM_PRICING: RefCell<HashMap<String, (f64, f64)>> = RefCell::new(HashMap::new());
-    static FETCHED_PRICING: RefCell<Option<FetchedPricing>> = const { RefCell::new(None) };
 }
 
-/// Load fetched pricing data from a JSON string.
-pub fn load_fetched_pricing_from_str(json: &str) -> Result<(), String> {
-    let response: PricingResponse =
-        serde_json::from_str(json).map_err(|e| format!("Failed to parse pricing JSON: {}", e))?;
-    let entries = response
-        .prices
-        .into_iter()
-        .map(|e| (e.id, e.vendor, e.input, e.output))
-        .collect();
-    FETCHED_PRICING.with(|p| {
-        *p.borrow_mut() = Some(FetchedPricing {
-            entries,
-            updated_at: response.updated_at,
-        });
-    });
-    Ok(())
-}
-
-/// Clear fetched pricing data.
-pub fn clear_fetched_pricing() {
-    FETCHED_PRICING.with(|p| {
-        *p.borrow_mut() = None;
-    });
-}
-
-/// Returns the `updated_at` timestamp of the fetched pricing data, if loaded.
-pub fn fetched_pricing_updated_at() -> Option<String> {
-    FETCHED_PRICING.with(|p| p.borrow().as_ref().map(|fp| fp.updated_at.clone()))
-}
-
-fn lookup_fetched(model: &str) -> Option<(f64, f64)> {
-    FETCHED_PRICING.with(|p| {
-        let p = p.borrow();
-        let fp = p.as_ref()?;
-
-        // Exact match on id
-        for (id, _, input, output) in &fp.entries {
-            if model == id {
-                return Some((*input, *output));
-            }
-        }
-
-        // Exact match on vendor/id
-        for (id, vendor, input, output) in &fp.entries {
-            let qualified = format!("{}/{}", vendor, id);
-            if model == qualified {
-                return Some((*input, *output));
-            }
-        }
-
-        // Substring match: model.contains(id), longest id wins
-        let mut best: Option<(usize, f64, f64)> = None;
-        for (id, _, input, output) in &fp.entries {
-            if model.contains(id.as_str()) && (best.is_none() || id.len() > best.unwrap().0) {
-                best = Some((id.len(), *input, *output));
-            }
-        }
-        best.map(|(_, input, output)| (input, output))
+fn lookup_custom(model: &str) -> Option<(f64, f64)> {
+    CUSTOM_PRICING.with(|p| {
+        p.borrow()
+            .iter()
+            .find(|(pattern, _)| model.contains(pattern.as_str()))
+            .map(|(_, pricing)| *pricing)
     })
 }
 
-/// Returns (input_cost_per_million, output_cost_per_million) for a model.
+fn lookup_embedded(model: &str) -> Option<(f64, f64)> {
+    let p = embedded();
+    // Exact match on canonical bare id, then on an explicit "vendor/id".
+    if let Some(price) = p.by_id.get(model).or_else(|| p.by_qualified.get(model)) {
+        return Some(*price);
+    }
+    // Substring fallback: longest matching id wins (handles dated/suffixed variants).
+    p.entries
+        .iter()
+        .filter(|(id, _, _)| model.contains(id.as_str()))
+        .max_by_key(|(id, _, _)| id.len())
+        .map(|(_, input, output)| (*input, *output))
+}
+
+/// Map a Sema provider name to its models.dev vendor key.
+///
+/// Known renames are aliased; any other provider name passes through unchanged, so a
+/// provider added later whose name already matches a models.dev vendor (e.g. `azure`,
+/// `openrouter`, `together`) gets correct per-vendor pricing with no code change here.
+fn vendor_for_provider(provider: &str) -> &str {
+    match provider {
+        "gemini" => "google",
+        "moonshot" => "moonshotai",
+        other => other,
+    }
+}
+
+/// Returns `(input_cost_per_million, output_cost_per_million)` for a model, using the
+/// canonical first-party price.
 pub fn model_pricing(model: &str) -> Option<(f64, f64)> {
-    // 1. Custom pricing (user overrides)
-    let custom = CUSTOM_PRICING.with(|p| {
-        let p = p.borrow();
-        for (pattern, pricing) in p.iter() {
-            if model.contains(pattern) {
-                return Some(*pricing);
-            }
-        }
-        None
-    });
-    if custom.is_some() {
-        return custom;
-    }
-
-    // 2. Fetched pricing (from llm-prices.com)
-    if let Some(result) = lookup_fetched(model) {
-        return Some(result);
-    }
-
-    // 3. Hardcoded fallback (estimates — may be outdated).
-    // Dynamic pricing from llm-prices.com is preferred when available.
-    // Last manually updated: 2025-01.
-    // Override with (llm/set-pricing "model" input output).
-    match model {
-        // Anthropic
-        m if m.contains("claude-3-5-haiku") || m.contains("claude-haiku-4-5") => Some((1.0, 5.0)),
-        m if m.contains("claude-3-5-sonnet") || m.contains("claude-sonnet-4-5") => {
-            Some((3.0, 15.0))
-        }
-        m if m.contains("claude-3-opus") || m.contains("claude-opus-4") => Some((15.0, 75.0)),
-        // OpenAI
-        m if m.contains("gpt-4o-mini") => Some((0.15, 0.60)),
-        m if m.contains("gpt-4o") => Some((2.50, 10.0)),
-        m if m.contains("gpt-4-turbo") => Some((10.0, 30.0)),
-        m if m.contains("o1-mini") => Some((3.0, 12.0)),
-        m if m.contains("o1") && !m.contains("o1-mini") => Some((15.0, 60.0)),
-        // Google Gemini
-        m if m.contains("gemini-2.0-flash") => Some((0.10, 0.40)),
-        m if m.contains("gemini-1.5-flash") => Some((0.075, 0.30)),
-        m if m.contains("gemini-1.5-pro") => Some((1.25, 5.00)),
-        m if m.contains("gemini") => Some((0.10, 0.40)), // fallback for other gemini models
-        // Groq (paid — prices vary by model, these are estimates)
-        m if m.contains("llama") && !m.contains("ollama") => Some((0.10, 0.30)),
-        m if m.contains("mixtral") => Some((0.25, 0.25)),
-        m if m.contains("gemma") => Some((0.10, 0.20)),
-        // xAI
-        m if m.contains("grok-3-mini") => Some((0.30, 0.50)),
-        m if m.contains("grok-3") => Some((3.00, 15.00)),
-        m if m.contains("grok-2") => Some((2.00, 10.00)),
-        // Mistral
-        m if m.contains("mistral-small") => Some((0.10, 0.30)),
-        m if m.contains("mistral-medium") => Some((2.70, 8.10)),
-        m if m.contains("mistral-large") => Some((2.00, 6.00)),
-        // Moonshot (estimates)
-        m if m.contains("moonshot") => Some((0.50, 1.50)),
-        _ => None,
-    }
+    lookup_custom(model).or_else(|| lookup_embedded(model))
 }
 
-/// Calculate cost in USD from usage.
+/// Provider-aware pricing: resolves the price for `model` as served by `provider`, so
+/// resellers/gateways that list the same model id at a different price get their own rate.
+/// Falls back to the canonical price when the provider doesn't list the model.
+pub fn model_pricing_for(provider: &str, model: &str) -> Option<(f64, f64)> {
+    if let Some(price) = lookup_custom(model) {
+        return Some(price);
+    }
+    let qualified = format!("{}/{}", vendor_for_provider(provider), model);
+    if let Some(price) = embedded().by_qualified.get(&qualified) {
+        return Some(*price);
+    }
+    lookup_embedded(model)
+}
+
+fn cost_from(prices: (f64, f64), usage: &Usage) -> f64 {
+    let (input, output) = prices;
+    (usage.prompt_tokens as f64 * input + usage.completion_tokens as f64 * output) / 1_000_000.0
+}
+
+/// Calculate cost in USD from usage, using the canonical first-party price.
 pub fn calculate_cost(usage: &Usage) -> Option<f64> {
-    model_pricing(&usage.model).map(|(input, output)| {
-        (usage.prompt_tokens as f64 * input / 1_000_000.0)
-            + (usage.completion_tokens as f64 * output / 1_000_000.0)
-    })
+    model_pricing(&usage.model).map(|prices| cost_from(prices, usage))
 }
 
-/// Set custom pricing for a model pattern.
+/// Provider-aware cost: like [`calculate_cost`] but prices the model as served by `provider`.
+pub fn calculate_cost_for(provider: &str, usage: &Usage) -> Option<f64> {
+    model_pricing_for(provider, &usage.model).map(|prices| cost_from(prices, usage))
+}
+
+/// Set custom pricing for a model pattern (substring match), overriding the embedded snapshot.
 pub fn set_custom_pricing(model_pattern: &str, input_per_million: f64, output_per_million: f64) {
     CUSTOM_PRICING.with(|p| {
         p.borrow_mut().insert(
@@ -171,95 +174,14 @@ pub fn set_custom_pricing(model_pattern: &str, input_per_million: f64, output_pe
     });
 }
 
-/// Write pricing JSON to cache file (atomic: write temp + rename).
-pub fn write_pricing_cache(path: &std::path::Path, json: &str) -> Result<(), String> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-    }
-    let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, json).map_err(|e| e.to_string())?;
-    std::fs::rename(&tmp, path).map_err(|e| e.to_string())?;
-    Ok(())
+/// Clear all custom pricing overrides. Called when resetting interpreter runtime state.
+pub fn clear_custom_pricing() {
+    CUSTOM_PRICING.with(|p| p.borrow_mut().clear());
 }
 
-/// Read pricing JSON from cache file. Returns Ok(None) if file doesn't exist.
-pub fn read_pricing_cache(path: &std::path::Path) -> Result<Option<String>, String> {
-    match std::fs::read_to_string(path) {
-        Ok(content) => Ok(Some(content)),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(e.to_string()),
-    }
-}
-
-pub const PRICING_URL: &str = "https://www.llm-prices.com/current-v1.json";
-
-/// Fetch pricing from llm-prices.com with a short timeout.
-/// Returns Ok(json_string) on success, Err on any failure.
-/// Uses blocking HTTP to avoid tokio runtime nesting issues.
-pub fn fetch_pricing_from_remote() -> Result<String, String> {
-    // reqwest::blocking panics if called from within a tokio runtime.
-    // Skip network fetch in that case (cache/hardcoded fallback still works).
-    if tokio::runtime::Handle::try_current().is_ok() {
-        return Err("skipping fetch: already inside async runtime".to_string());
-    }
-
-    let client = reqwest::blocking::Client::builder()
-        .connect_timeout(std::time::Duration::from_millis(500))
-        .timeout(std::time::Duration::from_secs(2))
-        .build()
-        .map_err(|e| e.to_string())?;
-
-    let resp = client.get(PRICING_URL).send().map_err(|e| e.to_string())?;
-
-    resp.text().map_err(|e| e.to_string())
-}
-
-/// Best-effort pricing refresh. Called during llm/auto-configure.
-/// 1. Load disk cache into memory (fast, sync)
-/// 2. Attempt network fetch (short timeout, swallow errors)
-/// 3. On success, update memory + write disk cache
-pub fn refresh_pricing(cache_path: Option<&std::path::Path>) {
-    let cache = cache_path.and_then(|p| read_pricing_cache(p).ok().flatten());
-
-    // Load cache into memory
-    if let Some(ref json) = cache {
-        let _ = load_fetched_pricing_from_str(json);
-    }
-
-    // Try network fetch (best-effort)
-    match fetch_pricing_from_remote() {
-        Ok(json) => {
-            if load_fetched_pricing_from_str(&json).is_ok() {
-                if let Some(p) = cache_path {
-                    let _ = write_pricing_cache(p, &json);
-                }
-            }
-        }
-        Err(_) => {
-            // Network unavailable — silently continue with cache or hardcoded
-        }
-    }
-}
-
-/// Return the default cache path: ~/.sema/pricing-cache.json
-pub fn default_cache_path() -> Option<std::path::PathBuf> {
-    let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))?;
-    Some(
-        std::path::PathBuf::from(home)
-            .join(".sema")
-            .join("pricing-cache.json"),
-    )
-}
-
-/// Returns the current pricing source info: source name and updated_at if available.
+/// Returns the pricing source name and the snapshot's `updated_at` date.
 pub fn pricing_status() -> (&'static str, Option<String>) {
-    let has_fetched = FETCHED_PRICING.with(|f| f.borrow().is_some());
-    if has_fetched {
-        let updated = fetched_pricing_updated_at();
-        ("fetched", updated)
-    } else {
-        ("hardcoded", None)
-    }
+    ("embedded", Some(embedded().updated_at.clone()))
 }
 
 #[cfg(test)]
@@ -267,116 +189,137 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_fetched_pricing_overrides_hardcoded() {
-        let json = r#"{
-            "updated_at": "2025-10-10",
-            "prices": [
-                {"id": "gpt-4o-mini", "vendor": "openai", "name": "GPT-4o Mini", "input": 0.10, "output": 0.40, "input_cached": null}
-            ]
-        }"#;
-        load_fetched_pricing_from_str(json).unwrap();
-        let (input, output) = model_pricing("gpt-4o-mini").unwrap();
-        assert!((input - 0.10).abs() < f64::EPSILON);
-        assert!((output - 0.40).abs() < f64::EPSILON);
-        clear_fetched_pricing();
+    fn test_embedded_pricing_parses() {
+        let p = embedded();
+        assert!(
+            p.entries.len() > 500,
+            "expected a substantial snapshot, got {}",
+            p.entries.len()
+        );
+        assert!(!p.updated_at.is_empty());
     }
 
     #[test]
-    fn test_hardcoded_fallback_when_no_fetch() {
-        clear_fetched_pricing();
-        let result = model_pricing("gpt-4o-mini");
-        assert!(result.is_some());
+    fn test_current_default_models_are_priced() {
+        // Every provider's current default (see providers.md) must resolve to a price,
+        // so llm/cost and budgets work out of the box.
+        for model in [
+            "claude-sonnet-4-6",
+            "gpt-5.5",
+            "gemini-3.5-flash",
+            "grok-4.3",
+            "mistral-large-latest",
+            "kimi-k2.6",
+            "llama-3.3-70b-versatile",
+        ] {
+            assert!(
+                model_pricing(model).is_some(),
+                "no embedded price for default model {model}"
+            );
+        }
     }
 
     #[test]
-    fn test_custom_pricing_wins_over_fetched() {
-        let json = r#"{
-            "updated_at": "2025-10-10",
-            "prices": [
-                {"id": "my-model", "vendor": "custom", "name": "My Model", "input": 1.0, "output": 2.0, "input_cached": null}
-            ]
-        }"#;
-        load_fetched_pricing_from_str(json).unwrap();
-        set_custom_pricing("my-model", 5.0, 10.0);
-        let (input, output) = model_pricing("my-model").unwrap();
-        assert!((input - 5.0).abs() < f64::EPSILON);
-        assert!((output - 10.0).abs() < f64::EPSILON);
-        clear_fetched_pricing();
-        CUSTOM_PRICING.with(|p| p.borrow_mut().clear());
+    fn test_known_prices_match_official() {
+        // Spot-check canonical first-party prices (USD per 1M tokens).
+        assert_eq!(model_pricing("gpt-5.5"), Some((5.0, 30.0)));
+        assert_eq!(model_pricing("claude-sonnet-4-6"), Some((3.0, 15.0)));
+        assert_eq!(model_pricing("grok-4.3"), Some((1.25, 2.5)));
+        assert_eq!(model_pricing("mistral-large-latest"), Some((0.5, 1.5)));
     }
 
     #[test]
-    fn test_fetched_substring_matching() {
-        let json = r#"{
-            "updated_at": "2025-10-10",
-            "prices": [
-                {"id": "claude-sonnet-4", "vendor": "anthropic", "name": "Claude Sonnet 4", "input": 3.0, "output": 15.0, "input_cached": null}
-            ]
-        }"#;
-        load_fetched_pricing_from_str(json).unwrap();
-        let result = model_pricing("claude-sonnet-4-20250514");
-        assert!(result.is_some());
-        let (input, _) = result.unwrap();
-        assert!((input - 3.0).abs() < f64::EPSILON);
-        clear_fetched_pricing();
+    fn test_qualified_vendor_id_lookup() {
+        // "vendor/id" form resolves to the same price as the bare id.
+        assert_eq!(
+            model_pricing("anthropic/claude-sonnet-4-6"),
+            model_pricing("claude-sonnet-4-6"),
+        );
     }
 
     #[test]
-    fn test_malformed_json_returns_error() {
-        let result = load_fetched_pricing_from_str("not json");
-        assert!(result.is_err());
+    fn test_provider_aware_lookup_canonical() {
+        // Provider-qualified lookup resolves to the first-party price.
+        assert_eq!(model_pricing_for("openai", "gpt-5.5"), Some((5.0, 30.0)));
+        assert_eq!(
+            model_pricing_for("anthropic", "claude-sonnet-4-6"),
+            Some((3.0, 15.0))
+        );
+    }
+
+    #[test]
+    fn test_provider_alias_mapping() {
+        // Sema provider names that differ from models.dev vendor keys are aliased.
+        assert_eq!(vendor_for_provider("gemini"), "google");
+        assert_eq!(vendor_for_provider("moonshot"), "moonshotai");
+        assert_eq!(vendor_for_provider("openai"), "openai");
+        assert_eq!(
+            model_pricing_for("gemini", "gemini-3.5-flash"),
+            Some((1.5, 9.0))
+        );
+        assert_eq!(
+            model_pricing_for("moonshot", "kimi-k2.6"),
+            Some((0.95, 4.0))
+        );
+    }
+
+    #[test]
+    fn test_provider_unknown_falls_back_to_canonical() {
+        // An unknown provider that doesn't list the model falls back to the canonical price.
+        assert_eq!(
+            model_pricing_for("some-future-provider", "gpt-5.5"),
+            Some((5.0, 30.0))
+        );
+    }
+
+    #[test]
+    fn test_calculate_cost_for_provider() {
+        let usage = Usage {
+            prompt_tokens: 1_000_000,
+            completion_tokens: 0,
+            model: "gpt-5.5".to_string(),
+        };
+        assert_eq!(calculate_cost_for("openai", &usage), Some(5.0));
+    }
+
+    #[test]
+    fn test_substring_match_for_dated_variant() {
+        // A dated/suffixed model id falls back to the longest matching base id.
+        let dated = model_pricing("claude-sonnet-4-6-20260217");
+        assert_eq!(dated, model_pricing("claude-sonnet-4-6"));
+    }
+
+    #[test]
+    fn test_custom_pricing_wins_over_embedded() {
+        set_custom_pricing("gpt-5.5", 1.0, 2.0);
+        assert_eq!(model_pricing("gpt-5.5"), Some((1.0, 2.0)));
+        clear_custom_pricing();
+        // Back to embedded after clearing.
+        assert_eq!(model_pricing("gpt-5.5"), Some((5.0, 30.0)));
     }
 
     #[test]
     fn test_unknown_model_returns_none() {
-        clear_fetched_pricing();
-        assert!(model_pricing("totally-unknown-model-xyz").is_none());
+        clear_custom_pricing();
+        assert!(model_pricing("totally-unknown-model-xyz-999").is_none());
     }
 
     #[test]
-    fn test_cache_roundtrip() {
-        let dir = std::env::temp_dir().join("sema-pricing-test");
-        let _ = std::fs::create_dir_all(&dir);
-        let cache_path = dir.join("pricing-cache.json");
-
-        let json = r#"{
-            "updated_at": "2025-10-10",
-            "prices": [
-                {"id": "test-model", "vendor": "test", "name": "Test", "input": 1.5, "output": 3.0, "input_cached": null}
-            ]
-        }"#;
-
-        write_pricing_cache(&cache_path, json).unwrap();
-        assert!(cache_path.exists());
-
-        let loaded = read_pricing_cache(&cache_path).unwrap();
-        assert!(loaded.is_some());
-        let content = loaded.unwrap();
-        assert!(content.contains("test-model"));
-
-        let _ = std::fs::remove_dir_all(&dir);
+    fn test_calculate_cost() {
+        let usage = Usage {
+            prompt_tokens: 1_000_000,
+            completion_tokens: 1_000_000,
+            model: "gpt-5.5".to_string(),
+        };
+        // 1M input @ $5 + 1M output @ $30 = $35.
+        let cost = calculate_cost(&usage).unwrap();
+        assert!((cost - 35.0).abs() < 1e-9, "got {cost}");
     }
 
     #[test]
-    fn test_cache_read_missing_file() {
-        let result = read_pricing_cache(std::path::Path::new("/nonexistent/path/cache.json"));
-        assert!(result.is_ok());
-        assert!(result.unwrap().is_none());
-    }
-
-    #[test]
-    fn test_fetch_pricing_url_is_correct() {
-        assert_eq!(PRICING_URL, "https://www.llm-prices.com/current-v1.json");
-    }
-
-    #[test]
-    fn test_refresh_pricing_loads_cache_fallback() {
-        clear_fetched_pricing();
-        let fake_cache = std::env::temp_dir()
-            .join("sema-pricing-noexist")
-            .join("cache.json");
-        refresh_pricing(Some(&fake_cache));
-        // Hardcoded should still work
-        assert!(model_pricing("gpt-4o-mini").is_some());
+    fn test_pricing_status_reports_embedded() {
+        let (source, updated_at) = pricing_status();
+        assert_eq!(source, "embedded");
+        assert!(updated_at.is_some());
     }
 }

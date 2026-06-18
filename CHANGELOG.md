@@ -1,5 +1,24 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- **Default chat models bumped to current flagships across all providers.** When you don't pass `:default-model` (or pin a `:model`), each provider now defaults to: Anthropic `claude-sonnet-4-6` (was `claude-sonnet-4-5-20250929`), OpenAI `gpt-5.5` (was `gpt-4o`, which is being deprecated), Gemini `gemini-3.5-flash` (was `gemini-2.0-flash`), xAI `grok-4.3` (was `grok-3-mini-fast`), Mistral `mistral-large-latest` (was `mistral-small-latest`), Moonshot `kimi-k2.6` (was `moonshot-v1-8k`), and Ollama `gemma4` (was `qwen3:8b` — Gemma is fast and pragmatic to run locally, even on a Mac). Groq stays on `llama-3.3-70b-versatile` (still current). Override any of these per provider with `:default-model`, globally via `SEMA_CHAT_MODEL`, or per call with `:model`. See the [default models table](https://sema-lang.com/docs/llm/providers.html#default-models).
+
+### Added
+
+- **Per-provider model overrides in `llm/with-fallback` chains.** Chain entries may now be `[provider model]` pairs or `{:provider :model}` maps in addition to bare provider keywords, so a single fallback chain can target a different model per provider (e.g. Opus on Anthropic, GPT-5.5 on OpenAI). A per-provider override wins over any `:model` pinned in the call body, and each provider always receives a model id valid for itself. Bare keywords continue to use the provider's configured default. See the [resilience docs](https://sema-lang.com/docs/llm/resilience.html).
+- **Provider-aware cost lookup.** `pricing::model_pricing_for(provider, model)` / `calculate_cost_for(provider, usage)` resolve the price for a model *as served by a specific provider*, so a reseller/gateway listing the same model id at a different rate is priced correctly. Cost tracking now uses the provider that actually served each `llm/complete`/`llm/chat` response; unknown providers fall back to the canonical first-party price.
+
+### Changed
+
+- **LLM pricing now comes from an embedded [models.dev](https://models.dev) snapshot instead of a runtime fetch from llm-prices.com.** A models.dev-derived snapshot (`crates/sema-llm/src/pricing-data.json`, MIT-licensed data, 2,400+ priced models) is vendored and embedded at build time; refresh it with `make update-pricing` and ship the diff in a patch release. This replaces both the stale hand-maintained hardcoded price table (which had drifted to 2025-01 and priced none of the current flagships) and the runtime fetch + disk cache against a third-party endpoint we don't control. In a freshness/accuracy bake-off against llm-prices.com and LiteLLM, models.dev was the only source correct on all current flagships (gpt-5.5, claude-sonnet-4-6/opus-4-8, gemini-3.5-flash, grok-4.3, mistral-large-latest, kimi-k2.6) and the only one carrying the newest launches. `llm/pricing-status` now reports `"embedded"` with the snapshot's `updated-at` date.
+
+### Fixed
+
+- **`llm/with-fallback` + response caching no longer sends the wrong provider's model id down the chain.** With caching enabled and no model pinned, the cache layer eagerly filled the request model with the *default provider's* default model before the fallback loop ran, which then bypassed each fallback provider's own per-provider model substitution (so e.g. an Anthropic model id could be sent to OpenAI on fallback). The cache key is now computed without mutating the request that flows into the loop, so per-provider model resolution is preserved whether or not caching is on.
+
 ## 1.17.1
 
 MCP server stability fix.
