@@ -1124,21 +1124,40 @@ fn eval_deftool(args: &[Value], env: &Env, ctx: &EvalContext) -> Result<Trampoli
         .ok_or_else(|| SemaError::eval("deftool: name must be a symbol"))?
         .to_string();
     let description = eval::eval_value(ctx, &args[1], env)?;
+    let parameters = eval::eval_value(ctx, &args[2], env)?;
+    let handler = eval::eval_value(ctx, &args[3], env)?;
+    Ok(Trampoline::Value(register_tool(
+        &name,
+        description,
+        parameters,
+        handler,
+        env,
+    )?))
+}
+
+/// Build a `ToolDefinition` from already-evaluated values and bind it in `env`.
+/// Shared by the tree-walker `deftool` special form and the VM's `__vm-deftool`
+/// native (which receives pre-evaluated description/parameters/handler), so the
+/// VM path needs no tree-walker round-trip.
+pub(crate) fn register_tool(
+    name: &str,
+    description: Value,
+    parameters: Value,
+    handler: Value,
+    env: &Env,
+) -> Result<Value, SemaError> {
     let description = description
         .as_str()
         .ok_or_else(|| SemaError::type_error("string", description.type_name()))?
         .to_string();
-    let parameters = eval::eval_value(ctx, &args[2], env)?;
-    let handler = eval::eval_value(ctx, &args[3], env)?;
-
     let tool = Value::tool_def(ToolDefinition {
-        name: name.clone(),
+        name: name.to_string(),
         description,
         parameters,
         handler,
     });
-    env.set(intern(&name), tool.clone());
-    Ok(Trampoline::Value(tool))
+    env.set(intern(name), tool.clone());
+    Ok(tool)
 }
 
 /// (defagent name {:system "..." :tools [...] :max-turns N :model "..."})
@@ -1151,6 +1170,14 @@ fn eval_defagent(args: &[Value], env: &Env, ctx: &EvalContext) -> Result<Trampol
         .ok_or_else(|| SemaError::eval("defagent: name must be a symbol"))?
         .to_string();
     let opts = eval::eval_value(ctx, &args[1], env)?;
+    Ok(Trampoline::Value(register_agent(&name, opts, env)?))
+}
+
+/// Build an `Agent` from an already-evaluated options map and bind it in `env`.
+/// Shared by the tree-walker `defagent` special form and the VM's `__vm-defagent`
+/// native (which receives the pre-evaluated options map), so the VM path needs
+/// no tree-walker round-trip.
+pub(crate) fn register_agent(name: &str, opts: Value, env: &Env) -> Result<Value, SemaError> {
     let opts_map = opts
         .as_map_rc()
         .ok_or_else(|| SemaError::type_error("map", opts.type_name()))?;
@@ -1184,14 +1211,14 @@ fn eval_defagent(args: &[Value], env: &Env, ctx: &EvalContext) -> Result<Trampol
         .unwrap_or_default();
 
     let agent = Value::agent(Agent {
-        name: name.clone(),
+        name: name.to_string(),
         system,
         tools,
         max_turns,
         model,
     });
-    env.set(intern(&name), agent.clone());
-    Ok(Trampoline::Value(agent))
+    env.set(intern(name), agent.clone());
+    Ok(agent)
 }
 
 /// (throw value) — raise a user exception

@@ -88,7 +88,7 @@ impl Interpreter {
         {
             sema_llm::builtins::reset_runtime_state();
             sema_llm::builtins::register_llm_builtins(&env, &sema_core::Sandbox::allow_all());
-            sema_llm::builtins::set_eval_callback(eval_value);
+            sema_llm::builtins::set_eval_callback(eval_value_vm);
         }
         let global_env = Rc::new(env);
         register_vm_delegates(&global_env);
@@ -106,7 +106,7 @@ impl Interpreter {
         {
             sema_llm::builtins::reset_runtime_state();
             sema_llm::builtins::register_llm_builtins(&env, sandbox);
-            sema_llm::builtins::set_eval_callback(eval_value);
+            sema_llm::builtins::set_eval_callback(eval_value_vm);
         }
         let global_env = Rc::new(env);
         register_vm_delegates(&global_env);
@@ -406,6 +406,23 @@ pub fn eval_value(ctx: &EvalContext, expr: &Value, env: &Env) -> EvalResult {
 
     ctx.eval_depth.set(ctx.eval_depth.get().saturating_sub(1));
     result
+}
+
+/// VM-native evaluation for callback consumers (e.g. sema-llm tool handlers):
+/// macro-expand, compile, and run `expr` on a fresh bytecode VM rooted at `env`.
+/// This is the VM-backed counterpart of `eval_value`, used to keep the
+/// eval-callback path off the tree-walker (M5 / Phase 1c). Each call builds a
+/// throwaway VM over a clone of `env` (sharing its bindings), so it is suited to
+/// one-shot evaluation rather than a persistent define-accumulating session.
+pub fn eval_value_vm(ctx: &EvalContext, expr: &Value, env: &Env) -> EvalResult {
+    let env_rc = Rc::new(env.clone());
+    let expanded = expand_for_vm_in(ctx, &env_rc, expr)?;
+    if expanded.is_nil() {
+        return Ok(Value::nil());
+    }
+    let prog = sema_vm::compile_program(std::slice::from_ref(&expanded), None)?;
+    let mut vm = sema_vm::VM::new(env_rc, prog.functions, &[], prog.main_cache_slots)?;
+    vm.execute(prog.closure, ctx)
 }
 
 /// Call a function value with already-evaluated arguments.
@@ -1332,38 +1349,42 @@ fn register_vm_delegates(env: &Rc<Env>) {
     );
 
     // __vm-deftool: delegate to tree-walker
+    // __vm-deftool: the VM has already evaluated description/parameters/handler
+    // and passes them as values, so build the tool directly — no tree-walker
+    // round-trip.
     let tool_env = env.clone();
     env.set(
         intern("__vm-deftool"),
-        Value::native_fn(NativeFn::with_ctx("__vm-deftool", move |ctx, args| {
+        Value::native_fn(NativeFn::simple("__vm-deftool", move |args| {
             if args.len() != 4 {
                 return Err(SemaError::arity("deftool", "4", args.len()));
             }
-            let form = Value::list(vec![
-                Value::symbol("deftool"),
-                args[0].clone(),
+            let name = args[0]
+                .as_symbol()
+                .ok_or_else(|| SemaError::eval("deftool: name must be a symbol"))?;
+            special_forms::register_tool(
+                &name,
                 args[1].clone(),
                 args[2].clone(),
                 args[3].clone(),
-            ]);
-            sema_core::eval_callback(ctx, &form, &tool_env)
+                &tool_env,
+            )
         })),
     );
 
-    // __vm-defagent: delegate to tree-walker
+    // __vm-defagent: the VM has already evaluated the options map, so build the
+    // agent directly — no tree-walker round-trip.
     let agent_env = env.clone();
     env.set(
         intern("__vm-defagent"),
-        Value::native_fn(NativeFn::with_ctx("__vm-defagent", move |ctx, args| {
+        Value::native_fn(NativeFn::simple("__vm-defagent", move |args| {
             if args.len() != 2 {
                 return Err(SemaError::arity("defagent", "2", args.len()));
             }
-            let form = Value::list(vec![
-                Value::symbol("defagent"),
-                args[0].clone(),
-                args[1].clone(),
-            ]);
-            sema_core::eval_callback(ctx, &form, &agent_env)
+            let name = args[0]
+                .as_symbol()
+                .ok_or_else(|| SemaError::eval("defagent: name must be a symbol"))?;
+            special_forms::register_agent(&name, args[1].clone(), &agent_env)
         })),
     );
 
