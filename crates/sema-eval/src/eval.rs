@@ -1021,7 +1021,7 @@ fn register_defmacro(items: &[Value], env: &Env) -> Result<(), SemaError> {
 /// Register `__vm-*` native functions that the bytecode VM calls back into
 /// the tree-walker for forms that cannot be fully compiled.
 /// Load built-in macros (threading, when-let, if-let) into the global environment.
-fn load_prelude(ctx: &EvalContext, env: &Rc<Env>) {
+pub fn load_prelude(ctx: &EvalContext, env: &Rc<Env>) {
     let exprs = sema_reader::read_many(crate::prelude::PRELUDE)
         .unwrap_or_else(|e| panic!("internal: prelude failed to parse: {e}"));
     // The prelude is exclusively `defmacro` forms. Register them via the
@@ -1033,7 +1033,7 @@ fn load_prelude(ctx: &EvalContext, env: &Rc<Env>) {
     }
 }
 
-fn register_vm_delegates(env: &Rc<Env>) {
+pub fn register_vm_delegates(env: &Rc<Env>) {
     // __vm-eval: macro-expand, compile, and run the expression on the bytecode
     // VM (rooted at the global env so top-level `define`s persist). The runtime
     // `(eval ...)` meta path is thus VM-native — it no longer round-trips

@@ -2383,14 +2383,21 @@ impl WasmInterpreter {
                 .map_err(|e| SemaError::eval(format!("{e}")))?;
             self.inner.ctx.merge_span_table(spans);
 
-            let module_env = Env::with_parent(self.inner.global_env.clone());
+            let module_env = std::rc::Rc::new(Env::with_parent(self.inner.global_env.clone()));
             self.inner.ctx.clear_module_exports();
 
-            for expr in &exprs {
-                sema_eval::eval_value(&self.inner.ctx, expr, &module_env)?;
-            }
+            self.inner.ctx.set_vm_backend(true);
+            let empty_spans = std::collections::HashMap::new();
+            let eval_result = sema_eval::eval_module_body_vm(
+                &self.inner.ctx,
+                &module_env,
+                &exprs,
+                &empty_spans,
+                None,
+            );
 
             let declared = self.inner.ctx.take_module_exports();
+            eval_result?;
             let exports: BTreeMap<String, Value> = match declared {
                 Some(names) => names
                     .iter()
