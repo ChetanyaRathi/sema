@@ -769,10 +769,11 @@ fn eval_step(ctx: &EvalContext, expr: &Value, env: &Env) -> Result<Trampoline, S
 fn annotate_arity_error(err: SemaError, expr: &Value) -> SemaError {
     if matches!(err.inner(), SemaError::Arity { .. }) && err.note().is_none() {
         let form_str = format!("{}", expr);
-        let truncated = if form_str.len() > 80 {
-            format!("{}…", &form_str[..79])
-        } else {
-            form_str
+        // Truncate on a char boundary (CORE-1): byte-slicing &form_str[..79]
+        // panics when byte 79 lands inside a multibyte UTF-8 char.
+        let truncated = match form_str.char_indices().nth(79) {
+            Some((idx, _)) => format!("{}…", &form_str[..idx]),
+            None => form_str,
         };
         err.with_note(format!("in: {truncated}"))
     } else {

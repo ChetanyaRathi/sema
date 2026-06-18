@@ -1041,10 +1041,21 @@ fn registry_download(
         return Err(format!("Download failed ({status}): {error}"));
     }
 
-    let tarball = resp
-        .bytes()
-        .map_err(|e| format!("Failed to read response: {e}"))?
-        .to_vec();
+    // BIN-3: cap the download so a malicious/broken registry can't OOM us by
+    // streaming an unbounded body. Read at most MAX_PKG_SIZE + 1 and reject if
+    // the cap is exceeded.
+    const MAX_PKG_SIZE: u64 = 200 * 1024 * 1024;
+    use std::io::Read;
+    let mut tarball = Vec::new();
+    resp.take(MAX_PKG_SIZE + 1)
+        .read_to_end(&mut tarball)
+        .map_err(|e| format!("Failed to read response: {e}"))?;
+    if tarball.len() as u64 > MAX_PKG_SIZE {
+        return Err(format!(
+            "Download too large: package exceeds the {} MiB limit",
+            MAX_PKG_SIZE / (1024 * 1024)
+        ));
+    }
 
     use sha2::Digest;
     let checksum = format!("{:x}", sha2::Sha256::digest(&tarball));
