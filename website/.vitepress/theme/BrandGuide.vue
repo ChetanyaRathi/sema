@@ -125,6 +125,21 @@ const icons = {
   fileSema: `<svg viewBox="0 0 16 16" width="32" height="32" fill="none"><text x="8" y="11.5" text-anchor="middle" font-family="'JetBrains Mono', monospace" font-weight="700" font-size="9" fill="#ffffff"><tspan fill="#c8a855" fill-opacity="0.65">(</tspan>s<tspan fill="#c8a855" fill-opacity="0.65">)</tspan></text></svg>`,
   fileSemac: `<svg viewBox="0 0 16 16" width="32" height="32" fill="none"><text x="7" y="11.5" text-anchor="middle" font-family="'JetBrains Mono', monospace" font-weight="700" font-size="8.5" fill="#968c79"><tspan fill="#6b6354" fill-opacity="0.65">(</tspan>s<tspan fill="#6b6354" fill-opacity="0.65">)</tspan></text><circle cx="13" cy="12.5" r="2.8" fill="#c8a855"/><text x="13" y="14.2" text-anchor="middle" font-family="'JetBrains Mono', monospace" font-weight="800" font-size="5" fill="#131110">c</text></svg>`,
   fileSemaNotebook: `<svg viewBox="0 0 16 16" width="32" height="32" fill="none"><text x="7" y="11.5" text-anchor="middle" font-family="'JetBrains Mono', monospace" font-weight="700" font-size="8.5" fill="#ffffff"><tspan fill="#c8a855" fill-opacity="0.65">(</tspan>s<tspan fill="#c8a855" fill-opacity="0.65">)</tspan></text><rect x="10.5" y="10.5" width="4.5" height="4.5" rx="0.5" fill="#131110" stroke="#c8a855" stroke-width="0.75"/><line x1="12" y1="12" x2="13.5" y2="12" stroke="#c8a855" stroke-width="0.5"/><line x1="12" y1="13.5" x2="13.5" y2="13.5" stroke="#c8a855" stroke-width="0.5"/></svg>`,
+
+  // Light-theme variants: the glyph flips to a dark ink so it stays legible on
+  // light IDE backgrounds (the dark-theme versions above use a white glyph).
+  // .semac reads on both themes (muted gray), so it has no separate variant.
+  fileSemaLight: `<svg viewBox="0 0 16 16" width="32" height="32" fill="none"><text x="8" y="11.5" text-anchor="middle" font-family="'JetBrains Mono', monospace" font-weight="700" font-size="9" fill="#1a1a1a"><tspan fill="#c8a855" fill-opacity="0.65">(</tspan>s<tspan fill="#c8a855" fill-opacity="0.65">)</tspan></text></svg>`,
+  fileSemaNotebookLight: `<svg viewBox="0 0 16 16" width="32" height="32" fill="none"><text x="7" y="11.5" text-anchor="middle" font-family="'JetBrains Mono', monospace" font-weight="700" font-size="8.5" fill="#1a1a1a"><tspan fill="#c8a855" fill-opacity="0.65">(</tspan>s<tspan fill="#c8a855" fill-opacity="0.65">)</tspan></text><rect x="10.5" y="10.5" width="4.5" height="4.5" rx="0.5" fill="#ffffff" stroke="#c8a855" stroke-width="0.75"/><line x1="12" y1="12" x2="13.5" y2="12" stroke="#c8a855" stroke-width="0.5"/><line x1="12" y1="13.5" x2="13.5" y2="13.5" stroke="#c8a855" stroke-width="0.5"/></svg>`,
+
+  // New-style notebook icon candidates (transparent (s) family). Not yet wired
+  // into any product — parked here for future use (e.g. notebook actions /
+  // tool windows). Dark-theme glyph (white s); pair with a light variant if used.
+  nbPageBadge: `<svg viewBox="0 0 16 16" width="32" height="32" fill="none"><text x="7" y="11.5" text-anchor="middle" font-family="'JetBrains Mono', monospace" font-weight="700" font-size="8.5" fill="#ffffff"><tspan fill="#c8a855" fill-opacity="0.65">(</tspan>s<tspan fill="#c8a855" fill-opacity="0.65">)</tspan></text><rect x="10.5" y="10.5" width="4.5" height="4.5" rx="0.5" fill="#131110" stroke="#c8a855" stroke-width="0.75"/><line x1="12" y1="12" x2="13.5" y2="12" stroke="#c8a855" stroke-width="0.5"/><line x1="12" y1="13.5" x2="13.5" y2="13.5" stroke="#c8a855" stroke-width="0.5"/></svg>`,
+  nbPlayBadge: `<svg viewBox="0 0 16 16" width="32" height="32" fill="none"><text x="7" y="11.5" text-anchor="middle" font-family="'JetBrains Mono', monospace" font-weight="700" font-size="8.5" fill="#ffffff"><tspan fill="#c8a855" fill-opacity="0.65">(</tspan>s<tspan fill="#c8a855" fill-opacity="0.65">)</tspan></text><circle cx="12.8" cy="12.6" r="3" fill="#c8a855"/><path d="M11.8 10.9 L14.2 12.6 L11.8 14.3 Z" fill="#131110"/></svg>`,
+  nbStacked: `<svg viewBox="0 0 16 16" width="32" height="32" fill="none"><text x="7" y="11.5" text-anchor="middle" font-family="'JetBrains Mono', monospace" font-weight="700" font-size="8.5" fill="#ffffff"><tspan fill="#c8a855" fill-opacity="0.65">(</tspan>s<tspan fill="#c8a855" fill-opacity="0.65">)</tspan></text><rect x="11.3" y="9.6" width="3.6" height="3.6" rx="0.4" fill="#131110" stroke="#c8a855" stroke-width="0.7"/><rect x="9.9" y="11.0" width="3.6" height="3.6" rx="0.4" fill="#131110" stroke="#c8a855" stroke-width="0.7"/></svg>`,
+  nbFullPage: `<svg viewBox="0 0 16 16" width="32" height="32" fill="none"><rect x="2.5" y="1.5" width="11" height="13" rx="1.5" fill="none" stroke="#c8a855" stroke-width="0.9" stroke-opacity="0.65"/><line x1="4.5" y1="4.6" x2="11.5" y2="4.6" stroke="#c8a855" stroke-width="0.7" stroke-opacity="0.45"/><line x1="4.5" y1="6.6" x2="9.5" y2="6.6" stroke="#c8a855" stroke-width="0.7" stroke-opacity="0.45"/><text x="8" y="12.6" text-anchor="middle" font-family="'JetBrains Mono', monospace" font-weight="700" font-size="6.5" fill="#ffffff"><tspan fill="#c8a855" fill-opacity="0.65">(</tspan>s<tspan fill="#c8a855" fill-opacity="0.65">)</tspan></text></svg>`,
+  nbCellLines: `<svg viewBox="0 0 16 16" width="32" height="32" fill="none"><text x="8" y="8.6" text-anchor="middle" font-family="'JetBrains Mono', monospace" font-weight="700" font-size="8" fill="#ffffff"><tspan fill="#c8a855" fill-opacity="0.65">(</tspan>s<tspan fill="#c8a855" fill-opacity="0.65">)</tspan></text><line x1="4" y1="11.6" x2="12" y2="11.6" stroke="#c8a855" stroke-width="0.9" stroke-opacity="0.6"/><line x1="4" y1="13.6" x2="9.5" y2="13.6" stroke="#c8a855" stroke-width="0.9" stroke-opacity="0.6"/></svg>`,
 }
 
 const copyIcon = (key) => {
@@ -962,22 +977,49 @@ resp = client.messages.create(
               <div class="pair-meta">
                 <h4>Transparent File Explorer Icons</h4>
                 <p>
-                  High-fidelity, transparent-background variants optimized for file trees in IDEs (like VS Code, Zed, and IntelliJ). The transparent backgrounds allow the icons to render beautifully on any custom editor background theme.
+                  High-fidelity, transparent-background variants optimized for file trees in IDEs (like VS Code, Zed, and IntelliJ). Each ships a light and dark variant — the glyph flips ink so it stays legible on any editor theme. Shown light / dark side by side below.
                 </p>
-                <div class="file-icons-horizontal" style="display: flex; gap: 2.5rem; margin-top: 1.5rem;">
-                  <div class="file-icon-showcase-item" style="display: flex; flex-direction: column; align-items: center; gap: 0.5rem;">
+                <div class="file-icons-horizontal" style="display: flex; gap: 2rem; margin-top: 1.5rem; flex-wrap: wrap;">
+                  <div class="file-icon-showcase-item" style="display: flex; flex-direction: column; align-items: center; gap: 0.6rem;">
                     <span style="font-family: 'JetBrains Mono', monospace; font-size: 0.65rem; color: var(--text-tertiary);">.sema</span>
-                    <div class="file-icon-box" style="background-color: #000000; border: 1px solid var(--border); border-radius: 6px; width: 64px; height: 64px; display: flex; align-items: center; justify-content: center;" v-html="icons.fileSema"></div>
+                    <div style="display: flex; gap: 0.4rem;">
+                      <div style="display: flex; flex-direction: column; align-items: center; gap: 0.3rem;">
+                        <div class="file-icon-box" style="background-color: #f4f4f5; border: 1px solid var(--border); border-radius: 6px; width: 56px; height: 56px; display: flex; align-items: center; justify-content: center;" v-html="icons.fileSemaLight"></div>
+                        <span style="font-family: 'JetBrains Mono', monospace; font-size: 0.55rem; color: var(--text-tertiary); text-transform: uppercase; letter-spacing: 0.08em;">Light</span>
+                      </div>
+                      <div style="display: flex; flex-direction: column; align-items: center; gap: 0.3rem;">
+                        <div class="file-icon-box" style="background-color: #131110; border: 1px solid var(--border); border-radius: 6px; width: 56px; height: 56px; display: flex; align-items: center; justify-content: center;" v-html="icons.fileSema"></div>
+                        <span style="font-family: 'JetBrains Mono', monospace; font-size: 0.55rem; color: var(--text-tertiary); text-transform: uppercase; letter-spacing: 0.08em;">Dark</span>
+                      </div>
+                    </div>
                     <button class="btn-copy-mini" @click="copyIcon('fileSema')">Copy SVG</button>
                   </div>
-                  <div class="file-icon-showcase-item" style="display: flex; flex-direction: column; align-items: center; gap: 0.5rem;">
+                  <div class="file-icon-showcase-item" style="display: flex; flex-direction: column; align-items: center; gap: 0.6rem;">
                     <span style="font-family: 'JetBrains Mono', monospace; font-size: 0.65rem; color: var(--text-tertiary);">.semac</span>
-                    <div class="file-icon-box" style="background-color: #000000; border: 1px solid var(--border); border-radius: 6px; width: 64px; height: 64px; display: flex; align-items: center; justify-content: center;" v-html="icons.fileSemac"></div>
+                    <div style="display: flex; gap: 0.4rem;">
+                      <div style="display: flex; flex-direction: column; align-items: center; gap: 0.3rem;">
+                        <div class="file-icon-box" style="background-color: #f4f4f5; border: 1px solid var(--border); border-radius: 6px; width: 56px; height: 56px; display: flex; align-items: center; justify-content: center;" v-html="icons.fileSemac"></div>
+                        <span style="font-family: 'JetBrains Mono', monospace; font-size: 0.55rem; color: var(--text-tertiary); text-transform: uppercase; letter-spacing: 0.08em;">Light</span>
+                      </div>
+                      <div style="display: flex; flex-direction: column; align-items: center; gap: 0.3rem;">
+                        <div class="file-icon-box" style="background-color: #131110; border: 1px solid var(--border); border-radius: 6px; width: 56px; height: 56px; display: flex; align-items: center; justify-content: center;" v-html="icons.fileSemac"></div>
+                        <span style="font-family: 'JetBrains Mono', monospace; font-size: 0.55rem; color: var(--text-tertiary); text-transform: uppercase; letter-spacing: 0.08em;">Dark</span>
+                      </div>
+                    </div>
                     <button class="btn-copy-mini" @click="copyIcon('fileSemac')">Copy SVG</button>
                   </div>
-                  <div class="file-icon-showcase-item" style="display: flex; flex-direction: column; align-items: center; gap: 0.5rem;">
+                  <div class="file-icon-showcase-item" style="display: flex; flex-direction: column; align-items: center; gap: 0.6rem;">
                     <span style="font-family: 'JetBrains Mono', monospace; font-size: 0.65rem; color: var(--text-tertiary);">.sema-nb</span>
-                    <div class="file-icon-box" style="background-color: #000000; border: 1px solid var(--border); border-radius: 6px; width: 64px; height: 64px; display: flex; align-items: center; justify-content: center;" v-html="icons.fileSemaNotebook"></div>
+                    <div style="display: flex; gap: 0.4rem;">
+                      <div style="display: flex; flex-direction: column; align-items: center; gap: 0.3rem;">
+                        <div class="file-icon-box" style="background-color: #f4f4f5; border: 1px solid var(--border); border-radius: 6px; width: 56px; height: 56px; display: flex; align-items: center; justify-content: center;" v-html="icons.fileSemaNotebookLight"></div>
+                        <span style="font-family: 'JetBrains Mono', monospace; font-size: 0.55rem; color: var(--text-tertiary); text-transform: uppercase; letter-spacing: 0.08em;">Light</span>
+                      </div>
+                      <div style="display: flex; flex-direction: column; align-items: center; gap: 0.3rem;">
+                        <div class="file-icon-box" style="background-color: #131110; border: 1px solid var(--border); border-radius: 6px; width: 56px; height: 56px; display: flex; align-items: center; justify-content: center;" v-html="icons.fileSemaNotebook"></div>
+                        <span style="font-family: 'JetBrains Mono', monospace; font-size: 0.55rem; color: var(--text-tertiary); text-transform: uppercase; letter-spacing: 0.08em;">Dark</span>
+                      </div>
+                    </div>
                     <button class="btn-copy-mini" @click="copyIcon('fileSemaNotebook')">Copy SVG</button>
                   </div>
                 </div>
@@ -1030,6 +1072,43 @@ resp = client.messages.create(
                       <span class="file-icon" style="width: 16px; height: 16px; display: inline-flex; align-items: center; justify-content: center;" v-html="icons.fileSemac"></span>
                       <span>hello.semac</span>
                     </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <!-- New-style notebook icon candidates (parked for later use) -->
+            <div class="icon-pair-card">
+              <div class="pair-meta">
+                <h4>Notebook Icon Candidates <span style="font-family: 'JetBrains Mono', monospace; font-size: 0.6rem; color: var(--text-tertiary); text-transform: uppercase; letter-spacing: 0.08em; border: 1px solid var(--border); border-radius: 10px; padding: 0.1rem 0.5rem; margin-left: 0.4rem;">parked</span></h4>
+                <p>
+                  Exploratory notebook marks in the new transparent <code>(s)</code> style — not yet shipped in any product, kept here for future use (notebook actions, tool-window icons). Dark-theme glyph shown; pair with a light variant when wired up.
+                </p>
+                <div style="display: flex; gap: 1.75rem; margin-top: 1.5rem; flex-wrap: wrap;">
+                  <div style="display: flex; flex-direction: column; align-items: center; gap: 0.5rem;">
+                    <span style="font-family: 'JetBrains Mono', monospace; font-size: 0.6rem; color: var(--text-tertiary);">A · Page</span>
+                    <div class="file-icon-box" style="background-color: #131110; border: 1px solid var(--border); border-radius: 6px; width: 56px; height: 56px; display: flex; align-items: center; justify-content: center;" v-html="icons.nbPageBadge"></div>
+                    <button class="btn-copy-mini" @click="copyIcon('nbPageBadge')">Copy</button>
+                  </div>
+                  <div style="display: flex; flex-direction: column; align-items: center; gap: 0.5rem;">
+                    <span style="font-family: 'JetBrains Mono', monospace; font-size: 0.6rem; color: var(--text-tertiary);">B · Play</span>
+                    <div class="file-icon-box" style="background-color: #131110; border: 1px solid var(--border); border-radius: 6px; width: 56px; height: 56px; display: flex; align-items: center; justify-content: center;" v-html="icons.nbPlayBadge"></div>
+                    <button class="btn-copy-mini" @click="copyIcon('nbPlayBadge')">Copy</button>
+                  </div>
+                  <div style="display: flex; flex-direction: column; align-items: center; gap: 0.5rem;">
+                    <span style="font-family: 'JetBrains Mono', monospace; font-size: 0.6rem; color: var(--text-tertiary);">C · Stacked</span>
+                    <div class="file-icon-box" style="background-color: #131110; border: 1px solid var(--border); border-radius: 6px; width: 56px; height: 56px; display: flex; align-items: center; justify-content: center;" v-html="icons.nbStacked"></div>
+                    <button class="btn-copy-mini" @click="copyIcon('nbStacked')">Copy</button>
+                  </div>
+                  <div style="display: flex; flex-direction: column; align-items: center; gap: 0.5rem;">
+                    <span style="font-family: 'JetBrains Mono', monospace; font-size: 0.6rem; color: var(--text-tertiary);">D · Full page</span>
+                    <div class="file-icon-box" style="background-color: #131110; border: 1px solid var(--border); border-radius: 6px; width: 56px; height: 56px; display: flex; align-items: center; justify-content: center;" v-html="icons.nbFullPage"></div>
+                    <button class="btn-copy-mini" @click="copyIcon('nbFullPage')">Copy</button>
+                  </div>
+                  <div style="display: flex; flex-direction: column; align-items: center; gap: 0.5rem;">
+                    <span style="font-family: 'JetBrains Mono', monospace; font-size: 0.6rem; color: var(--text-tertiary);">E · Cell lines</span>
+                    <div class="file-icon-box" style="background-color: #131110; border: 1px solid var(--border); border-radius: 6px; width: 56px; height: 56px; display: flex; align-items: center; justify-content: center;" v-html="icons.nbCellLines"></div>
+                    <button class="btn-copy-mini" @click="copyIcon('nbCellLines')">Copy</button>
                   </div>
                 </div>
               </div>
