@@ -46,11 +46,28 @@ time ./target/release/sema --vm benchmarks/1brc/1brc.sema -- benchmarks/data/ben
 
 ### Multi-dialect comparison (Docker)
 
+Use `linux/amd64` on native x86-64 Linux, or when you explicitly need to
+reproduce the published amd64 comparison:
+
 ```bash
-cd benchmarks/1brc
-docker build --platform linux/amd64 -t sema-1brc-bench .
+docker build --platform linux/amd64 -f benchmarks/1brc/Dockerfile -t sema-1brc-bench .
 docker run --platform linux/amd64 --rm \
-  -v $(pwd)/../../benchmarks/data/bench-10m.txt:/data/measurements.txt:ro \
-  -v $(pwd)/results:/results \
+  -v $(pwd)/benchmarks/data/bench-10m.txt:/data/measurements.txt:ro \
+  -v $(pwd)/benchmarks/1brc/results:/results \
   sema-1brc-bench /data/measurements.txt
 ```
+
+On Apple Silicon, Racket may abort under x86-64 Docker emulation. Use a native
+arm64 image if you want the Racket row to run locally. This is not the exact
+published matrix: Debian bookworm does not provide `chezscheme` on arm64, so
+the Chez row is skipped there.
+
+```bash
+docker build --platform linux/arm64 -f benchmarks/1brc/Dockerfile -t sema-1brc-bench .
+docker run --platform linux/arm64 --rm \
+  -v $(pwd)/benchmarks/data/bench-10m.txt:/data/measurements.txt:ro \
+  -v $(pwd)/benchmarks/1brc/results:/results \
+  sema-1brc-bench /data/measurements.txt
+```
+
+Do not compare amd64 and arm64 benchmark rows as the same environment.
