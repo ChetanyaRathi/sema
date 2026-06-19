@@ -173,6 +173,47 @@ pub fn call_cancel_callback(task_id: u64) -> Result<bool, SemaError> {
     f(task_id)
 }
 
+// ── Blocking-sleep callback ─────────────────────────────────────
+
+/// Callback type for blocking the current thread for real wall-clock time when
+/// the scheduler advances its virtual clock past a sleep. Takes a duration in
+/// milliseconds (already bounded by the `async/sleep`/`async/timeout` caps).
+pub type BlockingSleepFn = fn(u64);
+
+thread_local! {
+    static BLOCKING_SLEEP_CALLBACK: Cell<Option<BlockingSleepFn>> = const { Cell::new(None) };
+}
+
+/// Install a blocking-sleep callback. Used by the playground Web Worker to do a
+/// real `Atomics.wait` on a `SharedArrayBuffer`, so `async/sleep` paces in real
+/// time even in wasm (where the default is an instant no-op so the UI thread is
+/// never blocked). Native does not normally install one — it uses the
+/// `std::thread::sleep` default below.
+pub fn set_blocking_sleep_callback(f: BlockingSleepFn) {
+    BLOCKING_SLEEP_CALLBACK.with(|cb| cb.set(Some(f)));
+}
+
+/// Remove any installed blocking-sleep callback, restoring the platform default.
+pub fn clear_blocking_sleep_callback() {
+    BLOCKING_SLEEP_CALLBACK.with(|cb| cb.set(None));
+}
+
+/// Block for `ms` milliseconds of real wall-clock time as part of advancing the
+/// scheduler's virtual clock. If a host installed a callback (see
+/// [`set_blocking_sleep_callback`]) it is used. Otherwise the default is: sleep
+/// the OS thread on native, and no-op in wasm (the main thread must not block —
+/// the caller still advances virtual time afterward, preserving sleep ordering).
+pub fn blocking_sleep_ms(ms: u64) {
+    if let Some(f) = BLOCKING_SLEEP_CALLBACK.with(|cb| cb.get()) {
+        f(ms);
+        return;
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    std::thread::sleep(std::time::Duration::from_millis(ms));
+    #[cfg(target_arch = "wasm32")]
+    let _ = ms; // no-op: advancing virtual time (caller) is enough for ordering
+}
+
 /// Run the scheduler, optionally waiting for a specific promise.
 pub fn call_run_scheduler(
     ctx: &EvalContext,

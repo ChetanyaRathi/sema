@@ -293,6 +293,61 @@ fn equal_sleeps_wake_in_spawn_order() {
     );
 }
 
+// Records the real-sleep durations the scheduler requests, so a native test can
+// prove the blocking-sleep hook fires (the playground Web Worker installs an
+// Atomics.wait callback here; native normally uses the std::thread::sleep
+// default). fn-pointer callbacks can't capture, so record into a thread-local.
+thread_local! {
+    static SLEEP_DELTAS: std::cell::RefCell<Vec<u64>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+fn record_sleep(ms: u64) {
+    SLEEP_DELTAS.with(|d| d.borrow_mut().push(ms));
+}
+
+#[test]
+fn blocking_sleep_hook_receives_clock_advances() {
+    SLEEP_DELTAS.with(|d| d.borrow_mut().clear());
+    sema_core::set_blocking_sleep_callback(record_sleep);
+
+    // Sleeps 10/20/30 across three tasks: the virtual clock advances
+    // 0->10->20->30, so the hook should be invoked with deltas summing to 30
+    // (total virtual time), and ordering must still be a,b,c.
+    let out = eval_vm(
+        r#"
+        (let ((out (channel/new 8)))
+          (async/all
+            (list (async (async/sleep 30) (channel/send out :c))
+                  (async (async/sleep 10) (channel/send out :a))
+                  (async (async/sleep 20) (channel/send out :b))))
+          (list (channel/recv out) (channel/recv out) (channel/recv out)))
+    "#,
+    );
+
+    // Restore the default before asserting so a failure can't leak the hook
+    // into another test sharing this thread.
+    sema_core::clear_blocking_sleep_callback();
+    let deltas = SLEEP_DELTAS.with(|d| d.borrow().clone());
+
+    assert_eq!(
+        out,
+        Value::list(vec![
+            Value::keyword("a"),
+            Value::keyword("b"),
+            Value::keyword("c"),
+        ]),
+        "ordering must be unaffected by the blocking-sleep hook"
+    );
+    assert!(
+        !deltas.is_empty(),
+        "blocking-sleep hook should have been invoked"
+    );
+    assert_eq!(
+        deltas.iter().sum::<u64>(),
+        30,
+        "total real-sleep requested should equal total virtual time, got {deltas:?}"
+    );
+}
+
 // === Error cases ===
 
 #[test]

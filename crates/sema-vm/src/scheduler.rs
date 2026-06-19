@@ -543,18 +543,17 @@ fn run_until_reentrant(
                     (None, None) => None,
                 };
                 if let Some(target_time) = next {
-                    // On native, pass real wall-clock time so CLI scripts that
-                    // sleep for pacing/rate-limiting still wait. In WASM the UI
-                    // thread must not block, so the clock advances instantly.
-                    // `async/sleep`/`async/timeout` durations are capped (see
-                    // async_ops.rs), so `delta` here is bounded (≤ ~1 day) and
-                    // can't wedge the thread on a single multi-year sleep.
-                    #[cfg(not(target_arch = "wasm32"))]
-                    {
-                        let delta = target_time.saturating_sub(sched.virtual_now);
-                        if delta > 0 {
-                            std::thread::sleep(std::time::Duration::from_millis(delta));
-                        }
+                    // Pace this clock advance in real wall-clock time. Default:
+                    // sleep the OS thread on native; instant no-op in wasm (the
+                    // UI thread must not block — advancing virtual_now below is
+                    // enough for deterministic ordering). The playground Web
+                    // Worker installs a blocking-sleep callback (Atomics.wait on
+                    // a SharedArrayBuffer) to get real pacing in wasm too.
+                    // `delta` is bounded ≤ ~1 day by the async/sleep +
+                    // async/timeout caps, so it can never wedge for years.
+                    let delta = target_time.saturating_sub(sched.virtual_now);
+                    if delta > 0 {
+                        sema_core::blocking_sleep_ms(delta);
                     }
                     sched.virtual_now = target_time;
 
