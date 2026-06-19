@@ -26,6 +26,25 @@ thread_local! {
     static HTTP_CACHE: RefCell<BTreeMap<String, Value>> = const { RefCell::new(BTreeMap::new()) };
     /// Total bytes currently stored in the VFS
     static VFS_TOTAL_BYTES: Cell<usize> = const { Cell::new(0) };
+    /// Int32Array view over the control SharedArrayBuffer used for real
+    /// `Atomics.wait` sleep when running inside a Web Worker (installed via
+    /// `installAtomicsSleep`). `None` on the main thread (sleep stays an
+    /// instant virtual-clock advance — `Atomics.wait` is illegal there anyway).
+    static SLEEP_I32: RefCell<Option<js_sys::Int32Array>> = const { RefCell::new(None) };
+}
+
+/// Blocking-sleep callback installed in the Web Worker: block this (worker)
+/// thread for `ms` real milliseconds via `Atomics.wait` on the control SAB. The
+/// cell value stays 0, so the wait simply times out after `ms` (a later cancel
+/// can store a non-zero value + `Atomics.notify` to wake it early — see M6).
+/// A plain `fn` (no captures) so it fits `sema_core::BlockingSleepFn`; it reads
+/// the SAB view from the thread-local. Never called on the main thread.
+fn worker_atomics_sleep(ms: u64) {
+    SLEEP_I32.with(|s| {
+        if let Some(arr) = s.borrow().as_ref() {
+            let _ = js_sys::Atomics::wait_with_timeout(arr, 0, 0, ms as f64);
+        }
+    });
 }
 
 /// Active debug session state for cooperative VM execution.
@@ -2596,6 +2615,19 @@ impl WasmInterpreter {
     /// Get the Sema version
     pub fn version(&self) -> String {
         env!("CARGO_PKG_VERSION").to_string()
+    }
+
+    /// Enable real wall-clock `async/sleep` via `Atomics.wait` on the given
+    /// control buffer. Call this once from a Web Worker (where blocking is
+    /// allowed), passing an `Int32Array` over a `SharedArrayBuffer` shared with
+    /// the main thread. After this, the scheduler's virtual-clock advances also
+    /// block the worker for the real duration. Do NOT call on the main thread —
+    /// `Atomics.wait` is illegal there; leaving it uninstalled keeps the
+    /// instant virtual-clock behavior.
+    #[wasm_bindgen(js_name = installAtomicsSleep)]
+    pub fn install_atomics_sleep(&self, view: js_sys::Int32Array) {
+        SLEEP_I32.with(|s| *s.borrow_mut() = Some(view));
+        sema_core::set_blocking_sleep_callback(worker_atomics_sleep);
     }
 }
 

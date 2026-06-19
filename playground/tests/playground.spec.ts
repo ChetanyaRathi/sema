@@ -133,6 +133,54 @@ test('async/sleep ordering works in WASM (virtual clock)', async ({ page }) => {
   expect(lines).toEqual(['a', 'b', 'c']);
 });
 
+test('worker path: async/sleep paces in real wall-clock while the UI stays responsive', async ({ page }) => {
+  // Opt into the worker eval path (?worker). Requires cross-origin isolation,
+  // which the dev server provides via serve.json (COOP/COEP).
+  await page.goto('/?worker');
+  await page.waitForSelector('[data-testid="status"].status-ready', { timeout: 20000 });
+
+  // The worker path must actually be active (cross-origin isolated + SAB),
+  // otherwise this would silently fall back to the instant main-thread path.
+  const isolated = await page.evaluate(
+    () => self.crossOriginIsolated === true && 'SharedArrayBuffer' in globalThis
+  );
+  expect(isolated).toBe(true);
+
+  // Three concurrent sleeps (100/200/300ms) then a final print. On the worker
+  // these are REAL waits, so the run takes ~300ms wall-clock (vs instant on the
+  // main-thread virtual clock). Output is ordered by sleep duration.
+  const code = `(async/all
+  (list (async (async/sleep 300) (println "c"))
+        (async (async/sleep 100) (println "a"))
+        (async (async/sleep 200) (println "b"))))
+(println "done")`;
+  await setEditorCode(page, code);
+
+  // Main-thread responsiveness probe: a timer that must keep ticking while the
+  // worker is busy/blocked (it would be frozen on the old main-thread path).
+  await page.evaluate(() => {
+    (window as any).__ticks = 0;
+    (window as any).__t = setInterval(() => { (window as any).__ticks++; }, 20);
+  });
+
+  const t0 = Date.now();
+  await page.getByTestId('run-btn').click();
+  await page.waitForSelector('#output .output-timing', { timeout: 20000 });
+  const elapsed = Date.now() - t0;
+  const ticks = await page.evaluate(() => {
+    clearInterval((window as any).__t);
+    return (window as any).__ticks as number;
+  });
+
+  // Real wall-clock sleep happened (longest path = 300ms), not instant.
+  expect(elapsed).toBeGreaterThan(280);
+  // Main thread stayed responsive during the worker's real sleep.
+  expect(ticks).toBeGreaterThan(3);
+  // Output is correct and ordered by sleep duration, then the final print.
+  const lines = await page.$$eval('#output .output-line', (els) => els.map((e) => e.textContent));
+  expect(lines).toEqual(['a', 'b', 'c', 'done']);
+});
+
 test('evaluates a recursive fib correctly', async ({ page }) => {
   const code = `(define (fib n)
   (define (go a b i)

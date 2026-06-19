@@ -70,12 +70,12 @@ if (!existsSync(DIST_DIR)) {
 }
 
 await build({
-  entryPoints: ['src/app.js'],
-  outfile: 'dist/app.js',
+  entryPoints: ['src/app.js', 'src/sema-worker.js'],
+  outdir: 'dist',
   bundle: true,
   format: 'esm',
   minify: false,
   target: 'es2020',
   external: ['../pkg/*'],
 });
-console.log('Bundled dist/app.js');
+console.log('Bundled dist/app.js + dist/sema-worker.js');

@@ -4,8 +4,12 @@ import { highlightSema } from './highlight.js';
 import { TextareaUndo } from './undo.js';
 import { makeVfsHost, BACKENDS } from './vfs-backends.js';
 import { initSplitters } from './splitters.js';
+import { workerEvalEnabled, initWorker, evalViaWorker } from './worker-client.js';
 
 let interp = null;
+// When true, eval runs on a Web Worker (real wall-clock async/sleep, responsive
+// UI). Opt-in via ?worker + cross-origin isolation; see worker-client.js.
+let workerActive = false;
 let activeBtn = null;
 let vfsHost = null;
 let vfsBackend = null;
@@ -384,6 +388,17 @@ async function main() {
   interp = new SemaInterpreter();
   vfsHost = makeVfsHost(interp);
 
+  // Opt-in worker path: run eval off the main thread for real async/sleep.
+  if (workerEvalEnabled()) {
+    try {
+      await initWorker();
+      workerActive = true;
+    } catch (e) {
+      console.warn('worker eval unavailable, using main thread:', e);
+      workerActive = false;
+    }
+  }
+
   // Restore backend preference
   const saved = loadState();
   const storedBackend = saved.backend ?? 'memory';
@@ -426,9 +441,22 @@ async function run() {
   const runBtn = document.getElementById('run-btn');
   runBtn.disabled = true;
 
+  // On the worker path the main thread stays free, so a live "Running…" status
+  // can actually paint (and async/sleep paces in real wall-clock time).
+  const statusEl = document.getElementById('status');
+  if (workerActive) {
+    statusEl.textContent = 'Running…';
+    statusEl.className = 'status-text status-loading';
+  }
+
   const t0 = performance.now();
-  const result = await interp.evalVMAsync(code);
+  const result = workerActive ? await evalViaWorker(code) : await interp.evalVMAsync(code);
   const elapsed = performance.now() - t0;
+
+  if (workerActive) {
+    statusEl.textContent = result.error ? 'Error' : 'Ready';
+    statusEl.className = result.error ? 'status-text status-error' : 'status-text status-ready';
+  }
 
   runBtn.disabled = false;
 
