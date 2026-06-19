@@ -38,11 +38,22 @@ test.beforeEach(async ({ page }) => {
   await waitForReady(page);
 });
 
+/** Expand every sidebar category so its example buttons are clickable.
+ *  Only "Getting Started" is expanded by default; other categories collapse. */
+async function expandAllCategories(page: Page) {
+  await page.evaluate(() => {
+    document
+      .querySelectorAll('.tree-items.collapsed')
+      .forEach(el => el.classList.remove('collapsed'));
+  });
+}
+
 // ── Example smoke tests ──
 
 for (const name of EXAMPLES) {
   test(`example: ${name}`, async ({ page }) => {
-    // Click the example button in the sidebar tree
+    // Expand all categories, then click the example button in the sidebar tree
+    await expandAllCategories(page);
     await page.click(`.tree-file:text("${name}")`);
 
     // Verify editor has content
@@ -72,6 +83,7 @@ for (const name of EXAMPLES) {
 
 test('whitespace preserved in output', async ({ page }) => {
   // Use the Maze example which relies on whitespace alignment
+  await expandAllCategories(page);
   await page.click('.tree-file:text("maze.sema")');
   await clickRunAndWait(page);
 
