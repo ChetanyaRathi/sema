@@ -10,7 +10,13 @@ let worker = null;
 let ready = null;
 let nextId = 1;
 let controlView = null; // Int32Array over the shared control SAB (slot 0)
+let outputHandler = null; // called with each streamed output line
 const pending = new Map();
+
+/** Register a handler called with each live output line during a worker run. */
+export function setWorkerOutputHandler(fn) {
+  outputHandler = fn;
+}
 
 /** True when the worker eval path should be used: the browser is cross-origin
  *  isolated (SharedArrayBuffer + Atomics available) and the user hasn't opted
@@ -35,7 +41,9 @@ export function initWorker() {
   controlView = new Int32Array(sab);
   worker.addEventListener('message', (e) => {
     const m = e.data;
-    if (m && m.type === 'result') {
+    if (m && m.type === 'output') {
+      if (outputHandler) outputHandler(m.line);
+    } else if (m && m.type === 'result') {
       const resolve = pending.get(m.id);
       if (resolve) {
         pending.delete(m.id);

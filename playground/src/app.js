@@ -4,7 +4,7 @@ import { highlightSema } from './highlight.js';
 import { TextareaUndo } from './undo.js';
 import { makeVfsHost, BACKENDS } from './vfs-backends.js';
 import { initSplitters } from './splitters.js';
-import { workerEvalEnabled, initWorker, evalViaWorker, cancelWorker } from './worker-client.js';
+import { workerEvalEnabled, initWorker, evalViaWorker, cancelWorker, setWorkerOutputHandler } from './worker-client.js';
 
 let interp = null;
 // When true, eval runs on a Web Worker (real wall-clock async/sleep, responsive
@@ -396,6 +396,14 @@ async function main() {
     try {
       await initWorker();
       workerActive = true;
+      // Stream the worker's output lines into the pane live as they're produced.
+      setWorkerOutputHandler((line) => {
+        const div = document.createElement('div');
+        div.className = 'output-line';
+        div.textContent = line;
+        outputEl.appendChild(div);
+        outputEl.scrollTop = outputEl.scrollHeight;
+      });
     } catch (e) {
       console.warn('worker eval unavailable, using main thread:', e);
       workerActive = false;
@@ -455,6 +463,9 @@ async function run() {
     runBtn.classList.add('stop-btn');
     statusEl.textContent = 'Running…';
     statusEl.className = 'status-text status-loading';
+    // Clear now so streamed output lines (see setWorkerOutputHandler) land in a
+    // fresh pane and appear live as the program runs.
+    outputEl.innerHTML = '';
   } else {
     runBtn.disabled = true;
   }
@@ -486,14 +497,18 @@ async function run() {
     runBtn.disabled = false;
   }
 
-  outputEl.innerHTML = '';
-
-  if (result.output && result.output.length > 0) {
-    for (const line of result.output) {
-      const div = document.createElement('div');
-      div.className = 'output-line';
-      div.textContent = line;
-      outputEl.appendChild(div);
+  // On the worker path the output lines already streamed in live (and the pane
+  // was cleared at run start), so we only append the value/error + timing here.
+  // On the main-thread path output is batched, so clear and render it now.
+  if (!workerActive) {
+    outputEl.innerHTML = '';
+    if (result.output && result.output.length > 0) {
+      for (const line of result.output) {
+        const div = document.createElement('div');
+        div.className = 'output-line';
+        div.textContent = line;
+        outputEl.appendChild(div);
+      }
     }
   }
 

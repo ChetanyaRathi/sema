@@ -199,6 +199,35 @@ test('worker path: async/sleep paces in real wall-clock while the UI stays respo
   expect(lines).toEqual(['a', 'b', 'c', 'done']);
 });
 
+test('worker path: upload a file and read it from a script (VFS upload + mirror)', async ({ page }) => {
+  await page.goto('/?worker');
+  await page.waitForSelector('[data-testid="status"].status-ready', { timeout: 20000 });
+
+  // Upload a file via the hidden file input — it lands in the VFS at /uploads/.
+  await page.setInputFiles('#vfs-upload', {
+    name: 'notes.txt',
+    mimeType: 'text/plain',
+    buffer: Buffer.from('hello from an uploaded file'),
+  });
+
+  // It shows up in the file tree.
+  await page.waitForSelector('.vfs-tree-file:has-text("notes.txt")', { timeout: 5000 });
+
+  // A worker-run script can read it — the uploaded file is seeded into the
+  // worker via the VFS mirror (dumpVfs/loadVfs).
+  await setEditorCode(page, '(file/read "/uploads/notes.txt")');
+  await page.getByTestId('run-btn').click();
+  await page.waitForFunction(
+    () => {
+      const s = document.getElementById('status')?.textContent || '';
+      return s === 'Ready' || s === 'Error';
+    },
+    { timeout: 20000 }
+  );
+  const value = await page.$eval('#output .output-value', (el) => el.textContent || '');
+  expect(value).toContain('hello from an uploaded file');
+});
+
 test('worker path: a file written during eval shows up in the file tree (VFS mirror)', async ({ page }) => {
   // Eval runs on the worker (its own VFS); the main-thread interp is a mirror
   // synced via dumpVfs/loadVfs after each run, so the file tree must reflect
@@ -234,6 +263,38 @@ test('worker path: http/get works via synchronous XHR (no replay)', async ({ pag
   expect(errors.join('\n')).not.toContain('window');
   const value = await page.$eval('#output .output-value', (el) => el.textContent || '');
   expect(value).toContain('200');
+});
+
+test('worker path: output streams live (incrementally), not all at the end', async ({ page }) => {
+  await page.goto('/?worker');
+  await page.waitForSelector('[data-testid="status"].status-ready', { timeout: 20000 });
+
+  // Three prints separated by real ~300ms sleeps. With live streaming the lines
+  // must appear one at a time as the program runs — not batched at the end.
+  await setEditorCode(
+    page,
+    '(let loop ((i 1)) (if (> i 3) (println "fin") (begin (await (async (async/sleep 300))) (println (str "nap " i)) (loop (+ i 1)))))'
+  );
+  await page.getByTestId('run-btn').click();
+
+  // While still running, at least one line should already be visible.
+  await page.waitForFunction(
+    () => document.querySelectorAll('#output .output-line').length >= 1,
+    { timeout: 2000 }
+  );
+  const midRun = await page.$$eval('#output .output-line', (els) => els.length);
+  // Not all 4 lines yet (the later naps haven't elapsed) — proves it's live.
+  expect(midRun).toBeLessThan(4);
+
+  await page.waitForFunction(
+    () => {
+      const s = document.getElementById('status')?.textContent || '';
+      return s === 'Ready' || s === 'Error';
+    },
+    { timeout: 5000 }
+  );
+  const lines = await page.$$eval('#output .output-line', (els) => els.map((e) => e.textContent));
+  expect(lines).toEqual(['nap 1', 'nap 2', 'nap 3', 'fin']);
 });
 
 test('worker path: Stop cancels a running program and the worker survives', async ({ page }) => {

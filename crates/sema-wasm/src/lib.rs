@@ -31,6 +31,12 @@ thread_local! {
     /// `installAtomicsSleep`). `None` on the main thread (sleep stays an
     /// instant virtual-clock advance — `Atomics.wait` is illegal there anyway).
     static SLEEP_I32: RefCell<Option<js_sys::Int32Array>> = const { RefCell::new(None) };
+    /// Optional sink called with each completed output line as it is produced
+    /// (installed via `setOutputSink`). The Web Worker uses it to stream
+    /// `println` output to the main thread live, so a long-running program
+    /// (e.g. one that really sleeps) shows output as it happens instead of all
+    /// at once at the end. `None` on the main thread (output is batched).
+    static OUTPUT_SINK: RefCell<Option<js_sys::Function>> = const { RefCell::new(None) };
 }
 
 /// Blocking-sleep callback installed in the Web Worker: block this (worker)
@@ -150,10 +156,17 @@ fn append_output(s: &str) {
 
 /// Flush the current line buffer as a completed line.
 fn flush_line() {
-    LINE_BUF.with(|b| {
+    let line = LINE_BUF.with(|b| {
         let line = b.borrow().clone();
         b.borrow_mut().clear();
-        OUTPUT.with(|o| o.borrow_mut().push(line));
+        line
+    });
+    OUTPUT.with(|o| o.borrow_mut().push(line.clone()));
+    // Stream the line live if a sink is installed (Web Worker path).
+    OUTPUT_SINK.with(|s| {
+        if let Some(f) = s.borrow().as_ref() {
+            let _ = f.call1(&JsValue::NULL, &JsValue::from_str(&line));
+        }
     });
 }
 
@@ -2781,6 +2794,15 @@ impl WasmInterpreter {
         // The same control buffer carries the cancel flag (slot 0): the VM loop
         // guard polls this so a Stop aborts a running program (incl. mid-sleep).
         sema_core::set_interrupt_callback(worker_check_interrupt);
+    }
+
+    /// Install a sink called with each completed output line as it is produced,
+    /// so the Web Worker can stream `println` output to the main thread live
+    /// (a long-running / sleeping program shows output as it happens). Pass a
+    /// JS function `(line: string) => void`.
+    #[wasm_bindgen(js_name = setOutputSink)]
+    pub fn set_output_sink(&self, sink: js_sys::Function) {
+        OUTPUT_SINK.with(|s| *s.borrow_mut() = Some(sink));
     }
 }
 

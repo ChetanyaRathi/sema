@@ -27,6 +27,9 @@ self.onmessage = async (e) => {
         control = new Int32Array(msg.sab);
         interp.installAtomicsSleep(control);
       }
+      // Stream println output to the main thread as it's produced, so a
+      // long-running / sleeping program shows output live (not all at the end).
+      interp.setOutputSink((line) => self.postMessage({ type: 'output', line }));
       self.postMessage({ type: 'ready' });
       return;
     }

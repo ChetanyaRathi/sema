@@ -7,7 +7,7 @@ Real `async/sleep` in the browser playground, plus cancellation and a revived ru
 ### Added
 
 - **Cancellation / interrupt API.** `sema_core::set_interrupt_callback(fn() -> bool)` / `check_interrupt()` let a host abort a running evaluation; the VM polls it at loop back-edges and the async scheduler checks it between task steps (clearing pending tasks on cancel). New `set_blocking_sleep_callback` / `blocking_sleep_ms` let a host supply real wall-clock pacing for `async/sleep` (the playground worker uses `Atomics.wait`; native uses `std::thread::sleep`; the default in WASM is an instant virtual-clock advance).
-- **Web Worker eval path in the playground** (real `async/sleep`, responsive UI, a working Stop button, synchronous-XHR HTTP). Active when the page is cross-origin isolated; opt out with `?no-worker`. Internal/playground-only (`sema-wasm` is not published to crates.io), but the supporting `sema-core`/`sema-vm` hooks above are part of the public API.
+- **Web Worker eval path in the playground** (real `async/sleep`, responsive UI, a working Stop button, synchronous-XHR HTTP, and **live-streamed `println` output** so a long-running/sleeping program shows output as it happens instead of all at once at the end). Active when the page is cross-origin isolated; opt out with `?no-worker`. Internal/playground-only (`sema-wasm` is not published to crates.io), but the supporting `sema-core`/`sema-vm` hooks above are part of the public API.
 
 ### Fixed
 
