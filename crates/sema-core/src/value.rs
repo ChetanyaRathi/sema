@@ -91,6 +91,12 @@ pub struct NativeFn {
     pub name: String,
     pub func: Box<NativeFnInner>,
     pub payload: Option<Rc<dyn Any>>,
+    /// True when this `NativeFn` is actually the fallback wrapper for a VM
+    /// closure (a user-defined `lambda`/`fn`), not a genuine builtin. The VM
+    /// represents closures as `NativeFn`s carrying a `VmClosurePayload`; this
+    /// flag lets `type`/`type_name` report `:lambda` instead of `:native-fn`
+    /// without sema-core/sema-stdlib needing to know the VM's payload type.
+    pub is_closure: bool,
 }
 
 impl NativeFn {
@@ -102,6 +108,7 @@ impl NativeFn {
             name: name.into(),
             func: Box::new(move |_ctx, args| f(args)),
             payload: None,
+            is_closure: false,
         }
     }
 
@@ -113,6 +120,7 @@ impl NativeFn {
             name: name.into(),
             func: Box::new(f),
             payload: None,
+            is_closure: false,
         }
     }
 
@@ -125,6 +133,7 @@ impl NativeFn {
             name: name.into(),
             func: Box::new(f),
             payload: Some(payload),
+            is_closure: false,
         }
     }
 }

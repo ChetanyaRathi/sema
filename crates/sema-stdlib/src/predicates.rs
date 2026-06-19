@@ -104,6 +104,9 @@ pub fn register(env: &sema_core::Env) {
         check_arity!(args, "type", 1);
         match args[0].view() {
             ValueView::Record(r) => Ok(Value::keyword_from_spur(r.type_tag)),
+            // VM closures are represented as native-fn wrappers; report them as
+            // `:lambda` so user-defined functions are distinguishable from builtins.
+            ValueView::NativeFn(nf) if nf.is_closure => Ok(Value::keyword("lambda")),
             _ => Ok(Value::keyword(args[0].type_name())),
         }
     });

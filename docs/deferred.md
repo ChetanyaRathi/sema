@@ -16,14 +16,6 @@ Verified 2026-06-09: U6 ("did you mean" hints — shipped via `suggest_similar` 
 
 ---
 
-## VM-2 — `(type lambda)` reports `:native-fn`
-
-**Today:** `(type (lambda (x) x))` returns `:native-fn`, not `:lambda`, because VM closures are wrapped as native fns and `type` (in `sema-stdlib`, which cannot depend on `sema-vm`) can't distinguish them.
-
-**Proposed fix:** add a lightweight marker on `NativeFn` (set by the VM closure wrapper) that `type_name`/`type` can read to report `:lambda`. Small `sema-core` change. Cosmetic.
-
----
-
 ## D5 — Typed `try`/`catch` form
 
 **Today:** `(try expr (catch e ...))` catches *every* error type, including `:unbound`, `:arity`, `:type-error` — the kind of errors that usually mean a typo. The docs (`website/docs/language/special-forms.md` near "Re-throw errors you don't intend to handle") explicitly warn about this.
@@ -124,11 +116,11 @@ when a real long-running workload shows growth (a `Rc::strong_count` leak test w
 
 ---
 
-## C1 follow-ups — closure-as-NativeFn wrapping artifacts
+## C1 follow-up — caught-HOF-callback errors lack a stack trace
 
-**Today:** after the C1 fix (HOF callbacks routed into the running VM), two unrelated symptoms of wrapping a VM closure as a `NativeFn` remain: `(type (fn …))` reports `:native-fn` rather than a function type, and a VM error caught from inside a HOF callback lacks a `:stack-trace`.
+**Today:** after the C1 fix (HOF callbacks routed into the running VM), one residual symptom of wrapping a VM closure as a `NativeFn` remains: a VM error caught from inside a HOF callback lacks a `:stack-trace`. (The sibling `(type (fn …))` → `:native-fn` artifact was fixed 2026-06-19 via the `NativeFn::is_closure` marker — see VM-2 above, now resolved.)
 
-**Why deferred (decided 2026-06-18):** cosmetic / low-impact; they stem from the closure-as-NativeFn boundary, not from upvalue timing (which C1 fixed). Revisit if they bite real usage.
+**Why deferred (decided 2026-06-18):** cosmetic / low-impact; it stems from the closure-as-NativeFn boundary, not from upvalue timing (which C1 fixed). Tied to VM-1 (stack traces). Revisit if it bites real usage.
 
 ---
 

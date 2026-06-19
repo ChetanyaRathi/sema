@@ -2518,7 +2518,7 @@ impl VM {
         // The NativeFn wrapper is used as a fallback when called from outside the VM
         // (e.g., from stdlib HOFs like map/filter). Inside the VM, call_value detects
         // the payload and pushes a CallFrame instead — no Rust recursion.
-        let native = Value::native_fn_from_rc(Rc::new(sema_core::NativeFn::with_payload(
+        let mut native_fn = sema_core::NativeFn::with_payload(
             closure_for_fallback
                 .func
                 .name
@@ -2564,7 +2564,10 @@ impl VM {
                 vm.setup_for_call(closure_for_fallback.clone(), args)?;
                 vm.run(ctx)
             },
-        )));
+        );
+        // Mark this wrapper so `type`/`type_name` report `:lambda`, not `:native-fn`.
+        native_fn.is_closure = true;
+        let native = Value::native_fn_from_rc(Rc::new(native_fn));
 
         self.stack.push(native);
         Ok(())

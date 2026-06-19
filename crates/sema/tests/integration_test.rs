@@ -1212,10 +1212,9 @@ fn test_type_function() {
     assert_eq!(eval("(type #t)"), Value::keyword("bool"));
     assert_eq!(eval("(type nil)"), Value::keyword("nil"));
     assert_eq!(eval("(type +)"), Value::keyword("native-fn"));
-    // On the VM (sole evaluator), a user lambda is a native-fn-wrapped VM
-    // closure, so `type` reports :native-fn. Reporting :lambda for VM closures
-    // is a deferred cosmetic enhancement (docs/deferred.md).
-    assert_eq!(eval("(type (lambda (x) x))"), Value::keyword("native-fn"));
+    // A user lambda is a native-fn-wrapped VM closure under the hood, but the
+    // wrapper is marked (NativeFn::is_closure) so `type` reports :lambda.
+    assert_eq!(eval("(type (lambda (x) x))"), Value::keyword("lambda"));
 }
 
 #[test]
