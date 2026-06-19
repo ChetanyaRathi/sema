@@ -3,7 +3,6 @@ import tseslint from 'typescript-eslint';
 import litPlugin from 'eslint-plugin-lit';
 import litA11yPlugin from 'eslint-plugin-lit-a11y';
 import wcPlugin from 'eslint-plugin-wc';
-import storybookPlugin from 'eslint-plugin-storybook';
 
 export default tseslint.config(
   eslint.configs.recommended,
@@ -14,7 +13,6 @@ export default tseslint.config(
     rules: litA11yPlugin.configs.recommended.rules,
   },
   wcPlugin.configs['flat/recommended'],
-  ...storybookPlugin.configs['flat/recommended'],
   {
     settings: {
       wc: {
@@ -26,6 +24,6 @@ export default tseslint.config(
     },
   },
   {
-    ignores: ['dist/', 'node_modules/', '.storybook/'],
+    ignores: ['dist/', 'node_modules/'],
   }
 );

@@ -55,7 +55,6 @@ yarn-error.log
 
 # Build output
 **/dist/
-**/storybook-static/
 
 # Test artifacts
 /ui/.vitest-attachments

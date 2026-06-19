@@ -34,8 +34,6 @@ npm test              # Run tests and quit (Vitest + Playwright, headless)
 npm run test:watch    # Run tests in watch mode (re-run on changes)
 npm run test:ui       # Run tests with Vitest UI
 npm run lint          # ESLint across all source files
-npm run storybook     # Start Storybook dev server (http://localhost:6006)
-npm run build-storybook  # Build static Storybook
 ```
 
 ## Components
@@ -57,8 +55,7 @@ npm run build-storybook  # Build static Storybook
 - **CSS Anchor Positioning** — tooltip popups with `@supports` fallback (zero JS positioning)
 - **Vite 6** — Rolldown-powered build, TypeScript compilation, `declaration: true`
 - **Vitest 4** — Playwright browser mode, 49 tests, real Chromium rendering
-- **Storybook 10** — visual component catalog with a11y and interaction testing
-- **ESLint** — `eslint-plugin-lit` + `eslint-plugin-wc` + `eslint-plugin-storybook`
+- **ESLint** — `eslint-plugin-lit` + `eslint-plugin-lit-a11y` + `eslint-plugin-wc`
 - **54.8 KB** unminified, **13.4 KB** gzipped (Lit + 8 components bundled inline)
 
 ## Integration
