@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.19.1
+
+Dependency-hygiene patch release. No functional changes — this exists so the cargo-dist GitHub-release binaries and the Homebrew bottle (which build from the committed `Cargo.lock`, unlike `cargo install`, which re-resolves) embed the security-patched `tar` crate.
+
+### Fixed
+
+- **`tar` bumped 0.4.45 → 0.4.46** (RUSTSEC / GHSA-3pv8-6f4r-ffg2, PAX-header desync, medium severity). Used by the `sema build` standalone-executable archive path. `cargo install` users already resolved the patched version via `tar = "0.4"`; this pins it into the distributed binaries and Homebrew.
+- **`esbuild` bumped 0.28.0 → 0.28.1** in the playground and `ui` dev toolchains (GHSA-g7r4-m6w7-qqqr, dev-server file read on Windows, low severity, dev-only — we use esbuild for bundling, not serving).
+
 ## 1.19.0
 
 Real `async/sleep` in the browser playground, plus cancellation and a revived runaway-loop guard. The WASM playground now runs evaluation on a dedicated Web Worker that blocks on `Atomics.wait`, so `async/sleep` paces in real wall-clock time while the page stays responsive — and a Stop button can cancel a running program. Also fixes debugging async programs in the playground, and stops shipping the internal `sema-docs` binary via Homebrew.
