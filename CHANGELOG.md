@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- **Dev/test builds now compile with `debug = "line-tables-only"` (`[profile.dev]` in the workspace `Cargo.toml`).** Debug and test builds previously used Cargo's default `debug = 2` (full variable-level debug info), which made each integration-test binary ~84 MB. With ~12 crates, many test targets (`integration_test`, `dual_eval_test`, `vm_async_test`, `vm_integration_test`, the `zz_probe*` files, …), and Cargo never garbage-collecting stale fingerprint binaries, `target/debug` had ballooned to ~39 GB (175+ binaries over 40 MB, plus an 18 GB incremental cache). Dropping to line-tables-only keeps panic backtraces with file:line intact while cutting per-binary size to roughly a third; the only thing given up is variable-level inspection when stepping the *Rust* interpreter under `lldb` in a plain debug build. **Profiling and benchmarking are unaffected**: `make bench*`/`make bench-1m/10m/100m` build under `[profile.release]`, and `make profile`/`profile-vm` build under `[profile.release-with-debug]` (`debug = true`, `strip = "none"`), neither of which inherits from `[profile.dev]`. There are no Criterion `benches/` harnesses that would compile under the dev profile.
+
 ## 1.18.0
 
 Tree-walker retirement release. The legacy tree-walking interpreter is gone — the bytecode VM is now Sema's sole evaluator across every entry point (CLI, REPL, embedding API, `eval`, `import`/`load`, macros, async). Ships with refreshed default LLM models, an embedded models.dev pricing snapshot, a hardened standalone-binary build path, dependency bumps, an async example suite, and a runnable Rust embedding example. The VM/tree-walker switcher is removed from the playground.

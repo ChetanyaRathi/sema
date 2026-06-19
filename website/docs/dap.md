@@ -10,8 +10,8 @@ Sema Lisp includes a built-in [Debug Adapter Protocol](https://microsoft.github.
 sema dap
 ```
 
-::: info VM-Only Feature
-The debugger operates exclusively on the stack-based bytecode VM backend. The tree-walking interpreter does not support breakpoints or stepping. Programs debugged via DAP are compiled to bytecode automatically upon launch.
+::: info Runs on the bytecode VM
+The debugger operates on the stack-based bytecode VM — Sema's sole evaluator. Programs debugged via DAP are compiled to bytecode automatically upon launch.
 :::
 
 ## Features

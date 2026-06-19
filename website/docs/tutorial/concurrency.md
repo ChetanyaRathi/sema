@@ -57,6 +57,10 @@ Use `async/sleep` to yield control to the scheduler for at least a certain numbe
   (println "Done!"))
 ```
 
+::: tip Deterministic, and instant in the playground
+The scheduler uses a **virtual clock**, so sleeps order tasks deterministically — a shorter sleep always wakes before a longer one, the same on every run. On native the clock advances in real time (a 1-second sleep really waits); in the **browser playground it advances instantly** (the UI thread can't block), so durations still order tasks but no real time passes. Sleep durations are capped at 1 day.
+:::
+
 ---
 
 ## 3. Channels

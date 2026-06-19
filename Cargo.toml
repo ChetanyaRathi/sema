@@ -86,6 +86,13 @@ wasm-bindgen-futures = "0.4"
 getrandom = "0.4"
 
 
+# Dev/test builds: keep file:line backtraces but drop variable-level debug info.
+# Shrinks test binaries (~84MB -> ~25MB) and the incremental cache substantially.
+# Does NOT affect benchmarking (uses [profile.release]) or profiling (uses
+# [profile.release-with-debug], which keeps full symbols).
+[profile.dev]
+debug = "line-tables-only"
+
 [profile.release]
 opt-level = 3
 lto = "thin"

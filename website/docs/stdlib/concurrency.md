@@ -95,7 +95,7 @@ Run all pending async tasks to completion.
 (async/sleep ms)
 ```
 
-Inside an async task, yield for at least `ms` milliseconds (real timing — the scheduler will not wake the task until the deadline elapses). Outside async, calls `thread::sleep`.
+Inside an async task, yield for `ms` milliseconds on the scheduler's **virtual clock**. The clock only advances when every task is blocked, jumping to the nearest deadline — so a shorter sleep always wakes before a longer one, deterministically. On native, the scheduler also waits the real time when it advances (so CLI scripts that sleep for pacing/rate-limiting really wait); in the **browser playground the virtual clock advances instantly** (the UI thread must not block), so durations still order tasks correctly but no real time passes. Outside async, calls `thread::sleep` on native. Durations are capped at `86_400_000` ms (1 day).
 
 ### `async/timeout`
 
@@ -110,7 +110,7 @@ Wait for `promise` to resolve, but raise an error if it takes longer than `ms` m
 ;; raises: async/timeout: operation timed out
 ```
 
-`ms = 0` causes an immediate timeout if the promise has not already resolved.
+A `ms = 0` (or very short) timeout still lets work that is **synchronously ready** finish — it only fires once the virtual clock actually reaches the deadline with the task still pending (i.e. the task had to block/wait). Durations are capped at `86_400_000` ms (1 day).
 
 ### `async/cancel`
 

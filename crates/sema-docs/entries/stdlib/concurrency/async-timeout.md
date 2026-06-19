@@ -15,4 +15,4 @@ Wait for `promise` to resolve, but raise an error if it takes longer than `ms` m
 ;; raises: async/timeout: operation timed out
 ```
 
-`ms = 0` causes an immediate timeout if the promise has not already resolved.
+A `ms = 0` (or very short) timeout still lets synchronously-ready work finish — it only fires once the virtual clock reaches the deadline with the task still pending. Durations are capped at `86_400_000` ms (1 day).
