@@ -12,12 +12,15 @@ let nextId = 1;
 let controlView = null; // Int32Array over the shared control SAB (slot 0)
 const pending = new Map();
 
-/** True when the worker eval path is available and opted into. */
+/** True when the worker eval path should be used: the browser is cross-origin
+ *  isolated (SharedArrayBuffer + Atomics available) and the user hasn't opted
+ *  out with ?no-worker. Otherwise the playground runs on the main thread
+ *  (instant virtual-clock sleeps), exactly as before. */
 export function workerEvalEnabled() {
   return (
     typeof SharedArrayBuffer !== 'undefined' &&
     self.crossOriginIsolated === true &&
-    new URLSearchParams(location.search).has('worker')
+    !new URLSearchParams(location.search).has('no-worker')
   );
 }
 

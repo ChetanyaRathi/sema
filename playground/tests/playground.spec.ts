@@ -133,6 +133,24 @@ test('async/sleep ordering works in WASM (virtual clock)', async ({ page }) => {
   expect(lines).toEqual(['a', 'b', 'c']);
 });
 
+test('?no-worker forces the main-thread fallback (instant virtual-clock sleep)', async ({ page }) => {
+  // The worker path is the default under cross-origin isolation; ?no-worker
+  // opts out to the main-thread interpreter, where async/sleep is an instant
+  // no-op. A 2s sleep must therefore complete near-instantly (proving fallback).
+  await page.goto('/?no-worker');
+  await page.waitForSelector('[data-testid="status"].status-ready', { timeout: 20000 });
+
+  await setEditorCode(page, '(await (async (async/sleep 2000) 42))');
+  const t0 = Date.now();
+  await page.getByTestId('run-btn').click();
+  await page.waitForSelector('#output .output-timing', { timeout: 20000 });
+  const elapsed = Date.now() - t0;
+
+  expect(elapsed).toBeLessThan(1000); // instant on the main-thread path (not real-slept)
+  const value = await page.$eval('#output .output-value', (el) => el.textContent || '');
+  expect(value).toContain('42');
+});
+
 test('worker path: async/sleep paces in real wall-clock while the UI stays responsive', async ({ page }) => {
   // Opt into the worker eval path (?worker). Requires cross-origin isolation,
   // which the dev server provides via serve.json (COOP/COEP).

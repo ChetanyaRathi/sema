@@ -8,7 +8,8 @@ import { workerEvalEnabled, initWorker, evalViaWorker, cancelWorker } from './wo
 
 let interp = null;
 // When true, eval runs on a Web Worker (real wall-clock async/sleep, responsive
-// UI). Opt-in via ?worker + cross-origin isolation; see worker-client.js.
+// UI, cancellable). Active when the page is cross-origin isolated; opt out with
+// ?no-worker. See worker-client.js.
 let workerActive = false;
 // True while a worker eval is in flight (so the Run button acts as Stop).
 let workerRunning = false;
