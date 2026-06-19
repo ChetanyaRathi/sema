@@ -341,7 +341,24 @@ Slots 0–3 have dedicated zero-operand opcodes (`LoadLocal0`..`LoadLocal3`, `St
 Beyond the VM itself, the **distributed binaries** are optimized at build time:
 
 - **Fat LTO** (`lto = "fat"` on the `release`/`dist` profiles): lets LLVM inline across crate boundaries — the dispatch loop in `sema-vm` calls `sema-core` value accessors (`view`, `as_int`, `type_name`, …) millions of times per benchmark, and thin LTO can't always inline those. Measured 3–9% across the suite, at the cost of ~2× longer release builds.
-- **Profile-Guided Optimization (PGO):** the cargo-dist GitHub-release binaries and Homebrew bottle are built with PGO. The build instruments the binary, trains it on the full benchmark suite + a 1BRC sample, merges the profile with `llvm-profdata`, then rebuilds — letting LLVM lay out the `match op` dispatch hot blocks by _measured_ opcode frequency. Measured **~25–29% faster on 1BRC** and **−11% to −40% on compute benchmarks** (higher-order-fold −40%, tak −32%, deriv/hashmap −22%). It runs on native release targets via cargo-dist's `github-build-setup`; cross-compiled and Windows targets fall back to fat LTO, and the step is fail-safe (a PGO failure ships LTO, never breaks the release). Run it locally with `make build-pgo`. (`cargo install` builds get fat LTO but not PGO — PGO needs the training step.)
+- **Profile-Guided Optimization (PGO):** the cargo-dist GitHub-release binaries and Homebrew bottle are built with PGO. The build instruments the binary, trains it on the full benchmark suite + a 1BRC sample, merges the profile with `llvm-profdata`, then rebuilds — letting LLVM lay out the `match op` dispatch hot blocks by _measured_ opcode frequency. It runs on native release targets via cargo-dist's `github-build-setup`; cross-compiled and Windows targets fall back to fat LTO, and the step is fail-safe (a PGO failure ships LTO, never breaks the release). Run it locally with `make build-pgo`. (`cargo install` builds get fat LTO but not PGO — PGO needs the training step.)
+
+**Measured impact** (v1.19.2 PGO build vs the pre-optimization build, Apple Silicon, best-of-N):
+
+| Benchmark         | Before | v1.19.2 PGO | Δ      |
+| ----------------- | ------ | ----------- | ------ |
+| 1BRC (10M rows)   | 11.18s | 8.23s       | −26%   |
+| higher-order-fold | 552ms  | 334ms       | −39%   |
+| tak               | 1793ms | 1209ms      | −33%   |
+| mandelbrot        | 246ms  | 177ms       | −28%   |
+| deriv             | 767ms  | 570ms       | −26%   |
+| hashmap-bench     | 3976ms | 2967ms      | −25%   |
+| closure-storm     | 1040ms | 836ms       | −20%   |
+| bench-features    | 1373ms | 1098ms      | −20%   |
+| string-pipeline   | 633ms  | 537ms       | −15%   |
+| nqueens           | 2060ms | 1790ms      | −13%   |
+
+The win is dominated by PGO; fat LTO contributes ~3–9% of it. (`cargo install` builds get the LTO portion but not PGO.)
 
 ## Rejected Optimizations
 
