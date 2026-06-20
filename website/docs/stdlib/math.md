@@ -4,6 +4,28 @@ outline: [2, 3]
 
 # Math & Arithmetic
 
+## Domain & error policy
+
+Sema's numeric error behavior follows one rule, split by type:
+
+- **Integer division or modulo by zero raises an error.** `(/ 1 0)`, `(modulo 7 0)`, and `(mod 7 0)` all raise (`division by zero` / `modulo by zero`). Integers have no infinity or NaN to return, so the failure surfaces where it happens.
+- **Floating-point follows IEEE 754** — overflow and undefined real-domain results return `inf`, `-inf`, or `NaN` instead of raising:
+
+```sema
+(/ 1.0 0)     ; => inf
+(/ -1.0 0)    ; => -inf
+(/ 0.0 0.0)   ; => NaN
+(sqrt -1)     ; => NaN
+(log 0)       ; => -inf
+(log -1)      ; => NaN
+(pow 0 0)     ; => 1
+(pow 2 -1)    ; => 0.5
+```
+
+This matches the hardware and mainstream numeric languages, so `NaN` propagates and `inf` accumulates rather than forcing error handling around every operation. If you need to reject these, test with `math/nan?` / `math/infinite?` explicitly.
+
+> **Integer overflow wraps** (two's-complement) — Sema does not yet have arbitrary-precision integers, so e.g. `(+ 9223372036854775807 1)` wraps to a negative number rather than raising or promoting. (See ADR #64.)
+
 ## Basic Arithmetic
 
 ### `+`

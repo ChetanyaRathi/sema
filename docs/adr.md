@@ -708,3 +708,14 @@ The 620-line mini-evaluator (`sema_eval_value` + hand-rolled `call_function`) th
 - Two sources: **git repos** (`sema pkg add github.com/user/repo@ref` → `~/.sema/packages/`) and the **registry** (self-hostable single Rust binary in `pkg/` — SQLite/SeaORM, REST API, web UI; `DEFAULT_REGISTRY = pkg.sema-lang.com`, currently not serving — see `docs/plans/2026-06-09-pkg-registry-predeploy-hardening.md`).
 - Manifest: `sema.toml` (`[package]` + `[deps]`; short names = registry, URL paths = git). Default entrypoint `package.sema`, overridable via `entrypoint`.
 - **Lockfile is implemented** (`sema.lock`: exact commit SHAs + registry checksums, `--locked` enforcement in `crates/sema/src/pkg.rs`).
+
+### 64. Numeric domain & error policy: integer divide/modulo-by-zero raises; floats follow IEEE 754
+
+Formalizes existing behavior (`docs/wip.md` N9), which was already consistent — this ADR ratifies and documents it rather than changing code.
+
+- **Integer division and modulo by zero raise** an `:eval` error (`/`, `modulo`, `mod` on integer operands → `division by zero` / `modulo by zero`). Integers have no representation for infinity or NaN, so raising is the only sane result and it surfaces the bug at the point of failure.
+- **All floating-point results follow IEEE 754.** Overflow and undefined real-domain operations return the IEEE specials `inf` / `-inf` / `NaN` rather than raising: `(/ 1.0 0)` → `inf`, `(/ 0.0 0.0)` → `NaN`, `(sqrt -1)` → `NaN`, `(log 0)` → `-inf`, `(log -1)` → `NaN`. `(pow 0 0)` → `1` and `(pow 2 -1)` → `0.5` (float-promoted), per C/IEEE `pow` conventions.
+
+Rationale: this matches the hardware and every mainstream numeric language, so numeric/scientific code can rely on NaN propagation and `inf` accumulation instead of wrapping every operation in error handling. Raising on float domain edges would be both surprising to numeric programmers and a per-op cost. Integers are the sole exception only because they cannot represent `inf`/`NaN`.
+
+Out of scope: integer arithmetic **overflow wraps** (two's-complement) rather than promoting to bignum or raising — Sema has no arbitrary-precision integers yet; that is a separate concern, not part of this policy. Documented in `website/docs/stdlib/math.md`.

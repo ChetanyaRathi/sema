@@ -12,6 +12,10 @@
 - **LSP range formatting** (`textDocument/rangeFormatting`). The server now advertises `documentRangeFormattingProvider` and formats a selection by expanding it to the smallest set of *whole* top-level forms it overlaps, formatting those through `sema-fmt`, and returning edits scoped to that span. Formatting partial sub-expressions in a Lisp is unsafe, so a selection that touches no complete form is a no-op.
 - **DAP conditional breakpoints and an uncaught-exception breakpoint.** `supportsConditionalBreakpoints` is now on: a breakpoint's `condition` is evaluated (in the stopped frame, via the existing evaluate path) and a pure breakpoint stop only fires when it's truthy; a bad condition fails open so it surfaces. An `uncaught` exception filter (`setExceptionBreakpoints`) stops on errors that escape to the top level, with `exceptionInfo` reporting the message. (At an uncaught stop the VM has already unwound, so stack/scopes there are best-effort — the message is the load-bearing info.)
 
+### Documentation
+
+- **Numeric domain & error policy is now documented** (ADR #64, `stdlib/math.md`). No behavior change — the existing rule is ratified: integer division/modulo by zero raises (integers have no `inf`/`NaN`), while all floating-point operations follow IEEE 754 (`sqrt -1` → `NaN`, `1.0/0` → `inf`, `log 0` → `-inf`, …). Integer overflow wraps (no bignums yet).
+
 ### Performance
 
 - **Special-form lookup cache in the bytecode lowerer.** `lower_list` previously checked every list form against ~40 special-form names, each check re-interning the name (a thread-local `RefCell` borrow + hashbrown lookup per name per form). It now does a single lookup into a per-thread `HashMap<Spur, SpecialForm>` and matches on the resulting enum. Measured **~1.2× faster lowering** on a 10k-form file (88.6 ms → 73.6 ms); emitted bytecode is byte-identical. (Per-thread, not global, because the interner is thread-local.)
