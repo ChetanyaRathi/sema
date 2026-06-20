@@ -2,18 +2,18 @@
 
 | Dialect | Best (ms) | Relative | Verified |
 | --- | ---: | ---: | --- |
-| sbcl | 922 | 1.0x | yes |
-| chez | 1,594 | 1.7x | yes |
-| gambit | 2,445 | 2.7x | yes |
-| fennel | 2,664 | 2.9x | yes |
-| clojure | 2,972 | 3.2x | yes |
-| racket | 3,508 | 3.8x | yes |
-| guile | 4,350 | 4.7x | yes |
-| chicken | 5,816 | 6.3x | yes |
-| emacs | 8,518 | 9.2x | yes |
-| ecl | 9,068 | 9.8x | yes |
-| newlisp | 9,498 | 10.3x | yes |
-| janet | 12,395 | 13.4x | yes |
-| sema-vm | 15,174 | 16.5x | yes |
-| gauche | 16,577 | 18.0x | yes |
-| kawa | 18,751 | 20.3x | yes |
+| sbcl | 896 | 1.0x | yes |
+| chez | 1,537 | 1.7x | yes |
+| gambit | 2,346 | 2.6x | yes |
+| fennel | 2,668 | 3.0x | yes |
+| clojure | 2,901 | 3.2x | yes |
+| racket | 3,505 | 3.9x | yes |
+| guile | 4,361 | 4.9x | yes |
+| chicken | 5,762 | 6.4x | yes |
+| sema-vm | 8,162 | 9.1x | yes |
+| emacs | 8,245 | 9.2x | yes |
+| newlisp | 8,416 | 9.4x | yes |
+| ecl | 8,837 | 9.9x | yes |
+| janet | 10,124 | 11.3x | yes |
+| gauche | 16,745 | 18.7x | yes |
+| kawa | 18,335 | 20.5x | yes |

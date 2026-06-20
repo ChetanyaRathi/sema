@@ -28,10 +28,11 @@ How does Sema compare to other Lisp dialects on a real-world I/O-heavy workload?
 ::: info Tree-walker removed; Sema VM re-verified
 The Sema tree-walking row is **historical** — that evaluator was retired and its
 code deleted (2026-06-18); the bytecode VM is now Sema's sole evaluator. The
-other dialects' numbers are from the original Docker/Rosetta run and are
-unchanged. Sema's VM result was re-measured after the retirement to confirm it
-still holds: the native macOS run below measured 15.2 s for 10 M rows on Apple
-Silicon, while the Docker/Rosetta run above measured 21.1 s. The retirement is
+other dialects' numbers in **this Docker table** are from the original
+Docker/Rosetta run and are unchanged. Sema's VM result was re-measured after the
+retirement to confirm it held (15.2 s native at the time), and the native table
+below has since been **re-run with the v1.19.2 PGO build at 8.2 s** (2026-06-20).
+The Docker/Rosetta run above measured 21.1 s. The retirement is
 call-overhead-neutral for this I/O- and hashmap-heavy workload.
 :::
 
@@ -42,51 +43,51 @@ Gambit, Chicken, and ECL are now benchmarked in compiled mode (compiling via C),
 :::
 
 ::: info Native performance
-Sema runs faster natively on Apple Silicon: 15.2s (the bytecode VM) on 10M rows, compared to 21.1s under x86-64 emulation. The retired tree-walker measured 44.5s under emulation and is kept in the Docker table only for historical context. NaN-boxing (introduced in v1.5.0) adds overhead that is amplified by x86-64 emulation. Keep the Docker and native macOS tables separate; they are different runtime and OS environments.
+Sema runs faster natively on Apple Silicon. The **v1.19.2 PGO build does 10M rows in 8.2s** (re-measured 2026-06-20), down from 15.2s before this round of build-tuning (fat LTO + profile-guided optimization) — enough to overtake Janet, ECL, Gauche, and Kawa on this machine (see the native table below). The Docker table above is an older x86-64-emulation run (21.1s) and is not directly comparable. The retired tree-walker measured 44.5s under emulation and is kept in the Docker table only for historical context. Keep the Docker and native macOS tables separate; they are different runtime and OS environments.
 :::
 
 ## Native Apple Silicon Run
 
 We also ran the benchmark directly on macOS 15.6, Apple M2 Max, using native Homebrew runtimes where available. This run includes Racket and omits PicoLisp, because PicoLisp does not have a Homebrew core formula for native macOS. The results are useful for same-machine comparison, but they are not a replacement for the Docker/Linux table above.
 
-**10 million rows (~124 MiB / 130 MB), best of 3 runs, single-threaded, native macOS arm64:**
+**10 million rows (~124 MiB / 130 MB), best of 3 runs, single-threaded, native macOS arm64. Sema is the v1.19.2 PGO build (re-run 2026-06-20); all dialects re-measured together on the same machine:**
 
 | Dialect           | Time (ms) | Relative |
 | ----------------- | --------- | -------- |
-| **SBCL**          | 922       | 1.0x     |
-| **Chez Scheme**   | 1,594     | 1.7x     |
-| **Gambit**        | 2,445     | 2.7x     |
-| **Fennel/LuaJIT** | 2,664     | 2.9x     |
-| **Clojure**       | 2,972     | 3.2x     |
-| **Racket**        | 3,508     | 3.8x     |
-| **Guile**         | 4,350     | 4.7x     |
-| **Chicken**       | 5,816     | 6.3x     |
-| **Emacs Lisp**    | 8,518     | 9.2x     |
-| **ECL**           | 9,068     | 9.8x     |
-| **newLISP**       | 9,498     | 10.3x    |
-| **Janet**         | 12,395    | 13.4x    |
-| **Sema**          | 15,174    | 16.5x    |
-| **Gauche**        | 16,577    | 18.0x    |
-| **Kawa**          | 18,751    | 20.3x    |
+| **SBCL**          | 896       | 1.0x     |
+| **Chez Scheme**   | 1,537     | 1.7x     |
+| **Gambit**        | 2,346     | 2.6x     |
+| **Fennel/LuaJIT** | 2,668     | 3.0x     |
+| **Clojure**       | 2,901     | 3.2x     |
+| **Racket**        | 3,505     | 3.9x     |
+| **Guile**         | 4,361     | 4.9x     |
+| **Chicken**       | 5,762     | 6.4x     |
+| **Sema**          | 8,162     | 9.1x     |
+| **Emacs Lisp**    | 8,245     | 9.2x     |
+| **newLISP**       | 8,416     | 9.4x     |
+| **ECL**           | 8,837     | 9.9x     |
+| **Janet**         | 10,124    | 11.3x    |
+| **Gauche**        | 16,745    | 18.7x    |
+| **Kawa**          | 18,335    | 20.5x    |
 
-**Simple/idiomatic versions, same native macOS environment:**
+**Simple/idiomatic versions, same native macOS environment (Sema = v1.19.2 PGO, re-run 2026-06-20):**
 
 | Dialect           | Time (ms) | Relative |
 | ----------------- | --------- | -------- |
-| **Gambit**        | 2,412     | 1.0x     |
-| **Chez Scheme**   | 2,531     | 1.0x     |
-| **Fennel/LuaJIT** | 2,697     | 1.1x     |
-| **Clojure**       | 2,904     | 1.2x     |
-| **SBCL**          | 3,040     | 1.3x     |
-| **Guile**         | 5,353     | 2.2x     |
-| **Chicken**       | 9,293     | 3.9x     |
-| **newLISP**       | 9,296     | 3.9x     |
-| **Janet**         | 12,467    | 5.2x     |
-| **ECL**           | 13,163    | 5.5x     |
-| **Emacs Lisp**    | 16,535    | 6.9x     |
-| **Gauche**        | 16,826    | 7.0x     |
-| **Kawa**          | 17,700    | 7.3x     |
-| **Sema**          | 19,648    | 8.1x     |
+| **Gambit**        | 2,386     | 1.0x     |
+| **Chez Scheme**   | 2,530     | 1.1x     |
+| **Fennel/LuaJIT** | 2,685     | 1.1x     |
+| **Clojure**       | 2,841     | 1.2x     |
+| **SBCL**          | 3,027     | 1.3x     |
+| **Guile**         | 5,308     | 2.2x     |
+| **newLISP**       | 8,364     | 3.5x     |
+| **Chicken**       | 9,118     | 3.8x     |
+| **Sema**          | 10,148    | 4.3x     |
+| **Janet**         | 10,185    | 4.3x     |
+| **ECL**           | 13,675    | 5.7x     |
+| **Gauche**        | 16,630    | 7.0x     |
+| **Emacs Lisp**    | 16,753    | 7.0x     |
+| **Kawa**          | 18,132    | 7.6x     |
 
 ## Why SBCL Wins
 
@@ -151,7 +152,7 @@ Janet is the most architecturally comparable to Sema — both are:
 - Focused on practical scripting rather than language theory
 - No JIT, no native compilation
 
-Janet compiles to bytecode and runs on a register-based VM. Under the same Docker environment, Janet was ~3.4x faster than Sema's old tree-walker (12.9s vs 44.5s). Sema's bytecode VM at 21.1s under emulation closes the gap to 1.6x behind Janet. Sema's native Apple Silicon result (15.2s) is closer to Janet than the Docker/Rosetta row, but those two numbers are not from the same environment.
+Janet compiles to bytecode and runs on a register-based VM. Under the same Docker environment, Janet was ~3.4x faster than Sema's old tree-walker (12.9s vs 44.5s), and Sema's bytecode VM at 21.1s under emulation closed that gap to 1.6x behind. **On the native Apple Silicon re-run (2026-06-20), the v1.19.2 PGO build flips the result: Sema 8.2s vs Janet 10.1s — Sema is now ~1.2× faster than Janet** on the same machine. (The Docker and native rows are still different environments and not rank-equivalent.)
 
 Janet's implementation is straightforward: `file/read :line` in a loop, `string/find` + `string/slice` for parsing, mutable tables for accumulation. No special optimizations.
 
@@ -163,7 +164,7 @@ Guile (7.4x) and Gauche (11.2x) are Scheme implementations with bytecode compile
 
 Sema's now-retired tree-walker measured 22.9x (44.5s under emulation, ~29.7s native), reflecting the fundamental cost of tree-walking interpretation, amplified by NaN-boxing overhead under x86-64 emulation. Every operation — reading a line, splitting a string, parsing a number, updating a map — was a function call through the evaluator, with environment lookup, `Rc` reference counting, and trampoline dispatch.
 
-The bytecode VM — now Sema's sole evaluator — cuts this to 10.9x (21.1s under emulation, 15.2s native), a **2.1× speedup** over the old tree-walker under emulation. Under emulation, Sema's VM has overtaken Gauche (21.8s) and is closing in on Kawa. The native Apple Silicon result is close to the Docker/Rosetta Janet and Guile rows, but those are different environments and should not be treated as rank-equivalent.
+The bytecode VM — now Sema's sole evaluator — cut this to 21.1s under emulation (a **2.1× speedup** over the old tree-walker), and the v1.19.2 build-tuning (fat LTO + PGO) takes the **native** result to **8.2s / 9.1×** (re-run 2026-06-20). On that same-machine native run Sema now overtakes Janet (10.1s), ECL, Gauche, and Kawa, and sits level with Emacs Lisp and newLISP — a marked jump from the pre-PGO 15.2s / 16.5×. (Docker and native are different environments and should not be treated as rank-equivalent.)
 
 Key optimizations that remain in the runtime:
 
@@ -174,8 +175,8 @@ Key optimizations that remain in the runtime:
 - **Inline string opcodes (v1.19.2):** `string-length`, `string-ref`, and `string-append` compile to dedicated VM opcodes, bypassing the generic `CallGlobal` → hash-lookup → native-fn path.
 - **Fat LTO + PGO (v1.19.2):** Release binaries are built with fat link-time optimization (measured 3–9%) and **profile-guided optimization** — PGO trains the compiler on the benchmark suite + a 1BRC sample, then rebuilds with the profile, reordering the VM's dispatch hot blocks by real opcode frequency.
 
-::: warning Benchmark tables are pre-PGO
-The Sema rows in the tables above were measured **before** v1.19.2's profile-guided optimization. Re-measured this session on Apple Silicon, the PGO build runs the 1BRC workload in **8.23s vs 11.18s** for the pre-optimization build — **−26%** — with compute benchmarks **−13% to −39%** (tak −33%, higher-order-fold −39%, deriv −26%; see the [Performance Internals](./performance.md) table). The shipped v1.19.2 release binaries (cargo-dist / Homebrew) are materially faster than the numbers above. The published comparison tables are not yet re-run: the other dialects' numbers come from the same original measurement environment, so a fair comparison requires re-running the whole matrix together. (`cargo install` builds get fat LTO but not PGO.)
+::: info Which tables are PGO
+The **Native Apple Silicon tables** above are a fresh same-machine re-run (2026-06-20) with the v1.19.2 PGO release binary — the whole matrix was re-measured together, so the comparison is internally consistent. The **Docker/Linux table** at the top of the page is older (pre-PGO) and from a different environment; treat the two as separate. The PGO win itself measured 1BRC −26% (8.23s vs 11.18s) and compute benchmarks −13% to −39% — see the [Performance Internals](./performance.md) table. (`cargo install` builds get fat LTO but not PGO.)
 :::
 
 See the [Performance Internals](./performance.md) page for the optimization journey.
@@ -292,7 +293,7 @@ This is one workload. Different benchmarks would produce different orderings:
 
 The benchmark Dockerfile now builds Sema from the current repository checkout. Older saved Docker rows were produced before this change; regenerate the Docker table before publishing new Docker numbers.
 
-The native macOS rows were generated on macOS 15.6 / Apple M2 Max with Homebrew runtimes. The native runner rebuilds `sema-lang` in release mode before timing and records `sema --version` in the result metadata. All rows verified identical normalized output. PicoLisp is omitted from the native run.
+The native macOS rows were generated on macOS 15.6 / Apple M2 Max with Homebrew runtimes via `benchmarks/1brc/run-native-benchmarks.py` (best of 3, all dialects measured together). The 2026-06-20 re-run timed the **v1.19.2 PGO binary** (`make build-pgo`, run with `SEMA_SKIP_BUILD=1` so the runner times the prebuilt PGO binary instead of a plain release rebuild) and records `sema --version` in the result metadata. All rows verified identical normalized output. PicoLisp is omitted from the native run.
 
 ### Reproducing
 

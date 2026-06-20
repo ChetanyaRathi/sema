@@ -4,7 +4,7 @@
   "processor": "arm",
   "data_file": "/Users/helge/code/sema-lisp/benchmarks/data/bench-10m.txt",
   "rows": 10000000,
-  "sema_version": "sema 1.19.1",
+  "sema_version": "sema 1.19.2",
   "skipped": [
     "picolisp"
   ]

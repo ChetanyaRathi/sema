@@ -54,7 +54,10 @@ def run_checked(cmd: list[str], cwd: Path = BENCH, env: dict[str, str] | None = 
 
 
 def ensure_sema_current() -> str:
-    run_checked(["cargo", "build", "--release", "-p", "sema-lang"], cwd=ROOT)
+    # SEMA_SKIP_BUILD=1 benchmarks the existing target/release/sema as-is — used
+    # to measure a PGO build (`make build-pgo`), which a plain rebuild would clobber.
+    if not os.environ.get("SEMA_SKIP_BUILD"):
+        run_checked(["cargo", "build", "--release", "-p", "sema-lang"], cwd=ROOT)
 
     proc = subprocess.run([str(SEMA), "--version"], text=True, stdout=subprocess.PIPE, check=True)
     sema_version = proc.stdout.strip()
