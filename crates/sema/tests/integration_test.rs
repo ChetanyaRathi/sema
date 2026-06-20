@@ -11758,8 +11758,19 @@ fn test_match_guard_with_binding() {
 }
 
 #[test]
-fn test_match_no_match_returns_nil() {
-    assert_eq!(eval("(match 42 (1 \"one\") (2 \"two\"))"), Value::nil());
+fn test_match_no_match_raises() {
+    // Strict `match` raises when no clause matches (D3).
+    let err = eval_err("(match 42 (1 \"one\") (2 \"two\"))").to_string();
+    assert!(
+        err.contains("no clause matched"),
+        "expected match-failed error, got: {err}"
+    );
+}
+
+#[test]
+fn test_match_star_no_match_returns_nil() {
+    // The lenient `match*` returns nil on no-match.
+    assert_eq!(eval("(match* 42 (1 \"one\") (2 \"two\"))"), Value::nil());
 }
 
 #[test]
@@ -11949,8 +11960,10 @@ fn test_match_deeply_nested() {
 
 #[test]
 fn test_match_guard_all_fail() {
+    // All guards fail → no clause matches. `match*` is lenient (nil); strict
+    // `match` raises (covered by test_match_no_match_raises).
     assert_eq!(
-        eval("(match 5 (x when (> x 100) \"big\") (x when (< x 0) \"neg\"))"),
+        eval("(match* 5 (x when (> x 100) \"big\") (x when (< x 0) \"neg\"))"),
         Value::nil()
     );
 }

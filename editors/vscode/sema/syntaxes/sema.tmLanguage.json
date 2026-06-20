@@ -113,7 +113,7 @@
       ]
     },
     "special-form": {
-      "match": "(?<=[\\s(\\[{])(?:define|defun|lambda|fn|if|if-let|cond|case|when|when-let|unless|let\\*?|letrec|begin|do|and|or|set!|quote|quasiquote|unquote-splicing|unquote|define-record-type|defmacro|defmethod|defmulti|defagent|deftool|try|catch|throw|import|module|export|load|delay|force|eval|macroexpand|else|prompt|message|match)(?=[\\s)\\]}]|$)",
+      "match": "(?<=[\\s(\\[{])(?:define|defun|lambda|fn|if|if-let|cond|case|when|when-let|unless|let\\*?|letrec|begin|do|and|or|set!|quote|quasiquote|unquote-splicing|unquote|define-record-type|defmacro|defmethod|defmulti|defagent|deftool|try|catch|throw|import|module|export|load|delay|force|eval|macroexpand|else|prompt|message|match\\*|match)(?=[\\s)\\]}]|$)",
       "name": "keyword.control.sema"
     },
     "operator": {

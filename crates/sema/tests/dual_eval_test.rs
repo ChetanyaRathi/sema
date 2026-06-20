@@ -50,7 +50,8 @@ dual_eval_tests! {
     match_vector_rest: "(match '(1 2 3 4) ([a & rest] rest))" => Value::list(vec![Value::int(2), Value::int(3), Value::int(4)]),
     match_map_keys: "(match {:x 10 :y 20} ({:keys [x y]} (+ x y)))" => Value::int(30),
     match_guard: r#"(match 5 (x when (> x 10) "big") (x when (> x 0) "small") (_ "zero"))"# => Value::string("small"),
-    match_no_match_nil: r#"(match 42 (1 "one") (2 "two"))"# => Value::nil(),
+    // Strict `match` raises on no-match (see error tests); `match*` is the lenient nil form.
+    match_star_no_match_nil: r#"(match* 42 (1 "one") (2 "two"))"# => Value::nil(),
     match_nested: "(match '(1 (2 3)) ([a [b c]] (+ a b c)))" => Value::int(6),
     match_nil: r#"(match nil (nil "null") (_ "other"))"# => Value::string("null"),
     match_vector_mismatch: r#"(match '(1 2 3) ([a b] "two") (_ "other"))"# => Value::string("other"),
@@ -164,9 +165,10 @@ dual_eval_tests! {
           (_ nil))
     "# => Value::list(vec![Value::int(2), Value::int(3)]),
 
-    // All clauses fail, no wildcard — returns nil
-    match_all_clauses_fail: r#"
-        (match {:x [1]}
+    // All clauses fail, no wildcard — `match*` is lenient and returns nil.
+    // (Strict `match` raises here; covered in the error tests.)
+    match_star_all_clauses_fail: r#"
+        (match* {:x [1]}
           ({:x [1 2]} :bad)
           ({:x [a b]} :bad2))
     "# => Value::nil(),
@@ -260,6 +262,9 @@ dual_eval_error_tests! {
     assert_nil: "(assert nil)" => "assertion failed",
     assert_with_message: r#"(assert #f "custom error")"# => "custom error",
     assert_eq_mismatch: "(assert= 1 2)" => "assertion failed",
+    // Strict `match` raises when no clause matches (D3); `match*` stays lenient.
+    match_no_clause_raises: r#"(match 42 (1 "one") (2 "two"))"# => "no clause matched",
+    match_all_clauses_fail_raises: r#"(match {:x [1]} ({:x [1 2]} :bad) ({:x [a b c]} :bad2))"# => "no clause matched",
 }
 
 // ============================================================

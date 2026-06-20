@@ -165,7 +165,8 @@ fn lower_list(items: &[Value], tail: bool) -> Result<CoreExpr, SemaError> {
                 SpecialForm::Delay => lower_delay(args),
                 SpecialForm::Force => lower_force(args),
                 SpecialForm::DefineRecordType => lower_define_record_type(args),
-                SpecialForm::Match => lower_match(args, tail),
+                SpecialForm::Match => lower_match(args, tail, false),
+                SpecialForm::MatchStar => lower_match(args, tail, true),
                 SpecialForm::Defmulti => lower_defmulti(args),
                 SpecialForm::Defmethod => lower_defmethod(args),
                 SpecialForm::Async => lower_async(args),
@@ -226,6 +227,7 @@ enum SpecialForm {
     Force,
     DefineRecordType,
     Match,
+    MatchStar,
     Defmulti,
     Defmethod,
     Async,
@@ -274,6 +276,7 @@ const SPECIAL_FORM_NAMES: &[(&str, SpecialForm)] = &[
     ("force", SpecialForm::Force),
     ("define-record-type", SpecialForm::DefineRecordType),
     ("match", SpecialForm::Match),
+    ("match*", SpecialForm::MatchStar),
     ("defmulti", SpecialForm::Defmulti),
     ("defmethod", SpecialForm::Defmethod),
     ("async", SpecialForm::Async),
@@ -1285,13 +1288,17 @@ fn lower_case_clauses(clauses: &[Value], key_var: Spur, tail: bool) -> Result<Co
 
 /// Lower `(match expr [pattern body...] [pattern when guard body...] ...)`
 /// into nested if/let* chains calling `__vm-try-match`.
-fn lower_match(args: &[Value], tail: bool) -> Result<CoreExpr, SemaError> {
+/// `lenient` selects the no-match behavior: strict `match` (false) raises
+/// `:match-failed` when no clause matches, while `match*` (true) returns nil.
+fn lower_match(args: &[Value], tail: bool, lenient: bool) -> Result<CoreExpr, SemaError> {
+    let form = if lenient { "match*" } else { "match" };
     if args.len() < 2 {
-        return Err(SemaError::arity("match", "2+", args.len()));
+        return Err(SemaError::arity(form, "2+", args.len()));
     }
     let scrut = lower_expr(&args[0], false)?;
     let scrut_tmp = gensym("scrut");
     let try_match_spur = intern("__vm-try-match");
+    let match_failed_spur = intern("__vm-match-failed");
     let get_spur = intern("get");
     let nil_q_spur = intern("nil?");
     let when_spur = intern("when");
@@ -1300,10 +1307,12 @@ fn lower_match(args: &[Value], tail: bool) -> Result<CoreExpr, SemaError> {
         &args[1..],
         scrut_tmp,
         try_match_spur,
+        match_failed_spur,
         get_spur,
         nil_q_spur,
         when_spur,
         tail,
+        lenient,
     )?;
 
     Ok(CoreExpr::Let {
@@ -1312,17 +1321,29 @@ fn lower_match(args: &[Value], tail: bool) -> Result<CoreExpr, SemaError> {
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn lower_match_clauses(
     clauses: &[Value],
     scrut_var: Spur,
     try_match_spur: Spur,
+    match_failed_spur: Spur,
     get_spur: Spur,
     nil_q_spur: Spur,
     when_spur: Spur,
     tail: bool,
+    lenient: bool,
 ) -> Result<CoreExpr, SemaError> {
     if clauses.is_empty() {
-        return Ok(CoreExpr::Const(Value::nil()));
+        // No clause matched. `match*` is lenient (nil); `match` raises via the
+        // `__vm-match-failed` helper, which carries the unmatched value.
+        if lenient {
+            return Ok(CoreExpr::Const(Value::nil()));
+        }
+        return Ok(CoreExpr::Call {
+            func: Box::new(CoreExpr::Var(match_failed_spur)),
+            args: vec![CoreExpr::Var(scrut_var)],
+            tail: false,
+        });
     }
 
     let clause = if let Some(l) = clauses[0].as_list() {
@@ -1413,10 +1434,12 @@ fn lower_match_clauses(
             &clauses[1..],
             scrut_var,
             try_match_spur,
+            match_failed_spur,
             get_spur,
             nil_q_spur,
             when_spur,
             tail,
+            lenient,
         )?;
         // Need var bindings available for guard eval too
         let guard_body = CoreExpr::If {
@@ -1441,10 +1464,12 @@ fn lower_match_clauses(
         &clauses[1..],
         scrut_var,
         try_match_spur,
+        match_failed_spur,
         get_spur,
         nil_q_spur,
         when_spur,
         tail,
+        lenient,
     )?;
 
     // Build: (let ((map_tmp (try-match ...))) (if (nil? map_tmp) else then))

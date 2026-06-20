@@ -956,6 +956,21 @@ pub fn register_vm_delegates(env: &Rc<Env>) {
         })),
     );
 
+    // __vm-match-failed: the strict `(match ...)` no-clause-matched path. Always
+    // raises an :eval error carrying the unmatched value. `match*` never calls
+    // this (it returns nil instead).
+    env.set(
+        intern("__vm-match-failed"),
+        Value::native_fn(NativeFn::simple("__vm-match-failed", |args| {
+            let val = args.first().cloned().unwrap_or_else(Value::nil);
+            Err(
+                SemaError::eval(format!("match: no clause matched value: {val}")).with_hint(
+                    "add a catch-all `(_ ...)` clause, or use `match*` to return nil on no match",
+                ),
+            )
+        })),
+    );
+
     // __vm-make-multi: create a MultiMethod value
     env.set(
         intern("__vm-make-multi"),

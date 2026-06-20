@@ -310,13 +310,31 @@ Nested patterns are supported:
 
 ### `match`
 
-Match a value against patterns with optional guards. Returns `nil` if no clause matches.
+Match a value against patterns with optional guards.
 
 ```sema
 (match value
   (pattern body ...)
   (pattern when guard body ...)
   ...)
+```
+
+If no clause matches, `match` **raises an error** (`match: no clause matched value: …`) — a non-exhaustive match is almost always a bug, so it fails loudly rather than returning `nil` silently. Add a catch-all `(_ ...)` clause to handle the rest:
+
+```sema
+(match status
+  (:ok "success")
+  (_   "other"))          ; catch-all; without it, an unmatched status raises
+```
+
+#### `match*` — lenient variant
+
+When "no match" is a normal outcome (e.g. a lookup), use `match*`, which returns `nil` instead of raising:
+
+```sema
+(match* 42
+  (1 "one")
+  (2 "two"))              ; => nil  (no clause matched)
 ```
 
 #### Literal Matching
