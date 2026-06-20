@@ -1,4 +1,4 @@
-.PHONY: all build release build-pgo pgo-profile install uninstall test test-lsp test-embedding-bench test-http test-llm check clippy fmt fmt-check clean run lint lint-links docs docs-check update-pricing examples smoke-bytecode test-providers fuzz fuzz-reader fuzz-eval setup bench-1m bench-10m bench-100m site-dev site-build site-preview site-deploy deploy coverage coverage-html bench bench-vm bench-save bench-suite bench-closure bench-numeric bench-compare bench-baseline profile profile-vm ts-setup ts-generate ts-test ts-playground js-lib-build js-lib-dev
+.PHONY: all build release build-pgo pgo-profile install install-pgo uninstall test test-lsp test-embedding-bench test-http test-llm check clippy fmt fmt-check clean run lint lint-links docs docs-check update-pricing examples smoke-bytecode test-providers fuzz fuzz-reader fuzz-eval setup bench-1m bench-10m bench-100m site-dev site-build site-preview site-deploy deploy coverage coverage-html bench bench-vm bench-save bench-suite bench-closure bench-numeric bench-compare bench-baseline profile profile-vm ts-setup ts-generate ts-test ts-playground js-lib-build js-lib-dev
 build:
 	cargo build
 
@@ -16,6 +16,13 @@ pgo-profile:
 
 install:
 	cargo install --path crates/sema
+
+# Like `install`, but PGO-optimized: runs the full instrument->train->rebuild
+# pipeline and drops the resulting binary into the cargo bin dir (replacing any
+# `sema` already there). Slower to build than `install`, faster at runtime.
+install-pgo: build-pgo
+	@install -m 0755 target/release/sema "$${CARGO_HOME:-$$HOME/.cargo}/bin/sema"
+	@echo "Installed PGO-optimized sema -> $${CARGO_HOME:-$$HOME/.cargo}/bin/sema"
 
 uninstall:
 	cargo uninstall sema-lang

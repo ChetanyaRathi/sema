@@ -11,7 +11,8 @@ make test                                                # all tests (http tests
 make test-http                                           # run HTTP integration tests (requires network)
 make lint                                                # fmt-check + clippy -D warnings
 make fmt                                                 # cargo fmt
-make install                                             # install to ~/.cargo/bin
+make install                                             # install to ~/.cargo/bin (LTO, no PGO)
+make install-pgo                                          # PGO build + install to ~/.cargo/bin (slower build, faster runtime)
 make all                                                 # lint + test + build
 make run                                                 # start REPL
 make example-notebook                                    # run demo notebook headlessly
