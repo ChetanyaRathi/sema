@@ -75,6 +75,21 @@ Three different error policies (raise / NaN sentinel / silent promotion) for sim
 
 ---
 
+## LSP / DAP follow-ups
+
+Captured from `docs/plans/archive/2026-06-09-lsp-followups-and-docs-research.md` before archiving it (the bulk — the docs-resolving audit — shipped via the `sema-docs` crate; these three never landed):
+
+### L1 — Hover precedence ignores user redefinitions
+`crates/sema-lsp/src/handlers/hover.rs` checks `builtin_docs` before the user-def branch, so redefining a builtin name (e.g. `(define (map ...) ...)`) still shows the *builtin's* doc on hover. Reorder so a user definition wins.
+
+### L2 — No range / on-type formatting
+No `handle_range_formatting`; `document_range_formatting_provider` capability is unset. `sema-fmt` exists, so wiring range formatting is mechanical.
+
+### L3 — DAP conditional / exception breakpoints
+`supportsConditionalBreakpoints` / `supportsExceptionInfo` are still `false` in `crates/sema-dap`. (`setVariable`, `evaluate`/hover-eval already shipped.)
+
+---
+
 ## Notes on what's NOT here
 
 - **Items that shipped:** see commits `09f6c21` (Wave 1) through `83cbd58` (Wave 6a) — git log + the per-wave commit messages have the full list.
