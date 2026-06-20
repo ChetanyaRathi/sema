@@ -3020,6 +3020,7 @@ version = "1.19.2"
 dependencies = [
  "crc32fast",
  "sema-core",
+ "sema-docs",
  "sema-eval",
  "sema-fmt",
  "sema-notebook",
