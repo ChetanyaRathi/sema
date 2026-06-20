@@ -1,5 +1,12 @@
 # Living Code Phase 4: Runtime Self-Modification (Layer 6) Implementation Plan
 
+> ⚠️ **RETIRED (2026-06-20) — will not be implemented.** This plan (Layer 6:
+> `observe!`/`become!`/`history`/`rollback!`/`freeze!`) is part of the killed
+> Living Code LLM layers. The runtime self-modification it describes is
+> non-deterministic and unmaintainable; see `docs/deferred.md` ("LC") for the
+> rationale. The deterministic foundation (docstrings + doctests) is being
+> salvaged under a separate plan. PR #30 closed 2026-06-20.
+
 > **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 
 **Goal:** Implement `observe!`, `become!`, `history`, `rollback!`, and `freeze!` — the runtime self-modification primitives from Layer 6 of the Living Code design.

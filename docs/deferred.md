@@ -124,6 +124,18 @@ when a real long-running workload shows growth (a `Rc::strong_count` leak test w
 
 ---
 
+## LC — Living Code LLM layers (`ask` / `heal!` / `evolve` / `observe!` / `become!`) — killed for good
+
+**What it was:** layers 3–6 of the Living Code design (`docs/design/living-code.md`) — LLM-driven introspection (`ask`, `ask/code`, `ask/patch!`), auto-repair (`heal!`), genetic programming (`evolve`), and runtime self-modification (`observe!`, `become!`, `history`, `rollback!`, `freeze!`). Shipped on the tree-walker (PR #30, commits `248ebd8`/`fb0d7e6`/`69f1514`), then silently dropped when the tree-walker was retired in 1.18.0 — never ported to the VM, unbound at runtime, undiscovered for two releases.
+
+**Why killed (not deferred):** (1) non-deterministic by construction — `evolve`/`heal!` emit a fresh LLM sample each run, so there is no regression test you can write, which is *exactly* how it rotted unnoticed; (2) `become!` (LLM rewrites a running function in place) carries a safety surface — doctest gates, sandboxes, rate limits, audit logs, freeze switches, rollback history — larger than the feature itself, a permanent tax on every VM/env change; (3) zero demand — no issue, no playground example, no website doc referenced it, and nobody noticed its disappearance.
+
+**Salvage:** the *deterministic* foundation (layers 0–1: docstrings `doc`/`meta` + `doctest`) is worth reviving on its own merits and is tracked separately — not under the "living code" brand. The `Function` struct already carries serialized compile-time metadata (`source_file`, `local_scopes`), so a `doc` field fits the existing pattern; doctests are a deterministic, well-precedented (Python/Elixir/Rust) feature. Layer 2 (`read-source`/`source-of`/`;;@directives`) was mostly scaffolding for these dead LLM layers and is *not* part of the salvage — it needs reader surgery and source-text storage the VM doesn't have, for speculative demand.
+
+**Artifacts retired 2026-06-20:** PR #30 closed; `docs/plans/2026-02-24-living-code-phase4.md` archived; `docs/design/living-code.md` banner-marked RETIRED.
+
+---
+
 ## A note on the truly long-term language design items
 
 These are not deferred — they're design questions that need a deliberate decision before any code lands. They're tracked in `docs/wip.md` (the "Wave 6c" cluster), not here.
