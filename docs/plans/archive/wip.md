@@ -1,5 +1,12 @@
 # Work in progress — open threads from the May 2026 quality sweep
 
+> ✅ **ARCHIVED (2026-06-20) — board cleared.** Every open thread from the quality
+> sweep has now shipped or been parked. The last two — **D3** (`match` raises on
+> no-match; `match*` lenient) and **N9** (numeric domain policy) — both landed in
+> the 1.20.0 release (D3 in code, N9 documented as ADR #64). Perf papercuts
+> P2 shipped; P6/P7 are in `docs/deferred.md`. Nothing open remains. This file is
+> kept for historical context; start a fresh `docs/wip.md` when new threads arise.
+
 Status board for follow-up work that has been planned, partially explored, or that needs a design call before code can land. Each entry has enough context that you (or a future you / agent) can pick it up months from now without re-reading the audit.
 
 For items that have been *parked* with a clear "we're not doing this", see `docs/deferred.md`. For items that are deemed shipped, see commits `09f6c21`, `01f250c`, `a5b37df`, `c2b551b`, `6c4086f`, `83cbd58`.

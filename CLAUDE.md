@@ -152,7 +152,7 @@ that there's no second backend to differentially compare against.
 ## Design Docs
 
 - `docs/adr.md` — numbered design decisions with rationale
-- `docs/wip.md` — open threads / work-in-progress with full context
+- `docs/wip.md` — open threads / work-in-progress (currently archived to `docs/plans/archive/wip.md`; the board is empty — recreate when new threads arise)
 - `docs/limitations.md` — known gaps and limitations
 - `docs/deferred.md` — items parked with rationale (won't-fix or revisit-later)
 - `docs/plans/` — individual implementation plans, named `YYYY-MM-DD-<slug>.md`

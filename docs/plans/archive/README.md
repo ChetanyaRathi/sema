@@ -28,3 +28,4 @@ Active (still-pending) plans live one level up in `docs/plans/`.
 | `2026-06-07-performance-optimizations/` | Archived 2026-06-20 — alloc-reduction/unboxing/escape-analysis spike, never started; the shipped perf pass (PGO/LTO/string-opcodes, 1.19.2) was separate. 25-file OxCaml reference mirror deleted on archival; 3 original Sema docs kept. |
 | `documentation-strategy-research.md` | Archived 2026-06-20 — LSP docs-delivery research; superseded by the `sema-docs` crate (structured source of truth). |
 | `iteration-dsl.md` | Archived 2026-06-20 — CL-style `loop` DSL design; not adopted, simpler `dotimes`/`for-range` shipped instead. |
+| `wip.md` | Archived 2026-06-20 — the May 2026 quality-sweep WIP board, fully cleared: last items D3 (`match`/`match*`) + N9 (numeric policy) shipped in 1.20.0; P6/P7 in `docs/deferred.md`. Recreate `docs/wip.md` when new threads arise. |
