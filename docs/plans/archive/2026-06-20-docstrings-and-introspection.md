@@ -1,7 +1,17 @@
 # Docstrings & Introspection
 
+> 🅿️ **PARKED (2026-06-20) — cut for maintainability, not implemented.** A
+> feasibility pass confirmed this is *clean* to build (docstring rides the VM
+> `Function` metadata + `.semac` string table exactly like `name`/`local_scopes`;
+> no source-text drag; binary path inherits it free via the shared deserialize).
+> But with doctests and the LLM layers already gone, `doc`/`meta` alone wasn't
+> worth the standing maintenance (a `.semac` format-version bump + ~10 `Function`
+> construction sites + serialize round-trip to carry forever). Parked as a clean,
+> well-scoped plan to revisit if a concrete need appears. The feasibility notes
+> below are preserved so a future pass starts warm.
+
 **Date:** 2026-06-20
-**Status:** Proposed — deterministic salvage from the retired Living Code design (`docs/design/living-code.md` layer 0). The LLM layers (3–6) are killed (`docs/deferred.md` "LC"); doctests (layer 1) and `read-source` (layer 2) are **out of scope** (see below).
+**Status:** Parked — cut for maintainability 2026-06-20 (revisit later). Deterministic salvage from the retired Living Code design (`docs/design/living-code.md` layer 0). Doctests (layer 1) and `read-source` (layer 2) were already out of scope.
 
 **Goal:** Runtime docstrings on user functions, queryable via `doc` / `meta`. A small language feature that just adds polish — no LLM, no test runner, no self-modification.
 

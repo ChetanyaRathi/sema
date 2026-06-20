@@ -4,8 +4,9 @@
 > `observe!`/`become!`/`history`/`rollback!`/`freeze!`) is part of the killed
 > Living Code LLM layers. The runtime self-modification it describes is
 > non-deterministic and unmaintainable; see `docs/deferred.md` ("LC") for the
-> rationale. Only the docstrings foundation (`doc`/`meta`) is being salvaged
-> under a separate plan; doctests were dropped as YAGNI. PR #30 closed 2026-06-20.
+> rationale. The docstrings foundation (`doc`/`meta`) was considered as a salvage
+> but also parked for maintainability (doctests dropped as YAGNI); nothing from
+> Living Code is implemented. PR #30 closed 2026-06-20.
 
 > **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 
