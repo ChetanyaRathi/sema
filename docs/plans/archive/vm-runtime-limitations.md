@@ -1,5 +1,18 @@
 # VM Runtime Limitations — Tree-Walker Coupling
 
+> ⚠️ **SUPERSEDED (2026-06-20) — premise no longer holds.** This investigation
+> assumed the VM was coupled to a tree-walking interpreter. The tree-walker was
+> **retired in 1.18.0** (~2,180 lines of `eval_value`/`eval_step`/trampoline/
+> `apply_lambda` + special-form handlers deleted); the bytecode VM is now the
+> sole evaluator across every entry point. Every specific claim below is stale:
+> stdlib HOF callbacks now route into the running VM (`CURRENT_VM`/
+> `run_nested_closure`, audit finding C1 fixed); `load` **and** `import` are
+> VM-native; LLM tool handlers run on the VM. The "~1MB saved by removing the
+> tree-walker" is already realized. **Residual (not a tree-walker issue):** a
+> truly slim runtime binary would require gating heavy *optional deps*
+> (`pdf-extract`, the LLM stack) behind cargo features — tracked as a possible
+> future optimization, not a limitation. Kept only as historical context.
+
 **Date:** 2026-02-20
 **Context:** Investigated for `sema build` standalone executables (issue #9)
 
