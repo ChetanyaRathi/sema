@@ -14,7 +14,7 @@ harnesses, and proposes a smaller, better-grounded path to a first useful spike.
 > **TL;DR.** The central thesis of #41/#42 is correct and worth keeping: a
 > *deterministic Sema orchestrator* that spawns *LLM-backed leaf workers*. But the
 > draft over-commits to infrastructure (a `sema-workflowd` daemon, SSH remote
-> workers, a dashboard, Living Code evolution) before the two genuinely hard,
+> workers, a dashboard) before the two genuinely hard,
 > genuinely novel pieces have been de-risked: **(a) a parallel scheduling
 > primitive on a single-threaded `Rc` runtime, and (b) durable, replayable
 > runs.** This doc recommends shrinking the first deliverable to a *library-level*
@@ -175,8 +175,10 @@ span per LLM call, an `execute_tool` span per tool, nested under an
 - A separate long-lived **daemon** (`sema-workflowd`) before there's a runtime to
   supervise: this is #42's biggest over-commit (see §6).
 - SSH remote workers, HTTP worker daemons: endgame, not MVP.
-- Genetic `evolve-workflow` / Living Code: the dependency (Living Code, PR #30)
-  is **closed, not merged** — there is nothing to build on. Hard-defer.
+- Genetic `evolve-workflow` / Living Code: **scrapped** (owner decision,
+  2026-06-21). Living Code (PR #30) is closed and **will not be reopened** — this
+  whole branch of the design (`become!`/`rollback!`/`evolve-workflow`, the
+  self-mutating-strategy endgame) is cut, not deferred. Do not build on it.
 
 ---
 
@@ -375,10 +377,12 @@ Design decisions baked into the surface:
   string; the whole "filter verified findings onward" model needs typed results.
   This is a dependency, not a sub-task.
 - **R5 — Scope creep / over-infrastructure.** PR #42 already lists daemon +
-  dashboard + SQLite + SSH + Living Code. Building any of those before the core
-  is validated burns the budget on the wrong thing.
-- **R6 — Living Code dependency is dead** (PR #30 closed). Phase 6 has no
-  foundation. Hard-defer.
+  dashboard + SQLite + SSH. Building any of those before the core is validated
+  burns the budget on the wrong thing.
+- **R6 — Living Code is scrapped, not a risk.** PR #30 is closed and will not be
+  reopened (owner decision, 2026-06-21), so the genetic `evolve-workflow` /
+  self-mutating-strategy endgame is **cut from this plan entirely** — it is no
+  longer a dependency to manage.
 - **R7 — Priority.** Real LLM-loop bugs and the missing CI mock outrank this.
   Dynamic workflows should land *after* (and on top of) the cassette/mock work.
 
@@ -436,8 +440,11 @@ any already-journaled agent (verified via the cassette/usage counters).
 - OTel span emission (shared with `sema-llm` chokepoint).
 - HITL approval gates (over the async yield mechanism).
 - Remote SSH workers.
-- Living Code / `evolve-workflow` — **only after PR #30 (Living Code) actually
-  merges.**
+
+### Scrapped (cut, not deferred)
+- Living Code / `evolve-workflow` / `become!` / `rollback!` — PR #30 is closed and
+  **will not be reopened** (owner decision, 2026-06-21). This endgame is removed
+  from the design.
 
 ---
 
@@ -472,9 +479,10 @@ any already-journaled agent (verified via the cassette/usage counters).
   PR #42 under-specifies the step result/error model.
 - **Drop pre-declared `:phases [...]`** from metadata; discover phases from code.
 
-**Discard (or hard-defer):**
-- **Living Code / `evolve-workflow` (PR #42 Phase 6).** Dependency (PR #30) is
-  closed/unmerged — nothing to build on. Remove from the plan until it merges.
+**Discard:**
+- **Living Code / `evolve-workflow` (PR #42 Phase 6) — SCRAPPED.** PR #30 is
+  closed and will not be reopened (owner decision, 2026-06-21). Cut this branch of
+  the design entirely; it is not a "later" item.
 - **SSH/remote workers and HTTP daemons as anything but a far-future stage.**
 - **Dashboard/SQLite as early milestones** — they are read-only projections and
   must follow a *frozen* journal, not precede it.
