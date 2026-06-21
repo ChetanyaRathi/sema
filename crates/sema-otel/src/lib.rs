@@ -39,6 +39,9 @@ mod imp;
 #[cfg(not(target_arch = "wasm32"))]
 pub use imp::*;
 
+#[cfg(all(not(target_arch = "wasm32"), feature = "testing"))]
+pub mod testing;
+
 #[cfg(target_arch = "wasm32")]
 mod noop;
 #[cfg(target_arch = "wasm32")]

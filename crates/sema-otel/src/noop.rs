@@ -62,6 +62,17 @@ impl AgentSpan {
     pub fn set_conversation_id(&self, _id: &str) {}
 }
 
+pub struct RetrySpan;
+
+pub fn retry_span(_attempt: u32) -> RetrySpan {
+    RetrySpan
+}
+
+impl RetrySpan {
+    pub fn record_error(&self, _kind: &str, _msg: &str) {}
+    pub fn set_wait_ms(&self, _ms: u64) {}
+}
+
 pub struct VmSpan;
 
 pub fn vm_span(_name: &str) -> VmSpan {

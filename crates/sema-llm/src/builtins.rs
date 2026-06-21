@@ -4159,13 +4159,51 @@ fn is_cache_valid(cached: &CachedResponse) -> bool {
 }
 
 /// Send a ChatRequest via the default provider with caching, fallback, and rate-limit retry.
+/// Build the OTel `ResponseFacts` snapshot from a served response. Cost is priced as
+/// served by `provider` (matches `track_usage`).
+fn response_facts(provider: &str, resp: &ChatResponse) -> sema_otel::ResponseFacts {
+    sema_otel::ResponseFacts {
+        input_tokens: resp.usage.prompt_tokens,
+        output_tokens: resp.usage.completion_tokens,
+        cache_read_input_tokens: resp.usage.cache_read_input_tokens,
+        cache_creation_input_tokens: resp.usage.cache_creation_input_tokens,
+        response_model: resp.model.clone(),
+        finish_reason: resp.stop_reason.clone(),
+        cost_usd: pricing::calculate_cost_for(provider, &resp.usage),
+        cache_hit: resp.stop_reason.as_deref() == Some("cache_hit"),
+    }
+}
+
+/// Classify an `LlmError` for the `error.type` span attribute.
+fn llm_error_kind(e: &crate::types::LlmError) -> &'static str {
+    use crate::types::LlmError::*;
+    match e {
+        RateLimited { .. } => "rate_limited",
+        Api { status, .. } if *status >= 500 => "server_error",
+        Api { .. } => "api_error",
+        Http(_) => "network_error",
+        Parse(_) => "parse_error",
+        Config(_) => "config_error",
+    }
+}
+
 fn do_complete(request: ChatRequest) -> Result<ChatResponse, SemaError> {
+    // One CLIENT span per completion. Started here (before cache lookup) so a cache
+    // hit still gets a span; request attrs are known up front, provider/model/usage
+    // are filled in deeper where they're resolved.
+    let span = sema_otel::llm_span("chat");
+    span.set_request(
+        request.temperature,
+        request.max_tokens,
+        &request.stop_sequences,
+        request.reasoning_effort.as_deref(),
+    );
     // Reset the serving-provider stamp so a cache hit (which serves no provider) doesn't
     // inherit a stale name from a prior completion.
     LAST_SERVING_PROVIDER.with(|p| *p.borrow_mut() = None);
     let cache_enabled = CACHE_ENABLED.with(|c| c.get());
     if !cache_enabled {
-        return do_complete_inner(request);
+        return do_complete_inner(request, &span);
     }
     // Compute the cache key from the model the request will *logically* use, but
     // without mutating the request that flows into the fallback loop. Pre-filling
@@ -4189,7 +4227,7 @@ fn do_complete(request: ChatRequest) -> Result<ChatResponse, SemaError> {
             // (the provider never saw this request). The cached token counts live
             // in the on-disk/in-memory entry if ever needed; the live accounting
             // must reflect actual spend.
-            return Ok(ChatResponse {
+            let resp = ChatResponse {
                 content: cached.content,
                 role: "assistant".to_string(),
                 model: cached.model,
@@ -4201,11 +4239,16 @@ fn do_complete(request: ChatRequest) -> Result<ChatResponse, SemaError> {
                     ..Default::default()
                 },
                 stop_reason: Some("cache_hit".to_string()),
-            });
+            };
+            // Cache-hit span: no provider served it; tag gen_ai.cache.hit=true with
+            // zero usage (matches the zero-usage accounting invariant).
+            span.set_dispatch("", &resp.model);
+            span.set_response(&response_facts("", &resp));
+            return Ok(resp);
         }
     }
     CACHE_MISSES.with(|c| c.set(c.get() + 1));
-    let response = do_complete_inner(request)?;
+    let response = do_complete_inner(request, &span)?;
     store_cached(&cache_key, &response);
     Ok(response)
 }
@@ -4233,13 +4276,16 @@ fn primary_model_for_cache() -> Result<String, SemaError> {
     with_provider(|p| Ok(p.default_model().to_string()))
 }
 
-fn do_complete_inner(request: ChatRequest) -> Result<ChatResponse, SemaError> {
+fn do_complete_inner(
+    request: ChatRequest,
+    span: &sema_otel::LlmSpan,
+) -> Result<ChatResponse, SemaError> {
     let fallback_chain = FALLBACK_CHAIN.with(|c| c.borrow().clone());
     match fallback_chain {
         Some(chain) if !chain.is_empty() => {
             let mut last_error = None;
             for entry in &chain {
-                match do_complete_with_provider(entry, request.clone()) {
+                match do_complete_with_provider(entry, request.clone(), span) {
                     Ok(resp) => return Ok(resp),
                     Err(e) => {
                         eprintln!(
@@ -4250,9 +4296,17 @@ fn do_complete_inner(request: ChatRequest) -> Result<ChatResponse, SemaError> {
                     }
                 }
             }
-            Err(last_error.unwrap_or_else(|| SemaError::Llm("all providers failed".into())))
+            let err = last_error.unwrap_or_else(|| SemaError::Llm("all providers failed".into()));
+            span.record_error("provider_error", &err.to_string());
+            Err(err)
         }
-        _ => do_complete_uncached(request),
+        _ => {
+            let r = do_complete_uncached(request, span);
+            if let Err(e) = &r {
+                span.record_error("provider_error", &e.to_string());
+            }
+            r
+        }
     }
 }
 
@@ -4325,6 +4379,12 @@ fn complete_with_retry(
             Err(e) => match retryable_wait(&e) {
                 Some(hint) if attempt < max_retries => {
                     let wait = retry_backoff_ms(attempt, hint);
+                    // Surface each retry as a child span under the LLM span (the
+                    // attempt that triggered the retry + the backoff applied).
+                    let rspan = sema_otel::retry_span(attempt + 1);
+                    rspan.record_error(llm_error_kind(&e), &e.to_string());
+                    rspan.set_wait_ms(wait);
+                    drop(rspan);
                     if wait > 0 {
                         std::thread::sleep(std::time::Duration::from_millis(wait));
                     }
@@ -4339,6 +4399,7 @@ fn complete_with_retry(
 fn do_complete_with_provider(
     entry: &FallbackEntry,
     mut request: ChatRequest,
+    span: &sema_otel::LlmSpan,
 ) -> Result<ChatResponse, SemaError> {
     PROVIDER_REGISTRY.with(|reg| {
         let reg = reg.borrow();
@@ -4358,12 +4419,19 @@ fn do_complete_with_provider(
         let resp = complete_with_retry(provider, &request, max_retries)
             .map_err(|e| SemaError::Llm(e.to_string()))?;
         set_serving_provider(&entry.provider);
+        // Provider + model + response are all in scope here, before track_usage
+        // consumes the serving-provider stamp.
+        span.set_dispatch(&entry.provider, &request.model);
+        span.set_response(&response_facts(&entry.provider, &resp));
         Ok(resp)
     })
 }
 
 /// Original do_complete logic (provider dispatch + rate-limit retry).
-fn do_complete_uncached(mut request: ChatRequest) -> Result<ChatResponse, SemaError> {
+fn do_complete_uncached(
+    mut request: ChatRequest,
+    span: &sema_otel::LlmSpan,
+) -> Result<ChatResponse, SemaError> {
     enforce_rate_limit();
     let max_retries = NETWORK_MAX_RETRIES.with(|c| c.get());
     with_provider(|p| {
@@ -4373,6 +4441,9 @@ fn do_complete_uncached(mut request: ChatRequest) -> Result<ChatResponse, SemaEr
         let resp = complete_with_retry(p, &request, max_retries)
             .map_err(|e| SemaError::Llm(e.to_string()))?;
         set_serving_provider(p.name());
+        // Capture provider/model/response before track_usage consumes the stamp.
+        span.set_dispatch(p.name(), &request.model);
+        span.set_response(&response_facts(p.name(), &resp));
         Ok(resp)
     })
 }

@@ -284,12 +284,16 @@ impl LlmSpan {
     /// renames the span to the spec form `{op} {model}`.
     pub fn set_dispatch(&self, sema_provider: &str, request_model: &str) {
         if let Some(c) = &self.inner {
-            c.set_str(
-                "gen_ai.provider.name",
-                gen_ai_provider_name(sema_provider).to_string(),
-            );
-            c.set_str("gen_ai.request.model", request_model.to_string());
+            // A cache hit has no serving provider — skip the attribute rather than
+            // emit an empty/mis-mapped value.
+            if !sema_provider.is_empty() {
+                c.set_str(
+                    "gen_ai.provider.name",
+                    gen_ai_provider_name(sema_provider).to_string(),
+                );
+            }
             if !request_model.is_empty() {
+                c.set_str("gen_ai.request.model", request_model.to_string());
                 c.update_name(format!("{} {}", self.op, request_model));
             }
         }
@@ -415,6 +419,38 @@ impl AgentSpan {
     pub fn set_conversation_id(&self, id: &str) {
         if let Some(c) = &self.inner {
             c.set_str("gen_ai.conversation.id", id.to_string());
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Retry sub-span (per HTTP retry attempt, nested under the LLM span — Decision #10)
+// ---------------------------------------------------------------------------
+
+pub struct RetrySpan {
+    inner: Option<SpanCore>,
+}
+
+/// Start an INTERNAL child span for an HTTP retry attempt (`attempt` is 1-based:
+/// the first retry is attempt 1). Nests under the current LLM span via the TL stack.
+pub fn retry_span(attempt: u32) -> RetrySpan {
+    let inner = start(
+        "llm.retry_attempt".to_string(),
+        SpanKind::Internal,
+        vec![KeyValue::new("sema.retry.attempt", attempt as i64)],
+    );
+    RetrySpan { inner }
+}
+
+impl RetrySpan {
+    pub fn record_error(&self, kind: &str, msg: &str) {
+        if let Some(c) = &self.inner {
+            c.record_error(kind, msg);
+        }
+    }
+    pub fn set_wait_ms(&self, ms: u64) {
+        if let Some(c) = &self.inner {
+            c.set_i64("sema.retry.wait_ms", ms as i64);
         }
     }
 }

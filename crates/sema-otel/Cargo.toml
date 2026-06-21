@@ -7,6 +7,11 @@ repository.workspace = true
 homepage.workspace = true
 description = "OpenTelemetry GenAI tracing facade for the Sema runtime"
 
+[features]
+# In-process span capture for deterministic tests (pulls the SDK's in-memory
+# exporter). Enabled by downstream crates as a dev-dependency feature.
+testing = ["opentelemetry_sdk/testing"]
+
 [dependencies]
 sema-core = { workspace = true }
 serde_json = { workspace = true }

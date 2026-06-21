@@ -58,6 +58,7 @@ libc = "0.2"
 [dev-dependencies]
 paste = "1"
 pio = "0.3"
+sema-otel = { workspace = true, features = ["testing"] }
 reqwest.workspace = true
 portable-pty = "0.9"
 serde_json.workspace = true
