@@ -337,7 +337,7 @@ The [`examples/`](https://github.com/helgesverre/sema/tree/main/examples) direct
 - **LLMs as language primitives** — prompts, messages, conversations, tools, and agents are first-class data types, not string templates bolted on
 - **Multi-provider** — swap between Anthropic, OpenAI, Gemini, Ollama, any OpenAI-compatible endpoint, or define your own provider in Sema
 - **Pipeline-ready** — response caching, fallback chains, rate limiting, retry with backoff, text chunking, prompt templates, vector store, and a persistent KV store
-- **Cost-aware** — built-in budget tracking with dynamic pricing from [llm-prices.com](https://www.llm-prices.com)
+- **Cost-aware** — built-in budget tracking with a bundled pricing snapshot ([models.dev](https://models.dev)), updated per release
 - **Practical Lisp** — closures, TCO, macros, modules, error handling, HTTP, file I/O, regex, JSON, and a comprehensive stdlib
 - **Standalone executables** — `sema build` compiles programs into self-contained binaries with auto-traced imports and bundled assets
 - **Embeddable** — [available on crates.io](https://crates.io/crates/sema-lang), clean Rust crate structure with a builder API

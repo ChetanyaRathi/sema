@@ -247,7 +247,7 @@ messages = [{<span class="c-str">"role"</span>: <span class="c-str">"user"</span
             <div><span class="dollar">$</span> claude "add urgency classification to the ticket pipeline"</div>
             <div><span class="dot">●</span> Read pipeline.sema, llms.txt</div>
             <div><span class="dot">●</span> Edit pipeline.sema</div>
-            <div class="out">&nbsp;&nbsp;(llm/classify {:labels [:low :medium :urgent]} (:body ticket))</div>
+            <div class="out">&nbsp;&nbsp;(llm/classify [:low :medium :urgent] (:body ticket))</div>
             <div><span class="dot">●</span> Run sema check pipeline.sema</div>
             <div class="err">&nbsp;&nbsp;✗ unbound symbol: string=?</div>
             <div><span class="dot">●</span> llms.txt → "use equal? for all equality" — fixed, re-ran</div>
@@ -374,7 +374,7 @@ messages = [{<span class="c-str">"role"</span>: <span class="c-str">"user"</span
           <li><strong>Single-threaded.</strong> Rc-based values, no cross-thread sharing. Parallelism is at the LLM-call
             level, not the compute level.
           </li>
-          <li><strong>No JIT.</strong> A bytecode VM and a tree-walker. If your bottleneck is number crunching, use Rust
+          <li><strong>No JIT.</strong> A bytecode compiler and a stack-based VM. If your bottleneck is number crunching, use Rust
             — or embed Sema in it.
           </li>
           <li><strong>Not a full Scheme.</strong> No numeric tower, no call/cc, auto-gensym instead of syntax-rules.
