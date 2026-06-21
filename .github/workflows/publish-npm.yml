@@ -6,7 +6,12 @@ on:
       - 'v*'
 
 jobs:
+  # Gate: tests/lint/examples must pass before publishing to npm.
+  verify:
+    uses: ./.github/workflows/verify.yml
+
   publish-npm:
+    needs: verify
     runs-on: ubuntu-latest
     permissions:
       contents: read

@@ -7,16 +7,24 @@ infer the bump from the unreleased changes and confirm before tagging.
 This mirrors **Release Procedure** in `CLAUDE.md`. Do the steps in order and stop
 on the first failure — never tag or push a red build.
 
-## Step 1 — Pre-flight (must be green)
+## Step 1 — Pre-flight (run the FULL CI-equivalent suite; must be green)
+
+Plain `cargo test` is NOT enough — CI also runs the example + bytecode smoke
+tests, and a gap there once shipped a regression past four releases. Run what CI
+runs:
 
 ```bash
-cargo test 2>&1 | grep -E 'test result: FAILED|FAILED|error\[|panicked'   # expect no output
-make lint                                                                  # fmt-check + clippy -D warnings
-git status --short                                                         # know what's uncommitted
+cargo test --workspace      # unit + integration tests
+make examples               # smoke-test every .sema example (catches eval regressions)
+make smoke-bytecode         # bytecode round-trip smoke test
+make lint                   # fmt-check + clippy -D warnings
+make docs-check             # builtin doc index fresh
+git status --short          # the release commit should only bump version + Cargo.lock
 ```
 
-If tests or lint fail, fix first. Make sure all intended changes are committed
-(the release commit should only bump the version + Cargo.lock).
+Fix anything red before proceeding. The crates.io/npm publish workflows now gate
+on a `verify` job (`.github/workflows/verify.yml`) running these same checks, so a
+red suite blocks publishing — but catch it locally first to avoid a failed tag.
 
 ## Step 2 — Choose the version
 

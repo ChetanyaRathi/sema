@@ -21,7 +21,13 @@ on:
   workflow_dispatch: # allow re-running a partially-failed publish against main
 
 jobs:
+  # Gate: the full test/lint/examples suite must pass before anything is published.
+  # A red suite here blocks the publish job below (fixes "tests fail but ship anyway").
+  verify:
+    uses: ./.github/workflows/verify.yml
+
   publish:
+    needs: verify
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
