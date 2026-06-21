@@ -1,6 +1,8 @@
 # OpenTelemetry Observability for LLM/Agent Runs (and the VM)
 
-**Status:** Plan — validated, implementation-ready. **NOT started.**
+**Status:** IMPLEMENTED (M0–M5), 2026-06-22. All milestones shipped + verified
+(deterministic in-memory-exporter tests + live end-to-end through the CLI file
+exporter). See the `sema-otel` crate and the `otel_*` integration tests.
 **Date:** 2026-06-21 (rewritten with validated findings + resolved decisions)
 **Owner:** unassigned
 **Scope:** Standards-compliant, opt-in OpenTelemetry tracing + metrics for Sema's
