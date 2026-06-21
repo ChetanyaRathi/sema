@@ -195,7 +195,7 @@
 (define (gen-int env depth)
   (if (<= depth 0)
       (gen-int-leaf env)
-      (let ((choice (rng-int! 24)))
+      (let ((choice (rng-int! 26)))
         (cond
           ((< choice 3)  (gen-int-leaf env))
           ((= choice 3)  (gen-int-bin '+ env depth +))
@@ -218,6 +218,8 @@
           ((= choice 20) (gen-int-apply env depth))
           ((= choice 21) (gen-int-curry env depth))
           ((= choice 22) (gen-int-bits env depth))
+          ((= choice 23) (gen-int-asyncsum env depth))
+          ((= choice 24) (gen-int-asyncchan env depth))
           (else          (gen-int-fromcontainer env depth))))))
 
 (define (gen-int-leaf env)
@@ -405,6 +407,7 @@
           ((= choice 12) (gen-list-sort env depth))
           ((= choice 13) (gen-list-vals env depth))
           ((= choice 14) (gen-list-fromvec env depth))
+          ((= choice 15) (gen-list-asyncall env depth))
           (else          (gen-list-let env depth))))))
 
 (define (gen-list-leaf env)
@@ -630,6 +633,52 @@
 (define (gen-map-merge env depth)
   (let ((a (gen-map-v env (- depth 1))) (b (gen-map-v env (- depth 1))))
     (mk (list 'merge (gf a) (gf b)) (merge (gv a) (gv b)))))
+
+;; ── async / channels (deterministic patterns only) ───────────────────────────
+;; Sema's scheduler is cooperative + FIFO, so these are deterministic. We only
+;; generate patterns whose result is oracle-computable regardless of interleaving:
+;; async/all preserves order; channel fan-in is reduced order-independently (sum).
+;; Excluded: async/sleep, async/timeout, async/race, cancellation — real-time /
+;; schedule-order dependent, no stable value oracle.
+
+;; (foldl + 0 (async/all (list (async T1) (async T2) ...)))  => sum of task values.
+;; Task bodies are ordinary closed-over int programs; async captures outer locals.
+(define (gen-int-asyncsum env depth)
+  (let ((k (rng-range! 1 4)))
+    (let loop ((i 0) (tasks (list)) (sum 0))
+      (if (>= i k)
+          (mk (list 'foldl '+ 0 (list 'async/all (cons 'list (reverse tasks)))) sum)
+          (let ((t (gen-int env (- depth 1))))
+            (loop (+ i 1) (cons (list 'async (gf t)) tasks) (+ sum (gv t))))))))
+
+;; Channel fan-in: spawn k senders, drive them with async/all, then drain+sum.
+;; Order-independent reduction => expected is the sum no matter the recv order.
+(define (gen-int-asyncchan env depth)
+  (let ((k (rng-range! 1 5))
+        (ch (gensym "ch")) (lp (gensym "loop")) (kk (gensym "k")) (acc (gensym "acc")))
+    (let loop ((i 0) (senders (list)) (sum 0))
+      (if (>= i k)
+          (mk (list 'let (list (list ch (list 'channel/new 64)))
+                    (list 'async/all (cons 'list (reverse senders)))
+                    (list 'let lp (list (list kk 0) (list acc 0))
+                          (list 'if (list '>= kk k)
+                                acc
+                                (list lp (list '+ kk 1)
+                                      (list '+ acc (list 'channel/recv ch))))))
+              sum)
+          (let ((v (gen-int env (- depth 1))))
+            (loop (+ i 1)
+                  (cons (list 'async (list 'channel/send ch (gf v))) senders)
+                  (+ sum (gv v))))))))
+
+;; (async/all (list (async T1) (async T2) ...))  => (v1 v2 ...) in spawn order.
+(define (gen-list-asyncall env depth)
+  (let ((k (rng-range! 1 4)))
+    (let loop ((i 0) (tasks (list)) (vals (list)))
+      (if (>= i k)
+          (mk (list 'async/all (cons 'list (reverse tasks))) (reverse vals))
+          (let ((t (gen-int env (- depth 1))))
+            (loop (+ i 1) (cons (list 'async (gf t)) tasks) (cons (gv t) vals)))))))
 
 ;; ── float ──────────────────────────────────────────────────────────────────
 ;; Magnitudes kept small so +/-/* never overflow to inf and never produce NaN;

@@ -44,7 +44,9 @@ SEMA_FUZZ_SEED=<seed> SEMA_FUZZ_COUNT=1   # reproduce a single finding
 
 Arithmetic (`+ - *` incl. variadic, `min`/`max`, `mod`, `abs`, unary `-`, `expt`), bitwise ops (`bit/and|or|xor`, shifts, `bit/not`), all comparisons, numeric and type predicates (`even?`/`zero?`/…, `string?`/`list?`/`map?`/`vector?`/`bool?`/`nil?`), `and`/`or`/`not`, `if`, `cond`, `case`, `match` (including binding clauses), multi-binding mixed-type `let`, multi-arg and curried lambdas, `set!`, `try`/`throw`/`catch`, `apply`, named-let TCO recursion at large N, and a broad set of list/vector/map/string operations (`map`/`filter`/`foldl`/`reverse`/`append`/`cons`/`range`/`take`/`drop`/`sort`/`nth`/`length`/`last`, `assoc`/`dissoc`/`get`/`count`/`contains?`/`merge`/`keys`/`vals`, `string-append`/`substring`/`upcase`/`downcase`/`string/repeat`/`number->string`/…).
 
-**Excluded by design:** anything non-deterministic — LLM calls, time, randomness, `uuid`, file/network I/O, async timing — because it has no stable oracle.
+**Concurrency** is fuzzed too, exploiting the fact that Sema's scheduler is cooperative and FIFO — i.e. deterministic. Only patterns whose result is computable regardless of interleaving are generated: `(async/all (list (async T) …))` preserves spawn order (so the result is exactly predictable), and channel fan-in is reduced order-independently (`sum`). The task bodies `T` are ordinary generated programs, and `async` captures enclosing locals, so this also exercises closures crossing task boundaries and the in-VM higher-order-callback path.
+
+**Excluded by design:** anything non-deterministic — LLM calls, time, randomness, `uuid`, file/network I/O, and the timing-dependent async primitives (`async/sleep`, `async/timeout`, `async/race`, cancellation) — because none has a stable oracle.
 
 ## Running it
 
