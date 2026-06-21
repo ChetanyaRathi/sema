@@ -720,7 +720,18 @@ Rationale: this matches the hardware and every mainstream numeric language, so n
 
 Out of scope: integer arithmetic **overflow wraps** (two's-complement) rather than promoting to bignum or raising — Sema has no arbitrary-precision integers yet; that is a separate concern, not part of this policy. Documented in `website/docs/stdlib/math.md`.
 
-### 65. Special-form names are reserved; rejected at the bind site
+### 65. Special-form names are reserved; rejected at the bind site — REVERTED (1.21.2)
+
+> **REVERTED in 1.21.2.** The bind-site reservation below was too aggressive: it
+> rejected *all* bindings of a special-form name, including correct value-position
+> use (a function parameter named `message`, a variable named `fn`), to prevent a
+> rare operator-position footgun — and the scope-free lowerer can't distinguish
+> the two. It broke common code (5 repo examples) and slipped a CI regression past
+> four releases. The reservation is removed; operator-position shadowing is again a
+> documented limitation (`docs/limitations.md` #36). The proper fix is full lexical
+> shadowing (the Scheme model — make local bindings win everywhere, including
+> operator position, so it "just works"), deferred as future work. Original
+> decision preserved below for the record.
 
 The bytecode lowerer is scope-free — it resolves a special form from a call's head symbol before it knows about local bindings — so a binding whose name collides with a special form (`if`, `fn`, `let`, `and`, `cond`, `define`, `match`, …) cannot override that form in operator position. The special form silently wins, which historically produced silently-wrong results (`(let ((and *)) (and 3 4))` → `4`, not `12`) or confusing arity errors.
 

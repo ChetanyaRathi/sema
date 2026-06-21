@@ -490,22 +490,20 @@ dual_eval_error_tests! {
     multi_defmethod_no_args: "(defmethod)" => "defmethod expects 3",
 }
 
-// Special-form names are reserved: binding one (let/param/define/defun) is
-// rejected at the bind site rather than silently shadow-failing in operator
-// position. See docs/limitations.md and lower.rs::reject_reserved_binding.
-dual_eval_error_tests! {
-    reserved_let_fn: "(let ((fn (fn (x) (+ x 10)))) (fn 5))" => "reserved special-form name",
-    reserved_let_and: "(let ((and (fn (a b) (* a b)))) (and 3 4))" => "reserved special-form name",
-    reserved_let_if_value: "(let ((if 5)) (+ if 1))" => "reserved special-form name",
-    reserved_define: "(define if 5)" => "reserved special-form name",
-    reserved_defun_name: "(defun let (x) x)" => "reserved special-form name",
-    reserved_lambda_param: "(fn (if) if)" => "reserved special-form name",
-    reserved_letstar: "(let* ((or 1)) or)" => "reserved special-form name",
-    reserved_named_let: "(let when ((x 0)) x)" => "reserved special-form name",
+// Special-form names CAN be bound (the bind-site reservation was reverted in
+// 1.21.2 — it broke common code like a param named `message`/`fn`). They shadow
+// correctly in VALUE position; in OPERATOR/head position the special form still
+// wins (a documented footgun — docs/limitations.md #36; the proper fix is full
+// lexical shadowing, future work).
+dual_eval_tests! {
+    shadow_if_value_position: "(let ((if 5)) (+ if 1))" => Value::int(6),
+    shadow_message_value_position: r#"(let ((message "hi")) message)"# => Value::string("hi"),
+    shadow_fn_as_param: "((fn (fn) (+ fn 1)) 10)" => Value::int(11),
+    // Operator position: the special form wins, NOT the binding (documented limitation).
+    special_form_wins_in_operator_position: "(let ((and (fn (a b) (* a b)))) (and 3 4))" => Value::int(4),
 }
 
-// Regular (non-special-form) names still shadow freely — only special forms
-// are reserved.
+// Regular (non-special-form) names also shadow freely.
 dual_eval_tests! {
     shadow_builtin_list_fn: "(let ((list (fn (x) (* x 2)))) (list 5))" => Value::int(10),
     shadow_builtin_map_var: "(let ((map 7)) (+ map 1))" => Value::int(8),
