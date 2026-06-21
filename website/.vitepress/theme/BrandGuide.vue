@@ -5,15 +5,6 @@ import mazeSource from '../../../examples/maze.sema?raw'
 // Register the @sema/ui web components on the client only (they touch the DOM).
 onMounted(() => { import('../../../ui/dist/sema-ui.js') })
 
-const typerUsage = `<sema-code-typer frame logo status line-numbers
-                 filename="maze.sema" cps="42" loop>
-  ;; your Sema code here
-</sema-code-typer>
-
-<!-- export to GIF / WebP -->
-npm run export:typer -- --input examples/maze.sema \\
-  --out maze.gif --frame --logo --status --line-numbers`
-
 const copied = ref({})
 
 // Live generated cards (website/public/og/<slug>.jpg) produced by
@@ -1392,11 +1383,6 @@ resp = client.messages.create(
               <sema-code-typer loop cps="30" aria-label="inline Sema typer">(define (square x) (* x x))</sema-code-typer>
             </div>
           </ClientOnly>
-
-          <div style="position: relative; margin-top: 2rem; max-width: 760px;">
-            <button class="btn-copy-code" @click="copyToClipboard(typerUsage, 'typer')">{{ copied.typer ? 'Copied' : 'Copy' }}</button>
-            <pre style="margin: 0; padding: 1.25rem; background: var(--bg-editor, #1c1916); border: 1px solid var(--border); border-radius: 12px; overflow-x: auto; font-family: var(--mono, 'JetBrains Mono', monospace); font-size: 0.82rem; line-height: 1.6; color: var(--text-secondary, #968c79);"><code>{{ typerUsage }}</code></pre>
-          </div>
         </section>
       </main>
     </div>
