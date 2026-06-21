@@ -1,9 +1,13 @@
 <script setup>
-import {ref, onMounted} from 'vue'
-import mazeSource from '../../../examples/maze.sema?raw'
-
-// Register the @sema/ui web components on the client only (they touch the DOM).
-onMounted(() => { import('../../../ui/dist/sema-ui.js') })
+import {ref} from 'vue'
+// TEMPORARILY DISABLED — Code Typer (<sema-code-typer>) showcase. These imports
+// reach outside website/ (../../../examples and ../../../ui/dist), which the
+// website-only Vercel deploy cannot resolve. Re-enable as part of the proper
+// @sema/ui integration (see docs/plans/2026-06-21-mcp-client-spike.md sibling
+// work / monorepo deploy fix — git-integrate Vercel or vendor the bundle).
+// import {onMounted} from 'vue'
+// import mazeSource from '../../../examples/maze.sema?raw'
+// onMounted(() => { import('../../../ui/dist/sema-ui.js') })
 
 const copied = ref({})
 
@@ -181,7 +185,7 @@ const copyIcon = (key) => {
           <li><a href="#inventory">09. Project Inventory</a></li>
           <li><a href="#rules">10. Visual Rules</a></li>
           <li><a href="#opengraph">11. OpenGraph Cards</a></li>
-          <li><a href="#typer">12. Code Typer</a></li>
+          <!-- <li><a href="#typer">12. Code Typer</a></li> TEMPORARILY DISABLED -->
         </ul>
       </nav>
 
@@ -1364,7 +1368,12 @@ resp = client.messages.create(
           </div>
         </section>
 
-        <!-- 12. Code Typer -->
+        <!-- 12. Code Typer — TEMPORARILY DISABLED.
+             The <sema-code-typer> showcase depends on the @sema/ui bundle and the
+             examples/maze.sema source, both outside website/, which the
+             website-only Vercel deploy can't resolve. Re-enable with the proper
+             @sema/ui integration + monorepo deploy fix (git-integrate Vercel, or
+             vendor the bundle into website/public/).
         <section id="typer" class="brand-section">
           <div class="section-meta">
             <span class="section-num">12</span>
@@ -1384,6 +1393,7 @@ resp = client.messages.create(
             </div>
           </ClientOnly>
         </section>
+        -->
       </main>
     </div>
   </div>
