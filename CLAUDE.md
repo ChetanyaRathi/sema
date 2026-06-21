@@ -114,6 +114,7 @@ that there's no second backend to differentially compare against.
 - **Async tests**: `crates/sema/tests/vm_async_test.rs` — async/channel tests
 - **VM equivalence / integration**: `vm_integration_test.rs`, `integration_test.rs`
 - I/O, LLM, sandbox, CLI, module/import, server tests → `integration_test.rs`
+- **LLM / agent paths (keyless, deterministic)**: `crates/sema/tests/llm_fake_test.rs` uses `sema_llm::fake::FakeProvider` — a scripted provider (canned replies, tool calls, errors, streamed chunks) installed as the default via `sema_llm::builtins::register_test_provider`. It records every request (`FakeRecorder`) so tests can assert on the exact messages the runtime built (e.g. round-2 tool-result correlation). Test hooks: `set_retry_base_ms(0)` (no real sleeps) and `set_network_max_retries`. **Always add a FakeProvider test when changing the agent loop, retry, cache, budget, or provider serializers** — this is the regression oracle that runs in CI without API keys.
 - Notebook E2E tests: `crates/sema-notebook/tests/e2e/` (Playwright, run via `make test-notebook-e2e`)
 - A few `#[ignore]`d tests in `integration_test.rs` are a ready acceptance suite for the deferred VM stack-trace parity work (see `docs/deferred.md`).
 
@@ -129,15 +130,27 @@ that there's no second backend to differentially compare against.
 - **Prelude macro**: add to `crates/sema-eval/src/prelude.rs` (Sema code evaluated at startup, expanded VM-natively).
 - **Async feature**: implement in stdlib (`async_ops.rs`) using the yield signal mechanism, add an async test in `vm_async_test.rs`.
 
+## LLM & Agentic Features (sema-llm)
+
+Hard-won conventions — follow these or you will reintroduce shipped bugs (see `docs/llm-agentic-audit.md` and CHANGELOG 1.21.x):
+
+- **One canonical request, per-provider translation.** `ChatRequest` (in `sema-llm/src/types.rs`) is the single source of truth that Sema code produces; each provider's `build_request_body` (anthropic/openai/gemini/ollama) translates it to that provider's wire format. **Never branch on provider in Sema code or in builtins** — add the field to `ChatRequest` and map it in each serializer. Example: `:reasoning-effort` → OpenAI `reasoning_effort`, Anthropic extended thinking (`budget_tokens` + max-tokens/temperature adjustments), Gemini `thinkingConfig`.
+- **Tool-result correlation is mandatory.** The agent loop (`run_tool_loop`) must echo the assistant `tool_calls` turn and send results as correlated `ChatMessage::tool_result(id, name, content)`; each serializer maps that to its native shape (OpenAI `role:"tool"`+`tool_call_id`, Anthropic `tool_use`/`tool_result` blocks, Gemini `functionCall`/`functionResponse`). Plain user-text results silently break OpenAI-family providers.
+- **Compat is self-healing + no-op, never user-facing.** Unsupported params degrade gracefully: OpenAI's `temperature` 400 on gpt-5.0/o-series is learned per-model (`DROP_TEMPERATURE`) and retried; `max_completion_tokens` is used on official OpenAI/Azure (`is_official_openai_url`); reasoning effort is ignored where unsupported. Tolerate unknown response blocks (e.g. Anthropic `thinking`) rather than failing to decode.
+- **Accounting invariant:** a cache hit makes no provider call → it MUST report zero usage so `track_usage` doesn't recharge cost or burn budget. Network retry covers 429/5xx/network with backoff+jitter (`complete_with_retry`); 4xx-non-429 fail fast.
+- **Verification flow for any LLM change:** (1) deterministic FakeProvider test (required, CI), then (2) live integration test against real providers when feasible — keys are in the env (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY`, `MISTRAL_API_KEY`). Use cheap models for testing: `gpt-5.4-mini`, `claude-haiku-4-5-20251001`, `gemini-2.5-flash`, `mistral-small-latest`; **don't hammer `gpt-5.5`** (priciest). OpenAI model ids use dots (`gpt-5.4-mini`), not the dashed form in the pricing snapshot. Ollama-down is a handy hard-fail for testing `llm/with-fallback`.
+
 ## Release Procedure
 
-1. **Run tests**: `cargo test` — all must pass
-2. **Bump versions** in workspace `Cargo.toml` (`workspace.package.version`) — all crate deps auto-inherit
+1. **Run tests**: `cargo test` — all must pass; also `make lint`
+2. **Bump versions** in `Cargo.toml`: the workspace version *and* the 12 inter-crate `=X.Y.Z` pins (13 lines total). One-shot:
+   `sed -i '' -e 's/^version = "OLD"/version = "NEW"/' -e 's/version = "=OLD"/version = "=NEW"/g' Cargo.toml`
+   then `grep -c 'NEW' Cargo.toml` (expect 13) and `grep -c 'OLD' Cargo.toml` (expect 0).
 3. **Update CHANGELOG.md** — add new `## X.Y.Z` section at top
-4. **Build release**: `cargo build --release`
-5. **Commit & tag**: `git commit`, `git tag vX.Y.Z`
-6. **Push**: `git push origin main --tags` (triggers cargo-dist + crates.io publish)
-7. **Deploy website**: `cd website && vercel --prod`
+4. **Build release**: `cargo build --release` (also refreshes `Cargo.lock`); verify `./target/release/sema --version`
+5. **Commit & tag**: `git commit -m "release: X.Y.Z"`, `git tag vX.Y.Z`
+6. **Push**: `git push origin main --tags` — triggers 4 CI workflows (CI, Release/binaries, Publish to crates.io, Publish to npm); confirm with `gh run list`
+7. **Deploy website** *only if website content changed*: `cd website && vercel --prod` (see the deploy gotcha under Website)
 
 ## Playground
 
@@ -150,6 +163,8 @@ that there's no second backend to differentially compare against.
 ## Website
 
 - Hosted at **sema-lang.com**, deployed via `cd website && vercel --prod`
+- **Deploy gotcha (monorepo):** the Vercel project is CLI-deployed and **uploads only `website/`** — so any `import` in the site that reaches *outside* `website/` (e.g. `../../../ui/dist/...` or `../../../examples/...`) builds locally but **fails on Vercel** ("No such file or directory"). Keep all site imports inside `website/`. The `<sema-code-typer>` brand-page showcase (which imports the repo-root `@sema/ui` bundle) is currently **commented out** in `website/.vitepress/theme/BrandGuide.vue` for this reason; re-enabling it needs the proper monorepo deploy fix (git-integrate the Vercel project — `sourceFilesOutsideRootDirectory` is already on — or vendor the bundle into `website/public/`). Verify a deploy actually promoted: a failed build leaves the previous deploy live (production looks unchanged).
+- The live homepage is the **`HomepageV2.vue`** component (via `website/index.md`), **not** any standalone `*.html` file.
 - VitePress site, URLs require `.html` suffix: e.g. `https://sema-lang.com/docs/internals/lisp-comparison.html`
 - All docs pages are under `/docs/`: `https://sema-lang.com/docs/...`
 - **Syntax highlighting**: Use `` ```sema `` for code blocks in website docs. The custom TextMate grammar is at `website/.vitepress/sema.tmLanguage.json` (copied from canonical source `editors/vscode/sema/syntaxes/sema.tmLanguage.json` — keep in sync). For GitHub markdown outside the website, `sema` won't be recognized — use `` ```scheme `` as fallback there.
