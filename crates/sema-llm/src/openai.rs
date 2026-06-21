@@ -138,10 +138,21 @@ impl OpenAiProvider {
             None
         };
 
+        // The official OpenAI API requires `max_completion_tokens` (gpt-5 /
+        // o-series reject `max_tokens`); compatibility endpoints still expect the
+        // legacy `max_tokens`. Pick by endpoint.
+        let is_official_openai = self.base_url.contains("api.openai.com");
+        let (max_tokens, max_completion_tokens) = if is_official_openai {
+            (None, request.max_tokens)
+        } else {
+            (request.max_tokens, None)
+        };
+
         OpenAiRequest {
             model,
             messages,
-            max_tokens: request.max_tokens,
+            max_tokens,
+            max_completion_tokens,
             temperature: request.temperature,
             tools,
             stop: request.stop_sequences.clone(),
@@ -396,8 +407,14 @@ impl OpenAiProvider {
 struct OpenAiRequest {
     model: String,
     messages: Vec<OpenAiMessage>,
+    /// Legacy token cap — accepted by OpenAI-compatible endpoints (Ollama,
+    /// OpenRouter, vLLM, …) and older OpenAI models.
     #[serde(skip_serializing_if = "Option::is_none")]
     max_tokens: Option<u32>,
+    /// The current OpenAI cap — required by gpt-5 / o-series models, which reject
+    /// `max_tokens`. Sent only when targeting the official OpenAI endpoint.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_completion_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     temperature: Option<f64>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -542,5 +559,78 @@ fn serialize_openai_content(content: &MessageContent) -> serde_json::Value {
                 .collect();
             serde_json::Value::Array(arr)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::{ChatMessage, ChatRequest, ToolCall};
+
+    fn req_with_max() -> ChatRequest {
+        let mut r = ChatRequest::new("gpt-5.4-mini".into(), vec![ChatMessage::new("user", "hi")]);
+        r.max_tokens = Some(100);
+        r
+    }
+
+    #[test]
+    fn official_openai_uses_max_completion_tokens() {
+        // gpt-5 / o-series reject `max_tokens`; the official endpoint must send
+        // `max_completion_tokens` instead.
+        let p = OpenAiProvider::new("k".into(), None, None).unwrap();
+        let body = p.build_request_body(&req_with_max());
+        assert_eq!(body.max_completion_tokens, Some(100));
+        assert_eq!(body.max_tokens, None);
+    }
+
+    #[test]
+    fn compat_endpoint_uses_legacy_max_tokens() {
+        // OpenAI-compatible endpoints (Ollama/OpenRouter/vLLM) expect `max_tokens`.
+        let p =
+            OpenAiProvider::new("k".into(), Some("http://localhost:1234/v1".into()), None).unwrap();
+        let body = p.build_request_body(&req_with_max());
+        assert_eq!(body.max_tokens, Some(100));
+        assert_eq!(body.max_completion_tokens, None);
+    }
+
+    #[test]
+    fn tool_results_serialize_with_correlation() {
+        // Phase 2: assistant turn carries tool_calls; the result is a role:"tool"
+        // message keyed by tool_call_id.
+        let p = OpenAiProvider::new("k".into(), None, None).unwrap();
+        let mut r = ChatRequest::new(
+            "gpt-5.4-mini".into(),
+            vec![
+                ChatMessage::new("user", "weather?"),
+                ChatMessage::assistant_with_tool_calls(
+                    "",
+                    vec![ToolCall {
+                        id: "call_1".into(),
+                        name: "get_weather".into(),
+                        arguments: serde_json::json!({"city": "Oslo"}),
+                    }],
+                ),
+                ChatMessage::tool_result("call_1", "get_weather", "sunny"),
+            ],
+        );
+        r.max_tokens = Some(100);
+        let body = p.build_request_body(&r);
+
+        let assistant = body
+            .messages
+            .iter()
+            .find(|m| m.role == "assistant")
+            .expect("assistant message present");
+        assert!(
+            assistant.tool_calls.as_ref().is_some_and(|t| !t.is_empty()),
+            "assistant message must echo tool_calls"
+        );
+
+        let tool = body
+            .messages
+            .iter()
+            .find(|m| m.role == "tool")
+            .expect("tool result message present");
+        assert_eq!(tool.tool_call_id.as_deref(), Some("call_1"));
     }
 }
