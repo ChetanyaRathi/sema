@@ -68,7 +68,29 @@ These eight questions are answered; do not re-litigate during implementation.
    `http-proto` (default, via `reqwest-blocking-client`) and `grpc-tonic`. Read
    `OTEL_EXPORTER_OTLP_PROTOCOL` at init and dispatch in code — the env var does NOT
    auto-flip linked transports. Default `http/protobuf` (lighter, no runtime
-   coupling). Details in §3.1 / §3.2.
+   coupling). **gRPC is ALWAYS compiled (no cargo feature gate)** (owner decision,
+   2026-06-21): the heavy transitive stack (`hyper`/`h2`/`tower`/`hyper-util`/
+   `tokio-stream`) is already in the workspace via `reqwest`+`axum`, so gRPC's
+   net-new cost is only ~5-8 crates (`tonic`/`prost`) + ~0.5-1 MB binary; the
+   zero-config "`OTEL_EXPORTER_OTLP_PROTOCOL=grpc` just works" UX wins. Details in
+   §3.1 / §3.2.
+
+9. **Cache-token attributes + Sema `Usage` expansion (was Open item #1; owner
+   decision: include + surface in Sema).** Add `cache_creation_input_tokens` and
+   `cache_read_input_tokens` to the shared `Usage` struct (`types.rs`), populate
+   them from providers that report cache usage (Anthropic `AnthropicUsage`,
+   `anthropic.rs`; others as available), and surface them **both** in the
+   Sema-facing usage maps (`llm/session-usage`, `llm/last-usage` — useful for cost
+   analysis independent of OTel) **and** as span attributes
+   `gen_ai.usage.cache_creation.input_tokens` / `gen_ai.usage.cache_read.input_tokens`.
+   This is a small provider/type change done as part of the OTel work.
+
+10. **Retry sub-spans + streaming span are IN v1 (was Open item #3; owner decision:
+    include both).** Per-HTTP-attempt child spans inside `complete_with_retry`
+    (`builtins.rs:4290` — surfaces 429/5xx retries + backoff; the attempt count is
+    currently discarded, so thread span context through) AND a streaming-call span
+    for `llm/stream` (which bypasses `do_complete`) are part of the initial
+    implementation, not parked. Folded into the milestones below.
 
 ---
 
@@ -109,7 +131,10 @@ per-call user code** and **zero overhead when disabled**.
 >   (`do_complete` early-return at `:4158-4179`, `stop_reason="cache_hit"`) — emit a
 >   span tagged `gen_ai.cache.hit=true` with zero usage in **M1**.
 > - **Streaming** (`llm/stream`) bypasses `do_complete` AND `track_usage` entirely
->   (`builtins.rs:1565/1579`) — add a streaming span in **M4**.
+>   (`builtins.rs:1565/1579`) — add a streaming span in **M2** (in v1 scope per
+>   Decision #10).
+> - **Retries** (`complete_with_retry`, `:4290`) — emit a child span per HTTP
+>   attempt (429/5xx + backoff) under the LLM span; in **M1** scope per Decision #10.
 > - **Embeddings** bypass `do_complete` — add `embeddings` spans in **M4**.
 
 ---
@@ -245,10 +270,11 @@ serde_json = { workspace = true }       # for the JSONL file exporter
 > -> BoxFuture`, `runtime::Tokio` in the batch builder) will NOT compile against
 > 0.32 — do not copy them.
 
-> Optional: gate `grpc-tonic` behind a cargo feature so default builds stay
-> HTTP-light. `grpc-tonic` pulls the full tonic/hyper/h2/tower/tokio stack; the
-> HTTP path needs none of it. (Human call — see Open items. Functionality is
-> identical either way, only build cost differs.)
+> Transport build (resolved, Decision #8): **compile both, no cargo feature gate.**
+> `grpc-tonic`'s heavy transitive stack (`hyper`/`h2`/`tower`/`hyper-util`/
+> `tokio-stream`) is already in the workspace via `reqwest`+`axum`, so the net-new
+> cost is only ~5-8 crates (`tonic`/`prost`) + ~0.5-1 MB binary. `grpc` works with
+> zero config out of the box.
 
 **Why a new `sema-otel` crate, not deps on `sema-llm`:**
 - Confirmed dependency edges: `sema-core` depends on nothing internal;
@@ -511,6 +537,14 @@ enabled flag (no-op when off). `sema-stdlib` depends on `sema-otel`, never on
     `pricing::calculate_cost_for`, `response.model`, `finish_reasons` as a
     1-element array) BEFORE `track_usage` (`:220`) consumes the serving-provider
     stamp.
+  - **Retry sub-spans (Decision #10):** in `complete_with_retry` (`:4290`), open a
+    short child span per HTTP attempt tagged with the attempt number and outcome
+    (429/5xx/network + the backoff applied), nested under the LLM span.
+- **Cache-token `Usage` expansion (Decision #9):** add `cache_creation_input_tokens`
+  / `cache_read_input_tokens` to `Usage` (`types.rs`), populate from `AnthropicUsage`
+  (`anthropic.rs`), surface in `llm/session-usage` + `llm/last-usage` maps, and emit
+  `gen_ai.usage.cache_creation.input_tokens` / `gen_ai.usage.cache_read.input_tokens`
+  on the span when present. (Small provider/type change; useful beyond OTel.)
 - **Operation name:** `chat` for completions; `embeddings` deferred to M4.
 - **Acceptance:** with local Jaeger (`docker run jaegertracing/all-in-one`),
   `OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318 sema -e '(llm/auto-configure)(llm/complete "ping" {:max-tokens 10})'`
@@ -534,6 +568,9 @@ enabled flag (no-op when off). `sema-stdlib` depends on `sema-otel`, never on
     when `is_error` (`:4584-4593`). Re-use the already-measured `duration_ms`
     (`:4594`) for the tool span (this is the one real latency source).
   - Stamp `gen_ai.conversation.id` on every child span.
+  - **Streaming span (Decision #10):** `llm/stream` (`:1565/1579`) bypasses
+    `do_complete`/`track_usage`, so wrap it directly in a `chat` span that captures
+    model + whatever usage the stream surfaces at completion.
 - **Acceptance:** an `agent/run` with one tool (FakeProvider scripted: tool_call →
   final answer) produces the trace tree `invoke_agent` →
   (`chat`, `execute_tool <name>`, `chat`) with correct parent/child nesting and the
@@ -553,13 +590,13 @@ enabled flag (no-op when off). `sema-stdlib` depends on `sema-otel`, never on
   absent** (privacy test). `(otel/span "x" (fn () 42))` returns `42` and emits one
   INTERNAL span. Eval test pinning the flag-off no-op returning `42`.
 
-### Milestone 4 (vision) — notebook trace + streaming + embeddings (1–2 days)
+### Milestone 4 (vision) — notebook trace + embeddings (1–2 days)
 - **Files:** `crates/sema-notebook/src/*` — one root trace per "Run All" with a
   child `vm_span` per cell (shared cell env makes this natural), LLM/tool spans
   nested beneath the issuing cell, `gen_ai.conversation.id` propagated; single-cell
-  eval = standalone one-cell trace. `builtins.rs` `llm/stream` (`:1565/1579`) —
-  bypasses `do_complete`, add a span there. `embed` paths — `embeddings` operation
-  spans with `input_tokens` only.
+  eval = standalone one-cell trace. `embed` paths — `embeddings` operation spans
+  with `input_tokens` only.
+  (Streaming spans moved to M2 and retry sub-spans to M1 per Decision #10.)
 - **Acceptance:** the demo notebook with OTel enabled yields one trace whose root
   has one child per executed cell, LLM/tool spans nested beneath; a streamed
   completion produces a span; `llm/embed` produces an `embeddings` span with input
@@ -625,16 +662,10 @@ Sema-level `(otel/span …)` surface, streaming + embeddings coverage, and the n
 
 ## 8. Open items (human calls / parked)
 
-1. **Anthropic prompt-cache token attributes** (`gen_ai.usage.cache_creation.input_tokens`
-   / `cache_read.input_tokens`) need a real code change: `AnthropicUsage`
-   (`anthropic.rs:378`) and the shared `Usage` struct currently DROP cache fields.
-   Include this small provider/type change in the OTel work, or ship MVP without
-   cache-token attributes and do it separately?
-2. **gRPC as a cargo feature vs always-compiled.** `grpc-tonic` pulls the full
-   tonic/hyper/h2/tower/tokio stack into an otherwise HTTP-light path. Compile gRPC
-   by default, or gate it behind a feature (functionality identical, only build cost
-   differs)?
-3. **Retry sub-spans + streaming span scope.** Per-HTTP-attempt sub-spans inside
-   `complete_with_retry` (`:4290`, attempt count currently discarded) and the
-   streaming span (`llm/stream` bypasses `do_complete`) — fold into M4 vision scope
-   or park as follow-ups? Both need small code changes and are not required for MVP.
+All previously-open items are now resolved (owner decisions, 2026-06-21) and
+captured in §0:
+- Anthropic cache-token attributes → **include + surface in Sema `Usage`** (Decision #9).
+- gRPC transport → **always compiled, no feature gate** (Decision #8).
+- Retry sub-spans + streaming span → **in v1 scope** (Decision #10).
+
+No open questions remain. Ready to implement.
