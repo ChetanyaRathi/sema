@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.20.3
+
+Bugfix release. Three correctness fixes surfaced by a multi-agent bug-hunt across subsystems the grammar fuzzer can't structurally reach.
+
+### Fixed
+
+- **`get-in` conflated a present `nil` value with a missing key.** `(get-in {:a nil} [:a] "default")` returned `"default"` instead of `nil`, and `(get-in nil [] "default")` returned `"default"` instead of the root `nil`. `get-in` now distinguishes a key that is present (even with a `nil` value) from a missing key, and an empty path returns the root collection (Clojure semantics).
+- **IEEE 754 special floats didn't round-trip through the reader.** The printer emits `inf` / `-inf` / `NaN`, but the reader parsed those back as *symbols*, so `(read (str (/ 1.0 0.0)))` was a symbol, not a float. The reader now recognizes `inf` / `-inf` / `NaN` (and common spellings like `+inf`, `Infinity`, `nan`) as float literals.
+- **Readable string printing didn't escape special characters.** Strings containing `"`, `\`, newlines, tabs, or carriage returns printed inside a container (or via `str` in readable position) were emitted unescaped, so `(read (str (list "a\nb")))` didn't reproduce the original. The readable form now escapes `\\ \" \n \t \r`; the reader already parsed these back. Bare strings printed via `display`/`println`/`str` use a separate raw path and are unchanged.
+
 ## 1.20.2
 
 Bugfix release. Fixes silent integer corruption in the VM's inline add/subtract, found by the grammar fuzzer's new metamorphic oracle.
