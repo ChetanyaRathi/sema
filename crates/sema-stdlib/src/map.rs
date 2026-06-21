@@ -611,18 +611,25 @@ pub fn register(env: &sema_core::Env) {
         } else {
             Value::nil()
         };
+        // Walk the path, distinguishing a MISSING key (-> default) from a key
+        // that is present with a nil value (-> nil). The previous version used
+        // `unwrap_or(nil)` and a final `is_nil -> default` check, which conflated
+        // the two: `(get-in {:a nil} [:a] d)` wrongly returned `d`, and an empty
+        // path on a nil root returned `d` instead of the root. An empty path
+        // returns the root itself (Clojure semantics).
         let mut current = args[0].clone();
         for key in &path {
-            if let Some(map) = current.as_map_ref() {
-                current = map.get(key).cloned().unwrap_or(Value::nil());
+            let next = if let Some(map) = current.as_map_ref() {
+                map.get(key).cloned()
             } else if let Some(map) = current.as_hashmap_ref() {
-                current = map.get(key).cloned().unwrap_or(Value::nil());
+                map.get(key).cloned()
             } else {
-                return Ok(default);
+                None
+            };
+            match next {
+                Some(v) => current = v,
+                None => return Ok(default),
             }
-        }
-        if current.is_nil() && args.len() == 3 {
-            return Ok(default);
         }
         Ok(current)
     });

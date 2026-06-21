@@ -87,10 +87,10 @@
 (define *sym-pool* (list 'a 'b 'c 'foo 'bar 'x 'y 'list 'quote 'do-thing))
 (define *kw-pool*  (list :a :b :c :foo :bar :k1 :k2 :k3))
 (define *char-pool* (list #\a #\Z #\0 #\space #\newline #\tab #\return))
-;; Safe string alphabet — excludes " and \ which the current printer does not
-;; escape (a separate, known printer gap; keep it out so structural bugs aren't
-;; masked by it).
-(define *str-alpha* "abcdefghijkRSTUVWXYZ0123456789 -_./:?!()[]{}*+=<>")
+;; String alphabet, including the escape-sensitive characters " \ newline tab —
+;; the readable printer now escapes these and the reader parses them back, so the
+;; round-trip oracle covers them (this is what regression-guards that fix).
+(define *str-alpha* "abcdefghijkRSTUVWXYZ0123456789 -_./:?!()[]{}*+=<>\"\\\n\t")
 
 (define (gen-char-from alpha)
   (let ((k (rng-int! (string-length alpha))))

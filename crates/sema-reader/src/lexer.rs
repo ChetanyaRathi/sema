@@ -572,6 +572,29 @@ pub fn tokenize(input: &str) -> Result<Vec<SpannedToken>, SemaError> {
                             byte_start: token_byte_start,
                             byte_end: token_byte_end,
                         }),
+                        // IEEE 754 special floats, so they round-trip through the
+                        // printer (which emits `inf` / `-inf` / `NaN`). Accept a
+                        // few common spellings too.
+                        "inf" | "+inf" | "Inf" | "Infinity" | "+Infinity" => {
+                            tokens.push(SpannedToken {
+                                token: Token::Float(f64::INFINITY),
+                                span: token_span,
+                                byte_start: token_byte_start,
+                                byte_end: token_byte_end,
+                            })
+                        }
+                        "-inf" | "-Infinity" => tokens.push(SpannedToken {
+                            token: Token::Float(f64::NEG_INFINITY),
+                            span: token_span,
+                            byte_start: token_byte_start,
+                            byte_end: token_byte_end,
+                        }),
+                        "nan" | "NaN" | "NAN" | "+nan" | "-nan" => tokens.push(SpannedToken {
+                            token: Token::Float(f64::NAN),
+                            span: token_span,
+                            byte_start: token_byte_start,
+                            byte_end: token_byte_end,
+                        }),
                         _ => tokens.push(SpannedToken {
                             token: Token::Symbol(name),
                             span: token_span,

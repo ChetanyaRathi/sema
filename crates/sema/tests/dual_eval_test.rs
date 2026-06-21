@@ -18,6 +18,19 @@ dual_eval_tests! {
     big_int_sub_overflows_small: "(let ((x 9000000000000) (y -9000000000000)) (- x y))" => Value::int(18000000000000),
     big_int_distributivity: "(let ((a 32768) (b 320462586) (c 352969177)) (- (* a (+ b c)) (+ (* a b) (* a c))))" => Value::int(0),
 
+    // Regression: get-in must distinguish a key present with a nil value from a
+    // missing key, and an empty path returns the root (found by ultracode hunt).
+    get_in_present_nil: r#"(get-in {:a nil} [:a] "default")"# => Value::nil(),
+    get_in_nil_empty_path: r#"(get-in nil [] "default")"# => Value::nil(),
+    get_in_missing_key: r#"(get-in {:a 1} [:b] "default")"# => Value::string("default"),
+    get_in_nested: "(get-in {:a {:b 2}} [:a :b] 0)" => Value::int(2),
+    // Regression: IEEE inf/-inf round-trip through printer -> reader.
+    inf_round_trips: "(= (/ 1.0 0.0) (read (str (/ 1.0 0.0))))" => Value::bool(true),
+    neg_inf_reads: r#"(= (/ -1.0 0.0) (read "-inf"))"# => Value::bool(true),
+    // Regression: strings with escapes round-trip when printed readably (nested).
+    string_newline_round_trips: r#"(= (list "a\nb") (read (str (list "a\nb"))))"# => Value::bool(true),
+    string_quote_backslash_round_trips: r#"(= (list "q\"b\\s") (read (str (list "q\"b\\s"))))"# => Value::bool(true),
+
     destructure_let_vector: "(let (([a b] '(1 2))) (+ a b))" => Value::int(3),
     destructure_let_vector_from_vec: "(let (([a b] [10 20])) (+ a b))" => Value::int(30),
     // Hand-constructed Value to avoid eval_tw oracle circularity (see docs/bugs/eval-tw-oracle-circularity.md)

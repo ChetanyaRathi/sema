@@ -1942,7 +1942,24 @@ impl fmt::Display for Value {
                     write!(f, "{n}")
                 }
             }
-            ValueView::String(s) => write!(f, "\"{s}\""),
+            ValueView::String(s) => {
+                // Readable form: escape so the output re-reads to the same string
+                // (round-trip). Bare strings printed via display/println/str go
+                // through a separate raw path, so this only affects nested/readable
+                // output. The reader parses these escapes back.
+                write!(f, "\"")?;
+                for c in s.chars() {
+                    match c {
+                        '"' => write!(f, "\\\"")?,
+                        '\\' => write!(f, "\\\\")?,
+                        '\n' => write!(f, "\\n")?,
+                        '\t' => write!(f, "\\t")?,
+                        '\r' => write!(f, "\\r")?,
+                        c => write!(f, "{c}")?,
+                    }
+                }
+                write!(f, "\"")
+            }
             ValueView::Symbol(s) => with_resolved(s, |name| write!(f, "{name}")),
             ValueView::Keyword(s) => with_resolved(s, |name| write!(f, ":{name}")),
             ValueView::Char(c) => match c {
