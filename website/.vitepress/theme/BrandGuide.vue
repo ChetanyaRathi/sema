@@ -1,5 +1,18 @@
 <script setup>
-import {ref} from 'vue'
+import {ref, onMounted} from 'vue'
+import mazeSource from '../../../examples/maze.sema?raw'
+
+// Register the @sema/ui web components on the client only (they touch the DOM).
+onMounted(() => { import('../../../ui/dist/sema-ui.js') })
+
+const typerUsage = `<sema-code-typer frame logo status line-numbers
+                 filename="maze.sema" cps="42" loop>
+  ;; your Sema code here
+</sema-code-typer>
+
+<!-- export to GIF / WebP -->
+npm run export:typer -- --input examples/maze.sema \\
+  --out maze.gif --frame --logo --status --line-numbers`
 
 const copied = ref({})
 
@@ -177,6 +190,7 @@ const copyIcon = (key) => {
           <li><a href="#inventory">09. Project Inventory</a></li>
           <li><a href="#rules">10. Visual Rules</a></li>
           <li><a href="#opengraph">11. OpenGraph Cards</a></li>
+          <li><a href="#typer">12. Code Typer</a></li>
         </ul>
       </nav>
 
@@ -1344,6 +1358,32 @@ resp = client.messages.create(
 
               <img :src="`/og/${ogVariations[activeOgVariation].slug}.jpg`" :alt="`Documentation OpenGraph card — ${ogVariations[activeOgVariation].label}`" loading="lazy" style="display: block; width: 100%; aspect-ratio: 1200 / 630; border: 1px solid var(--border); border-radius: 12px; box-shadow: 0 20px 50px rgba(0,0,0,0.5);" />
             </div>
+          </div>
+        </section>
+
+        <!-- 12. Code Typer -->
+        <section id="typer" class="brand-section">
+          <div class="section-meta">
+            <span class="section-num">12</span>
+            <h2 class="section-title">Code Typer</h2>
+            <p class="section-desc">
+              <code>&lt;sema-code-typer&gt;</code> is a live web component that types code out with
+              Sema syntax highlighting, a moving caret and optional editor chrome — a reusable
+              toolkit piece for animated code in docs, demos and marketing. The same component
+              exports to GIF or WebP via <code>npm&nbsp;run&nbsp;export:typer</code>.
+            </p>
+          </div>
+
+          <ClientOnly>
+            <div style="display: flex; flex-direction: column; gap: 2rem; max-width: 760px;">
+              <sema-code-typer frame logo status line-numbers filename="maze.sema" rows="14" loop cps="42">{{ mazeSource }}</sema-code-typer>
+              <sema-code-typer loop cps="30" aria-label="inline Sema typer">(define (square x) (* x x))</sema-code-typer>
+            </div>
+          </ClientOnly>
+
+          <div style="position: relative; margin-top: 2rem; max-width: 760px;">
+            <button class="btn-copy-code" @click="copyToClipboard(typerUsage, 'typer')">{{ copied.typer ? 'Copied' : 'Copy' }}</button>
+            <pre style="margin: 0; padding: 1.25rem; background: var(--bg-editor, #1c1916); border: 1px solid var(--border); border-radius: 12px; overflow-x: auto; font-family: var(--mono, 'JetBrains Mono', monospace); font-size: 0.82rem; line-height: 1.6; color: var(--text-secondary, #968c79);"><code>{{ typerUsage }}</code></pre>
           </div>
         </section>
       </main>

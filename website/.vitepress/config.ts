@@ -11,6 +11,20 @@ export default defineConfig({
   description: 'A Lisp with first-class LLM primitives, implemented in Rust.',
   appearance: 'force-dark',
 
+  // <sema-*> are web components (e.g. <sema-code-typer>), not Vue components.
+  vue: {
+    template: {
+      compilerOptions: {
+        isCustomElement: (tag: string) => tag.startsWith('sema-'),
+      },
+    },
+  },
+
+  // Allow importing the built @sema/ui bundle + example sources from the repo root.
+  vite: {
+    server: { fs: { allow: ['../..'] } },
+  },
+
   sitemap: {
     hostname: 'https://sema-lang.com'
   },
