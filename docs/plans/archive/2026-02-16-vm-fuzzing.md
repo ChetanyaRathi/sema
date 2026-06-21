@@ -1,5 +1,25 @@
 # VM Fuzzing Implementation Plan
 
+**Status (2026-06-21): ARCHIVED — largely implemented or obsoleted.** Most of this
+plan landed via different (better) routes, and the differential phase was made moot
+by the tree-walker retirement. Per-task reconciliation against current `main`:
+
+| Task | Status |
+| --- | --- |
+| 1. Safe opcode decode (no `transmute` on bad bytes) | **DONE** — the dispatch loop returns `VM: invalid opcode {op}` (`vm.rs:2205`); the only remaining `transmute` is in the (de)serializer, gated by `validate_bytecode`. |
+| 2. VM fuel / step limit | **NOT done as designed — by choice.** Infinite loops are bounded at the harness level (`cargo fuzz … -timeout=10`) plus `MAX_FRAMES = 2048` (`vm.rs:127`, enforced at `2383`/`2447`). An in-VM step-fuel for untrusted embedding is a deliberate non-goal for now; the DoS angle is documented in `docs/limitations.md` #35. |
+| 3. Bounds checks on operand reads | **DONE differently (better).** `validate_bytecode` / `validate_chunk_bytecode` (`serialize.rs:912/941`, called at `1377`) prove stack balance + operand validity at load time, so the hot loop reads unchecked safely. See archived `2026-05-15-adi-bytecode-verifier.md`. |
+| 4. Source-level `fuzz_vm` | **DONE.** The VM is the sole evaluator, so `crates/sema-eval/fuzz/fuzz_targets/fuzz_eval.rs` fuzzes the real compile+execute pipeline via `eval_str_compiled`. The in-language grammar fuzzer (`fuzz/grammar-fuzz.sema`, `make fuzz-grammar`) also detects VM panics. |
+| 5. Differential tree-walker vs VM | **OBSOLETE.** Tree-walker retired (VM is sole evaluator) — there is no second backend to diff. Superseded by the grammar fuzzer's compositional value oracle + metamorphic laws. |
+| 6. Raw bytecode fuzz target | **NOT done — the only residual idea with real (modest) value.** Would stress `validate_bytecode`'s completeness and the VM's robustness against bytecode that passes validation but is still pathological. Attack surface (loading `.semac`) is already guarded by `validate_bytecode`. Revisit only if untrusted-bytecode loading becomes a supported use case. |
+| 7. Seed corpus | Not done (minor; libFuzzer cold-starts fine for these targets). |
+| 8. Stack/frame guards | **DONE** — `MAX_FRAMES = 2048`. |
+
+**Net:** archiving loses only Task 6 (raw-bytecode fuzzing) and the deliberate Task 2
+non-goal; both are captured above. Original plan preserved below for reference.
+
+---
+
 > **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 
 **Goal:** Add fuzzing infrastructure for the bytecode VM (`sema-vm`) to find panics, UB, correctness bugs, and DoS vectors.
