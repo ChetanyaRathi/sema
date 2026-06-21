@@ -16,7 +16,8 @@ Grafana / Phoenix).
 
 ## 0. Resolved decisions (locked)
 
-These eight questions are answered; do not re-litigate during implementation.
+These sixteen questions are answered; do not re-litigate during implementation.
+(Decisions #11–#16 are the embedded-OTel / wasm calls resolved 2026-06-21.)
 
 1. **Crate version pin (was Open Q#1).** Pin the synchronized **0.32 train**, bumped
    together: `opentelemetry` 0.32.0, `opentelemetry_sdk` 0.32.1 (patch ahead of the
@@ -84,6 +85,16 @@ These eight questions are answered; do not re-litigate during implementation.
    analysis independent of OTel) **and** as span attributes
    `gen_ai.usage.cache_creation.input_tokens` / `gen_ai.usage.cache_read.input_tokens`.
    This is a small provider/type change done as part of the OTel work.
+   **STATUS — Sema-side SHIPPED (2026-06-21, pre-OTel):** the `Usage` fields,
+   provider population (OpenAI `prompt_tokens_details.cached_tokens`; Gemini
+   `cachedContentTokenCount`; Anthropic distinct cache fields — non-streaming AND
+   streaming), session accumulation, and `:cache-read-tokens` / `:cache-creation-tokens`
+   in both usage maps are done, tested (FakeProvider regression), and live-verified
+   (OpenAI + Gemini implicit reads). Remaining for OTel: emit the two
+   `gen_ai.usage.cache_*` span attributes from these already-populated fields.
+   Note: Anthropic caching is opt-in via request-side `cache_control` markers,
+   which are NOT yet wired — the parser is ready but cache counts stay 0 until a
+   future `:cache`-enable feature lands (parked, separate from OTel).
 
 10. **Retry sub-spans + streaming span are IN v1 (was Open item #3; owner decision:
     include both).** Per-HTTP-attempt child spans inside `complete_with_retry`
@@ -91,6 +102,50 @@ These eight questions are answered; do not re-litigate during implementation.
     currently discarded, so thread span context through) AND a streaming-call span
     for `llm/stream` (which bypasses `do_complete`) are part of the initial
     implementation, not parked. Folded into the milestones below.
+
+11. **WASM/JS = pure compile-out no-op for v1 (was §9.3 Q#1; owner decision,
+    2026-06-21).** The browser build has no span *source* — every LLM/GenAI builtin is
+    already `cfg(not(target_arch="wasm32"))`-gated, like `sema-llm`. So on wasm the
+    `sema-otel` facade compiles to no-op spans and links no `opentelemetry-otlp` /
+    `BatchSpanProcessor` / `std::fs`. The JS-bridge exporter (`setSpanSink(fn)` +
+    `JsBridgeExporter`) is **deferred** until in-browser LLM/agent runs exist. The
+    "always compile both OTLP transports" (#8) and `SEMA_OTEL_FILE` JSONL fallback
+    (#6) are scoped to **native non-wasm** targets. Add a build-regression test that
+    `sema-wasm` still builds with the otel facade present.
+
+12. **Embedded default = attach to the host's ambient provider (was §9.3 Q#2; owner
+    decision, 2026-06-21).** An embedded `Interpreter` emits to whatever **global** OTel
+    provider the host already installed, and is a silent no-op if the host installed
+    nothing. Sema spans "just appear" in a host that already runs OTel, with zero host
+    wiring. Sema NEVER installs/hijacks a provider in this mode (see #14).
+
+13. **Commit to trace-context continuity via `Context::current()` (was §9.3 Q#3; owner
+    decision, 2026-06-21).** Sema's root span is started with
+    `tracer.start_with_context(name, &opentelemetry::Context::current())` so Sema's
+    LLM/tool spans auto-nest under the host's current span (e.g. an HTTP request span).
+    This is the single highest-value embedded behavior and is worth coupling
+    `sema-otel` to the `opentelemetry` `Context` API (a deliberate exception to §3.4's
+    otherwise-minimal facade). On wasm this is a no-op (#11).
+
+14. **`build()` never owns the provider (was §9.3 Q#4; owner decision confirmed,
+    2026-06-21).** `InterpreterBuilder::build()` MUST NOT install or shut down a tracer
+    provider. In the `FromEnv` self-install path, the `OtelGuard` (which owns
+    flush/shutdown) is **handed back to the host to own**, so `reset_runtime_state` on
+    every build can never leak or duplicate providers. Host owns lifecycle; Sema only
+    emits.
+
+15. **Direct-OTel only — no `tracing`-bridge variant for v1 (was §9.3 Q#5; owner
+    decision, 2026-06-21).** `sema-otel` emits raw `opentelemetry` spans, parented via
+    `Context` (#13). We do NOT ship a `tracing`/`tracing-opentelemetry` re-emit variant
+    in v1 (one code path; revisit if `tracing`-based hosts need auto-nesting in their
+    own subscriber).
+
+16. **Env config defers to a host-installed provider (was §9.3 Q#6; owner decision,
+    2026-06-21).** If a host has already set a global OTel provider AND Sema is
+    env-configured (`SEMA_OTEL_*` present) in `FromEnv` mode, Sema **detects the
+    existing global provider and declines to overwrite it** — it emits into the host's
+    pipeline rather than clobbering host telemetry. (No warning required; defer
+    silently. A diagnostic breadcrumb is optional.)
 
 ---
 
@@ -669,3 +724,233 @@ captured in §0:
 - Retry sub-spans + streaming span → **in v1 scope** (Decision #10).
 
 No open questions remain. Ready to implement.
+
+---
+
+## 9. Embedded OTel (host Rust app + WASM/JS)
+
+§§0–8 are scoped to the **standalone CLI/REPL/notebook-server** shape: Sema owns the
+process, so it legitimately owns the global tracer provider and the shutdown
+sequence. That model is correct for that mode and **nothing in §§0–8 changes**. But
+Sema also ships as (2) an embeddable Rust library (`crates/sema/src/lib.rs`
+`Interpreter`/`InterpreterBuilder`) and (3) a browser/WASM runtime (`sema-wasm`,
+sema.run). In both, the standalone init model is wrong-to-harmful. This section
+extends — never overrides — the locked decisions for those two modes.
+
+The unifying principle (matches Decision #6's "silent no-op default" and the
+opentelemetry-rust library contract): **libraries instrument, applications
+configure.** `sema-otel` should *emit* GenAI-conventioned spans against whatever
+provider exists and never *install* one except in standalone mode. opentelemetry's
+own docs are explicit: `global::set_tracer_provider` "Libraries should NOT call this
+function. It is intended for applications/executables." When no provider is set,
+`global::tracer(...)` returns a `NoopTracerProvider` that silently discards — so the
+facade can call it unconditionally and pay nothing when unconfigured.
+
+### 9.1 The three deployment modes at a glance
+
+| Mode | Who calls init | Who owns the global provider | Who owns shutdown | Export backend |
+|------|----------------|------------------------------|-------------------|----------------|
+| **1. Standalone** (CLI/REPL/notebook server) | `sema_otel::init_from_env()` in `main()` (§4.2) | **Sema** (installs it) | **Sema** (`OtelGuard::drop`, §3.3e) | thread-based `BatchSpanProcessor` → OTLP / `SEMA_OTEL_FILE` JSONL |
+| **2. Embedded-in-Rust** (`Interpreter`) | the **host app** (or Sema self-installs via explicit opt-in) | the **host** (Sema attaches, does NOT hijack) | the **host** | host's own processor/exporter; or host hands Sema a provider |
+| **3. WASM/JS** (`sema-wasm`) | nobody (no provider) | n/a | n/a | **none** (compile-out no-op); future JS-callback bridge → host JS OTel SDK |
+
+The crate stays one sink-agnostic facade. What differs per mode is **wiring**, not
+**logic**: who calls init, who owns the provider, who owns shutdown. The mode-agnostic
+locked decisions (semconv, cost attributes, both OTLP transports, JSONL fallback,
+zero `observe-llm` coupling) survive unchanged — but several are inherently
+standalone-only and must be re-scoped where the runtime can't honor them (noted
+inline below).
+
+### 9.2 Mode 2 — embedded in a host Rust app
+
+A host Rust app almost always already runs OpenTelemetry (or `tracing` +
+`tracing-opentelemetry`) with its own global provider, batch processor, and shutdown.
+The embedding contract therefore inverts the standalone one:
+
+**(a) Never hijack the global from a library default.** `Interpreter::new()` /
+`InterpreterBuilder::build()` MUST NOT call `global::set_tracer_provider` (nor
+`set_meter_provider` / `set_text_map_propagator`). Doing so either clobbers a host
+that already configured OTel (host spans silently stop exporting) or gets clobbered
+when the host configures later — last-writer-wins, no error. This is the central
+embedding bug to avoid, and it is the natural failure mode of the raw-`opentelemetry`
+design chosen in §3.1 (raw OTel reaches for the global; a `tracing`-based lib owns no
+global). This also already aligns with the *existing* codebase reality: an exhaustive
+grep found **zero** `set_global_default` / `set_tracer_provider` / `tracing_subscriber`
+calls anywhere in non-test code — Sema installs no global telemetry today, so there is
+no conflict yet. The risk is entirely about what `sema-otel` *would* install.
+
+**(b) Bring-your-own provider + read-the-global default.** The default embedded
+behavior is to emit spans against whatever the host already installed via
+`opentelemetry::global` (silent no-op if the host installed nothing — same contract
+as standalone-off). Make the facade resolve its tracer **lazily** via
+`global::tracer_with_scope(InstrumentationScope::builder("sema").with_version(…).build())`
+rather than a captured/owned provider, so it transparently honors the host. Offer two
+explicit opt-ins for hosts that want more control (mirroring the
+`.with_sandbox`/`.with_llm` builder ergonomics):
+   - `UseHostGlobal` (default) — read `global`, install nothing.
+   - `OwnProvider(SdkTracerProvider)` — host hands Sema a provider it built; Sema
+     uses it but still does NOT call `set_tracer_provider`, and does NOT install a
+     shutdown-owning `OtelGuard` (the host owns lifecycle).
+   - `FromEnv` — Sema self-installs the standalone path and hands the resulting
+     `OtelGuard` **back to the host** to own (for hosts that genuinely want Sema to
+     own OTel).
+
+**(c) Parent-context adoption (the highest-value embedded behavior).** §3.5's
+thread-local `RefCell<Vec<Context>>` reproduces nesting *within* Sema but currently
+seeds from empty, so embedded Sema starts a **new root trace** instead of nesting
+under the host's request span. Fix: seed the bottom of the stack from
+`opentelemetry::Context::current()` and start Sema's root span via
+`tracer.start_with_context(name, &Context::current())`. Then a host HTTP request span
+becomes the parent of Sema's `invoke_agent` → `chat`/`execute_tool` tree — the whole
+point of embedding observability. (W3C `traceparent` adoption falls out for free if
+the host installed a propagator.)
+
+**(d) Idempotent, never auto-init at build time.** `reset_runtime_state`
+(`builtins.rs:115`) runs on **every** interpreter build (3 sites: `eval.rs:67`,
+`eval.rs:85`, `lib.rs:85`), and it wipes per-thread LLM/provider state. So (i) any
+self-install must be `std::sync::Once`-guarded *and* application-scoped (already noted
+in §4.2 — extended here: the guard is necessary but insufficient; the global *write*
+must also be restricted to the `FromEnv`/standalone path), and (ii) do NOT park OTel
+config where `reset_runtime_state` destroys it. **Scope the OTel handle per
+`EvalContext`** (like the eval/call callbacks already are), NOT in a thread-local or
+global — that matches the documented per-interpreter isolation contract
+(`embedding.md`) and survives `build()`.
+
+**(e) Drop-safety inside a host async context.** A host may call Sema from inside its
+own tokio runtime (the MCP-server drop-panic case in `http.rs:11-16` is a real, hit
+scenario). If Sema self-installs (`FromEnv`), its `OtelGuard::drop`
+flush+shutdown must mirror `BlockingRuntime`'s non-blocking-`Drop` /
+`shutdown_background` discipline (`http.rs:35-41`) and never block on the host's
+runtime thread. In `UseHostGlobal`/`OwnProvider` modes Sema installs no guard at all,
+so there is nothing to shut down — the host owns it.
+
+**(f) Send/!Send + LLM-state caveats.** The eval path is `Rc`-based and `!Send`
+(`Value`/`Env`/`EvalContext`); OTel plumbing must not require `Send`/`Sync` on the
+eval path — the facade already hands only plain `Send` `ResponseFacts` to the export
+thread (§3.4), keep it that way. Note also that GenAI/LLM telemetry granularity is
+inherently **per-thread**, not per-interpreter: the provider registry / usage /
+budgets it draws from are thread-local (`builtins.rs:29-97`) and shared across all
+interpreters on a thread. Decision #7's zero-`observe-llm` coupling already keeps the
+span layer thin here; just be aware the *data source* is per-thread.
+
+**Mode-2 API/config surface (additive to §4):**
+- `sema-otel` facade gains a non-installing init variant:
+  `sema_otel::use_host_global()` (read `global`, no install) and
+  `sema_otel::use_provider(SdkTracerProvider)` (BYO, no install). `init_from_env()`
+  remains the **only** function that may call `set_tracer_provider`, documented
+  application-only.
+- Facade tracer resolution switches to lazy `global::tracer_with_scope("sema")`.
+- Root-span constructors (`vm_span`/`agent_span`, and `llm_span` when no Sema parent
+  exists) seed parent from `Context::current()`.
+- `InterpreterBuilder::with_telemetry(TelemetryMode)` where
+  `TelemetryMode ∈ { Off (default), UseHostGlobal, OwnProvider(SdkTracerProvider),
+  FromEnv }`; `Interpreter::new()`/`build()` stay a guaranteed no-op that never touches
+  global OTel state. Store the chosen scope per `EvalContext`.
+- `website/docs/embedding.md` documents: hosts own init + shutdown; Sema never
+  installs a global provider on its own; the four `TelemetryMode`s and the
+  parent-nesting behavior.
+
+### 9.3 Mode 3 — WASM / browser (sema.run)
+
+The standalone export machinery is **structurally impossible** on
+`wasm32-unknown-unknown`, and three locked decisions cannot hold there as written:
+
+- **No OS threads** → the thread-based `BatchSpanProcessor` (Decision #6 / §3.3a, the
+  "dedicated background OS thread") cannot exist. WASM is single-threaded `Rc`; the
+  only concurrency is the JS event loop + an optional Web Worker.
+- **No `tokio`, no `reqwest`** in the wasm dependency closure → neither OTLP transport
+  from Decision #8 (`http-proto` via reqwest-blocking, `grpc-tonic`) can build. The
+  reqwest path additionally fails to *compile* (wasm `reqwest::Response` /
+  `JsFuture` internals are `!Send`, violating the exporter's `Send + Sync` bounds —
+  upstream `open-telemetry/opentelemetry-rust#3155`, still open, no committed fix).
+- **No filesystem** → `SEMA_OTEL_FILE` (Decision #6 / §3.3f) has no target; the wasm
+  VFS is in-memory `BTreeMap` only.
+- **`std::time::Instant` panics** on wasm32 ("time not implemented") — any duration
+  math would have to route through `js_sys::Date` / `performance.now()`.
+
+Crucially, **there is nothing to observe in the browser anyway**: `sema-llm` is fully
+compiled out of wasm (`register_llm_builtins` is `#[cfg(not(target_arch="wasm32"))]`
+at `eval.rs:65`; `sema-llm` depends unconditionally on tokio+reqwest), so the entire
+GenAI span surface this plan instruments has **no source** in the wasm build. The
+`http`/`io`/`server`/etc. stdlib modules are likewise `cfg(not(wasm32))`-gated
+(`sema-stdlib/src/lib.rs:11-38`).
+
+**Recommended minimal viable behavior (MVP): pure compile-out no-op.** Under
+`cfg(target_arch = "wasm32")` the `sema-otel` facade compiles to no-op spans
+(constructors return `None`-holding spans; `otel/span` / `otel/event` remain callable
+and inert in the playground), and **none** of `opentelemetry-otlp` / `tokio` /
+`std::fs` / `BatchSpanProcessor` is linked. This mirrors the existing `sema-llm` wasm
+exclusion, keeps the sema.run bundle small, dodges #3155 / the `Instant` panic / the
+missing-fs problem, and is the correct default per Decision #6. Re-scope the
+standalone decisions for wasm: "always compile both OTLP transports" becomes "on
+**native non-wasm** targets"; the `SEMA_OTEL_FILE` JSONL fallback is a no-op on wasm.
+`sema-core` must stay a tokio-free leaf (§3.1 already states this) — do not let any
+otel dep reach it.
+
+**Nicer option (post-MVP, only if browser tracing is ever wanted): a JS-callback
+bridge, not in-wasm export.** Expose a wasm-only sink, e.g. `setSpanSink(fn)` /
+`setOtelSink(fn)`, mirroring the existing `setOutputSink(fn)` (`lib.rs:2803`) and
+`registerFn(name, fn)` (`lib.rs:2437`) callback pattern (store a `js_sys::Function`
+in a thread-local). Sema emits each finished span as a plain JS object (name,
+trace/span/parent ids, `performance.now()`-based timing, attributes incl. `gen_ai.*`)
+to that callback; the host page forwards them to its own
+`@opentelemetry/sdk-trace-web` + `exporter-trace-otlp-http` SDK, which already solves
+OTLP-JSON encoding, batching tuned for page-unload, retry, CORS, CSP, and W3C
+context. This is the idiomatic Rust-wasm pattern (`tracing-wasm`/`tracing-web` are all
+JS-bridge layers, none export OTel from inside wasm) and needs no new heavy deps —
+`sema-wasm`'s `Cargo.toml` already enables the `web-sys` fetch features. Reuse the
+SpanData→stable-JSON serializer written for the `SEMA_OTEL_FILE` exporter (one
+schema, two sinks). A Rust-side in-wasm `fetch` exporter (`SimpleSpanProcessor` +
+hand-written `web_sys::fetch` exporter + `web-time` + `spawn_local` to dodge `!Send`)
+is technically possible but is the **last-resort, high-maintenance** path — prefer the
+JS bridge.
+
+**Mode-3 API/config surface:**
+- MVP: **zero new surface.** Rely on `cfg(target_arch = "wasm32")` gating; add a
+  build-regression test asserting `sema-wasm` builds with the otel facade present,
+  produces a no-op, and links no tokio/otlp (the Vercel-Edge bundler pitfall — never
+  rely on runtime detection).
+- Post-MVP bridge: a wasm-only `setSpanSink(js_sys::Function)` on the `SemaInterpreter`
+  wasm interface + a `JsBridgeExporter` behind `cfg(target_arch = "wasm32")`.
+
+### 9.4 Open decisions for the owner — RESOLVED 2026-06-21
+
+All six were answered by the owner and promoted to locked decisions in §0:
+Q#1 → **#11** (wasm = compile-out no-op, JS bridge deferred);
+Q#2 → **#12** (embedded default = attach to host's ambient provider);
+Q#3 → **#13** (commit to `Context::current()` trace continuity);
+Q#4 → **#14** (`build()` never owns the provider);
+Q#5 → **#15** (direct-OTel only, no `tracing`-bridge variant in v1);
+Q#6 → **#16** (env config defers to a host-installed global provider).
+
+The original framing is preserved below for context.
+
+1. **WASM MVP scope.** Confirm wasm/JS = **pure compile-out no-op** for v1, deferring
+   the JS-bridge exporter until in-browser LLM/agent runs exist (recommended). I.e.
+   we are NOT building the JS bridge now.
+2. **Embedded default policy.** Should an embedded `Interpreter` **by default** attach
+   to the host's ambient/global provider (recommended — Sema spans "just appear" in a
+   host that already runs OTel; silent if the host installed nothing), or stay fully
+   inert unless the host explicitly calls `.with_telemetry(…)`?
+3. **Trace-context continuity commitment.** Do we commit to seeding the facade's
+   parent from `opentelemetry::Context::current()` (§9.2c)? It is the single
+   highest-value embedded behavior but couples `sema-otel` directly to the
+   `opentelemetry` `Context` API (vs. §3.4's deliberately minimal facade).
+4. **Provider/shutdown ownership contract.** Confirm `build()` NEVER installs or shuts
+   down a provider, and that in the `FromEnv` self-install path the `OtelGuard` is
+   handed back to the host to own (so `reset_runtime_state` on every build cannot
+   leak/duplicate providers).
+5. **`tracing`-bridge variant (embedded ergonomics).** §3.1 picked raw
+   `opentelemetry`. Most Rust hosts standardize on the `tracing` crate +
+   `tracing-opentelemetry` (wasmtime/sqlx/reqwest/tonic all emit `tracing` only). Do
+   we stay direct-OTel-only (host sees raw OTel spans, parented via `Context`), or also
+   ship an optional `tracing`-feature variant that re-emits the same `gen_ai.*` spans
+   as `tracing` spans (with `otel.kind`/`gen_ai.*` fields) for auto-nesting in a host's
+   existing subscriber? (Caveat: `tracing-opentelemetry` materializes the OTel span at
+   tracing-span *close*, so SpanContext can't be read back mid-span.) Affects embedded
+   ergonomics only.
+6. **Host-provider-already-installed precedence.** If a host has set a global provider
+   AND Sema is also configured via env (`SEMA_OTEL_*` present) in `FromEnv` mode,
+   should Sema detect the existing provider and **decline to overwrite** (defer to
+   host), warn, or proceed? Need the precedence rule between host-installed provider
+   and Sema env config.
