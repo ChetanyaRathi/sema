@@ -466,6 +466,12 @@ fn main() {
 
     let cli = Cli::parse();
 
+    // Opt-in OpenTelemetry: installs a provider only when SEMA_OTEL_FILE or an OTLP
+    // endpoint is configured (zero-cost no-op otherwise). Held for the process
+    // lifetime; its Drop does the bounded flush+shutdown on normal return. (The JSONL
+    // file exporter writes synchronously, so it survives a `std::process::exit` too.)
+    let _otel_guard = sema_otel::init_from_env();
+
     let sandbox = match &cli.sandbox {
         Some(value) => sema_core::Sandbox::parse_cli(value).unwrap_or_else(|e| {
             eprintln!("Error: {e}");
