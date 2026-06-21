@@ -1,0 +1,34 @@
+[package]
+name = "sema-otel"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "OpenTelemetry GenAI tracing facade for the Sema runtime"
+
+[dependencies]
+sema-core = { workspace = true }
+serde_json = { workspace = true }
+
+# OTel is native-only — mirrors the sema-llm wasm exclusion. On wasm32 the facade
+# compiles to no-op spans and links none of the export machinery (Decision #11).
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+opentelemetry = "0.32"
+opentelemetry_sdk = { version = "0.32", features = ["trace", "metrics"] }
+opentelemetry-otlp = { version = "0.32", default-features = false, features = [
+    "trace",
+    "metrics",
+    "http-proto",
+    "http-json",
+    "reqwest-blocking-client",
+    "grpc-tonic",
+] }
+opentelemetry-semantic-conventions = { version = "0.32", features = [
+    "semconv_experimental",
+] }
+# A live tokio reactor is needed ONLY to construct the gRPC (tonic) exporter.
+tokio = { workspace = true }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+opentelemetry_sdk = { version = "0.32", features = ["trace", "metrics", "testing"] }
