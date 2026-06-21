@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.20.2
+
+Bugfix release. Fixes silent integer corruption in the VM's inline add/subtract, found by the grammar fuzzer's new metamorphic oracle.
+
+### Fixed
+
+- **Silent integer corruption: inline `+`/`-` truncated results past ±2⁴⁴ (~17.5 trillion).** The branchless small-int fast paths for the 2-argument inline `ADD_INT`/`SUB_INT` opcodes did raw-bit arithmetic and masked the result to the 45-bit NaN-box payload with no overflow check, so any runtime add or subtract whose result crossed the small-int boundary was silently wrapped/truncated — e.g. `(let ((a 9000000000000)) (+ a a))` returned `-17184372088832` instead of `18000000000000`. They now sign-extend to `i64` and build the result through `Value::int`, which promotes to a boxed integer on overflow (matching `MUL_INT`, which was already correct). Small ints stay unboxed immediates; literal operands were unaffected (constant-folded at compile time), which is why it went unnoticed. Found by the in-language grammar fuzzer's metamorphic distributivity law (`a*(b+c) == a*b + a*c`).
+
 ## 1.20.1
 
 Bugfix release. Fixes a VM crash on valid code, found by a new in-language grammar fuzzer.
