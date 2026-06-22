@@ -1395,9 +1395,11 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
         let mut temperature = None;
         let mut system = None;
         let mut reasoning_effort = None;
+        let mut conv_scope = ConvScope::default();
 
         if let Some(opts_val) = args.get(1) {
             if let Some(opts) = opts_val.as_map_rc() {
+                conv_scope = ConvScope::from_opts(Some(&opts));
                 model = get_opt_string(&opts, "model").unwrap_or_default();
                 max_tokens = get_opt_u32(&opts, "max-tokens");
                 temperature = get_opt_f64(&opts, "temperature");
@@ -1405,6 +1407,16 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
                 reasoning_effort = get_opt_effort(&opts, "reasoning-effort");
             }
         }
+
+        // Honor a caller-supplied conversation/session/user identity (else do_complete
+        // generates a fresh conversation id).
+        let _conv = conv_scope.conversation.as_ref().map(|c| {
+            sema_otel::set_conversation_scope(
+                c,
+                conv_scope.session.as_deref(),
+                conv_scope.user.as_deref(),
+            )
+        });
 
         let messages = vec![ChatMessage::new("user", prompt_text)];
 
@@ -1440,9 +1452,11 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
             let mut tools: Vec<Value> = Vec::new();
             let mut tool_mode = "auto".to_string();
             let mut max_tool_rounds = 10usize;
+            let mut conv_scope = ConvScope::default();
 
             if let Some(opts_val) = args.get(1) {
                 if let Some(opts) = opts_val.as_map_rc() {
+                    conv_scope = ConvScope::from_opts(Some(&opts));
                     model = get_opt_string(&opts, "model").unwrap_or_default();
                     max_tokens = get_opt_u32(&opts, "max-tokens");
                     temperature = get_opt_f64(&opts, "temperature");
@@ -1490,6 +1504,7 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
                     max_tool_rounds,
                     None,
                     None,
+                    conv_scope,
                 )?;
                 Ok(Value::string(&result))
             }
@@ -1561,6 +1576,15 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
         request.system = system;
 
         // Streaming bypasses do_complete/track_usage, so it gets its own CLIENT span.
+        let _conv = if sema_otel::current_conversation_id().is_none() {
+            Some(sema_otel::set_conversation_scope(
+                &sema_otel::new_conversation_id(),
+                None,
+                None,
+            ))
+        } else {
+            None
+        };
         let span = sema_otel::llm_span("chat");
         span.set_request(
             request.temperature,
@@ -1568,6 +1592,7 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
             &request.stop_sequences,
             None,
         );
+        span.set_output_type(false);
 
         let response = with_provider(|p| {
             if request.model.is_empty() {
@@ -1585,9 +1610,13 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
                     Ok(())
                 };
                 let req_model = req.model.clone();
-                let resp = p
-                    .stream_complete(req, &mut chunk_cb)
-                    .map_err(|e| SemaError::Llm(e.to_string()))?;
+                let resp = match p.stream_complete(req, &mut chunk_cb) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        span.record_error(llm_error_kind(&e), &e.to_string());
+                        return Err(SemaError::Llm(e.to_string()));
+                    }
+                };
                 span.set_dispatch(p.name(), &req_model);
                 span.set_response(&response_facts(p.name(), &resp));
                 Ok(resp)
@@ -1603,9 +1632,13 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
                     }
                     Ok(())
                 };
-                let resp = p
-                    .stream_complete(request.clone(), &mut chunk_cb)
-                    .map_err(|e| SemaError::Llm(e.to_string()))?;
+                let resp = match p.stream_complete(request.clone(), &mut chunk_cb) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        span.record_error(llm_error_kind(&e), &e.to_string());
+                        return Err(SemaError::Llm(e.to_string()));
+                    }
+                };
                 span.set_dispatch(p.name(), &request.model);
                 span.set_response(&response_facts(p.name(), &resp));
                 Ok(resp)
@@ -2225,6 +2258,7 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
             agent.max_turns,
             on_tool_call.as_ref(),
             Some(&agent.name),
+            ConvScope::from_opts(opts.as_ref()),
         )?;
 
         // 3-arg form with opts: return {:response "..." :messages [...]}
@@ -2521,9 +2555,13 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
         let span = sema_otel::llm_span("embeddings");
         let req_model = request.model.clone().unwrap_or_default();
         let response = with_embedding_provider(|p| {
-            let resp = p
-                .embed(request)
-                .map_err(|e| SemaError::Llm(e.to_string()))?;
+            let resp = match p.embed(request) {
+                Ok(r) => r,
+                Err(e) => {
+                    span.record_error(llm_error_kind(&e), &e.to_string());
+                    return Err(SemaError::Llm(e.to_string()));
+                }
+            };
             span.set_dispatch(p.name(), &req_model);
             span.set_response(&sema_otel::ResponseFacts {
                 input_tokens: resp.usage.prompt_tokens,
@@ -4208,13 +4246,65 @@ fn response_facts(provider: &str, resp: &ChatResponse) -> sema_otel::ResponseFac
     }
 }
 
-/// Flatten chat messages into a `role: content` text blob for opt-in content capture.
-fn messages_text(messages: &[ChatMessage]) -> String {
-    messages
+/// Per-message content cap (chars) for opt-in content capture, applied BEFORE JSON
+/// encoding so truncation never splits the JSON.
+const CONTENT_FIELD_MAX: usize = 8192;
+
+fn truncate_content(s: &str) -> String {
+    if s.len() <= CONTENT_FIELD_MAX {
+        s.to_string()
+    } else {
+        let mut t: String = s.chars().take(CONTENT_FIELD_MAX).collect();
+        t.push_str("…[truncated]");
+        t
+    }
+}
+
+/// Encode chat messages as the GenAI structured-message JSON array
+/// `[{"role":..,"parts":[{"type":"text","content":..}]}]` for opt-in content capture.
+fn messages_json(messages: &[ChatMessage]) -> String {
+    let arr: Vec<serde_json::Value> = messages
         .iter()
-        .map(|m| format!("{}: {}", m.role, m.content.to_text()))
-        .collect::<Vec<_>>()
-        .join("\n")
+        .map(|m| {
+            serde_json::json!({
+                "role": m.role,
+                "parts": [{"type": "text", "content": truncate_content(&m.content.to_text())}],
+            })
+        })
+        .collect();
+    serde_json::Value::Array(arr).to_string()
+}
+
+/// Encode a single role/content turn as the structured-message JSON array.
+fn content_json(role: &str, content: &str) -> String {
+    serde_json::json!([{
+        "role": role,
+        "parts": [{"type": "text", "content": truncate_content(content)}],
+    }])
+    .to_string()
+}
+
+/// Conversation / session / user identity threaded into the agent + completion spans.
+#[derive(Default, Clone)]
+struct ConvScope {
+    conversation: Option<String>,
+    session: Option<String>,
+    user: Option<String>,
+}
+
+impl ConvScope {
+    /// Read `:conversation-id` / `:session-id` / `:user-id` from an options map.
+    fn from_opts(opts: Option<&Rc<BTreeMap<Value, Value>>>) -> Self {
+        let get = |k: &str| {
+            opts.and_then(|o| o.get(&Value::keyword(k)))
+                .and_then(|v| v.as_str().map(|s| s.to_string()))
+        };
+        ConvScope {
+            conversation: get("conversation-id"),
+            session: get("session-id"),
+            user: get("user-id"),
+        }
+    }
 }
 
 /// Classify an `LlmError` for the `error.type` span attribute.
@@ -4231,6 +4321,17 @@ fn llm_error_kind(e: &crate::types::LlmError) -> &'static str {
 }
 
 fn do_complete(request: ChatRequest) -> Result<ChatResponse, SemaError> {
+    // Standalone completions get their own conversation id so every chat span carries
+    // gen_ai.conversation.id; agent-nested completions inherit the agent's scope.
+    let _conv = if sema_otel::current_conversation_id().is_none() {
+        Some(sema_otel::set_conversation_scope(
+            &sema_otel::new_conversation_id(),
+            None,
+            None,
+        ))
+    } else {
+        None
+    };
     // One CLIENT span per completion. Started here (before cache lookup) so a cache
     // hit still gets a span; request attrs are known up front, provider/model/usage
     // are filled in deeper where they're resolved.
@@ -4241,6 +4342,7 @@ fn do_complete(request: ChatRequest) -> Result<ChatResponse, SemaError> {
         &request.stop_sequences,
         request.reasoning_effort.as_deref(),
     );
+    span.set_output_type(request.json_mode);
     // Reset the serving-provider stamp so a cache hit (which serves no provider) doesn't
     // inherit a stale name from a prior completion.
     LAST_SERVING_PROVIDER.with(|p| *p.borrow_mut() = None);
@@ -4467,9 +4569,13 @@ fn do_complete_with_provider(
         span.set_dispatch(&entry.provider, &request.model);
         span.set_response(&response_facts(&entry.provider, &resp));
         span.set_messages(
-            &messages_text(&request.messages),
-            &resp.content,
-            request.system.as_deref(),
+            &messages_json(&request.messages),
+            &content_json("assistant", &resp.content),
+            request
+                .system
+                .as_deref()
+                .map(|s| content_json("system", s))
+                .as_deref(),
         );
         Ok(resp)
     })
@@ -4493,9 +4599,13 @@ fn do_complete_uncached(
         span.set_dispatch(p.name(), &request.model);
         span.set_response(&response_facts(p.name(), &resp));
         span.set_messages(
-            &messages_text(&request.messages),
-            &resp.content,
-            request.system.as_deref(),
+            &messages_json(&request.messages),
+            &content_json("assistant", &resp.content),
+            request
+                .system
+                .as_deref()
+                .map(|s| content_json("system", s))
+                .as_deref(),
         );
         Ok(resp)
     })
@@ -4676,7 +4786,17 @@ fn run_tool_loop(
     max_rounds: usize,
     on_tool_call: Option<&Value>,
     agent_name: Option<&str>,
+    ids: ConvScope,
 ) -> Result<(String, Vec<ChatMessage>), SemaError> {
+    // Open the conversation/session/user scope FIRST so the agent span and every
+    // nested chat/tool span carry the same gen_ai.conversation.id (+ session.id /
+    // user.id). A caller-supplied id wins; otherwise generate a fresh one.
+    let conv = ids
+        .conversation
+        .clone()
+        .unwrap_or_else(sema_otel::new_conversation_id);
+    let _conv_scope =
+        sema_otel::set_conversation_scope(&conv, ids.session.as_deref(), ids.user.as_deref());
     // INTERNAL agent span over the whole loop; the per-round `chat` spans (from
     // do_complete) and per-tool spans nest under it via the thread-local stack.
     let _agent_span = sema_otel::agent_span(agent_name);

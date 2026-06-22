@@ -19,6 +19,24 @@ pub fn init_from_env() -> Option<OtelGuard> {
 /// No-op on wasm.
 pub fn use_host_global() {}
 
+pub struct ConversationGuard;
+
+pub fn set_conversation_scope(
+    _conversation_id: &str,
+    _session_id: Option<&str>,
+    _user_id: Option<&str>,
+) -> ConversationGuard {
+    ConversationGuard
+}
+
+pub fn current_conversation_id() -> Option<String> {
+    None
+}
+
+pub fn new_conversation_id() -> String {
+    String::new()
+}
+
 pub struct LlmSpan;
 
 pub fn llm_span(_op: &'static str) -> LlmSpan {
@@ -34,6 +52,7 @@ impl LlmSpan {
         _reasoning_effort: Option<&str>,
     ) {
     }
+    pub fn set_output_type(&self, _json: bool) {}
     pub fn set_dispatch(&self, _sema_provider: &str, _request_model: &str) {}
     pub fn set_response(&self, _facts: &ResponseFacts) {}
     pub fn set_conversation_id(&self, _id: &str) {}

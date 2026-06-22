@@ -91,6 +91,23 @@ Key span attributes: `gen_ai.operation.name`, `gen_ai.provider.name`,
 `gen_ai.usage.cost_usd`, and `gen_ai.cache.hit` on cached responses. Tool spans carry
 `gen_ai.tool.name` / `gen_ai.tool.call.id` / `gen_ai.tool.type`.
 
+### Sessions & users (multi-turn grouping)
+
+Every span carries a `gen_ai.conversation.id` (auto-generated per run, or supplied by
+you). For session-aware backends like **Langfuse**, Sema also emits `session.id` and
+`user.id`, so a multi-turn conversation groups into a single
+[Session](https://langfuse.com/docs/observability/features/sessions):
+
+```sema
+(agent/run bot "what is 2 + 3?"  {:session-id "chat-42" :user-id "alice"})
+(agent/run bot "now add 10"      {:session-id "chat-42" :user-id "alice"})
+;; → both traces appear under one Langfuse session "chat-42", attributed to alice
+```
+
+`agent/run`, `llm/chat`, and `llm/complete` accept `:conversation-id`, `:session-id`,
+and `:user-id` options. `:session-id` defaults to the conversation id when omitted; a
+standalone completion gets a fresh conversation id automatically.
+
 ### Metrics
 
 When exporting over OTLP, two GenAI histograms are recorded:

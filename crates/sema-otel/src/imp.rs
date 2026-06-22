@@ -79,6 +79,80 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 thread_local! {
     /// Active-span stack for parent/child nesting in the single-threaded VM.
     static STACK: RefCell<Vec<Context>> = const { RefCell::new(Vec::new()) };
+    /// Current GenAI conversation / session / user identity, applied to every span
+    /// started while a scope is active (set by agent runs + standalone completions).
+    static CONVERSATION_ID: RefCell<Option<String>> = const { RefCell::new(None) };
+    static SESSION_ID: RefCell<Option<String>> = const { RefCell::new(None) };
+    static USER_ID: RefCell<Option<String>> = const { RefCell::new(None) };
+    static CONV_COUNTER: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// RAII scope for the conversation/session/user identity. Restores the PREVIOUS
+/// values on drop so a standalone completion nested inside an agent run cannot wipe
+/// the agent's id.
+pub struct ConversationGuard {
+    prev_conv: Option<String>,
+    prev_session: Option<String>,
+    prev_user: Option<String>,
+}
+
+impl Drop for ConversationGuard {
+    fn drop(&mut self) {
+        CONVERSATION_ID.with(|c| *c.borrow_mut() = self.prev_conv.take());
+        SESSION_ID.with(|c| *c.borrow_mut() = self.prev_session.take());
+        USER_ID.with(|c| *c.borrow_mut() = self.prev_user.take());
+    }
+}
+
+/// Open a conversation scope. `session_id` defaults to the conversation id (so a single
+/// run groups in session-aware backends like Langfuse); `user_id` is inherited when
+/// `None`. Every span started while the returned guard is alive carries
+/// `gen_ai.conversation.id` (+ `session.id` / `user.id` for Langfuse).
+pub fn set_conversation_scope(
+    conversation_id: &str,
+    session_id: Option<&str>,
+    user_id: Option<&str>,
+) -> ConversationGuard {
+    let prev_conv = CONVERSATION_ID.with(|c| c.borrow_mut().replace(conversation_id.to_string()));
+    let session = session_id
+        .map(str::to_string)
+        .unwrap_or_else(|| conversation_id.to_string());
+    let prev_session = SESSION_ID.with(|c| c.borrow_mut().replace(session));
+    let prev_user = USER_ID.with(|c| {
+        let mut b = c.borrow_mut();
+        let prev = b.clone();
+        if let Some(u) = user_id {
+            *b = Some(u.to_string());
+        }
+        prev
+    });
+    ConversationGuard {
+        prev_conv,
+        prev_session,
+        prev_user,
+    }
+}
+
+/// The conversation id of the active scope, if any.
+pub fn current_conversation_id() -> Option<String> {
+    CONVERSATION_ID.with(|c| c.borrow().clone())
+}
+
+/// Generate a fresh, cheap conversation id (monotonic counter mixed with wall-clock).
+pub fn new_conversation_id() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    let c = CONV_COUNTER.with(|c| {
+        let v = c.get().wrapping_add(1);
+        c.set(v);
+        v
+    });
+    format!(
+        "conv_{:016x}",
+        nanos ^ c.wrapping_mul(0x9E37_79B9_7F4A_7C15)
+    )
 }
 
 /// OTel schema version our `gen_ai.*` attributes conform to (GenAI semconv baseline).
@@ -406,7 +480,18 @@ fn start(name: String, kind: SpanKind, attrs: Vec<KeyValue>) -> Option<SpanCore>
         .start_with_context(&tracer, &parent);
     let ctx = parent.with_span(span);
     STACK.with(|s| s.borrow_mut().push(ctx.clone()));
-    Some(SpanCore { ctx })
+    let core = SpanCore { ctx };
+    // Apply the active conversation/session/user identity to EVERY span uniformly.
+    if let Some(id) = CONVERSATION_ID.with(|c| c.borrow().clone()) {
+        core.set_str("gen_ai.conversation.id", id);
+    }
+    if let Some(id) = SESSION_ID.with(|c| c.borrow().clone()) {
+        core.set_str("session.id", id); // Langfuse session grouping
+    }
+    if let Some(id) = USER_ID.with(|c| c.borrow().clone()) {
+        core.set_str("user.id", id); // Langfuse user attribution
+    }
+    Some(core)
 }
 
 /// Whether message-content capture is enabled (off by default). Standard flag with a
@@ -419,10 +504,10 @@ fn capture_content() -> bool {
         .unwrap_or(false)
 }
 
-/// Truncate + prototype-pollution-guard message content before it becomes a span
-/// attribute. Cheap and panic-proof (runs on the calling thread).
+/// Backstop cap for already-per-field-truncated structured content before it becomes a
+/// span attribute. Cheap and panic-proof (runs on the calling thread).
 fn scrub(s: &str) -> String {
-    const MAX: usize = 8192;
+    const MAX: usize = 65_536;
     if s.len() <= MAX {
         s.to_string()
     } else {
@@ -482,6 +567,13 @@ impl LlmSpan {
             if let Some(r) = reasoning_effort {
                 c.set_str("sema.gen_ai.request.reasoning_effort", r.to_string());
             }
+        }
+    }
+
+    /// Set `gen_ai.output.type` (`json` when JSON mode is requested, else `text`).
+    pub fn set_output_type(&self, json: bool) {
+        if let Some(c) = &self.inner {
+            c.set_str("gen_ai.output.type", if json { "json" } else { "text" });
         }
     }
 

@@ -37,6 +37,15 @@ fn content_capture_when_opted_in() {
     let output = span["attributes"]["gen_ai.output.messages"]
         .as_str()
         .expect("output messages captured");
-    assert!(input.contains("what is the answer?"), "input: {input}");
-    assert!(output.contains("the answer is 42"), "output: {output}");
+
+    // Structured GenAI message shape: [{"role","parts":[{"type":"text","content"}]}].
+    let input_json: serde_json::Value = serde_json::from_str(input).expect("input is JSON");
+    let first = &input_json[0];
+    assert_eq!(first["role"], "user");
+    assert_eq!(first["parts"][0]["type"], "text");
+    assert_eq!(first["parts"][0]["content"], "what is the answer?");
+
+    let output_json: serde_json::Value = serde_json::from_str(output).expect("output is JSON");
+    assert_eq!(output_json[0]["role"], "assistant");
+    assert_eq!(output_json[0]["parts"][0]["content"], "the answer is 42");
 }

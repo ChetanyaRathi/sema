@@ -59,6 +59,14 @@ fn llm_completion_emits_genai_chat_span() {
     assert_eq!(ping["attributes"]["gen_ai.request.model"], "fake-model");
     assert_eq!(ping["attributes"]["gen_ai.response.model"], "fake-model");
     assert_eq!(ping["attributes"]["gen_ai.usage.output_tokens"], 3);
+    // Standalone completion gets a generated conversation id + output type.
+    assert!(
+        ping["attributes"]["gen_ai.conversation.id"]
+            .as_str()
+            .is_some_and(|c| c.starts_with("conv_")),
+        "standalone chat span carries a generated conversation id"
+    );
+    assert_eq!(ping["attributes"]["gen_ai.output.type"], "text");
     assert_eq!(
         ping["attributes"]["gen_ai.response.finish_reasons"],
         json!(["end_turn"])

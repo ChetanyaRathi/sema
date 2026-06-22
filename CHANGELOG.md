@@ -24,6 +24,15 @@
   in. Embedded hosts keep ownership: Sema never installs a global provider on its own
   and nests under the host's current span. wasm builds compile the facade out to a
   no-op. Docs: `website/docs/llm/observability.md`.
+  - **Production hardening (post-MVP):** gRPC OTLP export now actually works (was a
+    latent no-op — the tonic exporter ran on the static async runtime); spans/metrics
+    carry `gen_ai.conversation.id` plus `session.id` / `user.id` so multi-turn runs
+    group into **Langfuse Sessions** (`:conversation-id` / `:session-id` / `:user-id`
+    options on `agent/run`, `llm/chat`, `llm/complete`); message content is captured in
+    the structured GenAI JSON shape; streaming + embeddings spans now record errors;
+    `gen_ai.output.type` is emitted; and the instrumentation scope + Resource are
+    enriched (schema URL, service version, runtime). Verified live against a
+    self-hosted Langfuse via an OTel Collector (HTTP + gRPC).
 
 - **Prompt-cache token reporting across providers.** `llm/last-usage` and `llm/session-usage` now expose `:cache-read-tokens` and `:cache-creation-tokens`, surfacing how many input tokens were served from (or written to) the provider's prompt cache. Wired through every first-party provider for both non-streaming and streaming responses: OpenAI/OpenAI-compatible (`prompt_tokens_details.cached_tokens` — implicit cache), Gemini (`cachedContentTokenCount` — implicit cache on 2.5+), and Anthropic (`cache_read_input_tokens` / `cache_creation_input_tokens`, reported separately from input tokens). Session counters accumulate cache tokens; custom Sema-defined providers can report them via `:cache-read-tokens` / `:cache-creation-tokens` in their usage map. Verified live (OpenAI and Gemini implicit cache reads observed on repeated long prefixes) and with a deterministic FakeProvider regression test. Cached reads are reported for visibility but not yet discounted in `:cost-usd`.
 

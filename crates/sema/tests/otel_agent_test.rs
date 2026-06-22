@@ -78,4 +78,19 @@ fn agent_run_emits_agent_tool_chat_tree() {
         assert_eq!(c["trace_id"], trace_id);
         assert_eq!(c["kind"], "client");
     }
+
+    // Every span in the run shares ONE non-empty gen_ai.conversation.id, and a Langfuse
+    // session.id is set to match (so the whole agent run groups into one session).
+    let conv = agent["attributes"]["gen_ai.conversation.id"]
+        .as_str()
+        .expect("agent span carries a conversation id");
+    assert!(conv.starts_with("conv_"), "generated conversation id: {conv}");
+    assert_eq!(agent["attributes"]["session.id"], conv);
+    for s in [tool].into_iter().chain(chats.iter().copied()) {
+        assert_eq!(
+            s["attributes"]["gen_ai.conversation.id"], conv,
+            "all spans share the agent's conversation id"
+        );
+        assert_eq!(s["attributes"]["session.id"], conv);
+    }
 }
