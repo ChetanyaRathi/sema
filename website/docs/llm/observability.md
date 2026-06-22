@@ -23,9 +23,9 @@ If OpenTelemetry is new to you, the terms used below:
   — the agreed attribute names for LLM telemetry (token counts, model, cost, …) — so
   these tools understand the data with no per-tool glue.
 
-Tracing is **off by default**. If you set no endpoint and no file, Sema installs nothing
-and the tracing code does nothing. A slow or unreachable backend can never block, delay,
-or crash your script — exports happen on a background thread with a bounded queue.
+Tracing is **off by default** — if you don't point Sema at a backend or a file, it
+records nothing. And once it's on, a slow or unreachable backend can never block, delay,
+or crash your script: telemetry is sent in the background, out of the way of your run.
 
 ## How to turn it on
 
@@ -95,8 +95,8 @@ for how to set them). The `OTEL_*` names come from OpenTelemetry itself; the
 | `OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT` | Set to `true` to also record the **prompt and response text** (off by default — see [Privacy](#privacy)). Sema also accepts the shorter alias `SEMA_OTEL_CAPTURE_CONTENT`. |
 | `OTEL_BSP_MAX_QUEUE_SIZE`, `OTEL_BSP_MAX_EXPORT_BATCH_SIZE`, `OTEL_BSP_SCHEDULE_DELAY` | Advanced: tune the background export batching. The defaults are fine for most uses. |
 
-Both network transports (HTTP and gRPC) are built in; switch with
-`OTEL_EXPORTER_OTLP_PROTOCOL` — no rebuild needed.
+Sema can send over HTTP or gRPC; choose with `OTEL_EXPORTER_OTLP_PROTOCOL`. HTTP (the
+default) is what most backends accept — only switch to gRPC if yours requires it.
 
 ### Writing to a file instead of a backend
 

@@ -56,7 +56,7 @@ Reset session usage counters.
 Sema tracks LLM costs using pricing data from these sources, checked in this order:
 
 1. **Custom pricing** — set via `(llm/set-pricing "model" input output)`, always wins
-2. **Embedded snapshot** — a [models.dev](https://models.dev) price list (2,400+ models) vendored and compiled into the binary, so cost tracking works fully offline with no runtime network calls
+2. **Bundled price list** — a [models.dev](https://models.dev) snapshot (2,400+ models) that ships with Sema, so cost tracking works fully offline with no network calls
 3. **Unknown** — if no source matches, cost tracking returns `nil` and budget enforcement is best-effort
 
 The embedded snapshot is refreshed by maintainers with `make update-pricing` and shipped in patch releases. Prices are matched by model id, preferring the canonical first-party listing; when the serving provider is known (e.g. inside an `llm/with-fallback` chain), a reseller/gateway that lists the same model at a different rate is priced correctly.

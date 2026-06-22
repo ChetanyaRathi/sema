@@ -32,7 +32,7 @@ Manually configure a known provider with specific options.
 
 ### OpenAI-Compatible Providers
 
-Any provider with an OpenAI-compatible API can be registered by passing `:api-key` and `:base-url` with any provider name. No Rust code required.
+Any provider with an OpenAI-compatible API can be registered by passing `:api-key` and `:base-url` with any provider name — no custom code needed, just configuration.
 
 ```sema
 ;; Together AI

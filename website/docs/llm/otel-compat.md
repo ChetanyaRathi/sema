@@ -69,8 +69,8 @@ capture with `OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT=true` (see
 [Privacy](./observability#privacy)). Token counts, models, cost, and span types are
 always added.
 
-When `SEMA_OTEL_COMPAT` is unset, no extra attributes are written — the spans are exactly
-what you get on the [Tracing & Metrics](./observability) page, at no added cost.
+When `SEMA_OTEL_COMPAT` is unset, no extra attributes are written — the traces are exactly
+what you get on the [Tracing & Metrics](./observability) page.
 
 ## Per-tool setup
 
