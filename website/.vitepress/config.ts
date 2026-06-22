@@ -48,7 +48,7 @@ export default defineConfig({
           '- Clojure-style surface: `:keywords`, `{:k v}` maps, `[1 2 3]` vectors, `#(* % %)` lambdas, `f"...${x}"` strings, `#"regex"` literals.',
           '- LLMs are language primitives: `llm/complete`, `deftool`/`agent/run`, `llm/extract`, cassettes, OpenTelemetry, vector store.',
           '',
-          'The table of contents below indexes the full docs — fetch any `/docs/**/*.md` on demand, or read everything at [/llms-full.txt](https://sema-lang.com/llms-full.txt).',
+          'The table of contents below indexes the full docs — fetch only the specific `/docs/**/*.md` pages you need, on demand. Do not load `/llms-full.txt` (the full concatenation, ~200k tokens) into context.',
         ].join('\n'),
       }),
     ],

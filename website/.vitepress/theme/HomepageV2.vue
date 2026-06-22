@@ -428,7 +428,7 @@ messages = [{<span class="c-str">"role"</span>: <span class="c-str">"user"</span
             <span class="install">
             <span class="cmd-text">
               <span class="dollar">$</span>
-              <span id="i5">curl -fsSL https://sema-lang.com/docs/for-agents.md >> CLAUDE.md</span>
+              <span id="i5">curl -fsSL https://sema-lang.com/docs/for-agents.md >> AGENTS.md</span>
             </span>
             <button class="copy" @click="copyText('i5', $event)">copy</button>
           </span>

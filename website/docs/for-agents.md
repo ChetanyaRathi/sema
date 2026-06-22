@@ -9,9 +9,9 @@ aside: false
 If you already know a Lisp, this page is **everything that's different about Sema** — read it
 and you can write correct Sema without ingesting the full reference. It's deliberately
 terse. When you need detail, the full per-page docs are indexed at
-[`/llms.txt`](/llms.txt) — fetch any `/docs/**/*.md` on demand (e.g.
-`/docs/llm/tools-agents.md`); everything concatenated is at
-[`/llms-full.txt`](/llms-full.txt) (large — don't read it whole).
+[`/llms.txt`](/llms.txt) — fetch only the specific `/docs/**/*.md` page you need on demand
+(e.g. `/docs/llm/tools-agents.md`). Do **not** load `/llms-full.txt` (the whole-docs
+concatenation, ~200k tokens) into context.
 
 ## Install & run
 
