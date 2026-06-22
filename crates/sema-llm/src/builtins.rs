@@ -445,6 +445,14 @@ fn get_opt_u32(opts: &BTreeMap<Value, Value>, key: &str) -> Option<u32> {
         .map(|n| n as u32)
 }
 
+/// Read an optional per-call `:timeout` (milliseconds) from a call's options argument.
+fn opt_timeout_ms(opts_arg: Option<&Value>) -> Option<u64> {
+    opts_arg
+        .and_then(|v| v.as_map_rc())
+        .and_then(|o| get_opt_u32(&o, "timeout"))
+        .map(|n| n as u64)
+}
+
 /// Read an optional list-of-strings option for observability tags: `:tags ["a" "b"]`,
 /// or a lone string `:tags "a"`. Non-string elements are skipped.
 fn get_opt_string_list(opts: &BTreeMap<Value, Value>, key: &str) -> Vec<String> {
@@ -1514,6 +1522,7 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
         request.temperature = temperature;
         request.system = system;
         request.reasoning_effort = reasoning_effort;
+        request.timeout_ms = opt_timeout_ms(args.get(1));
 
         let response = do_complete(request)?;
         track_usage(&response.usage)?;
@@ -1579,6 +1588,7 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
                 request.temperature = temperature;
                 request.system = system;
                 request.reasoning_effort = reasoning_effort;
+                request.timeout_ms = opt_timeout_ms(args.get(1));
                 let _conv = conv_scope.open();
                 let response = do_complete(request)?;
                 track_usage(&response.usage)?;
@@ -4286,6 +4296,7 @@ fn complete_with_prompt(prompt: &Prompt, opts: Option<&Value>) -> Result<Value, 
     let mut request = ChatRequest::new(model, messages);
     request.max_tokens = max_tokens.or(Some(4096));
     request.temperature = temperature;
+    request.timeout_ms = opt_timeout_ms(opts);
 
     // Per-call observability tags/metadata (read inside do_complete's span).
     let _tele = install_call_telemetry(opts.and_then(|v| v.as_map_rc()).as_ref());

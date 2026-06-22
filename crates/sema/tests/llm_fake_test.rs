@@ -413,3 +413,23 @@ fn rerank_reorders_documents_by_relevance() {
     assert_eq!(reqs[0].documents.len(), 3);
     assert_eq!(reqs[0].top_k, Some(3));
 }
+
+#[test]
+fn timeout_option_threads_into_the_request() {
+    // The per-call :timeout (ms) must reach the canonical ChatRequest the provider sees.
+    let fake = FakeProvider::builder("fake").model("m").reply("ok").build();
+    let (result, recorder) =
+        eval_with_fake(r#"(llm/complete "hi" {:model "m" :timeout 7500})"#, fake);
+    result.expect("complete should succeed");
+    let reqs = recorder.requests();
+    assert_eq!(reqs.len(), 1);
+    assert_eq!(reqs[0].timeout_ms, Some(7500));
+}
+
+#[test]
+fn no_timeout_option_leaves_request_default() {
+    let fake = FakeProvider::builder("fake").model("m").reply("ok").build();
+    let (result, recorder) = eval_with_fake(r#"(llm/complete "hi" {:model "m"})"#, fake);
+    result.expect("complete should succeed");
+    assert_eq!(recorder.requests()[0].timeout_ms, None);
+}

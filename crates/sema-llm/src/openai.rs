@@ -202,15 +202,17 @@ impl OpenAiProvider {
     async fn complete_async(&self, request: ChatRequest) -> Result<ChatResponse, LlmError> {
         let body = self.build_request_body(&request);
 
-        let resp = self
-            .client
-            .post(format!("{}/chat/completions", self.base_url))
-            .header("Authorization", format!("Bearer {}", self.api_key))
-            .header("Content-Type", "application/json")
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| LlmError::Http(e.to_string()))?;
+        let resp = crate::http::with_timeout(
+            self.client
+                .post(format!("{}/chat/completions", self.base_url)),
+            request.timeout_ms,
+        )
+        .header("Authorization", format!("Bearer {}", self.api_key))
+        .header("Content-Type", "application/json")
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| LlmError::Http(e.to_string()))?;
 
         let status = resp.status().as_u16();
         if status == 429 {
@@ -328,6 +330,10 @@ impl OpenAiProvider {
         let mut cache_read_input_tokens = 0u32;
         let mut cache_creation_input_tokens = 0u32;
         let mut finish_reason = None;
+        // Streamed tool calls arrive as index-keyed fragments: the first delta for an
+        // index carries `id` + `function.name`, later deltas append `function.arguments`
+        // chunks. Accumulate (id, name, args) per index, then assemble at the end.
+        let mut tool_acc: Vec<(String, String, String)> = Vec::new();
 
         crate::sse::parse_sse_stream(resp, |data| {
             if let Ok(chunk) = serde_json::from_str::<serde_json::Value>(data) {
@@ -365,6 +371,35 @@ impl OpenAiProvider {
                                 full_content.push_str(content);
                                 on_chunk(content)?;
                             }
+                            if let Some(tcs) = delta.get("tool_calls").and_then(|t| t.as_array()) {
+                                for tc in tcs {
+                                    let idx = tc.get("index").and_then(|v| v.as_u64()).unwrap_or(0)
+                                        as usize;
+                                    while tool_acc.len() <= idx {
+                                        tool_acc.push((
+                                            String::new(),
+                                            String::new(),
+                                            String::new(),
+                                        ));
+                                    }
+                                    let entry = &mut tool_acc[idx];
+                                    if let Some(id) = tc.get("id").and_then(|v| v.as_str()) {
+                                        if !id.is_empty() {
+                                            entry.0 = id.to_string();
+                                        }
+                                    }
+                                    if let Some(f) = tc.get("function") {
+                                        if let Some(name) = f.get("name").and_then(|v| v.as_str()) {
+                                            entry.1.push_str(name);
+                                        }
+                                        if let Some(args) =
+                                            f.get("arguments").and_then(|v| v.as_str())
+                                        {
+                                            entry.2.push_str(args);
+                                        }
+                                    }
+                                }
+                            }
                         }
                         if let Some(fr) = choice.get("finish_reason") {
                             if !fr.is_null() {
@@ -378,11 +413,22 @@ impl OpenAiProvider {
         })
         .await?;
 
+        let tool_calls: Vec<ToolCall> = tool_acc
+            .into_iter()
+            .filter(|(_, name, _)| !name.is_empty())
+            .map(|(id, name, args)| ToolCall {
+                id,
+                name,
+                arguments: serde_json::from_str(&args)
+                    .unwrap_or(serde_json::Value::Object(serde_json::Map::new())),
+            })
+            .collect();
+
         Ok(ChatResponse {
             content: full_content,
             role: "assistant".to_string(),
             model: model_name.clone(),
-            tool_calls: Vec::new(),
+            tool_calls,
             usage: Usage {
                 prompt_tokens,
                 completion_tokens,

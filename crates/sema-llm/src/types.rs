@@ -159,6 +159,9 @@ pub struct ChatRequest {
     /// native control (OpenAI `reasoning_effort`, Anthropic extended thinking,
     /// Gemini `thinkingConfig`); providers/models that don't support it ignore it.
     pub reasoning_effort: Option<String>,
+    /// Per-call HTTP timeout (milliseconds). `None` uses the client default. Applied as a
+    /// per-request reqwest timeout by each provider; ignored by providers that don't send.
+    pub timeout_ms: Option<u64>,
 }
 
 impl ChatRequest {
@@ -173,6 +176,7 @@ impl ChatRequest {
             stop_sequences: Vec::new(),
             json_mode: false,
             reasoning_effort: None,
+            timeout_ms: None,
         }
     }
 }

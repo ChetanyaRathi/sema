@@ -129,16 +129,17 @@ impl AnthropicProvider {
     async fn complete_async(&self, request: ChatRequest) -> Result<ChatResponse, LlmError> {
         let body = self.build_request_body(&request);
 
-        let resp = self
-            .client
-            .post("https://api.anthropic.com/v1/messages")
-            .header("x-api-key", &self.api_key)
-            .header("anthropic-version", "2023-06-01")
-            .header("content-type", "application/json")
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| LlmError::Http(e.to_string()))?;
+        let resp = crate::http::with_timeout(
+            self.client.post("https://api.anthropic.com/v1/messages"),
+            request.timeout_ms,
+        )
+        .header("x-api-key", &self.api_key)
+        .header("anthropic-version", "2023-06-01")
+        .header("content-type", "application/json")
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| LlmError::Http(e.to_string()))?;
 
         let status = resp.status().as_u16();
         if status == 429 {

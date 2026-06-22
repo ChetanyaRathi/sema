@@ -208,6 +208,32 @@ Remaining work:
 
 ---
 
+## LLM-1 — LLM bulletproofing remnants (from the archived plan)
+
+**Deferred (revisit later) — 2026-06-22.** The bulletproofing plan
+(`docs/plans/archive/2026-06-21-llm-bulletproofing.md`) shipped Phases 0–3, 4.1, 4.2, 4.4,
+5, and 6.3. What's left:
+
+- **4.3 — streaming through the dispatch layer (PENDING DECISION).** `llm/stream` still
+  bypasses budget/cache/rate-limit/fallback (the bypass is documented in
+  `docs/llm/resilience.md`). Framework research (Vercel AI SDK / LangChain / LiteLLM /
+  LlamaIndex / Mastra) shows the consensus is to act at *stream-open*: budget pre-gate on
+  *accumulated* spend, rate-limit + fallback before the first chunk, cache via
+  buffer-then-replay; mid-stream failure after partial emission has no clean recovery
+  anywhere. Awaiting an owner decision on which concerns to bind to stream-open vs. leave bypassed.
+- **6.1 — `llm/generate-object`**: schema-validated structured output with a bounded repair
+  loop (today only `llm/extract` does schema+reask). Reuse `validate_extraction` +
+  `format_reask_prompt`.
+- **6.2 — batch budget pre-flight**: budgets are post-call caps, so a concurrent
+  `llm/batch`/`llm/pmap` fan-out can overshoot before the cap fires. Add a pre-dispatch
+  token-estimate gate.
+- **6.5 — agent eval harness**: a `deftest`/`eval` surface that scores an agent against a
+  fixture task + cassette in CI. Explicitly deferred by owner; reuses FakeProvider/cassettes.
+
+(Cassette CI corpus — plan's 6.4 — is tracked separately as CASS-1.)
+
+---
+
 ## A note on the truly long-term language design items
 
 These are not deferred — they're design questions that need a deliberate decision before any code lands. They're tracked in `docs/wip.md` (the "Wave 6c" cluster), not here.

@@ -63,9 +63,7 @@ impl GeminiProvider {
 
         let body = self.build_request_body(&request);
 
-        let resp = self
-            .client
-            .post(&url)
+        let resp = crate::http::with_timeout(self.client.post(&url), request.timeout_ms)
             .header("Content-Type", "application/json")
             .header("x-goog-api-key", &self.api_key)
             .json(&body)
@@ -338,9 +336,14 @@ impl GeminiProvider {
         let mut content = String::new();
         let mut tool_calls = Vec::new();
         let mut tool_call_idx = 0usize;
+        let mut finish_reason_str: Option<String> = None;
 
         if let Some(candidates) = resp.get("candidates").and_then(|c| c.as_array()) {
             if let Some(candidate) = candidates.first() {
+                finish_reason_str = candidate
+                    .get("finishReason")
+                    .and_then(|f| f.as_str())
+                    .map(|s| s.to_string());
                 if let Some(parts) = candidate
                     .pointer("/content/parts")
                     .and_then(|p| p.as_array())
@@ -391,6 +394,32 @@ impl GeminiProvider {
                 .get("cachedContentTokenCount")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(0) as u32;
+        }
+        // Thinking tokens are reported separately and are NOT in candidatesTokenCount —
+        // when a small budget is spent entirely on reasoning, the visible output is empty.
+        let thoughts_tokens = resp
+            .get("usageMetadata")
+            .and_then(|u| u.get("thoughtsTokenCount"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as u32;
+
+        // Empty-output footgun: Gemini's default models are thinking models, so a small
+        // `:max-tokens` can be spent entirely on reasoning, leaving no visible text and a
+        // `MAX_TOKENS` finish — a silent empty string otherwise. Surface it instead.
+        if content.is_empty()
+            && tool_calls.is_empty()
+            && (finish_reason_str.as_deref() == Some("MAX_TOKENS") || thoughts_tokens > 0)
+        {
+            return Err(LlmError::Api {
+                status: 200,
+                message: format!(
+                    "Gemini returned an empty response (finishReason: {}; {thoughts_tokens} \
+                     reasoning tokens, 0 visible output tokens). Thinking models spend part of \
+                     `:max-tokens` reasoning before producing visible output — increase \
+                     `:max-tokens`, or lower `:reasoning-effort`.",
+                    finish_reason_str.as_deref().unwrap_or("unknown")
+                ),
+            });
         }
 
         let stop_reason = if tool_calls.is_empty() {

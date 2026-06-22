@@ -1,5 +1,25 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- **Per-call `:timeout` (ms)** on `llm/complete` / `llm/chat` / `llm/send`. The option
+  now reaches the HTTP layer as a per-request reqwest timeout for the network providers
+  (Anthropic / OpenAI / Gemini) — previously parsed but ignored. (Local Ollama is excluded;
+  streaming calls aren't capped, since a wall-clock timeout would kill a long legitimate stream.)
+
+### Fixed
+
+- **OpenAI streaming dropped tool calls.** `stream_complete` returned an empty `tool_calls`,
+  discarding tool-call deltas — streaming agents on OpenAI were broken. It now accumulates the
+  index-keyed `id` / `function.name` / `function.arguments` fragments and assembles them into
+  the final response (verified live against the OpenAI API).
+- **Gemini silent empty output.** A thinking model with a small `:max-tokens` could spend the
+  whole budget reasoning and return an empty string with `finishReason: MAX_TOKENS` (exit 0,
+  no signal). It now raises an actionable error telling you to raise `:max-tokens` / lower
+  `:reasoning-effort` (verified live; normal calls unaffected).
+
 ## 1.24.0
 
 ### Added

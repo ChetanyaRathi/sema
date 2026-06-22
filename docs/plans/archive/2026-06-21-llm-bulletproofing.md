@@ -1,7 +1,15 @@
 # Bulletproofing Sema's LLM / Agentic Features
 
 **Date:** 2026-06-21
-**Status:** Not started. Execution-ready, task-by-task.
+**Status:** ARCHIVED 2026-06-22 — substantially shipped. **Done:** Phase 0 (accuracy
+fixes), Phase 1 (FakeProvider + CI tests), Phase 2 (tool-result correlation), Phase 3
+(recoverable tool errors + arg validation), Phase 4.1 (backoff+jitter+broadened retry),
+**4.2 (`:timeout` per-call, network providers — verified live)**, **4.4 (OpenAI streaming
+tool-delta accumulation — verified live)**, Phase 5 (OpenTelemetry — shipped far beyond
+this plan's scope), and **6.3 (Gemini empty-output hint — verified live)**.
+**Remaining (tracked in `docs/deferred.md`):** 4.3 streaming dispatch routing (PENDING a
+design decision — see the framework research + open questions), 6.1 `llm/generate-object`,
+6.2 batch budget pre-flight, 6.4 cassette CI corpus (CASS-1), 6.5 agent eval harness.
 **Companions:**
 - `docs/plans/2026-06-21-llm-cassettes.md` — the record/replay tape primitive. Phase 1 of THIS plan uses a simpler in-process `FakeProvider` for unit tests; cassettes are the broader CI-corpus layer. They are complementary: `FakeProvider` for hand-scripted scenarios, cassettes for recorded real-provider corpora. Phase 1 lands the fake provider; Phase 6 wires cassettes into CI.
 - `docs/plans/2026-06-21-mcp-client-spike.md` — MCP tool calls share the same seam; observability spans (Phase 5) should cover them.
