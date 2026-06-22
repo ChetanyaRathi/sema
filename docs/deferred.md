@@ -161,6 +161,32 @@ one-time port plus updating CI and the docs that reference `make` targets. When 
 happens, mirror the current targets (`build`/`release`/`test`/`lint`/`examples`/
 `smoke-bytecode`/`deploy`/`deploy-all`/…) one-for-one first, then improve.
 
+## TOOL-2 — Speed up CI drastically (it's painful)
+
+**Deferred (revisit later) — 2026-06-22.** A release cycle takes painfully long: the
+`verify` gate (full `cargo test --workspace` + examples + smoke-bytecode + lint +
+docs-check) runs ~12–15 min on a **cold** cache, and it runs **per workflow** (CI on the
+branch push, `publish.yml` verify on the tag, `publish-npm.yml` verify on the tag) — so a
+release re-builds the world several times. Observed leads for a future push:
+
+- **Caching is the big lever.** `Swatinem/rust-cache` keys per *job*, so each workflow's
+  verify job has its own (often cold) cache; warm it / share it, or move to `sccache`
+  with a shared backend. Cold-cache full builds are the dominant cost.
+- **Split the gate for fast-fail.** Run `fmt` + `clippy` + `docs-check` as a quick job
+  that fails in ~1 min; run the heavy `cargo test`/examples/smoke separately and in
+  parallel (test sharding via `cargo-nextest --partition`).
+- **Don't re-verify per registry.** crates.io and npm publishes each gate on `verify`
+  today (kept separate because npm's OIDC whitelists the workflow *filename* — see
+  `publish-npm.yml`). Find a way to share one verify result across both without breaking
+  the OIDC filename match (e.g. a reusable verify that both `needs:`, gated so it runs
+  once per SHA).
+- **Faster runners.** GitHub's free runners are 2 vCPU. Managed drop-ins that work on a
+  *personal* account (not just orgs): **Namespace** and **Ubicloud** (Blacksmith is
+  org-only). ~2–3× wall-clock on a compile-heavy Rust suite.
+- **cargo-dist Windows flakiness** (separate but related): the Windows build intermittently
+  fails fetching from crates.io; mitigated by `.cargo/config.toml` (`[http] multiplexing
+  = false`, `[net] retry = 10`) — keep an eye on whether that's enough.
+
 ---
 
 ## A note on the truly long-term language design items
