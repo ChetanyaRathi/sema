@@ -450,7 +450,8 @@ messages = [{<span class="c-str">"role"</span>: <span class="c-str">"user"</span
         <a href="/docs/internals/lisp-comparison">Benchmarks</a> ·
         <a href="https://github.com/HelgeSverre/sema/blob/main/CHANGELOG.md">Changelog</a> ·
         <a href="https://github.com/HelgeSverre/sema">GitHub</a> ·
-        <a href="/brand">Brand</a>
+        <a href="/brand">Brand</a> ·
+        <a href="/llms.txt">llms.txt</a>
       </span>
       </div>
     </footer>
