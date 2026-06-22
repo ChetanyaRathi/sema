@@ -2,7 +2,7 @@
 
 Sema is a Lisp with first-class LLM primitives, implemented in Rust. All code runs on a single evaluator: a [bytecode VM](./bytecode-vm.md). The runtime is single-threaded (`Rc`, not `Arc`), with deterministic destruction via reference counting instead of a garbage collector.
 
-The entire implementation is ~125k lines of Rust spread across 14 crates, each with a clear responsibility and strict dependency ordering.
+The entire implementation is ~116k lines of Rust across 15 crates, each with a clear responsibility and strict dependency ordering.
 
 ## Crate Map
 
@@ -61,6 +61,7 @@ This is discussed in detail in [The Circular Dependency Problem](#the-circular-d
 | **sema-eval**   | Macro expansion + module loading | Macro expander (VM-native), module system (`import`/`load`), prelude, eval/call callback wiring; drives the VM. _Not_ a standalone evaluator — the VM is the sole evaluator |
 | **sema-stdlib** | Standard library                | Native functions across a comprehensive standard library                                                                                  |
 | **sema-llm**    | LLM integration                 | `LlmProvider` trait, native providers (Anthropic, OpenAI, Gemini, Ollama), OpenAI-compatible shim, embedding providers, cost tracking     |
+| **sema-otel**   | Observability                   | OpenTelemetry facade (spans/metrics for LLM, agent, tool, and notebook runs); depends only on `sema-core`; native-only (no-op on wasm32)   |
 | **sema-lsp**    | Language Server              | LSP via tower-lsp: completions, hover, go-to-definition, references, rename, semantic tokens, diagnostics                                  |
 | **sema-dap**    | Debug Adapter                | DAP server: breakpoints, stepping, stack traces, variable inspection via VM debug hooks                                                    |
 | **sema-fmt**    | Formatter                       | Code formatter for `.sema` files (`sema fmt`)                                                                                             |
@@ -341,6 +342,8 @@ Sema compiles to WebAssembly with conditional compilation gates. The `#[cfg(not(
 
 **sema-llm** is excluded entirely — LLM providers require network access.
 
+**sema-otel** compiles to no-op spans on wasm32 — the OTLP exporter and its async runtime are gated out, so tracing calls become zero-cost stubs in the browser.
+
 The pure-computation core (arithmetic, strings, lists, maps, JSON, regex, crypto, datetime, CSV, bytevectors, predicates, math, comparison, bitwise, meta) remains available in WASM, making Sema usable as an embedded scripting language in browser-based applications.
 
 ## The LLM Subsystem
@@ -401,6 +404,14 @@ Every completion records token usage in `SESSION_USAGE` and computes dollar cost
   (llm/complete "Summarize this document...")))
 ;; Raises an error if cumulative cost exceeds $0.50 or 10000 tokens
 ```
+
+## Observability
+
+Tracing and metrics live in **sema-otel**, a thin facade over [OpenTelemetry](https://opentelemetry.io/). It sits *below* the subsystems it instruments — `sema-llm`, `sema-stdlib`, and `sema-notebook` all depend on it — but it itself depends only on `sema-core`, so the OpenTelemetry stack never leaks into the core types. On `wasm32` the whole crate compiles to no-op stubs (see [WASM Support](#wasm-support)).
+
+Instrumentation is automatic and follows the OpenTelemetry [GenAI semantic conventions](https://github.com/open-telemetry/semantic-conventions/tree/main/docs/gen-ai) (`gen_ai.*` attributes): every `llm/complete` and `llm/embed` emits a `CLIENT` span; each agent run, tool dispatch, and notebook cell emits an `INTERNAL` span (`invoke_agent` → `chat` → `execute_tool`); HTTP retries nest beneath the LLM span. Token counts, model, cost, and finish reason ride along as attributes. Tracing is **off by default** and exports over OTLP (HTTP by default, gRPC optional) or to a JSONL file.
+
+When Sema is embedded as a library it **never installs a global tracer provider on its own** — that is the host's job. The host chooses the wiring through `InterpreterBuilder::with_telemetry(TelemetryMode::…)`: `Off`, `UseHostGlobal` (emit against the provider the app already installed), `OwnProvider(p)` (a provider handed to Sema), or `FromEnv` (self-install from the `OTEL_*` variables, owned by the built `Interpreter`). Sema's spans nest under whatever span is current, so a host request span becomes the parent of the `invoke_agent` tree. An optional `SEMA_OTEL_COMPAT` setting also writes vendor-specific attribute names for backends that don't read `gen_ai.*`. See [Tracing & Metrics](../llm/observability) and [Backend Compatibility](../llm/otel-compat) for the user-facing guide.
 
 ## The Circular Dependency Problem
 

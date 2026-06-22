@@ -195,7 +195,8 @@ export default defineConfig({
             { text: 'Fuzzing the VM', link: '/docs/internals/fuzzing' },
             { text: 'Performance', link: '/docs/internals/performance' },
             { text: 'Lisp Dialect Benchmark', link: '/docs/internals/lisp-comparison' },
-            { text: 'Feature Comparison', link: '/docs/internals/feature-comparison' }
+            { text: 'Feature Comparison', link: '/docs/internals/feature-comparison' },
+            { text: 'Glossary', link: '/docs/internals/glossary' }
           ]
         }
       ],
