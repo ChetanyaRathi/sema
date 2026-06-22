@@ -379,11 +379,168 @@ pub(crate) fn io(input: &str, output: &str) -> Vec<KeyValue> {
     kvs
 }
 
-/// String-array attribute helper (tags). Used by the tag-emission helpers.
-#[allow(dead_code)]
-pub(crate) fn string_array(key: &'static str, vals: &[String]) -> KeyValue {
+/// String-array attribute helper (tags).
+fn string_array(key: &'static str, vals: &[String]) -> KeyValue {
     let arr: Vec<StringValue> = vals.iter().map(|s| s.clone().into()).collect();
     KeyValue::new(key, Value::Array(Array::String(arr)))
+}
+
+// ---------------------------------------------------------------------------
+// Tool execution I/O (on the execute_tool span, content-gated by the caller)
+// ---------------------------------------------------------------------------
+
+pub(crate) fn tool_io(args_json: &str, result: &str) -> Vec<KeyValue> {
+    let set = active();
+    if set.is_empty() {
+        return Vec::new();
+    }
+    let mut kvs = Vec::new();
+    if set.has(CompatSet::OPENINFERENCE) {
+        // OpenInference has no tool-RESULT key — the result goes in output.value.
+        kvs.push(KeyValue::new(
+            "tool_call.function.arguments",
+            args_json.to_string(),
+        ));
+        kvs.push(KeyValue::new("input.value", args_json.to_string()));
+        kvs.push(KeyValue::new("input.mime_type", "application/json"));
+        kvs.push(KeyValue::new("output.value", result.to_string()));
+        kvs.push(KeyValue::new("output.mime_type", "text/plain"));
+    }
+    if set.has(CompatSet::TRACELOOP) {
+        kvs.push(KeyValue::new(
+            "traceloop.entity.input",
+            args_json.to_string(),
+        ));
+        kvs.push(KeyValue::new("traceloop.entity.output", result.to_string()));
+    }
+    if set.has(CompatSet::LANGFUSE) {
+        kvs.push(KeyValue::new(
+            "langfuse.observation.input",
+            args_json.to_string(),
+        ));
+        kvs.push(KeyValue::new(
+            "langfuse.observation.output",
+            result.to_string(),
+        ));
+    }
+    if set.has(CompatSet::BRAINTRUST) {
+        kvs.push(KeyValue::new(
+            "braintrust.input_json",
+            args_json.to_string(),
+        ));
+        kvs.push(KeyValue::new("braintrust.output_json", result.to_string()));
+    }
+    kvs
+}
+
+// ---------------------------------------------------------------------------
+// Advertised tool schemas (on the chat/LLM span)
+// ---------------------------------------------------------------------------
+
+pub(crate) fn tools(views: &[crate::ToolView]) -> Vec<KeyValue> {
+    let set = active();
+    if set.is_empty() || views.is_empty() {
+        return Vec::new();
+    }
+    let mut kvs = Vec::new();
+    for (i, t) in views.iter().enumerate() {
+        if set.has(CompatSet::OPENINFERENCE) {
+            kvs.push(KeyValue::new(
+                format!("llm.tools.{i}.tool.json_schema"),
+                t.json_schema.clone(),
+            ));
+        }
+        if set.has(CompatSet::TRACELOOP) {
+            kvs.push(KeyValue::new(
+                format!("llm.request.functions.{i}.name"),
+                t.name.clone(),
+            ));
+            kvs.push(KeyValue::new(
+                format!("llm.request.functions.{i}.description"),
+                t.description.clone(),
+            ));
+            kvs.push(KeyValue::new(
+                format!("llm.request.functions.{i}.parameters"),
+                t.json_schema.clone(),
+            ));
+        }
+    }
+    kvs
+}
+
+// ---------------------------------------------------------------------------
+// Trace-level I/O rollup (on the run's ROOT span — agent, or standalone chat)
+// ---------------------------------------------------------------------------
+
+pub(crate) fn trace_io(input: &str, output: &str) -> Vec<KeyValue> {
+    let set = active();
+    if set.is_empty() {
+        return Vec::new();
+    }
+    let mut kvs = Vec::new();
+    if set.has(CompatSet::LANGFUSE) {
+        kvs.push(KeyValue::new("langfuse.trace.input", input.to_string()));
+        kvs.push(KeyValue::new("langfuse.trace.output", output.to_string()));
+    }
+    kvs
+}
+
+// ---------------------------------------------------------------------------
+// Tags + metadata
+// ---------------------------------------------------------------------------
+
+pub(crate) fn tags(tags: &[String]) -> Vec<KeyValue> {
+    let set = active();
+    if set.is_empty() || tags.is_empty() {
+        return Vec::new();
+    }
+    let mut kvs = Vec::new();
+    if set.has(CompatSet::LANGFUSE) {
+        kvs.push(string_array("langfuse.trace.tags", tags));
+    }
+    if set.has(CompatSet::BRAINTRUST) {
+        kvs.push(string_array("braintrust.tags", tags));
+    }
+    if set.has(CompatSet::LANGSMITH) {
+        kvs.push(KeyValue::new("langsmith.span.tags", tags.join(",")));
+    }
+    kvs
+}
+
+pub(crate) fn metadata(meta: &[(String, String)]) -> Vec<KeyValue> {
+    let set = active();
+    if set.is_empty() || meta.is_empty() {
+        return Vec::new();
+    }
+    let mut kvs = Vec::new();
+    for (k, v) in meta {
+        if set.has(CompatSet::LANGFUSE) {
+            kvs.push(KeyValue::new(
+                format!("langfuse.trace.metadata.{k}"),
+                v.clone(),
+            ));
+        }
+        if set.has(CompatSet::LANGSMITH) {
+            kvs.push(KeyValue::new(format!("langsmith.metadata.{k}"), v.clone()));
+        }
+        if set.has(CompatSet::TRACELOOP) {
+            kvs.push(KeyValue::new(
+                format!("traceloop.association.properties.{k}"),
+                v.clone(),
+            ));
+        }
+    }
+    if set.has(CompatSet::BRAINTRUST) {
+        let obj: serde_json::Map<String, serde_json::Value> = meta
+            .iter()
+            .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
+            .collect();
+        kvs.push(KeyValue::new(
+            "braintrust.metadata",
+            serde_json::Value::Object(obj).to_string(),
+        ));
+    }
+    kvs
 }
 
 #[cfg(test)]

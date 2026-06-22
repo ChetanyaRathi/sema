@@ -18,6 +18,17 @@
 mod provider_map;
 pub use provider_map::gen_ai_provider_name;
 
+/// Plain owned view of a tool advertised to the model (for the OpenInference
+/// `llm.tools.*` / Traceloop `llm.request.functions.*` compat aliases). Keeps
+/// `sema-otel` free of `sema-llm` types.
+#[derive(Debug, Clone, Default)]
+pub struct ToolView {
+    pub name: String,
+    pub description: String,
+    /// The tool's parameter JSON schema, already serialized.
+    pub json_schema: String,
+}
+
 /// Plain `Send` snapshot of an LLM response, so `sema-otel` need not depend on
 /// `sema-llm` types. `sema-llm` maps `ChatResponse`/`Usage` into this.
 #[derive(Debug, Clone, Default)]

@@ -4359,6 +4359,20 @@ fn do_complete(request: ChatRequest) -> Result<ChatResponse, SemaError> {
         request.reasoning_effort.as_deref(),
     );
     span.set_output_type(request.json_mode);
+    // Advertise the tools available this turn (compat: OpenInference llm.tools.*,
+    // Traceloop llm.request.functions.*). Only built when a backend compat is active.
+    if sema_otel::compat_active() && !request.tools.is_empty() {
+        let views: Vec<sema_otel::ToolView> = request
+            .tools
+            .iter()
+            .map(|t| sema_otel::ToolView {
+                name: t.name.clone(),
+                description: t.description.clone(),
+                json_schema: t.parameters.to_string(),
+            })
+            .collect();
+        span.set_tools(&views);
+    }
     // Reset the serving-provider stamp so a cache hit (which serves no provider) doesn't
     // inherit a stale name from a prior completion.
     LAST_SERVING_PROVIDER.with(|p| *p.borrow_mut() = None);
@@ -4817,6 +4831,12 @@ fn run_tool_loop(
     // do_complete) and per-tool spans nest under it via the thread-local stack.
     let _agent_span = sema_otel::agent_span(agent_name);
     let mut messages = initial_messages;
+    // First user input for the trace-level I/O rollup (compat: Langfuse trace panel).
+    let first_input = messages
+        .iter()
+        .find(|m| m.role == "user")
+        .map(|m| m.content.to_text())
+        .unwrap_or_default();
     let mut last_content = String::new();
     // Bound runaway error loops: if the model keeps issuing failing tool calls
     // and never recovers, abort rather than burning every round. Reset on any
@@ -4850,6 +4870,7 @@ fn run_tool_loop(
             if !last_content.is_empty() {
                 messages.push(ChatMessage::new("assistant", last_content.clone()));
             }
+            _agent_span.set_trace_io(&first_input, &last_content);
             return Ok((last_content, messages));
         }
 
@@ -4900,6 +4921,12 @@ fn run_tool_loop(
             if is_error {
                 tspan.record_error("tool_error", &result);
             }
+            // Tool args + result on the span (content-gated; canonical
+            // gen_ai.tool.call.* + compat aliases) — the key agent-debugging datum.
+            if sema_otel::content_capture_enabled() {
+                let args_json = serde_json::to_string(&tc.arguments).unwrap_or_default();
+                tspan.set_tool_io(&args_json, &result);
+            }
             drop(tspan);
             let duration_ms = start_time.elapsed().as_millis() as i64;
 
@@ -4945,6 +4972,7 @@ fn run_tool_loop(
     if !last_content.is_empty() {
         messages.push(ChatMessage::new("assistant", last_content.clone()));
     }
+    _agent_span.set_trace_io(&first_input, &last_content);
     Ok((last_content, messages))
 }
 

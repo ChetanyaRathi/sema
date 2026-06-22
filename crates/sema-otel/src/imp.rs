@@ -638,6 +638,12 @@ fn capture_content() -> bool {
         .unwrap_or(false)
 }
 
+/// Public: whether content capture is on, so callers can skip serializing content they
+/// would only attach when capture is enabled (tool args/result, trace I/O rollup).
+pub fn content_capture_enabled() -> bool {
+    ENABLED.load(Ordering::Relaxed) && capture_content()
+}
+
 /// Backstop cap for already-per-field-truncated structured content before it becomes a
 /// span attribute. Cheap and panic-proof (runs on the calling thread).
 fn scrub(s: &str) -> String {
@@ -724,6 +730,32 @@ impl LlmSpan {
     pub fn set_output_type(&self, json: bool) {
         if let Some(c) = &self.inner {
             c.set_str("gen_ai.output.type", if json { "json" } else { "text" });
+        }
+    }
+
+    /// Advertise the tools available this turn (compat: OpenInference `llm.tools.*`,
+    /// Traceloop `llm.request.functions.*`). No-op unless compat is active.
+    pub fn set_tools(&self, tools: &[crate::ToolView]) {
+        if let Some(c) = &self.inner {
+            c.set_attrs(compat::tools(tools));
+        }
+    }
+
+    /// Trace-level I/O rollup on a STANDALONE chat span (compat: Langfuse trace panel).
+    /// Content-gated.
+    pub fn set_trace_io(&self, input: &str, output: &str) {
+        if !capture_content() {
+            return;
+        }
+        if let Some(c) = &self.inner {
+            c.set_attrs(compat::trace_io(input, output));
+        }
+    }
+
+    /// Tags (auto + user) — compat: Langfuse/LangSmith/Braintrust.
+    pub fn set_tags(&self, tags: &[String]) {
+        if let Some(c) = &self.inner {
+            c.set_attrs(compat::tags(tags));
         }
     }
 
@@ -902,6 +934,18 @@ impl ToolSpan {
             c.set_str("gen_ai.conversation.id", id.to_string());
         }
     }
+    /// Tool call arguments + result. Canonical `gen_ai.tool.call.arguments`/`result`
+    /// plus compat aliases. Content-gated.
+    pub fn set_tool_io(&self, args_json: &str, result: &str) {
+        if !capture_content() {
+            return;
+        }
+        if let Some(c) = &self.inner {
+            c.set_str("gen_ai.tool.call.arguments", args_json.to_string());
+            c.set_str("gen_ai.tool.call.result", result.to_string());
+            c.set_attrs(compat::tool_io(args_json, result));
+        }
+    }
     pub fn record_error(&self, kind: &str, msg: &str) {
         if let Some(c) = &self.inner {
             c.record_error(kind, msg);
@@ -938,6 +982,26 @@ impl AgentSpan {
     pub fn set_conversation_id(&self, id: &str) {
         if let Some(c) = &self.inner {
             c.set_str("gen_ai.conversation.id", id.to_string());
+        }
+    }
+    /// Trace-level I/O rollup on the agent root (compat: Langfuse trace panel).
+    /// Content-gated.
+    pub fn set_trace_io(&self, input: &str, output: &str) {
+        if !capture_content() {
+            return;
+        }
+        if let Some(c) = &self.inner {
+            c.set_attrs(compat::trace_io(input, output));
+        }
+    }
+    pub fn set_tags(&self, tags: &[String]) {
+        if let Some(c) = &self.inner {
+            c.set_attrs(compat::tags(tags));
+        }
+    }
+    pub fn set_metadata(&self, meta: &[(String, String)]) {
+        if let Some(c) = &self.inner {
+            c.set_attrs(compat::metadata(meta));
         }
     }
     pub fn record_error(&self, kind: &str, msg: &str) {

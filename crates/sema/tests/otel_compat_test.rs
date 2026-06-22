@@ -74,4 +74,21 @@ fn compat_all_emits_backend_aliases() {
     assert_eq!(attr("invoke_agent", "traceloop.span.kind"), "agent");
     assert_eq!(attr("invoke_agent", "langsmith.span.kind"), "chain");
     assert_eq!(attr("invoke_agent", "langfuse.observation.type"), "span");
+
+    // Advertised tool schemas on the chat span (OpenInference + Traceloop).
+    assert!(
+        attr("chat", "llm.tools.0.tool.json_schema").is_string(),
+        "OpenInference advertised tool schema"
+    );
+    assert_eq!(attr("chat", "llm.request.functions.0.name"), "get-x");
+
+    // Tool args + result on the execute_tool span (content-gated).
+    assert!(attr("execute_tool", "gen_ai.tool.call.arguments").is_string());
+    assert!(attr("execute_tool", "tool_call.function.arguments").is_string());
+    assert_eq!(attr("execute_tool", "output.value"), "42");
+    assert_eq!(attr("execute_tool", "traceloop.entity.output"), "42");
+
+    // Trace-level I/O rollup on the agent root (Langfuse trace panel).
+    assert!(attr("invoke_agent", "langfuse.trace.input").is_string());
+    assert!(attr("invoke_agent", "langfuse.trace.output").is_string());
 }

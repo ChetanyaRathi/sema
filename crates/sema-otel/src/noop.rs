@@ -24,6 +24,11 @@ pub fn compat_active() -> bool {
     false
 }
 
+/// Content capture is native-only; always off on wasm.
+pub fn content_capture_enabled() -> bool {
+    false
+}
+
 /// Embedded telemetry mode. `OwnProvider` is omitted on wasm (no `SdkTracerProvider`
 /// exists there); the whole LLM/otel surface is native-only anyway.
 pub enum TelemetryMode {
@@ -70,6 +75,9 @@ impl LlmSpan {
     ) {
     }
     pub fn set_output_type(&self, _json: bool) {}
+    pub fn set_tools(&self, _tools: &[crate::ToolView]) {}
+    pub fn set_trace_io(&self, _input: &str, _output: &str) {}
+    pub fn set_tags(&self, _tags: &[String]) {}
     pub fn set_dispatch(&self, _sema_provider: &str, _request_model: &str) {}
     pub fn set_response(&self, _facts: &ResponseFacts) {}
     pub fn set_conversation_id(&self, _id: &str) {}
@@ -85,6 +93,7 @@ pub fn tool_span(_name: &str, _call_id: &str, _description: Option<&str>) -> Too
 
 impl ToolSpan {
     pub fn set_conversation_id(&self, _id: &str) {}
+    pub fn set_tool_io(&self, _args_json: &str, _result: &str) {}
     pub fn record_error(&self, _kind: &str, _msg: &str) {}
 }
 
@@ -96,6 +105,9 @@ pub fn agent_span(_name: Option<&str>) -> AgentSpan {
 
 impl AgentSpan {
     pub fn set_conversation_id(&self, _id: &str) {}
+    pub fn set_trace_io(&self, _input: &str, _output: &str) {}
+    pub fn set_tags(&self, _tags: &[String]) {}
+    pub fn set_metadata(&self, _meta: &[(String, String)]) {}
     pub fn record_error(&self, _kind: &str, _msg: &str) {}
 }
 
