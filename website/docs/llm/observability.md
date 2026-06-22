@@ -18,6 +18,11 @@ It is **off by default and zero-cost when off** — no provider is installed unl
 set an OTLP endpoint or a file sink, and a down/slow collector can never block, add
 latency, or crash your script.
 
+> Using **Arize Phoenix, Traceloop, LangSmith, or Langfuse**? See
+> [Backend Compatibility](./otel-compat) — `SEMA_OTEL_COMPAT` makes Sema render
+> first-class in those tools too. Most other backends (Grafana, Datadog, Honeycomb,
+> SigNoz, Logfire, Braintrust…) work with no extra config.
+
 ## Quick start (Jaeger in one command)
 
 ```bash

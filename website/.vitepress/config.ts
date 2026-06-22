@@ -162,7 +162,8 @@ export default defineConfig({
             { text: 'Resilience & Retry', link: '/docs/llm/resilience' },
             { text: 'Providers', link: '/docs/llm/providers' },
             { text: 'Cost & Budgets', link: '/docs/llm/cost' },
-            { text: 'Observability (OpenTelemetry)', link: '/docs/llm/observability' }
+            { text: 'Observability (OpenTelemetry)', link: '/docs/llm/observability' },
+            { text: 'Backend Compatibility', link: '/docs/llm/otel-compat' }
           ]
         }
       ],
