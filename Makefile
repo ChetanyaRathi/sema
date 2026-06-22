@@ -204,7 +204,17 @@ js-lib-dev:
 # Playground
 deploy: site-deploy playground-deploy
 
-.PHONY: playground-build playground-dev playground-deploy deploy
+# One-shot "ship the web" pipeline: build the WASM playground, gate on the
+# playground + notebook E2E suites, then deploy both the docs site and the
+# playground to production. `deploy` is the quick path that skips the E2E gate.
+# (Run `make site-og` first and commit the cards if titles/version changed.)
+deploy-all: playground-build
+	cd playground && npx playwright test
+	$(MAKE) test-notebook-e2e
+	$(MAKE) site-deploy
+	$(MAKE) playground-deploy
+
+.PHONY: playground-build playground-dev playground-deploy deploy deploy-all
 
 playground-build:
 	cd crates/sema-wasm && wasm-pack build --target web --out-dir ../../playground/pkg -- --config 'profile.release.package.sema-wasm.opt-level="s"'

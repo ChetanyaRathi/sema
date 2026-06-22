@@ -150,6 +150,19 @@ when a real long-running workload shows growth (a `Rc::strong_count` leak test w
 
 ---
 
+## TOOL-1 — Migrate the Makefile to a justfile
+
+**Deferred (revisit later) — 2026-06-22.** The build/dev/deploy automation lives in a
+single growing `Makefile`. The intent is to move it to a [`justfile`](https://github.com/casey/just),
+whose tooling is better suited to a task runner (real argument passing, no `.PHONY`
+bookkeeping, no tab/space footguns, per-recipe shebangs, `just --list` discovery, dotenv
+support). Not urgent — the Makefile works — so parked until there's appetite for the
+one-time port plus updating CI and the docs that reference `make` targets. When it
+happens, mirror the current targets (`build`/`release`/`test`/`lint`/`examples`/
+`smoke-bytecode`/`deploy`/`deploy-all`/…) one-for-one first, then improve.
+
+---
+
 ## A note on the truly long-term language design items
 
 These are not deferred — they're design questions that need a deliberate decision before any code lands. They're tracked in `docs/wip.md` (the "Wave 6c" cluster), not here.
