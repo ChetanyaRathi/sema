@@ -23,24 +23,45 @@ Sema at a backend — this page only covers the per-tool labelling.
 
 ## Which tools need it
 
-| Tool | Reads the standard `gen_ai.*`? | `SEMA_OTEL_COMPAT` value | What turning it on adds |
-| --- | --- | --- | --- |
-| Grafana / Tempo, Jaeger (plain OTel) | yes | — | nothing needed |
-| [Logfire](https://pydantic.dev/logfire) | yes | — | nothing needed |
-| Datadog LLM Observability | yes | — | nothing needed |
-| Honeycomb | yes | — | nothing needed |
-| [SigNoz](https://signoz.io/) | yes | — | nothing needed |
-| Elastic / New Relic | yes | — | nothing needed |
-| OpenLIT | yes | — | nothing needed |
-| [Braintrust](https://www.braintrust.dev/) | yes | `braintrust` *(optional)* | native tags + metadata + cost metric |
-| [Langfuse](https://langfuse.com/) | partly | `langfuse` | observation type/model, usage + cost detail, trace-level input/output, tags/metadata |
-| [Arize Phoenix](https://phoenix.arize.com/) (OpenInference) | no | `openinference` | span types, model/provider, token counts, cost, message I/O, tool args + schemas |
-| [Traceloop](https://www.traceloop.com/) (OpenLLMetry) | partly | `traceloop` | span types, entity I/O, indexed token keys, tool functions |
-| [LangSmith](https://www.langchain.com/langsmith) | partly | `langsmith` | run types, session threading, tags/metadata |
-| [Helicone](https://www.helicone.ai/) | n/a | — | not reachable via OTLP — see [Limitations](#limitations) |
+This list covers the tools that can **receive** OpenTelemetry traces. Most of them read
+the standard `gen_ai.*` attributes and need no value at all; a handful use their own
+attribute names and need a `SEMA_OTEL_COMPAT` token. (Tools that ingest only through
+their own SDK or proxy can't receive an OTLP push at all — see
+[Tools you can't send traces to](#tools-you-can-t-send-traces-to).)
 
-Most tools work without any value — they already read the standard attributes. You only
-need `SEMA_OTEL_COMPAT` for the four at the bottom of the table.
+### Works with no token
+
+These read the standard `gen_ai.*` attributes directly:
+
+| Tool | Self-hostable? | Notes |
+| --- | --- | --- |
+| Grafana / Tempo, [Jaeger](https://www.jaegertracing.io/) | yes | plain OpenTelemetry trace viewers |
+| [SigNoz](https://signoz.io/) | yes | OTLP on 4317 / 4318 |
+| [OpenObserve](https://openobserve.ai/) | yes | OTLP `/api/{org}/v1/traces` *(verified)* |
+| [OpenLIT](https://openlit.io/) | yes | OTel-native; `docker run openlit/openlit` |
+| [MLflow](https://mlflow.org/) | yes | the MLflow server exposes an OTLP `/v1/traces` endpoint |
+| [Logfire](https://pydantic.dev/logfire) | — | Pydantic's OTel platform |
+| Honeycomb, Elastic | partly | general OTel APM |
+| Datadog LLM Observability | no | reads the GenAI conventions natively |
+| [New Relic](https://newrelic.com/), [Dynatrace](https://www.dynatrace.com/), [Coralogix](https://coralogix.com/) | partly | APM platforms with native GenAI ingest |
+| [Portkey](https://portkey.ai/), [HoneyHive](https://honeyhive.ai/) | no | OTLP endpoint, GenAI conventions |
+
+### Works better with a token
+
+These read OTLP but key off their own attribute names, so a token fills in the detail:
+
+| Tool | `SEMA_OTEL_COMPAT` token | What the token adds |
+| --- | --- | --- |
+| [Arize Phoenix](https://phoenix.arize.com/), [Arize AX](https://arize.com/), [FutureAGI](https://futureagi.com/) | `openinference` | span types, model/provider, tokens, cost, message I/O, tool args + schemas |
+| [Langfuse](https://langfuse.com/) | `langfuse` | observation type/model, usage + cost detail, trace-level input/output, tags |
+| [Traceloop](https://www.traceloop.com/), [Laminar](https://www.lmnr.ai/), [LangWatch](https://langwatch.ai/), [Agenta](https://agenta.ai/) | `traceloop` | span types, entity input/output, indexed token keys, tool functions |
+| [LangSmith](https://www.langchain.com/langsmith) | `langsmith` | run types, session threading, tags/metadata |
+| [Braintrust](https://www.braintrust.dev/) | `braintrust` *(optional)* | native tags, metadata, and cost fields (it also reads `gen_ai.*` on its own) |
+
+> A few tools (Galileo, PromptLayer, Keywords AI, Arthur AI, W&B Weave) advertise
+> "OpenTelemetry support" but don't clearly document a public OTLP trace endpoint that
+> reads `gen_ai.*`. They may work, but we haven't confirmed them — try the standard
+> setup and check whether your spans appear.
 
 ## Setting `SEMA_OTEL_COMPAT`
 
@@ -140,6 +161,37 @@ How each Sema span is labelled for each tool when its compat value is on:
 | `execute_tool` | `TOOL` | `tool` | `tool` | `span` |
 | `invoke_agent` | `AGENT` | `agent` | `chain` | `span` |
 | notebook cell / retry | `CHAIN` | `workflow` | `chain` | `span` |
+
+## Tools you can't send traces to
+
+Many LLM tools collect data a different way — through their own client SDK, by sitting in
+front of your API calls as a proxy, or by running offline evaluations — rather than by
+receiving OpenTelemetry traces. Sema's OTLP export can't feed those; to use one, follow
+its own integration guide instead. The main categories:
+
+- **Proxies / gateways** — capture by routing your model calls through them, not by
+  accepting traces: [Helicone](https://www.helicone.ai/),
+  [LiteLLM](https://litellm.ai/), [Portkey gateway](https://portkey.ai/) (its
+  *observability* endpoint does accept OTLP — see the table above), [Pezzo](https://pezzo.ai/).
+- **SDK-only platforms** — ingest through their own Python/JS library, with no OTLP trace
+  endpoint: [Opik](https://www.comet.com/opik), [Lunary](https://lunary.ai/),
+  [Vellum](https://www.vellum.ai/), [Athina AI](https://athina.ai/),
+  [Parea AI](https://www.parea.ai/), [PostHog](https://posthog.com/) (LLM analytics events),
+  [Nebuly](https://www.nebuly.com/), [Humanloop](https://humanloop.com/),
+  [Maxim AI](https://www.getmaxim.ai/), [Fiddler AI](https://www.fiddler.ai/),
+  [W&B Weave](https://wandb.ai/) (accepts OTLP but is built around its own SDK).
+- **Evaluation-only** — offline scoring/testing, not a runtime trace receiver:
+  [Promptfoo](https://www.promptfoo.dev/), [DeepEval](https://www.deepeval.com/),
+  [RAGAS](https://docs.ragas.io/), [Patronus AI](https://www.patronus.ai/),
+  [UpTrain](https://uptrain.ai/), [Evidently AI](https://www.evidentlyai.com/),
+  [Giskard](https://www.giskard.ai/), [Confident AI](https://www.confident-ai.com/),
+  [TruLens](https://www.trulens.org/).
+- **Guardrails libraries** that *emit* telemetry rather than receive it:
+  [NVIDIA NeMo Guardrails](https://github.com/NVIDIA/NeMo-Guardrails),
+  [Guardrails AI](https://www.guardrailsai.com/).
+
+If a tool here later adds an OTLP endpoint that reads the GenAI conventions, Sema will
+work with it the same as the others — no change needed on Sema's side.
 
 ## Limitations
 

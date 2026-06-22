@@ -21,7 +21,10 @@ If OpenTelemetry is new to you, the terms used below:
 - Sema follows the OTel
   [GenAI semantic conventions](https://github.com/open-telemetry/semantic-conventions/tree/main/docs/gen-ai)
   — the agreed attribute names for LLM telemetry (token counts, model, cost, …) — so
-  these tools understand the data with no per-tool glue.
+  these tools understand the data with no per-tool glue. Grafana, Jaeger, SigNoz,
+  OpenObserve, Datadog, Honeycomb, Logfire, MLflow, and others read it as-is; a few
+  LLM-specific tools (Arize Phoenix, Langfuse, …) need one extra setting — see
+  [Backend Compatibility](./otel-compat).
 
 Tracing is **off by default** — if you don't point Sema at a backend or a file, it
 records nothing. And once it's on, a slow or unreachable backend can never block, delay,
