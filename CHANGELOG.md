@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 1.22.0
 
 ### Added
 
@@ -34,7 +34,41 @@
     enriched (schema URL, service version, runtime). Verified live against a
     self-hosted Langfuse via an OTel Collector (HTTP + gRPC).
 
+- **Backend compatibility layer for LLM-observability tools (`SEMA_OTEL_COMPAT`).**
+  Sema always emits the standard `gen_ai.*` GenAI conventions; setting
+  `SEMA_OTEL_COMPAT` to one or more *compatibility modes* makes it *also* write a
+  tool's own attribute names, so backends that key off their own namespace light up
+  fully. Modes: `openinference` (Arize Phoenix / Arize AX), `traceloop` /
+  `openllmetry`, `langsmith`, `langfuse`, `braintrust`, and `all`. Purely additive
+  (the standard attributes are always present), content-gated detail respects the
+  capture opt-in, and spans are typed per tool (`LLM`/`TOOL`/`AGENT`/`EMBEDDING`,
+  etc.). Verified live against Phoenix (gRPC + HTTP) and Langfuse. Docs:
+  `website/docs/llm/otel-compat.md`, with a fact-checked survey (against each tool's
+  own current docs) of which backends accept an OTLP push, which need a mode, and
+  which can't receive traces at all.
+
 - **Prompt-cache token reporting across providers.** `llm/last-usage` and `llm/session-usage` now expose `:cache-read-tokens` and `:cache-creation-tokens`, surfacing how many input tokens were served from (or written to) the provider's prompt cache. Wired through every first-party provider for both non-streaming and streaming responses: OpenAI/OpenAI-compatible (`prompt_tokens_details.cached_tokens` — implicit cache), Gemini (`cachedContentTokenCount` — implicit cache on 2.5+), and Anthropic (`cache_read_input_tokens` / `cache_creation_input_tokens`, reported separately from input tokens). Session counters accumulate cache tokens; custom Sema-defined providers can report them via `:cache-read-tokens` / `:cache-creation-tokens` in their usage map. Verified live (OpenAI and Gemini implicit cache reads observed on repeated long prefixes) and with a deterministic FakeProvider regression test. Cached reads are reported for visibility but not yet discounted in `:cost-usd`.
+
+### Changed
+
+- **Unified `sema-llm` onto the canonical evaluator callback.** Tool handlers,
+  Lisp-defined provider `:complete` functions, streaming/agent callbacks, and
+  `with-*` thunks now run through `sema_core::call_callback` →
+  `sema_eval::call_value` (the VM's nested-closure path) instead of a redundant
+  hand-rolled application routine. This removes the bespoke `EVAL_FN` / `call_value_fn`
+  / `simple_eval` path, so `set!`, captured upvalues, and async/yield *inside* a tool
+  handler or callback now share the same VM semantics as standard-library
+  higher-order functions. No user-facing API change.
+
+### Docs
+
+- New **[Glossary](https://sema-lang.com/docs/internals/glossary.html)** (178 terms)
+  with explicit multi-meaning entries for overloaded words (token, span, agent, tool,
+  provider, chunk, atom, …).
+- Observability docs gain an **Authentication headers** section (the
+  `OTEL_EXPORTER_OTLP_HEADERS` format and per-backend examples), and the architecture
+  overview is refreshed (15 crates incl. `sema-otel`; the circular-dependency framing
+  corrected).
 
 ## 1.21.2
 
