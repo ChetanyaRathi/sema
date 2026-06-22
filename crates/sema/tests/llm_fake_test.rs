@@ -433,3 +433,47 @@ fn no_timeout_option_leaves_request_default() {
     result.expect("complete should succeed");
     assert_eq!(recorder.requests()[0].timeout_ms, None);
 }
+
+/// SPIKE (4.3): what does `llm/stream` actually do when the provider fails MID-stream,
+/// after some chunks were already delivered to the callback? Established empirically:
+/// the partial chunks ARE delivered, the error IS surfaced (catchable), and there is
+/// NO auto-retry (one provider call). This is why mid-stream retry can't transparently
+/// "solve" streaming failure — a retry would re-deliver the already-emitted chunks.
+#[test]
+fn spike_mid_stream_failure_behaviour() {
+    use sema_llm::types::LlmError;
+    let fake = FakeProvider::builder("fake")
+        .model("m")
+        .stream_then_error(
+            &["Hello ", "wor"],
+            LlmError::Http("connection reset by peer".to_string()),
+        )
+        .build();
+
+    let src = r#"
+        (define received "")
+        (define errored #f)
+        (try
+          (llm/stream "p" (lambda (c) (set! received (string-append received c))) {:model "m"})
+          (catch e (set! errored #t)))
+        (list received errored)
+    "#;
+    let (result, recorder) = eval_with_fake(src, fake);
+    let val = result.expect("the try/catch should yield a value, not propagate");
+    let items = val.as_seq().expect("returns (received errored)");
+
+    // (1) The partial chunks emitted BEFORE the failure were delivered to the callback.
+    assert_eq!(
+        items[0].as_str(),
+        Some("Hello wor"),
+        "partial chunks must reach the callback before the mid-stream error"
+    );
+    // (2) The mid-stream failure surfaced as a catchable error.
+    assert_eq!(items[1], Value::bool(true), "the error must surface");
+    // (3) No automatic retry — exactly one provider call (a retry would duplicate output).
+    assert_eq!(
+        recorder.requests().len(),
+        1,
+        "no auto-retry on a mid-stream failure (a retry would re-emit the partial)"
+    );
+}

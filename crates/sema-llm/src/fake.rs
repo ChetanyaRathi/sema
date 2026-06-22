@@ -30,6 +30,12 @@ pub enum FakeReply {
         chunks: Vec<String>,
         response: ChatResponse,
     },
+    /// A streamed response that FAILS mid-stream: emit `chunks` to `on_chunk`, then
+    /// return `error` (models a provider dropping the connection partway through).
+    StreamThenError {
+        chunks: Vec<String>,
+        error: LlmError,
+    },
     /// An embedding response.
     Embed(EmbedResponse),
     /// A rerank response (scored results, highest-first).
@@ -173,6 +179,15 @@ impl FakeProviderBuilder {
 
     /// Script a streamed reply: `chunks` are delivered to `on_chunk`, then the
     /// concatenation is returned as the final response.
+    /// Script a stream that emits `chunks` then fails with `error` (mid-stream failure).
+    pub fn stream_then_error(mut self, chunks: &[&str], error: LlmError) -> Self {
+        self.script.push_back(FakeReply::StreamThenError {
+            chunks: chunks.iter().map(|c| c.to_string()).collect(),
+            error,
+        });
+        self
+    }
+
     pub fn stream(mut self, chunks: &[&str]) -> Self {
         let full: String = chunks.concat();
         let response = self.chat_text(&full, None);
@@ -267,6 +282,7 @@ impl LlmProvider for FakeProvider {
         match self.next() {
             Some(FakeReply::Chat(r)) => Ok(r),
             Some(FakeReply::Stream { response, .. }) => Ok(response),
+            Some(FakeReply::StreamThenError { error, .. }) => Err(error),
             Some(FakeReply::Error(e)) => Err(e),
             Some(FakeReply::Embed(_)) | Some(FakeReply::Rerank(_)) => Err(LlmError::Config(
                 "FakeProvider: complete() reached an embed/rerank-scripted reply".to_string(),
@@ -289,6 +305,13 @@ impl LlmProvider for FakeProvider {
                     on_chunk(c)?;
                 }
                 Ok(response)
+            }
+            Some(FakeReply::StreamThenError { chunks, error }) => {
+                // Deliver the partial chunks to the callback, THEN fail.
+                for c in &chunks {
+                    on_chunk(c)?;
+                }
+                Err(error)
             }
             Some(FakeReply::Chat(r)) => {
                 on_chunk(&r.content)?;
