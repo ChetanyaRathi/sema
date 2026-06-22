@@ -114,6 +114,8 @@ All completion and chat functions accept an options map with these keys:
 | `:system`           | System prompt (for `llm/complete`)                            |
 | `:reasoning-effort` | Reasoning effort for thinking models — see below              |
 | `:tools`            | List of tool values (see [Tools & Agents](./tools-agents.md)) |
+| `:timeout`          | Per-call HTTP timeout in **milliseconds** (network providers; non-streaming) |
+| `:tags` / `:metadata` | Observability tags/metadata — see [Backend Compatibility](./otel-compat.md) |
 
 ### Reasoning effort
 
