@@ -23,14 +23,10 @@ use crate::types::{
 };
 use crate::vector_store::{VectorDocument, VectorStore};
 
-/// Type for a full evaluator callback: (ctx, expr, env) -> Result<Value, SemaError>
-pub type EvalCallback = Box<dyn Fn(&EvalContext, &Value, &Env) -> Result<Value, SemaError>>;
-
 thread_local! {
     static PROVIDER_REGISTRY: RefCell<ProviderRegistry> = RefCell::new(ProviderRegistry::new());
     static SESSION_USAGE: RefCell<Usage> = RefCell::new(Usage::default());
     static LAST_USAGE: RefCell<Option<Usage>> = const { RefCell::new(None) };
-    static EVAL_FN: RefCell<Option<EvalCallback>> = RefCell::new(None);
     static SESSION_COST: RefCell<f64> = const { RefCell::new(0.0) };
     static BUDGET_LIMIT: RefCell<Option<f64>> = const { RefCell::new(None) };
     static BUDGET_SPENT: RefCell<f64> = const { RefCell::new(0.0) };
@@ -101,22 +97,12 @@ struct LispProviderCallbacks {
     complete_fn: Value,
 }
 
-/// Register a full evaluator for use by tool handlers and other LLM builtins.
-pub fn set_eval_callback(
-    f: impl Fn(&EvalContext, &Value, &Env) -> Result<Value, SemaError> + 'static,
-) {
-    EVAL_FN.with(|eval| {
-        *eval.borrow_mut() = Some(Box::new(f));
-    });
-}
-
 /// Reset LLM runtime state used by builtins.
 /// Called by interpreter construction to avoid cross-instance leakage.
 pub fn reset_runtime_state() {
     PROVIDER_REGISTRY.with(|r| *r.borrow_mut() = ProviderRegistry::new());
     SESSION_USAGE.with(|u| *u.borrow_mut() = Usage::default());
     LAST_USAGE.with(|u| *u.borrow_mut() = None);
-    EVAL_FN.with(|e| *e.borrow_mut() = None);
     SESSION_COST.with(|c| *c.borrow_mut() = 0.0);
     BUDGET_LIMIT.with(|l| *l.borrow_mut() = None);
     BUDGET_SPENT.with(|s| *s.borrow_mut() = 0.0);
@@ -151,17 +137,6 @@ pub fn register_test_provider(provider: Box<dyn LlmProvider>) {
         reg.register(provider);
         reg.set_default(&name);
     });
-}
-
-/// Evaluate an expression using the registered full evaluator.
-fn full_eval(ctx: &EvalContext, expr: &Value, env: &Env) -> Result<Value, SemaError> {
-    EVAL_FN.with(|eval_fn| {
-        let eval_fn = eval_fn.borrow();
-        match &*eval_fn {
-            Some(f) => f(ctx, expr, env),
-            None => simple_eval(ctx, expr, env),
-        }
-    })
 }
 
 fn register_fn(env: &Env, name: &str, f: impl Fn(&[Value]) -> Result<Value, SemaError> + 'static) {
@@ -496,9 +471,12 @@ impl LlmProvider for LispProvider {
 
             let request_map = chat_request_to_value(&request);
 
-            let ctx = EvalContext::new();
-            ctx.eval_step_limit.set(1_000_000);
-            let result = call_value_fn(&ctx, &complete_fn, &[request_map]);
+            // The LlmProvider trait gives us no caller ctx, so invoke the user's
+            // `:complete` function on the shared stdlib context, which carries the
+            // registered evaluator callback (same path stdlib HOFs use).
+            let result = sema_core::with_stdlib_ctx(|ctx| {
+                sema_core::call_callback(ctx, &complete_fn, &[request_map])
+            });
 
             match result {
                 Ok(response_val) => parse_lisp_provider_response(&response_val, &request.model),
@@ -1595,7 +1573,7 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
                 req.model = p.default_model().to_string();
                 let mut chunk_cb = |chunk: &str| -> Result<(), crate::types::LlmError> {
                     if let Some(ref cb) = callback {
-                        call_value_fn(ctx, cb, &[Value::string(chunk)])
+                        sema_core::call_callback(ctx, cb, &[Value::string(chunk)])
                             .map_err(|e| crate::types::LlmError::Config(e.to_string()))?;
                     } else {
                         print!("{}", chunk);
@@ -1618,7 +1596,7 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
             } else {
                 let mut chunk_cb = |chunk: &str| -> Result<(), crate::types::LlmError> {
                     if let Some(ref cb) = callback {
-                        call_value_fn(ctx, cb, &[Value::string(chunk)])
+                        sema_core::call_callback(ctx, cb, &[Value::string(chunk)])
                             .map_err(|e| crate::types::LlmError::Config(e.to_string()))?;
                     } else {
                         print!("{}", chunk);
@@ -2301,7 +2279,7 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
         let mut prompts = Vec::with_capacity(items.len());
         for item in &items {
             #[allow(clippy::cloned_ref_to_slice_refs)] // clone needed: &Value -> [Value]
-            let result = call_value_fn(ctx, func, &[item.clone()])?;
+            let result = sema_core::call_callback(ctx, func, &[item.clone()])?;
             let prompt_str = result
                 .as_str()
                 .map(|s| s.to_string())
@@ -3392,7 +3370,7 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
         }
 
         push_budget_scope(max_cost, max_tokens);
-        let result = call_value_fn(ctx, body_fn, &[]);
+        let result = sema_core::call_callback(ctx, body_fn, &[]);
         pop_budget_scope();
         result
     });
@@ -3479,7 +3457,7 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
         let prev_ttl = CACHE_TTL_SECS.with(|c| c.get());
         CACHE_ENABLED.with(|c| c.set(true));
         CACHE_TTL_SECS.with(|c| c.set(ttl));
-        let result = call_value_fn(ctx, body_fn, &[]);
+        let result = sema_core::call_callback(ctx, body_fn, &[]);
         CACHE_ENABLED.with(|c| c.set(prev_enabled));
         CACHE_TTL_SECS.with(|c| c.set(prev_ttl));
         result
@@ -3504,7 +3482,7 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
             .collect::<Result<_, _>>()?;
         let prev = FALLBACK_CHAIN.with(|c| c.borrow().clone());
         FALLBACK_CHAIN.with(|c| *c.borrow_mut() = Some(chain));
-        let result = call_value_fn(ctx, body_fn, &[]);
+        let result = sema_core::call_callback(ctx, body_fn, &[]);
         FALLBACK_CHAIN.with(|c| *c.borrow_mut() = prev);
         result
     });
@@ -3818,7 +3796,7 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
         }
         let prev = RATE_LIMIT_RPS.with(|r| r.get());
         RATE_LIMIT_RPS.with(|r| r.set(Some(rps)));
-        let result = call_value_fn(ctx, body_fn, &[]);
+        let result = sema_core::call_callback(ctx, body_fn, &[]);
         RATE_LIMIT_RPS.with(|r| r.set(prev));
         result
     });
@@ -4894,7 +4872,7 @@ fn run_tool_loop(
                 event_map.insert(Value::keyword("event"), Value::string("start"));
                 event_map.insert(Value::keyword("tool"), Value::string(&tc.name));
                 event_map.insert(Value::keyword("args"), args_value.clone());
-                let _ = call_value_fn(ctx, callback, &[Value::map(event_map)]);
+                let _ = sema_core::call_callback(ctx, callback, &[Value::map(event_map)]);
             }
 
             let start_time = std::time::Instant::now();
@@ -4947,7 +4925,7 @@ fn run_tool_loop(
                 event_map.insert(Value::keyword("result"), Value::string(&result_preview));
                 event_map.insert(Value::keyword("error"), Value::bool(is_error));
                 event_map.insert(Value::keyword("duration-ms"), Value::int(duration_ms));
-                let _ = call_value_fn(ctx, callback, &[Value::map(event_map)]);
+                let _ = sema_core::call_callback(ctx, callback, &[Value::map(event_map)]);
             }
 
             // Correlated tool result — keyed by the call id and tool name — rather
@@ -5010,7 +4988,7 @@ fn execute_tool_call(
 
     // Convert JSON arguments to Sema values and call the handler
     let sema_args = json_args_to_sema(&tool_def.parameters, arguments, &tool_def.handler);
-    let result = call_value_fn(ctx, &tool_def.handler, &sema_args)?;
+    let result = sema_core::call_callback(ctx, &tool_def.handler, &sema_args)?;
 
     // Convert result to string for sending back to LLM
     if let Some(s) = result.as_str() {
@@ -5061,90 +5039,6 @@ fn json_args_to_sema(params: &Value, arguments: &serde_json::Value, handler: &Va
         }
     }
     vec![sema_core::json_to_value(arguments)]
-}
-
-/// Call a Sema value as a function (lambda or native).
-fn call_value_fn(ctx: &EvalContext, func: &Value, args: &[Value]) -> Result<Value, SemaError> {
-    if let Some(native) = func.as_native_fn_rc() {
-        return (native.func)(ctx, args);
-    }
-    if let Some(lambda) = func.as_lambda_rc() {
-        let env = Env::with_parent(Rc::new(lambda.env.clone()));
-        // Bind params
-        if let Some(ref rest) = lambda.rest_param {
-            if args.len() < lambda.params.len() {
-                return Err(SemaError::arity(
-                    lambda
-                        .name
-                        .map(resolve)
-                        .unwrap_or_else(|| "lambda".to_string()),
-                    format!("{}+", lambda.params.len()),
-                    args.len(),
-                ));
-            }
-            for (param, arg) in lambda.params.iter().zip(args.iter()) {
-                env.set(*param, arg.clone());
-            }
-            let rest_args = args[lambda.params.len()..].to_vec();
-            env.set(*rest, Value::list(rest_args));
-        } else {
-            if args.len() != lambda.params.len() {
-                return Err(SemaError::arity(
-                    lambda
-                        .name
-                        .map(resolve)
-                        .unwrap_or_else(|| "lambda".to_string()),
-                    lambda.params.len().to_string(),
-                    args.len(),
-                ));
-            }
-            for (param, arg) in lambda.params.iter().zip(args.iter()) {
-                env.set(*param, arg.clone());
-            }
-        }
-        // Self-reference
-        if let Some(name) = lambda.name {
-            env.set(
-                name,
-                Value::lambda(sema_core::Lambda {
-                    params: lambda.params.clone(),
-                    rest_param: lambda.rest_param,
-                    body: lambda.body.clone(),
-                    env: lambda.env.clone(),
-                    name: lambda.name,
-                }),
-            );
-        }
-        // Eval body using the full evaluator (supports let, if, cond, etc.)
-        let mut result = Value::nil();
-        for expr in &lambda.body {
-            result = full_eval(ctx, expr, &env)?;
-        }
-        return Ok(result);
-    }
-    Err(SemaError::eval(format!(
-        "not callable: {} ({})",
-        func,
-        func.type_name()
-    )))
-}
-
-/// Minimal evaluator for use within LLM builtins (avoids circular dep with sema-eval).
-fn simple_eval(ctx: &EvalContext, expr: &Value, env: &Env) -> Result<Value, SemaError> {
-    match expr.view() {
-        ValueView::Symbol(spur) => env
-            .get(spur)
-            .ok_or_else(|| SemaError::Unbound(resolve(spur))),
-        ValueView::List(items) if !items.is_empty() => {
-            let func_val = simple_eval(ctx, &items[0], env)?;
-            let mut args = Vec::new();
-            for arg in &items[1..] {
-                args.push(simple_eval(ctx, arg, env)?);
-            }
-            call_value_fn(ctx, &func_val, &args)
-        }
-        _ => Ok(expr.clone()),
-    }
 }
 
 /// Detect media type from file magic bytes.
@@ -5400,44 +5294,35 @@ mod tests {
         assert_eq!(result[2], Value::bool(true));
     }
 
-    // -- execute_tool_call tests --
+    // -- tool-call argument ordering (json_args_to_sema) --
+    // These pin that JSON arguments bind to handler params by *declaration order*,
+    // not alphabetically. The binding lives in `json_args_to_sema`; the handler is
+    // applied later via the canonical evaluator callback (covered end-to-end by the
+    // FakeProvider agent tests in `crates/sema/tests/llm_fake_test.rs`).
 
     #[test]
-    fn test_execute_tool_call_arg_ordering() {
-        // Tool with params where alphabetical != declaration order.
-        // Handler returns "path={path}, content={content}" to verify ordering.
+    fn test_tool_args_bind_in_declaration_order() {
+        // Params (path, content): alphabetical order would swap them.
         let handler = Value::lambda(Lambda {
             params: vec![intern("path"), intern("content")],
             rest_param: None,
-            body: vec![
-                // Body: (string-append path "|" content)
-                // We can't call string-append without a full evaluator,
-                // so just return the first param to verify it's the path.
-                Value::symbol("path"),
-            ],
+            body: vec![Value::symbol("path")],
             env: Env::new(),
             name: Some(intern("write-file-handler")),
         });
-
-        let tool = Value::tool_def(sema_core::ToolDefinition {
-            name: "write-file".to_string(),
-            description: "Write content to a file".to_string(),
-            parameters: make_param_map(&["path", "content"]),
-            handler,
-        });
-
+        let params = make_param_map(&["path", "content"]);
         let args = json!({"path": "/tmp/test.txt", "content": "file body here"});
-        let ctx = EvalContext::new();
-        let result = execute_tool_call(&ctx, &[tool], "write-file", &args).unwrap();
 
-        // If ordering is wrong (alphabetical), content would be bound to `path`
-        // and we'd get "file body here" instead of the actual path.
-        assert_eq!(result, "/tmp/test.txt");
+        let result = json_args_to_sema(&params, &args, &handler);
+
+        // Declaration order (path, content), not alphabetical (content, path).
+        assert_eq!(result[0], Value::string("/tmp/test.txt"));
+        assert_eq!(result[1], Value::string("file body here"));
     }
 
     #[test]
-    fn test_execute_tool_call_reverse_alpha_order() {
-        // Declare params (z_last, a_first) — exact reverse of alphabetical.
+    fn test_tool_args_reverse_alpha_order() {
+        // Params (z_last, a_first): exact reverse of alphabetical.
         let handler = Value::lambda(Lambda {
             params: vec![intern("z_last"), intern("a_first")],
             rest_param: None,
@@ -5445,20 +5330,14 @@ mod tests {
             env: Env::new(),
             name: Some(intern("test-handler")),
         });
-
-        let tool = Value::tool_def(sema_core::ToolDefinition {
-            name: "test-tool".to_string(),
-            description: "test".to_string(),
-            parameters: make_param_map(&["z_last", "a_first"]),
-            handler,
-        });
-
+        let params = make_param_map(&["z_last", "a_first"]);
         let args = json!({"z_last": "ZLAST", "a_first": "AFIRST"});
-        let ctx = EvalContext::new();
-        let result = execute_tool_call(&ctx, &[tool], "test-tool", &args).unwrap();
 
-        // Lambda body returns z_last — must be "ZLAST", not "AFIRST"
-        assert_eq!(result, "ZLAST");
+        let result = json_args_to_sema(&params, &args, &handler);
+
+        // z_last is declared first, so it must be arg 0 — not alphabetical.
+        assert_eq!(result[0], Value::string("ZLAST"));
+        assert_eq!(result[1], Value::string("AFIRST"));
     }
 
     #[test]

@@ -117,7 +117,6 @@ impl InterpreterBuilder {
 
         if self.llm {
             sema_llm::builtins::register_llm_builtins(&env, &self.sandbox);
-            sema_llm::builtins::set_eval_callback(sema_eval::eval_value_vm);
         }
 
         let global_env = Rc::new(env);

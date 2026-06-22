@@ -66,7 +66,6 @@ impl Interpreter {
         {
             sema_llm::builtins::reset_runtime_state();
             sema_llm::builtins::register_llm_builtins(&env, &sema_core::Sandbox::allow_all());
-            sema_llm::builtins::set_eval_callback(eval_value_vm);
         }
         let global_env = Rc::new(env);
         register_vm_delegates(&global_env);
@@ -84,7 +83,6 @@ impl Interpreter {
         {
             sema_llm::builtins::reset_runtime_state();
             sema_llm::builtins::register_llm_builtins(&env, sandbox);
-            sema_llm::builtins::set_eval_callback(eval_value_vm);
         }
         let global_env = Rc::new(env);
         register_vm_delegates(&global_env);
