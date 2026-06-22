@@ -46,6 +46,12 @@ pub fn install() -> SpanCapture {
     }
 }
 
+/// Force the active `SEMA_OTEL_COMPAT` backend set for a test (bypasses env), e.g.
+/// `"openinference,langfuse"` or `"all"`. Empty string clears it.
+pub fn set_compat(tokens: &str) {
+    crate::compat::set_test_override(tokens);
+}
+
 impl SpanCapture {
     /// All finished spans so far, serialized to the Sema JSONL schema (one object per
     /// span). Flushes first so freshly-ended spans are visible.

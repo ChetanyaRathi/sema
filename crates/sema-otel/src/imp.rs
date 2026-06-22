@@ -13,6 +13,7 @@ use opentelemetry_sdk::metrics::{PeriodicReader, SdkMeterProvider};
 use opentelemetry_sdk::trace::SdkTracerProvider;
 use opentelemetry_sdk::Resource;
 
+use crate::compat;
 use crate::file_exporter::JsonlFileExporter;
 use crate::provider_map::gen_ai_provider_name;
 use crate::ResponseFacts;
@@ -552,6 +553,16 @@ impl SpanCore {
     fn update_name(&self, name: String) {
         self.ctx.span().update_name(name);
     }
+    /// Apply a batch of attributes (used by the compat layer).
+    fn set_attrs(&self, kvs: Vec<KeyValue>) {
+        if kvs.is_empty() {
+            return;
+        }
+        let span = self.ctx.span();
+        for kv in kvs {
+            span.set_attribute(kv);
+        }
+    }
     fn record_error(&self, kind: &str, msg: &str) {
         self.ctx
             .span()
@@ -663,6 +674,14 @@ pub fn llm_span(op: &'static str) -> LlmSpan {
         SpanKind::Client,
         vec![KeyValue::new("gen_ai.operation.name", op)],
     );
+    if let Some(c) = &inner {
+        let kind = if op == "embeddings" {
+            compat::Kind::Embedding
+        } else {
+            compat::Kind::Llm
+        };
+        c.set_attrs(compat::span_kind(kind));
+    }
     LlmSpan {
         inner,
         op,
@@ -692,6 +711,12 @@ impl LlmSpan {
             if let Some(r) = reasoning_effort {
                 c.set_str("sema.gen_ai.request.reasoning_effort", r.to_string());
             }
+            c.set_attrs(compat::request_params(
+                temperature,
+                max_tokens,
+                stop_sequences,
+                reasoning_effort,
+            ));
         }
     }
 
@@ -723,6 +748,8 @@ impl LlmSpan {
                 c.set_str("gen_ai.request.model", request_model.to_string());
                 c.update_name(format!("{} {}", self.op, request_model));
             }
+            // Compat aliases use the RAW Sema provider name (back-translated per backend).
+            c.set_attrs(compat::llm_dispatch(self.op, sema_provider, request_model));
         }
     }
 
@@ -790,6 +817,14 @@ impl LlmSpan {
                 // sema.gen_ai.request.reasoning_effort).
                 c.set_bool("sema.gen_ai.cache.hit", true);
             }
+            c.set_attrs(compat::llm_usage(
+                facts.input_tokens,
+                facts.output_tokens,
+                facts.input_tokens + facts.output_tokens,
+                facts.cache_read_input_tokens,
+                facts.cache_creation_input_tokens,
+                facts.cost_usd,
+            ));
         }
         // A cache hit made no provider call (zero usage, no serving provider) — recording
         // the histograms would emit a misleading zero-token sample with an empty provider
@@ -817,11 +852,13 @@ impl LlmSpan {
             c.set_str("gen_ai.output.messages", output.clone());
             // Langfuse maps observation I/O from these keys (it ignores gen_ai.*.messages),
             // so the content actually renders on the generation.
-            c.set_str("langfuse.observation.input", input);
-            c.set_str("langfuse.observation.output", output);
+            c.set_str("langfuse.observation.input", input.clone());
+            c.set_str("langfuse.observation.output", output.clone());
             if let Some(sys) = system {
                 c.set_str("gen_ai.system_instructions", scrub(sys));
             }
+            // OpenInference input.value/output.value, Traceloop entity.input/output, etc.
+            c.set_attrs(compat::io(&input, &output));
         }
     }
 
@@ -853,6 +890,9 @@ pub fn tool_span(name: &str, call_id: &str, description: Option<&str>) -> ToolSp
         attrs.push(KeyValue::new("gen_ai.tool.description", d.to_string()));
     }
     let inner = start(format!("execute_tool {name}"), SpanKind::Internal, attrs);
+    if let Some(c) = &inner {
+        c.set_attrs(compat::span_kind(compat::Kind::Tool));
+    }
     ToolSpan { inner }
 }
 
@@ -888,6 +928,9 @@ pub fn agent_span(name: Option<&str>) -> AgentSpan {
         _ => "invoke_agent".to_string(),
     };
     let inner = start(span_name, SpanKind::Internal, attrs);
+    if let Some(c) = &inner {
+        c.set_attrs(compat::span_kind(compat::Kind::Agent));
+    }
     AgentSpan { inner }
 }
 
@@ -947,6 +990,9 @@ pub struct VmSpan {
 /// Start a generic INTERNAL span (notebook cell, load/import, `(otel/span …)`).
 pub fn vm_span(name: &str) -> VmSpan {
     let inner = start(name.to_string(), SpanKind::Internal, Vec::new());
+    if let Some(c) = &inner {
+        c.set_attrs(compat::span_kind(compat::Kind::Chain));
+    }
     VmSpan { inner }
 }
 

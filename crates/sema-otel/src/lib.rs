@@ -33,9 +33,13 @@ pub struct ResponseFacts {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
+mod compat;
+#[cfg(not(target_arch = "wasm32"))]
 mod file_exporter;
 #[cfg(not(target_arch = "wasm32"))]
 mod imp;
+#[cfg(not(target_arch = "wasm32"))]
+pub use compat::compat_active;
 #[cfg(not(target_arch = "wasm32"))]
 pub use imp::*;
 

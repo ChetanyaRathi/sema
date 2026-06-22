@@ -19,6 +19,11 @@ pub fn init_from_env() -> Option<OtelGuard> {
 /// No-op on wasm.
 pub fn use_host_global() {}
 
+/// Backend compat is native-only; always inactive on wasm.
+pub fn compat_active() -> bool {
+    false
+}
+
 /// Embedded telemetry mode. `OwnProvider` is omitted on wasm (no `SdkTracerProvider`
 /// exists there); the whole LLM/otel surface is native-only anyway.
 pub enum TelemetryMode {
