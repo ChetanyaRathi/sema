@@ -1,6 +1,9 @@
 # Playground → downloadable native binary (curiosity / future plan)
 
-**Status:** idea, not scheduled. Captured 2026-06-19.
+**Status:** 🅿️ **Deferred — archived 2026-06-23.** Captured 2026-06-19 as a
+curiosity. Feasibility is high and effort low (see verdict), but it's not
+scheduled — kept as a resume-ready scoping doc. Tracked in `docs/deferred.md`
+(PG-1). Resume from the "Smallest proof-of-concept" section.
 
 ## The question
 

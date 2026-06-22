@@ -232,6 +232,28 @@ Remaining work:
 
 ---
 
+## PG-1 — Playground → downloadable native binary
+
+**Deferred (revisit later) — 2026-06-23.** Captured 2026-06-19 as a curiosity and
+archived to `docs/plans/archive/2026-06-19-playground-binary-export.md`. The
+playground runs the WASM build, but `sema build` isn't compilation — it's
+concatenation (`[stock runtime] + [VFS archive] + [trailer]`), so the browser
+could produce a byte-identical runnable native binary with **no compiler**: pick a
+target, fetch the stock runtime (ideally mirrored same-origin on sema.run), append
+the archive built from the editor contents, write the `SEMAEXEC` trailer, download.
+
+**Feasibility high, effort low (~half a day)** — mostly UI + hosting the runtime
+mirror. Preferred first step: factor archive-writing into a lib and expose a
+`sema-wasm` binding returning `Uint8Array` (avoids format drift vs. reimplementing
+the format in JS). Pointers: `crates/sema/src/archive.rs` (format),
+`crates/sema/src/cross_compile.rs` (`SUPPORTED_TARGETS`, runtime download/cache),
+`crates/sema/src/main.rs` `Commands::Build` + `pkg.rs`.
+
+**Why deferred:** not scheduled — no demand pull, just an attractive proof-of-concept.
+Resume from the plan's "Smallest proof-of-concept" section.
+
+---
+
 ## A note on the truly long-term language design items
 
 These are not deferred — they're design questions that need a deliberate decision before any code lands. They're tracked in `docs/wip.md` (the "Wave 6c" cluster), not here.
