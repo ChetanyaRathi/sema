@@ -19,6 +19,22 @@ pub fn init_from_env() -> Option<OtelGuard> {
 /// No-op on wasm.
 pub fn use_host_global() {}
 
+/// Embedded telemetry mode. `OwnProvider` is omitted on wasm (no `SdkTracerProvider`
+/// exists there); the whole LLM/otel surface is native-only anyway.
+pub enum TelemetryMode {
+    Off,
+    UseHostGlobal,
+    FromEnv,
+}
+
+pub fn host_global_is_real() -> bool {
+    false
+}
+
+pub fn activate(_mode: TelemetryMode) -> Option<OtelGuard> {
+    None
+}
+
 pub struct ConversationGuard;
 
 pub fn set_conversation_scope(

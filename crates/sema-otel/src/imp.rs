@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use opentelemetry::global;
 use opentelemetry::metrics::Histogram;
-use opentelemetry::trace::{SpanKind, Status, TraceContextExt, Tracer};
+use opentelemetry::trace::{Span, SpanKind, Status, TraceContextExt, Tracer, TracerProvider};
 use opentelemetry::{Array, Context, InstrumentationScope, KeyValue, StringValue, Value};
 use opentelemetry_sdk::metrics::{PeriodicReader, SdkMeterProvider};
 use opentelemetry_sdk::trace::SdkTracerProvider;
@@ -85,6 +85,76 @@ thread_local! {
     static SESSION_ID: RefCell<Option<String>> = const { RefCell::new(None) };
     static USER_ID: RefCell<Option<String>> = const { RefCell::new(None) };
     static CONV_COUNTER: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// Host-supplied tracer provider (embedded `OwnProvider` mode). When set, spans are
+    /// emitted against it instead of the global provider, WITHOUT installing a global.
+    /// Thread-local because the eval path is `!Send`/`Rc`-based and single-threaded.
+    static OWNED_PROVIDER: RefCell<Option<SdkTracerProvider>> = const { RefCell::new(None) };
+}
+
+/// How an embedded host wires Sema's telemetry (Decisions #12, #14, #16). The
+/// standalone CLI uses `init_from_env()` directly; embedders pass one of these to
+/// `InterpreterBuilder::with_telemetry`.
+pub enum TelemetryMode {
+    /// Default: emit nothing, touch no global state (pure no-op).
+    Off,
+    /// Emit against whatever provider the host already installed in `global` (silent
+    /// no-op if none).
+    UseHostGlobal,
+    /// Emit against a provider the host hands us, installing NO global.
+    OwnProvider(SdkTracerProvider),
+    /// Self-install from the environment (standalone behavior) — but DECLINE and defer
+    /// to the host if a real global provider is already installed (Decision #16). The
+    /// returned `OtelGuard` is handed back to the host to own.
+    FromEnv,
+}
+
+/// Emit subsequent spans against a host-supplied provider (no global install).
+pub fn use_provider(provider: SdkTracerProvider) {
+    OWNED_PROVIDER.with(|c| *c.borrow_mut() = Some(provider));
+    ENABLED.store(true, Ordering::Relaxed);
+}
+
+/// Decision #16 detector: is a REAL (non-Noop) tracer provider installed globally?
+/// opentelemetry 0.32 exposes no is-set flag, so probe span validity: a real SDK
+/// always allocates non-zero trace/span ids (valid context) even under AlwaysOff,
+/// while the Noop default yields an invalid context. The probe is suppressed so a live
+/// SDK drops it (id generation — hence validity — is unaffected by suppression).
+pub fn host_global_is_real() -> bool {
+    let _suppress = Context::enter_telemetry_suppressed_scope();
+    let tracer = global::tracer_with_scope(scope());
+    let mut span = tracer
+        .span_builder("sema.otel.probe")
+        .with_kind(SpanKind::Internal)
+        .start_with_context(&tracer, &Context::new());
+    let valid = span.span_context().is_valid();
+    span.end();
+    valid
+}
+
+/// Activate a telemetry mode. Returns an `OtelGuard` ONLY for `FromEnv` when Sema
+/// self-installs; all other modes install nothing and return `None`. This is the
+/// single activation entry point for embedders.
+pub fn activate(mode: TelemetryMode) -> Option<OtelGuard> {
+    match mode {
+        TelemetryMode::Off => None,
+        TelemetryMode::UseHostGlobal => {
+            use_host_global();
+            None
+        }
+        TelemetryMode::OwnProvider(p) => {
+            use_provider(p);
+            None
+        }
+        TelemetryMode::FromEnv => {
+            if host_global_is_real() {
+                // A host already runs OTel — defer to it, never overwrite (Decision #16).
+                use_host_global();
+                None
+            } else {
+                init_from_env()
+            }
+        }
+    }
 }
 
 /// RAII scope for the conversation/session/user identity. Restores the PREVIOUS
@@ -463,6 +533,26 @@ impl SpanCore {
     }
 }
 
+/// Build a span on `tracer` parented to `parent`, returning the `Context` that carries
+/// it. Generic so it works for both the global `BoxedTracer` and an owned `SdkTracer`.
+fn build_ctx<T: Tracer>(
+    tracer: &T,
+    name: String,
+    kind: SpanKind,
+    attrs: Vec<KeyValue>,
+    parent: &Context,
+) -> Context
+where
+    T::Span: Send + Sync + 'static,
+{
+    let span = tracer
+        .span_builder(name)
+        .with_kind(kind)
+        .with_attributes(attrs)
+        .start_with_context(tracer, parent);
+    parent.with_span(span)
+}
+
 /// Start a span as a child of the current TL-stack top (or `Context::current()` when
 /// the stack is empty — Decision #13), push it onto the stack, return its core.
 /// Returns `None` when telemetry is disabled (no `global` touch, near-zero cost).
@@ -472,13 +562,19 @@ fn start(name: String, kind: SpanKind, attrs: Vec<KeyValue>) -> Option<SpanCore>
     }
     let parent = STACK.with(|s| s.borrow().last().cloned());
     let parent = parent.unwrap_or_else(Context::current);
-    let tracer = global::tracer_with_scope(scope());
-    let span = tracer
-        .span_builder(name)
-        .with_kind(kind)
-        .with_attributes(attrs)
-        .start_with_context(&tracer, &parent);
-    let ctx = parent.with_span(span);
+    // Route through a host-supplied provider (OwnProvider mode) when set; else the
+    // global provider (standalone install or host's ambient provider).
+    let owned = OWNED_PROVIDER.with(|c| c.borrow().clone());
+    let ctx = match owned {
+        Some(p) => build_ctx(&p.tracer_with_scope(scope()), name, kind, attrs, &parent),
+        None => build_ctx(
+            &global::tracer_with_scope(scope()),
+            name,
+            kind,
+            attrs,
+            &parent,
+        ),
+    };
     STACK.with(|s| s.borrow_mut().push(ctx.clone()));
     let core = SpanCore { ctx };
     // Apply the active conversation/session/user identity to EVERY span uniformly.
@@ -853,7 +949,7 @@ mod tests {
 
     #[test]
     fn scrub_truncates_long_content() {
-        let big = "x".repeat(20_000);
+        let big = "x".repeat(100_000);
         let out = scrub(&big);
         assert!(out.len() < big.len());
         assert!(out.ends_with("…[truncated]"));

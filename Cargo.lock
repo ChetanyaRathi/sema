@@ -2165,6 +2165,7 @@ dependencies = [
  "rand 0.9.3",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-stream",
 ]
 
 [[package]]
@@ -3095,6 +3096,8 @@ dependencies = [
  "libc",
  "libsui",
  "nu-ansi-term",
+ "opentelemetry",
+ "opentelemetry_sdk",
  "paste",
  "pio",
  "portable-pty",

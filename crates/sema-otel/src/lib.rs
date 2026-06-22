@@ -39,6 +39,11 @@ mod imp;
 #[cfg(not(target_arch = "wasm32"))]
 pub use imp::*;
 
+// Re-export so embedded hosts can name `TelemetryMode::OwnProvider(..)`'s payload
+// without taking a direct `opentelemetry_sdk` dependency.
+#[cfg(not(target_arch = "wasm32"))]
+pub use opentelemetry_sdk::trace::SdkTracerProvider;
+
 #[cfg(all(not(target_arch = "wasm32"), feature = "testing"))]
 pub mod testing;
 

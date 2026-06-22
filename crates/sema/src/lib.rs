@@ -28,6 +28,7 @@ pub struct InterpreterBuilder {
     stdlib: bool,
     llm: bool,
     sandbox: Sandbox,
+    telemetry: sema_otel::TelemetryMode,
 }
 
 impl Default for InterpreterBuilder {
@@ -43,7 +44,17 @@ impl InterpreterBuilder {
             stdlib: true,
             llm: true,
             sandbox: Sandbox::allow_all(),
+            telemetry: sema_otel::TelemetryMode::Off,
         }
+    }
+
+    /// Configure how this interpreter emits OpenTelemetry (default
+    /// [`TelemetryMode::Off`](sema_otel::TelemetryMode::Off) — no telemetry, never
+    /// touches any global provider). For `FromEnv` use [`Self::build_with_telemetry`]
+    /// so the returned guard (which owns flush-on-exit) stays alive.
+    pub fn with_telemetry(mut self, mode: sema_otel::TelemetryMode) -> Self {
+        self.telemetry = mode;
+        self
     }
 
     /// Enable or disable the standard library (default: `true`).
@@ -81,8 +92,23 @@ impl InterpreterBuilder {
     }
 
     /// Build the [`Interpreter`] with the configured options.
+    ///
+    /// For `TelemetryMode::FromEnv`, prefer [`Self::build_with_telemetry`] — `build`
+    /// drops the telemetry guard, losing flush-on-exit for a self-installed provider.
     pub fn build(self) -> Interpreter {
+        let (interp, _guard) = self.build_with_telemetry();
+        interp
+    }
+
+    /// Build the interpreter and return the OpenTelemetry guard (if any). Hosts using
+    /// `TelemetryMode::FromEnv` must keep the returned guard alive for the process
+    /// lifetime; all other modes return `None` (they install nothing to shut down).
+    pub fn build_with_telemetry(self) -> (Interpreter, Option<sema_otel::OtelGuard>) {
         sema_llm::builtins::reset_runtime_state();
+        // Activate telemetry AFTER reset_runtime_state so the per-thread reset can't
+        // wipe facade state. `new()`/`build()` with the default `Off` is a pure no-op
+        // that never touches global OTel state.
+        let guard = sema_otel::activate(self.telemetry);
 
         let env = Env::new();
         let ctx = sema_eval::EvalContext::new();
@@ -107,9 +133,12 @@ impl InterpreterBuilder {
         sema_eval::register_vm_delegates(&global_env);
         sema_eval::load_prelude(&ctx, &global_env);
 
-        Interpreter {
-            inner: sema_eval::Interpreter { global_env, ctx },
-        }
+        (
+            Interpreter {
+                inner: sema_eval::Interpreter { global_env, ctx },
+            },
+            guard,
+        )
     }
 }
 

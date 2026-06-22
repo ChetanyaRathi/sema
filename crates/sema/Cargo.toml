@@ -60,6 +60,8 @@ libc = "0.2"
 paste = "1"
 pio = "0.3"
 sema-otel = { workspace = true, features = ["testing"] }
+opentelemetry = "0.32"
+opentelemetry_sdk = { version = "0.32", features = ["trace", "testing"] }
 reqwest.workspace = true
 portable-pty = "0.9"
 serde_json.workspace = true
