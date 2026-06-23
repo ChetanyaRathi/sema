@@ -98,16 +98,22 @@ thread_local! {
 // prove that N offloaded futures are in flight *simultaneously* on SHARED_RT,
 // not merely that the wall-clock was fast. `IO_INFLIGHT` is the live count;
 // `IO_PEAK` is the high-water mark.
+// Signed (`AtomicI64`), not `AtomicUsize`: an abandoned future (a task dropped by
+// `async/timeout` or a pool error-path) still runs to completion and decrements the
+// counter during a *later* test. On `usize` that underflows to `usize::MAX`, which
+// then (a) panics on the regular `+ 1` below and (b) poisons `IO_PEAK`. Signed lets a
+// stray decrement go to -1 harmlessly, and we clamp the decrement at 0 so it never
+// shifts a later test's high-water mark.
 #[cfg(not(target_arch = "wasm32"))]
-pub static IO_INFLIGHT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+pub static IO_INFLIGHT: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
 #[cfg(not(target_arch = "wasm32"))]
-pub static IO_PEAK: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+pub static IO_PEAK: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
 
 /// Peak number of `llm/io-sleep-once` futures simultaneously in flight. The
 /// acceptance test asserts this is `>= 2` to prove true overlap.
 #[cfg(not(target_arch = "wasm32"))]
 pub fn io_peak_inflight() -> usize {
-    IO_PEAK.load(std::sync::atomic::Ordering::SeqCst)
+    IO_PEAK.load(std::sync::atomic::Ordering::SeqCst).max(0) as usize
 }
 
 /// Reset the spike in-flight counters (test helper).
@@ -4286,7 +4292,11 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
 
         crate::http::shared_rt().spawn(async move {
             tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
-            IO_INFLIGHT.fetch_sub(1, Ordering::SeqCst);
+            // Clamp at 0: a stray decrement from an abandoned future (timeout/pool
+            // error-path) must not push a later test's live count negative.
+            let _ = IO_INFLIGHT.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| {
+                Some((v - 1).max(0))
+            });
             let _ = tx.send(id);
             // Wake the parked VM thread so it re-polls promptly.
             sema_core::notify_io_complete();
