@@ -59,6 +59,25 @@ pub fn new_conversation_id() -> String {
     String::new()
 }
 
+/// wasm no-op: there is no real otel context to swap, so this is an empty marker.
+#[derive(Default)]
+pub struct OtelTaskCtx;
+
+pub fn take_task_otel() -> OtelTaskCtx {
+    OtelTaskCtx
+}
+
+pub fn install_task_otel(_ctx: OtelTaskCtx) -> OtelTaskCtx {
+    OtelTaskCtx
+}
+
+pub fn current_conversation_scope() -> OtelTaskCtx {
+    OtelTaskCtx
+}
+
+/// wasm no-op: the scheduler never offloads on wasm, so no callbacks are wired.
+pub fn register_task_callbacks() {}
+
 pub struct LlmSpan;
 
 pub fn llm_span(_op: &'static str) -> LlmSpan {

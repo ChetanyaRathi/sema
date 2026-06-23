@@ -11,6 +11,7 @@
 //! native calls and returns `VmExecResult::AsyncYield(reason)`. On resume,
 //! the scheduler sets `set_resume_value(val)` before re-running the VM.
 
+use std::any::Any;
 use std::cell::RefCell;
 use std::rc::Rc;
 
@@ -56,6 +57,14 @@ struct Task {
     /// resumes once `Scheduler::virtual_now >= wake_at`. See the module-level
     /// note on the virtual clock.
     wake_at: Option<u64>,
+    /// This task's saved OTel context (span stack + conversation/session/user
+    /// ids), type-erased as `Box<dyn Any>` so `sema-vm` need not depend on
+    /// `sema-otel`. It is swapped into the otel thread-locals on task entry and
+    /// taken back out (capturing any spans opened during the step) on task
+    /// leave, so a task that parks mid-span cannot corrupt a sibling's stack.
+    /// Seeded at spawn from `current_conversation_scope()` (ids only, empty
+    /// stack) so conversation grouping survives the per-task isolation.
+    otel: Box<dyn Any>,
 }
 
 // ── Scheduler ──────────────────────────────────────────────────────
@@ -139,6 +148,7 @@ impl Scheduler {
             cancelled: false,
             resume_value: None,
             wake_at: None,
+            otel: sema_core::current_conversation_scope_boxed(),
         });
 
         Ok(promise)
@@ -347,6 +357,7 @@ pub(crate) fn run_closure_as_inline_task(
         cancelled: false,
         resume_value: None,
         wake_at: None,
+        otel: sema_core::current_conversation_scope_boxed(),
     });
 
     // Re-enter the scheduler with this promise as the wait target. The
@@ -457,14 +468,41 @@ struct ReinstallGuard<'a> {
     /// True until `reinstall` runs; gates the Drop fallback so it only fires on
     /// an unexpected unwind (not after the normal-path reinstall).
     armed: bool,
+    /// The otel context displaced when this task's context was installed into
+    /// the thread-locals on task entry. Restored on leave (normal path AND
+    /// panic unwind) so a sibling/parent's otel stack + ids are never corrupted
+    /// by a task that parked mid-span. `None` once consumed.
+    prev_otel: Option<Box<dyn Any>>,
 }
 
 impl ReinstallGuard<'_> {
+    /// Swap the per-task otel context back out of the thread-locals — capturing
+    /// any spans the task opened during its step into `task.otel` — and restore
+    /// the otel context that was active before this task ran. Idempotent: a
+    /// second call (Drop after the explicit reinstall) is a no-op.
+    fn restore_otel(&mut self) {
+        let Some(prev) = self.prev_otel.take() else {
+            return;
+        };
+        // Take this task's (possibly mid-span) otel context out and stash it on
+        // the task so it resumes with the same stack/ids next step.
+        let task_otel = sema_core::take_task_otel();
+        if let Some(task) = self.task.as_mut() {
+            task.otel = task_otel;
+        }
+        // Restore the previously-active otel context.
+        let _ = sema_core::install_task_otel(prev);
+    }
+
     /// Take the scheduler back out of the thread-local, re-push the in-flight
     /// task (unless it reached a terminal state), drop terminal tasks left over
     /// from cancellations, and write the result into `*self.sched`. Disarms the
     /// guard so Drop does not reinstall a second time.
     fn reinstall(&mut self) -> Result<(), SemaError> {
+        // Restore otel FIRST (while `self.task` is still owned by the guard) so
+        // a parked task carries its span stack and the prev context is live
+        // again before we re-push tasks into the scheduler.
+        self.restore_otel();
         self.armed = false;
         let mut s = take_scheduler()?;
         if let Some(task) = self.task.take() {
@@ -483,15 +521,15 @@ impl ReinstallGuard<'_> {
 impl Drop for ReinstallGuard<'_> {
     fn drop(&mut self) {
         // If `reinstall` already ran on the normal path the guard is disarmed
-        // and the scheduler has been taken back; nothing to do. Otherwise (a
-        // panic unwound past the explicit reinstall) recover the scheduler from
-        // the thread-local so the empty dummy is never left in `*self.sched`
-        // and the in-flight task is not silently dropped (VM-5).
+        // and the scheduler has been taken back; nothing to do — but still make
+        // sure the otel context was restored (idempotent).
         if !self.armed {
+            self.restore_otel();
             return;
         }
         // Best-effort during unwind: if the scheduler is somehow absent we
-        // cannot do anything useful, so leave `*self.sched` as-is.
+        // cannot do anything useful, so leave `*self.sched` as-is. `reinstall`
+        // restores the otel context first.
         let _ = self.reinstall();
     }
 }
@@ -689,10 +727,19 @@ fn run_until_reentrant(
         // silently dropped the running task, deadlocking callers (VM-5).
         let taken = std::mem::replace(sched, Scheduler::new(Rc::new(Env::new()), Vec::new()));
         put_scheduler(taken);
+        // Install this task's otel context (span stack + conversation/session/
+        // user ids) into the thread-locals for the duration of its step, holding
+        // the displaced context in the guard so it is restored on leave — even
+        // on a panic unwind. This keeps concurrent tasks' otel state isolated:
+        // a task that parks mid-span carries that stack on its own `task.otel`
+        // and never corrupts a sibling's.
+        let task_otel = std::mem::replace(&mut task.otel, Box::new(()));
+        let prev_otel = sema_core::install_task_otel(task_otel);
         let mut guard = ReinstallGuard {
             sched,
             task: Some(task),
             armed: true,
+            prev_otel: Some(prev_otel),
         };
         let task = guard.task.as_mut().expect("in-flight task present");
 
@@ -794,6 +841,7 @@ mod tests {
                 sched: &mut sched,
                 task: None,
                 armed: true,
+                prev_otel: None,
             };
             // Simulate a panic mid-step (e.g. an `unreachable!()` in the VM).
             panic!("simulated task panic");

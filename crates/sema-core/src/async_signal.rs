@@ -8,6 +8,7 @@
 //! Lives in sema-core (not sema-vm) so sema-stdlib can use it without
 //! depending on sema-vm. Follows the same pattern as `set_eval_callback`.
 
+use std::any::Any;
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::{Condvar, Mutex};
@@ -249,6 +250,72 @@ pub fn set_blocking_sleep_callback(f: BlockingSleepFn) {
 /// Remove any installed blocking-sleep callback, restoring the platform default.
 pub fn clear_blocking_sleep_callback() {
     BLOCKING_SLEEP_CALLBACK.with(|cb| cb.set(None));
+}
+
+// ── Per-task OTel context swap (type-erased seam) ───────────────
+//
+// The cooperative scheduler runs many tasks on the one VM thread. The otel
+// span stack + conversation/session/user ids live in `sema-otel` thread-locals,
+// so a task that parks mid-span and yields to a sibling would otherwise share
+// (and corrupt) that single stack. The scheduler swaps each task's otel context
+// in on entry and out on leave.
+//
+// `sema-core` must not depend on `sema-otel`, so the actual take/install lives
+// in `sema-otel` and is reached through these type-erased fn-pointer callbacks
+// (`Box<dyn Any>` carries the `OtelTaskCtx`), registered once at startup by a
+// crate that names both types — exactly mirroring `set_blocking_sleep_callback`.
+// When no callback is installed (e.g. a unit test with no otel), both helpers
+// are no-ops returning an empty box.
+
+/// Take (mem::take) the current thread's otel task context, leaving it empty.
+pub type OtelTakeFn = fn() -> Box<dyn Any>;
+/// Install (mem::replace) an otel task context, returning the one displaced.
+pub type OtelInstallFn = fn(Box<dyn Any>) -> Box<dyn Any>;
+/// Capture the current conversation/session/user identity with an EMPTY span
+/// stack — seeded onto a freshly-spawned task.
+pub type OtelScopeFn = fn() -> Box<dyn Any>;
+
+thread_local! {
+    static OTEL_TAKE_CALLBACK: Cell<Option<OtelTakeFn>> = const { Cell::new(None) };
+    static OTEL_INSTALL_CALLBACK: Cell<Option<OtelInstallFn>> = const { Cell::new(None) };
+    static OTEL_SCOPE_CALLBACK: Cell<Option<OtelScopeFn>> = const { Cell::new(None) };
+}
+
+/// Register the per-task otel take/install/scope callbacks. Called once at
+/// startup by `sema_otel::register_task_callbacks()`.
+pub fn set_otel_task_callbacks(take: OtelTakeFn, install: OtelInstallFn, scope: OtelScopeFn) {
+    OTEL_TAKE_CALLBACK.with(|cb| cb.set(Some(take)));
+    OTEL_INSTALL_CALLBACK.with(|cb| cb.set(Some(install)));
+    OTEL_SCOPE_CALLBACK.with(|cb| cb.set(Some(scope)));
+}
+
+/// Capture the current conversation scope (ids only, empty span stack) as a
+/// type-erased otel task context to seed onto a newly-spawned task. Returns
+/// `Box::new(())` when no callback is installed.
+pub fn current_conversation_scope_boxed() -> Box<dyn Any> {
+    match OTEL_SCOPE_CALLBACK.with(|cb| cb.get()) {
+        Some(f) => f(),
+        None => Box::new(()),
+    }
+}
+
+/// Take the current otel task context out of the thread-locals (leaving them
+/// empty). Returns `Box::new(())` when no callback is installed.
+pub fn take_task_otel() -> Box<dyn Any> {
+    match OTEL_TAKE_CALLBACK.with(|cb| cb.get()) {
+        Some(f) => f(),
+        None => Box::new(()),
+    }
+}
+
+/// Install `ctx` into the otel thread-locals, returning the context it displaced
+/// (so the caller can restore it). A no-op returning `Box::new(())` when no
+/// callback is installed.
+pub fn install_task_otel(ctx: Box<dyn Any>) -> Box<dyn Any> {
+    match OTEL_INSTALL_CALLBACK.with(|cb| cb.get()) {
+        Some(f) => f(ctx),
+        None => Box::new(()),
+    }
 }
 
 // ── Interrupt (cancellation) callback ───────────────────────────

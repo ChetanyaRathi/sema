@@ -952,6 +952,13 @@ fn guard_provider_url(unrestricted: bool, opts: &BTreeMap<Value, Value>) -> Resu
 pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
     let unrestricted = sandbox.is_unrestricted();
 
+    // Wire the per-task otel context-swap callbacks into sema-core so the
+    // cooperative scheduler (sema-vm, which can't depend on sema-otel) can swap
+    // the otel span stack + ids on task-switch. Idempotent (just resets two
+    // thread-local fn pointers); registering here keeps it in a crate that names
+    // both `sema_core` and `sema_otel`.
+    sema_otel::register_task_callbacks();
+
     // CI/global cassette: SEMA_LLM_CASSETTE=path [+ SEMA_LLM_CASSETTE_MODE=replay|
     // record|auto] installs a cassette for the whole process, so a suite can be
     // forced into deterministic replay without touching test source. Only honored

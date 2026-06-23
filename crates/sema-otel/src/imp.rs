@@ -92,6 +92,81 @@ thread_local! {
     static OWNED_PROVIDER: RefCell<Option<SdkTracerProvider>> = const { RefCell::new(None) };
 }
 
+// ---------------------------------------------------------------------------
+// Per-task OTel context swap (cooperative-scheduler isolation)
+// ---------------------------------------------------------------------------
+
+/// A snapshot of the per-thread otel context owned by one scheduler task: the
+/// active-span stack plus the conversation/session/user identity. The scheduler
+/// swaps one of these into the thread-locals on task entry and takes it back out
+/// on task leave, so a task that parks mid-span (its `SpanCore` guard still on
+/// the stack) cannot corrupt a sibling task's stack or ids.
+#[derive(Default)]
+pub struct OtelTaskCtx {
+    stack: Vec<Context>,
+    conversation_id: Option<String>,
+    session_id: Option<String>,
+    user_id: Option<String>,
+}
+
+/// Move the current thread's otel context out of the thread-locals (leaving them
+/// empty), returning it so the scheduler can store it on the parked task.
+pub fn take_task_otel() -> OtelTaskCtx {
+    OtelTaskCtx {
+        stack: STACK.with(|s| std::mem::take(&mut *s.borrow_mut())),
+        conversation_id: CONVERSATION_ID.with(|c| c.borrow_mut().take()),
+        session_id: SESSION_ID.with(|c| c.borrow_mut().take()),
+        user_id: USER_ID.with(|c| c.borrow_mut().take()),
+    }
+}
+
+/// Install `ctx` into the thread-locals, returning the context it displaced (so
+/// the scheduler can restore the previous task's context after this task's step).
+pub fn install_task_otel(ctx: OtelTaskCtx) -> OtelTaskCtx {
+    OtelTaskCtx {
+        stack: STACK.with(|s| std::mem::replace(&mut *s.borrow_mut(), ctx.stack)),
+        conversation_id: CONVERSATION_ID
+            .with(|c| std::mem::replace(&mut *c.borrow_mut(), ctx.conversation_id)),
+        session_id: SESSION_ID.with(|c| std::mem::replace(&mut *c.borrow_mut(), ctx.session_id)),
+        user_id: USER_ID.with(|c| std::mem::replace(&mut *c.borrow_mut(), ctx.user_id)),
+    }
+}
+
+/// Capture the current conversation/session/user identity into a fresh task
+/// context with an EMPTY span stack. Seeded onto a newly-spawned task so its
+/// spans group under the same conversation as the spawning code, without
+/// inheriting (and later mis-popping) the spawner's in-flight span stack.
+pub fn current_conversation_scope() -> OtelTaskCtx {
+    OtelTaskCtx {
+        stack: Vec::new(),
+        conversation_id: CONVERSATION_ID.with(|c| c.borrow().clone()),
+        session_id: SESSION_ID.with(|c| c.borrow().clone()),
+        user_id: USER_ID.with(|c| c.borrow().clone()),
+    }
+}
+
+/// Register the type-erased per-task otel callbacks with `sema-core` so the
+/// scheduler (in `sema-vm`, which must not depend on `sema-otel`) can swap the
+/// otel context on task-switch. Called once at interpreter startup. The
+/// `Box<dyn Any>` carries an [`OtelTaskCtx`]; a non-`OtelTaskCtx` box (e.g. the
+/// `()` placeholder when no context was ever captured) installs the default.
+pub fn register_task_callbacks() {
+    fn take() -> Box<dyn std::any::Any> {
+        Box::new(take_task_otel())
+    }
+    fn install(ctx: Box<dyn std::any::Any>) -> Box<dyn std::any::Any> {
+        let ctx = ctx
+            .downcast::<OtelTaskCtx>()
+            .map(|b| *b)
+            .unwrap_or_default();
+        Box::new(install_task_otel(ctx))
+    }
+    fn scope_ctx() -> Box<dyn std::any::Any> {
+        Box::new(current_conversation_scope())
+    }
+    sema_core::set_otel_task_callbacks(take, install, scope_ctx);
+}
+
 /// How an embedded host wires Sema's telemetry (Decisions #12, #14, #16). The
 /// standalone CLI uses `init_from_env()` directly; embedders pass one of these to
 /// `InterpreterBuilder::with_telemetry`.
