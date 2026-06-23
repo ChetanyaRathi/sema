@@ -562,7 +562,49 @@ fn run_until_reentrant(
                     // the top of the loop live (so Ctrl-C still works) and
                     // bounds any missed notify. Then loop back to re-run
                     // `wake_blocked_tasks`, which polls the IO handles.
-                    sema_core::io_park(50);
+                    //
+                    // Crucially, while IO is pending we keep the VIRTUAL CLOCK
+                    // and TIMEOUTS live by advancing `virtual_now` by the REAL
+                    // time we parked. The old `io_park(50); continue;` skipped
+                    // this and starved any concurrent `async/sleep` sleeper
+                    // (#2) and disabled `async/timeout` (#3) for the duration of
+                    // the in-flight IO. We compute the nearest deadline exactly
+                    // as the sleeper path below does, clamp the park to it (so
+                    // we don't overshoot a near sleeper) and to 50 ms (so the
+                    // `check_interrupt` cadence stays ~50 ms for Ctrl-C), park
+                    // for real time, then advance `virtual_now` by the measured
+                    // elapsed so sleepers wake and the timeout fires.
+                    let next_sleep = sched
+                        .tasks
+                        .iter()
+                        .filter(|t| matches!(t.state, TaskState::Blocked(YieldReason::Sleep(_))))
+                        .filter_map(|t| t.wake_at)
+                        .min();
+                    let next = match (next_sleep, goal.sleep_limit()) {
+                        (Some(a), Some(b)) => Some(a.min(b)),
+                        (Some(a), None) | (None, Some(a)) => Some(a),
+                        (None, None) => None,
+                    };
+                    let to_deadline = next
+                        .map(|t| t.saturating_sub(sched.virtual_now))
+                        .unwrap_or(u64::MAX);
+                    let park_ms = to_deadline.clamp(1, 50);
+
+                    let t0 = std::time::Instant::now();
+                    sema_core::io_park(park_ms);
+                    let elapsed = t0.elapsed().as_millis() as u64;
+
+                    // While IO is pending, virtual time tracks real time so
+                    // sleepers wake (via `wake_blocked_tasks` at the loop top
+                    // when `virtual_now >= wake_at`) and timeouts fire.
+                    sched.virtual_now = sched.virtual_now.saturating_add(elapsed.max(1));
+
+                    // Replicate the sleeper path's timeout check: if we've
+                    // reached the `async/timeout` deadline with the target still
+                    // pending, the operation has timed out (#3).
+                    if goal.sleep_limit().is_some_and(|dl| sched.virtual_now >= dl) {
+                        return Ok(SchedulerRunResult::TimedOut);
+                    }
                     continue;
                 }
 
