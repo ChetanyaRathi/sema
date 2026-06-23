@@ -1,6 +1,49 @@
 # Plan — Breakpoints & stepping inside async tasks
 
-**Status:** Scoped, not started (2026-06-23). Bug write-up: `docs/bugs/async-breakpoints.md`.
+**Status:** Slice 1 (native DAP STOP+CONTINUE) SHIPPED 2026-06-23. Bug write-up: `docs/bugs/async-breakpoints.md`.
+
+## Slice 1 — shipped (native DAP stop+continue)
+
+A breakpoint on a line that runs only inside an async task
+(`async/spawn`/`async`/`async/map`/`pool-map`/`async/all`/channels) now STOPS under
+the native DAP debugger and `Continue` resumes the task + scheduler to completion.
+
+How:
+- `ACTIVE_DEBUG` thread-local (`*mut DebugState`) in `crates/sema-vm/src/vm.rs`,
+  mirroring `CURRENT_VM`. `execute_debug` registers the active session via an
+  `ActiveDebugGuard` (popped on return/panic). The scheduler — reached through the
+  `RUN_SCHEDULER_CALLBACK` fn-pointer seam, which can't carry a borrowed
+  `&mut DebugState` — reborrows it via `with_active_debug(...)`, gated on the cheap
+  `is_debug_session_active()` so the **non-debug async hot path is byte-identical**.
+- `VM::execute_async_debug` / `run_async_debug` run the task step through
+  `run_inner(ctx, Some(debug))`.
+- The `Stopped` command loop was extracted from `execute_debug` into the reusable
+  `VM::handle_debug_stop(ctx, debug, info) -> DebugStopResume`. The scheduler calls
+  it on `task.vm`, so GetStackTrace/GetScopes/GetVariables target the **stopped
+  task's VM** (its frames), not the main VM.
+- Gate test: `crates/sema/tests/dap_async_breakpoint_test.rs` (async-task breakpoint
+  stops+continues; sync control proves the harness).
+
+Verified vs deferred (Slice 1):
+- VERIFIED: stop on a breakpoint inside an async task; `Continue` resumes the task
+  and the scheduler to completion. Workspace tests, `make examples` (81/0), lint all
+  green; existing DAP tests unregressed.
+- DEFERRED follow-ups (documented, not done in Slice 1):
+  - **Stepping across the scheduler.** `Continue` is correct. `Step*` set the
+    stopped task VM's step mode and stop again on the next line *within that task*,
+    but stepping does not follow control across the scheduler boundary (into sibling
+    tasks or back to the main VM); siblings stay parked. See the code comment on
+    `scheduler::step_task_debug`.
+  - **Full frame/scope inspection at an async stop.** `handle_debug_stop` targets
+    `task.vm` so inspection requests are wired correctly, but inspection at an async
+    stop is not yet covered by an integration test — left as a follow-up (Slice 1
+    lands STOP+CONTINUE solidly).
+  - **WASM playground** (the harder suspend/resume-through-the-scheduler half) is a
+    separate later slice — native DAP only here.
+
+---
+
+## Original scoping (below)
 **Goal:** breakpoints, stepping, and pause/inspect work for code running inside the
 cooperative scheduler (`async`/`async/spawn`/`async/map`/`pool-map`/channels), in both
 the WASM playground and the native DAP — to the same fidelity as synchronous code.

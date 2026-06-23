@@ -1,7 +1,10 @@
 # Breakpoints don't fire inside async task code
 
-**Status:** Known limitation, deferred (2026-06-23). Fix scoped in
-`docs/plans/2026-06-23-async-debugger.md`.
+**Status:** Native DAP STOP+CONTINUE FIXED (2026-06-23, Slice 1) — a breakpoint
+inside an async task now stops and `Continue` resumes. Stepping across the
+scheduler, full frame/scope inspection at an async stop, and the WASM playground
+remain documented follow-ups. See `docs/plans/2026-06-23-async-debugger.md` and the
+gate test `crates/sema/tests/dap_async_breakpoint_test.rs`.
 
 ## Symptom
 
