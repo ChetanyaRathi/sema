@@ -8,14 +8,14 @@ Extract a snippet around a search term with omission markers. Case-insensitive s
 
 ```sema
 (text/excerpt "The quick brown fox jumps over the lazy dog" "fox" {:radius 10})
-; => "...brown fox jumps ov..."
+; => "...ick brown fox jumps ove..."
 
 (text/excerpt "Hello world" "Hello")
 ; => "Hello world"
 
 ;; Custom omission marker
 (text/excerpt "Long text here..." "text" {:radius 5 :omission "[…]"})
-; => "[…]g text here[…]"
+; => "Long text here[…]"
 ```
 
 Options map (optional third argument):

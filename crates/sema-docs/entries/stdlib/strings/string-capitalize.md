@@ -4,8 +4,9 @@ module: "strings"
 section: "Core String Operations"
 ---
 
-Capitalize the first character.
+Uppercase the first character and lowercase the rest.
 
 ```sema
 (string/capitalize "hello")   ; => "Hello"
+(string/capitalize "hELLO")   ; => "Hello"
 ```

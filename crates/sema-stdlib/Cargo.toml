@@ -25,6 +25,7 @@ hmac.workspace = true
 hex.workspace = true
 hashbrown.workspace = true
 unicode-normalization.workspace = true
+caseless.workspace = true
 glob.workspace = true
 toml.workspace = true
 

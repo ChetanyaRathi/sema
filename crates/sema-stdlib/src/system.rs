@@ -7,6 +7,34 @@ use sema_core::{check_arity, Caps, SemaError, Value};
 
 use crate::register_fn;
 
+/// Monotonic clock captured the first time it is needed — forced during
+/// `register()` so it reflects interpreter/process startup, not the first call
+/// to `sys/elapsed`. `sys/elapsed` reports nanoseconds since this instant.
+fn process_start() -> std::time::Instant {
+    use std::sync::OnceLock;
+    static PROCESS_START: OnceLock<std::time::Instant> = OnceLock::new();
+    *PROCESS_START.get_or_init(std::time::Instant::now)
+}
+
+/// Whether a PATH candidate is actually runnable. On Unix this requires an
+/// execute permission bit, matching POSIX `which`; reporting a non-executable
+/// file as a found command is wrong. On other platforms runnability is governed
+/// by extension rules, so existence (already checked by the caller) suffices.
+fn is_executable(path: &std::path::Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        path.metadata()
+            .map(|m| m.permissions().mode() & 0o111 != 0)
+            .unwrap_or(false)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        true
+    }
+}
+
 // ─── Signal pending flags (set by async signal handlers) ────────────────────
 static SIGWINCH_PENDING: AtomicBool = AtomicBool::new(false);
 static SIGINT_PENDING: AtomicBool = AtomicBool::new(false);
@@ -201,6 +229,9 @@ fn shell_async(program: String, child_args: Vec<String>) -> Result<Value, SemaEr
 }
 
 pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
+    // Anchor the sys/elapsed clock at startup rather than at its first call.
+    process_start();
+
     crate::register_fn_gated(env, sandbox, Caps::ENV_READ, "env", |args| {
         check_arity!(args, "env", 1);
         let name = args[0]
@@ -260,7 +291,15 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
         let code = if args.is_empty() {
             0
         } else {
-            args[0].as_int().unwrap_or(0) as i32
+            // Reject non-numeric status rather than silently exiting 0 — a script
+            // that means to fail must not succeed. Floats truncate toward zero.
+            match args[0]
+                .as_int()
+                .or_else(|| args[0].as_float().map(|f| f as i64))
+            {
+                Some(n) => n as i32,
+                None => return Err(SemaError::type_error("integer", args[0].type_name())),
+            }
         };
         std::process::exit(code);
     });
@@ -429,7 +468,7 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
         let sep = if cfg!(windows) { ';' } else { ':' };
         for dir in path_var.split(sep) {
             let candidate = std::path::Path::new(dir).join(name);
-            if candidate.is_file() {
+            if candidate.is_file() && is_executable(&candidate) {
                 return Ok(Value::string(&candidate.to_string_lossy()));
             }
         }
@@ -447,11 +486,7 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
 
     register_fn(env, "sys/elapsed", |args| {
         check_arity!(args, "sys/elapsed", 0);
-        use std::time::Instant;
-        thread_local! {
-            static START: Instant = Instant::now();
-        }
-        let nanos = START.with(|s| s.elapsed().as_nanos()) as i64;
+        let nanos = process_start().elapsed().as_nanos() as i64;
         Ok(Value::int(nanos))
     });
 

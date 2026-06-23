@@ -2,14 +2,35 @@ use sema_core::{check_arity, SemaError, Value};
 
 use crate::register_fn;
 
+/// Validate a user-supplied array length: a non-negative integer within a sane
+/// allocation bound. Without this guard a negative length wraps through
+/// `as usize` to a near-`usize::MAX` value and the subsequent `vec![fill; n]`
+/// aborts the whole process with a Rust `capacity overflow` panic.
+fn array_length(arg: &Value, op: &str) -> Result<usize, SemaError> {
+    let n = arg
+        .as_int()
+        .ok_or_else(|| SemaError::type_error("integer", arg.type_name()))?;
+    if n < 0 {
+        return Err(SemaError::eval(format!(
+            "{op}: length must be non-negative, got {n}"
+        )));
+    }
+    // Cap well below allocation limits so an absurd-but-positive length errors
+    // cleanly instead of OOM-killing the process.
+    const MAX_LEN: i64 = 1 << 32;
+    if n > MAX_LEN {
+        return Err(SemaError::eval(format!(
+            "{op}: length {n} exceeds maximum {MAX_LEN}"
+        )));
+    }
+    Ok(n as usize)
+}
+
 pub fn register(env: &sema_core::Env) {
     // (f64-array/make n) or (f64-array/make n fill) — create f64 array
     register_fn(env, "f64-array/make", |args| {
         check_arity!(args, "f64-array/make", 1..=2);
-        let n = args[0]
-            .as_int()
-            .ok_or_else(|| SemaError::type_error("integer", args[0].type_name()))?
-            as usize;
+        let n = array_length(&args[0], "f64-array/make")?;
         let fill = if let Some(v) = args.get(1) {
             v.as_float()
                 .or_else(|| v.as_int().map(|i| i as f64))
@@ -23,10 +44,7 @@ pub fn register(env: &sema_core::Env) {
     // (i64-array/make n) or (i64-array/make n fill) — create i64 array
     register_fn(env, "i64-array/make", |args| {
         check_arity!(args, "i64-array/make", 1..=2);
-        let n = args[0]
-            .as_int()
-            .ok_or_else(|| SemaError::type_error("integer", args[0].type_name()))?
-            as usize;
+        let n = array_length(&args[0], "i64-array/make")?;
         let fill = if let Some(v) = args.get(1) {
             v.as_int()
                 .ok_or_else(|| SemaError::type_error("integer", v.type_name()))?

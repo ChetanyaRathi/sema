@@ -85,6 +85,7 @@ Stdlib higher-order functions (map, filter, foldl, sort-by) call through `sema_c
 - Errors: use `SemaError::eval()`, `::type_error()`, `::arity()` constructors — never raw enum variants. Use `.with_hint()` for actionable guidance.
 - Native fns: `NativeFn` takes `(&EvalContext, &[Value])`, returns `Result<Value, SemaError>`. Use `NativeFn::simple()` for fns that don't need context, `NativeFn::with_ctx()` for those that do
 - Single-threaded: `Rc` everywhere, not `Arc`. `hashbrown::HashMap` for `Env` bindings, `BTreeMap` for user-facing sorted maps.
+- Comments describe the code as it stands, not what changed. Drop change-narration ("now uses X instead of Y", "switched from", "previously", "fixed to"); keep the *why* (rationale, invariants, gotchas). Git tracks the story; the source shouldn't. Contrasting with a sibling (`unlike string/lower`) is fine; contrasting with a past version is not.
 
 ### Sema Language Naming (Decision #24)
 

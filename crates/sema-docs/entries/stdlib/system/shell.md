@@ -4,9 +4,11 @@ module: "system"
 section: "Shell & Process Control"
 ---
 
-Run a shell command and return its stdout as a string.
+Run a shell command. Returns a map with `:stdout`, `:stderr`, and `:exit-code`.
 
 ```sema
-(shell "ls -la")       ; => "total 42\n..."
-(shell "echo hello")   ; => "hello\n"
+(shell "echo hello")
+; => {:exit-code 0 :stderr "" :stdout "hello\n"}
+
+(:stdout (shell "echo hello"))   ; => "hello\n"
 ```

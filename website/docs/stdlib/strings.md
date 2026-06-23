@@ -76,10 +76,11 @@ Convert string to lowercase.
 
 ### `string/capitalize`
 
-Capitalize the first character.
+Uppercase the first character and lowercase the rest.
 
 ```sema
 (string/capitalize "hello")   ; => "Hello"
+(string/capitalize "hELLO")   ; => "Hello"
 ```
 
 ### `string/title-case`

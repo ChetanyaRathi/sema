@@ -6322,11 +6322,100 @@ fn test_string_foldcase() {
         eval(r#"(string/foldcase "Hello World")"#),
         Value::string("hello world")
     );
-    // German sharp s stays lowercase
+    // True Unicode case folding: German sharp s folds to "ss"
+    // (this is the whole point of foldcase vs string/lower, which leaves "ß")
     assert_eq!(
         eval(r#"(string/foldcase "Straße")"#),
-        Value::string("straße")
+        Value::string("strasse")
     );
+    // Final sigma folds the same as medial sigma, so caseless comparison works
+    assert_eq!(eval(r#"(string/foldcase "ΩΣ")"#), Value::string("ωσ"));
+    assert_eq!(
+        eval(r#"(string/foldcase "ὈΔΥΣΣΕΎΣ")"#),
+        eval(r#"(string/foldcase "ὀδυσσεύς")"#)
+    );
+    // string/lower still leaves the sharp s untouched (the two diverge)
+    assert_eq!(eval(r#"(string/lower "Straße")"#), Value::string("straße"));
+}
+
+#[test]
+fn test_string_ci_equal_folding() {
+    // case-insensitive equality must use full folding, not plain lowercase,
+    // so "ß" and "SS" compare equal
+    assert_eq!(
+        eval(r#"(string-ci=? "Straße" "STRASSE")"#),
+        Value::bool(true)
+    );
+    assert_eq!(
+        eval(r#"(string-ci=? "ΣΙΣΥΦΟΣ" "σισυφος")"#),
+        Value::bool(true)
+    );
+}
+
+// ─── Audit regressions (stdlib semantic-divergence sweep) ───────────────────
+
+#[test]
+fn test_typed_array_make_negative_length_errors() {
+    // A negative length must error gracefully, not abort the process with a
+    // Rust capacity-overflow panic (length wraps through `as usize`).
+    assert!(eval_err("(f64-array/make -1)")
+        .to_string()
+        .contains("non-negative"));
+    assert!(eval_err("(i64-array/make -5)")
+        .to_string()
+        .contains("non-negative"));
+    // valid lengths still work
+    assert_eq!(eval("(f64-array/length (f64-array/make 3))"), Value::int(3));
+}
+
+#[test]
+fn test_int_rejects_non_finite_and_out_of_range() {
+    // `int` truncates toward zero but must reject NaN/inf/out-of-range like its
+    // sibling `truncate`, not saturate to i64::MIN/MAX or 0.
+    assert!(eval_err("(int (/ 1.0 0.0))").to_string().contains("int"));
+    assert!(eval_err("(int math/nan)").to_string().contains("int"));
+    // 1.0e19 is beyond i64::MAX (~9.2e18); relies on scientific-notation literals (LEX-1)
+    assert!(eval_err("(int 1.0e19)").to_string().contains("int"));
+    // ordinary truncation unchanged
+    assert_eq!(eval("(int 3.9)"), Value::int(3));
+    assert_eq!(eval("(int -3.9)"), Value::int(-3));
+}
+
+#[test]
+fn test_math_clamp_propagates_nan() {
+    // NaN must propagate, not silently become the low bound (f64::max drops NaN).
+    let v = eval("(math/clamp math/nan 0.0 10.0)");
+    assert!(
+        v.as_float().is_some_and(|f| f.is_nan()),
+        "expected NaN, got {v}"
+    );
+    // ordinary clamping unchanged
+    assert_eq!(eval("(math/clamp 15.0 0.0 10.0)"), Value::float(10.0));
+    assert_eq!(eval("(math/clamp -5.0 0.0 10.0)"), Value::float(0.0));
+}
+
+#[test]
+fn test_exit_rejects_non_numeric_status() {
+    // A non-numeric status must error rather than silently exit(0), which would
+    // turn an intended failure into success. (We only exercise the error path —
+    // a valid (exit n) would terminate the test process.)
+    assert!(eval_err(r#"(exit "x")"#)
+        .to_string()
+        .to_lowercase()
+        .contains("type"));
+}
+
+#[test]
+fn test_negative_fractional_timestamp_floors() {
+    // -0.5s is 1969-12-31 23:59:59.5 UTC; decomposition must floor, not
+    // truncate toward zero (which wrongly yields 1970-01-01).
+    assert_eq!(
+        eval(r#"(time/format -0.5 "%Y-%m-%d %H:%M:%S")"#),
+        Value::string("1969-12-31 23:59:59")
+    );
+    assert_eq!(eval("(get (time/date-parts -0.5) :year)"), Value::int(1969));
+    assert_eq!(eval("(get (time/date-parts -0.5) :month)"), Value::int(12));
+    assert_eq!(eval("(get (time/date-parts -0.5) :day)"), Value::int(31));
 }
 
 #[test]

@@ -175,7 +175,10 @@ pub fn register(env: &sema_core::Env) {
         check_arity!(args, "int", 1);
         match args[0].view() {
             ValueView::Int(n) => Ok(Value::int(n)),
-            ValueView::Float(f) => Ok(Value::int(f as i64)),
+            // Truncate toward zero, but reject NaN/inf/out-of-range like every
+            // other rounding builtin (floor/ceil/round/truncate) — a raw cast
+            // would saturate and silently return garbage.
+            ValueView::Float(f) => float_to_int(f.trunc(), "int"),
             ValueView::String(s) => s
                 .parse::<i64>()
                 .map(Value::int)
@@ -380,6 +383,11 @@ pub fn register(env: &sema_core::Env) {
                 let hi = args[2]
                     .as_float()
                     .ok_or_else(|| SemaError::type_error("number", args[2].type_name()))?;
+                // f64::max/min discard NaN, so a NaN input would silently become
+                // a bound. Propagate NaN instead, matching IEEE-754 expectations.
+                if v.is_nan() {
+                    return Ok(Value::float(v));
+                }
                 Ok(Value::float(v.max(lo).min(hi)))
             }
         }

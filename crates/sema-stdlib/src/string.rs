@@ -806,7 +806,11 @@ pub fn register(env: &sema_core::Env) {
         let s = args[0]
             .as_str()
             .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
-        Ok(Value::string(&s.to_lowercase()))
+        // Full Unicode case folding (CaseFolding.txt C+F), NOT plain lowercasing:
+        // e.g. "Straße" -> "strasse", final-sigma "ς" folds like "σ". This is what
+        // makes foldcase the correct basis for caseless comparison, distinct from
+        // string/lower (which leaves "ß" intact).
+        Ok(Value::string(&caseless::default_case_fold_str(s)))
     });
 
     register_fn(env, "string-ci=?", |args| {
@@ -817,7 +821,8 @@ pub fn register(env: &sema_core::Env) {
         let b = args[1]
             .as_str()
             .ok_or_else(|| SemaError::type_error("string", args[1].type_name()))?;
-        Ok(Value::bool(a.to_lowercase() == b.to_lowercase()))
+        // Caseless comparison via full case folding so "Straße" == "STRASSE".
+        Ok(Value::bool(caseless::default_caseless_match_str(a, b)))
     });
 
     // string/after — everything after first occurrence of needle

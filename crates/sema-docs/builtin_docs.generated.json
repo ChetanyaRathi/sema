@@ -1609,11 +1609,11 @@
       "name": "file/info",
       "module": "file-io",
       "section": "Directory Operations",
-      "summary": "Get file metadata. Returns a map with `:size`, `:modified`, and other keys.",
+      "summary": "Get file metadata. Returns a map with `:size` (bytes), `:modified` (Unix epoch **milliseconds**), `:is-file`, and `:is-dir`.",
       "examples": [
-        "(file/info \"data.txt\")   ; => {:size 1234 :modified 1707955200 ...}"
+        "(file/info \"data.txt\")\n; => {:is-dir #f :is-file #t :modified 1782248141021 :size 1234}"
       ],
-      "body": "Get file metadata. Returns a map with `:size`, `:modified`, and other keys.\n\n```sema\n(file/info \"data.txt\")   ; => {:size 1234 :modified 1707955200 ...}\n```"
+      "body": "Get file metadata. Returns a map with `:size` (bytes), `:modified` (Unix epoch\n**milliseconds**), `:is-file`, and `:is-dir`.\n\n```sema\n(file/info \"data.txt\")\n; => {:is-dir #f :is-file #t :modified 1782248141021 :size 1234}\n```"
     },
     {
       "name": "file/is-directory?",
@@ -2233,11 +2233,11 @@
       "name": "assv",
       "module": "lists",
       "section": "Association Lists",
-      "summary": "Like `assoc` but uses `eqv?` comparison (value equality for numbers).",
+      "summary": "Find the first pair in an association list whose key equals `key`. In Sema this compares by value, so `assv`, `assq`, and `assoc` all match structurally equal keys (including compound keys like lists) — they are not distinguished by object identity the way Scheme's `eqv?`/`eq?` would be.",
       "examples": [
         "(assv 2 '((1 \"one\") (2 \"two\")))   ; => (2 \"two\")"
       ],
-      "body": "Like `assoc` but uses `eqv?` comparison (value equality for numbers).\n\n```sema\n(assv 2 '((1 \"one\") (2 \"two\")))   ; => (2 \"two\")\n```"
+      "body": "Find the first pair in an association list whose key equals `key`. In Sema this\ncompares by value, so `assv`, `assq`, and `assoc` all match structurally equal\nkeys (including compound keys like lists) — they are not distinguished by\nobject identity the way Scheme's `eqv?`/`eq?` would be.\n\n```sema\n(assv 2 '((1 \"one\") (2 \"two\")))   ; => (2 \"two\")\n```"
     },
     {
       "name": "caaar",
@@ -4078,12 +4078,12 @@
       "name": "deep-merge",
       "module": "maps",
       "section": "Combining",
-      "summary": "Recursively merge maps left to right. Nested maps are merged; non-map values from later arguments overwrite earlier ones. Same as `map/deep-merge`.",
+      "summary": "Recursively merge maps left to right. Nested maps are merged; non-map values from later arguments overwrite earlier ones. Same as `map/deep-merge`. The result is always an ordered map, regardless of the input map types (unlike `merge`, which preserves the type of its first argument).",
       "returns": "map",
       "examples": [
         "(deep-merge {:a {:x 1}} {:a {:y 2}})   ; => {:a {:x 1 :y 2}}\n(deep-merge {:a 1} {:a 2})             ; => {:a 2}"
       ],
-      "body": "Recursively merge maps left to right. Nested maps are merged; non-map values from later arguments overwrite earlier ones. Same as `map/deep-merge`.\n\n```sema\n(deep-merge {:a {:x 1}} {:a {:y 2}})   ; => {:a {:x 1 :y 2}}\n(deep-merge {:a 1} {:a 2})             ; => {:a 2}\n```"
+      "body": "Recursively merge maps left to right. Nested maps are merged; non-map values from later arguments overwrite earlier ones. Same as `map/deep-merge`. The result is always an ordered map, regardless of the input map types (unlike `merge`, which preserves the type of its first argument).\n\n```sema\n(deep-merge {:a {:x 1}} {:a {:y 2}})   ; => {:a {:x 1 :y 2}}\n(deep-merge {:a 1} {:a 2})             ; => {:a 2}\n```"
     },
     {
       "name": "dissoc",
@@ -4510,11 +4510,11 @@
       "name": "=",
       "module": "math",
       "section": "Comparison",
-      "summary": "Numeric equality.",
+      "summary": "Equality. For numbers this is numeric equality (so `(= 1 1.0)` is `#t`); for non-numbers it falls back to structural equality. Unlike `<` / `>`, comparing non-numbers does not error.",
       "examples": [
-        "(= 1 1)       ; => #t\n(= 1 2)       ; => #f"
+        "(= 1 1)           ; => #t\n(= 1 1.0)         ; => #t\n(= 1 2)           ; => #f\n(= \"abc\" \"abc\")   ; => #t   (structural, not an error)"
       ],
-      "body": "Numeric equality.\n\n```sema\n(= 1 1)       ; => #t\n(= 1 2)       ; => #f\n```"
+      "body": "Equality. For numbers this is numeric equality (so `(= 1 1.0)` is `#t`); for\nnon-numbers it falls back to structural equality. Unlike `<` / `>`, comparing\nnon-numbers does not error.\n\n```sema\n(= 1 1)           ; => #t\n(= 1 1.0)         ; => #t\n(= 1 2)           ; => #f\n(= \"abc\" \"abc\")   ; => #t   (structural, not an error)\n```"
     },
     {
       "name": ">",
@@ -5683,11 +5683,11 @@
       "name": "=",
       "module": "predicates",
       "section": "Equality",
-      "summary": "Numeric equality.",
+      "summary": "Equality. For numbers this is numeric equality (so `(= 1 1.0)` is `#t`); for non-numbers it falls back to structural equality. Unlike `<` / `>`, comparing non-numbers does not error — it reports whether the values are equal.",
       "examples": [
-        "(= 1 1)       ; => #t\n(= 1 1.0)     ; => #t\n(= 1 2)       ; => #f"
+        "(= 1 1)           ; => #t\n(= 1 1.0)         ; => #t\n(= 1 2)           ; => #f\n(= \"abc\" \"abc\")   ; => #t   (structural, not an error)\n(= 1 \"a\")         ; => #f"
       ],
-      "body": "Numeric equality.\n\n```sema\n(= 1 1)       ; => #t\n(= 1 1.0)     ; => #t\n(= 1 2)       ; => #f\n```"
+      "body": "Equality. For numbers this is numeric equality (so `(= 1 1.0)` is `#t`); for\nnon-numbers it falls back to structural equality. Unlike `<` / `>`, comparing\nnon-numbers does not error — it reports whether the values are equal.\n\n```sema\n(= 1 1)           ; => #t\n(= 1 1.0)         ; => #t\n(= 1 2)           ; => #f\n(= \"abc\" \"abc\")   ; => #t   (structural, not an error)\n(= 1 \"a\")         ; => #f\n```"
     },
     {
       "name": "agent?",
@@ -7958,11 +7958,11 @@
       "name": "string/capitalize",
       "module": "strings",
       "section": "Core String Operations",
-      "summary": "Capitalize the first character.",
+      "summary": "Uppercase the first character and lowercase the rest.",
       "examples": [
-        "(string/capitalize \"hello\")   ; => \"Hello\""
+        "(string/capitalize \"hello\")   ; => \"Hello\"\n(string/capitalize \"hELLO\")   ; => \"Hello\""
       ],
-      "body": "Capitalize the first character.\n\n```sema\n(string/capitalize \"hello\")   ; => \"Hello\"\n```"
+      "body": "Uppercase the first character and lowercase the rest.\n\n```sema\n(string/capitalize \"hello\")   ; => \"Hello\"\n(string/capitalize \"hELLO\")   ; => \"Hello\"\n```"
     },
     {
       "name": "string/chars",
@@ -8059,11 +8059,11 @@
       "name": "string/foldcase",
       "module": "strings",
       "section": "Unicode & Encoding",
-      "summary": "Apply Unicode case folding to a string. Useful for case-insensitive comparisons and normalization. Uses full Unicode-aware lowercasing.",
+      "summary": "Apply full Unicode case folding (CaseFolding.txt C+F mappings) to a string. Useful for case-insensitive comparisons and normalization.",
       "examples": [
-        "(string/foldcase \"HELLO\")        ; => \"hello\"\n(string/foldcase \"Hello World\")  ; => \"hello world\"\n(string/foldcase \"Straße\")       ; => \"straße\"\n(string/foldcase \"ΩΜΕΓΑ\")        ; => \"ωμεγα\""
+        "(string/foldcase \"HELLO\")        ; => \"hello\"\n(string/foldcase \"Hello World\")  ; => \"hello world\"\n(string/foldcase \"Straße\")       ; => \"strasse\"   ; string/lower leaves \"straße\"\n(string/foldcase \"ΩΜΕΓΑ\")        ; => \"ωμεγα\""
       ],
-      "body": "Apply Unicode case folding to a string. Useful for case-insensitive comparisons and normalization. Uses full Unicode-aware lowercasing.\n\n```sema\n(string/foldcase \"HELLO\")        ; => \"hello\"\n(string/foldcase \"Hello World\")  ; => \"hello world\"\n(string/foldcase \"Straße\")       ; => \"straße\"\n(string/foldcase \"ΩΜΕΓΑ\")        ; => \"ωμεγα\"\n```"
+      "body": "Apply full Unicode case folding (CaseFolding.txt C+F mappings) to a string. Useful for case-insensitive comparisons and normalization.\n\nUnlike `string/lower`, folding maps characters to a canonical caseless form rather than simply lowercasing: the German sharp s `ß` folds to `ss`, and final-sigma `ς` folds the same as medial `σ`. This is what makes `string/foldcase` the correct basis for caseless matching (see `string-ci=?`).\n\n```sema\n(string/foldcase \"HELLO\")        ; => \"hello\"\n(string/foldcase \"Hello World\")  ; => \"hello world\"\n(string/foldcase \"Straße\")       ; => \"strasse\"   ; string/lower leaves \"straße\"\n(string/foldcase \"ΩΜΕΓΑ\")        ; => \"ωμεγα\"\n```"
     },
     {
       "name": "string/from-codepoints",
@@ -8653,11 +8653,11 @@
       "name": "shell",
       "module": "system",
       "section": "Shell & Process Control",
-      "summary": "Run a shell command and return its stdout as a string.",
+      "summary": "Run a shell command. Returns a map with `:stdout`, `:stderr`, and `:exit-code`.",
       "examples": [
-        "(shell \"ls -la\")       ; => \"total 42\\n...\"\n(shell \"echo hello\")   ; => \"hello\\n\""
+        "(shell \"echo hello\")\n; => {:exit-code 0 :stderr \"\" :stdout \"hello\\n\"}\n\n(:stdout (shell \"echo hello\"))   ; => \"hello\\n\""
       ],
-      "body": "Run a shell command and return its stdout as a string.\n\n```sema\n(shell \"ls -la\")       ; => \"total 42\\n...\"\n(shell \"echo hello\")   ; => \"hello\\n\"\n```"
+      "body": "Run a shell command. Returns a map with `:stdout`, `:stderr`, and `:exit-code`.\n\n```sema\n(shell \"echo hello\")\n; => {:exit-code 0 :stderr \"\" :stdout \"hello\\n\"}\n\n(:stdout (shell \"echo hello\"))   ; => \"hello\\n\"\n```"
     },
     {
       "name": "spy",
@@ -9323,9 +9323,9 @@
       "section": "Text Cleaning",
       "summary": "Extract a snippet around a search term with omission markers. Case-insensitive search. Returns `nil` if query not found.",
       "examples": [
-        "(text/excerpt \"The quick brown fox jumps over the lazy dog\" \"fox\" {:radius 10})\n; => \"...brown fox jumps ov...\"\n\n(text/excerpt \"Hello world\" \"Hello\")\n; => \"Hello world\"\n\n;; Custom omission marker\n(text/excerpt \"Long text here...\" \"text\" {:radius 5 :omission \"[…]\"})\n; => \"[…]g text here[…]\""
+        "(text/excerpt \"The quick brown fox jumps over the lazy dog\" \"fox\" {:radius 10})\n; => \"...ick brown fox jumps ove...\"\n\n(text/excerpt \"Hello world\" \"Hello\")\n; => \"Hello world\"\n\n;; Custom omission marker\n(text/excerpt \"Long text here...\" \"text\" {:radius 5 :omission \"[…]\"})\n; => \"Long text here[…]\""
       ],
-      "body": "Extract a snippet around a search term with omission markers. Case-insensitive search. Returns `nil` if query not found.\n\n```sema\n(text/excerpt \"The quick brown fox jumps over the lazy dog\" \"fox\" {:radius 10})\n; => \"...brown fox jumps ov...\"\n\n(text/excerpt \"Hello world\" \"Hello\")\n; => \"Hello world\"\n\n;; Custom omission marker\n(text/excerpt \"Long text here...\" \"text\" {:radius 5 :omission \"[…]\"})\n; => \"[…]g text here[…]\"\n```\n\nOptions map (optional third argument):\n\n- `:radius` — number of characters to show on each side (default: 100)\n- `:omission` — marker string for truncated parts (default: `\"...\"`)"
+      "body": "Extract a snippet around a search term with omission markers. Case-insensitive search. Returns `nil` if query not found.\n\n```sema\n(text/excerpt \"The quick brown fox jumps over the lazy dog\" \"fox\" {:radius 10})\n; => \"...ick brown fox jumps ove...\"\n\n(text/excerpt \"Hello world\" \"Hello\")\n; => \"Hello world\"\n\n;; Custom omission marker\n(text/excerpt \"Long text here...\" \"text\" {:radius 5 :omission \"[…]\"})\n; => \"Long text here[…]\"\n```\n\nOptions map (optional third argument):\n\n- `:radius` — number of characters to show on each side (default: 100)\n- `:omission` — marker string for truncated parts (default: `\"...\"`)"
     },
     {
       "name": "text/normalize-newlines",
