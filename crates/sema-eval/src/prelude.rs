@@ -107,4 +107,40 @@ pub const PRELUDE: &str = r#"
 ;; (with-session "chat-42" {:user "alice"} (llm/complete "...")) — use {} for no user.
 (defmacro with-session (id config . body)
   `(otel/with-session ,id ,config (lambda () ,@body)))
+
+;; async/pool-map: bounded-concurrency fan-out. Applies `f` to each item with at
+;; most `n` tasks running concurrently, returning results in INPUT order.
+;;
+;;   (async/pool-map fetch urls 8)   ; fetch all urls, <=8 sockets open at once
+;;
+;; `f`, `items` and `n` are all ordinary values, so this could be a plain
+;; function — it's a macro only because the prelude loader registers macros, not
+;; top-level defines. The args are spliced verbatim into a `let` (each is bound
+;; once, so they evaluate exactly once and in argument order).
+;;
+;; Concurrency is bounded by a semaphore built from a capacity-`n` channel
+;; pre-filled with `n` tokens: each spawned task first `(channel/recv sem)`
+;; (acquire — yields/parks when the pool is full, which is what caps concurrency),
+;; runs `(pool-f item)`, then releases its token on BOTH the success and error
+;; paths (via try/catch — a throwing `f` must still release, or the pool
+;; deadlocks). Errors are re-raised so a failing item surfaces. `async/all`
+;; preserves spawn (i.e. input) order, so results line up with `items`.
+(defmacro async/pool-map (f items n)
+  `(let ((pool-f# ,f)
+         (pool-items# ,items)
+         (pool-sem# (channel/new ,n)))
+     ;; Pre-fill the semaphore with n tokens (the available concurrency slots).
+     (for-range (i# 0 ,n) (channel/send pool-sem# #t))
+     (async/all
+       (map (fn (item#)
+              (async/spawn
+                (fn ()
+                  (channel/recv pool-sem#)            ; acquire a slot (parks if full)
+                  (let ((result# (try {:ok (pool-f# item#)}
+                                      (catch e# {:err e#}))))
+                    (channel/send pool-sem# #t)        ; release on BOTH paths
+                    (if (contains? result# :err)
+                      (throw (:err result#))           ; re-raise so failures surface
+                      (:ok result#))))))
+            pool-items#))))
 "#;

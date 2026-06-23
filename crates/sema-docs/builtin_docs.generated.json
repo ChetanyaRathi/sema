@@ -531,6 +531,17 @@
       "body": "`#t` if `promise` is still pending (has not yet resolved, rejected, or been cancelled), `#f` otherwise. Errors if the argument is not a promise.\n\n```sema\n(async/pending? (async (do-work)))  ; => #t (before the scheduler runs)\n```"
     },
     {
+      "name": "async/pool-map",
+      "module": "concurrency",
+      "section": "Promises",
+      "summary": "Bounded-concurrency fan-out: apply `f` to each item with at most `n` tasks running concurrently, returning the results in **input order**.",
+      "examples": [
+        "(async/pool-map f items n) → list",
+        ";; Fetch many URLs with at most 8 requests in flight at once.\n(async/pool-map (fn (u) (http/get u)) urls 8)\n\n(async/pool-map (fn (i) (* i i)) '(0 1 2 3 4 5) 2)  ; => (0 1 4 9 16 25)"
+      ],
+      "body": "```sema\n(async/pool-map f items n) → list\n```\n\nBounded-concurrency fan-out: apply `f` to each item with at most `n` tasks\nrunning concurrently, returning the results in **input order**.\n\nUnlike `(async/all (map #(async/spawn (fn () (f %))) items))`, which opens *all*\ntasks at once, `async/pool-map` caps how many run simultaneously — so fanning out\nover thousands of items won't open thousands of sockets or processes. Concurrency\nis bounded by a semaphore (a capacity-`n` channel pre-filled with `n` tokens):\neach task acquires a token before running `f` and releases it afterward on both\nthe success and error paths, so a throwing `f` can't deadlock the pool. A failing\nitem re-raises its error.\n\n```sema\n;; Fetch many URLs with at most 8 requests in flight at once.\n(async/pool-map (fn (u) (http/get u)) urls 8)\n\n(async/pool-map (fn (i) (* i i)) '(0 1 2 3 4 5) 2)  ; => (0 1 4 9 16 25)\n```"
+    },
+    {
       "name": "async/promise?",
       "module": "concurrency",
       "section": "Promises",
