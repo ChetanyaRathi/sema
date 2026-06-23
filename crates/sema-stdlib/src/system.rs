@@ -100,22 +100,30 @@ fn shell_async(program: String, child_args: Vec<String>) -> Result<Value, SemaEr
     }
 
     let (tx, mut rx) = tokio::sync::oneshot::channel::<Result<RawShellOutput, String>>();
-    // The child's OS pid, published by the worker once spawned (0 = not yet). The
-    // abort hook reads it to issue a SYNCHRONOUS SIGKILL — see below.
+    // The child's OS pid, published by the worker once spawned (0 = not yet). On Unix
+    // the child is its OWN process-group leader (process_group(0) → pgid == pid), so
+    // the abort hook can SIGKILL the whole group. The poll closure resets this to 0 on
+    // completion so a later abort never signals a reaped (possibly reused) pid.
     let pid_slot = Arc::new(AtomicU32::new(0));
     let pid_for_worker = pid_slot.clone();
+    let pid_for_poll = pid_slot.clone();
 
     let join = crate::async_rt::stdlib_shared_rt().spawn(async move {
         let result = async {
             // Spawn (not `.output()`) so we can publish the pid before awaiting, then
-            // gather output. `kill_on_drop` ensures that if this future is aborted
-            // (cancel/timeout/interrupt) while the runtime is still alive, dropping
-            // the `Child` kills the subprocess. stdout/stderr piped to match `.output()`.
-            let child = tokio::process::Command::new(&program)
-                .args(&child_args)
+            // gather output. `kill_on_drop` kills the direct child if this future is
+            // dropped while the runtime is alive. stdout/stderr piped to match `.output()`.
+            let mut cmd = tokio::process::Command::new(&program);
+            cmd.args(&child_args)
                 .kill_on_drop(true)
                 .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped());
+            // Put the child in its own process group so a compound/pipelined command
+            // (`sh -c "a; b"`) — where `sh` forks the real workers as grandchildren —
+            // can be torn down as a GROUP on abort, not just the `sh` leader.
+            #[cfg(unix)]
+            cmd.process_group(0);
+            let child = cmd
                 .spawn()
                 // Match the sync path's spawn-error message format exactly.
                 .map_err(|e| format!("shell: {e}"))?;
@@ -139,24 +147,34 @@ fn shell_async(program: String, child_args: Vec<String>) -> Result<Value, SemaEr
     });
 
     // True cancellation: on cancel/timeout the scheduler runs this hook. It (a) aborts
-    // the spawned task (→ drops the kill_on_drop `Child` once the runtime processes
-    // it) AND (b) issues a SYNCHRONOUS `SIGKILL` by pid. (b) is what makes the kill
-    // reliable even when the program exits IMMEDIATELY after the timeout (e.g. a
-    // one-shot `sema -e`), where the runtime is torn down before it can process the
-    // async abort — without it the orphaned child would run to completion. The hook
-    // fires only on cancellation, never on normal completion.
+    // the spawned task (→ drops the kill_on_drop `Child` once the runtime processes it)
+    // AND (b) issues a SYNCHRONOUS `SIGKILL` to the child's whole PROCESS GROUP. (b) is
+    // what makes the kill reliable even when the program exits IMMEDIATELY after the
+    // timeout (e.g. a one-shot `sema -e`), where the runtime is torn down before it can
+    // process the async abort — and killing the GROUP (not just the `sh` pid) reaps the
+    // grandchildren a compound command forks. Fires only on cancellation.
     let abort_handle = join.abort_handle();
+    #[cfg(unix)]
     let pid_for_abort = pid_slot;
+    #[cfg(not(unix))]
+    let _ = pid_slot;
     let handle = Rc::new(sema_core::IoHandle::with_abort(
         move || match rx.try_recv() {
             Err(TryRecvError::Empty) => sema_core::IoPoll::Pending,
-            Ok(Ok(raw)) => sema_core::IoPoll::Ready(Ok(shell_output_value(
-                raw.status_code,
-                &raw.stdout,
-                &raw.stderr,
-            ))),
-            Ok(Err(msg)) => sema_core::IoPoll::Ready(Err(msg)),
+            Ok(Ok(raw)) => {
+                pid_for_poll.store(0, Ordering::SeqCst);
+                sema_core::IoPoll::Ready(Ok(shell_output_value(
+                    raw.status_code,
+                    &raw.stdout,
+                    &raw.stderr,
+                )))
+            }
+            Ok(Err(msg)) => {
+                pid_for_poll.store(0, Ordering::SeqCst);
+                sema_core::IoPoll::Ready(Err(msg))
+            }
             Err(TryRecvError::Closed) => {
+                pid_for_poll.store(0, Ordering::SeqCst);
                 sema_core::IoPoll::Ready(Err("shell: subprocess worker dropped".to_string()))
             }
         },
@@ -166,11 +184,13 @@ fn shell_async(program: String, child_args: Vec<String>) -> Result<Value, SemaEr
             {
                 let pid = pid_for_abort.load(Ordering::SeqCst);
                 if pid != 0 {
-                    // SAFETY: kill(2) with a pid we spawned and a constant signal; the
-                    // worst case of a (vanishingly unlikely) pid-reuse race is signaling
-                    // an unrelated process, no memory safety concern.
+                    // SAFETY: killpg of the child's own process group (process_group(0)
+                    // set pgid == pid). The negative pid targets the GROUP, killing the
+                    // `sh` leader AND any grandchildren it forked. The pid is reset to 0
+                    // by the poll closure once the worker observed completion, so a
+                    // reaped/reused pid is never targeted (only a constant signal is sent).
                     unsafe {
-                        libc::kill(pid as libc::pid_t, libc::SIGKILL);
+                        libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
                     }
                 }
             }

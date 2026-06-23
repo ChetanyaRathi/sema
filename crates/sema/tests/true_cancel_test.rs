@@ -31,19 +31,21 @@ fn marker(name: &str) -> PathBuf {
     p
 }
 
-/// HEADLINE GATE: a subprocess that sleeps then writes a marker, abandoned by a
-/// short `async/timeout`, must be KILLED — the marker must NOT appear even after we
-/// wait well past the subprocess's own sleep. A best-effort cancel (the old
-/// behavior) would let the child run to completion and the marker WOULD appear.
+/// HEADLINE GATE: the marker is written by a GRANDCHILD (a backgrounded subshell)
+/// that `sh` forks, while `sh` itself stays alive (`wait`). On timeout the whole
+/// PROCESS GROUP must be killed — so neither `sh` nor the grandchild survives and
+/// the marker never appears. This specifically distinguishes a group kill from a
+/// kill of only the direct `sh` pid (which would orphan the grandchild, leaving it
+/// to `touch` the marker after its sleep).
 #[test]
 #[serial]
-fn subprocess_is_killed_on_timeout() {
+fn subprocess_group_is_killed_on_timeout() {
     let m = marker("killed");
     let interp = Interpreter::new();
     let program = format!(
         r#"(try
              (async/timeout 200
-               (async/spawn (fn () (shell "sh" "-c" "sleep 3; touch {}"))))
+               (async/spawn (fn () (shell "sh" "-c" "(sleep 3; touch {}) & wait"))))
              (catch e :caught))"#,
         m.display()
     );
@@ -55,12 +57,51 @@ fn subprocess_is_killed_on_timeout() {
         sema_core::Value::keyword("caught"),
         "the timeout must surface as a caught error"
     );
-    // Wait past the subprocess's 3 s sleep. If it was merely abandoned (not killed),
-    // it would `touch` the marker around now. A real kill means it never does.
+    // Wait past the grandchild's 3 s sleep. If only `sh` (the direct child) were
+    // killed, the orphaned grandchild would `touch` the marker around now.
     std::thread::sleep(Duration::from_millis(4000));
     assert!(
         !m.exists(),
-        "the subprocess must have been KILLED on timeout — marker {} should not exist",
+        "the whole process GROUP must be killed on timeout — marker {} should not exist",
+        m.display()
+    );
+    let _ = std::fs::remove_file(&m);
+}
+
+/// Cancellation must be TRANSITIVE: a subprocess awaited INDIRECTLY (one
+/// `async/await` layer deeper than the timed-out task) must still be killed, and its
+/// inner task must not survive as an un-reaped orphan. Before transitive cancel, the
+/// timeout cancelled only the outer task and the inner `Blocked(AwaitIo)` shell task
+/// ran to completion (marker appeared) AND lingered in the scheduler.
+#[test]
+#[serial]
+fn indirectly_awaited_subprocess_is_killed_on_timeout() {
+    let m = marker("indirect");
+    let interp = Interpreter::new();
+    let program = format!(
+        r#"(try
+             (async/timeout 200
+               (async/spawn (fn ()
+                 (async/await
+                   (async/spawn (fn () (shell "sh" "-c" "(sleep 3; touch {}) & wait")))))))
+             (catch e :caught))"#,
+        m.display()
+    );
+    let result = interp
+        .eval_str_compiled(&program)
+        .expect("indirect timeout-abandoned shell evaluated");
+    assert_eq!(result, sema_core::Value::keyword("caught"));
+    // No orphaned inner task left behind (would also be a #7 span-at-teardown hazard
+    // for the LLM tier): transitive cancel transitioned it to terminal → reaped.
+    assert_eq!(
+        sema_vm::scheduler_task_count(),
+        0,
+        "the indirectly-awaited inner task must be cancelled + reaped, not orphaned"
+    );
+    std::thread::sleep(Duration::from_millis(4000));
+    assert!(
+        !m.exists(),
+        "an indirectly-awaited subprocess must also be killed — marker {} should not exist",
         m.display()
     );
     let _ = std::fs::remove_file(&m);

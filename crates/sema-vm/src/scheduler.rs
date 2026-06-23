@@ -281,58 +281,93 @@ impl Scheduler {
             .retain(|t| !matches!(t.state, TaskState::Done | TaskState::Failed));
     }
 
-    /// Cancel the task whose promise is `target` — the victim of an
-    /// `async/timeout` that just expired (or an `async/cancel`). Transition it to
-    /// a terminal `Failed`/`Cancelled` state NOW, on the VM thread while the OTel
-    /// thread-locals are alive, so its `Blocked(AwaitIo(handle))` reason is
-    /// dropped here: the `IoHandle` (which may own a detached `LlmSpan`) ends its
-    /// span at this point instead of surviving to teardown (adversarial #7). The
-    /// in-flight offloaded future is left to run to completion and discard its
-    /// result (best-effort cancel; a true socket/process abort is a separate
-    /// slice). No-op if the task already settled or no such task exists.
-    fn cancel_promise_task(&mut self, target: &Rc<AsyncPromise>) {
-        if let Some(task) = self
-            .tasks
-            .iter_mut()
-            .find(|t| Rc::ptr_eq(&t.promise, target))
-        {
-            if !matches!(task.state, TaskState::Done | TaskState::Failed) {
-                // True cancellation: abort the in-flight offloaded work (real
-                // socket/process abort where the handle supports it) BEFORE the
-                // reassignment below drops the Blocked(AwaitIo(handle)).
-                if let TaskState::Blocked(YieldReason::AwaitIo(h)) = &task.state {
-                    h.abort();
-                }
-                task.cancelled = true;
-                *task.promise.state.borrow_mut() = PromiseState::Cancelled;
-                // Reassigning `state` drops the previous `Blocked(AwaitIo(handle))`,
-                // dropping the `IoHandle` and ending any detached span it owns.
-                task.state = TaskState::Failed;
-            }
-        }
-    }
-
-    /// Mark a task as cancelled and transition its promise into `Cancelled`.
-    /// Returns true if this call actually transitioned the task into the
-    /// cancelled state, false if the task was already terminal (Done /
-    /// Failed / previously Cancelled) or if no task with that id exists.
-    fn cancel_task(&mut self, task_id: u64) -> Result<bool, SemaError> {
-        let Some(task) = self.tasks.iter_mut().find(|t| t.id == task_id) else {
-            // Task already completed and was pruned — no transition.
-            return Ok(false);
-        };
+    /// Cancel ONE non-terminal task in place: abort any in-flight offloaded work it
+    /// holds (real socket/process abort where the handle supports it), then transition
+    /// it to `Cancelled`/`Failed`. Returns `(transitioned, awaited)` — whether this
+    /// call actually transitioned it, and the promise it was DIRECTLY awaiting via
+    /// `AwaitPromise` (the next hop for transitive cancellation), if any. Aborting +
+    /// transitioning here (on the VM thread, OTel TLS alive) is what drops a
+    /// span-owning `IoHandle` before teardown (adversarial #7).
+    fn cancel_one(task: &mut Task) -> (bool, Option<Rc<AsyncPromise>>) {
         if matches!(task.state, TaskState::Done | TaskState::Failed) || task.cancelled {
-            return Ok(false);
+            return (false, None);
         }
-        // Abort the in-flight offloaded work (real socket/process abort where the
-        // handle supports it) BEFORE reassigning `state` drops the Blocked(AwaitIo).
-        if let TaskState::Blocked(YieldReason::AwaitIo(h)) = &task.state {
-            h.abort();
-        }
+        let awaited = match &task.state {
+            // Abort the offloaded work BEFORE the reassignment below drops the reason.
+            TaskState::Blocked(YieldReason::AwaitIo(h)) => {
+                h.abort();
+                None
+            }
+            // Indirect await: this task is blocked ON another task's promise — that
+            // child must be cancelled too, or the IO it (transitively) holds escapes.
+            TaskState::Blocked(YieldReason::AwaitPromise(p)) => Some(p.clone()),
+            _ => None,
+        };
         task.cancelled = true;
         *task.promise.state.borrow_mut() = PromiseState::Cancelled;
         task.state = TaskState::Failed;
-        Ok(true)
+        (true, awaited)
+    }
+
+    /// Cancel `root` and, TRANSITIVELY, every task it is (directly or indirectly)
+    /// awaiting through `AwaitPromise` edges. Without this, a single layer of
+    /// indirection — `(async/await (async/spawn (fn () (http/get …))))` — would leave
+    /// the inner IO-bound task un-aborted (its socket/process kept running) and
+    /// un-reaped (a non-terminal `Blocked(AwaitIo)` task the terminal-only reap keeps,
+    /// re-opening the #7 span-at-teardown hazard). Returns whether `root` itself
+    /// transitioned (for `async/cancel`'s bool result).
+    ///
+    /// Semantics note: cancelling a task cancels the work it was waiting for, even if
+    /// that work is also awaited elsewhere — consistent with "best-effort" cancel and
+    /// with timeout meaning "give up on this and free its resources".
+    fn cancel_await_tree(&mut self, root: &Rc<AsyncPromise>) -> bool {
+        let mut root_transitioned = false;
+        let mut frontier = vec![root.clone()];
+        // Belt-and-suspenders against a pathological await cycle (can't normally form
+        // — a cancelled task goes terminal so it never re-enqueues children).
+        let mut budget = 100_000usize;
+        while let Some(p) = frontier.pop() {
+            budget = budget.saturating_sub(1);
+            if budget == 0 {
+                break;
+            }
+            let is_root = Rc::ptr_eq(&p, root);
+            if let Some(task) = self.tasks.iter_mut().find(|t| Rc::ptr_eq(&t.promise, &p)) {
+                let (transitioned, awaited) = Self::cancel_one(task);
+                if is_root {
+                    root_transitioned = transitioned;
+                }
+                if let Some(next) = awaited {
+                    frontier.push(next);
+                }
+            }
+        }
+        root_transitioned
+    }
+
+    /// Cancel the task whose promise is `target` — the victim of an `async/timeout`
+    /// that just expired. Transitive (see [`cancel_await_tree`]).
+    ///
+    /// [`cancel_await_tree`]: Scheduler::cancel_await_tree
+    fn cancel_promise_task(&mut self, target: &Rc<AsyncPromise>) {
+        self.cancel_await_tree(target);
+    }
+
+    /// Mark a task (by id) as cancelled and transition its promise into `Cancelled`,
+    /// transitively cancelling whatever it awaits. Returns true if this call actually
+    /// transitioned the task, false if it was already terminal/cancelled or no task
+    /// with that id exists.
+    fn cancel_task(&mut self, task_id: u64) -> Result<bool, SemaError> {
+        let Some(promise) = self
+            .tasks
+            .iter()
+            .find(|t| t.id == task_id)
+            .map(|t| t.promise.clone())
+        else {
+            // Task already completed and was pruned — no transition.
+            return Ok(false);
+        };
+        Ok(self.cancel_await_tree(&promise))
     }
 }
 

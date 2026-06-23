@@ -84,7 +84,10 @@ impl IoHandle {
     ///
     /// [`new`]: IoHandle::new
     pub fn abort(&self) {
-        if let Some(f) = self.abort.borrow_mut().take() {
+        // Take the hook OUT before invoking it, releasing the RefCell borrow — so a
+        // re-entrant or double abort is genuinely a no-op, never a BorrowMutError.
+        let hook = self.abort.borrow_mut().take();
+        if let Some(f) = hook {
             f();
         }
     }
