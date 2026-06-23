@@ -2770,6 +2770,10 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
             let provider_name = provider.name().to_string();
             let (tx, mut rx) = tokio::sync::oneshot::channel::<Result<EmbedResponse, LlmError>>();
             let req2 = request.clone();
+            // Best-effort cancel: spawn_blocking work cannot be interrupted, so this
+            // handle has no abort hook (IoHandle::new) — on cancel/timeout the result
+            // is discarded but the request runs to completion (LLM tier; the
+            // spawn-based http/shell offloads get a real AbortHandle).
             crate::http::shared_rt().spawn_blocking(move || {
                 let r = provider.embed(req2);
                 let _ = tx.send(r);

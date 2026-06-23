@@ -88,6 +88,8 @@ struct RawShellOutput {
 /// value on resume.
 fn shell_async(program: String, child_args: Vec<String>) -> Result<Value, SemaError> {
     use std::rc::Rc;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::Arc;
     use tokio::sync::oneshot::error::TryRecvError;
 
     // Vestigial under CALL_NATIVE (the scheduler delivers the resume value via
@@ -98,36 +100,82 @@ fn shell_async(program: String, child_args: Vec<String>) -> Result<Value, SemaEr
     }
 
     let (tx, mut rx) = tokio::sync::oneshot::channel::<Result<RawShellOutput, String>>();
+    // The child's OS pid, published by the worker once spawned (0 = not yet). The
+    // abort hook reads it to issue a SYNCHRONOUS SIGKILL — see below.
+    let pid_slot = Arc::new(AtomicU32::new(0));
+    let pid_for_worker = pid_slot.clone();
 
-    crate::async_rt::stdlib_shared_rt().spawn(async move {
-        let result = tokio::process::Command::new(&program)
-            .args(&child_args)
-            .output()
-            .await
-            .map(|output| RawShellOutput {
+    let join = crate::async_rt::stdlib_shared_rt().spawn(async move {
+        let result = async {
+            // Spawn (not `.output()`) so we can publish the pid before awaiting, then
+            // gather output. `kill_on_drop` ensures that if this future is aborted
+            // (cancel/timeout/interrupt) while the runtime is still alive, dropping
+            // the `Child` kills the subprocess. stdout/stderr piped to match `.output()`.
+            let child = tokio::process::Command::new(&program)
+                .args(&child_args)
+                .kill_on_drop(true)
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                // Match the sync path's spawn-error message format exactly.
+                .map_err(|e| format!("shell: {e}"))?;
+            if let Some(id) = child.id() {
+                pid_for_worker.store(id, Ordering::SeqCst);
+            }
+            let output = child
+                .wait_with_output()
+                .await
+                .map_err(|e| format!("shell: {e}"))?;
+            Ok::<RawShellOutput, String>(RawShellOutput {
                 status_code: output.status.code(),
                 stdout: output.stdout,
                 stderr: output.stderr,
             })
-            // Match the sync path's spawn-error message format exactly.
-            .map_err(|e| format!("shell: {e}"));
+        }
+        .await;
         let _ = tx.send(result);
         // Wake the parked VM thread so it re-polls promptly.
         sema_core::notify_io_complete();
     });
 
-    let handle = Rc::new(sema_core::IoHandle::new(move || match rx.try_recv() {
-        Err(TryRecvError::Empty) => sema_core::IoPoll::Pending,
-        Ok(Ok(raw)) => sema_core::IoPoll::Ready(Ok(shell_output_value(
-            raw.status_code,
-            &raw.stdout,
-            &raw.stderr,
-        ))),
-        Ok(Err(msg)) => sema_core::IoPoll::Ready(Err(msg)),
-        Err(TryRecvError::Closed) => {
-            sema_core::IoPoll::Ready(Err("shell: subprocess worker dropped".to_string()))
-        }
-    }));
+    // True cancellation: on cancel/timeout the scheduler runs this hook. It (a) aborts
+    // the spawned task (→ drops the kill_on_drop `Child` once the runtime processes
+    // it) AND (b) issues a SYNCHRONOUS `SIGKILL` by pid. (b) is what makes the kill
+    // reliable even when the program exits IMMEDIATELY after the timeout (e.g. a
+    // one-shot `sema -e`), where the runtime is torn down before it can process the
+    // async abort — without it the orphaned child would run to completion. The hook
+    // fires only on cancellation, never on normal completion.
+    let abort_handle = join.abort_handle();
+    let pid_for_abort = pid_slot;
+    let handle = Rc::new(sema_core::IoHandle::with_abort(
+        move || match rx.try_recv() {
+            Err(TryRecvError::Empty) => sema_core::IoPoll::Pending,
+            Ok(Ok(raw)) => sema_core::IoPoll::Ready(Ok(shell_output_value(
+                raw.status_code,
+                &raw.stdout,
+                &raw.stderr,
+            ))),
+            Ok(Err(msg)) => sema_core::IoPoll::Ready(Err(msg)),
+            Err(TryRecvError::Closed) => {
+                sema_core::IoPoll::Ready(Err("shell: subprocess worker dropped".to_string()))
+            }
+        },
+        move || {
+            abort_handle.abort();
+            #[cfg(unix)]
+            {
+                let pid = pid_for_abort.load(Ordering::SeqCst);
+                if pid != 0 {
+                    // SAFETY: kill(2) with a pid we spawned and a constant signal; the
+                    // worst case of a (vanishingly unlikely) pid-reuse race is signaling
+                    // an unrelated process, no memory safety concern.
+                    unsafe {
+                        libc::kill(pid as libc::pid_t, libc::SIGKILL);
+                    }
+                }
+            }
+        },
+    ));
     sema_core::set_yield_signal(sema_core::YieldReason::AwaitIo(handle));
     Ok(Value::nil())
 }

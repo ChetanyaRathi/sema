@@ -171,6 +171,11 @@ impl Scheduler {
         for task in &mut self.tasks {
             if task.cancelled {
                 if !matches!(task.state, TaskState::Done | TaskState::Failed) {
+                    // Abort the offloaded work (real socket/process abort where the
+                    // handle supports it) BEFORE the Blocked(AwaitIo) state is dropped.
+                    if let TaskState::Blocked(YieldReason::AwaitIo(h)) = &task.state {
+                        h.abort();
+                    }
                     *task.promise.state.borrow_mut() = PromiseState::Cancelled;
                     task.state = TaskState::Failed;
                 }
@@ -292,6 +297,12 @@ impl Scheduler {
             .find(|t| Rc::ptr_eq(&t.promise, target))
         {
             if !matches!(task.state, TaskState::Done | TaskState::Failed) {
+                // True cancellation: abort the in-flight offloaded work (real
+                // socket/process abort where the handle supports it) BEFORE the
+                // reassignment below drops the Blocked(AwaitIo(handle)).
+                if let TaskState::Blocked(YieldReason::AwaitIo(h)) = &task.state {
+                    h.abort();
+                }
                 task.cancelled = true;
                 *task.promise.state.borrow_mut() = PromiseState::Cancelled;
                 // Reassigning `state` drops the previous `Blocked(AwaitIo(handle))`,
@@ -312,6 +323,11 @@ impl Scheduler {
         };
         if matches!(task.state, TaskState::Done | TaskState::Failed) || task.cancelled {
             return Ok(false);
+        }
+        // Abort the in-flight offloaded work (real socket/process abort where the
+        // handle supports it) BEFORE reassigning `state` drops the Blocked(AwaitIo).
+        if let TaskState::Blocked(YieldReason::AwaitIo(h)) = &task.state {
+            h.abort();
         }
         task.cancelled = true;
         *task.promise.state.borrow_mut() = PromiseState::Cancelled;
@@ -631,6 +647,13 @@ fn run_until_reentrant(
         // pending tasks so a cancelled run leaves no dangling/sleeping tasks to
         // resurrect on a later eval.
         if sema_core::check_interrupt() {
+            // Abort any in-flight offloaded work (real socket/process abort where
+            // supported) before dropping the tasks on an interrupt (e.g. Ctrl-C).
+            for task in &sched.tasks {
+                if let TaskState::Blocked(YieldReason::AwaitIo(h)) = &task.state {
+                    h.abort();
+                }
+            }
             sched.tasks.clear();
             return Err(SemaError::eval("evaluation cancelled".to_string()));
         }

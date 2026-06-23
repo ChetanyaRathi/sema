@@ -189,7 +189,7 @@ fn http_request_async(
 
     let (tx, mut rx) = tokio::sync::oneshot::channel::<Result<RawHttpResponse, String>>();
 
-    crate::async_rt::stdlib_shared_rt().spawn(async move {
+    let join = crate::async_rt::stdlib_shared_rt().spawn(async move {
         let result = async {
             let response = builder
                 .send()
@@ -218,18 +218,25 @@ fn http_request_async(
         sema_core::notify_io_complete();
     });
 
-    let handle = Rc::new(sema_core::IoHandle::new(move || match rx.try_recv() {
-        Err(TryRecvError::Empty) => sema_core::IoPoll::Pending,
-        Ok(Ok(raw)) => sema_core::IoPoll::Ready(Ok(build_response_value(
-            raw.status,
-            &raw.headers,
-            &raw.body,
-        ))),
-        Ok(Err(msg)) => sema_core::IoPoll::Ready(Err(msg)),
-        Err(TryRecvError::Closed) => {
-            sema_core::IoPoll::Ready(Err("http: request worker dropped".to_string()))
-        }
-    }));
+    // True cancellation: on cancel/timeout the scheduler calls the abort hook, which
+    // aborts the spawned task → drops the in-flight reqwest future → the connection
+    // is torn down (no wasted round-trip). Never called on normal completion.
+    let abort_handle = join.abort_handle();
+    let handle = Rc::new(sema_core::IoHandle::with_abort(
+        move || match rx.try_recv() {
+            Err(TryRecvError::Empty) => sema_core::IoPoll::Pending,
+            Ok(Ok(raw)) => sema_core::IoPoll::Ready(Ok(build_response_value(
+                raw.status,
+                &raw.headers,
+                &raw.body,
+            ))),
+            Ok(Err(msg)) => sema_core::IoPoll::Ready(Err(msg)),
+            Err(TryRecvError::Closed) => {
+                sema_core::IoPoll::Ready(Err("http: request worker dropped".to_string()))
+            }
+        },
+        move || abort_handle.abort(),
+    ));
     sema_core::set_yield_signal(sema_core::YieldReason::AwaitIo(handle));
     Ok(Value::nil())
 }

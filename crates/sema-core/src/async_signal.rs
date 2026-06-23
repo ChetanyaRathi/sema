@@ -38,20 +38,55 @@ pub enum IoPoll {
 /// lives in a `thread_local`).
 pub struct IoHandle {
     poll: RefCell<Box<dyn FnMut() -> IoPoll>>,
+    /// Optional one-shot abort hook, run when the scheduler CANCELS a task parked on
+    /// this handle (`async/cancel`, `async/timeout` expiry, or an interrupt) — NEVER
+    /// on normal completion. It aborts the offloaded work where the runtime supports
+    /// it (a tokio `AbortHandle::abort()` for the `spawn`-based http/shell offloads,
+    /// dropping the in-flight future → connection torn down / `kill_on_drop` child
+    /// killed). For `spawn_blocking` offloads (the LLM tier) there is no hook — a
+    /// blocking closure cannot be interrupted, so cancellation stays best-effort
+    /// there (the result is discarded). Built via [`with_abort`]; `None` for [`new`].
+    ///
+    /// [`with_abort`]: IoHandle::with_abort
+    /// [`new`]: IoHandle::new
+    abort: RefCell<Option<Box<dyn FnOnce()>>>,
 }
 
 impl IoHandle {
-    /// Create a handle from a poller closure. The closure is called each time
-    /// the scheduler checks whether the offloaded future has completed.
+    /// Create a handle from a poller closure with NO abort hook (cancellation is
+    /// best-effort: the offloaded future runs to completion, its result discarded).
+    /// The poll closure is called each time the scheduler checks for completion.
     pub fn new(f: impl FnMut() -> IoPoll + 'static) -> Self {
         Self {
             poll: RefCell::new(Box::new(f)),
+            abort: RefCell::new(None),
+        }
+    }
+
+    /// Create a handle with a one-shot `abort` hook. `abort` is called AT MOST ONCE,
+    /// from the VM thread, when the scheduler cancels a task parked on this handle.
+    /// It must be non-blocking (e.g. `tokio::task::AbortHandle::abort()`).
+    pub fn with_abort(f: impl FnMut() -> IoPoll + 'static, abort: impl FnOnce() + 'static) -> Self {
+        Self {
+            poll: RefCell::new(Box::new(f)),
+            abort: RefCell::new(Some(Box::new(abort))),
         }
     }
 
     /// Poll the offloaded future without blocking.
     pub fn poll(&self) -> IoPoll {
         (self.poll.borrow_mut())()
+    }
+
+    /// Run the abort hook if present, consuming it so it runs at most once. A no-op
+    /// for handles built with [`new`], or after a prior `abort`. The scheduler calls
+    /// this ONLY on cancellation/timeout/interrupt — never on normal completion.
+    ///
+    /// [`new`]: IoHandle::new
+    pub fn abort(&self) {
+        if let Some(f) = self.abort.borrow_mut().take() {
+            f();
+        }
     }
 }
 
@@ -454,4 +489,42 @@ pub fn call_run_scheduler_timeout(
         )
     })?;
     f(ctx, SchedulerTarget::Timeout(target, timeout_ms))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::rc::Rc;
+
+    #[test]
+    fn io_handle_abort_runs_once() {
+        let count = Rc::new(Cell::new(0));
+        let c = count.clone();
+        let h = IoHandle::with_abort(|| IoPoll::Pending, move || c.set(c.get() + 1));
+        assert_eq!(count.get(), 0, "abort not run until called");
+        h.abort();
+        assert_eq!(count.get(), 1, "abort runs on first call");
+        h.abort();
+        h.abort();
+        assert_eq!(count.get(), 1, "abort is one-shot — later calls are no-ops");
+    }
+
+    #[test]
+    fn io_handle_new_abort_is_noop() {
+        // A handle with no abort hook must not panic when aborted.
+        let h = IoHandle::new(|| IoPoll::Ready(Ok(Value::nil())));
+        h.abort();
+        // Poll still works after a (no-op) abort.
+        assert!(matches!(h.poll(), IoPoll::Ready(Ok(_))));
+    }
+
+    #[test]
+    fn io_handle_poll_works_after_abort() {
+        let h = IoHandle::with_abort(|| IoPoll::Ready(Ok(Value::int(7))), || {});
+        h.abort();
+        match h.poll() {
+            IoPoll::Ready(Ok(v)) => assert_eq!(v, Value::int(7)),
+            _ => panic!("poll should still return Ready after abort"),
+        }
+    }
 }
