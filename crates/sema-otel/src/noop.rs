@@ -80,6 +80,10 @@ pub fn register_task_callbacks() {}
 
 pub struct LlmSpan;
 
+pub fn llm_span_detached(_op: &'static str) -> LlmSpan {
+    LlmSpan
+}
+
 pub fn llm_span(_op: &'static str) -> LlmSpan {
     LlmSpan
 }

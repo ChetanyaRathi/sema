@@ -591,15 +591,24 @@ fn build_meter_provider() -> Option<SdkMeterProvider> {
 
 /// Shared RAII span core. Holds the `Context` carrying the span (cloned onto the TL
 /// stack for nesting). `Drop` pops the stack and ends the span (recording duration).
+///
+/// A `detached` core was NOT pushed onto the stack (it is a leaf whose parent was
+/// captured at construction), so its `Drop` must NOT pop — popping would remove an
+/// unrelated span, corrupting the stack. Used by the async embeddings span, whose
+/// `Drop` runs on the VM thread inside the IO poller, possibly while a sibling
+/// task's span is on the stack.
 struct SpanCore {
     ctx: Context,
+    detached: bool,
 }
 
 impl Drop for SpanCore {
     fn drop(&mut self) {
-        STACK.with(|s| {
-            s.borrow_mut().pop();
-        });
+        if !self.detached {
+            STACK.with(|s| {
+                s.borrow_mut().pop();
+            });
+        }
         self.ctx.span().end();
     }
 }
@@ -689,7 +698,10 @@ fn start(name: String, kind: SpanKind, attrs: Vec<KeyValue>) -> Option<SpanCore>
         ),
     };
     STACK.with(|s| s.borrow_mut().push(ctx.clone()));
-    let core = SpanCore { ctx };
+    let core = SpanCore {
+        ctx,
+        detached: false,
+    };
     // Apply the active conversation/session/user identity to EVERY span uniformly.
     if let Some(id) = CONVERSATION_ID.with(|c| c.borrow().clone()) {
         core.set_str("gen_ai.conversation.id", id);
@@ -702,6 +714,48 @@ fn start(name: String, kind: SpanKind, attrs: Vec<KeyValue>) -> Option<SpanCore>
     }
     // Per-backend trace identity (LangSmith session id, Langfuse release). No-op unless
     // the relevant compat backend is active.
+    let session = SESSION_ID.with(|c| c.borrow().clone());
+    core.set_attrs(compat::identity(session.as_deref(), release()));
+    Some(core)
+}
+
+/// Start a DETACHED span: parented to the current TL-stack top (captured now) but
+/// NOT pushed onto the stack, and whose `Drop` does NOT pop. For a leaf span whose
+/// lifetime is decoupled from the stack discipline — e.g. an async embeddings span
+/// carried into an IO-poller closure and finalized on the VM thread after a yield,
+/// possibly while a sibling task's span sits on the stack. Returns `None` when
+/// telemetry is disabled.
+fn start_detached(name: String, kind: SpanKind, attrs: Vec<KeyValue>) -> Option<SpanCore> {
+    if !ENABLED.load(Ordering::Relaxed) {
+        return None;
+    }
+    let parent = STACK.with(|s| s.borrow().last().cloned());
+    let parent = parent.unwrap_or_else(Context::current);
+    let owned = OWNED_PROVIDER.with(|c| c.borrow().clone());
+    let ctx = match owned {
+        Some(p) => build_ctx(&p.tracer_with_scope(scope()), name, kind, attrs, &parent),
+        None => build_ctx(
+            &global::tracer_with_scope(scope()),
+            name,
+            kind,
+            attrs,
+            &parent,
+        ),
+    };
+    // NOTE: no STACK push — this is the whole point of "detached".
+    let core = SpanCore {
+        ctx,
+        detached: true,
+    };
+    if let Some(id) = CONVERSATION_ID.with(|c| c.borrow().clone()) {
+        core.set_str("gen_ai.conversation.id", id);
+    }
+    if let Some(id) = SESSION_ID.with(|c| c.borrow().clone()) {
+        core.set_str("session.id", id);
+    }
+    if let Some(id) = USER_ID.with(|c| c.borrow().clone()) {
+        core.set_str("user.id", id);
+    }
     let session = SESSION_ID.with(|c| c.borrow().clone());
     core.set_attrs(compat::identity(session.as_deref(), release()));
     Some(core)
@@ -789,6 +843,36 @@ pub struct LlmSpan {
 /// via `set_dispatch`.
 pub fn llm_span(op: &'static str) -> LlmSpan {
     let inner = start(
+        op.to_string(),
+        SpanKind::Client,
+        vec![KeyValue::new("gen_ai.operation.name", op)],
+    );
+    if let Some(c) = &inner {
+        let kind = if op == "embeddings" {
+            compat::Kind::Embedding
+        } else {
+            compat::Kind::Llm
+        };
+        c.set_attrs(compat::span_kind(kind));
+    }
+    LlmSpan {
+        inner,
+        op,
+        start: std::time::Instant::now(),
+        dims: RefCell::new((String::new(), String::new())),
+        user_tags: RefCell::new(Vec::new()),
+        first_token: std::cell::Cell::new(false),
+    }
+}
+
+/// Start a DETACHED LLM-call span (CLIENT) — parented to the current span but NOT
+/// pushed onto the active-span stack (and its `Drop` does not pop). For the async
+/// embeddings leaf, whose `LlmSpan` is moved into the IO-poller closure and
+/// finalized on the VM thread after the task yields (when the stack may hold a
+/// sibling task's span). The embeddings span is a leaf — it needs no nesting, only
+/// a correctly-captured parent.
+pub fn llm_span_detached(op: &'static str) -> LlmSpan {
+    let inner = start_detached(
         op.to_string(),
         SpanKind::Client,
         vec![KeyValue::new("gen_ai.operation.name", op)],
