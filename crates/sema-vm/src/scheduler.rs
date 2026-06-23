@@ -661,6 +661,74 @@ impl Drop for ReinstallGuard<'_> {
     }
 }
 
+/// Step one task with the breakpoint/step machinery live, handling any mid-task
+/// debug stop in place. Reached only when a debug session is active on this thread
+/// (see [`vm::is_debug_session_active`]); the `DebugState` is reborrowed from the
+/// `execute_debug` frame via the `ACTIVE_DEBUG` thread-local (it cannot be passed
+/// through the `RUN_SCHEDULER_CALLBACK` fn-pointer seam).
+///
+/// On a `Stopped` the stopped TASK's VM (`task.vm`) handles the stop — so
+/// GetStackTrace/GetScopes/GetVariables inspect the async task's frames, not the
+/// main VM's — then the task resumes per the resume command. The loop repeats
+/// until the step yields a non-`Stopped` result (Finished / AsyncYield / error),
+/// which the caller maps to the task state as usual.
+///
+/// Stepping limitation (this slice): `Continue` resumes correctly across the
+/// scheduler. `Step*` set the task VM's step mode and will stop again on the next
+/// line within the task, but stepping does NOT currently follow control across the
+/// scheduler boundary into sibling tasks or back to the main VM — siblings stay
+/// parked. This is acceptable for the STOP+CONTINUE slice; see
+/// docs/plans/2026-06-23-async-debugger.md. The non-debug path is untouched.
+fn step_task_debug(task: &mut Task, ctx: &EvalContext) -> Result<VmExecResult, SemaError> {
+    // First step of this task slice: start it or resume it, in debug mode.
+    let mut result = if !task.started {
+        task.started = true;
+        let closure = task.closure.clone();
+        match vm::with_active_debug(|debug| {
+            task.vm.execute_async_debug(closure.clone(), ctx, debug)
+        }) {
+            Some(r) => r,
+            // No active debug after all (race-free here: gated by caller) — fall
+            // back to the non-debug start so we never drop a task.
+            None => task.vm.execute_async(task.closure.clone(), ctx),
+        }
+    } else {
+        match vm::with_active_debug(|debug| task.vm.run_async_debug(ctx, debug)) {
+            Some(r) => r,
+            None => task.vm.run_async(ctx),
+        }
+    };
+
+    // Drain any breakpoint/step stops that occur mid-task. Each stop parks on the
+    // command channel inside `handle_debug_stop` (blocking this scheduler thread,
+    // which is exactly the desired pause), then resumes the SAME task.
+    loop {
+        match result {
+            Ok(VmExecResult::Stopped(info)) => {
+                let resume = vm::with_active_debug(|debug| {
+                    task.vm.handle_debug_stop(ctx, debug, info.clone())
+                });
+                match resume {
+                    Some(vm::DebugStopResume::Disconnect) | None => {
+                        // Frontend disconnected (or debug session vanished): finish
+                        // the task with nil so the run can unwind cleanly.
+                        return Ok(VmExecResult::Finished(Value::nil()));
+                    }
+                    Some(vm::DebugStopResume::Resume) => {
+                        result = match vm::with_active_debug(|debug| {
+                            task.vm.run_async_debug(ctx, debug)
+                        }) {
+                            Some(r) => r,
+                            None => task.vm.run_async(ctx),
+                        };
+                    }
+                }
+            }
+            other => return other,
+        }
+    }
+}
+
 /// Run the scheduler event loop with re-entrant safety.
 ///
 /// Before each task step, the scheduler is put back into the thread-local
@@ -889,11 +957,17 @@ fn run_until_reentrant(
         }
         let prev_async = in_async_context();
         set_async_context(true);
-        let result = if !task.started {
-            task.started = true;
-            task.vm.execute_async(task.closure.clone(), ctx)
+        let result = if vm::is_debug_session_active() {
+            step_task_debug(task, ctx)
         } else {
-            task.vm.run_async(ctx)
+            // Non-debug hot path — byte-identical to before. Gated on the cheap
+            // thread-local check so async runs exactly as before when not debugging.
+            if !task.started {
+                task.started = true;
+                task.vm.execute_async(task.closure.clone(), ctx)
+            } else {
+                task.vm.run_async(ctx)
+            }
         };
         set_async_context(prev_async);
 

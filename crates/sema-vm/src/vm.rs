@@ -14,6 +14,17 @@ use crate::opcodes::op;
 
 const DEBUG_VALUE_REF_BASE: u64 = crate::debug::DEBUG_VALUE_REF_BASE;
 
+/// Outcome of [`VM::handle_debug_stop`]: whether the caller should resume
+/// execution (step mode already set per the resume command) or terminate the
+/// debug session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DebugStopResume {
+    /// Continue running (Continue/Step*/closed-channel).
+    Resume,
+    /// The frontend disconnected; stop the program.
+    Disconnect,
+}
+
 /// State of a captured variable (upvalue).
 #[derive(Debug)]
 pub enum UpvalueState {
@@ -234,6 +245,67 @@ pub fn current_vm_globals() -> Option<Rc<Env>> {
             .last()
             .map(|&ptr| unsafe { &*ptr }.globals.clone())
     })
+}
+
+thread_local! {
+    /// Stack of pointers to the `DebugState` of an active debug session on this
+    /// thread. Set by `execute_debug` (and the cooperative WASM start) around the
+    /// run loop, popped on exit. The async scheduler is reached through the
+    /// `RUN_SCHEDULER_CALLBACK` fn-pointer seam (`async_signal.rs`), which cannot
+    /// carry a borrowed `&mut DebugState`; it consults this thread-local instead so
+    /// task steps run in debug mode and a mid-task breakpoint can stop/resume.
+    ///
+    /// SAFETY mirrors `CURRENT_VM`: each pointer is valid for as long as the
+    /// `execute_debug` frame that pushed it is on the Rust call stack. While that
+    /// frame is blocked inside a native call that re-enters the scheduler, the
+    /// `&mut DebugState` it owns is DORMANT (not otherwise touched) — the scheduler
+    /// reborrows it through this raw pointer for the duration of one task step and
+    /// drops the borrow before returning, so no two live `&mut` ever alias.
+    static ACTIVE_DEBUG: RefCell<Vec<*mut crate::debug::DebugState>> =
+        const { RefCell::new(Vec::new()) };
+}
+
+/// RAII guard registering a `DebugState` as the active debug session for the
+/// duration of a debug run, unregistering it on drop (including panic unwind).
+struct ActiveDebugGuard;
+
+impl ActiveDebugGuard {
+    fn enter(debug: &mut crate::debug::DebugState) -> Self {
+        let ptr = debug as *mut crate::debug::DebugState;
+        ACTIVE_DEBUG.with(|stack| stack.borrow_mut().push(ptr));
+        ActiveDebugGuard
+    }
+}
+
+impl Drop for ActiveDebugGuard {
+    fn drop(&mut self) {
+        ACTIVE_DEBUG.with(|stack| {
+            stack.borrow_mut().pop();
+        });
+    }
+}
+
+/// True when a debug session is active on this thread (cheap: a thread-local
+/// length check). The async scheduler gates its debug-aware task-step path on
+/// this so the non-debug hot path stays byte-identical when not debugging.
+pub fn is_debug_session_active() -> bool {
+    ACTIVE_DEBUG.with(|stack| !stack.borrow().is_empty())
+}
+
+/// Run `f` with a mutable borrow of the innermost active `DebugState`, if any.
+/// Returns `None` when no debug session is active on this thread (the scheduler's
+/// non-debug path). Used by the scheduler to reach the `DebugState` it cannot
+/// receive by reference through the fn-pointer callback seam.
+///
+/// SAFETY: see `ACTIVE_DEBUG`. The top pointer was registered by a live
+/// `execute_debug` frame on this thread's Rust stack; that frame is blocked in the
+/// native call that re-entered the scheduler and does not touch its
+/// `&mut DebugState` while blocked. The reborrow does not escape `f`.
+pub fn with_active_debug<R>(f: impl FnOnce(&mut crate::debug::DebugState) -> R) -> Option<R> {
+    let ptr = ACTIVE_DEBUG.with(|stack| stack.borrow().last().copied())?;
+    // SAFETY: as documented above.
+    let debug = unsafe { &mut *ptr };
+    Some(f(debug))
 }
 
 /// Close `closure`'s still-open upvalue cells against the VM(s) currently
@@ -457,6 +529,12 @@ impl VM {
             open_upvalues: None,
         });
 
+        // Register this DebugState as the active session so the async scheduler
+        // (reached via the RUN_SCHEDULER_CALLBACK seam during a native call) can
+        // run task steps in debug mode and stop/resume on a mid-task breakpoint.
+        // Popped on return/panic by the guard's Drop.
+        let _active = ActiveDebugGuard::enter(debug);
+
         loop {
             let step = match self.run_inner(ctx, Some(debug)) {
                 Ok(step) => step,
@@ -492,121 +570,129 @@ impl VM {
                     ));
                 }
                 crate::debug::VmExecResult::Stopped(info) => {
-                    // Per the DAP spec, variablesReferences are only valid until
-                    // the next stop. Reset the handle map on each stop so Values
-                    // expanded in prior stops are not retained for the whole
-                    // session (otherwise debug_values grows unbounded across a
-                    // long stepping session, pinning the underlying heap).
-                    self.debug_values.clear();
-                    self.next_debug_value_ref = DEBUG_VALUE_REF_BASE;
-
-                    let _ = debug.event_tx.send(crate::debug::DebugEvent::Stopped {
-                        reason: info.reason,
-                        description: None,
-                    });
-
-                    loop {
-                        match debug.command_rx.recv() {
-                            Ok(crate::debug::DebugCommand::Continue) => {
-                                debug.step_mode = crate::debug::StepMode::Continue;
-                                break;
-                            }
-                            Ok(crate::debug::DebugCommand::StepInto) => {
-                                debug.step_mode = crate::debug::StepMode::StepInto;
-                                debug.step_frame_depth = self.frames.len();
-                                break;
-                            }
-                            Ok(crate::debug::DebugCommand::StepOver) => {
-                                debug.step_mode = crate::debug::StepMode::StepOver;
-                                debug.step_frame_depth = self.frames.len();
-                                break;
-                            }
-                            Ok(crate::debug::DebugCommand::StepOut) => {
-                                debug.step_mode = crate::debug::StepMode::StepOut;
-                                debug.step_frame_depth = self.frames.len();
-                                break;
-                            }
-                            Ok(crate::debug::DebugCommand::Pause) => {}
-                            Ok(crate::debug::DebugCommand::SetBreakpoints {
-                                file,
-                                breakpoints,
-                                reply,
-                            }) => {
-                                let ids =
-                                    debug.set_breakpoints_with_conditions(&file, &breakpoints);
-                                let _ = reply.send(ids);
-                            }
-                            Ok(crate::debug::DebugCommand::SetExceptionBreakpoints {
-                                break_on_uncaught,
-                            }) => {
-                                debug.break_on_uncaught = break_on_uncaught;
-                            }
-                            Ok(crate::debug::DebugCommand::GetStackTrace { reply }) => {
-                                let _ = reply.send(self.debug_stack_trace());
-                            }
-                            Ok(crate::debug::DebugCommand::GetScopes { frame_id, reply }) => {
-                                let _ = reply.send(self.debug_scopes(frame_id));
-                            }
-                            Ok(crate::debug::DebugCommand::GetVariables { reference, reply }) => {
-                                let _ = reply.send(self.debug_variables(reference));
-                            }
-                            Ok(crate::debug::DebugCommand::Evaluate {
-                                frame_id,
-                                expression,
-                                reply,
-                            }) => {
-                                let result = sema_reader::read(&expression)
-                                    .map_err(|e| e.to_string())
-                                    .and_then(|expr| {
-                                        self.debug_evaluate_mut(frame_id, &expr, ctx, debug)
-                                            .map(|value| {
-                                                self.debug_value_to_variable("result", value)
-                                            })
-                                            .map_err(|e| e.to_string())
-                                    });
-                                let _ = reply.send(result);
-                            }
-                            Ok(crate::debug::DebugCommand::SetVariable {
-                                variables_reference,
-                                name,
-                                value_expression,
-                                reply,
-                            }) => {
-                                let result =
-                                    match crate::debug::decode_scope_ref(variables_reference) {
-                                        Some(crate::debug::ScopeKind::Locals(frame_id))
-                                        | Some(crate::debug::ScopeKind::Upvalues(frame_id)) => {
-                                            sema_reader::read(&value_expression)
-                                                .map_err(|e| e.to_string())
-                                                .and_then(|expr| {
-                                                    self.debug_evaluate(frame_id, &expr, ctx, debug)
-                                                        .map_err(|e| e.to_string())
-                                                })
-                                                .and_then(|value| {
-                                                    self.debug_set_variable(
-                                                        variables_reference,
-                                                        &name,
-                                                        value,
-                                                    )
-                                                    .map_err(|e| e.to_string())
-                                                })
-                                        }
-                                        None => {
-                                            Err("setVariable: invalid variablesReference"
-                                                .to_string())
-                                        }
-                                    };
-                                let _ = reply.send(result);
-                            }
-                            Ok(crate::debug::DebugCommand::Disconnect) => {
-                                return Ok(Value::nil());
-                            }
-                            Err(_) => {
-                                debug.step_mode = crate::debug::StepMode::Continue;
-                                break;
-                            }
-                        }
+                    match self.handle_debug_stop(ctx, debug, info) {
+                        DebugStopResume::Resume => {}
+                        DebugStopResume::Disconnect => return Ok(Value::nil()),
                     }
+                }
+            }
+        }
+    }
+
+    /// Handle a `Stopped` mid-execution: reset variable handles, emit the
+    /// `Stopped` event, then block on `command_rx` serving inspection requests
+    /// until a resume/step/disconnect arrives. Shared by the main VM debug loop
+    /// (`execute_debug`) and the async scheduler's debug task step, so a breakpoint
+    /// hit inside a task stops/resumes with the SAME loop — and the inspection
+    /// commands (GetStackTrace/GetScopes/GetVariables/Evaluate) target `self`,
+    /// which is the STOPPED task's VM in the scheduler case.
+    ///
+    /// Returns [`DebugStopResume::Resume`] to continue execution (the step mode was
+    /// set per the resume command) or [`DebugStopResume::Disconnect`] to terminate.
+    pub fn handle_debug_stop(
+        &mut self,
+        ctx: &EvalContext,
+        debug: &mut crate::debug::DebugState,
+        info: crate::debug::StopInfo,
+    ) -> DebugStopResume {
+        // Per the DAP spec, variablesReferences are only valid until the next stop.
+        // Reset the handle map on each stop so Values expanded in prior stops are
+        // not retained for the whole session (otherwise debug_values grows
+        // unbounded across a long stepping session, pinning the underlying heap).
+        self.debug_values.clear();
+        self.next_debug_value_ref = DEBUG_VALUE_REF_BASE;
+
+        let _ = debug.event_tx.send(crate::debug::DebugEvent::Stopped {
+            reason: info.reason,
+            description: None,
+        });
+
+        loop {
+            match debug.command_rx.recv() {
+                Ok(crate::debug::DebugCommand::Continue) => {
+                    debug.step_mode = crate::debug::StepMode::Continue;
+                    return DebugStopResume::Resume;
+                }
+                Ok(crate::debug::DebugCommand::StepInto) => {
+                    debug.step_mode = crate::debug::StepMode::StepInto;
+                    debug.step_frame_depth = self.frames.len();
+                    return DebugStopResume::Resume;
+                }
+                Ok(crate::debug::DebugCommand::StepOver) => {
+                    debug.step_mode = crate::debug::StepMode::StepOver;
+                    debug.step_frame_depth = self.frames.len();
+                    return DebugStopResume::Resume;
+                }
+                Ok(crate::debug::DebugCommand::StepOut) => {
+                    debug.step_mode = crate::debug::StepMode::StepOut;
+                    debug.step_frame_depth = self.frames.len();
+                    return DebugStopResume::Resume;
+                }
+                Ok(crate::debug::DebugCommand::Pause) => {}
+                Ok(crate::debug::DebugCommand::SetBreakpoints {
+                    file,
+                    breakpoints,
+                    reply,
+                }) => {
+                    let ids = debug.set_breakpoints_with_conditions(&file, &breakpoints);
+                    let _ = reply.send(ids);
+                }
+                Ok(crate::debug::DebugCommand::SetExceptionBreakpoints { break_on_uncaught }) => {
+                    debug.break_on_uncaught = break_on_uncaught;
+                }
+                Ok(crate::debug::DebugCommand::GetStackTrace { reply }) => {
+                    let _ = reply.send(self.debug_stack_trace());
+                }
+                Ok(crate::debug::DebugCommand::GetScopes { frame_id, reply }) => {
+                    let _ = reply.send(self.debug_scopes(frame_id));
+                }
+                Ok(crate::debug::DebugCommand::GetVariables { reference, reply }) => {
+                    let _ = reply.send(self.debug_variables(reference));
+                }
+                Ok(crate::debug::DebugCommand::Evaluate {
+                    frame_id,
+                    expression,
+                    reply,
+                }) => {
+                    let result = sema_reader::read(&expression)
+                        .map_err(|e| e.to_string())
+                        .and_then(|expr| {
+                            self.debug_evaluate_mut(frame_id, &expr, ctx, debug)
+                                .map(|value| self.debug_value_to_variable("result", value))
+                                .map_err(|e| e.to_string())
+                        });
+                    let _ = reply.send(result);
+                }
+                Ok(crate::debug::DebugCommand::SetVariable {
+                    variables_reference,
+                    name,
+                    value_expression,
+                    reply,
+                }) => {
+                    let result = match crate::debug::decode_scope_ref(variables_reference) {
+                        Some(crate::debug::ScopeKind::Locals(frame_id))
+                        | Some(crate::debug::ScopeKind::Upvalues(frame_id)) => {
+                            sema_reader::read(&value_expression)
+                                .map_err(|e| e.to_string())
+                                .and_then(|expr| {
+                                    self.debug_evaluate(frame_id, &expr, ctx, debug)
+                                        .map_err(|e| e.to_string())
+                                })
+                                .and_then(|value| {
+                                    self.debug_set_variable(variables_reference, &name, value)
+                                        .map_err(|e| e.to_string())
+                                })
+                        }
+                        None => Err("setVariable: invalid variablesReference".to_string()),
+                    };
+                    let _ = reply.send(result);
+                }
+                Ok(crate::debug::DebugCommand::Disconnect) => {
+                    return DebugStopResume::Disconnect;
+                }
+                Err(_) => {
+                    debug.step_mode = crate::debug::StepMode::Continue;
+                    return DebugStopResume::Resume;
                 }
             }
         }
@@ -786,6 +872,19 @@ impl VM {
         self.run_inner(ctx, None)
     }
 
+    /// Debug-aware resume of an async task step: like [`run_async`] but with the
+    /// breakpoint/step machinery live (`run_inner(ctx, Some(debug))`). The async
+    /// scheduler uses this for parked-task resumes when a debug session is active,
+    /// so a breakpoint on a line that runs only inside the task can stop. A
+    /// returned `Stopped` is handled by the scheduler via [`handle_debug_stop`].
+    pub fn run_async_debug(
+        &mut self,
+        ctx: &EvalContext,
+        debug: &mut crate::debug::DebugState,
+    ) -> Result<crate::debug::VmExecResult, SemaError> {
+        self.run_inner(ctx, Some(debug))
+    }
+
     /// Replace the top of the stack with a value.
     /// Used by the scheduler to set the resume value before continuing
     /// a yielded task (the yield left a nil placeholder on the stack).
@@ -813,6 +912,29 @@ impl VM {
             open_upvalues: None,
         });
         self.run_inner(ctx, None)
+    }
+
+    /// Debug-aware first step of an async task: like [`execute_async`] but with the
+    /// breakpoint/step machinery live. Used by the scheduler to start a task when a
+    /// debug session is active.
+    pub fn execute_async_debug(
+        &mut self,
+        closure: Rc<Closure>,
+        ctx: &EvalContext,
+        debug: &mut crate::debug::DebugState,
+    ) -> Result<crate::debug::VmExecResult, SemaError> {
+        self.ensure_cache_space(&closure.func);
+        let base = self.stack.len();
+        let n_locals = closure.func.chunk.n_locals as usize;
+        self.stack.resize(base + n_locals, Value::nil());
+        self.frames.push(CallFrame {
+            cache_base: closure.func.cache_offset,
+            closure,
+            pc: 0,
+            base,
+            open_upvalues: None,
+        });
+        self.run_inner(ctx, Some(debug))
     }
 
     /// Prepare the VM to run `closure` with `args` already bound to its

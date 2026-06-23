@@ -107,7 +107,13 @@ fn sync_breakpoint_stops() {
         .recv_timeout(Duration::from_secs(5))
         .expect("a Stopped event should arrive for the sync breakpoint");
     assert!(
-        matches!(evt, DebugEvent::Stopped { reason: StopReason::Breakpoint, .. }),
+        matches!(
+            evt,
+            DebugEvent::Stopped {
+                reason: StopReason::Breakpoint,
+                ..
+            }
+        ),
         "expected Stopped(Breakpoint), got {evt:?}"
     );
 
@@ -140,7 +146,13 @@ fn async_task_breakpoint_stops_and_continues() {
         .recv_timeout(Duration::from_secs(5))
         .expect("a Stopped event should arrive for the async-task breakpoint");
     assert!(
-        matches!(evt, DebugEvent::Stopped { reason: StopReason::Breakpoint, .. }),
+        matches!(
+            evt,
+            DebugEvent::Stopped {
+                reason: StopReason::Breakpoint,
+                ..
+            }
+        ),
         "expected Stopped(Breakpoint) inside the async task, got {evt:?}"
     );
 
