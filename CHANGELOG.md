@@ -1,5 +1,42 @@
 # Changelog
 
+## 1.27.0
+
+### Added
+
+- **Concurrent I/O — blocking leaves now overlap on the scheduler.** Previously
+  `async/spawn` could interleave channels and sleeps, but any task that hit network or a
+  subprocess froze the single VM thread for the whole round-trip, so spawned I/O ran
+  serially. Now `http/*`, `shell`, `llm/embed`, and `llm/complete` / `llm/classify` /
+  `llm/extract` **yield to the scheduler** while their work runs on a background runtime
+  (via a new cooperative `AwaitIo` yield), so spawning them as tasks makes wall-clock
+  approach `max(latency)` instead of `sum(latency)`. Verified live: 4× concurrent
+  `llm/complete` ~3.4× faster than serial; 4× `llm/embed` ~13.6×; 5× `shell` 514 ms vs
+  2571 ms. Top-level (non-async) calls are unchanged — byte-identical synchronous behavior.
+- **`async/pool-map`** — bounded-concurrency fan-out: `(async/pool-map f items n)` maps `f`
+  over `items` with at most `n` calls in flight, results in input order. Fan a large batch
+  (embeddings, fetches, completions) across a rate-limited resource without launching
+  everything at once.
+- **True cancellation.** `async/cancel` and `async/timeout` now **abort in-flight I/O** for
+  real where the runtime allows: a cancelled/timed-out `http/*` request tears down its
+  connection, and a `shell` subprocess is **killed** (`SIGKILL`) instead of running to
+  completion in the background. `llm/*` cancellation stays best-effort (the blocking worker
+  can't be interrupted mid-call; the result is discarded). `async/timeout` expiry now
+  cancels its target task automatically (you no longer need a paired `async/cancel` to free
+  its resources).
+- **Per-task OpenTelemetry isolation.** Concurrent LLM tasks each carry their own span
+  stack + conversation/session/user scope (swapped on every scheduler task-switch), so
+  overlapping `llm/embed` / `llm/complete` spans never cross-contaminate.
+
+### Fixed
+
+- **Scheduler no longer reaps still-pending tasks at an outermost exit.** A task spawned in
+  one top-level form and awaited in a later one (e.g. a streaming-pipeline collector spawned
+  before an `(async/all …)` of the other stages) was being cleared between scheduler runs
+  → "async/await: still pending after scheduler run". The reap is now terminal-only.
+
+Docs: [Concurrency → Concurrent I/O](https://sema-lang.com/docs/stdlib/concurrency).
+
 ## 1.26.0
 
 ### Added

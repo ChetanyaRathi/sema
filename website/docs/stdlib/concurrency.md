@@ -103,7 +103,7 @@ Inside an async task, yield for `ms` milliseconds on the scheduler's **virtual c
 (async/timeout ms promise) → value
 ```
 
-Wait for `promise` to resolve, but raise an error if it takes longer than `ms` milliseconds. The underlying task is **not** automatically cancelled; pair with `async/cancel` if you need to free its resources.
+Wait for `promise` to resolve, but raise an error if it takes longer than `ms` milliseconds. On expiry the target task **is cancelled** — and any in-flight offloaded I/O it holds is aborted for real (an HTTP connection is torn down, a subprocess is killed; LLM calls are best-effort — see [`async/cancel`](#async-cancel)). So a timed-out `http/get`/`shell` stops consuming resources immediately rather than running to completion in the background.
 
 ```sema
 (async/timeout 100 (async (do-slow-work)))
@@ -120,7 +120,13 @@ A `ms = 0` (or very short) timeout still lets work that is **synchronously ready
 
 Request cancellation of a spawned task. Returns `#t` if the call actually transitioned the promise into the `Cancelled` state, `#f` if there was nothing to cancel — the promise was already terminal (resolved, rejected, previously cancelled) or was never spawned in the first place (e.g. created via `async/resolved`).
 
-Cancellation is best-effort and never errors. The next time the task hits a yield point, it transitions to `Cancelled`; subsequent `(await p)` raises `"async/await: task was cancelled"` (distinct from a normal rejection).
+Cancellation never errors. The task transitions to `Cancelled`; subsequent `(await p)` raises `"async/await: task was cancelled"` (distinct from a normal rejection).
+
+**What actually gets aborted.** If the cancelled task is parked on offloaded I/O, the underlying work is aborted where the runtime allows it:
+
+- `http/*` — the in-flight request's future is dropped, **tearing down the connection** (no wasted round-trip).
+- `shell` — the subprocess is **killed** (`SIGKILL`), not left running in the background.
+- `llm/*` (`embed`, `complete`, `classify`, `extract`) — **best-effort**: the request runs on a blocking worker that can't be interrupted mid-call, so the in-flight call completes and its result is discarded. A multi-round caller stops issuing further rounds.
 
 ```sema
 (async/cancel (async/resolved 1))                ;; => #f  (never spawned)
@@ -151,6 +157,43 @@ The four predicates **partition** the terminal states: a promise is at most one 
 | `(async/rejected? p)` | Is promise `p` rejected? (excludes cancelled) |
 | `(async/pending? p)` | Is promise `p` still pending? |
 | `(async/cancelled? p)` | Was promise `p` cancelled? |
+
+### `async/pool-map`
+
+```sema
+(async/pool-map f items n) → list
+```
+
+Map `f` over `items` with **bounded concurrency**: at most `n` calls run at once, results returned in input order. A semaphore (an `n`-capacity channel) gates how many tasks are in flight, so you can fan a large batch across a rate-limited resource without launching everything at once. The token is released on both success and error, so a failing item never deadlocks the pool.
+
+```sema
+;; Embed 10 000 chunks, but only 8 requests in flight at a time:
+(async/pool-map (fn (chunk) (llm/embed chunk)) chunks 8)
+
+;; Fetch many URLs, 16 at a time:
+(async/pool-map (fn (u) (http/get u)) urls 16)
+```
+
+## Concurrent I/O — what actually overlaps
+
+The scheduler's payoff is **latency overlap**: when several tasks each wait on I/O, the waits happen *simultaneously* instead of one after another. The blocking leaves below now yield to the scheduler while their work runs on a background runtime, so spawning them as tasks (via `async/spawn` + `async/all`, or `async/pool-map`) makes wall-clock approach `max(latency)` instead of `sum(latency)`:
+
+| Operation | Overlaps when spawned concurrently |
+| --- | --- |
+| `http/get` and the other `http/*` verbs | ✅ |
+| `shell` (subprocess) | ✅ |
+| `llm/embed` | ✅ |
+| `llm/complete`, `llm/classify`, `llm/extract` | ✅ |
+
+```sema
+;; Four independent LLM calls — concurrent, not serial:
+(async/all
+  (map (fn (q) (async/spawn (fn () (llm/complete q))))
+       '("summarize A" "summarize B" "summarize C" "summarize D")))
+;; wall-clock ≈ one call, not four.
+```
+
+Outside a scheduler task (a plain top-level call) these run **synchronously**, byte-identical to before — the concurrency only engages inside `async`/`async/spawn`. Tasks still interleave at I/O boundaries on the single VM thread; this is cooperative concurrency, not parallel CPU execution.
 
 ## Channels
 
