@@ -1,6 +1,8 @@
 # Concurrent `agent/run` on the Cooperative Scheduler
 
-**Status:** design + spike plan (not started) — **reviewed 2026-06-23, see §8 Verification addendum: 5 blockers must be resolved before Phase 2**
+**Status:** Phase 1 (AwaitIo gate) **IN PROGRESS** on branch `feat/async-awaitio` (started 2026-06-23). Steps 1,3,4,5 + the §5 timer spike — proves overlap across the per-task-VM scheduler; touches **none** of B1–B5. Gate: 5×1s IO-sleeps via `async/all` finish in ~1s (not ~5s) + peak in-flight ≥2 + full workspace green. — **reviewed 2026-06-23, see §8 Verification addendum: 5 blockers must be resolved before Phase 2.**
+
+> **Incremental roadmap (the "no major rewrite" track, decided 2026-06-23).** Build the generic `AwaitIo` yield ONCE (this slice), then convert blocking leaves one at a time by cost: **#1 `http/*`** (cleanest — no cache/usage/otel) → **#2 `shell`/subprocess** (also unblocks *subprocess workflow workers*, dodging the agent-loop rewrite) → **#3 bounded fan-out + real-clock timeout (B3) + true cancel** → **#4 single-shot LLM** (`llm/embed`/`classify`/`extract`/`complete` — needs B5 cache-stage extraction + B2 per-task otel snapshot; no B4, no loop lift). **Major rewrite, OUT of this track:** concurrent in-process multi-round `agent/run` (B1+B4 + Sema-loop lift). For B1, prefer `spawn_blocking(|| provider.complete(req))` — reuses the sync path (retry, DROP_TEMPERATURE, serving-provider) and dissolves three majors.
 **Date:** 2026-06-23
 **Owner:** repo owner (build target)
 **Scope (v1):** make `agent/run` completions overlap when several agents are spawned as scheduler tasks. `llm/stream`, `llm/pmap`, and `batch_complete` keep their existing paths.
