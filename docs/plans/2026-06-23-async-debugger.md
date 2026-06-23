@@ -1,6 +1,46 @@
 # Plan — Breakpoints & stepping inside async tasks
 
-**Status:** Slice 1 (native DAP STOP+CONTINUE) + Slice 2 (WASM playground cooperative STOP+CONTINUE) SHIPPED 2026-06-23. Bug write-up: `docs/bugs/async-breakpoints.md`.
+**Status:** Slice 1 (native DAP STOP+CONTINUE) + Slice 2 (WASM playground cooperative STOP+CONTINUE) SHIPPED 2026-06-23. Slice 3 (the three Slice-1/2 follow-ups) SHIPPED 2026-06-24. Bug write-up: `docs/bugs/async-breakpoints.md`.
+
+## Slice 3 — shipped (the deferred follow-ups)
+
+The three items parked after Slices 1–2 are now done:
+
+1. **Async-stop inspection is verified and works in both debuggers.**
+   - Native DAP: `handle_debug_stop` already runs on `task.vm`, so
+     GetStackTrace/GetScopes/GetVariables target the stopped task's frames. Pinned
+     by `dap_async_breakpoint_test::async_task_breakpoint_inspects_task_frame_locals`
+     (task-local `n=42` visible, top frame at the breakpoint line).
+   - WASM cooperative: the main VM is parked at the `await`, so inspection has to
+     reach the paused task's per-task VM. `set_coop_task_stop` now records the
+     paused task **id**; `scheduler::with_coop_paused_task_vm` relocates that task
+     by id (no raw pointers across the JS boundary) and hands its VM to the
+     inspection calls. `debug_get_stack_trace`/`debug_get_locals` route through it.
+     Gate: `wasm_async_debug_test::coop_async_stop_inspects_paused_task_locals`
+     (task VM sees `n=42`; main VM does NOT — proving the routing was required).
+
+2. **Cooperative step depth is task-correct.** `debug_resume` measured
+   `step_frame_depth` against the main VM, but a cooperative step re-drives the
+   PAUSED TASK's VM — so when the main thread awaited from a deeper frame than the
+   task, StepOut/StepOver compared against the wrong depth and StepOut wrongly
+   stopped *inside* the task. Fixed to measure depth via `with_coop_paused_task_vm`.
+   Gate: `wasm_async_debug_test::coop_async_step_over_and_out_use_task_depth`
+   (mutation-verified: the old main-VM depth makes StepOut stop at line 3 inside
+   the task). The native DAP path was already correct (`handle_debug_stop` sets the
+   depth from `task.vm.frames.len()`).
+
+3. **Missing-`DebugCoopResume` guard.** `surface_coop_task_stop` now enforces that
+   a cooperative task stop only surfaces to JS when the scheduler-driving
+   combinator registered a `DebugCoopResume` — a new combinator that paused the
+   scheduler without one fails loudly instead of silently wedging the next resume.
+   Unit test: `vm::tests::surface_coop_task_stop_requires_a_pending_resume`.
+
+**Still deferred (genuinely out of scope):** stepping that follows control INTO a
+concurrently-scheduled SIBLING task. Step-within-a-task and step-out-of-a-task are
+correct; making a `Step` interleave the stepper across independent sibling tasks
+is confusing semantics (most debuggers don't), low-value, and would require
+rebasing the session-global step state across per-task VM boundaries. Left parked
+deliberately; revisit only if a concrete need appears.
 
 ## Slice 2 — shipped (WASM playground cooperative stop+continue)
 

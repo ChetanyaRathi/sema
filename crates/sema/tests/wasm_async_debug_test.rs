@@ -91,6 +91,23 @@ impl Coop {
         )
     }
 
+    /// Apply a step command at the current stop and run one cooperative slice,
+    /// mirroring `WasmInterpreter::debug_resume`: at an async stop the step depth
+    /// is measured against the PAUSED TASK's VM (the one that resumes), not the
+    /// main VM parked at the await.
+    fn step(&mut self, mode: StepMode) -> VmExecResult {
+        self.debug.step_mode = mode;
+        if mode != StepMode::Continue {
+            self.debug.step_frame_depth =
+                sema_vm::with_coop_paused_task_vm(|tvm| tvm.frame_count())
+                    .unwrap_or_else(|| self.vm.frame_count());
+        }
+        self.debug.instructions_remaining = 5_000_000;
+        self.vm
+            .run_cooperative(&self.interpreter.ctx, &mut self.debug)
+            .expect("run_cooperative does not error on step")
+    }
+
     /// Simulate a Continue / poll loop: re-enter `run_cooperative` until the
     /// program finishes. Panics if it does not finish within the tick budget.
     fn continue_to_finish(&mut self) {
@@ -181,6 +198,53 @@ fn coop_async_breakpoint_in_first_task() {
     let (mut coop, first) = Coop::start(source, 2);
     assert_stopped_at(&first, 2);
     coop.continue_to_finish();
+}
+
+/// Slice-1 follow-up #1 (cross-scheduler stepping, task-correct depth): StepOver
+/// and StepOut at a stop INSIDE an async task must use the TASK's frame depth, so
+/// that — even when the main thread awaits from a deeper frame than the task —
+/// StepOver advances line-by-line within the task and StepOut leaves the task
+/// instead of erroneously stopping on the next line within it.
+///
+/// The main thread awaits from inside `(drive)` (main depth 2) while the task
+/// body is a single frame (depth 1); the old code measured the step depth against
+/// the main VM (2), making StepOut's `depth < step_frame_depth` (1 < 2) wrongly
+/// true and stopping inside the task.
+#[test]
+fn coop_async_step_over_and_out_use_task_depth() {
+    // 1  (define p (async/spawn (fn ()
+    // 2    (let ((a 1))            <- breakpoint; task frame depth 1
+    // 3      (let ((b 2))
+    // 4        (+ a b))))))
+    // 5  (define (drive) (await p))   <- main awaits from depth 2
+    // 6  (drive)
+    let source = "(define p (async/spawn (fn ()\n  (let ((a 1))\n    (let ((b 2))\n      (+ a b))))))\n(define (drive) (await p))\n(drive)\n";
+
+    // StepOver advances within the task: line 2 -> 3.
+    {
+        let (mut coop, first) = Coop::start(source, 2);
+        assert_stopped_at(&first, 2);
+        let next = coop.step(StepMode::StepOver);
+        assert_stopped_at(&next, 3);
+    }
+
+    // StepOut leaves the task's only frame — it must NOT stop again on line 3/4
+    // inside the same task (the bug). With task-correct depth the task runs out.
+    {
+        let (mut coop, first) = Coop::start(source, 2);
+        assert_stopped_at(&first, 2);
+        let after = coop.step(StepMode::StepOut);
+        match after {
+            // Correct: control left the task; nothing in the task stops again.
+            // (It finishes, or yields back to the main poll loop — either way it
+            // must not be a Step stop on a line still inside the task body.)
+            VmExecResult::Stopped(info) => assert!(
+                info.line < 2 || info.line > 4,
+                "StepOut must not stop INSIDE the async task body (lines 2-4), got {info:?}"
+            ),
+            VmExecResult::Finished(_) | VmExecResult::Yielded | VmExecResult::AsyncYield(_) => {}
+        }
+    }
 }
 
 /// Slice-1 follow-up #2 (cooperative half): at an async stop, INSPECTION must

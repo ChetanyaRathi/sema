@@ -2829,7 +2829,14 @@ impl WasmInterpreter {
 
             sess.debug.step_mode = mode;
             if mode != sema_vm::StepMode::Continue {
-                sess.debug.step_frame_depth = sess.vm.frame_count();
+                // Step depth must be measured against the VM that will actually be
+                // stepped. At a stop INSIDE an async task the resume re-drives that
+                // task's per-task VM (not the main VM, which is parked at the
+                // await), so StepOver/StepOut depth comparisons must use the task's
+                // frame count. Falls back to the main VM for ordinary sync stops.
+                sess.debug.step_frame_depth =
+                    sema_vm::with_coop_paused_task_vm(|tvm| tvm.frame_count())
+                        .unwrap_or_else(|| sess.vm.frame_count());
             }
             sess.debug.instructions_remaining = WASM_DEBUG_INSTRUCTION_BUDGET;
 
