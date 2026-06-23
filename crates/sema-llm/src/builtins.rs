@@ -1566,6 +1566,17 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
         request.reasoning_effort = reasoning_effort;
         request.timeout_ms = opt_timeout_ms(args.get(1));
 
+        // Inside a scheduler task: offload + yield so siblings overlap. The poller
+        // accounts (no post-call `track_usage` here) and shapes the value. The sync
+        // branch below is byte-identical to before.
+        #[cfg(not(target_arch = "wasm32"))]
+        if sema_core::in_async_context() {
+            return do_complete_async_yield(
+                request,
+                Box::new(|resp| Ok(Value::string(&resp.content))),
+            );
+        }
+
         let response = do_complete(request)?;
         track_usage(&response.usage)?;
         Ok(Value::string(&response.content))
@@ -1782,12 +1793,12 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
         if args.len() < 2 || args.len() > 3 {
             return Err(SemaError::arity("llm/extract", "2-3", args.len()));
         }
-        let schema = &args[0];
+        let schema = args[0].clone();
         let text = args[1]
             .as_str()
             .ok_or_else(|| SemaError::type_error("string", args[1].type_name()))?;
 
-        let schema_desc = format_schema(schema);
+        let schema_desc = format_schema(&schema);
         let system = format!(
             "Extract structured data from the text. Respond with ONLY a JSON object matching this schema:\n{}\nDo not include any other text.",
             schema_desc
@@ -1813,68 +1824,49 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
             }
         }
 
-        let mut last_validation_error = String::new();
-        let mut last_response_content = String::new();
+        // Attempt 0: the initial extraction request.
+        let mut request = ChatRequest::new(model.clone(), messages.clone());
+        request.json_mode = true;
+        request.system = Some(system.clone());
 
-        for attempt in 0..=max_retries {
-            let mut request = ChatRequest::new(model.clone(), messages.clone());
-            request.json_mode = true;
-            if attempt == 0 {
-                request.system = Some(system.clone());
-            } else if reask {
-                request.system = Some(format_reask_prompt(
-                    &last_response_content,
-                    &last_validation_error,
-                    &schema_desc,
-                ));
-            } else {
-                request.system = Some(format!(
-                    "{}\n\nYour previous response had validation errors: {}. Please fix.",
-                    system, last_validation_error
-                ));
-            }
-
-            let response = do_complete(request)?;
-            track_usage(&response.usage)?;
-
-            let content = response.content.trim();
-            let json_str = if content.starts_with("```") {
-                content
-                    .trim_start_matches("```json")
-                    .trim_start_matches("```")
-                    .trim_end_matches("```")
-                    .trim()
-            } else {
-                content
+        // Inside a scheduler task: ONLY attempt 0 is offloaded so siblings overlap;
+        // the poller accounts attempt 0, then `finalize` validates and — only if a
+        // re-ask is needed — runs the remaining attempts on the SYNCHRONOUS
+        // `do_complete` path (VM thread). A re-asking extract therefore briefly
+        // blocks siblings; the common single-attempt extract is fully concurrent.
+        #[cfg(not(target_arch = "wasm32"))]
+        if sema_core::in_async_context() {
+            let cfg = ExtractConfig {
+                schema,
+                schema_desc,
+                system,
+                model,
+                messages,
+                validate,
+                max_retries,
+                reask,
             };
-            let json: serde_json::Value = serde_json::from_str(json_str).map_err(|e| {
-                SemaError::Llm(format!(
-                    "failed to parse LLM JSON response: {e}\nResponse was: {content}"
-                ))
-            })?;
-            let result = sema_core::json_to_value(&json);
-
-            if validate {
-                match validate_extraction(&result, schema) {
-                    Ok(()) => return Ok(result),
-                    Err(err) => {
-                        last_validation_error = err;
-                        last_response_content = content.to_string();
-                        if attempt == max_retries {
-                            return Err(SemaError::Llm(format!(
-                                "extraction validation failed after {} attempt(s): {}",
-                                max_retries + 1,
-                                last_validation_error
-                            )));
-                        }
-                    }
-                }
-            } else {
-                return Ok(result);
-            }
+            return do_complete_async_yield(
+                request,
+                Box::new(move |first| extract_validate_and_reask(first, &cfg)),
+            );
         }
 
-        unreachable!()
+        // Sync path (byte-identical to before): attempt 0 through `do_complete` +
+        // `track_usage`, then the shared validate/re-ask loop.
+        let first = do_complete(request)?;
+        track_usage(&first.usage)?;
+        let cfg = ExtractConfig {
+            schema,
+            schema_desc,
+            system,
+            model,
+            messages,
+            validate,
+            max_retries,
+            reask,
+        };
+        extract_validate_and_reask(first, &cfg)
     });
 
     // (llm/extract-from-image schema source {:model "..."})
@@ -2007,19 +1999,30 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
         let mut request = ChatRequest::new(model, messages);
         request.system = Some(system);
 
+        // Shape the response into a category keyword (if it matched a keyword in the
+        // original list) or string. Shared by the sync and async paths.
+        let parse_category = move |response: ChatResponse| -> Result<Value, SemaError> {
+            let category = response.content.trim().to_string();
+            if categories
+                .iter()
+                .any(|c| c.as_keyword().map(|kw| kw == category).unwrap_or(false))
+            {
+                Ok(Value::keyword(&category))
+            } else {
+                Ok(Value::string(&category))
+            }
+        };
+
+        // Inside a scheduler task: offload + yield so siblings overlap; the poller
+        // accounts and runs `parse_category`. Sync branch is byte-identical.
+        #[cfg(not(target_arch = "wasm32"))]
+        if sema_core::in_async_context() {
+            return do_complete_async_yield(request, Box::new(parse_category));
+        }
+
         let response = do_complete(request)?;
         track_usage(&response.usage)?;
-
-        let category = response.content.trim().to_string();
-        // Return as keyword if it was in the original list as keyword
-        if categories
-            .iter()
-            .any(|c| c.as_keyword().map(|kw| kw == category).unwrap_or(false))
-        {
-            Ok(Value::keyword(&category))
-        } else {
-            Ok(Value::string(&category))
-        }
+        parse_category(response)
     });
 
     // Conversation functions
@@ -5054,6 +5057,277 @@ fn do_complete(request: ChatRequest) -> Result<ChatResponse, SemaError> {
     Ok(response)
 }
 
+/// Concurrent counterpart to [`do_complete`] + the native's post-call accounting,
+/// for the async-scheduler-task path. Mirrors the concurrent `llm/embed` flow,
+/// scaled to a completion: it runs the on-VM-thread stage (conv scope, detached
+/// `chat` span, request attrs, cache lookup, cassette decision, fallback-chain
+/// resolution into `Arc` clones) SYNCHRONOUSLY, then OFFLOADS the wire unit
+/// (`run_fallback_retry`) onto the shared runtime and YIELDS `AwaitIo` so sibling
+/// tasks overlap. All post-call work (span finalize, retry spans, cache store,
+/// cassette record, `track_usage`, content→Value) runs in the poller, on the VM
+/// thread, when the future lands — because the native is NOT re-invoked on resume.
+///
+/// `finalize` shapes the per-native return value from the `ChatResponse` (e.g.
+/// `Value::string(&resp.content)` for `llm/complete`). It runs in the poller on the
+/// VM thread, AFTER `track_usage`, so it may itself do further VM-thread work
+/// (e.g. `llm/extract`'s re-ask loop).
+///
+/// On a cache hit or cassette replay (no provider call) it finalizes the span,
+/// accounts ZERO usage, calls `finalize`, and returns WITHOUT yielding (nothing to
+/// overlap) — preserving the zero-usage cache-hit accounting invariant.
+#[cfg(not(target_arch = "wasm32"))]
+fn do_complete_async_yield(
+    request: ChatRequest,
+    finalize: Box<dyn FnOnce(ChatResponse) -> Result<Value, SemaError>>,
+) -> Result<Value, SemaError> {
+    use std::sync::atomic::Ordering;
+
+    // Defensive resume-value drain: the scheduler resumes the bytecode after the
+    // CALL via `replace_stack_top`, so this native is not re-invoked — but mirror
+    // `llm/embed`/`io-sleep-once` and drain any stray resume value.
+    if let Some(v) = sema_core::take_resume_value() {
+        return Ok(v);
+    }
+
+    // Standalone completions get their own conversation scope (so the chat span
+    // carries gen_ai.conversation.id); agent-nested ones inherit. The detached span
+    // captures the conversation id at creation, so the guard need only live across
+    // span creation below.
+    let _conv = if sema_otel::current_conversation_id().is_none() {
+        Some(sema_otel::set_conversation_scope(
+            &sema_otel::new_conversation_id(),
+            None,
+            None,
+        ))
+    } else {
+        None
+    };
+
+    // DETACHED chat span: parent captured now, finalized in the poller after the
+    // yield (when the active-span stack may hold a sibling task's span, so the span
+    // must not pop the stack on drop).
+    let span = sema_otel::llm_span_detached("chat");
+    span.set_request(
+        request.temperature,
+        request.max_tokens,
+        &request.stop_sequences,
+        request.reasoning_effort.as_deref(),
+    );
+    span.set_output_type(request.json_mode);
+    if sema_otel::compat_active() && !request.tools.is_empty() {
+        let views: Vec<sema_otel::ToolView> = request
+            .tools
+            .iter()
+            .map(|t| sema_otel::ToolView {
+                name: t.name.clone(),
+                description: t.description.clone(),
+                json_schema: t.parameters.to_string(),
+            })
+            .collect();
+        span.set_tools(&views);
+    }
+    apply_call_telemetry_llm(&span);
+
+    // ── Cache lookup (hit → finalize inline, zero usage, NO yield) ────────
+    let cache_enabled = CACHE_ENABLED.with(|c| c.get());
+    let cache_key = if cache_enabled {
+        let key_model = if request.model.is_empty() {
+            primary_model_for_cache()?
+        } else {
+            request.model.clone()
+        };
+        let mut key_request = request.clone();
+        key_request.model = key_model;
+        let key = compute_cache_key(&key_request);
+        if let Some(cached) = load_cached(&key) {
+            if is_cache_valid(&cached) {
+                CACHE_HITS.with(|c| c.set(c.get() + 1));
+                // A cache hit made no provider call → ZERO usage (mirrors
+                // `do_complete`), so `track_usage` does not recharge or burn budget.
+                let resp = ChatResponse {
+                    content: cached.content,
+                    role: "assistant".to_string(),
+                    model: cached.model,
+                    tool_calls: vec![],
+                    usage: Usage {
+                        prompt_tokens: 0,
+                        completion_tokens: 0,
+                        model: key_request.model.clone(),
+                        ..Default::default()
+                    },
+                    stop_reason: Some("cache_hit".to_string()),
+                };
+                span.set_dispatch("", &resp.model);
+                span.set_response(&response_facts("", &resp));
+                drop(span);
+                track_usage(&resp.usage)?;
+                return finalize(resp);
+            }
+        }
+        Some(key)
+    } else {
+        None
+    };
+
+    // ── Cassette decision (replay → inline, no yield; miss → Err) ─────────
+    // Keyed by the request as-is (no default-model resolution), matching
+    // `run_completion`'s key so record/replay agree with the sync path.
+    let cassette_decision = CASSETTE.with(|c| {
+        c.borrow().as_ref().map(|cass| {
+            let key = compute_cache_key(&request);
+            (key.clone(), cass.decide(&key))
+        })
+    });
+    match cassette_decision {
+        Some((_, crate::cassette::Decision::Replay(entry))) => {
+            let resp = entry.to_response();
+            span.set_dispatch("cassette", &resp.model);
+            span.set_response(&response_facts("cassette", &resp));
+            drop(span);
+            track_usage(&resp.usage)?;
+            return finalize(resp);
+        }
+        Some((k, crate::cassette::Decision::Miss(_))) => return Err(cassette_miss_error(&k)),
+        _ => {}
+    }
+    let cassette_record_key = match cassette_decision {
+        Some((k, crate::cassette::Decision::Record)) => Some(k),
+        _ => None,
+    };
+
+    // ── Resolve the fallback chain (or default provider) into Arc clones ──
+    // Done on the VM thread so the offloaded worker touches no thread-locals.
+    enforce_rate_limit();
+    let max_retries = NETWORK_MAX_RETRIES.with(|c| c.get());
+    let chain: Vec<ResolvedProvider> = PROVIDER_REGISTRY.with(|reg| {
+        let reg = reg.borrow();
+        let fallback = FALLBACK_CHAIN.with(|c| c.borrow().clone());
+        match fallback {
+            Some(entries) if !entries.is_empty() => entries
+                .iter()
+                .map(|e| {
+                    reg.get(&e.provider)
+                        .map(|p| ResolvedProvider {
+                            provider: p,
+                            name: e.provider.clone(),
+                            model: e.model.clone(),
+                        })
+                        .ok_or_else(|| {
+                            SemaError::Llm(format!("fallback provider '{}' not found", e.provider))
+                        })
+                })
+                .collect::<Result<Vec<_>, _>>(),
+            _ => {
+                let p = reg.default_provider().ok_or_else(|| {
+                    SemaError::Llm(
+                        "no LLM provider configured. Use (llm/configure :anthropic \
+                         {:api-key ...}) first"
+                            .to_string(),
+                    )
+                })?;
+                let name = p.name().to_string();
+                Ok(vec![ResolvedProvider {
+                    provider: p,
+                    name,
+                    model: None,
+                }])
+            }
+        }
+    })?;
+
+    // ── Offload the wire unit + yield ────────────────────────────────────
+    let (tx, mut rx) =
+        tokio::sync::oneshot::channel::<Result<CompleteOutcome, crate::types::LlmError>>();
+    let req2 = request.clone();
+    // Bump in-flight + peak on spawn so a test can prove simultaneity (mirrors the
+    // io-sleep-once spike instrumentation).
+    let prev = IO_INFLIGHT.fetch_add(1, Ordering::SeqCst) + 1;
+    IO_PEAK.fetch_max(prev, Ordering::SeqCst);
+    crate::http::shared_rt().spawn_blocking(move || {
+        let r = run_fallback_retry(chain, req2, max_retries);
+        let _ =
+            IO_INFLIGHT.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| Some((v - 1).max(0)));
+        let _ = tx.send(r);
+        sema_core::notify_io_complete();
+    });
+
+    // Move the span + cassette/cache context INTO the poller closure so all
+    // post-call work runs on the VM thread when the future lands.
+    let mut span_slot = Some(span);
+    let mut finalize_slot = Some(finalize);
+    let request_for_messages = request;
+    let handle = Rc::new(sema_core::IoHandle::new(move || {
+        use tokio::sync::oneshot::error::TryRecvError;
+        match rx.try_recv() {
+            Err(TryRecvError::Empty) => sema_core::IoPoll::Pending,
+            Ok(Ok(outcome)) => {
+                let CompleteOutcome {
+                    resp,
+                    serving_provider,
+                    serving_model,
+                    retry_events,
+                } = outcome;
+                if let Some(span) = span_slot.take() {
+                    // Emit retry spans + set the response facts UNDER this span so
+                    // children parent correctly (the detached span is not on the
+                    // stack). `entered` installs it as the active parent for the
+                    // closure, then restores.
+                    span.entered(|| {
+                        emit_retry_spans(&retry_events);
+                    });
+                    span.set_dispatch(&serving_provider, &serving_model);
+                    span.set_response(&response_facts(&serving_provider, &resp));
+                    span.set_messages(
+                        &messages_json(&request_for_messages.messages),
+                        &content_json("assistant", &resp.content),
+                        request_for_messages
+                            .system
+                            .as_deref()
+                            .map(|s| content_json("system", s))
+                            .as_deref(),
+                    );
+                    // span drops here → ends the span.
+                }
+                set_serving_provider(&serving_provider);
+                if let Some(key) = &cache_key {
+                    store_cached(key, &resp);
+                }
+                if let Some(key) = &cassette_record_key {
+                    CASSETTE.with(|c| {
+                        if let Some(cass) = c.borrow_mut().as_mut() {
+                            cass.record_entry(crate::cassette::TapeEntry::from_response(
+                                key, &resp,
+                            ));
+                        }
+                    });
+                }
+                // Account on the VM thread, then shape the value. A budget overrun
+                // fails the task, exactly as the sync path's `?`.
+                if let Err(e) = track_usage(&resp.usage) {
+                    return sema_core::IoPoll::Ready(Err(e.to_string()));
+                }
+                let finalize = finalize_slot.take().expect("finalize used once");
+                match finalize(resp) {
+                    Ok(value) => sema_core::IoPoll::Ready(Ok(value)),
+                    Err(e) => sema_core::IoPoll::Ready(Err(e.to_string())),
+                }
+            }
+            Ok(Err(e)) => {
+                if let Some(span) = span_slot.take() {
+                    span.record_error(llm_error_kind(&e), &e.to_string());
+                }
+                sema_core::IoPoll::Ready(Err(e.to_string()))
+            }
+            Err(TryRecvError::Closed) => {
+                span_slot.take();
+                sema_core::IoPoll::Ready(Err("complete: io worker dropped".to_string()))
+            }
+        }
+    }));
+    sema_core::set_yield_signal(sema_core::YieldReason::AwaitIo(handle));
+    Ok(Value::nil())
+}
+
 /// Cassette interception seam: below the otel span + response cache (set up in
 /// `do_complete`), above the real provider chain (`do_complete_inner`). When a
 /// cassette is active it replays a recorded response (still emitting the chat
@@ -5229,6 +5503,102 @@ fn primary_model_for_cache() -> Result<String, SemaError> {
         });
     }
     with_provider(|p| Ok(p.default_model().to_string()))
+}
+
+/// Parameters for `llm/extract`'s validate-and-re-ask stage, captured so the
+/// (possibly offloaded) finalize closure can run the synchronous re-ask attempts.
+struct ExtractConfig {
+    schema: Value,
+    schema_desc: String,
+    system: String,
+    model: String,
+    messages: Vec<ChatMessage>,
+    validate: bool,
+    max_retries: u32,
+    reask: bool,
+}
+
+/// Parse an LLM extraction response body into a Sema `Value` (strips a ```json
+/// fence if present). Shared by every `llm/extract` attempt.
+fn extract_parse_response(response: &ChatResponse) -> Result<Value, SemaError> {
+    let content = response.content.trim();
+    let json_str = if content.starts_with("```") {
+        content
+            .trim_start_matches("```json")
+            .trim_start_matches("```")
+            .trim_end_matches("```")
+            .trim()
+    } else {
+        content
+    };
+    let json: serde_json::Value = serde_json::from_str(json_str).map_err(|e| {
+        SemaError::Llm(format!(
+            "failed to parse LLM JSON response: {e}\nResponse was: {content}"
+        ))
+    })?;
+    Ok(sema_core::json_to_value(&json))
+}
+
+/// Validate `llm/extract`'s attempt-0 response and, on validation failure with
+/// retries remaining, run the re-ask attempts via the SYNCHRONOUS `do_complete`
+/// path (+ `track_usage` per attempt) — preserving the exact loop semantics and
+/// error messages of the original native. `first` is the attempt-0 response, which
+/// the caller has ALREADY accounted (sync path: inline; async path: in the poller).
+fn extract_validate_and_reask(
+    first: ChatResponse,
+    cfg: &ExtractConfig,
+) -> Result<Value, SemaError> {
+    let mut last_validation_error = String::new();
+    let mut last_response_content = String::new();
+
+    for attempt in 0..=cfg.max_retries {
+        // Attempt 0 reuses the already-issued+accounted `first` response; later
+        // attempts issue a fresh (re-ask) request synchronously here.
+        let response = if attempt == 0 {
+            first.clone()
+        } else {
+            let mut request = ChatRequest::new(cfg.model.clone(), cfg.messages.clone());
+            request.json_mode = true;
+            request.system = Some(if cfg.reask {
+                format_reask_prompt(
+                    &last_response_content,
+                    &last_validation_error,
+                    &cfg.schema_desc,
+                )
+            } else {
+                format!(
+                    "{}\n\nYour previous response had validation errors: {}. Please fix.",
+                    cfg.system, last_validation_error
+                )
+            });
+            let resp = do_complete(request)?;
+            track_usage(&resp.usage)?;
+            resp
+        };
+
+        let content = response.content.trim().to_string();
+        let result = extract_parse_response(&response)?;
+
+        if !cfg.validate {
+            return Ok(result);
+        }
+        match validate_extraction(&result, &cfg.schema) {
+            Ok(()) => return Ok(result),
+            Err(err) => {
+                last_validation_error = err;
+                last_response_content = content;
+                if attempt == cfg.max_retries {
+                    return Err(SemaError::Llm(format!(
+                        "extraction validation failed after {} attempt(s): {}",
+                        cfg.max_retries + 1,
+                        last_validation_error
+                    )));
+                }
+            }
+        }
+    }
+
+    unreachable!()
 }
 
 fn do_complete_inner(

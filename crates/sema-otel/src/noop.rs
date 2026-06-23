@@ -109,6 +109,9 @@ impl LlmSpan {
     pub fn set_conversation_id(&self, _id: &str) {}
     pub fn set_messages(&self, _input: &str, _output: &str, _system: Option<&str>) {}
     pub fn record_error(&self, _kind: &str, _msg: &str) {}
+    pub fn entered<R>(&self, f: impl FnOnce() -> R) -> R {
+        f()
+    }
 }
 
 pub struct ToolSpan;

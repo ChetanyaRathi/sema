@@ -614,6 +614,11 @@ impl Drop for SpanCore {
 }
 
 impl SpanCore {
+    /// The OTel `Context` carrying this span (for temporarily re-installing a
+    /// detached span as the active parent — see `LlmSpan::entered`).
+    fn context(&self) -> &Context {
+        &self.ctx
+    }
     fn set_str(&self, key: &'static str, val: impl Into<StringValue>) {
         self.ctx
             .span()
@@ -1158,6 +1163,23 @@ impl LlmSpan {
         if let Some(c) = &self.inner {
             c.record_error(kind, msg);
         }
+    }
+
+    /// Run `f` with this span pushed onto the active-span stack so any child spans
+    /// (e.g. `retry_span`) parent under it, then pop. For finalizing a DETACHED
+    /// span on the VM thread (it was never on the stack): a sibling task's span may
+    /// be on the stack, so we must temporarily install ours as the parent context
+    /// and restore on exit. A no-op when telemetry is disabled.
+    pub fn entered<R>(&self, f: impl FnOnce() -> R) -> R {
+        let Some(core) = &self.inner else {
+            return f();
+        };
+        STACK.with(|s| s.borrow_mut().push(core.context().clone()));
+        let r = f();
+        STACK.with(|s| {
+            s.borrow_mut().pop();
+        });
+        r
     }
 }
 
