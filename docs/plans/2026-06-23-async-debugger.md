@@ -35,8 +35,32 @@ The three items parked after Slices 1–2 are now done:
    scheduler without one fails loudly instead of silently wedging the next resume.
    Unit test: `vm::tests::surface_coop_task_stop_requires_a_pending_resume`.
 
+**Adversarial pass (2026-06-24)** found and fixed three session-boundary bugs the
+unit gates missed: (a) a breakpoint inside a HOF callback (`map`/`filter`/…)
+running in an async task drove the scheduler through `run_closure_as_inline_task`
+— the 6th, previously-unhandled scheduler-driving path — and the cooperative
+`DebugPaused` was swallowed into a spurious "HOF callback did not complete" error
+that also bypassed the guard; (b) abandoning a session (Stop) while paused at an
+async breakpoint leaked `DEBUG_COOP_RESUME` into the next session, whose first
+Continue would re-drive the dead target and clobber the new VM's stack; (c) the
+abandoned task survived `Ready` in the reused scheduler and could run under the
+next program. Fixes: `run_closure_as_inline_task` auto-continues through
+cooperative stops (forcing `Continue`, restored after) so the HOF completes;
+`start_cooperative` scrubs `DEBUG_COOP_RESUME`/`COOP_TASK_STOP`/`COOP_PAUSED_TASK_ID`
+and resets leftover scheduler tasks. Both regressions are mutation-verified
+(`coop_breakpoint_in_hof_callback_in_async_task_completes`,
+`coop_abandoned_async_session_does_not_poison_next_session`).
+
+**Known cooperative limitation:** a breakpoint inside a HOF callback running in an
+async task does NOT pause in the WASM playground (it auto-continues) — the nested
+inline-task drive runs synchronously inside the owning task's native call and
+cannot suspend back to JS without clobbering the outer resume target. The native
+DAP debugger DOES pause there (blocking path). Revisit only if needed.
+
 **Still deferred (genuinely out of scope):** stepping that follows control INTO a
-concurrently-scheduled SIBLING task. Step-within-a-task and step-out-of-a-task are
+concurrently-scheduled SIBLING task. (Adversarially confirmed safe — no panic/
+wedge; a sibling can pause spuriously and Continue escapes — but the session-global
+step state would need per-task scoping to contain it.) Step-within-a-task and step-out-of-a-task are
 correct; making a `Step` interleave the stepper across independent sibling tasks
 is confusing semantics (most debuggers don't), low-value, and would require
 rebasing the session-global step state across per-task VM boundaries. Left parked

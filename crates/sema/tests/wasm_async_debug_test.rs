@@ -200,6 +200,33 @@ fn coop_async_breakpoint_in_first_task() {
     coop.continue_to_finish();
 }
 
+/// Adversarial regression: a breakpoint inside a HOF callback (`map`) running in
+/// an async task must NOT crash the cooperative session with "HOF callback did
+/// not complete". The callback runs via `run_closure_as_inline_task` (the
+/// in-async-context fallback) which drives the scheduler synchronously inside the
+/// owning task's native call; it cannot suspend back to JS, so the cooperative
+/// debugger auto-continues through the stop and the program completes. (Native
+/// DAP still pauses there via the blocking path.)
+#[test]
+fn coop_breakpoint_in_hof_callback_in_async_task_completes() {
+    // 1  (define p (async/spawn (fn ()
+    // 2    (map (fn (x)
+    // 3      (* x 2))          <- breakpoint inside the HOF callback (inline task)
+    // 4      (list 1 2 3)))))
+    // 5  (await p)
+    let source = "(define p (async/spawn (fn ()\n  (map (fn (x)\n    (* x 2))\n    (list 1 2 3)))))\n(await p)\n";
+    let (mut coop, first) = Coop::start(source, 3);
+    // Before the fix this errored at start; now it auto-continues to completion.
+    match first {
+        VmExecResult::Finished(v) => {
+            assert_eq!(format!("{v}"), "(2 4 6)", "map result should be (2 4 6)");
+        }
+        // If it surfaces an intermediate stop/yield, Continue must still finish it
+        // cleanly (and never with the "did not complete" error).
+        _ => coop.continue_to_finish(),
+    }
+}
+
 /// Slice-1 follow-up #1 (cross-scheduler stepping, task-correct depth): StepOver
 /// and StepOut at a stop INSIDE an async task must use the TASK's frame depth, so
 /// that — even when the main thread awaits from a deeper frame than the task —
@@ -300,4 +327,113 @@ fn coop_async_stop_inspects_paused_task_locals() {
     );
 
     coop.continue_to_finish();
+}
+
+/// Adversarial regression (session-boundary hygiene): a cooperative session that
+/// is ABANDONED (Stop) while paused at an async breakpoint must not poison the
+/// NEXT session. The await native leaves a `DEBUG_COOP_RESUME` pending and the
+/// paused task `Ready` in the (reused) scheduler; without cleanup the next
+/// program's first Continue would consume the stale resume, re-drive the dead
+/// target, and clobber the new VM's stack. `start_cooperative` now clears that
+/// state, so session B runs cleanly.
+///
+/// Both sessions share ONE interpreter (so the scheduler is reused and the
+/// thread-locals persist), mirroring the persistent WASM playground interpreter.
+#[test]
+fn coop_abandoned_async_session_does_not_poison_next_session() {
+    let interpreter = Interpreter::new();
+    sema_vm::init_scheduler(interpreter.global_env.clone(), Vec::new());
+    let source_file = PathBuf::from("<playground>");
+
+    // Build a fresh VM + headless DebugState (single breakpoint) for `source`,
+    // sharing `interpreter` — i.e. NOT re-initialising the scheduler.
+    let build = |source: &str, bp_line: u32| {
+        let (vals, span_map) = sema_reader::read_many_with_spans(source).expect("parses");
+        let prog = sema_vm::compile_program_with_spans(&vals, &span_map, Some(source_file.clone()))
+            .expect("compiles");
+        let mut debug = DebugState::new_headless();
+        debug.set_valid_breakpoint_lines(sema_vm::valid_breakpoint_lines_by_file(
+            &prog.closure,
+            &prog.functions,
+        ));
+        let resolved = debug.set_breakpoints(&source_file, &[bp_line]);
+        assert!(
+            resolved.iter().any(|bp| bp.verified),
+            "bp {bp_line} resolves"
+        );
+        debug.step_mode = StepMode::Continue;
+        debug.instructions_remaining = 5_000_000;
+        let vm = VM::new(
+            interpreter.global_env.clone(),
+            prog.functions,
+            &[],
+            prog.main_cache_slots,
+        )
+        .expect("VM builds");
+        (vm, debug, prog.closure)
+    };
+
+    // SESSION A: pause inside an async task, then ABANDON (drop without resuming).
+    {
+        let (mut vm, mut debug, closure) = build(
+            "(define p (async/spawn (fn ()\n  (+ 1 2))))\n(await p)\n",
+            2,
+        );
+        let first = vm
+            .start_cooperative(closure, &interpreter.ctx, &mut debug)
+            .expect("session A starts");
+        assert_stopped_at(&first, 2);
+        // Drop vm/debug here WITHOUT resuming — simulates the user clicking Stop
+        // while paused. This leaves DEBUG_COOP_RESUME pending + the paused task
+        // Ready in the reused scheduler.
+    }
+
+    // The leak source is real: the await native left a resume pending and the
+    // paused task is still parked in the scheduler. (Sanity — if these were
+    // already clean the regression would be vacuous.)
+    assert!(
+        sema_core::debug_coop_resume_pending(),
+        "session A should have left a pending DEBUG_COOP_RESUME (the leak source)"
+    );
+    assert!(
+        sema_vm::scheduler_task_count() >= 1,
+        "session A's paused task should still be parked in the reused scheduler"
+    );
+
+    // SESSION B: starting a fresh program on the SAME interpreter must SCRUB that
+    // leaked state, so the next Continue cannot consume a stale resume / re-drive
+    // a dead target, and no abandoned task lingers.
+    {
+        let (mut vm, mut debug, closure) = build("(define r (* 6 7))\nr\n", 1);
+        let first = vm
+            .start_cooperative(closure, &interpreter.ctx, &mut debug)
+            .expect("session B starts");
+        assert_stopped_at(&first, 1);
+
+        // DIRECT assertions of the fix (these fail if start_cooperative's hygiene
+        // clears are removed): no stale resume, no leftover task.
+        assert!(
+            !sema_core::debug_coop_resume_pending(),
+            "session B start must clear the stale DEBUG_COOP_RESUME"
+        );
+        assert_eq!(
+            sema_vm::scheduler_task_count(),
+            0,
+            "session B start must drop the abandoned task from the reused scheduler"
+        );
+
+        // And it runs to its OWN result (42), not corruption.
+        let mut result = first;
+        for _ in 0..1000 {
+            debug.instructions_remaining = 5_000_000;
+            result = vm
+                .run_cooperative(&interpreter.ctx, &mut debug)
+                .expect("session B Continue does not error on a stale resume");
+            if let VmExecResult::Finished(v) = &result {
+                assert_eq!(format!("{v}"), "42", "session B must yield its own result");
+                return;
+            }
+        }
+        panic!("session B did not finish cleanly: {result:?}");
+    }
 }

@@ -947,11 +947,19 @@ impl VM {
         ctx: &EvalContext,
         debug: &mut crate::debug::DebugState,
     ) -> Result<crate::debug::VmExecResult, SemaError> {
-        // A fresh session has no paused async task. Clear any id left over from a
-        // PRIOR session that was abandoned (Stop) while paused inside a task, so a
-        // stale id can never misroute this session's inspection to an unrelated
-        // task that happens to reuse it. (Resume clears it on the normal path.)
+        // Session-boundary hygiene: a fresh cooperative session must not inherit
+        // ANY cooperative-debug state from a prior session that was abandoned
+        // (Stop) while paused at an async breakpoint. Without this, the next
+        // session's first Continue would consume a stale `DEBUG_COOP_RESUME` and
+        // re-drive a dead target — clobbering this program's VM stack — or surface
+        // a stale `COOP_TASK_STOP`, or inspect a leftover task by a reused id, or
+        // silently run an abandoned `Ready` task left in the reused scheduler.
+        // These thread-locals are cleared on the normal resume path; this is the
+        // belt-and-suspenders for the Stop-while-paused path. (Adversarial review.)
         clear_coop_paused_task_id();
+        let _ = take_coop_task_stop();
+        let _ = sema_core::take_debug_coop_resume();
+        crate::scheduler::reset_scheduler_tasks();
         self.ensure_cache_space(&closure.func);
         let base = self.stack.len();
         let n_locals = closure.func.chunk.n_locals as usize;

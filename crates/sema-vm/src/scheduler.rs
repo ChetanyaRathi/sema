@@ -399,6 +399,21 @@ fn put_scheduler(sched: Scheduler) {
     SCHEDULER.with(|s| *s.borrow_mut() = Some(sched));
 }
 
+/// Drop any tasks left over in the scheduler — used at the start of a cooperative
+/// debug session so an async task abandoned by a PRIOR session (paused at a
+/// breakpoint, then Stop) cannot survive as a `Ready` task and be silently
+/// executed by the next program. The playground reuses one persistent scheduler
+/// (`init_scheduler` takes the `Rc::ptr_eq` branch), and each debug run starts a
+/// fresh program, so clearing leftover tasks here is safe. No-op when the
+/// scheduler is uninitialized.
+pub fn reset_scheduler_tasks() {
+    SCHEDULER.with(|s| {
+        if let Some(sched) = s.borrow_mut().as_mut() {
+            sched.tasks.clear();
+        }
+    });
+}
+
 /// Run `f` against the per-task VM of the task currently paused at a cooperative
 /// breakpoint, if any. Returns `None` when no task is paused (or it can no longer
 /// be found — e.g. it already resumed/completed), in which case the caller should
@@ -492,11 +507,48 @@ pub(crate) fn run_closure_as_inline_task(
         otel: sema_core::current_conversation_scope_boxed(),
     });
 
-    // Re-enter the scheduler with this promise as the wait target. The
-    // scheduler is re-entrant: it puts itself back into the thread-local
-    // before each task step so nested HOF-callback yields work too.
+    // A cooperative (headless) debug session can pause this nested inline task at
+    // a breakpoint (`step_task_debug` returns `DebugPaused`). Unlike the top-level
+    // combinators, this path runs SYNCHRONOUSLY inside the owning task's HOF
+    // native call, so it cannot suspend back out to JS through the nested
+    // scheduler boundary without clobbering the OUTER session's resume target.
+    // The native DAP path handles the breakpoint fine (it blocks in
+    // `handle_debug_stop`); for the cooperative debugger we auto-continue the
+    // inline task through any stop so the HOF completes correctly instead of
+    // failing with "did not complete". Force `Continue` for the duration (restored
+    // after) so a session-global Step mode doesn't pause on every inline line.
+    // Trade-off: breakpoints inside a HOF callback running in an async task do not
+    // pause in the WASM playground (documented limitation).
+    let saved_step_mode = if vm::with_active_debug(|d| d.is_headless()).unwrap_or(false) {
+        vm::with_active_debug(|d| {
+            let prev = d.step_mode;
+            d.step_mode = crate::debug::StepMode::Continue;
+            prev
+        })
+    } else {
+        None
+    };
     let target = sema_core::SchedulerTarget::One(promise.clone());
-    let run_result = run_until_reentrant(&mut sched, ctx, &target);
+    let mut run_result = run_until_reentrant(&mut sched, ctx, &target);
+    let mut guard_ticks = 0u32;
+    while matches!(run_result, Ok(SchedulerRunResult::DebugPaused)) {
+        let _ = vm::take_coop_task_stop();
+        vm::clear_coop_paused_task_id();
+        guard_ticks += 1;
+        if guard_ticks > 100_000 {
+            if let Some(mode) = saved_step_mode {
+                vm::with_active_debug(|d| d.step_mode = mode);
+            }
+            put_scheduler(sched);
+            return Err(SemaError::eval(
+                "HOF callback in async task: too many debug pauses (possible loop)",
+            ));
+        }
+        run_result = run_until_reentrant(&mut sched, ctx, &target);
+    }
+    if let Some(mode) = saved_step_mode {
+        vm::with_active_debug(|d| d.step_mode = mode);
+    }
     put_scheduler(sched);
     run_result?;
 
