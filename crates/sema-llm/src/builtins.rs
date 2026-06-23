@@ -5320,26 +5320,48 @@ fn retry_backoff_ms(attempt: u32, server_hint: u64) -> u64 {
     entropy % (ceil + 1)
 }
 
+/// A single network-retry event, captured as DATA (not emitted as an otel span at
+/// the point it happens). The synchronous completion path emits `retry_span`s
+/// inline from these; the async path collects them on a worker thread (no otel TLS
+/// there) and replays them as spans in the VM-thread poller. Capturing-as-data is
+/// what lets both paths share one retry loop with zero telemetry drift.
+#[derive(Debug, Clone)]
+struct RetryEvent {
+    /// 1-based attempt number that triggered the retry (matches `retry_span`).
+    attempt: u32,
+    /// `llm_error_kind` of the error that triggered the retry.
+    kind: &'static str,
+    /// The error's display message.
+    msg: String,
+    /// The backoff actually applied before the retry, in ms.
+    wait_ms: u64,
+}
+
 /// Run `provider.complete` with retry on transient errors (429 / 5xx / network),
-/// using capped exponential backoff with jitter (429 honors `retry-after`).
-fn complete_with_retry(
+/// using capped exponential backoff with jitter (429 honors `retry-after`),
+/// COLLECTING each retry as a [`RetryEvent`] rather than emitting otel spans. The
+/// backoff `std::thread::sleep` runs on whatever thread calls this — fine on the
+/// synchronous VM thread (provider `block_on` already returned) and on the
+/// `spawn_blocking` worker for the async path. Touches NO thread-locals.
+fn complete_with_retry_collecting(
     provider: &dyn LlmProvider,
     request: &ChatRequest,
     max_retries: u32,
-) -> Result<ChatResponse, crate::types::LlmError> {
+) -> Result<(ChatResponse, Vec<RetryEvent>), crate::types::LlmError> {
     let mut attempt = 0u32;
+    let mut events = Vec::new();
     loop {
         match provider.complete(request.clone()) {
-            Ok(resp) => return Ok(resp),
+            Ok(resp) => return Ok((resp, events)),
             Err(e) => match retryable_wait(&e) {
                 Some(hint) if attempt < max_retries => {
                     let wait = retry_backoff_ms(attempt, hint);
-                    // Surface each retry as a child span under the LLM span (the
-                    // attempt that triggered the retry + the backoff applied).
-                    let rspan = sema_otel::retry_span(attempt + 1);
-                    rspan.record_error(llm_error_kind(&e), &e.to_string());
-                    rspan.set_wait_ms(wait);
-                    drop(rspan);
+                    events.push(RetryEvent {
+                        attempt: attempt + 1,
+                        kind: llm_error_kind(&e),
+                        msg: e.to_string(),
+                        wait_ms: wait,
+                    });
                     if wait > 0 {
                         std::thread::sleep(std::time::Duration::from_millis(wait));
                     }
@@ -5349,6 +5371,93 @@ fn complete_with_retry(
             },
         }
     }
+}
+
+/// Emit one `retry_span` child per collected [`RetryEvent`] under the active LLM
+/// span. Called on the VM thread (sync path: inline; async path: in the poller)
+/// where the otel context is live.
+fn emit_retry_spans(events: &[RetryEvent]) {
+    for ev in events {
+        let rspan = sema_otel::retry_span(ev.attempt);
+        rspan.record_error(ev.kind, &ev.msg);
+        rspan.set_wait_ms(ev.wait_ms);
+    }
+}
+
+/// Run `provider.complete` with retry on transient errors (429 / 5xx / network),
+/// using capped exponential backoff with jitter (429 honors `retry-after`).
+/// Re-expressed on top of [`complete_with_retry_collecting`] so the sync and async
+/// paths share one retry loop: this variant emits the collected retries as otel
+/// `retry_span` children inline (the sync path's behavior, unchanged).
+fn complete_with_retry(
+    provider: &dyn LlmProvider,
+    request: &ChatRequest,
+    max_retries: u32,
+) -> Result<ChatResponse, crate::types::LlmError> {
+    let (resp, events) = complete_with_retry_collecting(provider, request, max_retries)?;
+    emit_retry_spans(&events);
+    Ok(resp)
+}
+
+/// One resolved fallback target for the offloadable wire stage: an `Arc` provider
+/// clone (off the thread-local registry, cloned on the VM thread before offload),
+/// the provider's registry name, and an optional per-entry model override.
+#[cfg(not(target_arch = "wasm32"))]
+struct ResolvedProvider {
+    provider: std::sync::Arc<dyn LlmProvider>,
+    name: String,
+    model: Option<String>,
+}
+
+/// Result of the offloadable completion wire stage: the response, the name of the
+/// provider that served it (for `set_serving_provider` + pricing on the VM thread),
+/// and the collected retry events (replayed as spans in the poller).
+#[cfg(not(target_arch = "wasm32"))]
+struct CompleteOutcome {
+    resp: ChatResponse,
+    serving_provider: String,
+    serving_model: String,
+    retry_events: Vec<RetryEvent>,
+}
+
+/// The OFFLOADABLE wire unit for a completion: walk the resolved fallback chain,
+/// calling each provider's SYNC `complete()` (via `complete_with_retry_collecting`,
+/// preserving DROP_TEMPERATURE self-heal + network retry), failing over on error.
+/// Does NO thread-local access — no cassette, cache, spans, `track_usage`, or
+/// `set_serving_provider` (those all stay on the VM thread, in the poller). Backoff
+/// sleeps run here, on the worker thread.
+#[cfg(not(target_arch = "wasm32"))]
+fn run_fallback_retry(
+    chain: Vec<ResolvedProvider>,
+    request: ChatRequest,
+    max_retries: u32,
+) -> Result<CompleteOutcome, crate::types::LlmError> {
+    let mut last_error = None;
+    for entry in &chain {
+        let mut req = request.clone();
+        // Per-provider override wins; else fill the provider default when unpinned
+        // (mirrors `do_complete_with_provider` / `do_complete_uncached`).
+        if let Some(model) = &entry.model {
+            req.model = model.clone();
+        } else if req.model.is_empty() {
+            req.model = entry.provider.default_model().to_string();
+        }
+        match complete_with_retry_collecting(&*entry.provider, &req, max_retries) {
+            Ok((resp, retry_events)) => {
+                return Ok(CompleteOutcome {
+                    resp,
+                    serving_provider: entry.name.clone(),
+                    serving_model: req.model,
+                    retry_events,
+                });
+            }
+            Err(e) => {
+                eprintln!("Provider '{}' failed: {e}, trying next...", entry.name);
+                last_error = Some(e);
+            }
+        }
+    }
+    Err(last_error.unwrap_or_else(|| crate::types::LlmError::Config("all providers failed".into())))
 }
 
 fn do_complete_with_provider(
