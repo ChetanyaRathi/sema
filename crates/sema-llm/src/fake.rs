@@ -91,6 +91,12 @@ pub struct FakeProvider {
     /// overlap on the cooperative scheduler (wall ≈ max, not sum) — the chat
     /// counterpart of `embed_delay_ms`. 0 = no delay (default).
     chat_delay_ms: u64,
+    /// When set, `complete()` ignores the scripted queue and echoes the request's
+    /// last user-message text as the response content. This correlates each reply
+    /// to its prompt deterministically regardless of which `spawn_blocking` worker
+    /// finishes first, so a test can prove `async/pool-map` preserves INPUT order
+    /// even when concurrent completions land out of order.
+    echo: bool,
 }
 
 impl FakeProvider {
@@ -103,6 +109,7 @@ impl FakeProvider {
             script: VecDeque::new(),
             embed_delay_ms: 0,
             chat_delay_ms: 0,
+            echo: false,
         }
     }
 
@@ -120,6 +127,7 @@ pub struct FakeProviderBuilder {
     script: VecDeque<FakeReply>,
     embed_delay_ms: u64,
     chat_delay_ms: u64,
+    echo: bool,
 }
 
 impl FakeProviderBuilder {
@@ -262,6 +270,17 @@ impl FakeProviderBuilder {
         self
     }
 
+    /// Make `complete()` echo the request's last user-message text instead of
+    /// popping the scripted queue. Lets a concurrency test prove input-order
+    /// preservation (the reply is a function of the prompt, not arrival order).
+    /// Pairs with [`chat_delay`] for the overlap proof.
+    ///
+    /// [`chat_delay`]: Self::chat_delay
+    pub fn echo(mut self) -> Self {
+        self.echo = true;
+        self
+    }
+
     /// Script a rerank reply: `results` is `(original_index, relevance_score)` pairs,
     /// already ordered highest-relevance-first.
     pub fn rerank(mut self, results: &[(usize, f64)]) -> Self {
@@ -291,6 +310,7 @@ impl FakeProviderBuilder {
             recorder: Arc::new(FakeRecorder::default()),
             embed_delay_ms: self.embed_delay_ms,
             chat_delay_ms: self.chat_delay_ms,
+            echo: self.echo,
         }
     }
 
@@ -316,6 +336,23 @@ impl FakeProvider {
     fn next(&self) -> Option<FakeReply> {
         self.script.lock().unwrap().pop_front()
     }
+
+    /// Build a plain text chat response with default small usage (echo mode).
+    fn chat_text(&self, text: &str) -> ChatResponse {
+        ChatResponse {
+            content: text.to_string(),
+            role: "assistant".to_string(),
+            model: self.default_model.clone(),
+            tool_calls: Vec::new(),
+            usage: Usage {
+                prompt_tokens: 10,
+                completion_tokens: 5,
+                model: self.default_model.clone(),
+                ..Default::default()
+            },
+            stop_reason: Some("end_turn".to_string()),
+        }
+    }
 }
 
 impl LlmProvider for FakeProvider {
@@ -328,11 +365,26 @@ impl LlmProvider for FakeProvider {
     }
 
     fn complete(&self, request: ChatRequest) -> Result<ChatResponse, LlmError> {
+        // Echo mode: reply with the last user-message text BEFORE recording moves
+        // the request. Correlates reply↔prompt deterministically (order-independent).
+        let echoed = if self.echo {
+            request
+                .messages
+                .iter()
+                .rev()
+                .find(|m| m.role == "user")
+                .map(|m| m.content.to_text())
+        } else {
+            None
+        };
         self.recorder.requests.lock().unwrap().push(request);
         // Injected latency: on the async path this runs on a spawn_blocking
         // worker, so a real thread sleep is what lets two completions overlap.
         if self.chat_delay_ms > 0 {
             std::thread::sleep(std::time::Duration::from_millis(self.chat_delay_ms));
+        }
+        if let Some(text) = echoed {
+            return Ok(self.chat_text(&text));
         }
         match self.next() {
             Some(FakeReply::Chat(r)) => Ok(r),
