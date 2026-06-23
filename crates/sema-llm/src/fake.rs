@@ -86,6 +86,11 @@ pub struct FakeProvider {
     /// test can prove two concurrent `llm/embed`s overlap on the cooperative
     /// scheduler (wall ≈ max, not sum). 0 = no delay (default).
     embed_delay_ms: u64,
+    /// Fixed wall-clock delay injected into `complete()` (and only `complete()`),
+    /// so a test can prove two concurrent `llm/complete`/`classify`/`extract`s
+    /// overlap on the cooperative scheduler (wall ≈ max, not sum) — the chat
+    /// counterpart of `embed_delay_ms`. 0 = no delay (default).
+    chat_delay_ms: u64,
 }
 
 impl FakeProvider {
@@ -97,6 +102,7 @@ impl FakeProvider {
             default_model: "fake-model".to_string(),
             script: VecDeque::new(),
             embed_delay_ms: 0,
+            chat_delay_ms: 0,
         }
     }
 
@@ -113,6 +119,7 @@ pub struct FakeProviderBuilder {
     default_model: String,
     script: VecDeque<FakeReply>,
     embed_delay_ms: u64,
+    chat_delay_ms: u64,
 }
 
 impl FakeProviderBuilder {
@@ -245,6 +252,16 @@ impl FakeProviderBuilder {
         self
     }
 
+    /// Inject a fixed wall-clock delay into `complete()` (only `complete()`), so
+    /// two concurrent `llm/complete`/`classify`/`extract`s offloaded onto the
+    /// shared runtime visibly overlap (chat counterpart of [`embed_delay`]).
+    ///
+    /// [`embed_delay`]: Self::embed_delay
+    pub fn chat_delay(mut self, ms: u64) -> Self {
+        self.chat_delay_ms = ms;
+        self
+    }
+
     /// Script a rerank reply: `results` is `(original_index, relevance_score)` pairs,
     /// already ordered highest-relevance-first.
     pub fn rerank(mut self, results: &[(usize, f64)]) -> Self {
@@ -273,6 +290,7 @@ impl FakeProviderBuilder {
             script: Mutex::new(self.script),
             recorder: Arc::new(FakeRecorder::default()),
             embed_delay_ms: self.embed_delay_ms,
+            chat_delay_ms: self.chat_delay_ms,
         }
     }
 
@@ -311,6 +329,11 @@ impl LlmProvider for FakeProvider {
 
     fn complete(&self, request: ChatRequest) -> Result<ChatResponse, LlmError> {
         self.recorder.requests.lock().unwrap().push(request);
+        // Injected latency: on the async path this runs on a spawn_blocking
+        // worker, so a real thread sleep is what lets two completions overlap.
+        if self.chat_delay_ms > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(self.chat_delay_ms));
+        }
         match self.next() {
             Some(FakeReply::Chat(r)) => Ok(r),
             Some(FakeReply::Stream { response, .. }) => Ok(response),
@@ -417,6 +440,38 @@ mod tests {
         assert!(r2.tool_calls.is_empty());
 
         assert_eq!(recorder.call_count(), 2);
+    }
+
+    #[test]
+    fn chat_delay_is_honored_by_complete() {
+        let delay = 80u64;
+        let fake = FakeProvider::builder("fake")
+            .chat_delay(delay)
+            .reply("hi")
+            .build();
+        let t0 = std::time::Instant::now();
+        let r = fake
+            .complete(ChatRequest::new("fake-model".into(), vec![]))
+            .unwrap();
+        let elapsed = t0.elapsed();
+        assert_eq!(r.content, "hi");
+        assert!(
+            elapsed >= std::time::Duration::from_millis(delay),
+            "complete() should block for at least the chat delay; got {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn no_chat_delay_by_default() {
+        let fake = FakeProvider::builder("fake").reply("hi").build();
+        let t0 = std::time::Instant::now();
+        let _ = fake
+            .complete(ChatRequest::new("fake-model".into(), vec![]))
+            .unwrap();
+        assert!(
+            t0.elapsed() < std::time::Duration::from_millis(50),
+            "complete() should not block when no chat delay is set"
+        );
     }
 
     #[test]
