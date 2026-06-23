@@ -287,6 +287,29 @@ pub fn take_coop_task_stop() -> Option<crate::debug::StopInfo> {
     COOP_TASK_STOP.with(|s| s.borrow_mut().take())
 }
 
+/// Surface a cooperative async-task stop to JS as `VmExecResult::Stopped`,
+/// enforcing the invariant that the scheduler-driving native registered HOW to
+/// resume (`set_debug_coop_resume`). Every cooperative task pause is triggered by
+/// a scheduler-driving combinator (`async/await`/`all`/`race`/`run`/`timeout`),
+/// each of which records a [`DebugCoopResume`] before yielding the main VM. If a
+/// stop surfaces with no pending resume, a NEW combinator paused the scheduler
+/// without recording one — `run_cooperative`'s resume path would then take the
+/// non-resume branch and silently wedge (the paused task never re-drives, the
+/// awaited value is never reconstructed). Fail loudly here instead so the gap is
+/// caught the first time that combinator is debugged, not shipped.
+fn surface_coop_task_stop(
+    info: crate::debug::StopInfo,
+) -> Result<crate::debug::VmExecResult, SemaError> {
+    if !sema_core::debug_coop_resume_pending() {
+        return Err(SemaError::eval(
+            "internal: cooperative debug stop surfaced without a registered \
+             DebugCoopResume — a scheduler-driving async combinator paused for a \
+             breakpoint but did not call set_debug_coop_resume",
+        ));
+    }
+    Ok(crate::debug::VmExecResult::Stopped(info))
+}
+
 /// Reconstruct the value a scheduler-driving native (await/all/timeout/race/run)
 /// would have returned, now that its target promise(s) have settled — used by the
 /// cooperative debug-resume path to resume the main VM after a task breakpoint.
@@ -858,7 +881,9 @@ impl VM {
                     // coop resume here since we took it above.)
                     sema_core::set_debug_coop_resume(target, how);
                     if let Some(info) = take_coop_task_stop() {
-                        return Ok(crate::debug::VmExecResult::Stopped(info));
+                        // Resume was just re-armed above, so the guard's invariant
+                        // holds by construction here.
+                        return surface_coop_task_stop(info);
                     }
                     // Shouldn't happen, but don't wedge: fall through to a yield.
                     return Ok(crate::debug::VmExecResult::Yielded);
@@ -887,7 +912,7 @@ impl VM {
         let _active = ActiveDebugGuard::enter(debug);
         let result = self.run_inner(ctx, Some(debug))?;
         if let Some(info) = take_coop_task_stop() {
-            return Ok(crate::debug::VmExecResult::Stopped(info));
+            return surface_coop_task_stop(info);
         }
         Ok(result)
     }
@@ -921,7 +946,7 @@ impl VM {
         // native yielded the main VM (AsyncYield) and recorded the stop; surface
         // it to JS as a cooperative Stop instead of the raw AsyncYield.
         if let Some(info) = take_coop_task_stop() {
-            return Ok(crate::debug::VmExecResult::Stopped(info));
+            return surface_coop_task_stop(info);
         }
         Ok(result)
     }
@@ -4032,6 +4057,46 @@ mod tests {
     use super::*;
     use crate::chunk::{Chunk, Function};
     use sema_core::{intern, NativeFn};
+
+    /// The cooperative-stop guard: surfacing a task stop with NO pending
+    /// `DebugCoopResume` is an internal error (a scheduler-driving combinator
+    /// forgot `set_debug_coop_resume`), while a stop WITH one surfaces normally.
+    /// This pins the invariant so a future combinator that paginates the
+    /// scheduler without registering a resume fails loudly instead of wedging.
+    #[test]
+    fn surface_coop_task_stop_requires_a_pending_resume() {
+        use crate::debug::{StopInfo, StopReason, VmExecResult};
+
+        let info = || StopInfo {
+            reason: StopReason::Breakpoint,
+            file: None,
+            line: 7,
+        };
+
+        // No resume registered → loud internal error.
+        let _ = sema_core::take_debug_coop_resume(); // ensure clean slate
+        let err = surface_coop_task_stop(info()).unwrap_err();
+        assert!(
+            err.to_string().contains("DebugCoopResume"),
+            "guard error should name the missing resume: {err}"
+        );
+
+        // With a resume registered → surfaces as Stopped on the same line.
+        let promise = Rc::new(sema_core::AsyncPromise {
+            state: std::cell::RefCell::new(sema_core::PromiseState::Pending),
+            task_id: std::cell::Cell::new(0),
+        });
+        sema_core::set_debug_coop_resume(
+            sema_core::SchedulerTarget::One(promise.clone()),
+            sema_core::DebugCoopResume::Await(promise),
+        );
+        let surfaced = surface_coop_task_stop(info());
+        let Ok(VmExecResult::Stopped(got)) = surfaced else {
+            panic!("expected Stopped(line 7), got {surfaced:?}");
+        };
+        assert_eq!(got.line, 7);
+        let _ = sema_core::take_debug_coop_resume(); // leave the thread-local clean
+    }
 
     /// Convenience: compile and run a string expression in the VM.
     fn eval_str(input: &str, globals: &Rc<Env>, ctx: &EvalContext) -> Result<Value, SemaError> {
