@@ -2,6 +2,12 @@
 
 Things that came out of the May 2026 quality sweep (Wave 6 audit) but were intentionally not fixed because they're too risky, too design-dependent, or have a cheap workaround. Each entry says *why* it's deferred so a future pass can decide whether to revisit.
 
+## ASYNC-1 — Dynamic-scope flags vs deferred async tasks (cache/budget visibility)
+
+**Found 2026-06-23, during the concurrent-`llm/*` work.** `llm/with-cache` (and similarly `llm/with-budget`, per-call `:tags`/`:metadata`) sets a **dynamically-scoped thread-local** (`CACHE_ENABLED`, `BUDGET_*`, `CALL_TAGS`…) for the duration of its thunk, then resets it. An async task spawned inside that thunk reads the flag **when it actually executes** — and the scheduler can defer that execution past the point where the thunk returned and the flag was reset. Symptom: a single `(llm/with-cache … (fn () (async/all (list (async/spawn (fn () (llm/complete …)))))))` often reports `:misses 0` in `(llm/cache-stats)` (the task ran with `CACHE_ENABLED` already reset), and the `async_cache_miss_is_counted` test was removed as flaky for this reason. **Caching itself still works** for async completions awaited in-extent (a same-prompt repeat is served as a hit), so this is primarily an *accounting/visibility* nuance — but the same mechanism could mean `llm/with-budget` does **not** reliably gate concurrent completions, which would be a real correctness gap. **Deferred because** the fix is a design decision (snapshot the dynamic scope onto each task at `async/spawn` time and reinstall it when the task runs — a per-task dynamic-environment capture, akin to the per-task OTel context swap already shipped), not a one-liner, and it's orthogonal to the concurrency/cancellation slices it surfaced under. Revisit when wiring budgets to concurrent agent fan-out.
+
+---
+
 Verified 2026-06-09: U6 ("did you mean" hints — shipped via `suggest_similar` in sema-core, attached in both backends) and U9 (REPL completeness check — replaced by the lexer-based `SemaValidator` in `crates/sema/src/repl/validator.rs`) were removed because they have since been fixed. Remaining entries re-verified as still open.
 
 ---
