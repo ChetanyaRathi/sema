@@ -2,9 +2,19 @@
 
 Things that came out of the May 2026 quality sweep (Wave 6 audit) but were intentionally not fixed because they're too risky, too design-dependent, or have a cheap workaround. Each entry says *why* it's deferred so a future pass can decide whether to revisit.
 
-## ASYNC-2 — Breakpoints/stepping don't fire inside async task code
+## LEX-1 — Scientific/exponential number literals (`1.0e19`) not supported
 
-**Found 2026-06-23.** A breakpoint set on a line that runs only inside an `async`/`async/spawn` task (or via `async/map`/`pool-map`/channels) is silently ignored, in both the WASM playground and the native DAP. Root cause: breakpoint/step checking lives in `VM::run_inner(ctx, Some(debug))` (`vm.rs:875`), but the scheduler steps every task via `run_async`/`execute_async` → `run_inner(ctx, None)` (`scheduler.rs:894`) — non-debug mode, no `DebugState` plumbing. Synchronous-code debugging is unaffected. **Deferred because** the fix is a debugger×scheduler integration with a stop/resume design decision (a breakpoint hit mid-task must pause the scheduler and round-trip a `DebugCommand` through the playground's step-driven JS bridge), not a localized patch. Full write-up: `docs/bugs/async-breakpoints.md`; scoped fix: `docs/plans/2026-06-23-async-debugger.md`.
+**Found 2026-06-23.** Number literals don't accept an exponent: `1.0e19`, `1e19`, `1.5e3`, `2e-5` all fail to parse as numbers — the lexer's `read_number` (`crates/sema-reader/src/lexer.rs:725`) reads digits and an optional `.digits` fraction but stops before `e`/`E`, so `e19` is lexed as a separate symbol → `Error: Unbound variable: e19`. **Desired:** parse `<mantissa>[eE][+-]?<digits>` as an `f64` (`1.0e19` → 1e19, `2e-5` → 0.00002). Conversions of an out-of-range exponent literal should then error mentioning `int`, e.g.:
+
+```rust
+assert!(eval_err("(int 1.0e19)").to_string().contains("int"));
+```
+
+**Deferred because** it's a small, self-contained lexer addition (extend `read_number` + a few reader unit tests around exponent edge cases: bare `1e3`, signed `2e-5`, uppercase `1E10`, and the `1.` / `.e` non-number cases), just not yet prioritized.
+
+## ASYNC-2 — Breakpoints/stepping inside async tasks (core FIXED; sub-items remain)
+
+**Found 2026-06-23; STOP+CONTINUE FIXED same day** (native DAP + WASM playground — see `docs/bugs/async-breakpoints.md`). The original gap: breakpoint/step checking lives in `VM::run_inner(ctx, Some(debug))` (`vm.rs`), but the scheduler stepped every async task via `run_inner(ctx, None)` (non-debug). Now fixed — the debugger threads its state into the scheduler. **Still deferred:** (a) **stepping across the scheduler** into sibling tasks (Step Into/Over/Out stay within the stopped task), and (b) **stack/variable inspection** at a cooperative async stop targets the main VM's `async/all`/`await` frame, not the paused task's VM. Both are documented follow-ups in `docs/plans/2026-06-23-async-debugger.md`.
 
 ## ASYNC-1 — Dynamic-scope flags vs deferred async tasks (cache/budget visibility)
 
