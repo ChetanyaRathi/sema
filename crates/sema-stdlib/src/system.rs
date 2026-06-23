@@ -34,6 +34,104 @@ extern "C" fn handle_sigterm(_: libc::c_int) {
     SIGTERM_PENDING.store(true, Ordering::Relaxed);
 }
 
+/// Resolve the (program, argv) for a `shell` invocation. A lone command string
+/// runs through the system shell (`sh -c "<cmd>"` / `cmd /C "<cmd>"`); explicit
+/// args run the program directly. Owned `String`s so the spawned async path can
+/// move them across the thread boundary. Shared by both paths so they launch
+/// byte-identical commands.
+fn shell_program_args(cmd: &str, cmd_args: &[&str]) -> (String, Vec<String>) {
+    if cmd_args.is_empty() {
+        // Single string: run through the system shell for command parsing
+        let shell = if cfg!(windows) { "cmd" } else { "sh" };
+        let flag = if cfg!(windows) { "/C" } else { "-c" };
+        (shell.to_string(), vec![flag.to_string(), cmd.to_string()])
+    } else {
+        // Explicit args: run the command directly
+        (
+            cmd.to_string(),
+            cmd_args.iter().map(|s| s.to_string()).collect(),
+        )
+    }
+}
+
+/// Decode a finished child's status/stdout/stderr into the Sema `shell` result
+/// map. Identical shape for the sync and async paths: `:stdout`/`:stderr` are
+/// lossy-UTF-8 strings and `:exit-code` is the exit code (or `-1` when the
+/// process was terminated by a signal / has no code).
+fn shell_output_value(status_code: Option<i32>, stdout: &[u8], stderr: &[u8]) -> Value {
+    let stdout = String::from_utf8_lossy(stdout).to_string();
+    let stderr = String::from_utf8_lossy(stderr).to_string();
+
+    let mut result = std::collections::BTreeMap::new();
+    result.insert(Value::keyword("stdout"), Value::string(&stdout));
+    result.insert(Value::keyword("stderr"), Value::string(&stderr));
+    result.insert(
+        Value::keyword("exit-code"),
+        Value::int(status_code.unwrap_or(-1) as i64),
+    );
+    Value::map(result)
+}
+
+/// The subprocess facts that cross the thread boundary back from the shared
+/// runtime to the VM thread. Only plain `Send` data — never a `Value`/`Rc`.
+/// Decoded into the same `Value` shape as the sync path via [`shell_output_value`].
+struct RawShellOutput {
+    status_code: Option<i32>,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
+/// The offloaded (async-context) path: `spawn` the subprocess on the shared
+/// runtime and yield an `AwaitIo` handle whose poll closure decodes the `Send`
+/// output facts into the identical `Value` shape the sync path returns. Returns
+/// `Ok(nil)` after arming the yield signal; the scheduler delivers the real
+/// value on resume.
+fn shell_async(program: String, child_args: Vec<String>) -> Result<Value, SemaError> {
+    use std::rc::Rc;
+    use tokio::sync::oneshot::error::TryRecvError;
+
+    // Vestigial under CALL_NATIVE (the scheduler delivers the resume value via
+    // `replace_stack_top`, not by re-invoking this native), but kept for
+    // symmetry with the shipped `async/await` yield pattern.
+    if let Some(v) = sema_core::take_resume_value() {
+        return Ok(v);
+    }
+
+    let (tx, mut rx) = tokio::sync::oneshot::channel::<Result<RawShellOutput, String>>();
+
+    crate::async_rt::stdlib_shared_rt().spawn(async move {
+        let result = tokio::process::Command::new(&program)
+            .args(&child_args)
+            .output()
+            .await
+            .map(|output| RawShellOutput {
+                status_code: output.status.code(),
+                stdout: output.stdout,
+                stderr: output.stderr,
+            })
+            // Match the sync path's spawn-error message format exactly.
+            .map_err(|e| format!("shell: {e}"));
+        let _ = tx.send(result);
+        // Wake the parked VM thread so it re-polls promptly.
+        sema_core::notify_io_complete();
+    });
+
+    let handle = Rc::new(sema_core::IoHandle::new(move || match rx.try_recv() {
+        Err(TryRecvError::Empty) => sema_core::IoPoll::Pending,
+        Ok(Ok(raw)) => sema_core::IoPoll::Ready(Ok(shell_output_value(
+            raw.status_code,
+            &raw.stdout,
+            &raw.stderr,
+        ))),
+        Ok(Err(msg)) => sema_core::IoPoll::Ready(Err(msg)),
+        Err(TryRecvError::Closed) => {
+            sema_core::IoPoll::Ready(Err("shell: subprocess worker dropped".to_string()))
+        }
+    }));
+    sema_core::set_yield_signal(sema_core::YieldReason::AwaitIo(handle));
+    Ok(Value::nil())
+}
+
 pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
     crate::register_fn_gated(env, sandbox, Caps::ENV_READ, "env", |args| {
         check_arity!(args, "env", 1);
@@ -64,28 +162,30 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
             })
             .collect::<Result<_, _>>()?;
 
-        let output = if cmd_args.is_empty() {
-            // Single string: run through the system shell for command parsing
-            let shell = if cfg!(windows) { "cmd" } else { "sh" };
-            let flag = if cfg!(windows) { "/C" } else { "-c" };
-            std::process::Command::new(shell).args([flag, cmd]).output()
-        } else {
-            // Explicit args: run the command directly
-            std::process::Command::new(cmd).args(&cmd_args).output()
+        // Resolve the program + argv exactly once, shared by both paths so they
+        // launch byte-identical commands.
+        let (program, child_args) = shell_program_args(cmd, &cmd_args);
+
+        // Inside an `async/spawn`'d task: offload the subprocess onto the shared
+        // multi-thread runtime and yield `AwaitIo` so the scheduler can run
+        // sibling tasks while the child runs. Args are resolved and the result
+        // `Value` decoded on the VM thread; only `Send` facts cross the boundary.
+        if sema_core::in_async_context() {
+            return shell_async(program, child_args);
         }
-        .map_err(|e| SemaError::Io(format!("shell: {e}")))?;
 
-        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        // Top-level (not in a scheduler task): the original synchronous path,
+        // byte-identical in observable behavior to the pre-async implementation.
+        let output = std::process::Command::new(&program)
+            .args(&child_args)
+            .output()
+            .map_err(|e| SemaError::Io(format!("shell: {e}")))?;
 
-        let mut result = std::collections::BTreeMap::new();
-        result.insert(Value::keyword("stdout"), Value::string(&stdout));
-        result.insert(Value::keyword("stderr"), Value::string(&stderr));
-        result.insert(
-            Value::keyword("exit-code"),
-            Value::int(output.status.code().unwrap_or(-1) as i64),
-        );
-        Ok(Value::map(result))
+        Ok(shell_output_value(
+            output.status.code(),
+            &output.stdout,
+            &output.stderr,
+        ))
     });
 
     crate::register_fn_gated(env, sandbox, Caps::PROCESS, "exit", |args| {

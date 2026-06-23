@@ -9,36 +9,12 @@ thread_local! {
     static HTTP_CLIENT: reqwest::Client = reqwest::Client::new();
 }
 
-/// Process-wide multi-thread Tokio runtime that drives offloaded HTTP requests
-/// concurrently. A single shared runtime (rather than the per-VM-thread
-/// `HTTP_RUNTIME`) lets N in-flight requests overlap: an `async/spawn`'d task
-/// parks on `AwaitIo` while the VM thread runs its siblings, each launching its
-/// own request on this runtime.
-///
-/// Distinct from the thread-local `HTTP_RUNTIME`, which stays the synchronous
-/// `block_on` path for top-level (non-async) `http/*` calls. We never depend on
-/// `sema-llm`'s runtime — stdlib must not depend on `sema-llm` — so the pattern
-/// is replicated locally here.
-#[cfg(not(target_arch = "wasm32"))]
-static HTTP_SHARED_RT: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
-
 /// A process-wide `reqwest::Client` (`Send + Sync + Clone`) reused for every
 /// offloaded request, so connections pool across overlapping tasks. The
 /// thread-local `HTTP_CLIENT` cannot cross the thread boundary into the shared
 /// runtime, so the spawned path uses this one.
 #[cfg(not(target_arch = "wasm32"))]
 static HTTP_SHARED_CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
-
-/// Get (initializing on first use) the process-wide shared runtime.
-#[cfg(not(target_arch = "wasm32"))]
-fn http_shared_rt() -> &'static tokio::runtime::Runtime {
-    HTTP_SHARED_RT.get_or_init(|| {
-        tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .expect("HTTP_SHARED_RT")
-    })
-}
 
 /// Get (initializing on first use) the process-wide shared client.
 #[cfg(not(target_arch = "wasm32"))]
@@ -213,7 +189,7 @@ fn http_request_async(
 
     let (tx, mut rx) = tokio::sync::oneshot::channel::<Result<RawHttpResponse, String>>();
 
-    http_shared_rt().spawn(async move {
+    crate::async_rt::stdlib_shared_rt().spawn(async move {
         let result = async {
             let response = builder
                 .send()
