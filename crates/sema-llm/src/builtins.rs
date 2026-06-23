@@ -92,6 +92,31 @@ thread_local! {
     static LAST_SERVING_PROVIDER: RefCell<Option<String>> = const { RefCell::new(None) };
 }
 
+// ── AwaitIo spike instrumentation ───────────────────────────────
+//
+// Used only by the `llm/io-sleep-once` spike leaf (and its acceptance test) to
+// prove that N offloaded futures are in flight *simultaneously* on SHARED_RT,
+// not merely that the wall-clock was fast. `IO_INFLIGHT` is the live count;
+// `IO_PEAK` is the high-water mark.
+#[cfg(not(target_arch = "wasm32"))]
+pub static IO_INFLIGHT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+#[cfg(not(target_arch = "wasm32"))]
+pub static IO_PEAK: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Peak number of `llm/io-sleep-once` futures simultaneously in flight. The
+/// acceptance test asserts this is `>= 2` to prove true overlap.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn io_peak_inflight() -> usize {
+    IO_PEAK.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Reset the spike in-flight counters (test helper).
+#[cfg(not(target_arch = "wasm32"))]
+pub fn reset_io_inflight() {
+    IO_INFLIGHT.store(0, std::sync::atomic::Ordering::SeqCst);
+    IO_PEAK.store(0, std::sync::atomic::Ordering::SeqCst);
+}
+
 fn set_serving_provider(name: &str) {
     LAST_SERVING_PROVIDER.with(|p| *p.borrow_mut() = Some(name.to_string()));
 }
@@ -4229,6 +4254,56 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
             ))
         })?;
         Ok(sema_core::json_to_value(&json))
+    });
+
+    // (llm/io-sleep-once id [ms]) — AwaitIo spike leaf (NOT for production use).
+    //
+    // Mimics `llm/chat-once` but does a timer instead of an HTTP call: spawns a
+    // `tokio::time::sleep` on the shared runtime and yields `AwaitIo`, so the
+    // scheduler parks the task and runs siblings. Proves real overlap across the
+    // per-task-VM scheduler before any agent-loop work. Resolves to `id`.
+    #[cfg(not(target_arch = "wasm32"))]
+    register_fn_ctx(env, "llm/io-sleep-once", |_ctx, args| {
+        use std::sync::atomic::Ordering;
+
+        // Vestigial under CALL_NATIVE: the response arrives via the scheduler's
+        // `replace_stack_top`, not by re-invoking this native. Kept for symmetry
+        // with the shipped `async/await` pattern.
+        if let Some(v) = sema_core::take_resume_value() {
+            return Ok(v);
+        }
+        if args.is_empty() || args.len() > 2 {
+            return Err(SemaError::arity("llm/io-sleep-once", "1-2", args.len()));
+        }
+        let id = args[0].as_int().unwrap_or(0);
+        let ms = args.get(1).and_then(|v| v.as_int()).unwrap_or(1000).max(0) as u64;
+
+        let (tx, mut rx) = tokio::sync::oneshot::channel::<i64>();
+
+        // Bump in-flight + peak on spawn so the test can prove simultaneity.
+        let prev = IO_INFLIGHT.fetch_add(1, Ordering::SeqCst) + 1;
+        IO_PEAK.fetch_max(prev, Ordering::SeqCst);
+
+        crate::http::shared_rt().spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+            IO_INFLIGHT.fetch_sub(1, Ordering::SeqCst);
+            let _ = tx.send(id);
+            // Wake the parked VM thread so it re-polls promptly.
+            sema_core::notify_io_complete();
+        });
+
+        let handle = Rc::new(sema_core::IoHandle::new(move || {
+            use tokio::sync::oneshot::error::TryRecvError;
+            match rx.try_recv() {
+                Err(TryRecvError::Empty) => sema_core::IoPoll::Pending,
+                Ok(v) => sema_core::IoPoll::Ready(Ok(Value::int(v))),
+                Err(TryRecvError::Closed) => {
+                    sema_core::IoPoll::Ready(Err("io-sleep-once: worker dropped".to_string()))
+                }
+            }
+        }));
+        sema_core::set_yield_signal(sema_core::YieldReason::AwaitIo(handle));
+        Ok(Value::nil())
     });
 }
 
