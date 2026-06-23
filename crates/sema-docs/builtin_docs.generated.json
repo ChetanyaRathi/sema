@@ -514,6 +514,17 @@
       "body": "`#t` if a lazy promise (created with `delay`) has already been forced and cached its value, `#f` if it has not yet been evaluated. Canonical slash-namespaced alias of `promise-forced?`. Errors if the argument is not a promise.\n\n```sema\n(define p (delay (+ 1 2)))\n(async/forced? p)   ; => #f\n(force p)\n(async/forced? p)   ; => #t\n```"
     },
     {
+      "name": "async/map",
+      "module": "concurrency",
+      "section": "Promises",
+      "summary": "Concurrent map: apply `f` to each item in its **own** async task, returning the results in **input order**. The unbounded sibling of [`async/pool-map`](#async-pool-map) — every item gets a task at once, with no concurrency cap. Use `async/pool-map` when you need to limit how many run together (e.g. against a rate-limited API).",
+      "examples": [
+        "(async/map f items) → list",
+        ";; Fetch every URL concurrently.\n(async/map (fn (u) (http/get u)) urls)\n\n(async/map (fn (i) (* i i)) '(1 2 3 4))  ; => (1 4 9 16)"
+      ],
+      "body": "```sema\n(async/map f items) → list\n```\n\nConcurrent map: apply `f` to each item in its **own** async task, returning the\nresults in **input order**. The unbounded sibling of\n[`async/pool-map`](#async-pool-map) — every item gets a task at once, with no\nconcurrency cap. Use `async/pool-map` when you need to limit how many run together\n(e.g. against a rate-limited API).\n\nIt's the ergonomic form of `(async/all (map (fn (x) (async/spawn (fn () (f x)))) items))`.\n\n```sema\n;; Fetch every URL concurrently.\n(async/map (fn (u) (http/get u)) urls)\n\n(async/map (fn (i) (* i i)) '(1 2 3 4))  ; => (1 4 9 16)\n```"
+    },
+    {
       "name": "async/pending?",
       "module": "concurrency",
       "section": "Promises",
@@ -652,6 +663,17 @@
         "(define p (async (+ 1 2)))\n(await p)  ; => 3"
       ],
       "body": "```sema\n(async/spawn thunk) → async-promise\n```\n\nSpawn a zero-argument function as an async task. Returns a promise that resolves when the task completes.\n\n```sema\n(define p (async/spawn (fn () (+ 1 2))))\n(async/await p)  ; => 3\n```\n\nUsually called via the `async` special form:\n\n```sema\n(define p (async (+ 1 2)))\n(await p)  ; => 3\n```"
+    },
+    {
+      "name": "async/spawn-all",
+      "module": "concurrency",
+      "section": "Promises",
+      "summary": "Spawn a list of zero-argument functions as concurrent tasks and await them all, returning the results in **input order**. The ergonomic form of the very common `(async/all (map (fn (th) (async/spawn th)) thunks))`.",
+      "examples": [
+        "(async/spawn-all thunks) → list",
+        ";; Run two independent fetches at the same time.\n(async/spawn-all (list (fn () (http/get url-a))\n                       (fn () (http/get url-b))))\n\n(async/spawn-all (list (fn () :a) (fn () :b) (fn () :c)))  ; => (:a :b :c)"
+      ],
+      "body": "```sema\n(async/spawn-all thunks) → list\n```\n\nSpawn a list of zero-argument functions as concurrent tasks and await them all,\nreturning the results in **input order**. The ergonomic form of the very common\n`(async/all (map (fn (th) (async/spawn th)) thunks))`.\n\nUnbounded — every thunk gets its own task at once; use\n[`async/pool-map`](#async-pool-map) to cap how many run concurrently.\n\n```sema\n;; Run two independent fetches at the same time.\n(async/spawn-all (list (fn () (http/get url-a))\n                       (fn () (http/get url-b))))\n\n(async/spawn-all (list (fn () :a) (fn () :b) (fn () :c)))  ; => (:a :b :c)\n```"
     },
     {
       "name": "async/timeout",

@@ -40,6 +40,25 @@ fn task_survives_intervening_outermost_scheduler_exit() {
     );
 }
 
+// === async/map + async/spawn-all conveniences ===
+
+#[test]
+fn async_map_concurrent_in_order() {
+    // Concurrent map, results in INPUT order regardless of completion order.
+    assert_eq!(
+        eval(r#"(async/map (fn (x) (* x x)) (list 1 2 3 4))"#),
+        eval(r#"'(1 4 9 16)"#)
+    );
+}
+
+#[test]
+fn async_spawn_all_runs_thunks() {
+    assert_eq!(
+        eval(r#"(async/spawn-all (list (fn () :a) (fn () :b) (fn () :c)))"#),
+        eval(r#"'(:a :b :c)"#)
+    );
+}
+
 // === async special form ===
 
 #[test]

@@ -149,4 +149,23 @@ pub const PRELUDE: &str = r#"
                       (throw (:err result#))           ; re-raise so failures surface
                       (:ok result#))))))
             pool-items#))))
+
+;; async/spawn-all: spawn a list of zero-arg thunks as concurrent tasks and await
+;; them all, returning results in INPUT order. The ergonomic form of the very common
+;; `(async/all (map (fn (th) (async/spawn th)) thunks))`. Unbounded — every thunk gets
+;; its own task at once; use `async/pool-map` to cap how many run concurrently.
+;;
+;;   (async/spawn-all (list (fn () (http/get a)) (fn () (http/get b))))  ; both at once
+(defmacro async/spawn-all (thunks)
+  `(async/all (map (fn (thunk#) (async/spawn thunk#)) ,thunks)))
+
+;; async/map: concurrent map — apply `f` to each item in its OWN task, results in
+;; INPUT order. The unbounded sibling of `async/pool-map` (no concurrency cap).
+;;
+;;   (async/map fetch urls)            ; fetch every url concurrently
+;;   (async/map (fn (q) (llm/complete q)) prompts)
+(defmacro async/map (f items)
+  `(let ((amap-f# ,f))
+     (async/all
+       (map (fn (item#) (async/spawn (fn () (amap-f# item#)))) ,items))))
 "#;
