@@ -163,3 +163,72 @@ fn async_task_breakpoint_stops_and_continues() {
         .expect("program runs to completion after Continue");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Slice-1 follow-up: at a breakpoint INSIDE an async task, the inspection
+/// commands (GetStackTrace / GetScopes / GetVariables) must target the STOPPED
+/// TASK's VM frames — so the task-local `n` is visible with its value — not the
+/// main VM's frames (which are parked at `(await p)` with no `n` in scope).
+///
+/// This pins the wiring that `handle_debug_stop` runs on `task.vm`: had it served
+/// inspection against the main VM, `n` would be absent.
+#[test]
+fn async_task_breakpoint_inspects_task_frame_locals() {
+    let dir = std::env::temp_dir().join(format!("sema-dap-async-insp-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("async_insp.sema");
+    // Line 3: `(+ n 1)` runs only inside the task, where `n` is bound to 42.
+    let source = "(define p (async/spawn (fn ()\n  (let ((n 42))\n    (+ n 1)))))\n(await p)\n";
+    std::fs::write(&path, source).unwrap();
+    let path = std::fs::canonicalize(&path).unwrap();
+
+    let run = start_debug_run(source, &path, 3);
+
+    let evt = run
+        .event_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("a Stopped event should arrive for the async-task breakpoint");
+    assert!(
+        matches!(evt, DebugEvent::Stopped { .. }),
+        "expected Stopped inside the async task, got {evt:?}"
+    );
+
+    // GetStackTrace must report the task's frame (the inner `fn`), not the main
+    // top-level frame — the top frame's line is the breakpoint line (3).
+    let (tx, rx) = mpsc::sync_channel(1);
+    run.cmd_tx.send(DebugCommand::GetStackTrace { reply: tx }).unwrap();
+    let frames = rx.recv_timeout(Duration::from_secs(5)).expect("stack trace reply");
+    assert!(!frames.is_empty(), "expected at least one task frame");
+    let top = &frames[0];
+    assert_eq!(top.line, 3, "top frame should be at the breakpoint line: {frames:?}");
+    let frame_id = top.id as usize;
+
+    // GetScopes → the Locals scope reference for that frame.
+    let (tx, rx) = mpsc::sync_channel(1);
+    run.cmd_tx
+        .send(DebugCommand::GetScopes { frame_id, reply: tx })
+        .unwrap();
+    let scopes = rx.recv_timeout(Duration::from_secs(5)).expect("scopes reply");
+    let locals_ref = scopes
+        .iter()
+        .find(|s| s.name.eq_ignore_ascii_case("locals"))
+        .map(|s| s.variables_reference)
+        .expect("a Locals scope should exist");
+
+    // GetVariables on the Locals scope must surface the task-local `n = 42`.
+    let (tx, rx) = mpsc::sync_channel(1);
+    run.cmd_tx
+        .send(DebugCommand::GetVariables { reference: locals_ref, reply: tx })
+        .unwrap();
+    let vars = rx.recv_timeout(Duration::from_secs(5)).expect("variables reply");
+    assert!(
+        vars.iter().any(|v| v.name == "n" && v.value == "42"),
+        "task-local `n = 42` should be visible at the async stop, got {vars:?}"
+    );
+
+    run.cmd_tx.send(DebugCommand::Continue).unwrap();
+    run.handle
+        .join()
+        .expect("run thread joins")
+        .expect("program runs to completion after Continue");
+    let _ = std::fs::remove_dir_all(&dir);
+}
