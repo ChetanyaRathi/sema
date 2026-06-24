@@ -954,8 +954,8 @@ impl VM {
         // re-drive a dead target — clobbering this program's VM stack — or surface
         // a stale `COOP_TASK_STOP`, or inspect a leftover task by a reused id, or
         // silently run an abandoned `Ready` task left in the reused scheduler.
-        // These thread-locals are cleared on the normal resume path; this is the
-        // belt-and-suspenders for the Stop-while-paused path. (Adversarial review.)
+        // The normal resume path clears these thread-locals; this covers the
+        // Stop-while-paused path, which never resumes.
         clear_coop_paused_task_id();
         let _ = take_coop_task_stop();
         let _ = sema_core::take_debug_coop_resume();

@@ -200,7 +200,7 @@ fn coop_async_breakpoint_in_first_task() {
     coop.continue_to_finish();
 }
 
-/// Adversarial regression: a breakpoint inside a HOF callback (`map`) running in
+/// Regression: a breakpoint inside a HOF callback (`map`) running in
 /// an async task must NOT crash the cooperative session with "HOF callback did
 /// not complete". The callback runs via `run_closure_as_inline_task` (the
 /// in-async-context fallback) which drives the scheduler synchronously inside the
@@ -216,7 +216,8 @@ fn coop_breakpoint_in_hof_callback_in_async_task_completes() {
     // 5  (await p)
     let source = "(define p (async/spawn (fn ()\n  (map (fn (x)\n    (* x 2))\n    (list 1 2 3)))))\n(await p)\n";
     let (mut coop, first) = Coop::start(source, 3);
-    // Before the fix this errored at start; now it auto-continues to completion.
+    // It must auto-continue through the inline-task stop and complete — never
+    // surface the "HOF callback did not complete" error.
     match first {
         VmExecResult::Finished(v) => {
             assert_eq!(format!("{v}"), "(2 4 6)", "map result should be (2 4 6)");
@@ -234,9 +235,9 @@ fn coop_breakpoint_in_hof_callback_in_async_task_completes() {
 /// instead of erroneously stopping on the next line within it.
 ///
 /// The main thread awaits from inside `(drive)` (main depth 2) while the task
-/// body is a single frame (depth 1); the old code measured the step depth against
-/// the main VM (2), making StepOut's `depth < step_frame_depth` (1 < 2) wrongly
-/// true and stopping inside the task.
+/// body is a single frame (depth 1). Measuring the step depth against the main VM
+/// (2) makes StepOut's `depth < step_frame_depth` (1 < 2) wrongly true and stops
+/// inside the task; the depth must come from the paused task's VM (1).
 #[test]
 fn coop_async_step_over_and_out_use_task_depth() {
     // 1  (define p (async/spawn (fn ()
@@ -255,8 +256,8 @@ fn coop_async_step_over_and_out_use_task_depth() {
         assert_stopped_at(&next, 3);
     }
 
-    // StepOut leaves the task's only frame — it must NOT stop again on line 3/4
-    // inside the same task (the bug). With task-correct depth the task runs out.
+    // StepOut leaves the task's only frame — with the depth taken from the task's
+    // VM it must NOT stop again on line 3/4 inside the same task; the task runs out.
     {
         let (mut coop, first) = Coop::start(source, 2);
         assert_stopped_at(&first, 2);
@@ -329,13 +330,13 @@ fn coop_async_stop_inspects_paused_task_locals() {
     coop.continue_to_finish();
 }
 
-/// Adversarial regression (session-boundary hygiene): a cooperative session that
+/// Regression (session-boundary hygiene): a cooperative session that
 /// is ABANDONED (Stop) while paused at an async breakpoint must not poison the
 /// NEXT session. The await native leaves a `DEBUG_COOP_RESUME` pending and the
 /// paused task `Ready` in the (reused) scheduler; without cleanup the next
 /// program's first Continue would consume the stale resume, re-drive the dead
-/// target, and clobber the new VM's stack. `start_cooperative` now clears that
-/// state, so session B runs cleanly.
+/// target, and clobber the new VM's stack. `start_cooperative` clears that state,
+/// so session B runs cleanly.
 ///
 /// Both sessions share ONE interpreter (so the scheduler is reused and the
 /// thread-locals persist), mirroring the persistent WASM playground interpreter.
@@ -410,8 +411,8 @@ fn coop_abandoned_async_session_does_not_poison_next_session() {
             .expect("session B starts");
         assert_stopped_at(&first, 1);
 
-        // DIRECT assertions of the fix (these fail if start_cooperative's hygiene
-        // clears are removed): no stale resume, no leftover task.
+        // Session B start scrubs the leaked state: no stale resume, no leftover
+        // task carried over from the abandoned session A.
         assert!(
             !sema_core::debug_coop_resume_pending(),
             "session B start must clear the stale DEBUG_COOP_RESUME"
