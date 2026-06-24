@@ -43,6 +43,12 @@ pub enum WorkflowEvent {
         /// run.started stream row). Empty when no args were supplied.
         #[serde(default, skip_serializing_if = "String::is_empty")]
         args_json: String,
+        /// The workflow's declared phase plan (`defworkflow` meta `:phases`), so the
+        /// dashboard can render ALL phases up front (pending → running → done) instead
+        /// of only those that have started. Declared LAST (append-only); an empty plan
+        /// is skipped, keeping pre-existing goldens byte-identical.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        phases: Vec<String>,
     },
 
     /// A `phase` opened. Paired with exactly one [`Self::PhaseEnded`] (emitted even on
@@ -172,6 +178,7 @@ mod tests {
             run_id: "wf_test_0001".into(),
             code_version: String::new(), // skipped when empty
             args_json: String::new(),    // skipped when empty
+            phases: Vec::new(),          // skipped when empty
         };
         let line = serde_json::to_string(&ev).unwrap();
         assert_eq!(

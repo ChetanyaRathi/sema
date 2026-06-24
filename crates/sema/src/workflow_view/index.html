@@ -83,6 +83,9 @@
   .phase .count{color:var(--text-tertiary);font-size:var(--fs-small);flex:0 0 auto;}
   .phase.active .count{color:var(--gold-dim);}
   .phase.has-fail .count{color:var(--error);}
+  /* declared-but-not-yet-run phases: dimmed so they read as plan, not done */
+  .phase[data-status="pending"],.phase[data-status="skipped"]{opacity:.45;}
+  .phase .g-skip{color:var(--text-tertiary);}
   /* active marker is a square-cornered ledger rule, NOT a stripe on a rounded card */
   .phase.active{box-shadow:inset 2px 0 0 var(--gold);}
 
@@ -313,7 +316,7 @@ let M = emptyModel();
 /* =========================================================================
    PROJECTION — exactly the SQLite tables the journal projects into.
    ========================================================================= */
-const G = { run:"◐", ok:"✓", fail:"✗", pend:"○", cp:"◇", bud:"·", twig:"└" };
+const G = { run:"◐", ok:"✓", fail:"✗", pend:"○", skip:"⊘", cp:"◇", bud:"·", twig:"└" };
 
 function esc(s){ return String(s==null?"":s).replace(/[&<>]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;"}[c])); }
 function fmtTok(n){ if(n==null) return "—"; return n>=1000 ? (n/1000).toFixed(1)+"k" : String(n); }
@@ -334,13 +337,27 @@ function project(events){
     switch(e.event){
       case "run.started":
         run.run_id=e.run_id; run.workflow=e.workflow; run.code_version=e.code_version;
-        run.started_ts=e.ts; run.started_seq=e.seq; run.args_json=e.args_json; break;
+        run.started_ts=e.ts; run.started_seq=e.seq; run.args_json=e.args_json;
+        // Pre-seed ALL declared phases (defworkflow :phases) as pending rows, so the
+        // ledger shows the whole plan up front; phase.started later adopts each row.
+        if(Array.isArray(e.phases)) for(const name of e.phases){
+          phases.push({ start_seq:null, phase:name, status:"pending", dur_ms:null,
+                        agents:[], checkpoints:[], declared:true });
+        }
+        break;
       case "run.ended":
-        run.ended=true; run.status=e.status; break;
+        run.ended=true; run.status=e.status;
+        // Any declared phase that never started is honestly "skipped", not pending.
+        for(const p of phases) if(p.status==="pending") p.status="skipped";
+        break;
       case "phase.started": {
-        const p={ start_seq:e.seq, phase:e.phase, status:null, dur_ms:null,
-                  agents:[], checkpoints:[] };
-        phases.push(p); phaseBySeq.set(e.seq,p); curPhaseSeq=e.seq; break;
+        // Adopt the next declared-but-pending row with this label; else append a live
+        // row (covers an undeclared phase, or one that drifted from the :phases list).
+        let p = phases.find(x=>x.declared && x.status==="pending" && x.phase===e.phase);
+        if(p){ p.start_seq=e.seq; p.status=null; }
+        else { p={ start_seq:e.seq, phase:e.phase, status:null, dur_ms:null,
+                   agents:[], checkpoints:[] }; phases.push(p); }
+        phaseBySeq.set(e.seq,p); curPhaseSeq=e.seq; break;
       }
       case "phase.ended": {
         // last open phase with this label
@@ -400,7 +417,10 @@ function rollup(){
       if(a.cost_usd!=null){ cost=(cost||0)+a.cost_usd; anyCost=true; } }
   }
   const running = [...M.agents.values()].filter(a=>a.status==null).length;
-  return { phases:M.phases.length, agents:M.agents.size, agents_running:running,
+  // Count phases that actually STARTED (not pre-seeded pending/skipped rows), so the
+  // header rollup keeps its "phases seen" meaning while the left ledger shows the plan.
+  const started = M.phases.filter(p=>p.start_seq!=null).length;
+  return { phases:started, agents:M.agents.size, agents_running:running,
            tokens:tok, cost:anyCost?cost:null, budget_limit:M.latestBudgetLimit };
 }
 
@@ -428,6 +448,10 @@ const detailEl = document.getElementById("detail");
 const streamBody = document.getElementById("stream-body");
 
 function pGlyph(p){
+  // Pending/skipped FIRST: their status is non-null, so without these branches they
+  // would fall through to the ✓ "done" glyph — actively misleading.
+  if(p.status==="pending") return `<span class="pglyph g-pend">${G.pend}</span>`;
+  if(p.status==="skipped") return `<span class="pglyph g-skip">${G.skip}</span>`;
   if(phaseOpen(p)) return `<span class="pglyph g-run pulse">${G.run}</span>`;
   if(phaseHasFail(p)) return `<span class="pglyph g-fail">${G.fail}</span>`;
   return `<span class="pglyph g-ok">${G.ok}</span>`;
@@ -446,7 +470,12 @@ function renderPhases(){
     const count = total>0 ? `${done}/${total}`
                 : p.checkpoints.length>0 ? `◇${p.checkpoints.length}`
                 : ``;
-    html += `<div class="${cls}" data-seq="${p.start_seq}" data-testid="phase" data-phase-name="${esc(p.phase)}">`+
+    // A pending/skipped row has no start_seq; give it a stable synthetic key so it is
+    // selectable and highlightable without colliding on data-seq="null".
+    const key = p.start_seq!=null ? String(p.start_seq) : `pending:${p.phase}`;
+    const dstatus = p.status==="pending" ? "pending" : p.status==="skipped" ? "skipped"
+                  : phaseOpen(p) ? "running" : phaseHasFail(p) ? "failed" : "done";
+    html += `<div class="${cls}" data-seq="${key}" data-status="${dstatus}" data-testid="phase" data-phase-name="${esc(p.phase)}">`+
             pGlyph(p)+
             `<span class="pname ell">${esc(p.phase)}</span>`+
             `<span class="count tnum" data-testid="phase-count">${count}</span></div>`;
@@ -454,6 +483,8 @@ function renderPhases(){
   phasesEl.innerHTML = html;
   phasesEl.querySelectorAll(".phase").forEach(el=>{
     el.onclick = ()=>{
+      // Number("pending:…")===NaN, and phaseBySeq has no entry → the detail pane shows
+      // the "not started" placeholder. start_seq keys parse to their numeric seq.
       selPhaseSeq = Number(el.dataset.seq);
       const p = M.phaseBySeq.get(selPhaseSeq);
       if(p && p.agents.length){
@@ -479,7 +510,8 @@ function aGlyph(s,cls){
 
 function renderDetail(){
   const p = M.phaseBySeq.get(selPhaseSeq);
-  if(!p){ detailEl.innerHTML=""; return; }
+  if(!p){ detailEl.innerHTML = Number.isNaN(selPhaseSeq)
+            ? `<div class="col-label">Not started yet</div>` : ""; return; }
 
   const { done, total } = phaseProgress(p);
   const sub = [];
@@ -779,7 +811,10 @@ async function loadRun(runId){
   // Default selection: the open/live phase (or the last phase), and its live/first agent.
   if(selPhaseSeq==null || !M.phaseBySeq.has(selPhaseSeq)){
     const live = M.phases.find(p=>p.status==null);
-    const p = live || M.phases[M.phases.length-1];
+    // Prefer the last STARTED phase over a trailing pending/skipped row (which has no
+    // detail to show), so the default selection lands on something real.
+    const started = [...M.phases].reverse().find(p=>p.start_seq!=null);
+    const p = live || started || M.phases[M.phases.length-1];
     selPhaseSeq = p ? p.start_seq : null;
     if(p){ const la=p.agents.find(x=>x.status==null); selAgent=(la||p.agents[0])?.agent_id||null; }
   }

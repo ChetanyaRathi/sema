@@ -231,6 +231,7 @@ mod tests {
             run_id: "wf_test_0001".into(),
             code_version: String::new(),
             args_json: String::new(),
+            phases: Vec::new(),
         });
         j.write(&WorkflowEvent::RunEnded {
             seq: 1,

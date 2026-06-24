@@ -39,6 +39,21 @@ fn opt_str(v: &Value, key: &str) -> String {
         .unwrap_or_default()
 }
 
+/// The workflow's declared phase plan from `defworkflow` meta `:phases` (a list or
+/// vector of names — keyword OR string items, via `as_name`). Empty when absent. Lets
+/// the dashboard show ALL phases up front instead of only those that have started.
+fn declared_phases(meta: &Value) -> Vec<String> {
+    let Some(m) = meta.as_map_rc() else {
+        return Vec::new();
+    };
+    let Some(v) = m.get(&Value::keyword("phases")) else {
+        return Vec::new();
+    };
+    v.as_seq()
+        .map(|items| items.iter().filter_map(as_name).collect())
+        .unwrap_or_default()
+}
+
 /// Resolve an agent's role label from the `workflow/agent` first argument: the `:name`
 /// of an opts map, or a bare keyword/string label, falling back to "agent".
 fn agent_role(v: &Value) -> String {
@@ -152,6 +167,7 @@ pub fn register(env: &sema_core::Env) {
                 run_id: ctx.run_id(),
                 code_version: String::new(),
                 args_json: ctx.args_json().to_string(),
+                phases: declared_phases(&meta),
             });
         }
 

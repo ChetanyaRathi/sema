@@ -97,3 +97,31 @@ test('event stream → click jumps to the agent in the detail pane', async ({ pa
   await row.click();
   await expect(page.locator('[data-testid="agent-row"][data-agent="auditor_2"].sel')).toHaveCount(1);
 });
+
+// all-phases-upfront (S5): a run that declares 4 phases (run.started.phases) but has
+// only started 2 shows the whole plan — Inventory done, Audit running, Verify+Report
+// pending (dimmed, NOT a misleading ✓). Order preserved.
+test('phase ledger shows ALL declared phases, un-started ones pending', async ({ page }) => {
+  await page.goto('/?run=audit-pending', { waitUntil: 'networkidle' });
+  await page.waitForSelector('[data-testid="phase"]', { timeout: 15000 });
+
+  const phases = page.locator('[data-testid="phase"]');
+  await expect(phases).toHaveCount(4); // all declared phases up front
+  // order matches the declared plan
+  await expect(phases.nth(0)).toHaveAttribute('data-phase-name', 'Inventory');
+  await expect(phases.nth(1)).toHaveAttribute('data-phase-name', 'Audit');
+  await expect(phases.nth(2)).toHaveAttribute('data-phase-name', 'Verify');
+  await expect(phases.nth(3)).toHaveAttribute('data-phase-name', 'Report');
+
+  // status spread: done / running / pending / pending
+  await expect(phases.nth(0)).toHaveAttribute('data-status', 'done');
+  await expect(phases.nth(1)).toHaveAttribute('data-status', 'running');
+  await expect(page.locator('[data-testid="phase"][data-status="pending"]')).toHaveCount(2);
+
+  // a pending row shows the pending glyph (○), never the done ✓
+  const verify = page.locator('[data-testid="phase"][data-phase-name="Verify"]');
+  await expect(verify.locator('.pglyph')).toHaveText('○');
+
+  // header rollup counts only STARTED phases (2), while the ledger shows all 4
+  await expect(page.locator('#r-phases')).toHaveText('2');
+});
