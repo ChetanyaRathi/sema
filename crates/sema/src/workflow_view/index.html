@@ -370,7 +370,8 @@ function project(events){
       case "checkpoint": {
         const p=phaseBySeq.get(e.phase_seq);
         const cp={ seq:e.seq, phase_seq:e.phase_seq, key:e.key,
-                   content_key:e.content_key, value_digest:e.value_digest };
+                   content_key:e.content_key, value_digest:e.value_digest,
+                   value:e.value||"", open:false };
         if(p) p.checkpoints.push(cp); break;
       }
       case "budget": {
@@ -491,13 +492,18 @@ function renderDetail(){
     `<div class="agents-head"><span class="title">${esc(p.phase)} · ${done}/${total}</span>`+
     `<span class="sub ell">${sub.join(" · ")}</span></div>`;
 
-  // checkpoint lines (quiet) — names + digests only
+  // checkpoint lines — name + resume key; click to reveal the recorded value.
   for(const c of p.checkpoints){
-    html += `<div class="arow" style="grid-template-columns:16px 1fr auto;cursor:default" title="resume key">`+
-      `<span class="aglyph g-pend">${G.cp}</span>`+
-      `<span class="albl"><span style="color:var(--text-secondary)">saved ${esc(c.key)}</span></span>`+
-      `<span class="c tnum" title="content_key (resume) · value_digest">`+
-        `${esc(c.content_key)} · ${esc(c.value_digest)}</span></div>`;
+    const hasVal = !!c.value;
+    html += `<div data-testid="checkpoint">`+
+      `<div class="arow${hasVal?" ckp":""}" data-ckp="${c.seq}" `+
+        `style="grid-template-columns:16px 1fr auto;cursor:${hasVal?"pointer":"default"}" title="${hasVal?"click to see the value":"resume key"}">`+
+        `<span class="aglyph g-pend">${G.cp}</span>`+
+        `<span class="albl"><span style="color:var(--text-secondary)">saved ${esc(c.key)}</span></span>`+
+        `<span class="c tnum" title="content_key (resume) · value_digest">`+
+          `${esc(c.content_key)} · ${esc(c.value_digest)}</span></div>`+
+      (hasVal ? `<div class="disclosure" data-testid="checkpoint-value" style="display:${c.open?"block":"none"}">${esc(c.value)}</div>` : ``)+
+    `</div>`;
   }
 
   if(p.agents.length){
@@ -536,6 +542,14 @@ function renderDetail(){
   detailEl.innerHTML = html;
   detailEl.querySelectorAll(".arow[data-agent]").forEach(el=>{
     el.onclick = ()=>{ selAgent=el.dataset.agent; capturedOpen=false; renderDetail(); };
+  });
+  // checkpoint rows: click to toggle the recorded value.
+  detailEl.querySelectorAll(".arow[data-ckp]").forEach(el=>{
+    el.onclick = ()=>{
+      const seq = Number(el.dataset.ckp);
+      const c = p.checkpoints.find(x=>x.seq===seq);
+      if(c){ c.open = !c.open; renderDetail(); }
+    };
   });
   wireDrill();
 }

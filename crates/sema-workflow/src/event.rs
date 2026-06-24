@@ -116,8 +116,12 @@ pub enum WorkflowEvent {
         /// Stable resume key (hash of inputs + code version); short hex.
         #[serde(default, skip_serializing_if = "String::is_empty")]
         content_key: String,
-        /// Opaque digest of the recorded value.
+        /// Opaque digest of the recorded value (the resume identity).
         value_digest: String,
+        /// The recorded value itself, rendered + length-capped, so the dashboard can
+        /// show what was checkpointed (not just a hash). Empty if not captured.
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        value: String,
     },
 
     /// A budget / usage observation. Per-event (never a mutated counter) so summing
@@ -230,6 +234,7 @@ mod tests {
             key: "files".into(),
             content_key: "ck_4d2f8a1c".into(),
             value_digest: "abc123".into(),
+            value: String::new(), // skipped when empty
         };
         let line = serde_json::to_string(&ev).unwrap();
         assert_eq!(

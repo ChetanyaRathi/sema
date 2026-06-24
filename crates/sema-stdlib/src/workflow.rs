@@ -27,6 +27,19 @@ fn as_name(v: &Value) -> Option<String> {
     v.as_keyword().or_else(|| v.as_str().map(|s| s.to_string()))
 }
 
+/// Render a value for the journal so the dashboard can show the real data, capped
+/// (char-boundary safe) so one huge value can't bloat a journal line.
+fn capped_render(v: &Value) -> String {
+    const MAX: usize = 4000;
+    let s = sema_core::pretty_print(v, 100);
+    if s.chars().count() > MAX {
+        let head: String = s.chars().take(MAX).collect();
+        format!("{head}\n… (truncated, {} chars total)", s.chars().count())
+    } else {
+        s
+    }
+}
+
 /// Build the success envelope returned by `workflow/run`. PASS-THROUGH: if the
 /// workflow body's last value is already a `{:status …}` map (the idiomatic shape —
 /// e.g. `{:status :success :files … :findings …}`), it is returned verbatim so its
@@ -207,19 +220,9 @@ pub fn register(env: &sema_core::Env) {
         let usage = sema_llm::builtins::last_usage_snapshot();
         let model = usage.as_ref().map(|u| u.model.clone()).unwrap_or_default();
         // The agent's actual output, captured in the journal so the dashboard can
-        // show it. Length-capped (char-boundary safe) to bound the journal line; a
-        // huge output is truncated with a tail note rather than hashed away.
-        const MAX_OUTPUT: usize = 4000;
+        // show it (not a hash). Length-capped to bound the journal line.
         let output = match &result {
-            Ok(v) => {
-                let s = sema_core::pretty_print(v, 100);
-                if s.chars().count() > MAX_OUTPUT {
-                    let head: String = s.chars().take(MAX_OUTPUT).collect();
-                    format!("{head}\n… (truncated, {} chars total)", s.chars().count())
-                } else {
-                    s
-                }
-            }
+            Ok(v) => capped_render(v),
             Err(e) => format!("error: {e}"),
         };
         let status = if result.is_ok() { "ok" } else { "failed" };
@@ -301,6 +304,7 @@ pub fn register(env: &sema_core::Env) {
                 key: key.clone(),
                 content_key,
                 value_digest: digest,
+                value: capped_render(&value), // the real checkpointed value, for the dashboard
             });
             Ok(value)
         } else {
