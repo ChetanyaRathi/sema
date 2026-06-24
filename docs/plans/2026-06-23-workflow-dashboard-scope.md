@@ -1,23 +1,31 @@
 # Workflow Dashboard + SQLite Projection — Scoping
 
-> ## ⚑ OPTION-A SPIKE SHIPPED 2026-06-24 (branch `feat/dynamic-workflows-spike1`)
-> The visible viewer is built: `sema workflow view --run-dir <dir> [--host --port]`.
-> - `crates/sema/src/workflow_view.rs` — a minimal loopback tokio HTTP/1.1 static server
->   (NO new axum dep; 4 read-only routes: `/`, `/alpine.min.js`, `/api/runs`,
->   `/api/run/<id>/events.jsonl`). Loopback + no-auth, documented (same model as the notebook).
->   Path-traversal in the run id is rejected. Unit-tested routing/safety.
-> - `crates/sema/src/workflow_view/index.html` — the AlpineJS tree viewer (vendored alpine, same
->   as the notebook), on the Sema brand palette: run header + status pill + rollup, phase groups,
->   agent rows merging started→result with status glyph + duration, tool twigs, checkpoint/budget
->   lines, expand-to-see output, follow-live polling while a run is `running`. Honors §1.2
->   anti-dashboard-isms. Smoke-verified against the live content-pipeline journal
->   (`crates/sema/tests/fixtures/workflow/content-live.events.jsonl`).
-> - This is **Option A** (§2.2 — static client-side parse of `events.jsonl`). **Option B** (the
->   SQLite projection + idempotent replay-to-rows ingester + server-side `seq > N` live-tail cursor,
->   §3–§5) is the documented upgrade for many/large/long runs — **still to build**. Browser-visual
->   fidelity vs `variant-5b` is pending a human look.
+> ## ⚑ FULL VIEWER SHIPPED 2026-06-24 (branch `feat/dynamic-workflows-spike1`)
+> The complete `variant-5b` three-pane dashboard is built and live-data-wired:
+> `sema workflow view --run-dir <dir> [--host --port]`, and `sema workflow run --view`
+> auto-starts it.
+> - **`crates/sema/src/workflow_view/index.html`** — a faithful PORT of `variant-5b` (vanilla JS,
+>   NOT Alpine — porting the locked prototype verbatim guarantees fidelity), wired to fetch real
+>   data: **left** phase ledger (done/total + glyphs), **center** detail pane (agent table
+>   agent·model·tok·tools·dur + per-agent **drill-in**: Prompt / Tool calls / Output digest),
+>   **right** the raw **event stream** (one row per journal event, seq cursor, click-to-jump to
+>   the agent/phase). Header rollup (phases·agents·tok·cost), meta strip + budget bar, footer
+>   keybar. Follow-live polling while the run is `running`. Honors §1.2 anti-dashboard-isms.
+> - **`crates/sema/src/workflow_view.rs`** — minimal loopback tokio HTTP/1.1 static server (NO axum
+>   dep), routes `/`, `/api/runs`, `/api/run/<id>/{events.jsonl,result.json,metadata.json,args.json}`;
+>   path-traversal rejected; unit-tested.
+> - **Rich event vocab now EMITTED by the runtime** (so a LIVE run populates every pane, not just a
+>   fixture): agent.started{agent_id,agent_name,model}, agent.result{...,status,model},
+>   agent.tool_call{agent_id,tool_name,args_json}, checkpoint{phase_seq,content_key}, budget
+>   {agent_id,phase_seq,input/output_tokens,cost_usd} (per-agent tokens+cost via `sema_llm`
+>   last-usage), run.started{args_json}. Live-verified on `content-pipeline`.
+> - **Gate:** Playwright E2E `crates/sema/tests/e2e-workflow-view` (6/6) asserts every pane against
+>   the rich `audit-auth` fixture (extracted from the prototype's own mock journal).
+> - **Option B** (§3–§5: the SQLite projection + idempotent replay-to-rows ingester + server-side
+>   `seq > N` cursor) remains the documented scale upgrade for many/large/long runs — the current
+>   viewer parses `events.jsonl` client-side and re-polls, fine for normal runs.
 
-**Status:** scoping · Option A spike shipped 2026-06-24 · Option B (SQLite) pending · **Design direction LOCKED 2026-06-23.**
+**Status:** full variant-5b viewer + rich runtime events shipped 2026-06-24 · Option B (SQLite) = scale upgrade, pending · **Design LOCKED 2026-06-23.**
 **Depends on:** Spike 1 (sequential runtime + *frozen* JSONL journal) — see
 `docs/plans/2026-06-23-dynamic-workflows-derisk-spikes.md` §"Spike 1". This work
 **must not start until the ~8-event vocabulary is frozen** (scoping
