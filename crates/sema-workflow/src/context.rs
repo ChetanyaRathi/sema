@@ -120,6 +120,13 @@ impl WorkflowCtx {
         self.journal.borrow_mut().write(&event);
     }
 
+    /// True under the fixed-timestamp test seam (`SEMA_WORKFLOW_FIXED_TS`). Callers
+    /// that measure their own per-leaf durations force them to 0 in this mode so
+    /// goldens stay byte-identical.
+    pub fn deterministic(&self) -> bool {
+        self.fixed_ts.is_some()
+    }
+
     /// This run's stable identifier (also the run-dir name).
     pub fn run_id(&self) -> String {
         self.run_id.clone()

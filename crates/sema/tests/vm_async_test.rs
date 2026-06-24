@@ -1175,3 +1175,35 @@ fn awaiting_cancelled_promise_reports_cancellation_distinctly() {
         "cancellation should NOT surface as 'task rejected': {err}"
     );
 }
+
+// === workflow/foreach — bounded parallel fan-out (Spike 3) ===
+
+// ORDER: results line up with INPUT order even though completion order is reversed
+// (leaf i sleeps (8-i)*5ms, so item 7 finishes first, item 0 last).
+#[test]
+fn workflow_foreach_preserves_input_order() {
+    assert_eq!(
+        eval(
+            r#"(workflow/foreach
+                  (fn (i) (begin (async/sleep (* (- 8 i) 5)) i))
+                  (list 0 1 2 3 4 5 6 7) 3)"#
+        ),
+        common::eval(r#"'(0 1 2 3 4 5 6 7)"#)
+    );
+}
+
+// ERROR-TAGGING: a throwing item does NOT abort the batch — its slot becomes a
+// {:status :failed} map while siblings succeed (unlike async/pool-map, which
+// re-raises and kills the whole batch on the first failure).
+#[test]
+fn workflow_foreach_tags_failures_without_aborting() {
+    assert_eq!(
+        eval(
+            r#"(let ((r (workflow/foreach
+                          (fn (i) (if (= i 1) (throw "boom") (* i 10)))
+                          (list 0 1 2) 2)))
+                 (list (nth r 0) (:status (nth r 1)) (nth r 2)))"#
+        ),
+        common::eval(r#"'(0 :failed 20)"#)
+    );
+}

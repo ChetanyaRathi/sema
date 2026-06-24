@@ -10169,6 +10169,27 @@
       "syntax": "(phase label body ...)"
     },
     {
+      "name": "workflow/agent",
+      "module": "workflow",
+      "section": "Dynamic Workflows",
+      "summary": "Run a leaf step (typically an LLM or tool call) as a journaled **agent**: `(workflow/agent label thunk)` emits an `agent.started` event before the thunk and an `agent.result` event after (with an opaque output digest + duration), so the workflow dashboard renders it as an agent row under the current phase. Returns the thunk's value, or propagates its error after journaling the result. Outside a `workflow/run` it is transparent — it just calls the thunk. Compose it inside `workflow/foreach` to make a fanned-out set of leaves show up as sibling agent rows.",
+      "examples": [
+        "(define (write-article topic)\n  (workflow/agent topic\n    (fn () {:title topic\n            :body  (llm/complete (str \"Explain \" topic) {:model \"gpt-5.4-mini\"})})))\n\n(workflow/foreach write-article topics 4)   ; N agent rows, <=4 at once"
+      ],
+      "body": "Run a leaf step (typically an LLM or tool call) as a journaled **agent**: `(workflow/agent label thunk)` emits an `agent.started` event before the thunk and an `agent.result` event after (with an opaque output digest + duration), so the workflow dashboard renders it as an agent row under the current phase. Returns the thunk's value, or propagates its error after journaling the result. Outside a `workflow/run` it is transparent — it just calls the thunk. Compose it inside `workflow/foreach` to make a fanned-out set of leaves show up as sibling agent rows.\n\n```sema\n(define (write-article topic)\n  (workflow/agent topic\n    (fn () {:title topic\n            :body  (llm/complete (str \"Explain \" topic) {:model \"gpt-5.4-mini\"})})))\n\n(workflow/foreach write-article topics 4)   ; N agent rows, <=4 at once\n```\n\nSee also: `workflow/foreach`, `workflow/run`, `checkpoint`."
+    },
+    {
+      "name": "workflow/foreach",
+      "module": "workflow",
+      "section": "Dynamic Workflows",
+      "summary": "Macro: the workflow fan-out combinator. Applies `f` to each of `items` with at most `n` running concurrently, returning results in **input order** — like [`async/pool-map`](/docs/stdlib/async/pool-map), but a failing item does **not** abort the batch. Each item's error is caught and surfaces as a `{:status :failed :error \"…\"}` map in that slot, so a later `verify` phase can branch on it (`async/pool-map` re-raises, killing the whole batch on the first failure — wrong for a fan-out where leaves may fail independently). Successful items return `f`'s value unchanged. Bounded concurrency is enforced by a capacity-`n` semaphore channel.",
+      "examples": [
+        ";; generate articles for many topics, <=4 model calls in flight, in order\n(workflow/foreach write-article topics 4)\n\n;; a failing item is tagged, not fatal:\n(workflow/foreach (fn (i) (if (= i 1) (throw \"boom\") (* i 10))) (list 0 1 2) 2)\n;; => (0 {:status :failed :error \"boom\"} 20)"
+      ],
+      "body": "Macro: the workflow fan-out combinator. Applies `f` to each of `items` with at most `n` running concurrently, returning results in **input order** — like [`async/pool-map`](/docs/stdlib/async/pool-map), but a failing item does **not** abort the batch. Each item's error is caught and surfaces as a `{:status :failed :error \"…\"}` map in that slot, so a later `verify` phase can branch on it (`async/pool-map` re-raises, killing the whole batch on the first failure — wrong for a fan-out where leaves may fail independently). Successful items return `f`'s value unchanged. Bounded concurrency is enforced by a capacity-`n` semaphore channel.\n\n```sema\n;; generate articles for many topics, <=4 model calls in flight, in order\n(workflow/foreach write-article topics 4)\n\n;; a failing item is tagged, not fatal:\n(workflow/foreach (fn (i) (if (= i 1) (throw \"boom\") (* i 10))) (list 0 1 2) 2)\n;; => (0 {:status :failed :error \"boom\"} 20)\n```\n\nSee also: `defworkflow`, `workflow/agent`, `async/pool-map`.",
+      "syntax": "(workflow/foreach f items n)"
+    },
+    {
       "name": "workflow/phase",
       "module": "workflow",
       "section": "Dynamic Workflows",

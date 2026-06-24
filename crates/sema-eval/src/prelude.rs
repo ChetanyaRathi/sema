@@ -169,6 +169,32 @@ pub const PRELUDE: &str = r#"
                       (:ok result#))))))
             pool-items#))))
 
+;; workflow/foreach: the workflow fan-out combinator — like async/pool-map (bounded
+;; concurrency, results in INPUT order) but a failing item does NOT abort the batch.
+;; Each item's error is caught and surfaces as a {:status :failed :error "..."} map in
+;; that slot, so a `verify` phase can branch on it (async/pool-map re-raises, killing
+;; the whole batch on the first failure — wrong for a fan-out where some leaves may
+;; fail independently). Successful items return the worker's value unchanged.
+;;
+;;   (workflow/foreach write-article topics 4)   ; <=4 leaves at once, in order
+(defmacro workflow/foreach (f items n)
+  `(let ((wf-f# ,f)
+         (wf-items# ,items)
+         (wf-sem# (channel/new ,n)))
+     (for-range (i# 0 ,n) (channel/send wf-sem# #t))   ; n concurrency tokens
+     (async/all
+       (map (fn (item#)
+              (async/spawn
+                (fn ()
+                  (channel/recv wf-sem#)                 ; acquire (parks when full)
+                  (let ((r# (try {:ok (wf-f# item#)}
+                                 (catch e# {:err e#}))))
+                    (channel/send wf-sem# #t)            ; release on BOTH paths
+                    (if (contains? r# :err)
+                      {:status :failed :error (str (:err r#))}   ; tag, do NOT re-raise
+                      (:ok r#))))))
+            wf-items#))))
+
 ;; async/spawn-all: spawn a list of zero-arg thunks as concurrent tasks and await
 ;; them all, returning results in INPUT order. The ergonomic form of the very common
 ;; `(async/all (map (fn (th) (async/spawn th)) thunks))`. Unbounded — every thunk gets

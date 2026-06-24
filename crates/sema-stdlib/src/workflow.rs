@@ -20,6 +20,7 @@ use sema_core::{SemaError, Value};
 use sema_workflow::context;
 use sema_workflow::event::WorkflowEvent;
 use std::collections::BTreeMap;
+use std::time::Instant;
 
 /// A keyword/string argument as a plain `String` (checkpoint keys, phase labels).
 fn as_name(v: &Value) -> Option<String> {
@@ -156,6 +157,50 @@ pub fn register(env: &sema_core::Env) {
 
         // Propagate Ok OR Err AFTER phase.ended is journaled. The phase body's last
         // value flows out unchanged (the enclosing workflow/run wraps it in :value).
+        result
+    });
+
+    // (workflow/agent label thunk) — run a leaf (typically an LLM/tool call) as a
+    // journaled "agent": emits agent.started before and agent.result after, so the
+    // dashboard renders it as an agent row under the current phase. Returns the
+    // thunk's value (or propagates its error, after journaling a result). A no-op
+    // wrapper (just runs the thunk) when called outside a workflow run.
+    crate::register_fn(env, "workflow/agent", |args| {
+        if args.len() != 2 {
+            return Err(SemaError::arity("workflow/agent", "2", args.len()));
+        }
+        let label = as_name(&args[0])
+            .ok_or_else(|| SemaError::type_error("keyword or string", args[0].type_name()))?;
+        let thunk = &args[1];
+        let Some(ctx) = context::current() else {
+            // Outside a run: transparent — just call the thunk.
+            return crate::list::call_function(thunk, &[]);
+        };
+        ctx.emit(WorkflowEvent::AgentStarted {
+            seq: ctx.next_seq(),
+            ts: ctx.ts(),
+            agent: label.clone(),
+        });
+        let start = Instant::now();
+        let result = crate::list::call_function(thunk, &[]);
+        let dur_ms = if ctx.deterministic() {
+            0
+        } else {
+            start.elapsed().as_millis() as u64
+        };
+        // Opaque output (digest on success, error text on failure) — the frozen
+        // agent.result.output is a string/digest only.
+        let output = match &result {
+            Ok(v) => ctx.value_digest(v),
+            Err(e) => format!("error: {e}"),
+        };
+        ctx.emit(WorkflowEvent::AgentResult {
+            seq: ctx.next_seq(),
+            ts: ctx.ts(),
+            agent: label,
+            output,
+            dur_ms,
+        });
         result
     });
 

@@ -1,0 +1,84 @@
+;; content-pipeline.sema — a dynamic-workflow showcase: Sema generating its OWN
+;; explainer content. Public-safe (the topics are Sema's own features), so it works
+;; for everyone with no private data.
+;;
+;; Shape (the canonical inventory -> generate-each -> verify -> publish pipeline):
+;;   Topics    — a checked-in list of Sema features (deterministic inventory)
+;;   Write     — one LLM leaf per topic, fanned out N-at-a-time (workflow/foreach)
+;;   Verify    — keep only well-formed articles (per-item gate)
+;;   Publish   — write out/<slug>.md, return a {:status …} envelope
+;;
+;; Run it:
+;;   export OPENAI_API_KEY=...           # uses a cheap, fast gpt mini model
+;;   sema workflow run examples/workflows/content-pipeline.sema --run-dir .sema/runs
+;; then watch the run journal in the dashboard:  sema workflow view --run-dir .sema/runs
+;;
+;; The orchestrator (phases, fan-out, verify, publish) is deterministic; only the
+;; write-article LLM leaf is probabilistic — exactly the workflow value proposition.
+
+;; A small, fast model: good enough for short explainers, cheap to run, not garbage.
+(define model {:provider :openai :model "gpt-5.4-mini"})
+
+;; The inventory — Sema's own features. (Made-up showcase content about the language.)
+(define topics
+  (list "tail-call optimization"
+    "NaN-boxed values"
+    "the cooperative async scheduler"
+    "f-strings"
+    "async/pool-map bounded fan-out"
+    "pattern matching with match"))
+
+(define (slug s)
+  (string/replace (string/lower s) " " "-"))
+
+(define (article-prompt topic)
+  (str "Write a concise 120-word explainer for a developer audience about the "
+    "Sema programming language feature: \""
+    topic
+    "\". Sema is a homoiconic "
+    "Lisp with a bytecode VM. Mention the feature name. Plain prose, no headings."))
+
+;; One leaf: a journaled `agent` (so the dashboard shows it as an agent row) that
+;; asks the model for an article and returns {:title :body}. A failure inside here
+;; is caught by workflow/foreach and surfaces as a {:status :failed} slot.
+(define (write-article topic)
+  (workflow/agent topic
+    (fn ()
+      {:title topic
+       :body (llm/complete (article-prompt topic) model)})))
+
+;; A well-formed article: has a non-empty body that actually mentions the feature.
+(define (good-article? a)
+  (and (map? a)
+    (contains? a :body)
+    (not (empty? (:body a)))
+    (string/contains? (string/lower (:body a)) (string/lower (:title a)))))
+
+(defworkflow content-pipeline
+  "Generate + verify short explainer articles about Sema's own features."
+  {:args {} :model "gpt-5.4-mini"}
+
+  (phase "Topics"
+    (checkpoint :topics topics))
+
+  (phase "Write"
+    ;; Fan out: at most 4 model calls in flight at once, results in topic order.
+    (checkpoint :articles
+      (workflow/foreach write-article (checkpoint :topics) 4)))
+
+  (phase "Verify"
+    ;; Per-item gate: keep only the well-formed articles.
+    (checkpoint :verified
+      (filter good-article? (checkpoint :articles))))
+
+  (phase "Publish"
+    (file/mkdir "out")
+    (for-each
+      (fn (a)
+        (file/write (str "out/" (slug (:title a)) ".md")
+          (str "# " (:title a) "\n\n" (:body a) "\n")))
+      (checkpoint :verified)))
+
+  {:status :success
+   :topics (count (checkpoint :topics))
+   :published (count (checkpoint :verified))})
