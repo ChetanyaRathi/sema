@@ -108,8 +108,13 @@ pub const PRELUDE: &str = r#"
 (defmacro with-session (id config . body)
   `(otel/with-session ,id ,config (lambda () ,@body)))
 
-;; defworkflow: define + run a sequential, journaled workflow (Spike 1).
-;; (defworkflow audit-auth "doc" {:args ... :budget ...} (phase "Inventory" ...) ...)
+;; defworkflow: define + run a sequential, journaled workflow.
+;; (defworkflow audit-auth "doc" {:phases [...] :budget {:tokens N :usd N}} (phase ...) ...)
+;; The meta map's `:budget` submap caps spend: `:tokens` (deterministic) and/or `:usd`
+;; (best-effort, pricing-table dependent). Exceeding a cap latches the run and refuses
+;; to launch further `agent` leaves; the run ends {:status :failed :reason "budget
+;; exceeded"}. Under a concurrent fan-out the cap still trips, but per-agent token
+;; accounting is best-effort (the LAST_USAGE thread-local is not swapped per task).
 ;; expands to a (workflow/run name doc meta thunk) call. `name` is a bare symbol that
 ;; becomes a string; `meta` is the metadata map literal, spliced verbatim (like the
 ;; with-span attrs map at :103); the body forms become the run thunk. workflow/run opens

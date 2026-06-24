@@ -94,6 +94,15 @@ fn failed_envelope(msg: &str) -> Value {
     Value::map(m)
 }
 
+/// The envelope for a run that a budget cap stopped. Distinct `:reason` (not `:error`)
+/// because the body itself did not error — the runtime aborted it.
+fn budget_failed_envelope() -> Value {
+    let mut m = BTreeMap::new();
+    m.insert(Value::keyword("status"), Value::keyword("failed"));
+    m.insert(Value::keyword("reason"), Value::string("budget exceeded"));
+    Value::map(m)
+}
+
 pub fn register(env: &sema_core::Env) {
     // (workflow/run name doc meta thunk) — open a run scope, journal start/end, return
     // the {:status ...} envelope. `name`/`doc` are strings; `meta` is the workflow's
@@ -139,12 +148,23 @@ pub fn register(env: &sema_core::Env) {
 
         // Derive the envelope + status, then journal run.ended and write result.json
         // BEFORE the guard drops (so the sink is still open).
-        let (status, envelope) = match &result {
-            Ok(v) => ("success", success_envelope(v.clone())),
-            Err(e) => ("failed", failed_envelope(&e.to_string())),
+        let (mut status, mut envelope, mut reason) = match &result {
+            Ok(v) => ("success", success_envelope(v.clone()), None),
+            Err(e) => (
+                "failed",
+                failed_envelope(&e.to_string()),
+                Some("workflow body returned an error".to_string()),
+            ),
         };
 
         if let Some(ctx) = context::current() {
+            // A tripped budget cap fails the run regardless of the body's own outcome
+            // (the latch, not an Err, is the source of truth — see workflow/agent).
+            if ctx.over_budget() {
+                status = "failed";
+                envelope = budget_failed_envelope();
+                reason = Some("budget exceeded".to_string());
+            }
             // Close the last open marker phase before run.ended (its status mirrors the
             // run: a phase still open when the body errored is itself "failed").
             close_open_phase(&ctx, status);
@@ -152,11 +172,7 @@ pub fn register(env: &sema_core::Env) {
                 seq: ctx.next_seq(),
                 ts: ctx.ts(),
                 status: status.into(),
-                reason: if result.is_ok() {
-                    None
-                } else {
-                    Some("workflow body returned an error".to_string())
-                },
+                reason,
                 dur_ms: ctx.dur_ms(),
             });
             // result.json — the final envelope. Lossy/best-effort; swallow write errors
@@ -215,6 +231,14 @@ pub fn register(env: &sema_core::Env) {
             // Outside a run: transparent — just call the thunk.
             return crate::list::call_function(thunk, &[]);
         };
+        // Budget latch: once a cap is tripped, refuse to launch further leaves. No
+        // events are emitted for a skipped agent — the journal shows only the leaves
+        // that actually ran (the run is forced to :failed by workflow/run). Checking
+        // at ENTRY (not via Err) is what makes the cap hold through `__fanout-tagged`,
+        // which would otherwise swallow a leaf Err into nil.
+        if ctx.over_budget() {
+            return Ok(Value::nil());
+        }
         // Unique per-invocation id (the dashboard correlates started→result→budget
         // by it); the label is the agent_name (role).
         let agent_id = ctx.next_agent_id(&label);
@@ -267,8 +291,11 @@ pub fn register(env: &sema_core::Env) {
                 input_tokens: u.input_tokens,
                 output_tokens: u.output_tokens,
                 cost_usd: u.cost_usd,
-                budget_limit: None,
+                budget_limit: ctx.budget_limit_for_event(),
             });
+            // Charge AFTER the Budget event is journaled, so the leaf that tips the cap
+            // is itself fully recorded; the sticky latch then refuses the NEXT leaf.
+            ctx.charge(u.cost_usd, u.input_tokens + u.output_tokens);
         }
         result
     });

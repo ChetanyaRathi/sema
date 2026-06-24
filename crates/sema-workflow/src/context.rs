@@ -58,8 +58,25 @@ pub struct WorkflowCtx {
     seq: Cell<u64>,
     /// Wall-clock origin for `dur_ms`. Ignored when the fixed-ts seam is active.
     start: Instant,
-    /// Frozen budget map (optional for Spike 1; carried so the contract is stable).
+    /// Frozen budget map (the `:budget` submap of the workflow meta, keyword keys
+    /// flattened to `"usd"`/`"tokens"` strings).
     budget: BTreeMap<String, Value>,
+    /// Parsed spend caps (absent ⇒ that dimension is unenforced). `usd` is best-effort
+    /// (depends on the pricing table); `tokens` is deterministic from usage.
+    cost_limit: Option<f64>,
+    token_limit: Option<u64>,
+    /// Running totals charged from each agent leaf's usage. Single-thread `Cell` is
+    /// sound (the VM + scheduler are cooperative single-thread); under a concurrent
+    /// fan-out the per-leaf attribution is BEST-EFFORT (the `LAST_USAGE` thread-local
+    /// the snapshot reads is not swapped per task), but the cap still trips reliably.
+    cost_spent: Cell<f64>,
+    tokens_spent: Cell<u64>,
+    /// Sticky "a cap was exceeded" latch. Set by [`Self::charge`] once a total passes
+    /// its cap; checked at agent ENTRY (to refuse launching further leaves) and by
+    /// `workflow/run` after the body (to force a `:failed` envelope). A latch — not
+    /// `Err` propagation — because the `__fanout-tagged` engine swallows a leaf `Err`
+    /// into `nil`, so an exception can't stop a concurrent batch.
+    over_budget: Cell<bool>,
     /// `start_seq` of the currently-open phase (the phase.started event's seq), so
     /// checkpoints/agents/budget events can be attributed to their phase.
     cur_phase_seq: Cell<Option<u64>>,
@@ -100,6 +117,14 @@ impl WorkflowCtx {
         args_json: String,
     ) -> Rc<WorkflowCtx> {
         let fixed_ts = std::env::var(FIXED_TS_ENV).ok();
+        // Parse spend caps from the budget submap (tolerate an int usd, e.g. `:usd 2`).
+        let cost_limit = budget
+            .get("usd")
+            .and_then(|v| v.as_float().or_else(|| v.as_int().map(|i| i as f64)));
+        let token_limit = budget
+            .get("tokens")
+            .and_then(|v| v.as_int())
+            .map(|i| i as u64);
         Rc::new(WorkflowCtx {
             run_id,
             journal: Rc::new(RefCell::new(journal)),
@@ -107,6 +132,11 @@ impl WorkflowCtx {
             seq: Cell::new(0),
             start: Instant::now(),
             budget,
+            cost_limit,
+            token_limit,
+            cost_spent: Cell::new(0.0),
+            tokens_spent: Cell::new(0),
+            over_budget: Cell::new(false),
             cur_phase_seq: Cell::new(None),
             cur_phase_label: RefCell::new(None),
             agent_n: RefCell::new(BTreeMap::new()),
@@ -258,6 +288,43 @@ impl WorkflowCtx {
         &self.budget
     }
 
+    /// True when a `:budget` cap (usd and/or tokens) is in force for this run.
+    pub fn has_budget(&self) -> bool {
+        self.cost_limit.is_some() || self.token_limit.is_some()
+    }
+
+    /// The token cap, for the `budget_limit` field of a `Budget` event (typed `u64`).
+    /// `None` for a usd-only budget (the event field is tokens; usd has no slot).
+    pub fn budget_limit_for_event(&self) -> Option<u64> {
+        self.token_limit
+    }
+
+    /// Add one agent leaf's usage to the running totals and, if either cap is now
+    /// exceeded, set the sticky [`Self::over_budget`] latch. Returns `true` once the
+    /// run is over budget. Charge AFTER the leaf's events are journaled, so the leaf
+    /// that tips the cap is itself fully recorded; the NEXT leaf is the one refused.
+    pub fn charge(&self, cost: Option<f64>, tokens: u64) -> bool {
+        if let Some(c) = cost {
+            self.cost_spent.set(self.cost_spent.get() + c);
+        }
+        self.tokens_spent.set(self.tokens_spent.get() + tokens);
+        let over = self
+            .cost_limit
+            .is_some_and(|lim| self.cost_spent.get() > lim)
+            || self
+                .token_limit
+                .is_some_and(|lim| self.tokens_spent.get() > lim);
+        if over {
+            self.over_budget.set(true);
+        }
+        over
+    }
+
+    /// Whether a cap has been exceeded this run (the sticky latch).
+    pub fn over_budget(&self) -> bool {
+        self.over_budget.get()
+    }
+
     /// Best-effort flush of the journal writer (e.g. at `run.ended`).
     pub fn flush(&self) {
         self.journal.borrow_mut().flush();
@@ -307,11 +374,29 @@ pub fn set_workflow_scope(name: &str, doc: &str, meta: &Value) -> io::Result<Wor
         "meta": sema_core::json::value_to_json_lossy(meta),
     });
     let _ = journal.write_metadata(&metadata);
-    // Spike 1 carries an empty budget map (the :budget cap is not enforced yet).
+    // The `:budget` submap of meta becomes the run's enforced spend caps.
     // The CLI sets SEMA_WORKFLOW_ARGS_JSON to the verbatim `--args` string.
     let args_json = std::env::var("SEMA_WORKFLOW_ARGS_JSON").unwrap_or_default();
-    let ctx = WorkflowCtx::new_with_args(run_id, journal, BTreeMap::new(), args_json);
+    let ctx = WorkflowCtx::new_with_args(run_id, journal, parse_budget(meta), args_json);
     Ok(install_scope(ctx))
+}
+
+/// Extract the `:budget` submap from a workflow `meta` map, flattening its keyword
+/// keys (`:usd`, `:tokens`) to the `String` keys [`WorkflowCtx`] parses. Returns an
+/// empty map when there is no (or a malformed) `:budget` — caps stay unenforced, never
+/// a panic.
+pub fn parse_budget(meta: &Value) -> BTreeMap<String, Value> {
+    let mut out = BTreeMap::new();
+    if let Some(m) = meta.as_map_rc() {
+        if let Some(b) = m.get(&Value::keyword("budget")).and_then(|v| v.as_map_rc()) {
+            for (k, v) in b.iter() {
+                if let Some(name) = k.as_keyword() {
+                    out.insert(name, v.clone());
+                }
+            }
+        }
+    }
+    out
 }
 
 /// Resolve the run-directory base: the `SEMA_WORKFLOW_RUN_DIR` seam (set by the CLI
@@ -391,6 +476,59 @@ mod tests {
         assert_eq!(ctx.ts(), "1970-01-01T00:00:00Z");
         assert_eq!(ctx.dur_ms(), 0);
         std::env::remove_var(FIXED_TS_ENV);
+    }
+
+    fn ctx_with_budget(pairs: &[(&str, Value)]) -> Rc<WorkflowCtx> {
+        let mut b = BTreeMap::new();
+        for (k, v) in pairs {
+            b.insert(k.to_string(), v.clone());
+        }
+        WorkflowCtx::new_with_args("wf_t".into(), Journal::null(), b, String::new())
+    }
+
+    #[test]
+    fn charge_trips_usd_cap_and_latches() {
+        let ctx = ctx_with_budget(&[("usd", Value::float(0.01))]);
+        assert!(!ctx.charge(Some(0.005), 10), "under cap must not trip");
+        assert!(!ctx.over_budget());
+        assert!(ctx.charge(Some(0.02), 100), "crossing cap trips");
+        assert!(ctx.over_budget(), "latch is sticky");
+        // Once latched, it stays latched even on a tiny later charge.
+        let _ = ctx.charge(Some(0.0), 0);
+        assert!(ctx.over_budget());
+    }
+
+    #[test]
+    fn charge_enforces_tokens_when_cost_unknown() {
+        let ctx = ctx_with_budget(&[("tokens", Value::int(50))]);
+        assert!(!ctx.charge(None, 40), "cost None still counts tokens");
+        assert!(!ctx.over_budget());
+        assert!(ctx.charge(None, 20), "60 > 50 trips on tokens alone");
+        assert!(ctx.over_budget());
+        assert_eq!(ctx.budget_limit_for_event(), Some(50));
+    }
+
+    #[test]
+    fn no_budget_never_trips() {
+        let ctx = WorkflowCtx::new("wf_t".into(), Journal::null(), BTreeMap::new());
+        assert!(!ctx.has_budget());
+        assert!(!ctx.charge(Some(9999.0), 9_999_999));
+        assert!(!ctx.over_budget());
+        assert_eq!(ctx.budget_limit_for_event(), None);
+    }
+
+    #[test]
+    fn parse_budget_extracts_caps_and_tolerates_absence() {
+        let mut bm = BTreeMap::new();
+        bm.insert(Value::keyword("usd"), Value::float(2.5));
+        bm.insert(Value::keyword("tokens"), Value::int(1000));
+        let mut meta = BTreeMap::new();
+        meta.insert(Value::keyword("budget"), Value::map(bm));
+        let parsed = parse_budget(&Value::map(meta));
+        assert_eq!(parsed.get("usd").and_then(|v| v.as_float()), Some(2.5));
+        assert_eq!(parsed.get("tokens").and_then(|v| v.as_int()), Some(1000));
+        // No :budget at all → empty (unenforced).
+        assert!(parse_budget(&Value::map(BTreeMap::new())).is_empty());
     }
 
     #[test]
