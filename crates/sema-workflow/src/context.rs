@@ -58,9 +58,6 @@ pub struct WorkflowCtx {
     seq: Cell<u64>,
     /// Wall-clock origin for `dur_ms`. Ignored when the fixed-ts seam is active.
     start: Instant,
-    /// Frozen budget map (the `:budget` submap of the workflow meta, keyword keys
-    /// flattened to `"usd"`/`"tokens"` strings).
-    budget: BTreeMap<String, Value>,
     /// Parsed spend caps (absent ⇒ that dimension is unenforced). `usd` is best-effort
     /// (depends on the pricing table); `tokens` is deterministic from usage.
     cost_limit: Option<f64>,
@@ -132,9 +129,11 @@ impl WorkflowCtx {
         let cost_limit = budget
             .get("usd")
             .and_then(|v| v.as_float().or_else(|| v.as_int().map(|i| i as f64)));
+        // Tolerate an int OR a float token cap (`:tokens 5` or `:tokens 5.0`), so a
+        // float never silently drops the cap.
         let token_limit = budget
             .get("tokens")
-            .and_then(|v| v.as_int())
+            .and_then(|v| v.as_int().or_else(|| v.as_float().map(|f| f as i64)))
             .map(|i| i as u64);
         Rc::new(WorkflowCtx {
             run_id,
@@ -142,7 +141,6 @@ impl WorkflowCtx {
             state: Rc::new(RefCell::new(BTreeMap::new())),
             seq: Cell::new(0),
             start: Instant::now(),
-            budget,
             cost_limit,
             token_limit,
             cost_spent: Cell::new(0.0),
@@ -262,29 +260,19 @@ impl WorkflowCtx {
     }
 
     /// Store a checkpoint / run-state value under `key`, replacing any prior value.
-    pub fn checkpoint_set(&self, key: &str, val: Value) {
+    pub fn store_checkpoint(&self, key: &str, val: Value) {
         self.state.borrow_mut().insert(key.to_string(), val);
     }
 
     /// Read a checkpoint / run-state value. `None` if the key was never set in this run.
-    pub fn checkpoint_get(&self, key: &str) -> Option<Value> {
+    pub fn read_checkpoint(&self, key: &str) -> Option<Value> {
         self.state.borrow().get(key).cloned()
     }
 
-    /// Builtin-facing alias of [`Self::checkpoint_set`].
-    pub fn store_checkpoint(&self, key: &str, val: Value) {
-        self.checkpoint_set(key, val);
-    }
-
-    /// Builtin-facing alias of [`Self::checkpoint_get`].
-    pub fn read_checkpoint(&self, key: &str) -> Option<Value> {
-        self.checkpoint_get(key)
-    }
-
     /// Opaque, lossy digest of a checkpoint value for the event stream: the md5 hex
-    /// of the value's lossy-JSON encoding. Lossy is acceptable in Spike 1 (the digest
-    /// is for journal compactness/diffing, not resume — that's Spike 4's canonical
-    /// encoder). Stable for a given value within a process.
+    /// of the value's lossy-JSON encoding. The digest is for journal compactness and
+    /// diffing — NOT resume identity (resume keys on the input-derived content-key and
+    /// stores the real value in `memo/`, round-trip-guarded). Stable within a process.
     pub fn value_digest(&self, v: &Value) -> String {
         let json = sema_core::json::value_to_json_lossy(v);
         let bytes = serde_json::to_vec(&json).unwrap_or_default();
@@ -296,11 +284,6 @@ impl WorkflowCtx {
     pub fn write_result(&self, envelope: &Value) {
         let json = sema_core::json::value_to_json_lossy(envelope);
         let _ = self.journal.borrow().write_result(&json);
-    }
-
-    /// The frozen budget map for this run (empty when none was supplied).
-    pub fn budget(&self) -> &BTreeMap<String, Value> {
-        &self.budget
     }
 
     /// True when a `:budget` cap (usd and/or tokens) is in force for this run.
@@ -452,8 +435,9 @@ pub fn install_scope(ctx: Rc<WorkflowCtx>) -> WorkflowGuard {
 /// scope, and return the guard. The journal-open error propagates so the runtime can
 /// fail the run cleanly (per-event writes below are best-effort).
 ///
-/// `meta` is the workflow's metadata map (`{:args … :budget … :perms …}`); Spike 1
-/// records it into `metadata.json` but does not enforce `:budget`/`:perms`.
+/// `meta` is the workflow's metadata map (`{:phases … :budget … :args …}`); it is
+/// recorded into `metadata.json`, and `:budget` is parsed into the run's spend caps
+/// (`:perms` is not yet enforced).
 pub fn set_workflow_scope(name: &str, doc: &str, meta: &Value) -> io::Result<WorkflowGuard> {
     let run_id = resolve_run_id();
     let runs_root = resolve_runs_root();
@@ -714,9 +698,9 @@ mod tests {
     #[test]
     fn checkpoint_round_trips() {
         let ctx = WorkflowCtx::new("wf_t".into(), Journal::null(), BTreeMap::new());
-        assert_eq!(ctx.checkpoint_get("files"), None);
-        ctx.checkpoint_set("files", Value::int(3));
-        assert_eq!(ctx.checkpoint_get("files"), Some(Value::int(3)));
+        assert_eq!(ctx.read_checkpoint("files"), None);
+        ctx.store_checkpoint("files", Value::int(3));
+        assert_eq!(ctx.read_checkpoint("files"), Some(Value::int(3)));
     }
 
     #[test]

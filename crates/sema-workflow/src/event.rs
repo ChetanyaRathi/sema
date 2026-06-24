@@ -34,9 +34,9 @@ pub enum WorkflowEvent {
         workflow: String,
         /// Run identity (the `<run-id>` directory name).
         run_id: String,
-        /// Per-workflow-form code-version hash (Spike 4 contract — recorded now so
-        /// the frozen metadata need not be re-opened later). Empty if the caller has
-        /// no hash yet.
+        /// Per-run code-version hash (a source hash, folded into resume content-keys so
+        /// an edited workflow re-runs). Currently emitted empty here — the live value is
+        /// carried via the `SEMA_WORKFLOW_CODE_VERSION` seam + `metadata.json`.
         #[serde(default, skip_serializing_if = "String::is_empty")]
         code_version: String,
         /// The run's `--args` input as a JSON string (the dashboard shows it on the

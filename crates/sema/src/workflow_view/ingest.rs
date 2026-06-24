@@ -1,4 +1,4 @@
-//! SQLite cross-run projection of the JSONL journals (track #2, slice S4).
+//! SQLite cross-run projection of the JSONL journals.
 //!
 //! "Store everything by default so the dashboard can show useful things." The frozen
 //! `events.jsonl` is the system of record; this module replays it into a queryable
@@ -82,8 +82,10 @@ pub fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
             input_tokens INTEGER, output_tokens INTEGER, cost_usd REAL, -- nullable!
             PRIMARY KEY (run_id, seg, seq)
         );
+        -- One cursor per journal FILE (key = run_id for the primary, run_id::resume-n
+        -- for a segment), so each file resumes from its own byte offset.
         CREATE TABLE IF NOT EXISTS ingest_cursor (
-            run_id TEXT PRIMARY KEY, byte_offset INTEGER, started_ts TEXT
+            cursor_key TEXT PRIMARY KEY, byte_offset INTEGER
         );
         "#,
     )
@@ -139,7 +141,7 @@ fn sync_file(
 
     let mut offset: i64 = conn
         .query_row(
-            "SELECT byte_offset FROM ingest_cursor WHERE run_id=?1",
+            "SELECT byte_offset FROM ingest_cursor WHERE cursor_key=?1",
             params![cursor_key],
             |r| r.get(0),
         )
@@ -176,8 +178,8 @@ fn sync_file(
     }
     let new_offset = offset + complete.len() as i64;
     tx.execute(
-        "INSERT INTO ingest_cursor(run_id,byte_offset) VALUES(?1,?2)
-         ON CONFLICT(run_id) DO UPDATE SET byte_offset=?2",
+        "INSERT INTO ingest_cursor(cursor_key,byte_offset) VALUES(?1,?2)
+         ON CONFLICT(cursor_key) DO UPDATE SET byte_offset=?2",
         params![cursor_key, new_offset],
     )?;
     tx.commit()?;
@@ -219,10 +221,13 @@ fn project_event(
     match e.get("event").and_then(|v| v.as_str()).unwrap_or("") {
         "run.started" => {
             conn.execute(
+                // A resume re-emits run.started with a fresh ts; keep the ORIGINAL
+                // started_ts (don't overwrite it) so the run's start time and the
+                // time-ordered runs list stay stable across resumes.
                 "INSERT INTO runs(run_id,embedded_run_id,workflow,code_version,started_ts,args_json)
                  VALUES(?1,?2,?3,?4,?5,?6)
                  ON CONFLICT(run_id) DO UPDATE SET
-                   embedded_run_id=?2, workflow=?3, code_version=?4, started_ts=?5, args_json=?6",
+                   embedded_run_id=?2, workflow=?3, code_version=?4, args_json=?6",
                 params![
                     run_id,
                     s(e, "run_id"),

@@ -1,14 +1,15 @@
-//! Sema dynamic-workflow runtime — Spike 1: a SEQUENTIAL, in-process runtime that
-//! journals a frozen JSONL run-directory and returns a discriminated-union
-//! `{:status …}` envelope.
+//! Sema dynamic-workflow runtime: an in-process runtime that journals a frozen JSONL
+//! run-directory and returns a discriminated-union `{:status …}` envelope.
 //!
-//! Scope (Spike 1): no parallel, no resume, no canonical hashing, no subprocess,
-//! no daemon. The run directory is the stable public contract (treat like the
-//! `.semac` bytecode format) — its layout and event vocabulary are FROZEN.
+//! The body runs sequentially; leaves fan out with bounded concurrency (`parallel` /
+//! `pipeline`). `--resume` short-circuits any agent/checkpoint leaf already recorded in
+//! the run's `memo/` sidecar dir. The run directory is the stable public contract (treat
+//! like the `.semac` bytecode format) — its layout and event vocabulary are FROZEN
+//! (append-only Option/skippable fields only).
 //!
 //! This crate is a leaf: it depends only on `sema-core` + `sema-otel` + serde.
 //! The builtins that invoke Sema thunks (`workflow/run`, `workflow/phase`,
-//! `checkpoint`) live in `sema-stdlib`, which depends on this crate for the types.
+//! `checkpoint`, `workflow/agent`) live in `sema-stdlib`, which depends on this crate.
 
 pub mod context;
 pub mod event;

@@ -1,19 +1,22 @@
-//! Sema-level dynamic-workflow surface (Spike 1: sequential runtime + frozen journal).
+//! Sema-level dynamic-workflow surface: the builtins backing the workflow DSL.
 //!
-//! Three builtins, all thin wrappers over `sema_workflow` that dispatch a thunk back
-//! into the SAME VM via `crate::list::call_function` (the `otel/with-session` idiom):
+//! Thin wrappers over `sema_workflow` that dispatch Sema thunks back into the SAME VM
+//! via `crate::list::call_function` (the `otel/with-session` idiom):
 //!
 //! - `(workflow/run name doc meta thunk)` — opens a `WorkflowCtx` (journal sink under
-//!   `./.sema/runs/<run-id>/`), emits `run.started`, runs the body thunk, emits
-//!   `run.ended` with status derived from Ok/Err, writes `result.json`, and returns a
-//!   discriminated-union `{:status ...}` envelope value.
-//! - `(workflow/phase label thunk)` — emits `phase.started`, runs the thunk, then emits
-//!   `phase.ended` BEFORE propagating Ok OR Err (the emit is ordered before the Err
-//!   short-circuit; the Drop guard covers the rare panic case).
-//! - `(checkpoint :k v)` records and returns `v` (emitting a `checkpoint` event);
-//!   `(checkpoint :k)` reads the previously-stored value.
+//!   `./.sema/runs/<run-id>/`), emits `run.started`, runs the body thunk, closes the
+//!   open phase, emits `run.ended`, writes `result.json`, and returns the
+//!   discriminated-union `{:status …}` envelope (forced to `:failed` if a budget cap
+//!   tripped).
+//! - `(workflow/phase label)` — a MARKER: closes the previously-open phase and opens
+//!   `label` (the checkpoints/agents that follow attribute to it).
+//! - `(workflow/agent opts thunk)` — runs a leaf as a journaled agent (started/result
+//!   + per-agent budget), with the resume short-circuit and budget latch at its entry.
+//! - `(workflow/tool-call name [args])` — journals a tool call by the current agent.
+//! - `(checkpoint :k v)` records+returns `v` (emitting a `checkpoint` event);
+//!   `(checkpoint :k)` reads it back.
 //!
-//! The macros `defworkflow`/`phase` (prelude) expand to these — see
+//! The macros `defworkflow`/`phase`/`agent` (prelude) expand to these — see
 //! `crates/sema-eval/src/prelude.rs`.
 
 use sema_core::{SemaError, Value};
@@ -144,7 +147,7 @@ pub fn register(env: &sema_core::Env) {
             .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?
             .to_string();
         // doc (args[1]) and meta (args[2]) are carried for the journal/metadata.json but
-        // not otherwise interpreted in Spike 1; tolerate any shape.
+        // recorded into the journal/metadata.json; tolerate any shape.
         let doc = args[1].as_str().unwrap_or("").to_string();
         let meta = args[2].clone();
         let thunk = &args[3];
