@@ -108,6 +108,25 @@ pub const PRELUDE: &str = r#"
 (defmacro with-session (id config . body)
   `(otel/with-session ,id ,config (lambda () ,@body)))
 
+;; defworkflow: define + run a sequential, journaled workflow (Spike 1).
+;; (defworkflow audit-auth "doc" {:args ... :budget ...} (phase "Inventory" ...) ...)
+;; expands to a (workflow/run name doc meta thunk) call. `name` is a bare symbol that
+;; becomes a string; `meta` is the metadata map literal, spliced verbatim (like the
+;; with-span attrs map at :103); the body forms become the run thunk. workflow/run opens
+;; the journal sink under ./.sema/runs/<run-id>/, emits run.started/run.ended, writes
+;; result.json, and returns the {:status :success :value ...} / {:status :failed ...}
+;; envelope. Keeping defworkflow a macro leaves the VM untouched (deftool/defagent are
+;; special forms, but this matches the ->/when-let prelude family).
+(defmacro defworkflow (name doc meta . body)
+  `(workflow/run (symbol->string (quote ,name)) ,doc ,meta (lambda () ,@body)))
+
+;; phase: a journaled, labeled scope inside a workflow body — not control flow.
+;; (phase "Inventory" (checkpoint :files (inventory ...))) emits phase.started/phase.ended
+;; around the body and returns the body's last value unchanged (phase.ended is journaled
+;; even when the body throws).
+(defmacro phase (label . body)
+  `(workflow/phase ,label (lambda () ,@body)))
+
 ;; llm/embed is a SINGLE first-class native function (crates/sema-llm/src/
 ;; builtins.rs) that branches internally on `in_async_context()`: synchronous
 ;; inline outside a scheduler task, offloaded+overlapping inside one. Keeping it a

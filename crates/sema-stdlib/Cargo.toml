@@ -30,6 +30,7 @@ glob.workspace = true
 toml.workspace = true
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+sema-workflow.workspace = true
 tokio.workspace = true
 reqwest.workspace = true
 hostname.workspace = true

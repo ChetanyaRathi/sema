@@ -3252,6 +3252,7 @@ dependencies = [
  "sema-core",
  "sema-otel",
  "sema-reader",
+ "sema-workflow",
  "serde_json",
  "serialport",
  "sha2",
@@ -3288,6 +3289,17 @@ dependencies = [
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-sys",
+]
+
+[[package]]
+name = "sema-workflow"
+version = "1.27.1"
+dependencies = [
+ "md5",
+ "sema-core",
+ "sema-otel",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
