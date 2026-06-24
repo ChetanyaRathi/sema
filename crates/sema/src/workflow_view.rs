@@ -33,11 +33,8 @@ pub async fn serve(run_dir: PathBuf, host: &str, port: u16) {
             std::process::exit(1);
         }
     };
-    println!(
-        "Sema workflow viewer on http://{addr}  (run dir: {})",
-        run_dir.display()
-    );
-    println!("  loopback + no auth — a local developer tool; Ctrl-C to stop.");
+    println!("Sema workflow viewer:  http://{addr}");
+    println!("  runs: {}", run_dir.display());
     loop {
         match listener.accept().await {
             Ok((stream, _)) => {

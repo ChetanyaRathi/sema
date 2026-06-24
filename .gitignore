@@ -71,3 +71,8 @@ mutants.out.old/
 
 # Dynamic-workflow run journals (project-local)
 .sema/
+
+# workflow-view e2e (Playwright)
+crates/sema/tests/e2e-workflow-view/node_modules/
+crates/sema/tests/e2e-workflow-view/test-results/
+crates/sema/tests/e2e-workflow-view/playwright-report/

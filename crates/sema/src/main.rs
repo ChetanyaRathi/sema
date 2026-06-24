@@ -290,7 +290,7 @@ enum Commands {
         #[command(subcommand)]
         command: NotebookCommands,
     },
-    /// Dynamic workflows — run a sequential, journaled workflow (Spike 1)
+    /// Dynamic workflows — run journaled workflows and view their runs
     Workflow {
         #[command(subcommand)]
         command: WorkflowCommands,
@@ -430,8 +430,7 @@ enum WorkflowCommands {
         #[arg(long, default_value = ".sema/runs")]
         run_dir: String,
     },
-    /// Open the read-only web viewer over a run directory's journals (loopback,
-    /// no auth — a local developer tool).
+    /// Open the web viewer for a run directory's workflow journals
     View {
         /// Base directory holding `<run-id>/events.jsonl` run journals.
         #[arg(long, default_value = ".sema/runs")]
