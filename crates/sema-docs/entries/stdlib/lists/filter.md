@@ -6,7 +6,7 @@ params: [{ name: pred, type: function }, { name: seq, type: list }]
 returns: "list"
 ---
 
-Return a new list containing only the elements for which `pred` returns truthy; order is preserved and the input is untouched.
+Return a new list containing only the elements that **satisfy** `pred` (those for which it returns truthy); order is preserved and the input is untouched.
 
 ```sema
 (filter even? '(1 2 3 4 5))            ; => (2 4)
