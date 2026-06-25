@@ -134,10 +134,9 @@ pub(crate) fn semantic_token_legend() -> SemanticTokensLegend {
             SemanticTokenType::PARAMETER,
             SemanticTokenType::MACRO,
         ],
-        token_modifiers: vec![
-            SemanticTokenModifier::DEFAULT_LIBRARY,
-            SemanticTokenModifier::DEFINITION,
-        ],
+        // Only DEFAULT_LIBRARY is emitted (semantic_tokens.rs); don't advertise a
+        // modifier the server never sets.
+        token_modifiers: vec![SemanticTokenModifier::DEFAULT_LIBRARY],
     }
 }
 

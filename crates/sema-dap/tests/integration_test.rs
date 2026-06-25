@@ -1608,3 +1608,59 @@ fn test_dap_step_in_descends_into_callee() {
     let _ = child.wait();
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn test_dap_stop_on_entry_pauses_before_running() {
+    // stopOnEntry is wired but was untested — a regression would silently never pause at
+    // entry. Launch with no breakpoints + stopOnEntry:true → a stopped event must arrive
+    // before terminated; continue then runs to completion.
+    let dir = unique_temp_dir("entry");
+    let p = dir.join("p.sema");
+    std::fs::write(&p, "(+ 1 2)\n").unwrap();
+
+    let mut child = Command::new(sema_binary())
+        .arg("dap")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut reader = BufReader::new(child.stdout.take().unwrap());
+
+    send_dap(&mut stdin, 1, "initialize", Some(serde_json::json!({})));
+    read_dap(&mut reader).unwrap();
+    read_dap(&mut reader).unwrap();
+    send_dap(
+        &mut stdin,
+        2,
+        "launch",
+        Some(serde_json::json!({
+        "program": p.to_string_lossy(), "stopOnEntry": true })),
+    );
+    // The launch response must correlate to its request seq.
+    let resp = read_dap(&mut reader).unwrap();
+    assert_eq!(resp["command"], "launch");
+    assert_eq!(
+        resp["request_seq"], 2,
+        "response must correlate to the request seq"
+    );
+    send_dap(&mut stdin, 3, "configurationDone", None);
+    read_dap(&mut reader).unwrap();
+
+    assert!(
+        wait_for_event(&mut reader, "stopped", 50),
+        "stopOnEntry must pause at entry"
+    );
+
+    send_dap(&mut stdin, 4, "continue", Some(serde_json::json!({})));
+    read_dap(&mut reader).unwrap();
+    assert!(
+        wait_for_event(&mut reader, "terminated", 50),
+        "continue runs to completion"
+    );
+
+    send_dap(&mut stdin, 5, "disconnect", None);
+    let _ = child.wait();
+    let _ = std::fs::remove_dir_all(&dir);
+}
