@@ -43,7 +43,7 @@ import CustomPageLayout from './CustomPageLayout.vue'
 
         <div class="pipeline">
           <div class="pipe-stage">
-            <div class="pipe-icon"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="8" y1="13" x2="16" y2="13"/><line x1="8" y1="17" x2="13" y2="17"/></svg></div>
+            <div class="pipe-icon"><svg width="22" height="22" viewBox="0 0 16 16" fill="none"><text x="8" y="11.5" text-anchor="middle" font-family="'JetBrains Mono', monospace" font-weight="700" font-size="9" fill="currentColor"><tspan fill="#c8a855" fill-opacity="0.65">(</tspan>s<tspan fill="#c8a855" fill-opacity="0.65">)</tspan></text></svg></div>
             <div class="pipe-name">.sema source</div>
             <div class="pipe-desc">Your script + imports</div>
           </div>
