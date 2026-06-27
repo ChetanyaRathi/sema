@@ -1,6 +1,8 @@
 use nu_ansi_term::{Color, Style};
 use reedline::{DefaultHinter, Hinter, History};
 
+use crate::colors::TERTIARY as TERTIARY_RGB;
+
 use super::completer::{collect_completions, COMPLETER_ENV};
 
 /// Two-tier ghost-text hinter.
@@ -21,7 +23,7 @@ pub struct SemaHinter {
 
 impl SemaHinter {
     pub fn new() -> Self {
-        let style = Style::new().fg(Color::DarkGray);
+        let style = Style::new().fg(Color::Rgb(TERTIARY_RGB.0, TERTIARY_RGB.1, TERTIARY_RGB.2));
         Self {
             inner: DefaultHinter::default().with_style(style),
             style,

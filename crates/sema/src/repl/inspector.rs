@@ -15,6 +15,18 @@ use std::io::{self, Stdout, Write};
 use crossterm::cursor::{Hide, MoveTo, Show};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::style::{Color as CtColor, Print, ResetColor, SetForegroundColor};
+
+// Sema brand palette from `crates/sema/src/colors.rs`.
+const GOLD: CtColor = CtColor::Rgb {
+    r: 200,
+    g: 168,
+    b: 85,
+};
+const TERTIARY: CtColor = CtColor::Rgb {
+    r: 107,
+    g: 99,
+    b: 84,
+};
 use crossterm::terminal::{
     self, disable_raw_mode, enable_raw_mode, Clear, ClearType, EnterAlternateScreen,
     LeaveAlternateScreen,
@@ -184,7 +196,7 @@ fn render(
     // Title bar.
     queue!(
         stdout,
-        SetForegroundColor(CtColor::Cyan),
+        SetForegroundColor(GOLD),
         Print(format!("Inspector — {label}")),
         ResetColor,
     )?;
@@ -219,7 +231,7 @@ fn render(
         queue!(
             stdout,
             MoveTo(0, row),
-            SetForegroundColor(CtColor::DarkGrey),
+            SetForegroundColor(TERTIARY),
             Print("(leaf — no children)"),
             ResetColor,
         )?;
@@ -253,7 +265,7 @@ fn render(
             queue!(
                 stdout,
                 MoveTo(0, row),
-                SetForegroundColor(CtColor::DarkGrey),
+                SetForegroundColor(TERTIARY),
                 Print(format!("  ... {remaining} more")),
                 ResetColor,
             )?;
@@ -265,7 +277,7 @@ fn render(
     queue!(
         stdout,
         MoveTo(0, help_row),
-        SetForegroundColor(CtColor::DarkGrey),
+        SetForegroundColor(TERTIARY),
         Print("[↑/↓] move  [→/Enter] descend  [←/Esc] back  [q] quit"),
         ResetColor,
     )?;

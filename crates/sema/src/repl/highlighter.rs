@@ -4,6 +4,14 @@ use sema_core::SemaError;
 use sema_eval::SPECIAL_FORM_NAMES;
 use sema_reader::lexer::{tokenize, SpannedToken, Token};
 
+// Sema brand palette from `crates/sema/src/colors.rs` / `website/.vitepress/theme/BrandGuide.vue`.
+const GOLD: Color = Color::Rgb(200, 168, 85);
+const SAGE: Color = Color::Rgb(168, 196, 122);
+const AMBER: Color = Color::Rgb(209, 154, 102);
+const TEAL: Color = Color::Rgb(122, 172, 184);
+const TERTIARY: Color = Color::Rgb(107, 99, 84);
+const SECONDARY: Color = Color::Rgb(150, 140, 121);
+
 /// Lexer-driven syntax highlighter for the Sema REPL input line.
 ///
 /// The implementation is intentionally tolerant of half-typed input:
@@ -72,22 +80,22 @@ fn style_for(token: &Token, idx: usize, match_a: Option<usize>, match_b: Option<
     let is_match_partner = Some(idx) == match_a || Some(idx) == match_b;
 
     let base = match token {
-        Token::String(_) | Token::FString(_) | Token::Char(_) => Style::new().fg(Color::Green),
-        Token::Regex(_) => Style::new().fg(Color::Magenta),
-        Token::Int(_) | Token::Float(_) | Token::Bool(_) => Style::new().fg(Color::Yellow),
-        Token::Keyword(_) => Style::new().fg(Color::Cyan),
-        Token::Comment(_) => Style::new().dimmed(),
+        Token::String(_) | Token::FString(_) | Token::Char(_) => Style::new().fg(SAGE),
+        Token::Regex(_) => Style::new().fg(SECONDARY),
+        Token::Int(_) | Token::Float(_) | Token::Bool(_) => Style::new().fg(AMBER),
+        Token::Keyword(_) => Style::new().fg(TEAL),
+        Token::Comment(_) => Style::new().fg(TERTIARY),
         Token::Symbol(name) => {
             if SPECIAL_FORM_NAMES.contains(&name.as_str()) {
-                Style::new().fg(Color::Blue).bold()
+                Style::new().fg(GOLD).bold()
             } else {
                 Style::default()
             }
         }
         Token::Quote | Token::Quasiquote | Token::Unquote | Token::UnquoteSplice | Token::Dot => {
-            Style::new().dimmed()
+            Style::new().fg(TERTIARY)
         }
-        Token::ShortLambdaStart | Token::BytevectorStart => Style::new().fg(Color::Magenta),
+        Token::ShortLambdaStart | Token::BytevectorStart => Style::new().fg(GOLD),
         Token::LParen
         | Token::RParen
         | Token::LBracket
