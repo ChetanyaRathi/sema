@@ -686,7 +686,17 @@
     font-weight: 300;
     letter-spacing: 0.06em;
     color: var(--text-bright);
+    margin-bottom: 1rem;
+  }
+  .loading-joke {
+    font-family: var(--mono);
+    font-size: 0.85rem;
+    color: var(--text-dim);
+    max-width: 380px;
+    text-align: center;
+    line-height: 1.5;
     margin-bottom: 1.5rem;
+    padding: 0 1rem;
   }
   .loading-dots {
     display: flex;

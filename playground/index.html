@@ -30,6 +30,7 @@
 
 <div class="loading-overlay" id="loading">
   <div class="loading-title">Sema</div>
+  <div class="loading-joke" id="loading-joke"></div>
   <div class="loading-dots"><span></span><span></span><span></span></div>
 </div>
 
@@ -129,6 +130,35 @@
 <div class="status-bar">
   <span class="status-text status-loading" id="status" data-testid="status">Loading WASM module…</span>
 </div>
+
+<script>
+(function() {
+  var jokes = [
+    "Why did the Lisper quit? They lost their CAR.",
+    "(defun life () (life)) — recursion is its own reward.",
+    "In Lisp, the code is data. The data is code. Schrödinger called.",
+    "A Lisper walks into a bar. (cons 'beer nil)",
+    "How many Sema programmers does it take to change a lightbulb? (step \"change the lightbulb\" {:tools [screwdriver]})",
+    "cdr-cdr-cdr-cdr… congratulations, you've invented the array.",
+    "It's not a bug, it's a macro.",
+    "(quote (wisdom)) — sometimes the best code is the code you didn't eval.",
+    "Tail calls don't grow the stack. They grow your confidence.",
+    "A closure walks into a bar. The bartender says, 'you're captured.'",
+    "Why don't Lisps use semicolons? Because comments start with ;; and jokes end with ).",
+    "(let ((x 42)) x) — the meaning of life, lexically scoped.",
+    "NaN-boxing: because 64 bits should be enough for anybody.",
+    "Garbage collection: the only time throwing things away is productive.",
+    "(define (identity x) x) — the function that peaked in kindergarten.",
+    "S-expressions: because XML was a mistake.",
+    "You can't spell 'Lisp' without 'AI' — wait, yes you can. But you shouldn't.",
+    "The best thing about macros? You'll never know if the bug is in your code or the expansion.",
+    "(if (tired) (sleep) (code)) — a perfect branch, always taken.",
+    "nil is not nothing. nil is a choice."
+  ];
+  var el = document.getElementById('loading-joke');
+  if (el) el.textContent = jokes[Math.floor(Math.random() * jokes.length)];
+})();
+</script>
 
 <script type="module" src="dist/app.js"></script>
 </body>
