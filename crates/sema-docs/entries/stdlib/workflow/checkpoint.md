@@ -17,4 +17,4 @@ nested inside it):
 (count (checkpoint :files))                          ; read back => 3
 ```
 
-See also: `workflow/run`, `workflow/phase`.
+See also: `workflow/checkpoint`, `workflow/run`, `workflow/phase`.

@@ -1,5 +1,41 @@
 # Changelog
 
+## 1.28.1
+
+### Fixed
+
+- **Dynamic workflow resume is safer.** Checkpoint writes now resume lazily:
+  when a checkpoint memo exists, `(checkpoint :key expr)` returns the stored
+  value without evaluating `expr` again. Checkpoint journal events also carry
+  the resume `content_key`, so checkpoint memo files can be inspected and
+  invalidated with the same model as agent leaves.
+- **Workflow memo keys now include workflow source and `--args`.** Editing the
+  workflow or changing run arguments invalidates stale memo hits automatically,
+  while unchanged leaves still resume per-leaf.
+- **Workflow-declared sandbox permissions are enforced.** `defworkflow`
+  metadata can declare `:permissions` using the same syntax as `--sandbox`
+  (`strict`, `all`, `none`, or comma-separated denial capabilities such as
+  `no-fs-write,no-network`). Workflow permissions can only tighten the
+  caller's sandbox; they cannot loosen a stricter CLI sandbox or
+  `--allowed-paths` setting.
+- **Crates.io publish order includes `sema-workflow`.** The publish workflow
+  now publishes the workflow runtime crate before crates that depend on it.
+
+### Docs and Website
+
+- **Workflow documentation caught up with the runtime.** The workflow guide,
+  agent-facing docs, CLI sandbox reference, builtin docs, changelog, and
+  deferred notes now document `:permissions`, checkpoint resume behavior,
+  memo invalidation, and the complete workflow permission list. The abbreviated
+  `:perms` metadata spelling is not documented or accepted.
+- **Website rendering fixes.** The notebook feature page has more stable
+  shortcut layout, the website logo color is fixed, and generated Open Graph
+  images are deterministic by using vendored fonts and blocking external font
+  requests during generation.
+- **Docs/site maintenance.** Architecture docs now include the `sema-workflow`
+  crate, the workflow docs have an Open Graph image, and the playground loading
+  screen has a small rotating Lisp-joke set.
+
 ## 1.28.0
 
 ### Added
@@ -35,12 +71,8 @@
   `parallel` / `pipeline` — a journaled, resumable agentic-workflow runtime.
   Define multi-phase LLM workflows as ordinary Sema code; the runtime journals
   every event to a frozen JSONL run directory (`.sema/runs/<run-id>/`), enforces
-  budget caps (`:tokens` / `:usd`), enforces workflow-declared sandbox
-  restrictions via `:permissions`, and supports `--resume` via content-keyed
-  memo sidecars. Resume keys include the workflow source hash and `--args`, so
-  edits or changed inputs rerun affected leaves instead of replaying stale
-  values. Memoized checkpoints return before evaluating their write expression.
-  `sema workflow run` / `view` / `index` / `check` CLI commands.
+  budget caps (`:tokens` / `:usd`), and supports `--resume` via content-keyed
+  memo sidecars. `sema workflow run` / `view` / `index` / `check` CLI commands.
   A web viewer (`sema workflow view`) renders live runs with a SQLite cross-run
   index. `sema workflow check` statically validates workflow files without
   evaluating them — catches arity traps and layout issues before a run.
