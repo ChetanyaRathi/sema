@@ -36,41 +36,6 @@ import CustomPageLayout from './CustomPageLayout.vue'
       </div>
     </header>
 
-    <!-- ============ AT A GLANCE ============ -->
-    <section class="glance">
-      <div class="wrap">
-        <p class="kicker">At a glance</p>
-        <h2>The facts, in one screen.</h2>
-
-        <div class="glance-grid">
-          <div class="glance-card">
-            <div class="glance-label">Paradigm</div>
-            <div class="glance-value">Scheme-like Lisp, Clojure-flavored surface</div>
-          </div>
-          <div class="glance-card">
-            <div class="glance-label">Implementation</div>
-            <div class="glance-value">Rust, NaN-boxed bytecode VM</div>
-          </div>
-          <div class="glance-card">
-            <div class="glance-label">Concurrency</div>
-            <div class="glance-value">Single-threaded, cooperative async/await</div>
-          </div>
-          <div class="glance-card">
-            <div class="glance-label">Memory</div>
-            <div class="glance-value">Reference-counted (Rc), no GC</div>
-          </div>
-          <div class="glance-card">
-            <div class="glance-label">License</div>
-            <div class="glance-value">MIT</div>
-          </div>
-          <div class="glance-card">
-            <div class="glance-label">Embeddable</div>
-            <div class="glance-value">Rust crate <code>sema-lang</code>, WASM</div>
-          </div>
-        </div>
-      </div>
-    </section>
-
     <!-- ============ THE LANGUAGE ============ -->
     <section id="language">
       <div class="wrap">
@@ -490,44 +455,6 @@ import CustomPageLayout from './CustomPageLayout.vue'
 /* ---------- hero ---------- */
 .hero { padding: 104px 0 56px; }
 .req code { font-family: var(--font-mono); color: var(--muted); }
-
-/* ---------- at a glance ---------- */
-.glance { padding: 0 0 88px; border-top: none; }
-
-.glance-grid {
-  display: grid;
-  grid-template-columns: repeat(3, 1fr);
-  gap: 16px;
-  margin-top: 40px;
-}
-
-.glance-card {
-  padding: 18px 20px;
-  background: var(--bg-raise);
-  border: 1px solid var(--border);
-  border-radius: 10px;
-}
-
-.glance-label {
-  font-family: var(--font-mono);
-  font-size: 11px;
-  color: var(--gold);
-  text-transform: uppercase;
-  letter-spacing: 0.1em;
-  margin-bottom: 8px;
-}
-
-.glance-value {
-  font-size: 14.5px;
-  color: var(--text);
-  line-height: 1.5;
-}
-
-.glance-value code {
-  font-family: var(--font-mono);
-  font-size: 13px;
-  color: var(--gold-bright);
-}
 
 /* ---------- language section ---------- */
 .lang-split {
