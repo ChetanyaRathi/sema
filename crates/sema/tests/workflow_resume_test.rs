@@ -55,6 +55,7 @@ fn resume_skips_memoized_leaves_and_returns_the_same_result() {
             run_dir: &base,
             resume: true,
             code_version: "",
+            args_json: "{}",
         },
     );
     assert_eq!(
@@ -109,6 +110,7 @@ fn resume_is_per_leaf_checkpoint_replays_while_agent_reruns() {
             run_dir: &base,
             resume: true,
             code_version: "",
+            args_json: "{}",
         },
     );
     assert_eq!(
@@ -173,6 +175,7 @@ fn resume_does_not_evaluate_memoized_checkpoint_write_expression() {
             run_dir: &base,
             resume: true,
             code_version: "",
+            args_json: "{}",
         },
     );
     assert_eq!(r2.result, r1.result);
@@ -224,12 +227,68 @@ fn editing_the_workflow_invalidates_memos_and_reruns() {
             run_dir: &base,
             resume: true,
             code_version: "v2-edited",
+            args_json: "{}",
         },
     );
     assert_eq!(
         r2.recorder.call_count(),
         1,
         "a changed code version re-runs the agent"
+    );
+
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn changing_workflow_args_invalidates_memos_and_reruns() {
+    let base = temp_run_dir("resume-args-inval");
+    let marker = base.join("checkpoint-reran-for-args");
+    let marker_src = sema_string(marker.to_string_lossy().as_ref());
+    let src = format!(
+        r#"
+        (defworkflow args-invalidation-demo
+          "changed args should miss resume memos"
+          {{:phases ["A"]}}
+          (phase "A")
+          (def value
+            (checkpoint :value
+              (begin
+                (file/write "{marker_src}" "ran")
+                "ok")))
+          {{:status :success :value value}})
+        "#
+    );
+
+    let r1 = run_workflow(
+        &src,
+        fresh_fake(),
+        RunOpts {
+            run_id: "wf_resume_args_inval",
+            run_dir: &base,
+            resume: false,
+            code_version: "",
+            args_json: r#"{"batch":1}"#,
+        },
+    );
+    assert_eq!(r1.result["status"], "success");
+    assert!(marker.exists(), "fresh run must evaluate checkpoint");
+
+    std::fs::remove_file(&marker).expect("remove fresh-run marker");
+    let r2 = run_workflow(
+        &src,
+        fresh_fake(),
+        RunOpts {
+            run_id: "wf_resume_args_inval",
+            run_dir: &base,
+            resume: true,
+            code_version: "",
+            args_json: r#"{"batch":2}"#,
+        },
+    );
+    assert_eq!(r2.result, r1.result);
+    assert!(
+        marker.exists(),
+        "changed workflow args must invalidate checkpoint memo"
     );
 
     let _ = std::fs::remove_dir_all(&base);
@@ -252,6 +311,7 @@ fn missing_memo_reruns_conservatively() {
             run_dir: &base,
             resume: true,
             code_version: "",
+            args_json: "{}",
         },
     );
     assert_eq!(

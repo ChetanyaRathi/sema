@@ -89,16 +89,20 @@ pub struct WorkflowCtx {
     /// Resume state. `resuming` ⇒ this run was launched with `--resume`, so leaves whose
     /// content-key is in `resume_memos` short-circuit (return the recorded value, skip
     /// the model + events). `resume_memos` is loaded from the prior run's `memo/` dir at
-    /// scope open. `code_version` is folded into every content-key, so a changed workflow
-    /// (different version) simply produces different keys ⇒ no memo hits ⇒ full re-run
-    /// (automatic invalidation, no guard file). `key_seen` mints a per-base occurrence
-    /// ordinal so identical-prompt repeats in source order line up across runs.
+    /// scope open. `code_version` and the args fingerprint are folded into every
+    /// content-key, so a changed workflow or changed args produce different keys ⇒ no
+    /// memo hits ⇒ full re-run (automatic invalidation, no guard file). `key_seen`
+    /// mints a per-base occurrence ordinal so identical-prompt repeats in source order
+    /// line up across runs.
     resuming: Cell<bool>,
     code_version: RefCell<String>,
     resume_memos: RefCell<HashMap<String, Value>>,
     key_seen: RefCell<HashMap<String, u32>>,
     /// The run's `--args` JSON string (for the run.started event). Empty if none.
     args_json: String,
+    /// Canonical fingerprint of `--args`, folded into resume content-keys. Kept
+    /// separate so `args_json` can remain the operator's original journal text.
+    args_fingerprint: String,
     /// Cached fixed-ts override (read once at construction). `Some` ⇒ deterministic
     /// seam: `ts()` returns this string and `dur_ms()` returns 0.
     fixed_ts: Option<String>,
@@ -125,6 +129,7 @@ impl WorkflowCtx {
         args_json: String,
     ) -> Rc<WorkflowCtx> {
         let fixed_ts = std::env::var(FIXED_TS_ENV).ok();
+        let args_fingerprint = canonical_args_fingerprint(&args_json);
         // Parse spend caps from the budget submap (tolerate an int usd, e.g. `:usd 2`).
         let cost_limit = budget
             .get("usd")
@@ -155,6 +160,7 @@ impl WorkflowCtx {
             resume_memos: RefCell::new(HashMap::new()),
             key_seen: RefCell::new(HashMap::new()),
             args_json,
+            args_fingerprint,
             fixed_ts,
         })
     }
@@ -325,8 +331,9 @@ impl WorkflowCtx {
 
     // ── Resume / content-key memoization ──────────────────────────────────────
 
-    /// Set the workflow's code version (folded into every content-key). A changed
-    /// workflow ⇒ different version ⇒ different keys ⇒ no memo hits ⇒ full re-run.
+    /// Set the workflow's code version (folded into every content-key alongside args).
+    /// A changed workflow ⇒ different version ⇒ different keys ⇒ no memo hits ⇒ full
+    /// re-run.
     pub fn set_code_version(&self, v: String) {
         *self.code_version.borrow_mut() = v;
     }
@@ -359,9 +366,9 @@ impl WorkflowCtx {
         cur
     }
 
-    /// Content-key for an agent leaf: a stable hash over (kind, code-version, phase,
-    /// name, prompt, schema-repr) plus an occurrence ordinal. Length-prefixed so
-    /// `("a","bc")` and `("ab","c")` never collide.
+    /// Content-key for an agent leaf: a stable hash over (kind, code-version, args,
+    /// phase, name, prompt, schema-repr) plus an occurrence ordinal. Length-prefixed
+    /// so `("a","bc")` and `("ab","c")` never collide.
     pub fn agent_content_key(
         &self,
         prompt: &str,
@@ -370,15 +377,23 @@ impl WorkflowCtx {
         phase: &str,
     ) -> String {
         let cv = self.code_version.borrow().clone();
-        let base = hash_fields(&["agent", &cv, phase, name, prompt, schema_repr]);
+        let base = hash_fields(&[
+            "agent",
+            &cv,
+            &self.args_fingerprint,
+            phase,
+            name,
+            prompt,
+            schema_repr,
+        ]);
         format!("{base}_{}", self.next_occurrence(&base))
     }
 
-    /// Content-key for a checkpoint write: hash over (kind, code-version, phase, key)
-    /// plus an occurrence ordinal.
+    /// Content-key for a checkpoint write: hash over (kind, code-version, args, phase,
+    /// key) plus an occurrence ordinal.
     pub fn checkpoint_content_key(&self, key: &str, phase: &str) -> String {
         let cv = self.code_version.borrow().clone();
-        let base = hash_fields(&["checkpoint", &cv, phase, key]);
+        let base = hash_fields(&["checkpoint", &cv, &self.args_fingerprint, phase, key]);
         format!("{base}_{}", self.next_occurrence(&base))
     }
 
@@ -516,6 +531,18 @@ fn hash_fields(fields: &[&str]) -> String {
     }
     let h = format!("{:x}", md5::compute(&buf));
     h[..16].to_string()
+}
+
+fn canonical_args_fingerprint(args_json: &str) -> String {
+    let normalized = if args_json.trim().is_empty() {
+        String::new()
+    } else {
+        serde_json::from_str::<serde_json::Value>(args_json)
+            .ok()
+            .and_then(|json| serde_json::to_string(&json).ok())
+            .unwrap_or_else(|| args_json.to_string())
+    };
+    hash_fields(&["args", &normalized])
 }
 
 /// Env seam: set to "1" by the CLI `--resume` path to enter resume mode.
@@ -678,6 +705,29 @@ mod tests {
             ctx1.agent_content_key("p", "s", "n", "ph"),
             ctx2.agent_content_key("p", "s", "n", "ph"),
             "a changed code-version produces different content-keys (auto-invalidation)"
+        );
+    }
+
+    #[test]
+    fn args_changes_invalidate_keys() {
+        let ctx1 = WorkflowCtx::new_with_args(
+            "a".into(),
+            Journal::null(),
+            BTreeMap::new(),
+            r#"{"batch":1}"#.into(),
+        );
+        ctx1.set_code_version("v1".into());
+        let ctx2 = WorkflowCtx::new_with_args(
+            "b".into(),
+            Journal::null(),
+            BTreeMap::new(),
+            r#"{"batch":2}"#.into(),
+        );
+        ctx2.set_code_version("v1".into());
+        assert_ne!(
+            ctx1.checkpoint_content_key("files", "ph"),
+            ctx2.checkpoint_content_key("files", "ph"),
+            "changed workflow args produce different content-keys"
         );
     }
 

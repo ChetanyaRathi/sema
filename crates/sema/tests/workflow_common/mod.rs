@@ -25,6 +25,7 @@ pub struct RunOpts<'a> {
     pub run_dir: &'a Path,
     pub resume: bool,
     pub code_version: &'a str,
+    pub args_json: &'a str,
 }
 
 impl<'a> RunOpts<'a> {
@@ -35,6 +36,7 @@ impl<'a> RunOpts<'a> {
             run_dir,
             resume: false,
             code_version: "",
+            args_json: "{}",
         }
     }
 }
@@ -59,6 +61,7 @@ pub fn run_workflow(src: &str, fake: FakeProvider, opts: RunOpts) -> RunOutput {
     std::env::set_var("SEMA_WORKFLOW_RUN_ID", opts.run_id);
     std::env::set_var("SEMA_WORKFLOW_RUN_DIR", opts.run_dir);
     std::env::set_var("SEMA_WORKFLOW_CODE_VERSION", opts.code_version);
+    std::env::set_var("SEMA_WORKFLOW_ARGS_JSON", opts.args_json);
     if opts.resume {
         std::env::set_var("SEMA_WORKFLOW_RESUME", "1");
     } else {
@@ -76,6 +79,7 @@ pub fn run_workflow(src: &str, fake: FakeProvider, opts: RunOpts) -> RunOutput {
         "SEMA_WORKFLOW_RUN_ID",
         "SEMA_WORKFLOW_RUN_DIR",
         "SEMA_WORKFLOW_CODE_VERSION",
+        "SEMA_WORKFLOW_ARGS_JSON",
         "SEMA_WORKFLOW_RESUME",
     ] {
         std::env::remove_var(v);
