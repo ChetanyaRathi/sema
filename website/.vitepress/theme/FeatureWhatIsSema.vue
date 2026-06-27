@@ -355,20 +355,85 @@ import CustomPageLayout from './CustomPageLayout.vue'
             </p>
           </div>
           <div class="feature-visual">
-            <div class="arch-diagram">
-              <div class="arch-layer arch-layer-source">.sema source</div>
-              <div class="arch-arrow">&darr; sema-reader</div>
-              <div class="arch-layer arch-layer-ast">Value AST + Spans</div>
-              <div class="arch-arrow">&darr; sema-vm (lower → resolve → compile)</div>
-              <div class="arch-layer arch-layer-bc">Chunk (bytecode + constants)</div>
-              <div class="arch-arrow">&darr; sema-vm (stack-based dispatch)</div>
-              <div class="arch-layer arch-layer-vm">
-                <span class="arch-tag">VM</span>
-                NaN-boxed Value · intrinsic opcodes
+            <div class="bytecode-viz">
+              <!-- Source → compiled pipeline strip -->
+              <div class="bc-pipeline">
+                <span class="bc-pipe-step">.sema</span>
+                <span class="bc-pipe-arrow">&rarr;</span>
+                <span class="bc-pipe-step">reader</span>
+                <span class="bc-pipe-arrow">&rarr;</span>
+                <span class="bc-pipe-step">lower</span>
+                <span class="bc-pipe-arrow">&rarr;</span>
+                <span class="bc-pipe-step bc-pipe-step-hot">VM</span>
               </div>
-              <div class="arch-arrow">&darr; sema-stdlib + sema-llm</div>
-              <div class="arch-layer arch-layer-native">
-                Native functions · LLM providers · OpenTelemetry
+
+              <!-- .semac file layout — layered hex header + sections -->
+              <div class="bc-file">
+                <div class="bc-file-label">.semac file layout</div>
+
+                <div class="bc-hex-header">
+                  <div class="bc-hex-group">
+                    <span class="bc-hex-byte bc-hex-magic">00</span>
+                    <span class="bc-hex-byte bc-hex-magic">53</span>
+                    <span class="bc-hex-byte bc-hex-magic">45</span>
+                    <span class="bc-hex-byte bc-hex-magic">4D</span>
+                    <span class="bc-hex-note">magic</span>
+                  </div>
+                  <div class="bc-hex-group">
+                    <span class="bc-hex-byte">04</span><span class="bc-hex-byte">00</span>
+                    <span class="bc-hex-note">v4</span>
+                  </div>
+                  <div class="bc-hex-group">
+                    <span class="bc-hex-byte">00</span><span class="bc-hex-byte">00</span>
+                    <span class="bc-hex-note">flags</span>
+                  </div>
+                  <div class="bc-hex-group bc-hex-dots">
+                    <span class="bc-hex-byte bc-hex-faded">··</span><span class="bc-hex-byte bc-hex-faded">··</span><span class="bc-hex-byte bc-hex-faded">··</span><span class="bc-hex-byte bc-hex-faded">··</span>
+                    <span class="bc-hex-note">version</span>
+                  </div>
+                  <div class="bc-hex-group">
+                    <span class="bc-hex-byte">03</span><span class="bc-hex-byte">00</span>
+                    <span class="bc-hex-note">3 sections</span>
+                  </div>
+                  <div class="bc-hex-group bc-hex-dots">
+                    <span class="bc-hex-byte bc-hex-faded">··</span><span class="bc-hex-byte bc-hex-faded">··</span><span class="bc-hex-byte bc-hex-faded">··</span><span class="bc-hex-byte bc-hex-faded">··</span>
+                    <span class="bc-hex-note">reserved</span>
+                  </div>
+                </div>
+                <div class="bc-hex-size">24 bytes</div>
+
+                <div class="bc-sections">
+                  <div class="bc-section bc-section-required">
+                    <div class="bc-sec-head"><span class="bc-sec-id">0x01</span><span class="bc-sec-name">String Table</span><span class="bc-sec-tag">required</span></div>
+                    <div class="bc-sec-body">interned strings &middot; Spur remapping</div>
+                  </div>
+                  <div class="bc-section bc-section-required">
+                    <div class="bc-sec-head"><span class="bc-sec-id">0x02</span><span class="bc-sec-name">Function Table</span><span class="bc-sec-tag">required</span></div>
+                    <div class="bc-sec-body">compiled function templates</div>
+                  </div>
+                  <div class="bc-section bc-section-required bc-section-main">
+                    <div class="bc-sec-head"><span class="bc-sec-id">0x03</span><span class="bc-sec-name">Main Chunk</span><span class="bc-sec-tag">bytecode</span></div>
+                    <div class="bc-sec-body">
+                      <span class="bc-op">Const</span>
+                      <span class="bc-op">LoadLocal0</span>
+                      <span class="bc-op">Call</span>
+                      <span class="bc-op">Pop</span>
+                      <span class="bc-op">Const</span>
+                      <span class="bc-op">CallGlobal</span>
+                      <span class="bc-op">Return</span>
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              <!-- Value encoding -->
+              <div class="bc-value-box">
+                <div class="bc-value-label">NaN-boxed Value</div>
+                <div class="bc-value-visual">
+                  <div class="bc-value-part bc-value-tag"><span>tag</span><em>13 bits</em></div>
+                  <div class="bc-value-part bc-value-payload"><span>payload</span><em>48 bits</em></div>
+                </div>
+                <div class="bc-value-note"><code>struct Value(u64)</code> — every type in 8 bytes</div>
               </div>
             </div>
           </div>
@@ -741,52 +806,271 @@ import CustomPageLayout from './CustomPageLayout.vue'
   border-radius: 4px;
 }
 
-/* ---------- architecture diagram ---------- */
-.arch-diagram {
+/* ---------- bytecode visualization ---------- */
+.bytecode-viz {
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+  perspective: 800px;
+}
+
+/* pipeline strip */
+.bc-pipeline {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  flex-wrap: wrap;
+}
+
+.bc-pipe-step {
+  padding: 4px 10px;
+  background: var(--bg-raise);
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  color: var(--muted);
+}
+
+.bc-pipe-step-hot {
+  color: var(--gold-bright);
+  border-color: var(--gold-line);
+  background: var(--gold-fade);
+}
+
+.bc-pipe-arrow {
+  color: var(--dim);
+  font-size: 11px;
+}
+
+/* .semac file layout */
+.bc-file {
+  background: var(--bg-raise);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 16px;
+  transform: rotateX(4deg);
+  transform-style: preserve-3d;
+}
+
+.bc-file-label {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--dim);
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  margin-bottom: 12px;
+}
+
+/* hex header */
+.bc-hex-header {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  align-items: flex-start;
+}
+
+.bc-hex-group {
   display: flex;
   flex-direction: column;
   align-items: center;
-  gap: 0;
+  gap: 3px;
 }
 
-.arch-layer {
-  width: 100%;
-  text-align: center;
-  padding: 14px 18px;
-  border-radius: 8px;
+.bc-hex-byte {
+  display: inline-block;
   font-family: var(--font-mono);
-  font-size: 12.5px;
+  font-size: 10.5px;
+  color: var(--text);
+  background: var(--surface);
   border: 1px solid var(--border);
+  border-radius: 3px;
+  padding: 2px 5px;
+  min-width: 26px;
+  text-align: center;
+  line-height: 1.3;
 }
 
-.arch-layer-source { background: var(--bg-raise); color: var(--text); font-weight: 500; }
-.arch-layer-ast { background: var(--bg-raise); color: var(--muted); }
-.arch-layer-bc { background: var(--bg-raise); color: var(--muted); }
-.arch-layer-vm {
-  background: var(--gold-fade);
-  border-color: var(--gold-line);
+.bc-hex-magic {
   color: var(--gold-bright);
+  border-color: var(--gold-line);
+  background: var(--gold-fade);
+}
+
+.bc-hex-faded {
+  color: var(--dim);
+  border-color: var(--border-lo);
+  background: transparent;
+}
+
+.bc-hex-note {
+  font-family: var(--font-mono);
+  font-size: 8.5px;
+  color: var(--dim);
+  margin-top: 1px;
+}
+
+.bc-hex-size {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--dim);
+  margin-top: 6px;
+  text-align: right;
+}
+
+/* sections */
+.bc-sections {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 14px;
+}
+
+.bc-section {
+  background: var(--bg);
+  border: 1px solid var(--border-lo);
+  border-radius: 6px;
+  overflow: hidden;
+  transition: transform .15s;
+}
+
+.bc-section:hover {
+  transform: translateX(4px);
+}
+
+.bc-section-main {
+  border-color: var(--gold-line);
+  box-shadow: 0 0 0 1px rgba(200, 168, 85, .06);
+}
+
+.bc-sec-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border-lo);
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+}
+
+.bc-sec-id {
+  color: var(--dim);
+  font-size: 10px;
+}
+
+.bc-sec-name {
+  color: var(--text);
   font-weight: 500;
 }
 
-.arch-tag {
-  display: inline-block;
-  font-size: 10px;
-  color: var(--gold);
-  background: rgba(200, 168, 85, 0.14);
-  padding: 2px 7px;
-  border-radius: 4px;
-  margin-right: 8px;
+.bc-section-main .bc-sec-name {
+  color: var(--gold-bright);
+}
+
+.bc-sec-tag {
+  margin-left: auto;
+  font-size: 9px;
+  color: var(--dim);
+  background: var(--surface);
+  padding: 2px 6px;
+  border-radius: 3px;
   text-transform: uppercase;
   letter-spacing: 0.05em;
 }
 
-.arch-layer-native { background: var(--bg-raise); color: var(--muted); font-size: 12px; }
-
-.arch-arrow {
-  color: var(--dim);
+.bc-sec-body {
+  padding: 8px 12px;
+  font-family: var(--font-mono);
   font-size: 11px;
-  padding: 5px 0;
+  color: var(--muted);
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.bc-op {
+  padding: 2px 6px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  color: var(--gold-bright);
+  font-size: 10.5px;
+}
+
+/* value encoding box */
+.bc-value-box {
+  background: var(--bg-raise);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 14px 16px;
+}
+
+.bc-value-label {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--dim);
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  margin-bottom: 10px;
+}
+
+.bc-value-visual {
+  display: flex;
+  gap: 0;
+  border-radius: 6px;
+  overflow: hidden;
+}
+
+.bc-value-part {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+  padding: 10px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+}
+
+.bc-value-part span {
+  font-size: 10px;
+  color: var(--dim);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+
+.bc-value-part em {
+  font-style: normal;
+  font-size: 12px;
+  font-weight: 500;
+}
+
+.bc-value-tag {
+  background: var(--gold-fade);
+  border: 1px solid var(--gold-line);
+  color: var(--gold-bright);
+  flex: 0 0 25%;
+}
+
+.bc-value-payload {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-left: none;
+  color: var(--text);
+  flex: 1;
+}
+
+.bc-value-note {
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  color: var(--dim);
+  margin-top: 8px;
+}
+
+.bc-value-note code {
+  color: var(--gold-bright);
+  background: var(--gold-fade);
+  padding: 1px 5px;
+  border-radius: 3px;
 }
 
 /* ---------- naming ---------- */
