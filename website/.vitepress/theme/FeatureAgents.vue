@@ -45,43 +45,45 @@ import CustomPageLayout from './CustomPageLayout.vue'
           write — it's what <code>agent/run</code> does when you call it.
         </p>
 
-        <div class="loop-diagram">
-          <div class="loop-step" data-step="1">
-            <div class="loop-node">
-              <span class="loop-num">1</span>
-              <span class="loop-label">User message</span>
-            </div>
-            <p class="loop-desc">"Find TODOs in src/"</p>
+        <div class="filmstrip">
+          <div class="film-sprockets film-sprockets-top">
+            <span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span>
           </div>
 
-          <div class="loop-arrow">&rarr;</div>
-
-          <div class="loop-step" data-step="2">
-            <div class="loop-node loop-node-llm">
-              <span class="loop-num">2</span>
-              <span class="loop-label">LLM call</span>
+          <div class="film-frames">
+            <div class="film-frame">
+              <div class="film-frame-num">1</div>
+              <div class="film-frame-label">User message</div>
+              <div class="film-frame-desc">"Find TODOs in src/"</div>
             </div>
-            <p class="loop-desc">Model decides: call a tool or answer</p>
+            <div class="film-frame film-frame-hot">
+              <div class="film-frame-num">2</div>
+              <div class="film-frame-label">LLM call</div>
+              <div class="film-frame-desc">Model decides: call a tool or answer</div>
+            </div>
+            <div class="film-frame film-frame-branch">
+              <div class="film-frame-num">3</div>
+              <div class="film-frame-label">Tool call?</div>
+              <div class="film-frame-desc">Dispatch &amp; feed result back</div>
+            </div>
+            <div class="film-frame film-frame-done">
+              <div class="film-frame-num">4</div>
+              <div class="film-frame-label">Final answer</div>
+              <div class="film-frame-desc">String returned to caller</div>
+            </div>
           </div>
 
-          <div class="loop-arrow">&rarr;</div>
-
-          <div class="loop-step loop-branch" data-step="3">
-            <div class="loop-node loop-node-decision">
-              <span class="loop-num">3</span>
-              <span class="loop-label">Tool call?</span>
-            </div>
-            <p class="loop-desc">If yes: dispatch &amp; feed result back &rarr; loop to 2</p>
+          <div class="film-sprockets film-sprockets-bottom">
+            <span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span>
           </div>
 
-          <div class="loop-arrow">&rarr;</div>
-
-          <div class="loop-step" data-step="4">
-            <div class="loop-node loop-node-done">
-              <span class="loop-num">4</span>
-              <span class="loop-label">Final answer</span>
-            </div>
-            <p class="loop-desc">String returned to caller</p>
+          <!-- Loop-back arrow: from frame 3 back to frame 2 -->
+          <div class="film-loopback">
+            <svg viewBox="0 0 200 40" fill="none" preserveAspectRatio="none" aria-hidden="true">
+              <path d="M150 0 Q150 30 100 30 Q50 30 50 0" stroke="#c8a855" stroke-width="1.2" stroke-dasharray="3 3" fill="none" stroke-linecap="round"/>
+              <path d="M48 4 L50 0 L53 4" stroke="#c8a855" stroke-width="1.2" fill="none" stroke-linecap="round" stroke-linejoin="round"/>
+            </svg>
+            <span class="film-loopback-label">loop &mdash; tool result fed back to LLM</span>
           </div>
         </div>
 
@@ -451,83 +453,132 @@ messages = [{<span class="c-str">"role"</span>: <span class="c-str">"user"</span
 /* ---------- hero ---------- */
 .hero { padding: 104px 0 56px; }
 
-/* ---------- agent loop diagram ---------- */
+/* ---------- filmstrip loop diagram ---------- */
 .loop-showcase { padding: 0 0 88px; border-top: none; }
 
-.loop-diagram {
-  display: flex;
-  align-items: stretch;
-  gap: 0;
+.filmstrip {
   margin-top: 48px;
-  flex-wrap: wrap;
-}
-
-.loop-step {
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  gap: 12px;
-  flex: 1;
-  min-width: 140px;
-}
-
-.loop-node {
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  gap: 6px;
-  padding: 18px 16px;
   background: var(--bg-raise);
   border: 1px solid var(--border);
   border-radius: 12px;
-  width: 100%;
-  transition: border-color .15s;
+  padding: 0 0 8px;
+  overflow: hidden;
 }
 
-.loop-node-llm {
-  border-color: var(--gold-line);
-  box-shadow: 0 0 0 1px rgba(200, 168, 85, .06);
+.film-sprockets {
+  display: flex;
+  justify-content: space-between;
+  padding: 6px 12px;
+  background: var(--bg);
 }
 
-.loop-node-decision {
+.film-sprockets-top { border-bottom: 1px solid var(--border-lo); }
+.film-sprockets-bottom { border-top: 1px solid var(--border-lo); }
+
+.film-sprockets span {
+  display: block;
+  width: 10px;
+  height: 5px;
+  background: var(--border);
+  border-radius: 1px;
+  flex-shrink: 0;
+}
+
+.film-frames {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 1px;
+  background: var(--border-lo);
+}
+
+.film-frame {
+  background: var(--bg-raise);
+  padding: 18px 14px 20px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  text-align: center;
+  gap: 6px;
+  position: relative;
+  transition: background .15s;
+}
+
+.film-frame:hover {
   background: var(--surface);
-  border-style: dashed;
 }
 
-.loop-node-done {
-  border-color: rgba(155, 184, 122, 0.3);
-}
-
-.loop-num {
+.film-frame-num {
   font-family: var(--font-mono);
   font-size: 11px;
   color: var(--gold);
   font-weight: 500;
+  width: 24px;
+  height: 24px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--border);
+  border-radius: 50%;
+  background: var(--bg);
 }
 
-.loop-label {
+.film-frame-hot .film-frame-num {
+  border-color: var(--gold-line);
+  color: var(--gold-bright);
+  background: var(--gold-fade);
+}
+
+.film-frame-branch .film-frame-num {
+  border-style: dashed;
+}
+
+.film-frame-done .film-frame-num {
+  border-color: rgba(155, 184, 122, 0.3);
+  color: #9bb87a;
+}
+
+.film-frame-label {
   font-family: var(--font-body);
-  font-size: 14px;
+  font-size: 13.5px;
   font-weight: 500;
   color: var(--text);
 }
 
-.loop-desc {
+.film-frame-hot .film-frame-label { color: var(--gold-bright); }
+
+.film-frame-desc {
   font-family: var(--font-mono);
-  font-size: 11.5px;
+  font-size: 10.5px;
   color: var(--muted);
-  text-align: center;
-  line-height: 1.5;
-  max-width: 160px;
+  line-height: 1.45;
+  max-width: 130px;
 }
 
-.loop-arrow {
-  display: flex;
-  align-items: center;
-  font-size: 22px;
+/* loop-back arrow */
+.film-loopback {
+  position: relative;
+  padding: 0 18%;
+  margin-top: 2px;
+  height: 36px;
+}
+
+.film-loopback svg {
+  width: 100%;
+  height: 36px;
+  display: block;
+}
+
+.film-loopback-label {
+  position: absolute;
+  bottom: 0;
+  left: 50%;
+  transform: translateX(-50%);
+  font-family: var(--font-mono);
+  font-size: 10px;
   color: var(--dim);
-  padding: 0 4px;
-  align-self: center;
+  background: var(--bg-raise);
+  padding: 0 8px;
+  white-space: nowrap;
 }
 
 .loop-guards {
@@ -761,8 +812,11 @@ messages = [{<span class="c-str">"role"</span>: <span class="c-str">"user"</span
   .feature-row.reverse .feature-text { order: unset; }
   .feature-row.reverse .feature-visual { order: unset; }
 
-  .loop-diagram { flex-direction: column; gap: 12px; }
-  .loop-arrow { transform: rotate(90deg); padding: 4px 0; }
+  .film-frames {
+    grid-template-columns: 1fr 1fr;
+  }
+
+  .film-loopback { display: none; }
 
   .loop-guards { grid-template-columns: 1fr; }
 
