@@ -55,46 +55,91 @@ import CustomPageLayout from './CustomPageLayout.vue'
             <span class="trace-spans">6 spans</span>
           </div>
 
+          <!-- timeline ruler -->
+          <div class="trace-ruler">
+            <div class="ruler-tick" style="left: 0%">0</div>
+            <div class="ruler-tick" style="left: 25%">212</div>
+            <div class="ruler-tick" style="left: 50%">424</div>
+            <div class="ruler-tick" style="left: 75%">635</div>
+            <div class="ruler-tick" style="left: 100%">847ms</div>
+          </div>
+
           <div class="trace-tree">
+            <!-- Root: invoke_agent — spans the full 847ms -->
             <div class="span-row span-root">
-              <div class="span-bar" style="width: 100%">
-                <span class="span-name">invoke_agent <span class="span-attr">coder</span></span>
-                <span class="span-time">847ms</span>
+              <div class="span-indent"></div>
+              <div class="span-content">
+                <span class="span-label">invoke_agent <span class="span-attr">coder</span></span>
+                <div class="span-track">
+                  <div class="span-bar" style="width: 100%; margin-left: 0%">
+                    <span class="span-time">847ms</span>
+                  </div>
+                </div>
               </div>
             </div>
 
+            <!-- Child: chat #1 — 0–524ms (62%) -->
             <div class="span-row span-child">
-              <div class="span-bar span-bar-llm" style="width: 62%; margin-left: 0%">
-                <span class="span-name">chat <span class="span-attr">claude-sonnet-4</span></span>
-                <span class="span-time">524ms</span>
+              <div class="span-indent"></div>
+              <div class="span-content">
+                <span class="span-label">chat <span class="span-attr">claude-sonnet-4</span></span>
+                <div class="span-track">
+                  <div class="span-bar span-bar-llm" style="width: 62%; margin-left: 0%">
+                    <span class="span-time">524ms</span>
+                  </div>
+                </div>
               </div>
             </div>
 
+            <!-- Child: execute_tool read-file — 524–676ms (18%, starts at 62%) -->
             <div class="span-row span-child">
-              <div class="span-bar span-bar-tool" style="width: 18%; margin-left: 0%">
-                <span class="span-name">execute_tool <span class="span-attr">read-file</span></span>
-                <span class="span-time">152ms</span>
+              <div class="span-indent"></div>
+              <div class="span-content">
+                <span class="span-label">execute_tool <span class="span-attr">read-file</span></span>
+                <div class="span-track">
+                  <div class="span-bar span-bar-tool" style="width: 18%; margin-left: 62%">
+                    <span class="span-time">152ms</span>
+                  </div>
+                </div>
               </div>
             </div>
 
+            <!-- Child: chat #2 — 676–847ms (20%, starts at 80%) — slightly overlapped is unrealistic, fix: 680–847 -->
             <div class="span-row span-child">
-              <div class="span-bar span-bar-llm" style="width: 55%; margin-left: 0%">
-                <span class="span-name">chat <span class="span-attr">claude-sonnet-4</span></span>
-                <span class="span-time">465ms</span>
+              <div class="span-indent"></div>
+              <div class="span-content">
+                <span class="span-label">chat <span class="span-attr">claude-sonnet-4</span></span>
+                <div class="span-track">
+                  <div class="span-bar span-bar-llm" style="width: 20%; margin-left: 80%">
+                    <span class="span-time">167ms</span>
+                  </div>
+                </div>
               </div>
             </div>
 
+            <!-- Nested child: retry — under chat #2, 680–783ms (12%, starts at 80%) -->
             <div class="span-row span-child span-nested">
-              <div class="span-bar span-bar-retry" style="width: 22%; margin-left: 0%">
-                <span class="span-name">llm.retry_attempt</span>
-                <span class="span-time">103ms</span>
+              <div class="span-indent"></div>
+              <div class="span-content">
+                <span class="span-label">llm.retry_attempt</span>
+                <div class="span-track">
+                  <div class="span-bar span-bar-retry" style="width: 12%; margin-left: 80%">
+                    <span class="span-time">103ms</span>
+                  </div>
+                </div>
               </div>
             </div>
 
+            <!-- Child: execute_tool run-command — 783–847ms (8%, starts at 92%) -->
             <div class="span-row span-child">
-              <div class="span-bar span-bar-tool" style="width: 12%; margin-left: 0%">
-                <span class="span-name">execute_tool <span class="span-attr">run-command</span></span>
-                <span class="span-time">98ms</span>
+              <div class="span-indent"></div>
+              <div class="span-content">
+                <span class="span-label">execute_tool <span class="span-attr">run-command</span></span>
+                <div class="span-track">
+                  <div class="span-bar span-bar-tool" style="width: 8%; margin-left: 92%">
+                    <span class="span-time">64ms</span>
+                  </div>
+                </div>
               </div>
             </div>
           </div>
@@ -416,40 +461,119 @@ import CustomPageLayout from './CustomPageLayout.vue'
 .trace-duration { color: var(--text); }
 .trace-spans { color: var(--dim); margin-left: auto; }
 
+/* timeline ruler */
+.trace-ruler {
+  position: relative;
+  height: 22px;
+  margin-left: 180px;
+  padding: 0 18px;
+  border-bottom: 1px solid var(--border-lo);
+  background: var(--surface);
+}
+
+.ruler-tick {
+  position: absolute;
+  bottom: 4px;
+  transform: translateX(-50%);
+  font-family: var(--font-mono);
+  font-size: 9px;
+  color: var(--dim);
+  white-space: nowrap;
+}
+
+.ruler-tick:first-child { transform: translateX(0); }
+.ruler-tick:last-child { transform: translateX(-100%); }
+
+/* trace tree */
 .trace-tree {
-  padding: 18px 18px 14px;
+  padding: 12px 18px 16px;
   display: flex;
   flex-direction: column;
-  gap: 4px;
+  gap: 3px;
+  position: relative;
+}
+
+/* faint vertical grid lines aligned to the ruler */
+.trace-tree::before {
+  content: "";
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 198px;
+  right: 18px;
+  background-image:
+    linear-gradient(to right, transparent calc(25% - 1px), var(--border-lo) calc(25% - 1px), var(--border-lo) 25%, transparent 25%),
+    linear-gradient(to right, transparent calc(50% - 1px), var(--border-lo) calc(50% - 1px), var(--border-lo) 50%, transparent 50%),
+    linear-gradient(to right, transparent calc(75% - 1px), var(--border-lo) calc(75% - 1px), var(--border-lo) 75%, transparent 75%);
+  pointer-events: none;
+  opacity: 0.5;
 }
 
 .span-row {
   display: flex;
   align-items: center;
+  gap: 0;
+  position: relative;
 }
 
-.span-root { padding-bottom: 6px; }
-
-.span-child {
-  padding-left: 28px;
+.span-indent {
+  width: 20px;
+  flex-shrink: 0;
+  border-left: 1px solid var(--border);
+  height: 28px;
+  margin-left: 8px;
 }
 
-.span-nested {
-  padding-left: 56px;
+.span-child .span-indent { width: 20px; }
+.span-nested .span-indent { width: 20px; border-left: 1px dashed var(--border-lo); }
+
+.span-root .span-indent { border-left: none; width: 0; }
+
+.span-content {
+  display: flex;
+  align-items: center;
+  flex: 1;
+  min-width: 0;
+  gap: 12px;
+}
+
+.span-label {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text);
+  white-space: nowrap;
+  flex-shrink: 0;
+  width: 130px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.span-attr {
+  color: var(--dim);
+  font-size: 9.5px;
+}
+
+.span-track {
+  flex: 1;
+  position: relative;
+  height: 22px;
+  min-width: 0;
 }
 
 .span-bar {
+  position: absolute;
+  top: 0;
+  bottom: 0;
   display: flex;
   align-items: center;
-  justify-content: space-between;
-  gap: 8px;
-  padding: 7px 12px;
-  border-radius: 5px;
+  justify-content: flex-end;
+  padding: 0 8px;
+  border-radius: 4px;
   font-family: var(--font-mono);
-  font-size: 11.5px;
+  font-size: 10px;
   background: var(--bg);
   border: 1px solid var(--border-lo);
-  min-width: 0;
+  overflow: hidden;
 }
 
 .span-bar-llm {
@@ -459,7 +583,7 @@ import CustomPageLayout from './CustomPageLayout.vue'
 
 .span-bar-tool {
   border-color: rgba(155, 184, 122, 0.2);
-  background: rgba(155, 184, 122, 0.05);
+  background: rgba(155, 184, 122, 0.06);
 }
 
 .span-bar-retry {
@@ -468,27 +592,15 @@ import CustomPageLayout from './CustomPageLayout.vue'
   border-style: dashed;
 }
 
-.span-name {
-  color: var(--text);
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-
-.span-bar-llm .span-name { color: var(--gold-bright); }
-.span-bar-tool .span-name { color: #9bb87a; }
-.span-bar-retry .span-name { color: #c97b6a; }
-
-.span-attr {
-  color: var(--dim);
-  font-size: 10px;
-}
-
 .span-time {
   color: var(--dim);
-  font-size: 10.5px;
-  flex-shrink: 0;
+  font-size: 9.5px;
+  white-space: nowrap;
 }
+
+.span-bar-llm .span-time { color: var(--gold-bright); }
+.span-bar-tool .span-time { color: #9bb87a; }
+.span-bar-retry .span-time { color: #c97b6a; }
 
 /* trace attributes */
 .trace-attrs {
@@ -748,7 +860,16 @@ import CustomPageLayout from './CustomPageLayout.vue'
 
   .trace-attrs { grid-template-columns: 1fr 1fr; }
 
-  .span-child { padding-left: 16px; }
-  .span-nested { padding-left: 32px; }
+  .trace-ruler { margin-left: 0; }
+
+  .span-label {
+    width: 100px;
+    font-size: 10px;
+  }
+
+  .trace-tree::before { left: 118px; }
+
+  .span-child { padding-left: 0; }
+  .span-nested { padding-left: 0; }
 }
 </style>
