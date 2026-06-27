@@ -22,6 +22,7 @@ const featureItems = [
   { label: 'Notebook', link: '/feature/notebook', key: 'notebook' },
   { label: 'Agents & Tools', link: '/feature/agents', key: 'agents' },
   { label: 'Cassettes', link: '/feature/cassettes', key: 'cassettes' },
+  { label: 'Observability', link: '/feature/observability', key: 'observability' },
 ]
 
 const docsActive = computed(() => docsItems.some(i => i.key === props.activeNav))
