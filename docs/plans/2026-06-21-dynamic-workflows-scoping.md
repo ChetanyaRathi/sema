@@ -198,7 +198,7 @@ evolution) is a later projection over that stable core.
   "Audit a codebase for missing authorization checks."
   {:args   {:paths [:list :string] :framework :string}
    :budget {:max-agents 64 :max-concurrent 8 :max-tokens 250000 :on-exceed :hard}
-   :perms  [:read-repo :run-tests]}
+   :permissions "no-fs-write,no-network"}
 
   ;; phases are just labeled, journaled scopes — not control flow
   (phase "Inventory"
@@ -328,7 +328,7 @@ Design decisions baked into the surface:
   .sema/runs/<run-id>/
     events.jsonl     # append-only, the system of record
     args.json
-    metadata.json    # workflow name, code version, budget, perms
+    metadata.json    # workflow name, code version, budget, permissions
     result.json      # the final {:status …} envelope
     checkpoints/      # content-keyed step results (resume memo)
     artifacts/
@@ -356,7 +356,7 @@ Design decisions baked into the surface:
 5. *Minimal stable event vocabulary?* → The ~8 events in §3.5; freeze them before
    anything reads them.
 6. *(new)* Canonical Sema-value serialization for step keys — design first?
-7. *(new)* How do `:budget`/`:perms` compose with nested workflows and subprocess
+7. *(new)* How do `:budget`/`:permissions` compose with nested workflows and subprocess
    workers (inheritance vs re-declaration)?
 8. *(new)* What's the acceptance demo, exactly? (No demo = "useful" is undefined.)
 

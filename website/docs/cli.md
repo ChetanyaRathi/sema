@@ -481,11 +481,16 @@ The `--sandbox` flag restricts access to dangerous operations. Functions remain 
 
 | Mode            | Description                                                            |
 | --------------- | ---------------------------------------------------------------------- |
+| `none`          | Deny no capabilities                                                    |
 | `strict`        | Deny shell, fs-write, network, env-write, process, llm, serial (reads allowed) |
 | `all`           | Deny all capabilities                                                  |
 | Comma-separated | e.g. `no-shell,no-network` — deny specific capabilities                |
 
 ### Capabilities
+
+Capability names may be written with or without the `no-` prefix. For example,
+`no-network` and `network` both deny the `network` capability. The `no-*`
+form is preferred in examples because `--sandbox` is a denial list.
 
 The table below lists every function gated by each capability. It mirrors the `register_fn_gated` / `register_fn_path_gated` call sites in the stdlib — if a function is not listed it is never sandboxed.
 

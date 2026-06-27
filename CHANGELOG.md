@@ -35,8 +35,12 @@
   `parallel` / `pipeline` — a journaled, resumable agentic-workflow runtime.
   Define multi-phase LLM workflows as ordinary Sema code; the runtime journals
   every event to a frozen JSONL run directory (`.sema/runs/<run-id>/`), enforces
-  budget caps (`:tokens` / `:usd`), and supports `--resume` via content-keyed
-  memo sidecars. `sema workflow run` / `view` / `index` / `check` CLI commands.
+  budget caps (`:tokens` / `:usd`), enforces workflow-declared sandbox
+  restrictions via `:permissions`, and supports `--resume` via content-keyed
+  memo sidecars. Resume keys include the workflow source hash and `--args`, so
+  edits or changed inputs rerun affected leaves instead of replaying stale
+  values. Memoized checkpoints return before evaluating their write expression.
+  `sema workflow run` / `view` / `index` / `check` CLI commands.
   A web viewer (`sema workflow view`) renders live runs with a SQLite cross-run
   index. `sema workflow check` statically validates workflow files without
   evaluating them — catches arity traps and layout issues before a run.

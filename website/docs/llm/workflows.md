@@ -46,6 +46,7 @@ The `meta-map` supports:
 |-----|------|-------------|
 | `:phases` | `[:string …]` | Declared phase plan — the dashboard shows all phases up front |
 | `:budget` | `{:tokens N :usd M}` | Spend caps (see [Budget Enforcement](#budget-enforcement)) |
+| `:permissions` | string | Sandbox restrictions for `sema workflow run`, using the same syntax as `--sandbox` |
 | `:args` | map | Argument schema (informational; the actual args come from `--args`) |
 
 The body is ordinary Sema code. `phase` markers interleave with `def`,
@@ -132,8 +133,8 @@ previously-stored value back.
 
 Checkpoints double as the run-scoped state bag — values stored in one phase
 are readable in a later phase. Each checkpoint emits a `checkpoint` event
-with an opaque value digest (the value itself is not in the event stream; the
-memo sidecar stores it for resume).
+with a `content_key`, an opaque value digest, and a capped display value; the
+memo sidecar stores the canonical value for resume.
 
 ### `parallel`
 
@@ -175,9 +176,9 @@ Every `sema workflow run` creates a run directory under `.sema/runs/<run-id>/`:
   events.jsonl              # the system of record (append-only)
   events.resume-1.jsonl     # one per --resume continuation
   memo/                     # per-leaf resume cache
-    ck_a1b2c3d4.json        #   content-key → memoized value
-    ck_e5f6g7h8.json
-  metadata.json             # workflow name, code version, budget
+    3f13d37d3df7b337_0.json #   content-key → memoized value
+    7b03b1d77c616601_0.json
+  metadata.json             # workflow name, code version, budget, permissions
   result.json               # the final {:status …} envelope
 ```
 
@@ -211,15 +212,15 @@ memoized leaves — they replay for free.
 
 ### How content keys work
 
-Each leaf's content key is a hash of `(kind, code-version, phase, prompt,
-schema)`. Same inputs → same key → memo hit → no re-call. An occurrence
-ordinal distinguishes identical-prompt repeats in source order.
+Each step leaf's content key is a hash of `(kind, code-version, args, phase,
+step-name, prompt, schema)`. Checkpoints use `(kind, code-version, args,
+phase, key)`. Same inputs → same key → memo hit → no re-call. An occurrence
+ordinal distinguishes identical repeats in source order.
 
 ### Automatic invalidation
 
-Edit the workflow → the code version changes → content keys change → no memo
-hits → full re-run. No guard files to maintain; the invalidation is
-automatic.
+Edit the workflow or change `--args` → content keys change → no memo hits →
+full re-run. No guard files to maintain; the invalidation is automatic.
 
 ### Per-leaf granularity
 
@@ -270,6 +271,45 @@ a cap is exceeded — further step leaves are **refused** and the run ends
   counts, and cost — the dashboard shows per-leaf spend.
 - **Sticky latch.** Once tripped, the latch stays set for the rest of the run.
   No step leaf launches after it, even under concurrent `parallel` fan-out.
+
+## Permission enforcement
+
+Declare `:permissions` in the `defworkflow` metadata to tighten the sandbox
+for `sema workflow run`. The value uses the same syntax as the CLI
+`--sandbox` flag: `"strict"`, `"all"`, `"none"`, or comma-separated
+capabilities such as `"no-fs-write,no-network"`. Capability names may be
+written with or without the `no-` prefix (`"fs-write"` and `"no-fs-write"`
+are equivalent), but workflow docs use the `no-*` form because it reads as a
+denial list.
+
+| Value | Denies |
+|-------|--------|
+| `none` | Nothing; useful only when you want the metadata to say there is no workflow-specific tightening |
+| `strict` | `shell`, `fs-write`, `network`, `env-write`, `process`, `llm`, `serial` |
+| `all` | Every capability listed below |
+| `no-fs-read` | File, directory, import, PDF, stream-input, `http/file`, and read-side DB access |
+| `no-fs-write` | File writes/deletes/renames, output streams, KV writes, and write-side DB access |
+| `no-shell` | Calls to `shell` |
+| `no-network` | HTTP client/server operations |
+| `no-env-read` | Environment and host information reads |
+| `no-env-write` | Environment variable writes |
+| `no-process` | Process operations such as `exit`, `sys/args`, `sys/which`, and `shell` |
+| `no-llm` | LLM calls |
+| `no-serial` | Serial port operations |
+
+```sema
+(defworkflow readonly-audit
+  "Audit without writing files or using the network."
+  {:phases ["Audit"]
+   :permissions "no-fs-write,no-network"}
+
+  (phase "Audit")
+  (def files (file/list "src"))
+  {:status :success :files files})
+```
+
+Workflow permissions can only remove capabilities from the caller's sandbox;
+they cannot loosen a stricter `--sandbox` or `--allowed-paths` setting.
 
 ## `sema workflow check`
 

@@ -25,7 +25,7 @@ This file tracks larger dynamic-workflow ideas that should not be folded into th
 
 ## Permissions
 
-- Keep `:permissions` as the canonical workflow metadata key; `:perms` is only a legacy alias.
+- Keep `:permissions` as the workflow metadata key.
 - Move beyond CLI sandbox strings toward a structured permission schema, for example read-only, test-agent, patch-agent, and research-agent profiles.
 - Map workflow/agent permissions to child process sandbox flags and `--allowed-paths`.
 - Consider runtime-level enforcement for in-process workflow calls, not only CLI pre-run interpreter construction.

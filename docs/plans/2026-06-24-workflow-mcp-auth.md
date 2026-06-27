@@ -57,7 +57,7 @@ client landing. It is **not** a correctness fix and must not jump that queue.
 
 ## 2. Surface syntax — declaring required servers in `defworkflow`
 
-Declarations live in the workflow **meta map** (next to `:budget`/`:perms`/`:args`),
+Declarations live in the workflow **meta map** (next to `:budget`/`:permissions`/`:args`),
 so the requirement is **static and inspectable before the body runs** — the whole
 point of a deterministic orchestrator. A new `:mcp` key maps a local alias to a
 server spec (the same spec `mcp/connect` accepts) plus an optional `:auth` hint and

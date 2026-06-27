@@ -103,10 +103,10 @@ pub fn check_source(src: &str) -> Vec<Diag> {
 
 /// Return workflow-declared permission specs from `defworkflow` metadata.
 ///
-/// The canonical key is `:permissions`; legacy `:perms` remains an alias. Values use
-/// the same string syntax as the CLI `--sandbox` flag (`"strict"`,
-/// `"no-shell,no-network"`, etc.). Parse errors are left to the normal evaluator path;
-/// this helper only inspects forms the recover-parser could build.
+/// The metadata key is `:permissions`. Values use the same string syntax as the CLI
+/// `--sandbox` flag (`"strict"`, `"no-shell,no-network"`, etc.). Parse errors are
+/// left to the normal evaluator path; this helper only inspects forms the
+/// recover-parser could build.
 pub fn declared_permission_specs(src: &str) -> Result<Vec<String>, String> {
     let (forms, _spans, _symbol_spans, _parse_errors) =
         sema_reader::read_many_with_spans_recover(src);
@@ -144,9 +144,6 @@ fn collect_declared_permission_specs(form: &Value, out: &mut Vec<String>) -> Res
 fn permission_spec_from_meta(meta: &BTreeMap<Value, Value>) -> Result<Option<String>, String> {
     if let Some(value) = meta.get(&Value::keyword("permissions")) {
         return permission_spec_string(":permissions", value).map(Some);
-    }
-    if let Some(value) = meta.get(&Value::keyword("perms")) {
-        return permission_spec_string(":perms", value).map(Some);
     }
     Ok(None)
 }
@@ -614,23 +611,6 @@ mod tests {
     fn declared_permission_specs_reads_permissions_key() {
         let specs = declared_permission_specs(
             r#"(defworkflow d "d" {:permissions "no-fs-write"} {:status :ok})"#,
-        )
-        .unwrap();
-        assert_eq!(specs, vec!["no-fs-write"]);
-    }
-
-    #[test]
-    fn declared_permission_specs_keeps_perms_alias() {
-        let specs =
-            declared_permission_specs(r#"(defworkflow d "d" {:perms "no-network"} {:status :ok})"#)
-                .unwrap();
-        assert_eq!(specs, vec!["no-network"]);
-    }
-
-    #[test]
-    fn declared_permission_specs_prefers_permissions_over_perms() {
-        let specs = declared_permission_specs(
-            r#"(defworkflow d "d" {:perms "no-network" :permissions "no-fs-write"} {:status :ok})"#,
         )
         .unwrap();
         assert_eq!(specs, vec!["no-fs-write"]);

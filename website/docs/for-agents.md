@@ -125,6 +125,32 @@ LLM/agent operations are language primitives, not a bolted-on SDK:
 - **Concurrency** is a deterministic *cooperative* scheduler (single-threaded): `async`/`await`
   and channels, not OS threads. (Determinism is the same property cassettes give to LLM I/O.)
 
+## Dynamic workflows
+
+Use workflows for journaled, resumable multi-step agent runs. The form is the run:
+
+```sema
+(defworkflow audit
+  "Audit src without writing files."
+  {:phases ["Scan" "Report"]
+   :permissions "no-fs-write,no-network"}
+
+  (phase "Scan")                         ; marker, not a wrapper
+  (def files (checkpoint :files (file/list "src")))
+
+  (phase "Report")
+  (def summary (step "Summarize the files." {:name "reporter"}))
+  {:status :success :files files :summary summary})
+```
+
+- `phase` is a one-argument marker. Write `(phase "Scan")`, then sibling body forms.
+- `checkpoint` stores run state and resumes lazily; memoized writes do not re-evaluate.
+- Resume keys include workflow source, `--args`, phase, prompt/schema or checkpoint key.
+- Use `:permissions` for workflow sandbox restrictions. Valid values are `none`,
+  `strict`, `all`, `no-fs-read`, `no-fs-write`, `no-shell`, `no-network`,
+  `no-env-read`, `no-env-write`, `no-process`, `no-llm`, and `no-serial`.
+  Do not use abbreviated metadata keys.
+
 ## Where to look next
 
 - **Index of every page:** [`/llms.txt`](/llms.txt) — fetch a specific `/docs/**/*.md` when
