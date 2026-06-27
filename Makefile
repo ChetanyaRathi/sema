@@ -193,10 +193,11 @@ all: lint test build
 site-dev:
 	cd website && npm run dev
 
-# Regenerate per-page OpenGraph cards (public/og/*.jpg) from og-template.html.
+# Check vendored OG assets and regenerate per-page cards (public/og/*.jpg).
 # Run after editing the template, logo, page titles, or the version, then
 # commit the regenerated images before deploying.
 site-og:
+	cd website && npm run og:check
 	cd website && npm run og
 
 site-build:

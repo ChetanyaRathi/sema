@@ -2,14 +2,14 @@
 //
 // Renders the template in headless Chromium (via Playwright) at 1200x630,
 // once per page, driving its homepage/docs variants through URL query params.
-// Output: website/public/og/<slug>.png  (slug from og.shared.mjs::ogSlug)
+// Output: website/public/og/<slug>.jpg  (slug from og.shared.mjs::ogSlug)
 //
 // Usage:
 //   node scripts/generate-og.mjs            # all pages
 //   node scripts/generate-og.mjs home docs  # only matching slugs (substring)
 //
 // Re-run after editing og-template.html, the logo, page titles, or the
-// version, then commit the regenerated public/og/*.png before deploying.
+// version, then commit the regenerated public/og/*.jpg before deploying.
 
 import { chromium } from 'playwright'
 import { readFileSync, readdirSync, mkdirSync, statSync } from 'node:fs'
@@ -37,7 +37,7 @@ function semaVersion() {
 // Recursively collect every .md page under website/ (excluding node_modules).
 function collectPages(dir) {
   const out = []
-  for (const name of readdirSync(dir)) {
+  for (const name of readdirSync(dir).sort()) {
     if (name === 'node_modules' || name === '.vitepress' || name === 'public') continue
     const full = join(dir, name)
     const st = statSync(full)
@@ -171,10 +171,21 @@ const page = await browser.newPage({
   deviceScaleFactor: 1,
 })
 
+const externalRequests = []
+await page.route(/^https?:\/\//, (route) => {
+  externalRequests.push(route.request().url())
+  return route.abort('blockedbyclient')
+})
+
 let ok = 0
 for (const j of selected) {
+  const externalRequestStart = externalRequests.length
   await page.goto(templateUrl(j.params), { waitUntil: 'load' })
-  await page.waitForSelector('html[data-og-ready="1"]', { timeout: 10000 }).catch(() => {})
+  await page.waitForSelector('html[data-og-ready="1"]', { timeout: 10000 })
+  const jobExternalRequests = externalRequests.slice(externalRequestStart)
+  if (jobExternalRequests.length) {
+    throw new Error(`OG template made external request(s): ${jobExternalRequests.join(', ')}`)
+  }
   mkdirSync(dirname(j.out), { recursive: true })
   await page.screenshot({
     path: j.out,

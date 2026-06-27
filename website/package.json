@@ -6,7 +6,8 @@
     "dev": "vitepress dev",
     "build": "vitepress build",
     "preview": "vitepress preview",
-    "og": "node scripts/generate-og.mjs"
+    "og": "node scripts/generate-og.mjs",
+    "og:check": "node scripts/check-og-determinism.mjs"
   },
   "devDependencies": {
     "playwright": "1.60.0",
