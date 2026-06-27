@@ -191,7 +191,7 @@ import CustomPageLayout from './CustomPageLayout.vue'
               fails loudly, so a prompt change can't silently hit a live model.
             </p>
             <ul class="feature-list">
-              <li><strong>No API key in CI.</strong> The tape has the answers. Run <code>sema test</code> with zero secrets.</li>
+              <li><strong>No API key in CI.</strong> The tape has the answers. Run <code>sema test/agents.sema</code> with zero secrets.</li>
               <li><strong>Deterministic by design.</strong> Same input, same output, every run. LLM tests that pass reliably.</li>
               <li><strong>Drift detection.</strong> Change a prompt or model and the old tape stops matching — the failure names the call.</li>
             </ul>
@@ -204,7 +204,7 @@ import CustomPageLayout from './CustomPageLayout.vue'
               <div class="head">terminal — record &amp; replay</div>
               <div><span class="dollar">$</span> <span class="c-com"># Record: run once with a key</span></div>
               <div><span class="dollar">$</span> SEMA_LLM_CASSETTE=tapes/suite.jsonl \</div>
-              <div>&nbsp;&nbsp;semal test/agents.sema</div>
+              <div>&nbsp;&nbsp;sema test/agents.sema</div>
               <div class="out">→ recording 12 LLM calls…</div>
               <div class="ok">✓ wrote tapes/suite.jsonl (4.8 KB)</div>
               <div>&nbsp;</div>
@@ -214,7 +214,7 @@ import CustomPageLayout from './CustomPageLayout.vue'
               <div><span class="dollar">$</span> <span class="c-com"># CI: replay with no key</span></div>
               <div><span class="dollar">$</span> SEMA_LLM_CASSETTE=tapes/suite.jsonl \</div>
               <div>&nbsp;&nbsp;SEMA_LLM_CASSETTE_MODE=replay \</div>
-              <div>&nbsp;&nbsp;semal test/agents.sema</div>
+              <div>&nbsp;&nbsp;sema test/agents.sema</div>
               <div class="out">→ replaying 12 calls from tape…</div>
               <div class="ok">✓ all tests passed (0 API calls)</div>
             </div>
@@ -240,7 +240,7 @@ import CustomPageLayout from './CustomPageLayout.vue'
             <ul class="feature-list">
               <li><strong>Only answers.</strong> The model, tokens, and response are saved. Prompts and keys are not.</li>
               <li><strong>NDJSON format.</strong> One line per call. <code>git diff</code> shows exactly what changed when you re-record.</li>
-              <li><strong>Versioned.</strong> A <code>"v":1</code> field lets old tapes be migrated if the shape ever changes.</li>
+              <li><strong>Versioned.</strong> A <code>"v"</code> field supports future format changes.</li>
             </ul>
           </div>
           <div class="feature-visual">
@@ -435,7 +435,7 @@ import CustomPageLayout from './CustomPageLayout.vue'
     <section class="cta">
       <div class="wrap">
         <h2>Record your first tape in seconds.</h2>
-        <p class="sub">Wrap your LLM calls in <code>with-cassette</code>, run once, commit the tape.</p>
+        <p class="sub">Wrap your LLM calls in <code>llm/with-cassette</code>, run once, commit the tape.</p>
         <div class="install-stack">
           <div class="install-row">
             <span class="badge">curl</span>

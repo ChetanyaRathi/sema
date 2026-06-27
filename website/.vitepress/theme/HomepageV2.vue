@@ -262,7 +262,7 @@ messages = [{<span class="c-str">"role"</span>: <span class="c-str">"user"</span
           </div>
         </div>
         <p class="sub" style="margin-top:22px">
-          Eleven providers, configured from environment variables — set the key and go.
+          Eight chat providers plus embedding providers, configured from environment variables — set the key and go.
           <a href="/docs/llm/">Browse the LLM reference →</a>
         </p>
       </div>

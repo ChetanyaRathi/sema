@@ -31,7 +31,7 @@ import CustomPageLayout from './CustomPageLayout.vue'
             <button class="copy" @click="copyText('i1', $event)">copy</button>
           </span>
         </div>
-        <p class="req">Eleven providers · retries with backoff · scoped budgets · single binary</p>
+        <p class="req">Eight chat providers · retries with backoff · scoped budgets · single binary</p>
       </div>
     </header>
 
@@ -90,7 +90,7 @@ import CustomPageLayout from './CustomPageLayout.vue'
         <div class="loop-guards">
           <div class="guard">
             <span class="guard-icon">&#x21bb;</span>
-            <span><strong>Retry with backoff</strong> — 429s and 5xx retried automatically, up to 3 attempts with exponential backoff and full jitter</span>
+            <span><strong>Retry with backoff</strong> — 429s and 5xx retried automatically, up to 3 retries with exponential backoff and full jitter</span>
           </div>
           <div class="guard">
             <span class="guard-icon">$</span>
@@ -181,7 +181,7 @@ import CustomPageLayout from './CustomPageLayout.vue'
               <pre>(<span class="c-kw">defagent</span> <span class="c-fn">coder</span>
   {<span class="c-kwd">:system</span>    <span class="c-str">"You are a coding assistant."</span>
    <span class="c-kwd">:tools</span>     [read-file run-command]
-   <span class="c-kwd">:model</span>     <span class="c-str">"claude-sonnet-4"</span>
+   <span class="c-kwd">:model</span>     <span class="c-str">"claude-sonnet-4-6"</span>
    <span class="c-kwd">:max-turns</span> 10})
 
 (<span class="c-kw">llm/with-budget</span>
@@ -214,7 +214,7 @@ import CustomPageLayout from './CustomPageLayout.vue'
           <div class="form-row"><code>(llm/with-cassette "tape.jsonl" f)</code><span>record &amp; replay — deterministic tests</span></div>
         </div>
         <p class="sub" style="margin-top:22px">
-          Eleven providers, configured from environment variables — set the key and go.
+          Eight chat providers plus embedding providers, configured from environment variables — set the key and go.
           <a href="/docs/llm/">Browse the LLM reference &rarr;</a>
         </p>
       </div>
@@ -247,7 +247,7 @@ import CustomPageLayout from './CustomPageLayout.vue'
               </div>
               <pre>(<span class="c-kw">define</span> conv
   (conversation/new
-    {<span class="c-kwd">:model</span> <span class="c-str">"claude-sonnet-4"</span>}))
+    {<span class="c-kwd">:model</span> <span class="c-str">"claude-sonnet-4-6"</span>}))
 
 (<span class="c-kw">define</span> conv
   (conversation/say conv
@@ -403,7 +403,7 @@ messages = [{<span class="c-str">"role"</span>: <span class="c-str">"user"</span
   (<span class="c-kw">lambda</span> ()
     (agent/run coder <span class="c-str">"Find TODOs in src/"</span>)))</pre>
             <div class="pane-foot">
-              The tool loop, retries with backoff, rate limiting, and cost tracking
+              The tool loop, retries with backoff, and cost tracking
               live in the runtime. The spend cap is a <em>scope</em> — it can't be
               forgotten on the late-night code path.
             </div>

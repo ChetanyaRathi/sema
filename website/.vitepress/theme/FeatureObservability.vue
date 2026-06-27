@@ -168,9 +168,9 @@ import CustomPageLayout from './CustomPageLayout.vue'
               <div class="attr-label">gen_ai.response.finish_reasons</div>
               <div class="attr-value">["stop"]</div>
             </div>
-            <div class="attr-group">
+              <div class="attr-group">
               <div class="attr-label">sema.gen_ai.cache.hit</div>
-              <div class="attr-value">false</div>
+              <div class="attr-value">true</div>
             </div>
           </div>
         </div>
@@ -192,9 +192,8 @@ import CustomPageLayout from './CustomPageLayout.vue'
               and nothing is recorded.
             </p>
             <ul class="feature-list">
-              <li><strong>Network backend.</strong> <code>OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318</code> — sends spans to Jaeger, Grafana, Langfuse, any OTLP receiver.</li>
-              <li><strong>File backend.</strong> <code>SEMA_OTEL_FILE=/tmp/trace.jsonl</code> — writes spans to a local file, one JSON object per line. No backend needed.</li>
-              <li><strong>Never blocks.</strong> Telemetry is sent in the background. A slow or dead backend can't delay or crash your script.</li>
+              <li><strong>Network backend.</strong> <code>OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318</code> — sends spans to Jaeger, Grafana, Langfuse, any OTLP receiver. Telemetry is sent in the background — a slow or dead backend can't delay or crash your script.</li>
+              <li><strong>File backend.</strong> <code>SEMA_OTEL_FILE=/tmp/trace.jsonl</code> — writes spans to a local file, one JSON object per line. No network needed.</li>
             </ul>
           </div>
           <div class="feature-visual">

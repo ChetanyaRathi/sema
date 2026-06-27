@@ -32,7 +32,7 @@ import CustomPageLayout from './CustomPageLayout.vue'
             <button class="copy" @click="copyText('i1', $event)">copy</button>
           </span>
         </div>
-        <p class="req">v1.27 · MIT · Rust 2021 · 17 crates · ~116k lines</p>
+        <p class="req">v1.27.1 · MIT · Rust 2021 · 16 crates · ~125k lines</p>
       </div>
     </header>
 
@@ -84,7 +84,7 @@ import CustomPageLayout from './CustomPageLayout.vue'
             </div>
             <div class="feature-bite">
               <span class="bite-label">Error handling</span>
-              <p><code>try</code>/<code>catch</code>/<code>throw</code> — caught errors are structured maps with <code>:type</code>, <code>:message</code>, <code>:stack-trace</code>.</p>
+              <p><code>try</code>/<code>catch</code>/<code>throw</code> — caught errors are structured maps with <code>:type</code>, <code>:message</code>, and <code>:value</code>.</p>
             </div>
             <div class="feature-bite">
               <span class="bite-label">Async</span>
@@ -113,7 +113,6 @@ import CustomPageLayout from './CustomPageLayout.vue'
               <span class="type-tag">Integer</span>
               <span class="type-tag">Float</span>
               <span class="type-tag">String</span>
-              <span class="type-tag">F-String</span>
               <span class="type-tag">Boolean</span>
               <span class="type-tag">Nil</span>
               <span class="type-tag">Symbol</span>
@@ -235,7 +234,7 @@ import CustomPageLayout from './CustomPageLayout.vue'
               of its idea.
             </p>
             <ul class="feature-list">
-              <li><strong>Eleven providers.</strong> Anthropic, OpenAI, Gemini, Groq, xAI, Mistral, Moonshot, Ollama — auto-configured from environment variables.</li>
+              <li><strong>Eight chat providers.</strong> Anthropic, OpenAI, Gemini, Groq, xAI, Mistral, Moonshot, Ollama — auto-configured from environment variables. Plus Jina, Voyage, and Cohere for embeddings.</li>
               <li><strong>Tools &amp; agents.</strong> <code>deftool</code> defines a function with a schema. <code>defagent</code> defines a system prompt + tools + turn limit. <code>agent/run</code> handles the loop.</li>
               <li><strong>Conversations as data.</strong> Immutable, forkable, inspectable. <code>conversation/say</code> returns a new value — the old one is untouched.</li>
               <li><strong>Cassettes.</strong> Record LLM calls to a file, replay them forever. Deterministic tests without API keys.</li>
@@ -347,7 +346,7 @@ import CustomPageLayout from './CustomPageLayout.vue'
             <ul class="feature-list">
               <li><strong>Single-threaded.</strong> <code>Rc</code>-based values, no cross-thread sharing. Parallelism is at the LLM-call level, not the compute level.</li>
               <li><strong>No GC.</strong> Deterministic destruction via reference counting. Memory is freed the moment the last reference drops.</li>
-              <li><strong>17 crates.</strong> Strict dependency ordering: <code>sema-core ← sema-reader ← sema-vm ← sema-eval ← sema</code>. Stdlib and LLM depend on core, not eval — dependency inversion via callbacks.</li>
+              <li><strong>16 crates.</strong> Strict dependency ordering: <code>sema-core ← sema-reader ← sema-vm ← sema-eval ← sema</code>. Stdlib and LLM depend on core, not eval — dependency inversion via callbacks.</li>
               <li><strong>Bytecode format.</strong> <code>.semac</code> files with a 24-byte header, string table, function table, main chunk. <code>sema build</code> embeds the runtime + bytecode into a standalone binary.</li>
             </ul>
             <p class="sub" style="margin-top:18px">
@@ -430,8 +429,8 @@ import CustomPageLayout from './CustomPageLayout.vue'
               <div class="bc-value-box">
                 <div class="bc-value-label">NaN-boxed Value</div>
                 <div class="bc-value-visual">
-                  <div class="bc-value-part bc-value-tag"><span>tag</span><em>13 bits</em></div>
-                  <div class="bc-value-part bc-value-payload"><span>payload</span><em>48 bits</em></div>
+                  <div class="bc-value-part bc-value-tag"><span>tag</span><em>6 bits</em></div>
+                  <div class="bc-value-part bc-value-payload"><span>payload</span><em>45 bits</em></div>
                 </div>
                 <div class="bc-value-note"><code>struct Value(u64)</code> — every type in 8 bytes</div>
               </div>

@@ -15,7 +15,7 @@ import CustomPageLayout from './CustomPageLayout.vue'
         <p class="lede">
           A Jupyter-inspired notebook built into the Sema toolchain. Write code in
           cells, evaluate them individually or all at once, and see results inline —
-          including <strong>LLM outputs with cost and timing</strong>. All in the
+          including <strong>LLM outputs with timing and token usage</strong>. All in the
           browser, all backed by the same runtime.
         </p>
         <div class="hero-actions">
@@ -109,7 +109,7 @@ import CustomPageLayout from './CustomPageLayout.vue'
             <div class="nb-output">
               <div class="out-stdout">Classifying 3 texts via llm/extract…</div>
               <div class="out-value">[{<span class="c-kwd">:sentiment</span> <span class="c-str">"positive"</span>} {<span class="c-kwd">:sentiment</span> <span class="c-str">"negative"</span>} {<span class="c-kwd">:sentiment</span> <span class="c-str">"neutral"</span>}]</div>
-              <div class="out-meta">847ms · $0.0021 · claude-sonnet-4</div>
+              <div class="out-meta">847ms · 152 tok · claude-sonnet-4-6</div>
             </div>
 
             <!-- Insert cell hover indicator -->
@@ -330,7 +330,7 @@ import CustomPageLayout from './CustomPageLayout.vue'
             <h2>Run without a browser.</h2>
             <p class="sub">
               The same notebook you iterate on in the browser runs headless in CI.
-              Evaluate all cells, print stdout to the terminal, and export to
+              Evaluate all code cells, print stdout to the terminal, and export to
               Markdown for reports. No UI required — the notebook format is just
               JSON.
             </p>
@@ -344,12 +344,12 @@ import CustomPageLayout from './CustomPageLayout.vue'
             <div class="term">
               <div class="head">terminal — CI pipeline</div>
               <div><span class="dollar">$</span> sema notebook run sentiment.sema-nb</div>
-              <div class="out">→ evaluating 6 cells…</div>
+              <div class="out">→ evaluating 4 code cells…</div>
               <div class="out">→ [1] 3 items (4ms)</div>
               <div class="out">→ [2] classify defined (12ms)</div>
-              <div class="out">→ [3] [{:sentiment "positive"} …] (847ms, $0.0021)</div>
+              <div class="out">→ [3] [{:sentiment "positive"} …] (847ms, 152 tok)</div>
               <div class="out">→ [4] 3 (1ms)</div>
-              <div class="ok">✓ all cells passed</div>
+              <div class="ok">✓ all code cells passed</div>
               <div>&nbsp;</div>
               <div><span class="dollar">$</span> sema notebook export sentiment.sema-nb -o report.md</div>
               <div class="out">→ wrote report.md (2.1 KB)</div>
