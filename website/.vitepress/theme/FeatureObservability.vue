@@ -57,11 +57,14 @@ import CustomPageLayout from './CustomPageLayout.vue'
 
           <!-- timeline ruler -->
           <div class="trace-ruler">
-            <div class="ruler-tick" style="left: 0%">0</div>
-            <div class="ruler-tick" style="left: 25%">212</div>
-            <div class="ruler-tick" style="left: 50%">424</div>
-            <div class="ruler-tick" style="left: 75%">635</div>
-            <div class="ruler-tick" style="left: 100%">847ms</div>
+            <div class="trace-ruler-spacer"></div>
+            <div class="trace-ruler-track">
+              <div class="ruler-tick" style="left: 0%">0</div>
+              <div class="ruler-tick" style="left: 25%">212</div>
+              <div class="ruler-tick" style="left: 50%">424</div>
+              <div class="ruler-tick" style="left: 75%">635</div>
+              <div class="ruler-tick" style="left: 100%">847ms</div>
+            </div>
           </div>
 
           <div class="trace-tree">
@@ -461,14 +464,25 @@ import CustomPageLayout from './CustomPageLayout.vue'
 .trace-duration { color: var(--text); }
 .trace-spans { color: var(--dim); margin-left: auto; }
 
-/* timeline ruler */
+/* timeline ruler — spacer matches span-track offset (tree pad + indent + content pad + label + gap) */
 .trace-ruler {
   position: relative;
   height: 22px;
-  margin-left: 180px;
-  padding: 0 18px;
   border-bottom: 1px solid var(--border-lo);
   background: var(--surface);
+  display: flex;
+}
+
+.trace-ruler-spacer {
+  flex-shrink: 0;
+  width: 206px;
+  border-right: 1px solid var(--border-lo);
+}
+
+.trace-ruler-track {
+  flex: 1;
+  position: relative;
+  margin-right: 18px;
 }
 
 .ruler-tick {
@@ -490,43 +504,23 @@ import CustomPageLayout from './CustomPageLayout.vue'
   display: flex;
   flex-direction: column;
   gap: 3px;
-  position: relative;
-}
-
-/* faint vertical grid lines aligned to the ruler */
-.trace-tree::before {
-  content: "";
-  position: absolute;
-  top: 0;
-  bottom: 0;
-  left: 198px;
-  right: 18px;
-  background-image:
-    linear-gradient(to right, transparent calc(25% - 1px), var(--border-lo) calc(25% - 1px), var(--border-lo) 25%, transparent 25%),
-    linear-gradient(to right, transparent calc(50% - 1px), var(--border-lo) calc(50% - 1px), var(--border-lo) 50%, transparent 50%),
-    linear-gradient(to right, transparent calc(75% - 1px), var(--border-lo) calc(75% - 1px), var(--border-lo) 75%, transparent 75%);
-  pointer-events: none;
-  opacity: 0.5;
 }
 
 .span-row {
   display: flex;
   align-items: center;
   gap: 0;
-  position: relative;
 }
 
 .span-indent {
-  width: 20px;
+  width: 18px;
   flex-shrink: 0;
   border-left: 1px solid var(--border);
-  height: 28px;
-  margin-left: 8px;
+  align-self: stretch;
+  margin-right: 0;
 }
 
-.span-child .span-indent { width: 20px; }
-.span-nested .span-indent { width: 20px; border-left: 1px dashed var(--border-lo); }
-
+.span-nested .span-indent { border-left: 1px dashed var(--border-lo); }
 .span-root .span-indent { border-left: none; width: 0; }
 
 .span-content {
@@ -534,7 +528,8 @@ import CustomPageLayout from './CustomPageLayout.vue'
   align-items: center;
   flex: 1;
   min-width: 0;
-  gap: 12px;
+  gap: 10px;
+  padding-left: 10px;
 }
 
 .span-label {
@@ -543,9 +538,7 @@ import CustomPageLayout from './CustomPageLayout.vue'
   color: var(--text);
   white-space: nowrap;
   flex-shrink: 0;
-  width: 130px;
-  overflow: hidden;
-  text-overflow: ellipsis;
+  width: 150px;
 }
 
 .span-attr {
@@ -558,6 +551,22 @@ import CustomPageLayout from './CustomPageLayout.vue'
   position: relative;
   height: 22px;
   min-width: 0;
+}
+
+/* faint vertical grid lines inside the track area */
+.span-track::before {
+  content: "";
+  position: absolute;
+  top: -12px;
+  bottom: -3px;
+  left: 0;
+  right: 0;
+  background-image:
+    linear-gradient(to right, transparent calc(25% - 1px), var(--border-lo) calc(25% - 1px), var(--border-lo) 25%, transparent 25%),
+    linear-gradient(to right, transparent calc(50% - 1px), var(--border-lo) calc(50% - 1px), var(--border-lo) 50%, transparent 50%),
+    linear-gradient(to right, transparent calc(75% - 1px), var(--border-lo) calc(75% - 1px), var(--border-lo) 75%, transparent 75%);
+  pointer-events: none;
+  opacity: 0.4;
 }
 
 .span-bar {
@@ -574,6 +583,7 @@ import CustomPageLayout from './CustomPageLayout.vue'
   background: var(--bg);
   border: 1px solid var(--border-lo);
   overflow: hidden;
+  z-index: 1;
 }
 
 .span-bar-llm {
@@ -860,16 +870,8 @@ import CustomPageLayout from './CustomPageLayout.vue'
 
   .trace-attrs { grid-template-columns: 1fr 1fr; }
 
-  .trace-ruler { margin-left: 0; }
-
-  .span-label {
-    width: 100px;
-    font-size: 10px;
-  }
-
-  .trace-tree::before { left: 118px; }
-
-  .span-child { padding-left: 0; }
-  .span-nested { padding-left: 0; }
+  .trace-ruler-spacer { width: 152px; }
+  .span-label { width: 100px; font-size: 10px; }
+  .span-content { padding-left: 8px; gap: 8px; }
 }
 </style>
