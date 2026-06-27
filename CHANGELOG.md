@@ -31,8 +31,8 @@
 - **`llm/extract` and `llm/classify` are now sandbox-gated with `Caps::LLM`.**
   Previously only `llm/extract-from-image` was gated. Text-based extraction
   and classification made LLM API calls even when the sandbox denied `Caps::LLM`.
-- **Dynamic workflows.** `defworkflow` / `phase` / `agent` / `checkpoint` /
-  `parallel` / `pipeline` — a journaled, resumable agent-pipeline runtime.
+- **Dynamic workflows.** `defworkflow` / `phase` / `step` / `checkpoint` /
+  `parallel` / `pipeline` — a journaled, resumable agentic-workflow runtime.
   Define multi-phase LLM workflows as ordinary Sema code; the runtime journals
   every event to a frozen JSONL run directory (`.sema/runs/<run-id>/`), enforces
   budget caps (`:tokens` / `:usd`), and supports `--resume` via content-keyed
