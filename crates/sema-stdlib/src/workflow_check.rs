@@ -8,14 +8,14 @@
 //! `phase` is a one-argument marker.
 //!
 //! Design (kept deliberately simple): one recursive visitor carries an `in_workflow` flag.
-//! Marker checks (`phase`/`checkpoint`/`step`/`parallel`/`pipeline`) fire ONLY inside a
+//! Marker checks (`phase`/`checkpoint`/`agent`/`parallel`/`pipeline`) fire ONLY inside a
 //! `defworkflow` body, so a bare top-level `(parallel …)`/`(checkpoint …)` in an ordinary
 //! library file never trips a workflow-only diagnostic. Arities mirror the runtime
 //! (`crates/sema-stdlib/src/workflow.rs`) verbatim so static and dynamic never disagree.
 //!
 //! Diagnostics carry a source span when one is available. The reader keys its `SpanMap` by
 //! the `Rc` pointer of each LIST/VECTOR form (map literals and atoms get none), so a
-//! diagnostic about a map (bad step opts, the trailing `:status` map) is anchored to its
+//! diagnostic about a map (bad agent opts, the trailing `:status` map) is anchored to its
 //! enclosing list form, which always has a span.
 
 use sema_core::{Span, SpanMap, Value};
@@ -268,21 +268,21 @@ fn walk_markers(form: &Value, spans: &SpanMap, out: &mut Vec<Diag>) {
                     ));
                 }
             }
-            // step needs at least a prompt; if opts are given, validate the map.
-            "step" => {
+            // agent needs at least a prompt; if opts are given, validate the map.
+            "agent" => {
                 if items.len() < 2 {
                     out.push(Diag::error(
                         span,
-                        "E-STEP-ARITY",
-                        "step needs at least a prompt argument",
+                        "E-AGENT-ARITY",
+                        "agent needs at least a prompt argument",
                     ));
                 } else if let Some(opts) = items.get(2).and_then(|v| v.as_map_rc()) {
                     if let Some(name) = opts.get(&Value::keyword("name")) {
                         if name.as_str().is_none() {
                             out.push(Diag::warn(
                                 span,
-                                "W-STEP-NAME",
-                                "step :name should be a string",
+                                "W-AGENT-NAME",
+                                "agent :name should be a string",
                             ));
                         }
                     }
@@ -290,28 +290,28 @@ fn walk_markers(form: &Value, spans: &SpanMap, out: &mut Vec<Diag>) {
                         if tools.as_seq().is_none() {
                             out.push(Diag::warn(
                                 span,
-                                "W-STEP-TOOLS",
-                                "step :tools should be a list/vector of tools",
+                                "W-AGENT-TOOLS",
+                                "agent :tools should be a list/vector of tools",
                             ));
                         }
                     }
                     // :agent runs a configured defagent and owns its own tools/model; the
-                    // step must not also declare inline :tools/:model (they'd be ignored —
+                    // agent must not also declare inline :tools/:model (they'd be ignored —
                     // the routing takes the :agent branch). Warn so the author picks one.
                     let has_agent = opts.contains_key(&Value::keyword("agent"));
                     if has_agent {
                         if opts.contains_key(&Value::keyword("tools")) {
                             out.push(Diag::warn(
                                 span,
-                                "W-STEP-AGENT-TOOLS",
-                                "step :agent owns its own tools; inline :tools is ignored",
+                                "W-AGENT-DEFAGENT-TOOLS",
+                                "agent :agent owns its own tools; inline :tools is ignored",
                             ));
                         }
                         if opts.contains_key(&Value::keyword("model")) {
                             out.push(Diag::warn(
                                 span,
-                                "W-STEP-AGENT-MODEL",
-                                "step :agent owns its own model; inline :model is ignored",
+                                "W-AGENT-DEFAGENT-MODEL",
+                                "agent :agent owns its own model; inline :model is ignored",
                             ));
                         }
                     }
@@ -565,28 +565,28 @@ mod tests {
     }
 
     #[test]
-    fn step_arity_and_opts_are_checked() {
-        // no prompt → E-STEP-ARITY
+    fn agent_arity_and_opts_are_checked() {
+        // no prompt → E-AGENT-ARITY
         assert!(
-            codes(r#"(defworkflow d "d" {} (phase "P") (step) {:status :ok})"#)
-                .contains(&"E-STEP-ARITY")
+            codes(r#"(defworkflow d "d" {} (phase "P") (agent) {:status :ok})"#)
+                .contains(&"E-AGENT-ARITY")
         );
         // bad :name / :tools opts → warnings
         let c = codes(
-            r#"(defworkflow d "d" {} (phase "P") (step "go" {:name 1 :tools "x"}) {:status :ok})"#,
+            r#"(defworkflow d "d" {} (phase "P") (agent "go" {:name 1 :tools "x"}) {:status :ok})"#,
         );
-        assert!(c.contains(&"W-STEP-NAME"), "got {c:?}");
-        assert!(c.contains(&"W-STEP-TOOLS"), "got {c:?}");
+        assert!(c.contains(&"W-AGENT-NAME"), "got {c:?}");
+        assert!(c.contains(&"W-AGENT-TOOLS"), "got {c:?}");
     }
 
     #[test]
-    fn step_agent_with_inline_tools_or_model_warns() {
+    fn agent_defagent_with_inline_tools_or_model_warns() {
         // :agent owns its own tools/model — declaring inline :tools/:model is a mistake.
         let c = codes(
-            r#"(defworkflow d "d" {} (phase "P") (step "go" {:agent a :tools [t] :model "m"}) {:status :ok})"#,
+            r#"(defworkflow d "d" {} (phase "P") (agent "go" {:agent a :tools [t] :model "m"}) {:status :ok})"#,
         );
-        assert!(c.contains(&"W-STEP-AGENT-TOOLS"), "got {c:?}");
-        assert!(c.contains(&"W-STEP-AGENT-MODEL"), "got {c:?}");
+        assert!(c.contains(&"W-AGENT-DEFAGENT-TOOLS"), "got {c:?}");
+        assert!(c.contains(&"W-AGENT-DEFAGENT-MODEL"), "got {c:?}");
     }
 
     #[test]
