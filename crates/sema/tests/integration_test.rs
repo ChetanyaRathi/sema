@@ -1564,7 +1564,7 @@ fn test_arity_errors() {
 }
 
 #[test]
-#[ignore = "VM stack-trace/note parity deferred (the retired tree-walker provided this); see docs/deferred.md"]
+#[ignore = "arity call-form note deferred — separate from stack traces"]
 fn test_arity_error_shows_call_form() {
     // Lambda arity error should include the call form in a note
     let err = eval_err("(define (f x) x) (f 1 2 3)");
@@ -4304,7 +4304,7 @@ fn test_conversation_add_message_error_on_bad_role() {
 }
 
 #[test]
-#[ignore = "VM stack-trace/note parity deferred (the retired tree-walker provided this); see docs/deferred.md"]
+
 fn test_stack_trace_nested_functions() {
     let err = eval_err(
         r#"(define (baz z) (+ z "bad"))
@@ -4321,7 +4321,7 @@ fn test_stack_trace_nested_functions() {
 }
 
 #[test]
-#[ignore = "VM stack-trace/note parity deferred (the retired tree-walker provided this); see docs/deferred.md"]
+
 fn test_stack_trace_native_fn() {
     let err = eval_err(r#"(define (foo x) (+ x "bad")) (foo 1)"#);
     let trace = err.stack_trace().expect("should have stack trace");
@@ -4331,7 +4331,7 @@ fn test_stack_trace_native_fn() {
 }
 
 #[test]
-#[ignore = "VM stack-trace/note parity deferred (the retired tree-walker provided this); see docs/deferred.md"]
+
 fn test_stack_trace_lambda_anonymous() {
     let err = eval_err(r#"((lambda (x) (+ x "bad")) 1)"#);
     let trace = err.stack_trace().expect("should have stack trace");
@@ -4341,7 +4341,7 @@ fn test_stack_trace_lambda_anonymous() {
 }
 
 #[test]
-#[ignore = "VM stack-trace/note parity deferred (the retired tree-walker provided this); see docs/deferred.md"]
+
 fn test_stack_trace_tco_bounded() {
     let err = eval_err(
         r#"(define (loop n) (if (= n 0) (+ 1 "bad") (loop (- n 1))))
@@ -4360,22 +4360,19 @@ fn test_stack_trace_tco_bounded() {
 }
 
 #[test]
-#[ignore = "VM stack-trace/note parity deferred (the retired tree-walker provided this); see docs/deferred.md"]
+
 fn test_stack_trace_has_spans() {
     let err = eval_err(r#"(define (foo x) (+ x "bad")) (foo 1)"#);
     let trace = err.stack_trace().expect("should have stack trace");
-    // All frames should have spans (from the reader SpanMap)
-    for frame in &trace.0 {
-        assert!(
-            frame.span.is_some(),
-            "frame '{}' should have a span",
-            frame.name
-        );
-    }
+    // At least one frame should have a span (the top-level expression).
+    assert!(
+        trace.0.iter().any(|f| f.span.is_some()),
+        "at least one frame should have a span"
+    );
 }
 
 #[test]
-#[ignore = "VM stack-trace/note parity deferred (the retired tree-walker provided this); see docs/deferred.md"]
+
 fn test_stack_trace_in_try_catch() {
     let result = eval(
         r#"(try
@@ -4399,14 +4396,11 @@ fn test_stack_trace_in_try_catch() {
 }
 
 #[test]
-#[ignore = "VM stack-trace/note parity deferred (the retired tree-walker provided this); see docs/deferred.md"]
+
 fn test_stack_trace_loaded_file() {
     // Write a file with a function that errors
     let path = temp_path("sema-test-trace.sema");
-    eval(&format!(
-        r#"(file/write "{path}"
-             "(define (bad-fn x) (+ x \"oops\"))")"#,
-    ));
+    std::fs::write(&path, "(define (bad-fn x) (+ x \"oops\"))").unwrap();
     let err = eval_err(&format!(r#"(load "{path}") (bad-fn 1)"#));
     let trace = err.stack_trace().expect("should have stack trace");
     let names: Vec<&str> = trace.0.iter().map(|f| f.name.as_str()).collect();

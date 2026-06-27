@@ -140,7 +140,13 @@ impl Interpreter {
             expanded.push(expand_for_vm_in(&self.ctx, globals, expr)?);
         }
         let known_natives = collect_native_names(globals);
-        let prog = sema_vm::compile_program(&expanded, Some(known_natives))?;
+        let span_map = self.ctx.span_table.borrow().clone();
+        let prog = sema_vm::compile_program_with_spans_and_natives(
+            &expanded,
+            &span_map,
+            None,
+            Some(known_natives),
+        )?;
         let mut vm = sema_vm::VM::new(
             globals.clone(),
             prog.functions,

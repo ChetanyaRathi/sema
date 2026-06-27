@@ -4,12 +4,13 @@ use std::rc::Rc;
 
 use sema_core::{
     bits_to_spur,
-    error::{suggest_similar, veteran_hint},
+    error::{suggest_similar, veteran_hint, CallFrame as CoreCallFrame, StackTrace},
     resolve as resolve_spur, Env, EvalContext, NativeFn, SemaError, Spur, Value, ValueViewRef,
     NAN_INT_SMALL_PATTERN, NAN_PAYLOAD_BITS, NAN_PAYLOAD_MASK, NAN_TAG_MASK, TAG_NATIVE_FN,
 };
 
 use crate::chunk::Function;
+use crate::opcodes::Op;
 use crate::opcodes::op;
 
 const DEBUG_VALUE_REF_BASE: u64 = crate::debug::DEBUG_VALUE_REF_BASE;
@@ -3050,11 +3051,62 @@ impl VM {
 
     #[cold]
     #[inline(never)]
+    /// Capture the current VM call stack as a `StackTrace` for error reporting.
+    ///
+    /// Walks `self.frames` top-to-bottom (innermost first), mirroring
+    /// `debug_stack_trace` but producing `sema_core::CallFrame` instead of
+    /// `DapStackFrame`. For the innermost frame, decodes the opcode at
+    /// `failing_pc` to synthesize a leading intrinsic frame (e.g. `+`, `car`)
+    /// when the error originated from an inline opcode rather than a function
+    /// call.
+    fn capture_vm_stack_trace(&self, failing_pc: usize) -> StackTrace {
+        let mut frames: Vec<CoreCallFrame> = Vec::new();
+
+        // Try to synthesize an intrinsic frame for the innermost opcode.
+        if let Some(top) = self.frames.last() {
+            let code = &top.closure.func.chunk.code;
+            if failing_pc < code.len() {
+                let opcode = Op::from_u8(code[failing_pc]);
+                if let Some(name) = opcode.and_then(intrinsic_name) {
+                    let span = self.span_at_pc_raw(top, failing_pc);
+                    frames.push(CoreCallFrame {
+                        name: name.to_string(),
+                        file: top.closure.func.source_file.clone(),
+                        span,
+                    });
+                }
+            }
+        }
+
+        // Walk frames innermost-to-outermost.
+        for (i, frame) in self.frames.iter().rev().enumerate() {
+            let func = &frame.closure.func;
+            let name = func
+                .name
+                .map(resolve_spur)
+                .unwrap_or_else(|| "<lambda>".to_string());
+            // Use failing_pc for the innermost frame, frame.pc for the rest.
+            let pc = if i == 0 { failing_pc } else { frame.pc };
+            let span = self.span_at_pc_raw(frame, pc);
+            frames.push(CoreCallFrame {
+                name,
+                file: func.source_file.clone(),
+                span,
+            });
+        }
+
+        StackTrace(frames)
+    }
+
     fn handle_exception(
         &mut self,
-        err: SemaError,
+        mut err: SemaError,
         failing_pc: usize,
     ) -> Result<ExceptionAction, SemaError> {
+        // Capture the stack trace before unwinding frames.
+        let trace = self.capture_vm_stack_trace(failing_pc);
+        err = err.with_stack_trace(trace);
+
         let mut pc_for_lookup = failing_pc as u32;
         // Walk frames from top looking for a handler. Stop at `frame_floor`:
         // during a re-entrant nested run (run_nested_closure) the frames below
@@ -3443,19 +3495,20 @@ impl VM {
     }
 
     fn span_at_pc(&self, frame: &CallFrame) -> (u64, u64) {
-        let pc32 = frame.pc as u32;
+        match self.span_at_pc_raw(frame, frame.pc) {
+            Some(span) => (span.line as u64, span.col as u64 + 1),
+            None => (0, 0),
+        }
+    }
+
+    /// Resolve a `Span` from the chunk's span table at a given PC.
+    fn span_at_pc_raw(&self, frame: &CallFrame, pc: usize) -> Option<sema_core::error::Span> {
+        let pc32 = pc as u32;
         let spans = &frame.closure.func.chunk.spans;
-        // Find the most recent span at or before the current PC
         match spans.binary_search_by_key(&pc32, |(p, _)| *p) {
-            Ok(idx) => {
-                let span = &spans[idx].1;
-                (span.line as u64, span.col as u64 + 1)
-            }
-            Err(idx) if idx > 0 => {
-                let span = &spans[idx - 1].1;
-                (span.line as u64, span.col as u64 + 1)
-            }
-            _ => (0, 0),
+            Ok(idx) => Some(spans[idx].1.clone()),
+            Err(idx) if idx > 0 => Some(spans[idx - 1].1.clone()),
+            _ => None,
         }
     }
 
@@ -3765,7 +3818,73 @@ fn error_to_value(err: &SemaError) -> Value {
             unreachable!("inner() already unwraps these")
         }
     }
+
+    // Serialize stack trace if present
+    if let Some(trace) = err.stack_trace() {
+        let frames: Vec<Value> = trace
+            .0
+            .iter()
+            .map(|frame| {
+                let mut fm = BTreeMap::new();
+                fm.insert(Value::keyword("name"), Value::string(&frame.name));
+                if let Some(file) = &frame.file {
+                    fm.insert(
+                        Value::keyword("file"),
+                        Value::string(&file.display().to_string()),
+                    );
+                }
+                if let Some(span) = &frame.span {
+                    fm.insert(Value::keyword("line"), Value::int(span.line as i64));
+                    fm.insert(Value::keyword("col"), Value::int(span.col as i64));
+                }
+                Value::map(fm)
+            })
+            .collect();
+        map.insert(Value::keyword("stack-trace"), Value::list(frames));
+    }
+
     Value::map(map)
+}
+
+// --- Stack trace intrinsic name mapping ---
+
+/// Map an inline opcode to its Sema-level name for stack trace frames.
+/// Returns `None` for opcodes that don't correspond to a user-visible
+/// operation (e.g. `Const`, `Pop`, `Jump`).
+fn intrinsic_name(opcode: Op) -> Option<&'static str> {
+    match opcode {
+        Op::Add | Op::AddInt => Some("+"),
+        Op::Sub | Op::SubInt => Some("-"),
+        Op::Mul | Op::MulInt => Some("*"),
+        Op::Div => Some("/"),
+        Op::Mod => Some("mod"),
+        Op::Negate => Some("-"),
+        Op::Not => Some("not"),
+        Op::Eq | Op::EqInt => Some("="),
+        Op::Lt | Op::LtInt => Some("<"),
+        Op::Gt => Some(">"),
+        Op::Le => Some("<="),
+        Op::Ge => Some(">="),
+        Op::Car => Some("car"),
+        Op::Cdr => Some("cdr"),
+        Op::Cons => Some("cons"),
+        Op::IsNull => Some("null?"),
+        Op::IsPair => Some("pair?"),
+        Op::IsList => Some("list?"),
+        Op::IsNumber => Some("number?"),
+        Op::IsString => Some("string?"),
+        Op::IsSymbol => Some("symbol?"),
+        Op::Length => Some("length"),
+        Op::Append => Some("append"),
+        Op::Get => Some("get"),
+        Op::ContainsQ => Some("contains?"),
+        Op::Nth => Some("nth"),
+        Op::StringLength => Some("string-length"),
+        Op::StringRef => Some("string-ref"),
+        Op::StringAppend => Some("string-append"),
+        Op::Throw => Some("throw"),
+        _ => None,
+    }
 }
 
 // --- Arithmetic helpers ---
@@ -3892,6 +4011,15 @@ pub fn compile_program_with_spans(
     span_map: &sema_core::SpanMap,
     source_file: Option<std::path::PathBuf>,
 ) -> Result<CompiledProgram, SemaError> {
+    compile_program_with_spans_and_natives(vals, span_map, source_file, None)
+}
+
+pub fn compile_program_with_spans_and_natives(
+    vals: &[Value],
+    span_map: &sema_core::SpanMap,
+    source_file: Option<std::path::PathBuf>,
+    known_natives: Option<std::collections::HashSet<Spur>>,
+) -> Result<CompiledProgram, SemaError> {
     let source_file = source_file.map(|p| std::fs::canonicalize(&p).unwrap_or(p));
     let mut resolved = Vec::new();
     let mut total_locals: u16 = 0;
@@ -3902,7 +4030,7 @@ pub fn compile_program_with_spans(
         total_locals = total_locals.max(n);
         resolved.push(res);
     }
-    let result = crate::compiler::compile(&resolved, total_locals, None)?;
+    let result = crate::compiler::compile(&resolved, total_locals, known_natives)?;
 
     let functions: Vec<Rc<Function>> = result
         .functions
@@ -3937,7 +4065,7 @@ pub fn compile_program_with_spans(
     Ok(CompiledProgram {
         closure,
         functions,
-        native_table: Vec::new(),
+        native_table: result.native_table,
         main_cache_slots,
     })
 }
