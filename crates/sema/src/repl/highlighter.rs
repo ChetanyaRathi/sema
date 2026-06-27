@@ -4,6 +4,8 @@ use sema_core::SemaError;
 use sema_eval::SPECIAL_FORM_NAMES;
 use sema_reader::lexer::{tokenize, SpannedToken, Token};
 
+use crate::colors::enabled_stdout;
+
 // Sema brand palette from `crates/sema/src/colors.rs` / `website/.vitepress/theme/BrandGuide.vue`.
 const GOLD: Color = Color::Rgb(200, 168, 85);
 const SAGE: Color = Color::Rgb(168, 196, 122);
@@ -53,6 +55,7 @@ impl Highlighter for SemaHighlighter {
         let (match_a, match_b) = matching_bracket_indices(&tokens, cursor);
 
         let mut last_end: usize = 0;
+        let mut next_symbol_is_fn = false;
         for (idx, tok) in tokens.iter().enumerate() {
             // Emit any whitespace between the previous token and this one
             // as plain text so cursor positioning stays accurate.
@@ -60,9 +63,18 @@ impl Highlighter for SemaHighlighter {
                 out.push((Style::default(), line[last_end..tok.byte_start].to_string()));
             }
 
+            let is_fn_position = next_symbol_is_fn && matches!(tok.token, Token::Symbol(_));
+            if is_fn_position {
+                next_symbol_is_fn = false;
+            }
+
             let segment = &line[tok.byte_start..tok.byte_end];
-            let style = style_for(&tok.token, idx, match_a, match_b);
+            let style = style_for(&tok.token, idx, match_a, match_b, is_fn_position);
             out.push((style, segment.to_string()));
+
+            if matches!(tok.token, Token::LParen | Token::ShortLambdaStart) {
+                next_symbol_is_fn = true;
+            }
 
             last_end = tok.byte_end;
         }
@@ -76,7 +88,13 @@ impl Highlighter for SemaHighlighter {
     }
 }
 
-fn style_for(token: &Token, idx: usize, match_a: Option<usize>, match_b: Option<usize>) -> Style {
+fn style_for(
+    token: &Token,
+    idx: usize,
+    match_a: Option<usize>,
+    match_b: Option<usize>,
+    is_fn_position: bool,
+) -> Style {
     let is_match_partner = Some(idx) == match_a || Some(idx) == match_b;
 
     let base = match token {
@@ -88,6 +106,9 @@ fn style_for(token: &Token, idx: usize, match_a: Option<usize>, match_b: Option<
         Token::Symbol(name) => {
             if SPECIAL_FORM_NAMES.contains(&name.as_str()) {
                 Style::new().fg(GOLD).bold()
+            } else if is_fn_position {
+                // First symbol after '(' (or '#(') is the called function/operator.
+                Style::new().fg(GOLD)
             } else {
                 Style::default()
             }
@@ -110,6 +131,51 @@ fn style_for(token: &Token, idx: usize, match_a: Option<usize>, match_b: Option<
     } else {
         base
     }
+}
+
+/// Highlight Sema code blocks inside a Markdown doc string.
+///
+/// Fenced blocks tagged `sema` get inline syntax highlighting; the fence
+/// lines themselves are dimmed so they recede. Everything else is passed
+/// through unchanged. Returns the original string when ANSI colors are
+/// disabled (`NO_COLOR` set or stdout is not a terminal).
+pub fn highlight_doc_markdown(md: &str) -> String {
+    highlight_doc_markdown_inner(md, enabled_stdout())
+}
+
+fn highlight_doc_markdown_inner(md: &str, color: bool) -> String {
+    if !color {
+        return md.to_string();
+    }
+
+    let fence_style = Style::new().fg(TERTIARY);
+    let highlighter = SemaHighlighter::new();
+    let mut out = String::with_capacity(md.len() * 2);
+    let mut in_sema_block = false;
+
+    for line in md.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("```sema") {
+            in_sema_block = true;
+            out.push_str(&fence_style.paint(line).to_string());
+            out.push('\n');
+        } else if in_sema_block && trimmed.starts_with("```") {
+            in_sema_block = false;
+            out.push_str(&fence_style.paint(line).to_string());
+            out.push('\n');
+        } else if in_sema_block {
+            let styled = highlighter.highlight(line, 0);
+            for (style, text) in &styled.buffer {
+                out.push_str(&style.paint(text).to_string());
+            }
+            out.push('\n');
+        } else {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+
+    out
 }
 
 /// Given the tokens of the buffer and the cursor position, return the
@@ -317,6 +383,71 @@ mod tests {
     }
 
     #[test]
+    fn function_position_symbol_is_gold() {
+        let styled = SemaHighlighter.highlight("(agent/name greeter)", 0);
+        let gold = "\x1b[38;2;200;168;85m";
+        let agent_name = styled
+            .buffer
+            .iter()
+            .find(|(_, text)| text == "agent/name")
+            .expect("agent/name segment missing");
+        let rendered = agent_name.0.paint("agent/name").to_string();
+        assert!(
+            rendered.starts_with(gold),
+            "expected agent/name to be gold, got {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn function_argument_symbol_stays_plain() {
+        let styled = SemaHighlighter.highlight("(agent/name greeter)", 0);
+        let greeter = styled
+            .buffer
+            .iter()
+            .find(|(_, text)| text == "greeter")
+            .expect("greeter segment missing");
+        let rendered = greeter.0.paint("greeter").to_string();
+        assert_eq!(
+            rendered, "greeter",
+            "expected argument symbol to be unstyled, got {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn special_form_is_bold_gold() {
+        let styled = SemaHighlighter.highlight("(if #t 1 2)", 0);
+        let bold_gold = "\x1b[1;38;2;200;168;85m";
+        let if_token = styled
+            .buffer
+            .iter()
+            .find(|(_, text)| text == "if")
+            .expect("if segment missing");
+        let rendered = if_token.0.paint("if").to_string();
+        assert!(
+            rendered.starts_with(bold_gold),
+            "expected special form to be bold gold, got {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn nested_function_calls_are_colored() {
+        let styled = SemaHighlighter.highlight("(foo (bar x))", 0);
+        let gold = "\x1b[38;2;200;168;85m";
+        for name in ["foo", "bar"] {
+            let seg = styled
+                .buffer
+                .iter()
+                .find(|(_, text)| text == name)
+                .expect("{name} segment missing");
+            let rendered = seg.0.paint(name).to_string();
+            assert!(
+                rendered.starts_with(gold),
+                "expected {name} to be gold, got {rendered:?}"
+            );
+        }
+    }
+
+    #[test]
     fn bracket_match_nested() {
         let line = "(let ((x 1)) x)";
         let tokens = tokenize(line).unwrap();
@@ -328,5 +459,84 @@ mod tests {
         assert!(matches!(tokens[b_idx].token, Token::RParen));
         // The closer of the outermost paren should be the last token.
         assert_eq!(b_idx, tokens.len() - 1);
+    }
+
+    #[test]
+    fn doc_markdown_passes_through_plain_text() {
+        let md = "# Title\n\nSome body text.\n";
+        // In the test harness stdout is not a terminal, so highlighting is disabled
+        // and the markdown is returned unchanged.
+        assert_eq!(highlight_doc_markdown(md), md);
+    }
+
+    #[test]
+    fn doc_markdown_leaves_non_sema_blocks_plain() {
+        let md = "```bash\necho hi\n```\n";
+        assert_eq!(highlight_doc_markdown(md), md);
+    }
+
+    #[test]
+    fn doc_markdown_dims_all_sema_fences() {
+        let md = "Example:\n\n```sema\n(a 1)\n```\n\nMore:\n\n```sema\n(b 2)\n```\n";
+        let out = highlight_doc_markdown_inner(md, true);
+
+        // Every fence line should start with the tertiary foreground escape.
+        // (Lines begin with ANSI escapes after dimming, so we look for the
+        // fence marker anywhere in the line — code lines never contain triple
+        // backticks.)
+        let tertiary = "\x1b[38;2;107;99;84m";
+        let mut fence_count = 0;
+        for line in out.lines() {
+            if line.contains("```") {
+                assert!(
+                    line.starts_with(tertiary),
+                    "fence line was not dimmed: {line:?}"
+                );
+                fence_count += 1;
+            }
+        }
+
+        // Sanity: there are four fences (two open, two close).
+        assert_eq!(fence_count, 4);
+    }
+
+    #[test]
+    fn doc_markdown_defagent_closing_fence_is_dimmed() {
+        // Exact body of crates/sema-docs/entries/special-forms/defagent.md,
+        // trimmed the same way render_markdown does. This guards against a
+        // regression where the final closing fence of a multi-block doc was
+        // not styled.
+        let md = "Define an LLM agent. The `name` must be a symbol.\n\n```sema\n(defagent greeter\n  {:system \"You are a friendly greeter.\"})\n```\n\nInspecting an agent:\n\n```sema\n(agent/name greeter)       ; => \"greeter\"\n(agent? greeter)           ; => #t\n```";
+        let out = highlight_doc_markdown_inner(md, true);
+
+        let tertiary = "\x1b[38;2;107;99;84m";
+        let mut fence_count = 0;
+        for line in out.lines() {
+            if line.contains("```") {
+                assert!(line.starts_with(tertiary), "fence not dimmed: {line:?}");
+                fence_count += 1;
+            }
+        }
+        assert_eq!(fence_count, 4);
+    }
+
+    #[test]
+    fn doc_markdown_last_block_highlights_function_calls() {
+        // Regression: code in the final ```sema block of defagent was not
+        // getting function-position syntax highlighting.
+        let md = "Inspecting an agent:\n\n```sema\n(agent/name greeter)       ; => \"greeter\"\n(agent/system greeter)     ; => \"You are a friendly greeter...\"\n(agent/max-turns greeter)  ; => 5\n(agent? greeter)           ; => #t\n```";
+        let out = highlight_doc_markdown_inner(md, true);
+
+        let gold = "\x1b[38;2;200;168;85m";
+        for line in out.lines() {
+            if line.contains("agent/") || line.contains("agent?") {
+                // Each code line should begin with the gold escape from the
+                // leading '(' or directly from the function symbol.
+                assert!(
+                    line.contains(gold),
+                    "function call not highlighted in line: {line:?}"
+                );
+            }
+        }
     }
 }
