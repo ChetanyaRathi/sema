@@ -29,6 +29,10 @@ fn fresh_fake() -> FakeProvider {
         .build()
 }
 
+fn sema_string(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
 #[test]
 fn resume_skips_memoized_leaves_and_returns_the_same_result() {
     let base = temp_run_dir("resume-hit");
@@ -124,6 +128,57 @@ fn resume_is_per_leaf_checkpoint_replays_while_agent_reruns() {
     assert!(
         !kinds.contains(&"checkpoint"),
         "the still-memoized checkpoint must NOT recompute/emit: {kinds:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn resume_does_not_evaluate_memoized_checkpoint_write_expression() {
+    let base = temp_run_dir("resume-lazy-checkpoint");
+    let marker = base.join("checkpoint-value-ran");
+    let marker_src = sema_string(marker.to_string_lossy().as_ref());
+    let src = format!(
+        r#"
+        (defworkflow lazy-checkpoint-demo
+          "checkpoint write expression should not run on memo hit"
+          {{:phases ["A"]}}
+          (phase "A")
+          (def files
+            (checkpoint :files
+              (begin
+                (file/write "{marker_src}" "ran")
+                (list "a" "b"))))
+          {{:status :success :files files}})
+        "#
+    );
+
+    let r1 = run_workflow(
+        &src,
+        fresh_fake(),
+        RunOpts::fresh("wf_resume_lazy_checkpoint", &base),
+    );
+    assert_eq!(r1.result["status"], "success");
+    assert!(
+        marker.exists(),
+        "fresh run must evaluate the checkpoint write expression"
+    );
+
+    std::fs::remove_file(&marker).expect("remove fresh-run marker");
+    let r2 = run_workflow(
+        &src,
+        fresh_fake(),
+        RunOpts {
+            run_id: "wf_resume_lazy_checkpoint",
+            run_dir: &base,
+            resume: true,
+            code_version: "",
+        },
+    );
+    assert_eq!(r2.result, r1.result);
+    assert!(
+        !marker.exists(),
+        "memoized checkpoint write expression must not run during resume"
     );
 
     let _ = std::fs::remove_dir_all(&base);

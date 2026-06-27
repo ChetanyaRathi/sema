@@ -13,8 +13,9 @@
 //! - `(workflow/step opts thunk)` — runs a leaf as a journaled step (agent.started/
 //!   result + per-step budget), with the resume short-circuit and budget latch at its entry.
 //! - `(workflow/tool-call name [args])` — journals a tool call by the current agent.
-//! - `(checkpoint :k v)` records+returns `v` (emitting a `checkpoint` event);
-//!   `(checkpoint :k)` reads it back.
+//! - `(workflow/checkpoint :k thunk)` records+returns `(thunk)` (emitting a
+//!   `checkpoint` event); `(workflow/checkpoint :k)` reads it back. The public
+//!   `(checkpoint ...)` macro delays writes into this backend.
 //!
 //! The macros `defworkflow`/`phase`/`agent` (prelude) expand to these — see
 //! `crates/sema-eval/src/prelude.rs`.
@@ -421,11 +422,13 @@ pub fn register(env: &sema_core::Env) {
         Ok(Value::nil())
     });
 
-    // (checkpoint :k v) records+returns v and emits a checkpoint event;
-    // (checkpoint :k) reads the stored value (nil if unset).
-    crate::register_fn(env, "checkpoint", |args| {
+    // (workflow/checkpoint :k thunk) records+returns (thunk) and emits a checkpoint
+    // event; (workflow/checkpoint :k) reads the stored value (nil if unset). The
+    // public (checkpoint :k v) macro delays v into the thunk, so a resume memo hit can
+    // skip evaluating the write expression entirely.
+    crate::register_fn(env, "workflow/checkpoint", |args| {
         if args.is_empty() || args.len() > 2 {
-            return Err(SemaError::arity("checkpoint", "1-2", args.len()));
+            return Err(SemaError::arity("workflow/checkpoint", "1-2", args.len()));
         }
         let key = as_name(&args[0])
             .ok_or_else(|| SemaError::type_error("keyword or string", args[0].type_name()))?;
@@ -433,12 +436,11 @@ pub fn register(env: &sema_core::Env) {
             .ok_or_else(|| SemaError::eval("checkpoint outside a workflow/run"))?;
 
         if args.len() == 2 {
-            // Write: store, journal, return the value (so it threads through `let`).
-            let value = args[1].clone();
             // Resume short-circuit: a memoized checkpoint returns the recorded value,
             // seeds the state bag (so later `(checkpoint :k)` reads see it), and skips
-            // re-emitting the checkpoint event. The key advances its occurrence ordinal
-            // on every run (computed before the resume check) to stay in body order.
+            // evaluating the write thunk / re-emitting the checkpoint event. The key
+            // advances its occurrence ordinal on every run (computed before the resume
+            // check) to stay in body order.
             let resume_key = ctx.checkpoint_content_key(&key, &ctx.cur_phase_label());
             if ctx.resuming() {
                 if let Some(v) = ctx.memo_lookup(&resume_key) {
@@ -446,6 +448,9 @@ pub fn register(env: &sema_core::Env) {
                     return Ok(v);
                 }
             }
+            // Write miss: evaluate, store, journal, return the value (so it threads
+            // through `let`).
+            let value = crate::list::call_function(&args[1], &[])?;
             ctx.store_checkpoint(&key, value.clone());
             let digest = ctx.value_digest(&value);
             let content_key = ctx.content_key(&key, &digest);

@@ -134,6 +134,15 @@ pub const PRELUDE: &str = r#"
 (defmacro phase (label)
   `(workflow/phase ,label))
 
+;; checkpoint: a run-scoped state write/read. The write form delays its value
+;; expression so `workflow/checkpoint` can return a resume memo before evaluating
+;; expensive or side-effecting work.
+(defmacro checkpoint (key . rest)
+  (cond
+    ((null? rest) `(workflow/checkpoint ,key))
+    ((null? (cdr rest)) `(workflow/checkpoint ,key (fn () ,(car rest))))
+    (else (error "checkpoint takes 1 or 2 arguments"))))
+
 ;; step: a journaled orchestration unit (workflow.js `step(prompt, {…})`) — the
 ;; workflow's atomic call site, anonymous and workflow-owned (unlike `agent`, the
 ;; named/reusable actor). Runs the prompt through the configured provider and returns
