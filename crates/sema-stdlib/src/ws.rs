@@ -34,8 +34,25 @@ const EVENT_CAP: usize = 1024;
 enum WsFrame {
     Text(String),
     Binary(Vec<u8>),
+    /// Ping with an arbitrary payload; the server replies with a matching Pong.
+    Ping(Vec<u8>),
     /// Graceful close: pump sends a Close frame and exits.
     Close,
+}
+
+/// Options parsed from the `ws/connect` opts map (all optional).
+#[derive(Default)]
+struct ConnectOpts {
+    /// Extra HTTP headers on the upgrade request (e.g. `Authorization`).
+    headers: Vec<(String, String)>,
+    /// `Sec-WebSocket-Protocol` values offered to the server.
+    subprotocols: Vec<String>,
+    /// Handshake timeout in milliseconds (`None` = wait indefinitely).
+    timeout_ms: Option<u64>,
+    /// How many times to retry a failed handshake before giving up.
+    retries: u32,
+    /// Base backoff between handshake retries; doubles each attempt (capped).
+    backoff_ms: u64,
 }
 
 /// Incoming event from the pump task to the evaluator.
@@ -141,8 +158,18 @@ fn handles_of(
     (conn.cmd_tx.clone(), conn.evt_rx.clone())
 }
 
-/// Translate a Sema value into an outgoing frame: string → text, bytevector →
-/// binary, map → JSON-encoded text.
+/// Encode a value as JSON text for a frame.
+fn json_text(v: &Value) -> Result<String, SemaError> {
+    let json = sema_core::value_to_json_lossy(v);
+    serde_json::to_string(&json).map_err(|e| SemaError::eval(format!("ws/send: json encode: {e}")))
+}
+
+/// Translate a Sema value into an outgoing frame.
+///
+/// Shorthands: a string → text frame, a bytevector → binary frame, a plain map →
+/// JSON text. The framing can also be made explicit with a single-key tagged
+/// map, mirroring what `ws/recv` returns: `{:text s}`, `{:binary bv}`, or
+/// `{:json v}` (encodes `v` as JSON, so `{:json {…}}` sends the inner value).
 fn value_to_frame(v: &Value) -> Result<WsFrame, SemaError> {
     if let Some(s) = v.as_str() {
         return Ok(WsFrame::Text(s.to_string()));
@@ -150,14 +177,30 @@ fn value_to_frame(v: &Value) -> Result<WsFrame, SemaError> {
     if let Some(bv) = v.as_bytevector_rc() {
         return Ok(WsFrame::Binary(bv.to_vec()));
     }
-    if v.as_map_rc().is_some() {
-        let json = sema_core::value_to_json_lossy(v);
-        let s = serde_json::to_string(&json)
-            .map_err(|e| SemaError::eval(format!("ws/send: json encode: {e}")))?;
-        return Ok(WsFrame::Text(s));
+    if let Some(m) = v.as_map_rc() {
+        // Explicit tagged framing takes precedence over the plain-map shorthand.
+        if let Some(inner) = m.get(&Value::keyword("json")) {
+            return Ok(WsFrame::Text(json_text(inner)?));
+        }
+        if let Some(inner) = m.get(&Value::keyword("text")) {
+            let s = inner
+                .as_str()
+                .ok_or_else(|| SemaError::type_error("string", inner.type_name()))
+                .map_err(|e| e.with_hint("ws/send {:text …} expects a string"))?;
+            return Ok(WsFrame::Text(s.to_string()));
+        }
+        if let Some(inner) = m.get(&Value::keyword("binary")) {
+            let bv = inner
+                .as_bytevector_rc()
+                .ok_or_else(|| SemaError::type_error("bytevector", inner.type_name()))
+                .map_err(|e| e.with_hint("ws/send {:binary …} expects a bytevector"))?;
+            return Ok(WsFrame::Binary(bv.to_vec()));
+        }
+        // Plain map → JSON text.
+        return Ok(WsFrame::Text(json_text(v)?));
     }
     Err(SemaError::type_error("string, bytevector, or map", v.type_name()).with_hint(
-        "ws/send accepts a string (text frame), a bytevector (binary frame), or a map (sent as JSON text)",
+        "ws/send accepts a string (text), a bytevector (binary), or a map ({:json/:text/:binary …} or a plain map sent as JSON)",
     ))
 }
 
@@ -186,21 +229,95 @@ fn tagged(key: &str, value: Value) -> Value {
     Value::map(m)
 }
 
+/// Build the upgrade request for `url`, applying custom headers and subprotocols.
+fn build_request(
+    url: &str,
+    opts: &ConnectOpts,
+) -> Result<tokio_tungstenite::tungstenite::handshake::client::Request, String> {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    use tokio_tungstenite::tungstenite::http::header::{HeaderName, HeaderValue};
+
+    let mut request = url
+        .into_client_request()
+        .map_err(|e| format!("ws/connect {url}: {e}"))?;
+    let headers = request.headers_mut();
+    if !opts.subprotocols.is_empty() {
+        let joined = opts.subprotocols.join(", ");
+        let val = HeaderValue::from_str(&joined)
+            .map_err(|e| format!("ws/connect: invalid subprotocol: {e}"))?;
+        headers.insert("Sec-WebSocket-Protocol", val);
+    }
+    for (k, v) in &opts.headers {
+        let name = HeaderName::from_bytes(k.as_bytes())
+            .map_err(|e| format!("ws/connect: invalid header name {k:?}: {e}"))?;
+        let val = HeaderValue::from_str(v)
+            .map_err(|e| format!("ws/connect: invalid header value: {e}"))?;
+        headers.insert(name, val);
+    }
+    Ok(request)
+}
+
+/// Connect, honoring the handshake timeout and retrying with exponential backoff
+/// up to `opts.retries` times. A malformed header/URL fails fast (not retried).
+async fn connect_with_retry(
+    url: &str,
+    opts: &ConnectOpts,
+) -> Result<
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+    String,
+> {
+    let mut attempt: u32 = 0;
+    loop {
+        let request = build_request(url, opts)?;
+        let fut = tokio_tungstenite::connect_async(request);
+        let outcome: Result<_, String> = match opts.timeout_ms {
+            Some(ms) => match tokio::time::timeout(std::time::Duration::from_millis(ms), fut).await
+            {
+                Ok(Ok((ws, _resp))) => Ok(ws),
+                Ok(Err(e)) => Err(format!("ws/connect {url}: {e}")),
+                Err(_) => Err(format!(
+                    "ws/connect {url}: handshake timed out after {ms}ms"
+                )),
+            },
+            None => fut
+                .await
+                .map(|(ws, _resp)| ws)
+                .map_err(|e| format!("ws/connect {url}: {e}")),
+        };
+        match outcome {
+            Ok(ws) => return Ok(ws),
+            Err(e) => {
+                if attempt >= opts.retries {
+                    return Err(e);
+                }
+                // Exponential backoff, capped at 30s.
+                let backoff = opts
+                    .backoff_ms
+                    .saturating_mul(1u64 << attempt.min(16))
+                    .min(30_000);
+                tokio::time::sleep(std::time::Duration::from_millis(backoff)).await;
+                attempt += 1;
+            }
+        }
+    }
+}
+
 /// The pump task: connect, signal handshake result, then bridge the socket to
 /// the command/event channels until either side closes.
 async fn pump(
     url: String,
+    opts: ConnectOpts,
     mut cmd_rx: mpsc::UnboundedReceiver<WsFrame>,
     evt_tx: mpsc::Sender<WsEvent>,
     ready_tx: tokio::sync::oneshot::Sender<Result<(), String>>,
 ) {
-    let ws = match tokio_tungstenite::connect_async(url.as_str()).await {
-        Ok((ws, _resp)) => {
+    let ws = match connect_with_retry(&url, &opts).await {
+        Ok(ws) => {
             let _ = ready_tx.send(Ok(()));
             ws
         }
         Err(e) => {
-            let _ = ready_tx.send(Err(format!("ws/connect {url}: {e}")));
+            let _ = ready_tx.send(Err(e));
             return;
         }
     };
@@ -214,6 +331,9 @@ async fn pump(
                 }
                 Some(WsFrame::Binary(b)) => {
                     if sink.send(Message::Binary(b.into())).await.is_err() { break; }
+                }
+                Some(WsFrame::Ping(p)) => {
+                    if sink.send(Message::Ping(p.into())).await.is_err() { break; }
                 }
                 // Explicit close, or the evaluator dropped the connection.
                 Some(WsFrame::Close) | None => {
@@ -261,7 +381,7 @@ async fn pump(
 
 /// `ws/connect`: spawn the pump, then await the handshake (block at top level,
 /// yield `AwaitIo` inside an async task). Returns the connection stream value.
-fn ws_connect(url: &str) -> Result<Value, SemaError> {
+fn ws_connect(url: &str, opts: ConnectOpts) -> Result<Value, SemaError> {
     use tokio::sync::oneshot::error::TryRecvError;
 
     // Vestigial under CALL_NATIVE (the scheduler delivers the resume value), kept
@@ -274,8 +394,13 @@ fn ws_connect(url: &str) -> Result<Value, SemaError> {
     let (evt_tx, evt_rx) = mpsc::channel::<WsEvent>(EVENT_CAP);
     let (ready_tx, mut ready_rx) = tokio::sync::oneshot::channel::<Result<(), String>>();
 
-    let join =
-        crate::async_rt::stdlib_shared_rt().spawn(pump(url.to_string(), cmd_rx, evt_tx, ready_tx));
+    let join = crate::async_rt::stdlib_shared_rt().spawn(pump(
+        url.to_string(),
+        opts,
+        cmd_rx,
+        evt_tx,
+        ready_tx,
+    ));
 
     let conn_val = Value::stream(WsConnection {
         cmd_tx,
@@ -361,6 +486,112 @@ fn ws_recv(args: &[Value]) -> Result<Value, SemaError> {
     event_to_value(ev)
 }
 
+/// The async-context recv-with-deadline path. Polls for an event, returning the
+/// `:timeout` keyword once `deadline` passes with nothing received.
+fn ws_recv_timeout_async(
+    evt_rx: Rc<RefCell<mpsc::Receiver<WsEvent>>>,
+    deadline: std::time::Instant,
+) -> Result<Value, SemaError> {
+    use tokio::sync::mpsc::error::TryRecvError;
+
+    let handle = Rc::new(IoHandle::new(move || {
+        match evt_rx.borrow_mut().try_recv() {
+            Ok(ev) => match event_to_value(Some(ev)) {
+                Ok(v) => IoPoll::Ready(Ok(v)),
+                Err(e) => IoPoll::Ready(Err(e.to_string())),
+            },
+            Err(TryRecvError::Disconnected) => IoPoll::Ready(Ok(Value::nil())),
+            Err(TryRecvError::Empty) => {
+                if std::time::Instant::now() >= deadline {
+                    IoPoll::Ready(Ok(Value::keyword("timeout")))
+                } else {
+                    IoPoll::Pending
+                }
+            }
+        }
+    }));
+    sema_core::set_yield_signal(sema_core::YieldReason::AwaitIo(handle));
+    Ok(Value::nil())
+}
+
+fn ws_recv_timeout(args: &[Value]) -> Result<Value, SemaError> {
+    check_arity!(args, "ws/recv-timeout", 2);
+    let sb = ws_conn(args, "ws/recv-timeout", 0)?;
+    let ms = args[1]
+        .as_int()
+        .ok_or_else(|| SemaError::type_error("int", args[1].type_name()))
+        .map_err(|e| e.with_hint("ws/recv-timeout: argument 2 is the timeout in milliseconds"))?
+        .max(0) as u64;
+    let (_, evt_rx) = handles_of(&sb);
+
+    if sema_core::in_async_context() {
+        if let Some(v) = sema_core::take_resume_value() {
+            return Ok(v);
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(ms);
+        return ws_recv_timeout_async(evt_rx, deadline);
+    }
+
+    // Top level: poll on the shared runtime until an event arrives or the deadline
+    // passes. We `try_recv` (dropping the RefCell borrow) and `sleep` between polls
+    // rather than holding the receiver borrow across an await. `:timeout`
+    // distinguishes a timeout from `nil` (the connection closed).
+    use tokio::sync::mpsc::error::TryRecvError;
+    enum Outcome {
+        Event(WsEvent),
+        Closed,
+        Timeout,
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(ms);
+    let outcome = crate::async_rt::stdlib_shared_rt().block_on(async {
+        loop {
+            let polled = evt_rx.borrow_mut().try_recv();
+            match polled {
+                Ok(ev) => return Outcome::Event(ev),
+                Err(TryRecvError::Disconnected) => return Outcome::Closed,
+                Err(TryRecvError::Empty) => {
+                    if std::time::Instant::now() >= deadline {
+                        return Outcome::Timeout;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+            }
+        }
+    });
+    match outcome {
+        Outcome::Event(ev) => event_to_value(Some(ev)),
+        Outcome::Closed => Ok(Value::nil()),
+        Outcome::Timeout => Ok(Value::keyword("timeout")),
+    }
+}
+
+fn ws_ping(args: &[Value]) -> Result<Value, SemaError> {
+    check_arity!(args, "ws/ping", 1..=2);
+    let sb = ws_conn(args, "ws/ping", 0)?;
+    if sb.is_closed() {
+        return Err(SemaError::eval("ws/ping: connection is closed"));
+    }
+    // Optional payload: a string or bytevector. Default is an empty ping.
+    let payload = match args.get(1) {
+        None => Vec::new(),
+        Some(v) => {
+            if let Some(s) = v.as_str() {
+                s.as_bytes().to_vec()
+            } else if let Some(bv) = v.as_bytevector_rc() {
+                bv.to_vec()
+            } else {
+                return Err(SemaError::type_error("string or bytevector", v.type_name())
+                    .with_hint("ws/ping payload must be a string or bytevector"));
+            }
+        }
+    };
+    let (cmd_tx, _) = handles_of(&sb);
+    cmd_tx
+        .send(WsFrame::Ping(payload))
+        .map_err(|_| SemaError::eval("ws/ping: connection is closed"))?;
+    Ok(Value::nil())
+}
+
 fn ws_close(args: &[Value]) -> Result<Value, SemaError> {
     check_arity!(args, "ws/close", 1);
     let sb = ws_conn(args, "ws/close", 0)?;
@@ -375,13 +606,65 @@ fn ws_connected(args: &[Value]) -> Result<Value, SemaError> {
     Ok(Value::bool(!sb.is_closed() && !cmd_tx.is_closed()))
 }
 
+/// Parse the optional `ws/connect` opts map:
+/// `{:headers {…} :subprotocols [...] :timeout ms :retries n :retry-backoff-ms ms}`.
+fn parse_connect_opts(v: Option<&Value>) -> Result<ConnectOpts, SemaError> {
+    let mut opts = ConnectOpts {
+        backoff_ms: 500,
+        ..ConnectOpts::default()
+    };
+    let Some(map) = v.and_then(|v| v.as_map_rc()) else {
+        return Ok(opts);
+    };
+
+    if let Some(h) = map
+        .get(&Value::keyword("headers"))
+        .and_then(|h| h.as_map_rc())
+    {
+        for (k, val) in h.iter() {
+            let key = match k.view() {
+                sema_core::ValueView::String(s) => s.to_string(),
+                sema_core::ValueView::Keyword(s) => sema_core::resolve(s),
+                _ => k.to_string(),
+            };
+            let value = val
+                .as_str()
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| val.to_string());
+            opts.headers.push((key, value));
+        }
+    }
+    if let Some(sp) = map.get(&Value::keyword("subprotocols")) {
+        if let Some(list) = sp.as_list_rc().or_else(|| sp.as_vector_rc()) {
+            for item in list.iter() {
+                if let Some(s) = item.as_str() {
+                    opts.subprotocols.push(s.to_string());
+                }
+            }
+        }
+    }
+    if let Some(ms) = map.get(&Value::keyword("timeout")).and_then(|t| t.as_int()) {
+        opts.timeout_ms = Some(ms.max(0) as u64);
+    }
+    if let Some(n) = map.get(&Value::keyword("retries")).and_then(|t| t.as_int()) {
+        opts.retries = n.max(0) as u32;
+    }
+    if let Some(ms) = map
+        .get(&Value::keyword("retry-backoff-ms"))
+        .and_then(|t| t.as_int())
+    {
+        opts.backoff_ms = ms.max(0) as u64;
+    }
+    Ok(opts)
+}
+
 pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
     // Establishing a connection touches the network → gate on NETWORK. The
     // per-message ops below operate on an already-open connection (which could
     // only be obtained through this gate), so they need no separate gate —
     // matching the server-side ws closures.
     crate::register_fn_gated(env, sandbox, Caps::NETWORK, "ws/connect", |args| {
-        check_arity!(args, "ws/connect", 1);
+        check_arity!(args, "ws/connect", 1..=2);
         let url = args[0]
             .as_str()
             .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
@@ -391,11 +674,14 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
                     .with_hint("the URL must start with ws:// or wss://"),
             );
         }
-        ws_connect(url)
+        let opts = parse_connect_opts(args.get(1))?;
+        ws_connect(url, opts)
     });
 
     register_fn(env, "ws/send", ws_send);
     register_fn(env, "ws/recv", ws_recv);
+    register_fn(env, "ws/recv-timeout", ws_recv_timeout);
+    register_fn(env, "ws/ping", ws_ping);
     register_fn(env, "ws/close", ws_close);
     register_fn(env, "ws/connected?", ws_connected);
 }

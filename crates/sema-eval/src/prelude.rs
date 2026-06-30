@@ -82,6 +82,43 @@ pub const PRELUDE: &str = r#"
 (defmacro with-open (binding . body)
   `(with-stream ,binding ,@body))
 
+;; ws/listen: drive a receive loop on a websocket, dispatching each frame to the
+;; matching handler. Spawns an async task and returns its promise — await it (or
+;; run the scheduler) to actually drive the loop. All handlers are optional:
+;;   :on-open    (fn (conn) …)      — called once before the loop starts
+;;   :on-message (fn (conn msg) …)  — msg is the text string or binary bytevector
+;;   :on-close   (fn (conn info) …) — info is {:code … :reason …}
+;;   :on-error   (fn (conn err) …)  — a recv/protocol error; the loop then stops
+;; (async/await (ws/listen sock {:on-message (fn (c m) (println m))}))
+(defmacro ws/listen (conn handlers)
+  `(let ((conn# ,conn)
+         (hs# ,handlers))
+     (let ((on-open# (get hs# :on-open))
+           (on-message# (get hs# :on-message))
+           (on-close# (get hs# :on-close))
+           (on-error# (get hs# :on-error)))
+       (when on-open# (on-open# conn#))
+       (async/spawn
+         (fn ()
+           (let loop ()
+             (let ((msg# (try (ws/recv conn#)
+                           (catch e#
+                             (when on-error# (on-error# conn# e#))
+                             :ws-listen-error))))
+               (cond
+                 ((= msg# :ws-listen-error) nil)
+                 ((null? msg#)
+                  (when on-close# (on-close# conn# {:code 1006 :reason "closed"})))
+                 ((not (null? (get msg# :text)))
+                  (when on-message# (on-message# conn# (get msg# :text)))
+                  (loop))
+                 ((not (null? (get msg# :binary)))
+                  (when on-message# (on-message# conn# (get msg# :binary)))
+                  (loop))
+                 ((not (null? (get msg# :close)))
+                  (when on-close# (on-close# conn# (get msg# :close))))
+                 (else (loop))))))))))
+
 ;; dotimes: execute body n times with a counter variable
 ;; (dotimes (i 10) (println i)) — prints 0..9
 (defmacro dotimes (binding . body)

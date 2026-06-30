@@ -14,6 +14,13 @@
   task they yield cooperatively, mirroring the HTTP client's offload model. Gated
   on the `network` capability; native-only (not in the WASM playground). The
   server side (`:ws` routes / `http/websocket`) already shipped. (#49)
+- **WebSocket client, comprehensive surface.** `ws/connect` takes an options map
+  (`:headers`, `:subprotocols`, `:timeout`, `:retries`, `:retry-backoff-ms` with
+  exponential backoff). `ws/send` adds explicit framing (`{:text …}`, `{:binary …}`,
+  `{:json …}`) alongside the value-typed shorthands. New `ws/recv-timeout` (returns
+  `:timeout` distinct from `nil`), `ws/ping`, and the `ws/listen` macro — an evented
+  receive loop dispatching to `:on-open`/`:on-message`/`:on-close`/`:on-error`,
+  returning a promise to await. (#49)
 
 ## 1.28.1
 

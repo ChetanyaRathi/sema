@@ -1,9 +1,9 @@
 # WebSocket Features in Sema — Investigation & Plan
 
 Tracking issue: [#49](https://github.com/HelgeSverre/sema/issues/49)
-Status: **Phase 1 (client MVP) implemented** — see `crates/sema-stdlib/src/ws.rs`,
-the `with-open` prelude macro, and `test_websocket_client_*` in `server_test.rs`.
-Phases 2–4 below remain proposed.
+Status: **Phases 1–2 implemented** — see `crates/sema-stdlib/src/ws.rs`, the
+`with-open`/`ws/listen` prelude macros, and `test_websocket_*` in `server_test.rs`.
+Phases 3–4 below remain proposed.
 
 ## TL;DR
 
@@ -244,8 +244,11 @@ Follow the repo convention (network tests `#[ignore]`, deterministic tests alway
   `ws/close`, `ws/connected?`; `with-open`; `wss://`/TLS via rustls; `Caps::NETWORK`; dual
   top-level/async paths; ignored round-trip test + no-network error-path tests; docs in
   `web-server.md`. (Playground example deferred — native-only.)
-- **Phase 2 — comprehensive client.** Binary frames, `{:json …}`, headers/subprotocols,
-  `ws/recv-timeout`, `ws/ping`, `ws/listen` evented macro, reconnect-with-backoff helper.
+- **Phase 2 — comprehensive client.** ✅ Done. Explicit `{:text/:binary/:json}` framing;
+  connect opts (`:headers`, `:subprotocols`, `:timeout`, `:retries`, `:retry-backoff-ms` with
+  exponential backoff); `ws/recv-timeout` (→ `:timeout`); `ws/ping`; the `ws/listen` evented
+  macro. Tests in `server_test.rs` (`test_websocket_client_options_and_framing`,
+  `test_websocket_listen`); docs in `web-server.md`.
 - **Phase 3 — server parity.** Binary frames server-side, unify `conn` under `ws/*`, close codes,
   ping/pong.
 - **Phase 4 — reach (optional).** WASM/browser client via `web-sys` WebSocket; LSP signatures/docs;

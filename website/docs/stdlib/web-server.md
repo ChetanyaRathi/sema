@@ -449,39 +449,90 @@ error path.
 
 ### `ws/connect`
 
-`(ws/connect url)` — open a connection to a `ws://` or `wss://` URL, returning a
-connection value. Blocks until the handshake completes (or fails). Requires the
-`network` capability. Inside an `async/spawn` task it yields cooperatively, so
-sibling tasks run while the handshake and later receives are in flight.
+`(ws/connect url)` / `(ws/connect url opts)` — open a connection to a `ws://` or
+`wss://` URL, returning a connection value. Blocks until the handshake completes
+(or fails). Requires the `network` capability. Inside an `async/spawn` task it
+yields cooperatively, so sibling tasks run while the handshake and later receives
+are in flight.
+
+`opts` is an optional map:
+
+| Key                  | Meaning                                                       |
+| -------------------- | ------------------------------------------------------------- |
+| `:headers`           | map of extra HTTP headers on the upgrade (e.g. auth tokens)   |
+| `:subprotocols`      | list of `Sec-WebSocket-Protocol` values to offer              |
+| `:timeout`           | handshake timeout in milliseconds                             |
+| `:retries`           | retry a failed handshake this many times (default `0`)        |
+| `:retry-backoff-ms`  | base backoff, doubled each retry and capped at 30s (default `500`) |
+
+```sema
+(ws/connect "wss://api.example.com/socket"
+  {:headers {"Authorization" "Bearer …"}
+   :subprotocols ["chat"]
+   :timeout 5000
+   :retries 3})
+```
 
 ### `ws/send`
 
-`(ws/send conn msg)` — send a message. The payload type follows `msg`:
+`(ws/send conn msg)` — send a message. The frame type follows `msg`:
 
-| `msg` type   | Frame sent                              |
-| ------------ | --------------------------------------- |
-| string       | text frame                              |
-| bytevector   | binary frame                            |
-| map          | text frame containing the JSON encoding |
+| `msg`                | Frame sent                                              |
+| -------------------- | ------------------------------------------------------- |
+| string               | text frame                                              |
+| bytevector           | binary frame                                            |
+| `{:text s}`          | text frame (explicit)                                   |
+| `{:binary bv}`       | binary frame (explicit)                                 |
+| `{:json v}`          | text frame: `v` encoded as JSON                         |
+| any other map        | text frame: the map encoded as JSON                     |
 
-### `ws/recv`
+### `ws/recv` and `ws/recv-timeout`
 
 `(ws/recv conn)` — receive the next message, blocking until one arrives. Returns
 a single-key tagged map so a `match` can dispatch on the frame type:
 
-| Return value             | Meaning                                          |
-| ------------------------ | ------------------------------------------------ |
-| `{:text "…"}`            | a text frame                                     |
-| `{:binary #u8(…)}`       | a binary frame                                   |
-| `{:close {:code :reason}}` | the server closed the connection               |
-| `nil`                    | the connection is fully drained and closed       |
+| Return value               | Meaning                                          |
+| -------------------------- | ------------------------------------------------ |
+| `{:text "…"}`              | a text frame                                     |
+| `{:binary #u8(…)}`         | a binary frame                                   |
+| `{:close {:code :reason}}` | the server closed the connection                 |
+| `nil`                      | the connection is fully drained and closed       |
 
-A protocol error surfaces as a thrown error you can `try`/`catch`.
+`(ws/recv-timeout conn ms)` is the same but returns the keyword `:timeout` if no
+message arrives within `ms` milliseconds (distinct from `nil`, which means
+closed). A protocol error surfaces as a thrown error you can `try`/`catch`.
+
+### `ws/ping`
+
+`(ws/ping conn)` / `(ws/ping conn payload)` — send a ping frame (optional string
+or bytevector payload); the server replies with a matching pong. Incoming pings
+are answered automatically.
 
 ### `ws/close` and `ws/connected?`
 
 `(ws/close conn)` closes the connection (idempotent; also done for you by
 `with-open`). `(ws/connected? conn)` reports whether the socket is still live.
+
+### `ws/listen`
+
+`(ws/listen conn handlers)` drives a receive loop, dispatching each frame to the
+matching handler. It spawns an async task and returns its promise — `async/await`
+it (or run the scheduler) to drive the loop. All handlers are optional:
+
+| Handler        | Called with         | When                                   |
+| -------------- | ------------------- | -------------------------------------- |
+| `:on-open`     | `(conn)`            | once, before the loop                  |
+| `:on-message`  | `(conn msg)`        | each text (string) or binary (bytevector) frame |
+| `:on-close`    | `(conn info)`       | the connection closed (`info` is `{:code :reason}`) |
+| `:on-error`    | `(conn err)`        | a recv/protocol error (loop then stops) |
+
+```sema
+(with-open (sock (ws/connect "wss://stream.example.com"))
+  (async/await
+    (ws/listen sock
+      {:on-message (fn (conn msg) (println msg))
+       :on-close   (fn (conn info) (println "closed"))})))
+```
 
 > WebSocket support is native-only — it is not available in the browser
 > playground (WASM) build.
