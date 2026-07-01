@@ -179,21 +179,24 @@ impl McpClient {
         }
     }
 
-    /// The `WWW-Authenticate` challenge from the most recent HTTP `401`, if the
-    /// last request was refused for lack of authorization (HTTP transport only).
+    /// The `WWW-Authenticate` challenge from the most recent HTTP `401`/`403`, if
+    /// the last request was refused for auth (Streamable HTTP or legacy SSE).
     pub fn http_challenge(&self) -> Option<String> {
         match &self.transport {
             Transport::Http(t) => t.last_challenge.clone(),
-            _ => None,
+            Transport::LegacySse(t) => t.last_challenge.clone(),
+            Transport::Stdio(_) => None,
         }
     }
 
-    /// The HTTP status code of the most recent request, when it was not a
-    /// success (HTTP transport only) — used to detect a legacy-SSE server.
+    /// The HTTP status code of the most recent request when it was not a success
+    /// (Streamable HTTP or legacy SSE) — used to detect a legacy server (`404`/
+    /// `405`) or a mid-session auth challenge (`401`/`403`).
     pub fn http_last_status(&self) -> Option<u16> {
         match &self.transport {
             Transport::Http(t) => t.last_status,
-            _ => None,
+            Transport::LegacySse(t) => t.last_status,
+            Transport::Stdio(_) => None,
         }
     }
 
@@ -204,11 +207,41 @@ impl McpClient {
         }
     }
 
-    /// The remote server URL (HTTP transport only), for keying the token store.
+    /// Update the bearer token after a mid-session re-authorization and make the
+    /// connection ready to retry. Streamable HTTP just swaps the header (requests
+    /// are independent); the legacy transport must **reconnect** — its SSE stream
+    /// was opened with the stale token — so it re-opens the stream with the new
+    /// token and re-runs the handshake. No-op for stdio.
+    pub async fn reauthorize_bearer(&mut self, token: &str) -> Result<(), String> {
+        // Capture legacy reconnect params without holding a borrow across the
+        // transport reassignment below.
+        let legacy = match &self.transport {
+            Transport::LegacySse(t) => Some((t.base_url.clone(), t.headers.clone())),
+            _ => None,
+        };
+        match &mut self.transport {
+            Transport::Http(t) => {
+                t.set_bearer(token);
+                return Ok(());
+            }
+            Transport::Stdio(_) => return Ok(()),
+            Transport::LegacySse(_) => {}
+        }
+        let (url, mut headers) = legacy.expect("legacy transport");
+        headers.insert("Authorization".to_string(), format!("Bearer {token}"));
+        let fresh =
+            LegacySseTransport::connect(McpHttpConfig { url, headers }, self.timeout).await?;
+        self.transport = Transport::LegacySse(fresh);
+        self.next_id = 1;
+        self.initialize().await.map(|_| ())
+    }
+
+    /// The remote server URL (HTTP or legacy SSE), for keying the token store.
     pub fn http_url(&self) -> Option<String> {
         match &self.transport {
             Transport::Http(t) => Some(t.url.clone()),
-            _ => None,
+            Transport::LegacySse(t) => Some(t.base_url.clone()),
+            Transport::Stdio(_) => None,
         }
     }
 
@@ -722,6 +755,11 @@ struct LegacySseTransport {
     #[allow(clippy::type_complexity)]
     stream: std::pin::Pin<Box<dyn futures::Stream<Item = Result<Vec<u8>, reqwest::Error>> + Send>>,
     buffer: String,
+    /// Status + `WWW-Authenticate` of the most recent POST failure, so a mid-
+    /// session `401`/`403` on a legacy server can be re-authorized like an HTTP
+    /// one (parity — many servers still run this transport).
+    last_status: Option<u16>,
+    last_challenge: Option<String>,
 }
 
 impl LegacySseTransport {
@@ -756,6 +794,8 @@ impl LegacySseTransport {
             headers: config.headers,
             stream: Box::pin(stream),
             buffer: String::new(),
+            last_status: None,
+            last_challenge: None,
         };
 
         // The first meaningful event names the POST endpoint.
@@ -798,7 +838,7 @@ impl LegacySseTransport {
         self.post(body).await
     }
 
-    async fn post(&self, body: String) -> Result<(), String> {
+    async fn post(&mut self, body: String) -> Result<(), String> {
         let mut builder = self
             .client
             .post(&self.post_url)
@@ -811,11 +851,19 @@ impl LegacySseTransport {
             .send()
             .await
             .map_err(|err| format!("legacy SSE POST failed: {err}"))?;
-        if !response.status().is_success() {
-            return Err(format!(
-                "legacy SSE POST returned HTTP {}",
-                response.status().as_u16()
-            ));
+        let status = response.status();
+        self.last_status = (!status.is_success()).then_some(status.as_u16());
+        self.last_challenge = if status.is_success() {
+            None
+        } else {
+            response
+                .headers()
+                .get("www-authenticate")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string)
+        };
+        if !status.is_success() {
+            return Err(format!("legacy SSE POST returned HTTP {}", status.as_u16()));
         }
         Ok(())
     }

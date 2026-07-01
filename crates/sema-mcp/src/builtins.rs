@@ -329,7 +329,9 @@ fn call_tool_via_connection(
     };
 
     let mut conn = connection.borrow_mut();
-    conn.client.set_bearer_token(&token);
+    // Streamable HTTP swaps the header; legacy SSE reconnects its stream.
+    block_on(conn.client.reauthorize_bearer(&token))
+        .map_err(|e| SemaError::eval(format!("mcp/call: {e}")))?;
     block_on(conn.client.call_tool(tool_name, arguments_json))
         .map_err(|err| SemaError::eval(format!("mcp/call: {err}")))
 }
