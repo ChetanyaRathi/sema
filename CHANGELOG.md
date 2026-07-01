@@ -26,7 +26,17 @@
   silent; expired tokens are refreshed automatically. A headless RFC 8628
   device-authorization flow and a bring-your-own-token option (`:headers`) are
   also supported. `sema mcp login <url>` (with `--device` / `--client-id`) and
-  `sema mcp logout <url>` manage credentials from the CLI.
+  `sema mcp logout <url>` manage credentials from the CLI. A mid-session `401`
+  (expired token) or `403 insufficient_scope` re-authorizes and retries the call
+  transparently — refreshing, or stepping up to the union of scopes — on both the
+  Streamable-HTTP and legacy HTTP+SSE transports. Set `SEMA_MCP_TOKEN_STORE=file`
+  to force the `0600`-file store instead of the OS keychain (handy on headless
+  boxes or to avoid repeated keychain prompts while developing).
+- **MCP tool-call cassettes.** MCP `tools/call` results record and replay through
+  the same cassette tape as LLM calls (`llm/cassette-load`/`llm/cassette-save`,
+  or the `SEMA_LLM_CASSETTE` env var), keyed by a hash of the server identity,
+  tool, and arguments — so an agent-over-MCP flow can be captured once and
+  replayed offline/deterministically in CI, with no network or live server.
 
 ### Fixed
 
