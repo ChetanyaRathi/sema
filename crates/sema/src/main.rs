@@ -270,9 +270,13 @@ enum Commands {
     Lsp,
     /// Start the Debug Adapter Protocol server
     Dap,
-    /// Start the Model Context Protocol (MCP) server
+    /// Start the MCP server, or manage MCP client auth (`mcp login`/`logout`)
+    #[command(args_conflicts_with_subcommands = true)]
     Mcp {
-        /// Optional source files to run/load tools from
+        /// Client-auth subcommand; when omitted, runs the MCP server
+        #[command(subcommand)]
+        auth: Option<McpAuthCommands>,
+        /// Optional source files to run/load tools from (server mode)
         #[arg(value_name = "FILES")]
         files: Vec<String>,
         /// Comma-separated list of tool names to explicitly include
@@ -321,6 +325,26 @@ enum Commands {
         /// Disable LLM features
         #[arg(long)]
         no_llm: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum McpAuthCommands {
+    /// Log in to a remote (HTTP) MCP server and cache the OAuth token
+    Login {
+        /// The MCP server URL (e.g. https://mcp.example.com/mcp)
+        url: String,
+        /// Use the device-authorization flow instead of opening a browser
+        #[arg(long)]
+        device: bool,
+        /// A pre-registered OAuth client id (when the server has no dynamic registration)
+        #[arg(long = "client-id", value_name = "ID")]
+        client_id: Option<String>,
+    },
+    /// Remove cached credentials for a remote MCP server
+    Logout {
+        /// The MCP server URL whose cached credentials to clear
+        url: String,
     },
 }
 
@@ -683,10 +707,26 @@ fn main() {
                     .block_on(sema_dap::run_server());
             }
             Commands::Mcp {
+                auth,
                 files,
                 include,
                 exclude,
             } => {
+                if let Some(auth) = auth {
+                    let result = match auth {
+                        McpAuthCommands::Login {
+                            url,
+                            device,
+                            client_id,
+                        } => sema_mcp::mcp_login(&url, device, client_id.as_deref()),
+                        McpAuthCommands::Logout { url } => sema_mcp::mcp_logout(&url),
+                    };
+                    if let Err(e) = result {
+                        eprintln!("mcp: {e}");
+                        std::process::exit(1);
+                    }
+                    return;
+                }
                 let inc_tools = include.map(|s| {
                     s.split(',')
                         .map(|x| x.trim().to_string())
