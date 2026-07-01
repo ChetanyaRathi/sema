@@ -5800,6 +5800,105 @@
       "body": "Drop the fractional part, rounding toward zero (so negatives round *up*). Unlike [`round`](#round), it never inspects the fraction — `3.9` truncates to `3`.\n\n```sema\n(truncate 3.7)  ; => 3\n(truncate -3.7) ; => -3   ; toward zero, not floor (-4)\n(truncate 3.9)  ; => 3\n```"
     },
     {
+      "name": "mcp/call",
+      "module": "mcp",
+      "section": "MCP Client",
+      "summary": "Invoke a tool on an MCP server (`tools/call`) and return its result normalized to a Sema value: a plain text result collapses to a string; a richer result (images, resources, `structuredContent`) is returned as the full map. A tool that reports `isError` surfaces as a `SemaError`.",
+      "params": [
+        {
+          "name": "handle",
+          "type": "string"
+        },
+        {
+          "name": "tool",
+          "type": "string",
+          "doc": "tool name"
+        },
+        {
+          "name": "args",
+          "type": "map",
+          "doc": "arguments object"
+        }
+      ],
+      "returns": "any",
+      "examples": [
+        "(define fs (mcp/connect {:command \"npx\"\n                         :args [\"-y\" \"@modelcontextprotocol/server-filesystem\" \"/tmp\"]}))\n\n(mcp/call fs \"read_file\" {:path \"/tmp/notes.txt\"})\n; => \"…file contents…\""
+      ],
+      "body": "```\n(mcp/call handle tool args)\n```\n\nInvoke a tool on an MCP server (`tools/call`) and return its result normalized to\na Sema value: a plain text result collapses to a string; a richer result (images,\nresources, `structuredContent`) is returned as the full map. A tool that reports\n`isError` surfaces as a `SemaError`.\n\n```sema\n(define fs (mcp/connect {:command \"npx\"\n                         :args [\"-y\" \"@modelcontextprotocol/server-filesystem\" \"/tmp\"]}))\n\n(mcp/call fs \"read_file\" {:path \"/tmp/notes.txt\"})\n; => \"…file contents…\"\n```\n\nFor agent use, prefer `mcp/tools->sema` so the model drives the calls; use\n`mcp/call` directly for scripted, non-agent access."
+    },
+    {
+      "name": "mcp/close",
+      "module": "mcp",
+      "section": "MCP Client",
+      "summary": "Close an MCP connection. For a stdio server this terminates the child process; for an HTTP server it best-effort ends the session (`DELETE`). After closing, the handle is no longer valid. Dropping a handle without calling `mcp/close` still tears down a stdio child, but calling it explicitly is clearer and deterministic.",
+      "params": [
+        {
+          "name": "handle",
+          "type": "string",
+          "doc": "connection handle from mcp/connect"
+        }
+      ],
+      "returns": "nil",
+      "examples": [
+        "(define fs (mcp/connect {:command \"npx\" :args [\"-y\" \"server-filesystem\" \"/tmp\"]}))\n;; … use it …\n(mcp/close fs)"
+      ],
+      "body": "```\n(mcp/close handle)\n```\n\nClose an MCP connection. For a stdio server this terminates the child process;\nfor an HTTP server it best-effort ends the session (`DELETE`). After closing, the\nhandle is no longer valid. Dropping a handle without calling `mcp/close` still\ntears down a stdio child, but calling it explicitly is clearer and deterministic.\n\n```sema\n(define fs (mcp/connect {:command \"npx\" :args [\"-y\" \"server-filesystem\" \"/tmp\"]}))\n;; … use it …\n(mcp/close fs)\n```"
+    },
+    {
+      "name": "mcp/connect",
+      "module": "mcp",
+      "section": "MCP Client",
+      "summary": "Connect to an external MCP (Model Context Protocol) server and return an opaque connection **handle** (a string) for use with `mcp/tools`, `mcp/call`, `mcp/tools->sema`, and `mcp/close`. The handshake (`initialize`) runs eagerly, so a returned handle is ready to use. The transport is chosen from the config map:",
+      "params": [
+        {
+          "name": "config",
+          "type": "map",
+          "doc": "connection spec: :command (stdio) or :url (http)"
+        }
+      ],
+      "returns": "string",
+      "examples": [
+        ";; Local stdio server\n(define fs (mcp/connect {:command \"npx\"\n                         :args [\"-y\" \"@modelcontextprotocol/server-filesystem\" \"/tmp\"]}))\n\n;; Remote server (OAuth handled automatically on first use)\n(define asana (mcp/connect {:url \"https://mcp.asana.com/mcp\"}))\n\n;; Remote server with a bring-your-own bearer token\n(define gh (mcp/connect {:url \"https://mcp.example.com/mcp\"\n                         :headers {\"Authorization\" \"Bearer ghp_…\"}}))"
+      ],
+      "body": "```\n(mcp/connect {:command \"…\" :args […] :env {…} :cwd \"…\"})\n(mcp/connect {:url \"https://…/mcp\" :headers {…} :auth {:client-id \"…\"}})\n```\n\nConnect to an external MCP (Model Context Protocol) server and return an opaque\nconnection **handle** (a string) for use with `mcp/tools`, `mcp/call`,\n`mcp/tools->sema`, and `mcp/close`. The handshake (`initialize`) runs eagerly, so\na returned handle is ready to use. The transport is chosen from the config map:\n\n- **`:command`** — spawn a local server as a child process and speak JSON-RPC\n  over stdio. Optional `:args` (list of strings), `:env` (map of extra\n  environment variables — the place to pass a token a server reads from its\n  environment), and `:cwd`. Requires the `process` sandbox capability.\n- **`:url`** — connect to a remote server over **Streamable HTTP** (falls back\n  automatically to the deprecated 2024-11-05 HTTP+SSE transport when a server\n  only speaks that). Requires the `network` capability. Optional `:headers`\n  attaches a static bearer token (`{\"Authorization\" \"Bearer …\"}`); `:auth\n  {:client-id \"…\"}` supplies a pre-registered OAuth client id.\n\nA remote server that requires OAuth is handled automatically: the first `401`\ntriggers the browser login flow (or a cached/refreshed token), then the handshake\nretries. See `sema mcp login` to authenticate ahead of time.\n\nConnecting to an MCP server runs its tools with the **server's** authority, not\nSema's sandbox — treat an untrusted server like untrusted code.\n\n```sema\n;; Local stdio server\n(define fs (mcp/connect {:command \"npx\"\n                         :args [\"-y\" \"@modelcontextprotocol/server-filesystem\" \"/tmp\"]}))\n\n;; Remote server (OAuth handled automatically on first use)\n(define asana (mcp/connect {:url \"https://mcp.asana.com/mcp\"}))\n\n;; Remote server with a bring-your-own bearer token\n(define gh (mcp/connect {:url \"https://mcp.example.com/mcp\"\n                         :headers {\"Authorization\" \"Bearer ghp_…\"}}))\n```"
+    },
+    {
+      "name": "mcp/tools",
+      "module": "mcp",
+      "section": "MCP Client",
+      "summary": "List the tools an MCP server exposes (`tools/list`). Returns a list of maps, one per tool, each with `:name`, `:description`, and `:input-schema` (the tool's raw JSON-Schema for its arguments).",
+      "params": [
+        {
+          "name": "handle",
+          "type": "string",
+          "doc": "connection handle from mcp/connect"
+        }
+      ],
+      "returns": "list",
+      "examples": [
+        "(define fs (mcp/connect {:command \"npx\"\n                         :args [\"-y\" \"@modelcontextprotocol/server-filesystem\" \"/tmp\"]}))\n\n(mcp/tools fs)\n; => ({:name \"read_file\" :description \"Read a file\" :input-schema {…}} …)\n\n;; Just the names:\n(map (fn (t) (:name t)) (mcp/tools fs))"
+      ],
+      "body": "```\n(mcp/tools handle)\n```\n\nList the tools an MCP server exposes (`tools/list`). Returns a list of maps, one\nper tool, each with `:name`, `:description`, and `:input-schema` (the tool's raw\nJSON-Schema for its arguments).\n\nTo feed these tools to an agent, use `mcp/tools->sema` instead — it produces the\nvalue shape `deftool`/`defagent` expect.\n\n```sema\n(define fs (mcp/connect {:command \"npx\"\n                         :args [\"-y\" \"@modelcontextprotocol/server-filesystem\" \"/tmp\"]}))\n\n(mcp/tools fs)\n; => ({:name \"read_file\" :description \"Read a file\" :input-schema {…}} …)\n\n;; Just the names:\n(map (fn (t) (:name t)) (mcp/tools fs))\n```"
+    },
+    {
+      "name": "mcp/tools->sema",
+      "module": "mcp",
+      "section": "MCP Client",
+      "summary": "Convert an MCP server's tools into the exact value shape `deftool` produces (name, description, params map, handler), so `defagent` can consume external MCP tools as first-class agent tools with no agent-loop changes. Each returned tool's handler calls back into the server via the connection; a tool that reports `isError` surfaces to the agent loop as an error it can react to.",
+      "params": [
+        {
+          "name": "handle",
+          "type": "string",
+          "doc": "connection handle from mcp/connect"
+        }
+      ],
+      "returns": "list",
+      "examples": [
+        "(define fs (mcp/connect {:command \"npx\"\n                         :args [\"-y\" \"@modelcontextprotocol/server-filesystem\" \"/tmp\"]}))\n\n(defagent librarian\n  {:model \"claude-sonnet-5\"\n   :system \"You manage files.\"\n   :tools (mcp/tools->sema fs)})     ; MCP tools become agent tools\n\n(agent/run librarian \"Summarize /tmp/notes.txt\")"
+      ],
+      "body": "```\n(mcp/tools->sema handle)\n```\n\nConvert an MCP server's tools into the exact value shape `deftool` produces\n(name, description, params map, handler), so `defagent` can consume external MCP\ntools as first-class agent tools with no agent-loop changes. Each returned tool's\nhandler calls back into the server via the connection; a tool that reports\n`isError` surfaces to the agent loop as an error it can react to.\n\nThe MCP `inputSchema` (JSON Schema) is inverted into the `{param-name -> spec}`\nmap the agent loop expects (type, description, enum, and `:optional` for\nparameters not in the schema's `required` list).\n\n```sema\n(define fs (mcp/connect {:command \"npx\"\n                         :args [\"-y\" \"@modelcontextprotocol/server-filesystem\" \"/tmp\"]}))\n\n(defagent librarian\n  {:model \"claude-sonnet-5\"\n   :system \"You manage files.\"\n   :tools (mcp/tools->sema fs)})     ; MCP tools become agent tools\n\n(agent/run librarian \"Summarize /tmp/notes.txt\")\n```"
+    },
+    {
       "name": "memory/append",
       "module": "memory",
       "section": "Agent Memory",

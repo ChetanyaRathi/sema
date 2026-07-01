@@ -457,6 +457,14 @@ agent tests that use MCP tools stay deterministic and offline in CI.
   `2024-11-05` transport. *Acceptance:* headless login works via device flow against
   the test IdP; a `2024-11-05` server connects via the SSE fallback.
 - **M5 — MCP-call cassette recording** (shared format with LLM cassettes).
+- **Convenience features (deferred — riff on after the first PR lands):**
+  - **Named/aliased servers** — declare a server once (e.g. a name → `:url`/`:command`
+    config, in a script or a config file) and refer to it by name in `mcp/connect`
+    and the CLI, instead of repeating the URL.
+  - **`sema mcp list`** — show authenticated/known servers (and, if feasible, which
+    script or config declared each) alongside token status.
+  - Mid-session **`403 insufficient_scope`** step-up re-scope (initial-login scope
+    handling is done; mid-call step-up is not yet wired into `mcp/call`).
 
 ## Open questions
 
