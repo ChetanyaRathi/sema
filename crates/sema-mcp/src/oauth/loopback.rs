@@ -74,18 +74,33 @@ impl LoopbackDriver {
     }
 
     fn wait_for_code(&self, expected_state: &str) -> Result<String, String> {
-        let request = self
-            .server
-            .recv_timeout(self.timeout)
-            .map_err(|e| format!("loopback listener error: {e}"))?
-            .ok_or_else(|| "timed out waiting for the OAuth redirect".to_string())?;
+        let deadline = std::time::Instant::now() + self.timeout;
+        loop {
+            let remaining = deadline
+                .checked_duration_since(std::time::Instant::now())
+                .ok_or_else(|| "timed out waiting for the OAuth redirect".to_string())?;
+            let request = self
+                .server
+                .recv_timeout(remaining)
+                .map_err(|e| format!("loopback listener error: {e}"))?
+                .ok_or_else(|| "timed out waiting for the OAuth redirect".to_string())?;
 
-        let result = parse_callback(request.url(), expected_state);
-        let page = if result.is_ok() { DONE_PAGE } else { FAIL_PAGE };
-        let header = tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"text/html"[..])
-            .expect("static header");
-        let _ = request.respond(tiny_http::Response::from_string(page).with_header(header));
-        result
+            // Browsers hit a loopback listener with stray requests (favicon,
+            // preconnect, "/"). Answer those 404 and keep waiting — only the
+            // authorization-server redirect to /callback carries the code.
+            let path = request.url().split('?').next().unwrap_or("");
+            if path != "/callback" {
+                let _ = request.respond(tiny_http::Response::empty(404));
+                continue;
+            }
+
+            let result = parse_callback(request.url(), expected_state);
+            let page = if result.is_ok() { DONE_PAGE } else { FAIL_PAGE };
+            let header = tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"text/html"[..])
+                .expect("static header");
+            let _ = request.respond(tiny_http::Response::from_string(page).with_header(header));
+            return result;
+        }
     }
 }
 

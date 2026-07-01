@@ -33,6 +33,29 @@ thread_local! {
         RefCell::new(HashMap::new());
     // Reuse one current-thread Tokio runtime for all MCP builtins in this evaluator context.
     static TOKIO_RT: RefCell<Option<Runtime>> = const { RefCell::new(None) };
+    // The evaluator's sandbox, captured at registration, so the OAuth browser
+    // launch (connect-time or mid-session re-auth) can be denied when `PROCESS`
+    // is — opening the system browser spawns a process.
+    static SANDBOX: RefCell<Sandbox> = RefCell::new(Sandbox::allow_all());
+}
+
+/// A browser opener that refuses to launch (spawn) a browser when the sandbox
+/// denies `PROCESS`. Only invoked when a browser is actually needed (a full
+/// login), so cached/refresh flows are unaffected.
+fn gated_browser_opener() -> crate::oauth::loopback::BrowserOpener {
+    Box::new(|url: &str| {
+        if let Some(err) = SANDBOX.with(|s| {
+            let sb = s.borrow();
+            if sb.is_unrestricted() {
+                None
+            } else {
+                sb.check(Caps::PROCESS, "mcp/connect (open browser)").err()
+            }
+        }) {
+            return Err(err.to_string());
+        }
+        crate::oauth::loopback::open_browser(url)
+    })
 }
 
 static HANDLE_COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -126,7 +149,16 @@ fn connect_stdio(config_json: &serde_json::Value) -> Result<Value, SemaError> {
         .and_then(|value| value.as_str())
         .map(std::path::PathBuf::from);
 
-    let identity = format!("stdio\0{command}\0{}", args_vec.join(" "));
+    // Unambiguous identity for the cassette key: args as a JSON array (so
+    // ["a b"] and ["a","b"] don't collide) plus cwd. `env` is deliberately
+    // excluded — a rotated token there should not invalidate a recorded tape.
+    let identity = serde_json::json!({
+        "t": "stdio",
+        "command": command,
+        "args": args_vec,
+        "cwd": cwd.as_ref().map(|p| p.display().to_string()),
+    })
+    .to_string();
     let mut client = block_on(McpClient::connect(McpClientConfig {
         command: command.to_string(),
         args: args_vec,
@@ -233,8 +265,11 @@ fn obtain_access_token(
     let challenge = discovery::parse_www_authenticate(challenge_header);
     let http = reqwest::Client::new();
     let credential_store = store::default_store();
-    let driver = loopback::LoopbackDriver::new(std::time::Duration::from_secs(300))
-        .map_err(|e| SemaError::eval(format!("mcp/connect: {e}")))?;
+    let driver = loopback::LoopbackDriver::with_opener(
+        std::time::Duration::from_secs(300),
+        gated_browser_opener(),
+    )
+    .map_err(|e| SemaError::eval(format!("mcp/connect: {e}")))?;
 
     let config = login::LoginConfig {
         mcp_url: url,
@@ -394,8 +429,11 @@ fn reauthorize(
 ) -> Result<Option<String>, SemaError> {
     let http = reqwest::Client::new();
     let store = crate::oauth::store::default_store();
-    let driver = crate::oauth::loopback::LoopbackDriver::new(std::time::Duration::from_secs(300))
-        .map_err(|e| SemaError::eval(format!("mcp/call: {e}")))?;
+    let driver = crate::oauth::loopback::LoopbackDriver::with_opener(
+        std::time::Duration::from_secs(300),
+        gated_browser_opener(),
+    )
+    .map_err(|e| SemaError::eval(format!("mcp/call: {e}")))?;
     block_on(crate::oauth::login::reauth_on_challenge(
         &http,
         store.as_ref(),
@@ -486,6 +524,9 @@ fn schema_to_params(schema: &serde_json::Value) -> (Value, Vec<String>) {
 }
 
 pub fn register_mcp_builtins(env: &Env, sandbox: &Sandbox) {
+    // Capture the sandbox so the OAuth browser launch can honor the PROCESS cap.
+    SANDBOX.with(|s| *s.borrow_mut() = sandbox.clone());
+
     // `mcp/connect` picks its transport from the config map at runtime, so the
     // capability it needs is not fixed: a `:url` server is network I/O
     // (`NETWORK`), a `:command` server spawns a process (`PROCESS`). Gate inside

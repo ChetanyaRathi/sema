@@ -32,6 +32,19 @@ pub struct Discovered {
     pub authorization_server: AuthorizationServerMetadata,
 }
 
+/// Whether two URLs share scheme + host + port (same origin). Used to bind the
+/// RFC 8707 `resource` audience to the actual MCP server being connected to.
+fn same_origin(a: &str, b: &str) -> bool {
+    match (url::Url::parse(a), url::Url::parse(b)) {
+        (Ok(a), Ok(b)) => {
+            a.scheme() == b.scheme()
+                && a.host_str() == b.host_str()
+                && a.port_or_known_default() == b.port_or_known_default()
+        }
+        _ => false,
+    }
+}
+
 /// Walk the metadata chain: PRM (RFC 9728) → AS metadata (RFC 8414/OIDC), and
 /// enforce the PKCE-S256 gate.
 pub async fn discover(
@@ -44,12 +57,31 @@ pub async fn discover(
         config.resource_metadata_url,
     )
     .await?;
+    // RFC 9728: the advertised `resource` must be the server we're connecting to.
+    // Reject a PRM that binds our token's audience to a different origin (a
+    // malicious/mis-hosted resource-metadata document).
+    if !same_origin(config.mcp_url, &prm.resource) {
+        return Err(format!(
+            "protected resource metadata `resource` ({}) does not match the server being \
+             connected to ({}); refusing to authorize",
+            prm.resource, config.mcp_url
+        ));
+    }
     let issuer = prm
         .authorization_servers
         .first()
         .ok_or_else(|| "protected resource metadata lists no authorization servers".to_string())?
         .clone();
     let as_meta = discovery::fetch_authorization_server_metadata(client, &issuer).await?;
+    // RFC 8414 §3.3 (mix-up defense): the metadata's `issuer` MUST equal the
+    // issuer identifier we fetched it for.
+    if as_meta.issuer.trim_end_matches('/') != issuer.trim_end_matches('/') {
+        return Err(format!(
+            "authorization server metadata issuer ({}) does not match the requested issuer ({issuer}); \
+             refusing to authorize",
+            as_meta.issuer
+        ));
+    }
     if !as_meta.supports_pkce_s256() {
         return Err(format!(
             "authorization server `{issuer}` does not advertise PKCE S256 support; refusing to proceed"
@@ -323,7 +355,32 @@ pub async fn reauth_on_challenge(
 
 #[cfg(test)]
 mod tests {
-    use super::union_scopes;
+    use super::{same_origin, union_scopes};
+
+    #[test]
+    fn same_origin_binds_resource_to_the_server() {
+        assert!(same_origin(
+            "https://mcp.example.com/mcp",
+            "https://mcp.example.com"
+        ));
+        assert!(same_origin(
+            "https://mcp.example.com:443/mcp",
+            "https://mcp.example.com"
+        ));
+        // Different host, scheme, or port → not the same origin (mix-up defense).
+        assert!(!same_origin(
+            "https://mcp.example.com/mcp",
+            "https://evil.example.com"
+        ));
+        assert!(!same_origin(
+            "https://mcp.example.com/mcp",
+            "http://mcp.example.com"
+        ));
+        assert!(!same_origin(
+            "https://mcp.example.com/mcp",
+            "https://mcp.example.com:8443"
+        ));
+    }
 
     #[test]
     fn union_scopes_dedupes_and_preserves_order() {

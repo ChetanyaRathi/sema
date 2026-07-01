@@ -108,10 +108,21 @@ impl FileStore {
         &self.path
     }
 
-    fn read_doc(&self) -> FileDoc {
+    /// Read the store. A missing file is an empty store; a file that exists but
+    /// fails to parse is an ERROR (not silently discarded) so a corrupt or
+    /// partially-written file never causes the next `save` to wipe every other
+    /// server's credentials.
+    fn read_doc(&self) -> Result<FileDoc, String> {
         match std::fs::read_to_string(&self.path) {
-            Ok(text) => serde_json::from_str(&text).unwrap_or_default(),
-            Err(_) => FileDoc::default(),
+            Ok(text) => serde_json::from_str(&text).map_err(|e| {
+                format!(
+                    "MCP token store at {} is corrupt ({e}); refusing to overwrite it \
+                     (fix or delete the file, then re-authenticate)",
+                    self.path.display()
+                )
+            }),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(FileDoc::default()),
+            Err(e) => Err(format!("failed to read token store: {e}")),
         }
     }
 
@@ -122,15 +133,34 @@ impl FileStore {
         }
         let json = serde_json::to_string_pretty(doc)
             .map_err(|e| format!("failed to encode token store: {e}"))?;
-        std::fs::write(&self.path, json)
-            .map_err(|e| format!("failed to write token store: {e}"))?;
-        // Restrict perms after the write (mode-on-create doesn't apply to an
-        // existing file). No-op on Windows, where we rely on the user profile ACL.
+
+        // Write to a sibling temp file created 0600 (never a world-readable
+        // window), then atomically rename over the target — which also fixes an
+        // existing wrongly-permissioned file. On Windows we rely on the user
+        // profile ACL and just write in place.
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&self.path, std::fs::Permissions::from_mode(0o600))
-                .map_err(|e| format!("failed to secure token store perms: {e}"))?;
+            use std::io::Write;
+            use std::os::unix::fs::OpenOptionsExt;
+            let tmp = self.path.with_extension("json.tmp");
+            let mut file = std::fs::OpenOptions::new()
+                .mode(0o600)
+                .create(true)
+                .truncate(true)
+                .write(true)
+                .open(&tmp)
+                .map_err(|e| format!("failed to open temp token store: {e}"))?;
+            file.write_all(json.as_bytes())
+                .map_err(|e| format!("failed to write token store: {e}"))?;
+            file.sync_all().ok();
+            drop(file);
+            std::fs::rename(&tmp, &self.path)
+                .map_err(|e| format!("failed to replace token store: {e}"))?;
+        }
+        #[cfg(not(unix))]
+        {
+            std::fs::write(&self.path, json)
+                .map_err(|e| format!("failed to write token store: {e}"))?;
         }
         Ok(())
     }
@@ -139,6 +169,7 @@ impl FileStore {
 impl TokenStore for FileStore {
     fn load(&self, server_url: &str) -> Option<StoredCredentials> {
         self.read_doc()
+            .ok()?
             .servers
             .get(server_url)
             .filter(|creds| creds.server_url == server_url)
@@ -146,13 +177,13 @@ impl TokenStore for FileStore {
     }
 
     fn save(&self, creds: &StoredCredentials) -> Result<(), String> {
-        let mut doc = self.read_doc();
+        let mut doc = self.read_doc()?;
         doc.servers.insert(creds.server_url.clone(), creds.clone());
         self.write_doc(&doc)
     }
 
     fn delete(&self, server_url: &str) -> Result<(), String> {
-        let mut doc = self.read_doc();
+        let mut doc = self.read_doc()?;
         doc.servers.remove(server_url);
         self.write_doc(&doc)
     }
@@ -297,6 +328,22 @@ mod tests {
         store.save(&creds).unwrap();
         assert_eq!(store.load("https://mcp.example.com/mcp"), Some(creds));
         assert_eq!(store.load("https://other.example.com/mcp"), None);
+    }
+
+    #[test]
+    fn corrupt_store_is_not_clobbered_on_save() {
+        let store = FileStore::new(temp_path());
+        std::fs::create_dir_all(store.path().parent().unwrap()).unwrap();
+        std::fs::write(store.path(), "{ not valid json").unwrap();
+        // save must refuse (returning Err) rather than wipe the file…
+        assert!(store.save(&sample("https://x.example.com/mcp")).is_err());
+        // …and the file must be untouched.
+        assert_eq!(
+            std::fs::read_to_string(store.path()).unwrap(),
+            "{ not valid json"
+        );
+        // load of a corrupt store yields None (→ re-auth), never a panic.
+        assert!(store.load("https://x.example.com/mcp").is_none());
     }
 
     #[test]
