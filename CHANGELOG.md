@@ -38,8 +38,44 @@
     `html/text`.
   - **Path safety & config** — `path/canonicalize`, `path/relative-to`,
     `path/within?`, `sys/config-dir`.
+  - **Display-aware text** — `string/width` (terminal display columns; wide-char
+    and ANSI aware) and `string/word-wrap` (width-aware word wrapping).
+  - **Rich terminal input** — `io/read-key` now decodes the kitty keyboard
+    protocol (modifier reporting as an optional `:mods` list) and SGR mouse
+    reports (`{:kind :mouse …}`), both backward compatible; opt in with
+    `term/enable-kitty-keys!` / `term/disable-kitty-keys!` (mouse via the
+    existing `term/enable-mouse`, which now also reports drag).
+- **Streaming agent turns** — `agent/run` accepts an `:on-text` callback that
+  streams the assistant reply token-by-token (in addition to `:on-tool-call`),
+  so front-ends can render a reply as it arrives.
 - **Sema Coder** (`examples/sema-coder/`) — a terminal coding agent written in
-  Sema with an extensible slash-command registry and single-file JSON config.
+  Sema: a full-screen, frame-diffed TUI with a fuzzy `/` command palette, live
+  streaming, mouse-wheel scrolling, resize handling, and an extensible
+  slash-command registry + single-file JSON config (falls back to a plain
+  line-based REPL when stdout isn't a TTY).
+
+### Fixed
+
+- **`path/within?` could be fooled by a symlink.** For a path that doesn't exist
+  yet (the "agent about to write a new file" case) it now resolves the deepest
+  existing ancestor — so a symlink inside the sandbox can't escape it — and no
+  longer rejects legitimate paths under a symlinked prefix (e.g. macOS
+  `/var`→`/private/var`).
+- **`term/strip` swallowed text after non-SGR sequences.** It now parses full CSI
+  and OSC sequences (cursor moves, clears, titles), not just colors.
+- **Arrow/navigation keys could leak as literal characters.** `io/read-key` reads
+  unbuffered from the raw fd so escape-sequence continuation bytes stay visible to
+  `select()`, fixing intermittent `^[[C`-style leakage under fast terminals.
+- **Streamed tool calls were dropped (Anthropic).** `stream_complete` now
+  assembles `tool_use` blocks into `tool_calls`, so a streaming `agent/run` turn
+  can call tools.
+- **Multi-turn tool history failed on re-send.** `agent/run`'s `:messages`
+  round-trip now preserves assistant `tool_calls` and the tool-result
+  `tool_call_id`/name, so a conversation that used a tool no longer errors on the
+  next turn (e.g. Anthropic `tool_use_id` validation).
+- **Archive extraction could silently overwrite.** `zip/extract` / `tar/extract`
+  reject two entries that map to the same target; `diff/apply` folds hunk drift
+  into its offset; `sys/which` honors `PATHEXT` on Windows.
 
 ## 1.28.1
 
