@@ -91,6 +91,7 @@ crc32fast = "1"
 # resolves the config dir. Platform-native keyring backends avoid extra system
 # libs (no dbus) so CI builds stay green.
 oauth2 = { version = "5", default-features = false }
+url = "2"
 tiny_http = "0.12"
 webbrowser = "1"
 keyring = { version = "3", features = ["apple-native", "windows-native", "linux-native"] }

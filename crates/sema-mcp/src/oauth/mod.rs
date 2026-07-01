@@ -12,6 +12,8 @@
 //! discovery / registration HTTP is driven directly with our own reqwest client
 //! so nothing depends on `oauth2`'s (reqwest-0.12) built-in client.
 
+pub mod discovery;
+
 use oauth2::{CsrfToken, PkceCodeChallenge, PkceCodeVerifier};
 
 /// A freshly generated PKCE pair plus a CSRF `state`, produced by the `oauth2`

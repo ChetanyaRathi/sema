@@ -3413,6 +3413,7 @@ dependencies = [
  "sha2",
  "tiny_http",
  "tokio",
+ "url",
  "uuid",
  "webbrowser",
 ]
