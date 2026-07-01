@@ -15,6 +15,15 @@
 
 ### Fixed
 
+- **`sort` is type-safe and numerically correct without a comparator.**
+  Comparator-free `(sort xs)` previously delegated to an internal tag order, so
+  mixed int/float lists sorted every int before every float regardless of value
+  (`(sort (list 3 1.5))` → `(3 1.5)`) and heterogeneous lists
+  (`(sort (list 3 "a" 1))`) returned a silent, non-portable ordering. Now ints
+  and floats compare as one numeric family by value, every other element must
+  share its kind, and mixing unrelated types raises a type error pointing at
+  `sort-by` / a 2-arg comparator. Deliberate cross-type ordering via an explicit
+  comparator is unchanged.
 - **`str` is now a real alias of `string-append`.** The two builtins had
   byte-identical but separately copy-pasted implementations; `str` is now
   registered as an alias of `string-append` (matching how `string/append`
