@@ -4,7 +4,9 @@ use serde::{Deserialize, Serialize};
 pub struct JsonRpcRequest {
     pub jsonrpc: String,
     pub method: String,
-    #[serde(default)]
+    // Omit `params` entirely when absent rather than sending `"params":null` —
+    // some servers (e.g. Asana) reject an explicit null with `400`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub params: Option<serde_json::Value>,
     pub id: Option<serde_json::Value>,
 }
@@ -59,4 +61,38 @@ pub struct CallToolResult {
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum ToolContent {
     Text { text: String },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn request_omits_null_params() {
+        // A request with no params must NOT serialize `"params":null` — some
+        // servers (Asana) reject that with a 400.
+        let req = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            method: "tools/list".to_string(),
+            params: None,
+            id: Some(serde_json::json!(2)),
+        };
+        let encoded = serde_json::to_string(&req).unwrap();
+        assert!(
+            !encoded.contains("params"),
+            "params must be omitted when None: {encoded}"
+        );
+    }
+
+    #[test]
+    fn request_keeps_present_params() {
+        let req = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            method: "tools/call".to_string(),
+            params: Some(serde_json::json!({ "name": "x" })),
+            id: Some(serde_json::json!(1)),
+        };
+        let encoded = serde_json::to_string(&req).unwrap();
+        assert!(encoded.contains("\"params\""), "got: {encoded}");
+    }
 }

@@ -144,7 +144,7 @@ fn connect_http(config_json: &serde_json::Value) -> Result<Value, SemaError> {
         .get("url")
         .and_then(|value| value.as_str())
         .ok_or_else(|| SemaError::eval("mcp/connect requires a :url entry for http transport"))?;
-    let headers = config_json
+    let mut headers = config_json
         .get("headers")
         .and_then(|value| value.as_object())
         .map(|object| {
@@ -171,33 +171,49 @@ fn connect_http(config_json: &serde_json::Value) -> Result<Value, SemaError> {
     if let Err(err) = block_on(client.initialize()) {
         if let Some(challenge) = client.http_challenge() {
             // A `401` means the server requires OAuth; run the login flow, attach
-            // the token, and retry.
+            // the token, and retry. Some authenticated servers (e.g. Asana) gate
+            // *all* requests behind auth and only reveal that they actually speak
+            // the legacy HTTP+SSE transport once authorized — so a `404`/`405` on
+            // the authenticated Streamable POST means "retry over legacy SSE with
+            // the token attached", not a hard failure.
             let token = obtain_access_token(url, &challenge, preconfigured_client_id.as_deref())?;
+            headers.insert("Authorization".to_string(), format!("Bearer {token}"));
             client.set_bearer_token(&token);
-            if let Err(err) = block_on(client.initialize()) {
+            if let Err(err2) = block_on(client.initialize()) {
+                let status = client.http_last_status();
                 let _ = block_on(client.close());
+                if matches!(status, Some(404) | Some(405)) {
+                    return connect_legacy(url, headers);
+                }
                 return Err(SemaError::eval(format!(
-                    "mcp/connect: handshake failed after authorization: {err}"
+                    "mcp/connect: handshake failed after authorization: {err2}"
                 )));
             }
         } else if matches!(client.http_last_status(), Some(404) | Some(405)) {
-            // The Streamable-HTTP POST was rejected — fall back to the deprecated
-            // 2024-11-05 HTTP+SSE transport (POST→4xx→GET-`endpoint`).
+            // Unauthenticated server that only speaks the deprecated 2024-11-05
+            // HTTP+SSE transport (POST→4xx→GET-`endpoint`).
             let _ = block_on(client.close());
-            let mut legacy = block_on(McpClient::connect_legacy_sse(McpHttpConfig {
-                url: url.to_string(),
-                headers,
-            }))
-            .map_err(|e| SemaError::eval(format!("mcp/connect: {e}")))?;
-            block_on(legacy.initialize())
-                .map_err(|e| SemaError::eval(format!("mcp/connect (legacy SSE): {e}")))?;
-            return register_connection(legacy);
+            return connect_legacy(url, headers);
         } else {
             let _ = block_on(client.close());
             return Err(SemaError::eval(format!("mcp/connect: {err}")));
         }
     }
     register_connection(client)
+}
+
+/// Connect over the deprecated 2024-11-05 HTTP+SSE transport. `headers` carries
+/// any bearer token obtained during the OAuth flow, so authenticated legacy
+/// servers (e.g. Asana) work.
+fn connect_legacy(url: &str, headers: HashMap<String, String>) -> Result<Value, SemaError> {
+    let mut legacy = block_on(McpClient::connect_legacy_sse(McpHttpConfig {
+        url: url.to_string(),
+        headers,
+    }))
+    .map_err(|e| SemaError::eval(format!("mcp/connect: {e}")))?;
+    block_on(legacy.initialize())
+        .map_err(|e| SemaError::eval(format!("mcp/connect (legacy SSE): {e}")))?;
+    register_connection(legacy)
 }
 
 /// Run (or reuse) the OAuth login for a remote server that answered `401`, and
