@@ -243,7 +243,14 @@ pub(crate) fn render_apropos_hits(pattern: &str, hits: &[AproposHit]) -> String 
 }
 
 pub(crate) fn render_terminal_markdown(md: &str) -> String {
-    if !colors::enabled_stdout() {
+    render_terminal_markdown_inner(md, colors::enabled_stdout())
+}
+
+/// Rendering core with an explicit color decision so tests can exercise the
+/// styled path without a TTY (`render_terminal_markdown` supplies the real
+/// `colors::enabled_stdout()` at runtime).
+pub(crate) fn render_terminal_markdown_inner(md: &str, color: bool) -> String {
+    if !color {
         return md.to_string();
     }
 
@@ -255,7 +262,7 @@ pub(crate) fn render_terminal_markdown(md: &str) -> String {
         let trimmed = line.trim_start();
         if trimmed.starts_with("```sema") {
             sema_block = true;
-            out.push_str(&dim(line));
+            out.push_str(&paint_rgb(colors::TERTIARY, line));
             out.push('\n');
             continue;
         }
@@ -265,7 +272,7 @@ pub(crate) fn render_terminal_markdown(md: &str) -> String {
             } else {
                 other_block = !other_block;
             }
-            out.push_str(&dim(line));
+            out.push_str(&paint_rgb(colors::TERTIARY, line));
             out.push('\n');
             continue;
         }
@@ -280,33 +287,37 @@ pub(crate) fn render_terminal_markdown(md: &str) -> String {
             continue;
         }
         if let Some(rest) = trimmed.strip_prefix("### ") {
-            out.push_str(&yellow(rest));
+            out.push_str(&paint_rgb(colors::AMBER, rest));
             out.push('\n');
             continue;
         }
         if let Some(rest) = trimmed.strip_prefix("## ") {
-            out.push_str(&yellow(rest));
+            out.push_str(&paint_rgb(colors::AMBER, rest));
             out.push('\n');
             continue;
         }
         if let Some(rest) = trimmed.strip_prefix("# ") {
-            out.push_str(&yellow(rest));
+            out.push_str(&paint_rgb(colors::AMBER, rest));
             out.push('\n');
             continue;
         }
         if let Some(rest) = trimmed.strip_prefix("- ") {
             out.push_str("• ");
-            out.push_str(&style_inline(rest));
+            out.push_str(&style_inline_colored(rest, color));
             out.push('\n');
             continue;
         }
-        out.push_str(&style_inline(line));
+        out.push_str(&style_inline_colored(line, color));
         out.push('\n');
     }
     out
 }
 
 fn style_inline(text: &str) -> String {
+    style_inline_colored(text, colors::enabled_stdout())
+}
+
+fn style_inline_colored(text: &str, color: bool) -> String {
     let mut out = String::new();
     let chars: Vec<char> = text.chars().collect();
     let mut i = 0;
@@ -318,7 +329,7 @@ fn style_inline(text: &str) -> String {
             }
             if j + 1 < chars.len() {
                 let inner: String = chars[i + 2..j].iter().collect();
-                out.push_str(&yellow(&inner));
+                out.push_str(&maybe_rgb(color, colors::AMBER, &inner));
                 i = j + 2;
                 continue;
             }
@@ -330,7 +341,7 @@ fn style_inline(text: &str) -> String {
             }
             if j < chars.len() {
                 let inner: String = chars[i + 1..j].iter().collect();
-                out.push_str(&cyan(&inner));
+                out.push_str(&maybe_rgb(color, colors::TEAL, &inner));
                 i = j + 1;
                 continue;
             }
@@ -342,7 +353,7 @@ fn style_inline(text: &str) -> String {
             }
             if j < chars.len() {
                 let inner: String = chars[i + 1..j].iter().collect();
-                out.push_str(&dim(&inner));
+                out.push_str(&maybe_rgb(color, colors::TERTIARY, &inner));
                 i = j + 1;
                 continue;
             }
@@ -374,20 +385,26 @@ pub(crate) fn visible_padding(s: &str) -> usize {
     coloured.len().saturating_sub(s.len())
 }
 
-fn stdout_rgb(rgb: (u8, u8, u8), s: &str) -> String {
-    if colors::enabled_stdout() {
-        format!("\x1b[38;2;{};{};{}m{s}\x1b[0m", rgb.0, rgb.1, rgb.2)
+/// Unconditional truecolor paint — the caller has already decided color is on.
+fn paint_rgb(rgb: (u8, u8, u8), s: &str) -> String {
+    format!("\x1b[38;2;{};{};{}m{s}\x1b[0m", rgb.0, rgb.1, rgb.2)
+}
+
+/// Paint only when `color` is true, otherwise return the text unchanged.
+fn maybe_rgb(color: bool, rgb: (u8, u8, u8), s: &str) -> String {
+    if color {
+        paint_rgb(rgb, s)
     } else {
         s.to_string()
     }
 }
 
-fn cyan(s: &str) -> String {
-    stdout_rgb(colors::TEAL, s)
+fn stdout_rgb(rgb: (u8, u8, u8), s: &str) -> String {
+    maybe_rgb(colors::enabled_stdout(), rgb, s)
 }
 
-fn yellow(s: &str) -> String {
-    stdout_rgb(colors::AMBER, s)
+fn cyan(s: &str) -> String {
+    stdout_rgb(colors::TEAL, s)
 }
 
 fn dim(s: &str) -> String {
@@ -455,5 +472,35 @@ mod tests {
     fn search_results_render_empty_state() {
         let out = render_search_results("nope", &[]);
         assert!(out.contains("no documentation matches"));
+    }
+
+    // `,apropos` and `sema doc apropos` draw special forms from the sema-docs
+    // index rather than injecting `SPECIAL_FORM_NAMES`. That is only complete if
+    // every special form actually has a doc entry — this guards against a new
+    // special form silently disappearing from apropos/lookup.
+    #[test]
+    fn every_special_form_has_a_doc_entry() {
+        let missing: Vec<&str> = sema_eval::SPECIAL_FORM_NAMES
+            .iter()
+            .copied()
+            .filter(|name| lookup(name).is_none())
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "special forms missing a sema-docs entry: {missing:?}"
+        );
+    }
+
+    #[test]
+    fn markdown_inner_dims_fences_when_forced() {
+        // The styled path must not depend on stdout being a TTY.
+        let out = render_terminal_markdown_inner("```sema\n(a 1)\n```\n", true);
+        assert!(
+            out.contains("\x1b[38;2;107;99;84m"),
+            "fences not dimmed: {out:?}"
+        );
+        // And stays plain when color is off.
+        let plain = render_terminal_markdown_inner("```sema\n(a 1)\n```\n", false);
+        assert!(!plain.contains('\x1b'), "unexpected ansi: {plain:?}");
     }
 }

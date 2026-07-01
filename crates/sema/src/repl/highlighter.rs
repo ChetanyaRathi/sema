@@ -451,7 +451,7 @@ mod tests {
     #[test]
     fn doc_markdown_dims_all_sema_fences() {
         let md = "Example:\n\n```sema\n(a 1)\n```\n\nMore:\n\n```sema\n(b 2)\n```\n";
-        let out = crate::docs::render_terminal_markdown(md);
+        let out = crate::docs::render_terminal_markdown_inner(md, true);
 
         // Every fence line should start with the tertiary foreground escape.
         // (Lines begin with ANSI escapes after dimming, so we look for the
@@ -480,7 +480,7 @@ mod tests {
         // regression where the final closing fence of a multi-block doc was
         // not styled.
         let md = "Define an LLM agent. The `name` must be a symbol.\n\n```sema\n(defagent greeter\n  {:system \"You are a friendly greeter.\"})\n```\n\nInspecting an agent:\n\n```sema\n(agent/name greeter)       ; => \"greeter\"\n(agent? greeter)           ; => #t\n```";
-        let out = crate::docs::render_terminal_markdown(md);
+        let out = crate::docs::render_terminal_markdown_inner(md, true);
 
         let tertiary = "\x1b[38;2;107;99;84m";
         let mut fence_count = 0;
@@ -498,7 +498,7 @@ mod tests {
         // Regression: code in the final ```sema block of defagent was not
         // getting function-position syntax highlighting.
         let md = "Inspecting an agent:\n\n```sema\n(agent/name greeter)       ; => \"greeter\"\n(agent/system greeter)     ; => \"You are a friendly greeter...\"\n(agent/max-turns greeter)  ; => 5\n(agent? greeter)           ; => #t\n```";
-        let out = crate::docs::render_terminal_markdown(md);
+        let out = crate::docs::render_terminal_markdown_inner(md, true);
 
         let gold = "\x1b[38;2;200;168;85m";
         for line in out.lines() {
