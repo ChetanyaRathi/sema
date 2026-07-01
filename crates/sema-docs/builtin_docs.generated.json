@@ -1170,18 +1170,18 @@
     {
       "name": "conversation/cost",
       "module": "conversation",
-      "summary": "Estimate the cost in USD of the conversation, treating its estimated tokens (~4 chars per token, the same heuristic as `conversation/token-count`) as input tokens for the conversation's model. This is a rough planning aid, not a billing figure: it ignores output-token pricing and the provider's real tokenizer. Returns `nil` if pricing for the model is unknown.",
+      "summary": "Cumulative cost in USD, summed from each turn's actual token usage as it was sent (`conversation/say` folds the billed usage into the conversation). Returns `nil` when no priced turn has been recorded: an empty or hand-built conversation, or a model whose pricing is unknown.",
       "params": [
         {
           "name": "conv",
           "type": "conversation"
         }
       ],
-      "returns": "float",
+      "returns": "float or nil",
       "examples": [
-        "(conversation/cost conv)   ; => 0.0014"
+        "(conversation/cost conv)   ; => 0.00028 (or nil)"
       ],
-      "body": "Estimate the cost in USD of the conversation, treating its estimated tokens (~4 chars per token, the same heuristic as `conversation/token-count`) as input tokens for the conversation's model. This is a rough planning aid, not a billing figure: it ignores output-token pricing and the provider's real tokenizer. Returns `nil` if pricing for the model is unknown.\n\n```sema\n(conversation/cost conv)   ; => 0.0014\n```"
+      "body": "Cumulative cost in USD, summed from each turn's actual token usage as it was sent (`conversation/say` folds the billed usage into the conversation). Returns `nil` when no priced turn has been recorded: an empty or hand-built conversation, or a model whose pricing is unknown.\n\n```sema\n(conversation/cost conv)   ; => 0.00028 (or nil)\n```"
     },
     {
       "name": "conversation/filter",
@@ -1203,6 +1203,25 @@
       "body": "Return a new conversation keeping only messages for which `(pred msg)` is truthy. The predicate receives each message value. The result is still a conversation (so you can keep talking to it) — unlike `conversation/map`, which returns a plain list of per-message results. Combine with `message/role` to drop or isolate roles, e.g. strip tool chatter before re-sending.\n\n```sema\n;; Keep only the user turns.\n(conversation/filter conv (fn [m] (= (message/role m) :user)))\n```"
     },
     {
+      "name": "conversation/find",
+      "module": "conversation",
+      "summary": "Returns the first message for which `(pred msg)` is truthy, or `nil` if none match. Like `conversation/filter`, but returns just the first hit rather than a filtered conversation.",
+      "params": [
+        {
+          "name": "conv",
+          "type": "conversation"
+        },
+        {
+          "name": "pred"
+        }
+      ],
+      "returns": "message or nil",
+      "examples": [
+        "(conversation/find conv (fn (m) (= (message/role m) :assistant)))"
+      ],
+      "body": "Returns the first message for which `(pred msg)` is truthy, or `nil` if none match. Like `conversation/filter`, but returns just the first hit rather than a filtered conversation.\n\n```sema\n(conversation/find conv (fn (m) (= (message/role m) :assistant)))\n```"
+    },
+    {
       "name": "conversation/fork",
       "module": "conversation",
       "summary": "Return an independent copy of the conversation, sharing its history up to this point but diverging from here on. Use it to explore alternative continuations — ask the same context two different follow-ups, A/B different system prompts, or speculatively branch — without disturbing the original thread.",
@@ -1219,6 +1238,29 @@
       "body": "Return an independent copy of the conversation, sharing its history up to this point but diverging from here on. Use it to explore alternative continuations — ask the same context two different follow-ups, A/B different system prompts, or speculatively branch — without disturbing the original thread.\n\nBecause conversations are already immutable, `conversation/say` on the original would *also* leave it untouched; `fork` mainly signals intent and gives each branch its own name to thread forward. Each branch is a separate value you continue independently.\n\n```sema\n;; Explore two follow-ups from the same shared context:\n(let* ((a (conversation/say conv \"Summarize it formally.\"))\n       (b (conversation/say (conversation/fork conv) \"Summarize it casually.\")))\n  (list (conversation/last-reply a) (conversation/last-reply b)))\n```"
     },
     {
+      "name": "conversation/insert",
+      "module": "conversation",
+      "summary": "Returns a new conversation with a message inserted before index `idx`; passing `idx` equal to the length appends. The message is given either as a message value or as a `:role` keyword plus a content string. Errors if `idx` is out of bounds.",
+      "params": [
+        {
+          "name": "conv",
+          "type": "conversation"
+        },
+        {
+          "name": "idx",
+          "type": "int"
+        },
+        {
+          "name": "message"
+        }
+      ],
+      "returns": "conversation",
+      "examples": [
+        "(conversation/insert conv 1 :system \"Additional context.\")\n(conversation/insert conv 1 (message :system \"Additional context.\"))"
+      ],
+      "body": "Returns a new conversation with a message inserted before index `idx`; passing `idx` equal to the length appends. The message is given either as a message value or as a `:role` keyword plus a content string. Errors if `idx` is out of bounds.\n\n```sema\n(conversation/insert conv 1 :system \"Additional context.\")\n(conversation/insert conv 1 (message :system \"Additional context.\"))\n```"
+    },
+    {
       "name": "conversation/last-reply",
       "module": "conversation",
       "summary": "Return the content of the most recent assistant message as a string. Errors if the conversation has no assistant reply.",
@@ -1233,6 +1275,22 @@
         "(conversation/last-reply conv)"
       ],
       "body": "Return the content of the most recent assistant message as a string. Errors if the conversation has no assistant reply.\n\n```sema\n(conversation/last-reply conv)\n```"
+    },
+    {
+      "name": "conversation/length",
+      "module": "conversation",
+      "summary": "Number of messages in the conversation — system, user, and assistant messages are all counted. Contrast with `conversation/turns`, which counts only assistant replies.",
+      "params": [
+        {
+          "name": "conv",
+          "type": "conversation"
+        }
+      ],
+      "returns": "int",
+      "examples": [
+        "(conversation/length conv)   ; => 4"
+      ],
+      "body": "Number of messages in the conversation — system, user, and assistant messages are all counted. Contrast with `conversation/turns`, which counts only assistant replies.\n\n```sema\n(conversation/length conv)   ; => 4\n```"
     },
     {
       "name": "conversation/map",
@@ -1252,6 +1310,29 @@
         "(conversation/map conv message/content)"
       ],
       "body": "Apply `f` to each message in the conversation and return the list of results. Unlike `conversation/filter`, this returns a plain list rather than a conversation.\n\n```sema\n(conversation/map conv message/content)\n```"
+    },
+    {
+      "name": "conversation/map-role",
+      "module": "conversation",
+      "summary": "Returns a new conversation where every message whose role is `role` is replaced by `(f msg)` — `f` receives a message and must return a message. Messages of other roles pass through unchanged. Contrast with `conversation/map`, which applies `f` to every message and returns a plain list of results.",
+      "params": [
+        {
+          "name": "conv",
+          "type": "conversation"
+        },
+        {
+          "name": "role",
+          "type": "keyword"
+        },
+        {
+          "name": "f"
+        }
+      ],
+      "returns": "conversation",
+      "examples": [
+        "(conversation/map-role conv :assistant\n  (fn (m) (message :assistant (string/trim (message/content m)))))"
+      ],
+      "body": "Returns a new conversation where every message whose role is `role` is replaced by `(f msg)` — `f` receives a message and must return a message. Messages of other roles pass through unchanged. Contrast with `conversation/map`, which applies `f` to every message and returns a plain list of results.\n\n```sema\n(conversation/map-role conv :assistant\n  (fn (m) (message :assistant (string/trim (message/content m)))))\n```"
     },
     {
       "name": "conversation/messages",
@@ -1286,6 +1367,22 @@
       "body": "Return the model name associated with the conversation.\n\n```sema\n(conversation/model conv)   ; => \"claude-sonnet-4\"\n```"
     },
     {
+      "name": "conversation/models-used",
+      "module": "conversation",
+      "summary": "The models that produced replies in the conversation. A conversation carries a single configured model, so this is a one-element list of that model name — or an empty list when no model is set.",
+      "params": [
+        {
+          "name": "conv",
+          "type": "conversation"
+        }
+      ],
+      "returns": "list",
+      "examples": [
+        "(conversation/models-used conv)   ; => (\"gpt-4\")"
+      ],
+      "body": "The models that produced replies in the conversation. A conversation carries a single configured model, so this is a one-element list of that model name — or an empty list when no model is set.\n\n```sema\n(conversation/models-used conv)   ; => (\"gpt-4\")\n```"
+    },
+    {
       "name": "conversation/new",
       "module": "conversation",
       "summary": "Create a new, empty conversation — a value that bundles a model, an optional system prompt, and an ordered list of messages. The optional map sets the `:model`; any other keys are stored as string metadata.",
@@ -1300,6 +1397,49 @@
         "(conversation/new {:model \"claude-sonnet-4\" :user \"alice\"})\n\n;; Build up a conversation by threading the returned value (no LLM call here):\n(let* ((c  (conversation/new {:model \"claude-sonnet-4\"}))\n       (c1 (conversation/set-system c \"You are concise.\"))\n       (c2 (conversation/add-message c1 :user \"Hello\"))\n       (c3 (conversation/add-message c2 :assistant \"Hi.\")))\n  (conversation/map c3 message/role))  ; => (:system :user :assistant)"
       ],
       "body": "Create a new, empty conversation — a value that bundles a model, an optional system prompt, and an ordered list of messages. The optional map sets the `:model`; any other keys are stored as string metadata.\n\nConversations are **immutable**. Every operation (`conversation/say`, `conversation/add-message`, `conversation/set-system`, …) returns a *new* conversation rather than mutating in place, so you must thread the returned value forward — `let*` or a pipeline is the idiomatic way to chain turns. This immutability is what makes `conversation/fork` cheap and safe for branching.\n\n```sema\n(conversation/new {:model \"claude-sonnet-4\" :user \"alice\"})\n\n;; Build up a conversation by threading the returned value (no LLM call here):\n(let* ((c  (conversation/new {:model \"claude-sonnet-4\"}))\n       (c1 (conversation/set-system c \"You are concise.\"))\n       (c2 (conversation/add-message c1 :user \"Hello\"))\n       (c3 (conversation/add-message c2 :assistant \"Hi.\")))\n  (conversation/map c3 message/role))  ; => (:system :user :assistant)\n```"
+    },
+    {
+      "name": "conversation/remove",
+      "module": "conversation",
+      "summary": "Returns a new conversation with the message at index `idx` removed — conversations are immutable, so the original is unchanged. Errors if `idx` is out of bounds.",
+      "params": [
+        {
+          "name": "conv",
+          "type": "conversation"
+        },
+        {
+          "name": "idx",
+          "type": "int"
+        }
+      ],
+      "returns": "conversation",
+      "examples": [
+        "(conversation/remove conv 2)   ; drop the message at index 2"
+      ],
+      "body": "Returns a new conversation with the message at index `idx` removed — conversations are immutable, so the original is unchanged. Errors if `idx` is out of bounds.\n\n```sema\n(conversation/remove conv 2)   ; drop the message at index 2\n```"
+    },
+    {
+      "name": "conversation/replace",
+      "module": "conversation",
+      "summary": "Returns a new conversation with the message at index `idx` replaced. The replacement is given either as a message value or as a `:role` keyword plus a content string. Errors if `idx` is out of bounds.",
+      "params": [
+        {
+          "name": "conv",
+          "type": "conversation"
+        },
+        {
+          "name": "idx",
+          "type": "int"
+        },
+        {
+          "name": "message"
+        }
+      ],
+      "returns": "conversation",
+      "examples": [
+        "(conversation/replace conv 1 :user \"What is Scheme?\")"
+      ],
+      "body": "Returns a new conversation with the message at index `idx` replaced. The replacement is given either as a message value or as a `:role` keyword plus a content string. Errors if `idx` is out of bounds.\n\n```sema\n(conversation/replace conv 1 :user \"What is Scheme?\")\n```"
     },
     {
       "name": "conversation/say",
@@ -1353,6 +1493,26 @@
       "body": "Like `conversation/say` but overrides the system prompt (a string or prompt value) for **this turn only** — the conversation's own system message is left unchanged in the returned conversation, so the next plain `conversation/say` reverts to it. The optional opts map accepts `:temperature` and `:max-tokens`.\n\nContrast with `conversation/set-system`, which *persistently* replaces the system message for all future turns. Reach for `say-as` to adopt a persona or instruction for a single exchange.\n\n```sema\n(conversation/say-as conv \"You are a terse pirate.\" \"Describe the weather.\")\n```"
     },
     {
+      "name": "conversation/search",
+      "module": "conversation",
+      "summary": "Case-insensitive substring search over message content. Returns a list of `{:index :role :content}` maps, one per matching message.",
+      "params": [
+        {
+          "name": "conv",
+          "type": "conversation"
+        },
+        {
+          "name": "query",
+          "type": "string"
+        }
+      ],
+      "returns": "list",
+      "examples": [
+        "(conversation/search conv \"lisp\")\n;; => [{:index 1 :role :user :content \"What is Lisp?\"} ...]"
+      ],
+      "body": "Case-insensitive substring search over message content. Returns a list of `{:index :role :content}` maps, one per matching message.\n\n```sema\n(conversation/search conv \"lisp\")\n;; => [{:index 1 :role :user :content \"What is Lisp?\"} ...]\n```"
+    },
+    {
       "name": "conversation/set-system",
       "module": "conversation",
       "summary": "Return a new conversation with its system message set to (or replaced by) the given string, placed first among the messages. This **persists** for every future turn — contrast with `conversation/say-as`, which overrides the system prompt for one turn only. Read it back with `conversation/system`.",
@@ -1371,6 +1531,22 @@
         "(conversation/system\n  (conversation/set-system conv \"You are a concise expert.\"))  ; => \"You are a concise expert.\""
       ],
       "body": "Return a new conversation with its system message set to (or replaced by) the given string, placed first among the messages. This **persists** for every future turn — contrast with `conversation/say-as`, which overrides the system prompt for one turn only. Read it back with `conversation/system`.\n\n```sema\n(conversation/system\n  (conversation/set-system conv \"You are a concise expert.\"))  ; => \"You are a concise expert.\"\n```"
+    },
+    {
+      "name": "conversation/stats",
+      "module": "conversation",
+      "summary": "Aggregate report over the conversation: `{:messages :turns :tokens {:prompt :completion :total} :cost :models}`. The token and cost figures come from the real usage `conversation/say` accumulates as each turn is sent; they are `0` / `nil` when no priced turn has been recorded, and `:cost` is `nil` for a model with no known pricing.",
+      "params": [
+        {
+          "name": "conv",
+          "type": "conversation"
+        }
+      ],
+      "returns": "map",
+      "examples": [
+        "(conversation/stats conv)\n;; => {:messages 4 :turns 2 :tokens {:prompt 200 :completion 40 :total 240} :cost 0.00028 :models (\"gpt-4\")}"
+      ],
+      "body": "Aggregate report over the conversation: `{:messages :turns :tokens {:prompt :completion :total} :cost :models}`. The token and cost figures come from the real usage `conversation/say` accumulates as each turn is sent; they are `0` / `nil` when no priced turn has been recorded, and `:cost` is `nil` for a model with no known pricing.\n\n```sema\n(conversation/stats conv)\n;; => {:messages 4 :turns 2 :tokens {:prompt 200 :completion 40 :total 240} :cost 0.00028 :models (\"gpt-4\")}\n```"
     },
     {
       "name": "conversation/system",
@@ -1403,6 +1579,22 @@
         "(conversation/token-count conv)   ; => 312"
       ],
       "body": "Estimate the total number of tokens across all message contents in the conversation, using a ~4-characters-per-token heuristic.\n\n```sema\n(conversation/token-count conv)   ; => 312\n```"
+    },
+    {
+      "name": "conversation/turns",
+      "module": "conversation",
+      "summary": "Number of assistant replies in the conversation — the count of completed user/assistant exchanges. Contrast with `conversation/length`, which counts every message.",
+      "params": [
+        {
+          "name": "conv",
+          "type": "conversation"
+        }
+      ],
+      "returns": "int",
+      "examples": [
+        "(conversation/turns conv)   ; => 2"
+      ],
+      "body": "Number of assistant replies in the conversation — the count of completed user/assistant exchanges. Contrast with `conversation/length`, which counts every message.\n\n```sema\n(conversation/turns conv)   ; => 2\n```"
     },
     {
       "name": "base64/decode",
@@ -6935,6 +7127,46 @@
       "body": "Alias for `prompt/append`: concatenate one or more prompts into a single prompt, preserving message order. See `prompt/append` for the full behavior (system messages are *not* merged).\n\n```sema\n(prompt/messages\n  (prompt/concat (prompt (user \"a\")) (prompt (user \"b\"))))\n; => (<message user \"a\"> <message user \"b\">)\n```"
     },
     {
+      "name": "prompt/diff",
+      "module": "prompt",
+      "summary": "Structurally compares two prompts by `(role, content)`. Returns `{:added :removed}`: `:added` holds the messages present in `b` but not `a`, `:removed` those in `a` but not `b`. Useful for prompt versioning and review.",
+      "params": [
+        {
+          "name": "a",
+          "type": "prompt"
+        },
+        {
+          "name": "b",
+          "type": "prompt"
+        }
+      ],
+      "returns": "map",
+      "examples": [
+        "(prompt/diff prompt-v1 prompt-v2)\n;; => {:added [...] :removed [...]}"
+      ],
+      "body": "Structurally compares two prompts by `(role, content)`. Returns `{:added :removed}`: `:added` holds the messages present in `b` but not `a`, `:removed` those in `a` but not `b`. Useful for prompt versioning and review.\n\n```sema\n(prompt/diff prompt-v1 prompt-v2)\n;; => {:added [...] :removed [...]}\n```"
+    },
+    {
+      "name": "prompt/difference",
+      "module": "prompt",
+      "summary": "Returns a prompt of the messages in `a` that are not in `b`, matched by `(role, content)`, in `a`'s order and de-duplicated.",
+      "params": [
+        {
+          "name": "a",
+          "type": "prompt"
+        },
+        {
+          "name": "b",
+          "type": "prompt"
+        }
+      ],
+      "returns": "prompt",
+      "examples": [
+        "(prompt/difference prompt-a prompt-b)"
+      ],
+      "body": "Returns a prompt of the messages in `a` that are not in `b`, matched by `(role, content)`, in `a`'s order and de-duplicated.\n\n```sema\n(prompt/difference prompt-a prompt-b)\n```"
+    },
+    {
       "name": "prompt/fill",
       "module": "prompt",
       "summary": "Substitute `{{key}}` placeholders in every message of the prompt using the vars map (keys looked up as keywords). Slots with no matching key are left unchanged, so a partial fill is safe and re-fillable.",
@@ -6954,6 +7186,26 @@
         "(prompt/messages (prompt/fill template {:name \"Ada\"}))\n; => (<message user \"Hi Ada, let's do {{topic}}\">)"
       ],
       "body": "Substitute `{{key}}` placeholders in every message of the prompt using the vars map (keys looked up as keywords). Slots with no matching key are left unchanged, so a partial fill is safe and re-fillable.\n\nThe template stays reusable: `fill` returns a new prompt and never mutates the original, so one template can be filled many times with different vars.\n\n```sema\n(define template (prompt (user \"Hi {{name}}, let's do {{topic}}\")))\n(prompt/messages (prompt/fill template {:name \"Ada\" :topic \"loops\"}))\n; => (<message user \"Hi Ada, let's do loops\">)\n```\n\nA slot with no matching key is left verbatim — handy for filling in stages:\n\n```sema\n(prompt/messages (prompt/fill template {:name \"Ada\"}))\n; => (<message user \"Hi Ada, let's do {{topic}}\">)\n```\n\nUse `prompt/slots` to discover which placeholder keys a template expects before filling."
+    },
+    {
+      "name": "prompt/intersection",
+      "module": "prompt",
+      "summary": "Returns a prompt of the messages present in both prompts, matched by `(role, content)`, in `a`'s order and de-duplicated.",
+      "params": [
+        {
+          "name": "a",
+          "type": "prompt"
+        },
+        {
+          "name": "b",
+          "type": "prompt"
+        }
+      ],
+      "returns": "prompt",
+      "examples": [
+        "(prompt/intersection prompt-a prompt-b)"
+      ],
+      "body": "Returns a prompt of the messages present in both prompts, matched by `(role, content)`, in `a`'s order and de-duplicated.\n\n```sema\n(prompt/intersection prompt-a prompt-b)\n```"
     },
     {
       "name": "prompt/messages",
@@ -7006,6 +7258,26 @@
         "(prompt/slots template)   ; => (:name :topic)"
       ],
       "body": "Return the list of distinct `{{slot}}` placeholder names found across the prompt's messages, as keywords.\n\n```sema\n(prompt/slots template)   ; => (:name :topic)\n```"
+    },
+    {
+      "name": "prompt/union",
+      "module": "prompt",
+      "summary": "Returns a prompt containing the messages of `a` followed by those of `b`, de-duplicated by `(role, content)` with the first occurrence kept and order preserved. Matching is exact — it does not merge semantically similar instructions.",
+      "params": [
+        {
+          "name": "a",
+          "type": "prompt"
+        },
+        {
+          "name": "b",
+          "type": "prompt"
+        }
+      ],
+      "returns": "prompt",
+      "examples": [
+        "(prompt/union base-prompt safety-prompt)"
+      ],
+      "body": "Returns a prompt containing the messages of `a` followed by those of `b`, de-duplicated by `(role, content)` with the first occurrence kept and order preserved. Matching is exact — it does not merge semantically similar instructions.\n\n```sema\n(prompt/union base-prompt safety-prompt)\n```"
     },
     {
       "name": "define-record-type",

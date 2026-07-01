@@ -774,6 +774,67 @@ fn fill_template(template: &str, vars: &BTreeMap<Value, Value>) -> String {
     result
 }
 
+/// Parse a message role keyword (`:system`/`:user`/`:assistant`/`:tool`) for the
+/// conversation-surgery builtins, erroring with `who` in the message on anything else.
+fn parse_role(v: &Value, who: &str) -> Result<Role, SemaError> {
+    let kw = v
+        .as_keyword()
+        .ok_or_else(|| SemaError::type_error("keyword", v.type_name()))?;
+    match kw.as_str() {
+        "system" => Ok(Role::System),
+        "user" => Ok(Role::User),
+        "assistant" => Ok(Role::Assistant),
+        "tool" => Ok(Role::Tool),
+        other => Err(SemaError::eval(format!("{who}: unknown role '{other}'"))),
+    }
+}
+
+/// Build a `Message` from the tail of a surgery call: either a single message value
+/// (`(op conv i msg)`) or a `role`/`content` pair (`(op conv i :system "…")`).
+fn message_from_tail(tail: &[Value], who: &str) -> Result<Message, SemaError> {
+    match tail {
+        [m] => m
+            .as_message_rc()
+            .map(|rc| (*rc).clone())
+            .ok_or_else(|| SemaError::type_error("message", m.type_name())),
+        [role, content] => Ok(Message {
+            role: parse_role(role, who)?,
+            content: content
+                .as_str()
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| content.to_string()),
+            images: Vec::new(),
+        }),
+        _ => Err(SemaError::arity(who, "3-4", tail.len() + 2)),
+    }
+}
+
+/// Identity key for prompt-algebra dedup/compare: two messages are "the same" when
+/// role and content match (images are ignored).
+fn msg_key(m: &Message) -> (Role, &str) {
+    (m.role.clone(), m.content.as_str())
+}
+
+/// Fold a completed turn's real `usage` into a conversation's metadata so that
+/// `conversation/cost`/`conversation/stats` report actual billed figures. Cost is only
+/// accumulated when the model's price is known; if no turn ever contributes a priced
+/// usage, `usage-cost` stays absent and `conversation/cost` returns nil.
+fn accumulate_usage(meta: &mut BTreeMap<String, String>, usage: &Usage) {
+    let add_u32 = |meta: &mut BTreeMap<String, String>, key: &str, delta: u32| {
+        let prev: u64 = meta.get(key).and_then(|s| s.parse().ok()).unwrap_or(0);
+        meta.insert(key.to_string(), (prev + delta as u64).to_string());
+    };
+    add_u32(meta, "usage-prompt-tokens", usage.prompt_tokens);
+    add_u32(meta, "usage-completion-tokens", usage.completion_tokens);
+    if let Some(cost) = pricing::calculate_cost(usage) {
+        let prev: f64 = meta
+            .get("usage-cost")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0.0);
+        meta.insert("usage-cost".to_string(), (prev + cost).to_string());
+    }
+}
+
 /// A provider defined in Sema code via lambdas.
 /// Only stores String fields (Send+Sync); callbacks live in the
 /// LISP_PROVIDERS thread-local, accessed only from the same thread.
@@ -2317,10 +2378,12 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
             images: Vec::new(),
         });
 
+        let mut metadata = conv.metadata.clone();
+        accumulate_usage(&mut metadata, &response.usage);
         Ok(Value::conversation(Conversation {
             messages: new_messages,
             model: conv.model.clone(),
-            metadata: conv.metadata.clone(),
+            metadata,
         }))
     });
 
@@ -3918,10 +3981,12 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
             images: Vec::new(),
         });
 
+        let mut metadata = conv.metadata.clone();
+        accumulate_usage(&mut metadata, &response.usage);
         Ok(Value::conversation(Conversation {
             messages: new_messages,
             model: conv.model.clone(),
-            metadata: conv.metadata.clone(),
+            metadata,
         }))
     });
 
@@ -3943,7 +4008,9 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
         Ok(Value::int(estimated_tokens))
     });
 
-    // (conversation/cost conv) — estimate cost based on token count and model
+    // (conversation/cost conv) — cumulative cost in USD, summed from each turn's actual
+    // usage as it was sent (see accumulate_usage in conversation/say). Returns nil when no
+    // priced turn has been recorded.
     register_fn(env, "conversation/cost", |args| {
         if args.len() != 1 {
             return Err(SemaError::arity("conversation/cost", "1", args.len()));
@@ -3951,17 +4018,11 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
         let conv = args[0]
             .as_conversation_rc()
             .ok_or_else(|| SemaError::type_error("conversation", args[0].type_name()))?;
-        // Approximate token counts
-        let total_chars: usize = conv.messages.iter().map(|m| m.content.len()).sum();
-        let estimated_tokens = (total_chars as f64 / 4.0).ceil() as u32;
-        // Split: all messages are input tokens (the full context for next call)
-        let usage = Usage {
-            prompt_tokens: estimated_tokens,
-            completion_tokens: 0,
-            model: conv.model.clone(),
-            ..Default::default()
-        };
-        match pricing::calculate_cost(&usage) {
+        match conv
+            .metadata
+            .get("usage-cost")
+            .and_then(|s| s.parse::<f64>().ok())
+        {
             Some(cost) => Ok(Value::float(cost)),
             None => Ok(Value::nil()),
         }
@@ -4025,6 +4086,376 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
             }
         }
         Ok(Value::list(slots))
+    });
+
+    // ---- Conversation inspection (issue #12, Part 3) ----
+
+    // (conversation/length conv) — number of messages
+    register_fn(env, "conversation/length", |args| {
+        if args.len() != 1 {
+            return Err(SemaError::arity("conversation/length", "1", args.len()));
+        }
+        let conv = args[0]
+            .as_conversation_rc()
+            .ok_or_else(|| SemaError::type_error("conversation", args[0].type_name()))?;
+        Ok(Value::int(conv.messages.len() as i64))
+    });
+
+    // (conversation/turns conv) — number of assistant replies (user/assistant exchanges)
+    register_fn(env, "conversation/turns", |args| {
+        if args.len() != 1 {
+            return Err(SemaError::arity("conversation/turns", "1", args.len()));
+        }
+        let conv = args[0]
+            .as_conversation_rc()
+            .ok_or_else(|| SemaError::type_error("conversation", args[0].type_name()))?;
+        let turns = conv
+            .messages
+            .iter()
+            .filter(|m| m.role == Role::Assistant)
+            .count();
+        Ok(Value::int(turns as i64))
+    });
+
+    // (conversation/models-used conv) — list of models (the conversation carries one)
+    register_fn(env, "conversation/models-used", |args| {
+        if args.len() != 1 {
+            return Err(SemaError::arity(
+                "conversation/models-used",
+                "1",
+                args.len(),
+            ));
+        }
+        let conv = args[0]
+            .as_conversation_rc()
+            .ok_or_else(|| SemaError::type_error("conversation", args[0].type_name()))?;
+        if conv.model.is_empty() {
+            Ok(Value::list(Vec::new()))
+        } else {
+            Ok(Value::list(vec![Value::string(&conv.model)]))
+        }
+    });
+
+    // (conversation/stats conv) — aggregate report. Token/cost figures come from the
+    // real usage accumulated by conversation/say (see the usage-* metadata written there);
+    // they are 0 / nil when no priced turn has been sent.
+    register_fn(env, "conversation/stats", |args| {
+        if args.len() != 1 {
+            return Err(SemaError::arity("conversation/stats", "1", args.len()));
+        }
+        let conv = args[0]
+            .as_conversation_rc()
+            .ok_or_else(|| SemaError::type_error("conversation", args[0].type_name()))?;
+        let turns = conv
+            .messages
+            .iter()
+            .filter(|m| m.role == Role::Assistant)
+            .count() as i64;
+        let prompt_tokens: i64 = conv
+            .metadata
+            .get("usage-prompt-tokens")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        let completion_tokens: i64 = conv
+            .metadata
+            .get("usage-completion-tokens")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        let cost = conv
+            .metadata
+            .get("usage-cost")
+            .and_then(|s| s.parse::<f64>().ok());
+
+        let mut tokens = BTreeMap::new();
+        tokens.insert(Value::keyword("prompt"), Value::int(prompt_tokens));
+        tokens.insert(Value::keyword("completion"), Value::int(completion_tokens));
+        tokens.insert(
+            Value::keyword("total"),
+            Value::int(prompt_tokens + completion_tokens),
+        );
+
+        let models = if conv.model.is_empty() {
+            Value::list(Vec::new())
+        } else {
+            Value::list(vec![Value::string(&conv.model)])
+        };
+
+        let mut stats = BTreeMap::new();
+        stats.insert(
+            Value::keyword("messages"),
+            Value::int(conv.messages.len() as i64),
+        );
+        stats.insert(Value::keyword("turns"), Value::int(turns));
+        stats.insert(Value::keyword("tokens"), Value::map(tokens));
+        stats.insert(
+            Value::keyword("cost"),
+            cost.map(Value::float).unwrap_or_else(Value::nil),
+        );
+        stats.insert(Value::keyword("models"), models);
+        Ok(Value::map(stats))
+    });
+
+    // ---- Conversation surgery (issue #12, Part 3) ----
+
+    // (conversation/remove conv idx) — drop the message at idx
+    register_fn(env, "conversation/remove", |args| {
+        if args.len() != 2 {
+            return Err(SemaError::arity("conversation/remove", "2", args.len()));
+        }
+        let conv = args[0]
+            .as_conversation_rc()
+            .ok_or_else(|| SemaError::type_error("conversation", args[0].type_name()))?;
+        let idx = args[1]
+            .as_int()
+            .ok_or_else(|| SemaError::type_error("int", args[1].type_name()))?;
+        let mut messages = conv.messages.clone();
+        if idx < 0 || idx as usize >= messages.len() {
+            return Err(SemaError::eval(format!(
+                "conversation/remove: index {idx} out of bounds (length {})",
+                messages.len()
+            )));
+        }
+        messages.remove(idx as usize);
+        Ok(Value::conversation(Conversation {
+            messages,
+            model: conv.model.clone(),
+            metadata: conv.metadata.clone(),
+        }))
+    });
+
+    // (conversation/insert conv idx msg) | (conversation/insert conv idx :role "content")
+    register_fn(env, "conversation/insert", |args| {
+        if args.len() < 3 || args.len() > 4 {
+            return Err(SemaError::arity("conversation/insert", "3-4", args.len()));
+        }
+        let conv = args[0]
+            .as_conversation_rc()
+            .ok_or_else(|| SemaError::type_error("conversation", args[0].type_name()))?;
+        let idx = args[1]
+            .as_int()
+            .ok_or_else(|| SemaError::type_error("int", args[1].type_name()))?;
+        let msg = message_from_tail(&args[2..], "conversation/insert")?;
+        let mut messages = conv.messages.clone();
+        // idx == len is allowed (append); anything past that is out of bounds.
+        if idx < 0 || idx as usize > messages.len() {
+            return Err(SemaError::eval(format!(
+                "conversation/insert: index {idx} out of bounds (length {})",
+                messages.len()
+            )));
+        }
+        messages.insert(idx as usize, msg);
+        Ok(Value::conversation(Conversation {
+            messages,
+            model: conv.model.clone(),
+            metadata: conv.metadata.clone(),
+        }))
+    });
+
+    // (conversation/replace conv idx msg) | (conversation/replace conv idx :role "content")
+    register_fn(env, "conversation/replace", |args| {
+        if args.len() < 3 || args.len() > 4 {
+            return Err(SemaError::arity("conversation/replace", "3-4", args.len()));
+        }
+        let conv = args[0]
+            .as_conversation_rc()
+            .ok_or_else(|| SemaError::type_error("conversation", args[0].type_name()))?;
+        let idx = args[1]
+            .as_int()
+            .ok_or_else(|| SemaError::type_error("int", args[1].type_name()))?;
+        let msg = message_from_tail(&args[2..], "conversation/replace")?;
+        let mut messages = conv.messages.clone();
+        if idx < 0 || idx as usize >= messages.len() {
+            return Err(SemaError::eval(format!(
+                "conversation/replace: index {idx} out of bounds (length {})",
+                messages.len()
+            )));
+        }
+        messages[idx as usize] = msg;
+        Ok(Value::conversation(Conversation {
+            messages,
+            model: conv.model.clone(),
+            metadata: conv.metadata.clone(),
+        }))
+    });
+
+    // (conversation/map-role conv :role f) — transform only messages of `role` with (f msg),
+    // which must return a message; other messages pass through unchanged.
+    register_fn_ctx(env, "conversation/map-role", |ctx, args| {
+        if args.len() != 3 {
+            return Err(SemaError::arity("conversation/map-role", "3", args.len()));
+        }
+        let conv = args[0]
+            .as_conversation_rc()
+            .ok_or_else(|| SemaError::type_error("conversation", args[0].type_name()))?;
+        let role = parse_role(&args[1], "conversation/map-role")?;
+        let func = &args[2];
+        let mut messages = Vec::with_capacity(conv.messages.len());
+        for msg in &conv.messages {
+            if msg.role == role {
+                let result = sema_core::call_callback(ctx, func, &[Value::message(msg.clone())])?;
+                let new_msg = result
+                    .as_message_rc()
+                    .ok_or_else(|| SemaError::type_error("message", result.type_name()))?;
+                messages.push((*new_msg).clone());
+            } else {
+                messages.push(msg.clone());
+            }
+        }
+        Ok(Value::conversation(Conversation {
+            messages,
+            model: conv.model.clone(),
+            metadata: conv.metadata.clone(),
+        }))
+    });
+
+    // ---- Conversation search (issue #12, Part 3) ----
+
+    // (conversation/search conv query) — case-insensitive substring search over message
+    // content; returns a list of {:index :role :content} maps for each hit.
+    register_fn(env, "conversation/search", |args| {
+        if args.len() != 2 {
+            return Err(SemaError::arity("conversation/search", "2", args.len()));
+        }
+        let conv = args[0]
+            .as_conversation_rc()
+            .ok_or_else(|| SemaError::type_error("conversation", args[0].type_name()))?;
+        let query = args[1]
+            .as_str()
+            .ok_or_else(|| SemaError::type_error("string", args[1].type_name()))?
+            .to_lowercase();
+        let mut hits = Vec::new();
+        for (i, m) in conv.messages.iter().enumerate() {
+            if m.content.to_lowercase().contains(&query) {
+                let mut hit = BTreeMap::new();
+                hit.insert(Value::keyword("index"), Value::int(i as i64));
+                hit.insert(Value::keyword("role"), Value::keyword(&m.role.to_string()));
+                hit.insert(Value::keyword("content"), Value::string(&m.content));
+                hits.push(Value::map(hit));
+            }
+        }
+        Ok(Value::list(hits))
+    });
+
+    // (conversation/find conv pred) — first message where (pred msg) is truthy, else nil
+    register_fn_ctx(env, "conversation/find", |ctx, args| {
+        if args.len() != 2 {
+            return Err(SemaError::arity("conversation/find", "2", args.len()));
+        }
+        let conv = args[0]
+            .as_conversation_rc()
+            .ok_or_else(|| SemaError::type_error("conversation", args[0].type_name()))?;
+        let pred = &args[1];
+        for m in &conv.messages {
+            let msg_val = Value::message(m.clone());
+            if sema_core::call_callback(ctx, pred, std::slice::from_ref(&msg_val))?.is_truthy() {
+                return Ok(msg_val);
+            }
+        }
+        Ok(Value::nil())
+    });
+
+    // ---- Prompt algebra (issue #12, Part 7) — exact (role, content) matching ----
+
+    // (prompt/diff a b) — {:added [msgs only in b] :removed [msgs only in a]}
+    register_fn(env, "prompt/diff", |args| {
+        if args.len() != 2 {
+            return Err(SemaError::arity("prompt/diff", "2", args.len()));
+        }
+        let a = args[0]
+            .as_prompt_rc()
+            .ok_or_else(|| SemaError::type_error("prompt", args[0].type_name()))?;
+        let b = args[1]
+            .as_prompt_rc()
+            .ok_or_else(|| SemaError::type_error("prompt", args[1].type_name()))?;
+        let a_keys: Vec<_> = a.messages.iter().map(msg_key).collect();
+        let b_keys: Vec<_> = b.messages.iter().map(msg_key).collect();
+        let added: Vec<Value> = b
+            .messages
+            .iter()
+            .filter(|m| !a_keys.contains(&msg_key(m)))
+            .map(|m| Value::message(m.clone()))
+            .collect();
+        let removed: Vec<Value> = a
+            .messages
+            .iter()
+            .filter(|m| !b_keys.contains(&msg_key(m)))
+            .map(|m| Value::message(m.clone()))
+            .collect();
+        let mut out = BTreeMap::new();
+        out.insert(Value::keyword("added"), Value::list(added));
+        out.insert(Value::keyword("removed"), Value::list(removed));
+        Ok(Value::map(out))
+    });
+
+    // (prompt/union a b) — messages of a then b, de-duplicated, order preserved
+    register_fn(env, "prompt/union", |args| {
+        if args.len() != 2 {
+            return Err(SemaError::arity("prompt/union", "2", args.len()));
+        }
+        let a = args[0]
+            .as_prompt_rc()
+            .ok_or_else(|| SemaError::type_error("prompt", args[0].type_name()))?;
+        let b = args[1]
+            .as_prompt_rc()
+            .ok_or_else(|| SemaError::type_error("prompt", args[1].type_name()))?;
+        let mut seen: Vec<(Role, String)> = Vec::new();
+        let mut messages = Vec::new();
+        for m in a.messages.iter().chain(b.messages.iter()) {
+            let key = (m.role.clone(), m.content.clone());
+            if !seen.contains(&key) {
+                seen.push(key);
+                messages.push(m.clone());
+            }
+        }
+        Ok(Value::prompt(Prompt { messages }))
+    });
+
+    // (prompt/intersection a b) — messages present in both (order/dedup from a)
+    register_fn(env, "prompt/intersection", |args| {
+        if args.len() != 2 {
+            return Err(SemaError::arity("prompt/intersection", "2", args.len()));
+        }
+        let a = args[0]
+            .as_prompt_rc()
+            .ok_or_else(|| SemaError::type_error("prompt", args[0].type_name()))?;
+        let b = args[1]
+            .as_prompt_rc()
+            .ok_or_else(|| SemaError::type_error("prompt", args[1].type_name()))?;
+        let b_keys: Vec<_> = b.messages.iter().map(msg_key).collect();
+        let mut seen: Vec<(Role, String)> = Vec::new();
+        let mut messages = Vec::new();
+        for m in &a.messages {
+            let key = (m.role.clone(), m.content.clone());
+            if b_keys.contains(&msg_key(m)) && !seen.contains(&key) {
+                seen.push(key);
+                messages.push(m.clone());
+            }
+        }
+        Ok(Value::prompt(Prompt { messages }))
+    });
+
+    // (prompt/difference a b) — messages in a but not b (order/dedup from a)
+    register_fn(env, "prompt/difference", |args| {
+        if args.len() != 2 {
+            return Err(SemaError::arity("prompt/difference", "2", args.len()));
+        }
+        let a = args[0]
+            .as_prompt_rc()
+            .ok_or_else(|| SemaError::type_error("prompt", args[0].type_name()))?;
+        let b = args[1]
+            .as_prompt_rc()
+            .ok_or_else(|| SemaError::type_error("prompt", args[1].type_name()))?;
+        let b_keys: Vec<_> = b.messages.iter().map(msg_key).collect();
+        let mut seen: Vec<(Role, String)> = Vec::new();
+        let mut messages = Vec::new();
+        for m in &a.messages {
+            let key = (m.role.clone(), m.content.clone());
+            if !b_keys.contains(&msg_key(m)) && !seen.contains(&key) {
+                seen.push(key);
+                messages.push(m.clone());
+            }
+        }
+        Ok(Value::prompt(Prompt { messages }))
     });
 
     // (llm/set-default :provider-name) — switch the active provider

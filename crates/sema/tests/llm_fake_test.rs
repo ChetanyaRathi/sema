@@ -608,3 +608,60 @@ fn stream_does_not_fail_over_mid_stream() {
         "mid-stream error surfaces (no silent failover)"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Conversation usage accounting (issue #12 correctness fix): conversation/say
+// folds each turn's real usage into the conversation, and conversation/cost
+// reports the billed sum.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn conversation_say_accumulates_real_usage_and_cost() {
+    // Two turns, explicit token usage; a custom price for the fake's model so cost
+    // is a known figure: per turn 100*$1/M + 20*$2/M = 0.00014, doubled = 0.00028.
+    let fake = FakeProvider::builder("fake-priced")
+        .model("fake-priced")
+        .reply_with_usage("first", 100, 20)
+        .reply_with_usage("second", 100, 20)
+        .build();
+    let src = r#"
+        (llm/set-pricing "fake-priced" 1.0 2.0)
+        (let* ((c0 (conversation/new {:model "fake-priced"}))
+               (c1 (conversation/say c0 "hi"))
+               (c2 (conversation/say c1 "again"))
+               (stats (conversation/stats c2)))
+          (and (= (:prompt (:tokens stats)) 200)
+               (= (:completion (:tokens stats)) 40)
+               (= (:total (:tokens stats)) 240)
+               (> (conversation/cost c2) 0.00027)
+               (< (conversation/cost c2) 0.00029)))"#;
+    let (result, _rec) = eval_with_fake(src, fake);
+    let val = result.expect("conversation/say should accumulate usage");
+    assert_eq!(
+        val,
+        Value::bool(true),
+        "tokens accumulate across turns and cost equals the billed sum"
+    );
+}
+
+#[test]
+fn conversation_cost_is_nil_without_known_pricing() {
+    // A model with no price: usage still accumulates (tokens), but cost stays nil —
+    // conversation/cost must NOT fall back to estimation.
+    let fake = FakeProvider::builder("unpriced")
+        .model("unpriced-model")
+        .reply_with_usage("hello", 10, 5)
+        .build();
+    let src = r#"
+        (let* ((c0 (conversation/new {:model "unpriced-model"}))
+               (c1 (conversation/say c0 "hi")))
+          (and (nil? (conversation/cost c1))
+               (= (:total (:tokens (conversation/stats c1))) 15)))"#;
+    let (result, _rec) = eval_with_fake(src, fake);
+    let val = result.expect("conversation/say should still run without pricing");
+    assert_eq!(
+        val,
+        Value::bool(true),
+        "cost is nil (no estimation) while tokens still accumulate"
+    );
+}
