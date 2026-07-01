@@ -9,17 +9,18 @@
 ;; in; the token is then cached (OS keychain, or a 0600 file) so later runs are
 ;; silent. You can also pre-authenticate from the shell:
 ;;
-;;     sema mcp login https://mcp.asana.com/sse
+;;     sema mcp login https://mcp.asana.com/mcp
 ;;
 ;; Requirements:
 ;;   - ANTHROPIC_API_KEY set in your environment (for the agent's model).
 ;;   - Network access (this reaches Asana). Run unsandboxed (the default).
 ;;
-;; NOTE: confirm Asana's current MCP endpoint from their docs and update
-;; `asana-url` below if it differs. Sema auto-detects Streamable-HTTP vs the
-;; legacy SSE transport, so either shape works.
+;; Asana exposes two endpoints (per https://developers.asana.com/docs/using-asanas-mcp-server):
+;;   - https://mcp.asana.com/mcp — modern Streamable HTTP (recommended)
+;;   - https://mcp.asana.com/sse — deprecated HTTP+SSE (also works; Sema
+;;     auto-detects and falls back to it)
 
-(define asana-url "https://mcp.asana.com/sse")
+(define asana-url "https://mcp.asana.com/mcp")
 
 ;; The model the agent uses. Any tool-use-capable Claude model works; bump this
 ;; to a stronger model if the agent struggles to pick the right Asana tool.
