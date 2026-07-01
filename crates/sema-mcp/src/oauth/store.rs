@@ -237,6 +237,15 @@ fn keychain_available() -> bool {
 /// file fallback (with a one-time visible warning, since tokens then sit in a
 /// permission-restricted plaintext file).
 pub fn default_store() -> Box<dyn TokenStore> {
+    // Explicit override via `SEMA_MCP_TOKEN_STORE=file|keychain`. `file` is the
+    // handy escape hatch for dev/CI/headless: it skips the keychain entirely,
+    // avoiding repeated macOS Keychain prompts — an ad-hoc-signed dev binary gets
+    // a new code identity on every rebuild, so "Always Allow" never sticks.
+    match std::env::var("SEMA_MCP_TOKEN_STORE").ok().as_deref() {
+        Some("file") => return Box::new(FileStore::new(default_file_path())),
+        Some("keychain") => return Box::new(KeychainStore::new()),
+        _ => {}
+    }
     if keychain_available() {
         Box::new(KeychainStore::new())
     } else {
