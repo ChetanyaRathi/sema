@@ -4,6 +4,7 @@ pub mod context;
 pub mod error;
 pub mod home;
 pub mod json;
+pub mod mcp_cassette;
 pub mod output_hook;
 pub mod resolve;
 pub mod sandbox;
@@ -32,6 +33,10 @@ pub use context::{
 pub use error::{CallFrame, SemaError, Span, SpanMap, StackTrace};
 pub use home::sema_home;
 pub use json::{json_to_value, key_to_string, value_to_json, value_to_json_lossy};
+pub use mcp_cassette::{
+    clear_mcp_cassette_hook, mcp_cassette_decide, mcp_cassette_record, set_mcp_cassette_hook,
+    McpCassetteDecision,
+};
 pub use lasso::Spur;
 pub use output_hook::{set_stderr_hook, set_stdout_hook, write_stderr, write_stdout};
 pub use sandbox::{Caps, Sandbox};
