@@ -13494,7 +13494,122 @@ fn test_package_imports() {
     .unwrap();
 }
 
+// ── sema completions (shell completion generation) ────────────────
+
+#[test]
+fn test_completions_all_shells_generate_without_panic() {
+    // Regression guard: a hidden `__complete-doc-symbols` clap subcommand once
+    // made clap_complete's bash generator panic. Every shell must generate a
+    // non-empty script and exit 0.
+    for shell in ["bash", "zsh", "fish", "powershell", "elvish"] {
+        let output = sema_cmd()
+            .args(["completions", shell])
+            .output()
+            .expect("failed to run sema completions");
+        assert!(
+            output.status.success(),
+            "sema completions {shell} did not exit 0; stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            !output.stdout.is_empty(),
+            "sema completions {shell} produced no script"
+        );
+    }
+}
+
+#[test]
+fn test_completions_bash_zsh_fish_wire_dynamic_doc_hook() {
+    // The interactive shells must include the dynamic doc-symbol hook that calls
+    // back into `sema __complete-doc-symbols`; bash must also define the wrapper.
+    for shell in ["bash", "zsh", "fish"] {
+        let output = sema_cmd()
+            .args(["completions", shell])
+            .output()
+            .expect("failed to run sema completions");
+        let script = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            script.contains("__complete-doc-symbols"),
+            "{shell} completion missing dynamic doc-symbol hook"
+        );
+    }
+    let bash = sema_cmd().args(["completions", "bash"]).output().unwrap();
+    let bash = String::from_utf8_lossy(&bash.stdout);
+    assert!(
+        bash.contains("_sema_doc_complete"),
+        "bash completion missing the doc-completion wrapper function"
+    );
+}
+
 // ── sema eval subcommand ──────────────────────────────────────────
+
+#[test]
+fn test_doc_show_builtin() {
+    let output = sema_cmd()
+        .args(["doc", "string/split"])
+        .output()
+        .expect("failed to run sema doc");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("string/split"), "stdout: {stdout}");
+    assert!(
+        stdout.contains("Split a string by a literal delimiter"),
+        "stdout: {stdout}"
+    );
+}
+
+#[test]
+fn test_doc_search_finds_builtin() {
+    let output = sema_cmd()
+        .args(["doc", "search", "split", "a", "string"])
+        .output()
+        .expect("failed to run sema doc search");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("string/split"), "stdout: {stdout}");
+}
+
+#[test]
+fn test_doc_apropos_finds_name_matches() {
+    let output = sema_cmd()
+        .args(["doc", "apropos", "string/spl"])
+        .output()
+        .expect("failed to run sema doc apropos");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("string/split") || stdout.contains("string-split"),
+        "stdout: {stdout}"
+    );
+}
+
+#[test]
+fn test_complete_doc_symbols_filters_prefix() {
+    let output = sema_cmd()
+        .args(["__complete-doc-symbols", "string/spl"])
+        .output()
+        .expect("failed to run sema __complete-doc-symbols");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.lines().any(|line| line == "string/split"));
+    assert!(!stdout.lines().any(|line| line == "map"));
+}
 
 #[test]
 fn test_eval_expr_json() {
