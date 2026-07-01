@@ -79,6 +79,9 @@ pub struct TapeEntry {
     /// For `kind:"embed"` — the recorded embedding vectors (one per input text).
     #[serde(default)]
     pub embeddings: Vec<Vec<f64>>,
+    /// For `kind:"mcp-call"` — the recorded `tools/call` result JSON.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp_result: Option<serde_json::Value>,
 }
 
 fn default_role() -> String {
@@ -103,6 +106,29 @@ impl TapeEntry {
             cache_creation_input_tokens: resp.usage.cache_creation_input_tokens,
             chunks: Vec::new(),
             embeddings: Vec::new(),
+            mcp_result: None,
+        }
+    }
+
+    /// Tape entry for an MCP `tools/call`: the recorded result JSON, keyed by a
+    /// hash of the server identity + tool + arguments.
+    pub fn from_mcp_call(key: &str, result: &serde_json::Value) -> TapeEntry {
+        TapeEntry {
+            v: 1,
+            kind: "mcp-call".to_string(),
+            key: key.to_string(),
+            content: String::new(),
+            role: default_role(),
+            model: String::new(),
+            tool_calls: Vec::new(),
+            stop_reason: None,
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            cache_read_input_tokens: 0,
+            cache_creation_input_tokens: 0,
+            chunks: Vec::new(),
+            embeddings: Vec::new(),
+            mcp_result: Some(result.clone()),
         }
     }
 
@@ -136,6 +162,7 @@ impl TapeEntry {
             cache_creation_input_tokens: 0,
             chunks: Vec::new(),
             embeddings: embeddings.to_vec(),
+            mcp_result: None,
         }
     }
 
@@ -303,6 +330,31 @@ mod tests {
             },
             stop_reason: Some("end".to_string()),
         }
+    }
+
+    #[test]
+    fn mcp_call_round_trips_through_the_tape() {
+        let path = std::env::temp_dir().join(format!(
+            "sema-cassette-mcp-{}-{}/tape.ndjson",
+            std::process::id(),
+            line!()
+        ));
+        let result = serde_json::json!({"content": [{"type": "text", "text": "hi"}]});
+
+        let mut rec = Cassette::load(path.clone(), CassetteMode::Record);
+        rec.record_entry(TapeEntry::from_mcp_call("mcpkey", &result));
+        rec.save().unwrap();
+
+        // Reloaded from disk in replay mode → serves the recorded result.
+        let replay = Cassette::load(path, CassetteMode::Replay);
+        match replay.decide("mcpkey") {
+            Decision::Replay(entry) => {
+                assert_eq!(entry.kind, "mcp-call");
+                assert_eq!(entry.mcp_result.as_ref(), Some(&result));
+            }
+            _ => panic!("expected a replay hit for the recorded mcp-call"),
+        }
+        assert!(matches!(replay.decide("absent"), Decision::Miss(_)));
     }
 
     #[test]

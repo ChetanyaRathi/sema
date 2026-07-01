@@ -360,6 +360,49 @@ pub fn reset_runtime_state() {
     pricing::clear_custom_pricing();
 }
 
+// ── MCP-call cassette bridge ─────────────────────────────────
+// The LLM cassette (thread-local `CASSETTE`) also serves MCP `tools/call`
+// interactions so agent-over-MCP flows replay deterministically. These fns are
+// registered into `sema-core` (fn pointers) so `sema-mcp` can consult the tape
+// without depending on `sema-llm`.
+
+fn mcp_cassette_decide(key: &str) -> sema_core::McpCassetteDecision {
+    use crate::cassette::Decision;
+    CASSETTE.with(|c| match c.borrow().as_ref() {
+        // No active cassette → behave as passthrough (real call, no recording).
+        None => sema_core::McpCassetteDecision::Record,
+        Some(cass) => match cass.decide(key) {
+            Decision::Replay(entry) => match entry.mcp_result {
+                Some(value) => sema_core::McpCassetteDecision::Replay(value),
+                // Present under this key but not an mcp-call entry — treat as drift.
+                None => sema_core::McpCassetteDecision::Miss,
+            },
+            Decision::Miss(_) => sema_core::McpCassetteDecision::Miss,
+            Decision::Record => sema_core::McpCassetteDecision::Record,
+        },
+    })
+}
+
+fn mcp_cassette_record(key: &str, value: &serde_json::Value) {
+    CASSETTE.with(|c| {
+        if let Some(cass) = c.borrow_mut().as_mut() {
+            cass.record_entry(crate::cassette::TapeEntry::from_mcp_call(key, value));
+        }
+    });
+}
+
+/// Install a cassette on the current thread (programmatic/test entry point;
+/// the env path `SEMA_LLM_CASSETTE` uses the same thread-local).
+pub fn install_cassette(cassette: crate::cassette::Cassette) {
+    CASSETTE.with(|c| *c.borrow_mut() = Some(cassette));
+}
+
+/// Remove and return the active cassette (e.g. to flush it to disk after
+/// recording).
+pub fn take_cassette() -> Option<crate::cassette::Cassette> {
+    CASSETTE.with(|c| c.borrow_mut().take())
+}
+
 /// Test-only: register `provider` as the default LLM provider, bypassing
 /// `llm/configure`. Lets integration tests drive the completion/agent paths with
 /// a scripted [`crate::fake::FakeProvider`] — no API keys, fully deterministic.
@@ -1162,6 +1205,10 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
     // thread-local fn pointers); registering here keeps it in a crate that names
     // both `sema_core` and `sema_otel`.
     sema_otel::register_task_callbacks();
+
+    // Bridge the LLM cassette to MCP tool calls (sema-mcp consults this via
+    // sema-core). Idempotent — just sets two thread-local fn pointers.
+    sema_core::set_mcp_cassette_hook(mcp_cassette_decide, mcp_cassette_record);
 
     // CI/global cassette: SEMA_LLM_CASSETTE=path [+ SEMA_LLM_CASSETTE_MODE=replay|
     // record|auto] installs a cassette for the whole process, so a suite can be
