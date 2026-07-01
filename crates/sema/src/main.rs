@@ -288,9 +288,13 @@ enum Commands {
     Lsp,
     /// Start the Debug Adapter Protocol server
     Dap,
-    /// Start the Model Context Protocol (MCP) server
+    /// Start the MCP server, or manage MCP client auth (`mcp login`/`logout`)
+    #[command(args_conflicts_with_subcommands = true)]
     Mcp {
-        /// Optional source files to run/load tools from
+        /// Client-auth subcommand; when omitted, runs the MCP server
+        #[command(subcommand)]
+        auth: Option<McpAuthCommands>,
+        /// Optional source files to run/load tools from (server mode)
         #[arg(value_name = "FILES")]
         files: Vec<String>,
         /// Comma-separated list of tool names to explicitly include
@@ -363,6 +367,26 @@ enum DocCommands {
     Apropos {
         /// Pattern to search for
         pattern: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum McpAuthCommands {
+    /// Log in to a remote (HTTP) MCP server and cache the OAuth token
+    Login {
+        /// The MCP server URL (e.g. https://mcp.example.com/mcp)
+        url: String,
+        /// Use the device-authorization flow instead of opening a browser
+        #[arg(long)]
+        device: bool,
+        /// A pre-registered OAuth client id (when the server has no dynamic registration)
+        #[arg(long = "client-id", value_name = "ID")]
+        client_id: Option<String>,
+    },
+    /// Remove cached credentials for a remote MCP server
+    Logout {
+        /// The MCP server URL whose cached credentials to clear
+        url: String,
     },
 }
 
@@ -574,6 +598,16 @@ enum NotebookCommands {
     },
 }
 
+/// Build the standard CLI interpreter: stdlib + LLM (registered inside sema-eval)
+/// plus the MCP *client* builtins (`mcp/connect`, `mcp/tools`, `mcp/tools->sema`,
+/// …). The MCP builtins live in `sema-mcp`, which depends on `sema-eval`, so they
+/// can't be registered inside `sema-eval` itself — the binary wires them in here.
+fn build_interpreter(sandbox: &sema_core::Sandbox) -> Interpreter {
+    let interpreter = Interpreter::new_with_sandbox(sandbox);
+    sema_mcp::register_mcp_builtins(&interpreter.global_env, sandbox);
+    interpreter
+}
+
 fn main() {
     // Check for embedded archive before parsing CLI args
     if let Some(exit_code) = try_run_embedded() {
@@ -754,10 +788,26 @@ fn main() {
                     .block_on(sema_dap::run_server());
             }
             Commands::Mcp {
+                auth,
                 files,
                 include,
                 exclude,
             } => {
+                if let Some(auth) = auth {
+                    let result = match auth {
+                        McpAuthCommands::Login {
+                            url,
+                            device,
+                            client_id,
+                        } => sema_mcp::mcp_login(&url, device, client_id.as_deref()),
+                        McpAuthCommands::Logout { url } => sema_mcp::mcp_logout(&url),
+                    };
+                    if let Err(e) = result {
+                        eprintln!("mcp: {e}");
+                        std::process::exit(1);
+                    }
+                    return;
+                }
                 let inc_tools = include.map(|s| {
                     s.split(',')
                         .map(|x| x.trim().to_string())
@@ -770,7 +820,7 @@ fn main() {
                 });
 
                 let sandbox = sema_core::Sandbox::allow_all();
-                let interpreter = Interpreter::new_with_sandbox(&sandbox);
+                let interpreter = build_interpreter(&sandbox);
 
                 let _ = interpreter.eval_str("(llm/auto-configure)");
 
@@ -823,7 +873,7 @@ fn main() {
         return;
     }
 
-    let interpreter = Interpreter::new_with_sandbox(&sandbox);
+    let interpreter = build_interpreter(&sandbox);
 
     // Set LLM env vars before auto-configure
     if let Some(model) = cli.chat_model.as_ref() {
@@ -1119,7 +1169,7 @@ fn run_workflow_command(command: WorkflowCommands, sandbox: &sema_core::Sandbox)
         std::thread::sleep(std::time::Duration::from_millis(250));
     }
 
-    let interpreter = Interpreter::new_with_sandbox(&effective_sandbox);
+    let interpreter = build_interpreter(&effective_sandbox);
 
     // Auto-configure an LLM provider from the environment (mirrors the default run
     // path), so a workflow whose leaves call `llm/*` works without self-configuring.
@@ -1434,7 +1484,7 @@ fn run_eval(
         None => sema_core::Sandbox::allow_all(),
     };
 
-    let interpreter = Interpreter::new_with_sandbox(&sandbox);
+    let interpreter = build_interpreter(&sandbox);
 
     // Auto-configure LLM unless --no-llm
     if !no_llm {
@@ -1643,7 +1693,7 @@ fn run_compile(file: &str, output: Option<&str>) {
 
     // Use Interpreter for macro expansion before compilation
     let sandbox = sema_core::Sandbox::allow_all();
-    let interpreter = Interpreter::new_with_sandbox(&sandbox);
+    let interpreter = build_interpreter(&sandbox);
 
     let result = match interpreter.compile_to_bytecode(&source) {
         Ok(r) => r,
@@ -1720,7 +1770,7 @@ fn try_run_embedded() -> Option<i32> {
     sema_core::vfs::init_vfs(arch.files);
 
     let sandbox = sema_core::Sandbox::allow_all();
-    let interpreter = Interpreter::new_with_sandbox(&sandbox);
+    let interpreter = build_interpreter(&sandbox);
 
     let _ = interpreter.eval_str("(llm/auto-configure)");
 
@@ -1861,7 +1911,7 @@ fn run_build(
     // Compute source hash and compile to bytecode
     let source_hash = crc32fast::hash(source.as_bytes());
     let sandbox = sema_core::Sandbox::allow_all();
-    let interpreter = Interpreter::new_with_sandbox(&sandbox);
+    let interpreter = build_interpreter(&sandbox);
 
     let result = match interpreter.compile_to_bytecode(&source) {
         Ok(r) => r,
