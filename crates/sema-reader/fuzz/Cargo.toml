@@ -13,9 +13,6 @@ libfuzzer-sys = "0.4"
 [dependencies.sema-reader]
 path = ".."
 
-[dependencies.sema-core]
-path = "../../sema-core"
-
 # Prevent this from interfering with workspaces
 [workspace]
 members = ["."]

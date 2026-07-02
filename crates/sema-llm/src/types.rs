@@ -70,6 +70,18 @@ impl MessageContent {
 pub struct ChatMessage {
     pub role: String,
     pub content: MessageContent,
+    /// Tool calls emitted by an assistant turn. When non-empty, this message must
+    /// be echoed back to the provider so it can correlate the following tool
+    /// results (OpenAI requires the assistant `tool_calls`; Anthropic the
+    /// `tool_use` blocks). Empty for ordinary messages.
+    pub tool_calls: Vec<ToolCall>,
+    /// For a tool-result message (`role == "tool"`): the id of the tool call this
+    /// result answers. `None` for ordinary messages. Providers use this to match
+    /// the result to the call (`tool_call_id` / `tool_use_id` / `functionResponse`).
+    pub tool_call_id: Option<String>,
+    /// For a tool-result message: the name of the tool that produced it (Gemini's
+    /// `functionResponse` keys results by name).
+    pub tool_name: Option<String>,
 }
 
 impl ChatMessage {
@@ -77,6 +89,9 @@ impl ChatMessage {
         ChatMessage {
             role: role.into(),
             content: MessageContent::Text(content.into()),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+            tool_name: None,
         }
     }
 
@@ -84,6 +99,39 @@ impl ChatMessage {
         ChatMessage {
             role: role.into(),
             content: MessageContent::Blocks(blocks),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+            tool_name: None,
+        }
+    }
+
+    /// An assistant turn that invoked one or more tools. `content` may be empty
+    /// (most providers return empty text alongside tool calls).
+    pub fn assistant_with_tool_calls(
+        content: impl Into<String>,
+        tool_calls: Vec<ToolCall>,
+    ) -> Self {
+        ChatMessage {
+            role: "assistant".to_string(),
+            content: MessageContent::Text(content.into()),
+            tool_calls,
+            tool_call_id: None,
+            tool_name: None,
+        }
+    }
+
+    /// A tool-result message correlated to the call it answers (`role == "tool"`).
+    pub fn tool_result(
+        tool_call_id: impl Into<String>,
+        name: impl Into<String>,
+        content: impl Into<String>,
+    ) -> Self {
+        ChatMessage {
+            role: "tool".to_string(),
+            content: MessageContent::Text(content.into()),
+            tool_calls: Vec::new(),
+            tool_call_id: Some(tool_call_id.into()),
+            tool_name: Some(name.into()),
         }
     }
 }
@@ -106,6 +154,14 @@ pub struct ChatRequest {
     pub stop_sequences: Vec<String>,
     /// When true, providers that support it will request JSON output mode.
     pub json_mode: bool,
+    /// Canonical reasoning effort: `minimal` | `low` | `medium` | `high` | `none`
+    /// | `xhigh` (stored raw for forward-compat). Each provider maps it to its
+    /// native control (OpenAI `reasoning_effort`, Anthropic extended thinking,
+    /// Gemini `thinkingConfig`); providers/models that don't support it ignore it.
+    pub reasoning_effort: Option<String>,
+    /// Per-call HTTP timeout (milliseconds). `None` uses the client default. Applied as a
+    /// per-request reqwest timeout by each provider; ignored by providers that don't send.
+    pub timeout_ms: Option<u64>,
 }
 
 impl ChatRequest {
@@ -119,6 +175,8 @@ impl ChatRequest {
             tools: Vec::new(),
             stop_sequences: Vec::new(),
             json_mode: false,
+            reasoning_effort: None,
+            timeout_ms: None,
         }
     }
 }
@@ -138,6 +196,14 @@ pub struct Usage {
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
     pub model: String,
+    /// Prompt tokens served from the provider's prompt cache (read hits).
+    /// Double-counting note: for OpenAI/Gemini/most OpenAI-compatible providers this
+    /// is a SUBSET of `prompt_tokens`; for Anthropic it is SEPARATE from
+    /// `input_tokens` (which already excludes cached). 0 when unsupported/absent.
+    pub cache_read_input_tokens: u32,
+    /// Tokens written to the prompt cache this request. Only Anthropic reports a
+    /// distinct creation counter; 0 for everyone else.
+    pub cache_creation_input_tokens: u32,
 }
 
 impl Usage {
@@ -157,6 +223,30 @@ pub struct EmbedResponse {
     pub embeddings: Vec<Vec<f64>>,
     pub model: String,
     pub usage: Usage,
+}
+
+/// Canonical rerank request (one shape Sema produces; each provider translates it).
+#[derive(Debug, Clone)]
+pub struct RerankRequest {
+    pub query: String,
+    pub documents: Vec<String>,
+    /// Keep only the top-K most relevant (provider-side); `None` returns all, reordered.
+    pub top_k: Option<usize>,
+    pub model: Option<String>,
+}
+
+/// One reranked result: an index back into the original `documents` plus its relevance score.
+#[derive(Debug, Clone)]
+pub struct RerankResult {
+    pub index: usize,
+    pub score: f64,
+}
+
+/// Rerank response: `results` are sorted by descending relevance (highest first).
+#[derive(Debug, Clone)]
+pub struct RerankResponse {
+    pub results: Vec<RerankResult>,
+    pub model: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -305,6 +395,7 @@ mod tests {
             prompt_tokens: 100,
             completion_tokens: 50,
             model: "m".into(),
+            ..Default::default()
         };
         assert_eq!(usage.total_tokens(), 150);
     }

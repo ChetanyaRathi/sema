@@ -11,7 +11,10 @@ outline: [2, 3]
 Get token usage from the most recent LLM call.
 
 ```sema
-(llm/last-usage)   ; => {:prompt-tokens 42 :completion-tokens 15 ...}
+(llm/last-usage)
+; => {:prompt-tokens 42 :completion-tokens 15 :total-tokens 57
+;     :cache-read-tokens 0 :cache-creation-tokens 0
+;     :model "..." :cost-usd 0.0003}
 ```
 
 ### `llm/session-usage`
@@ -20,7 +23,25 @@ Get cumulative usage across all LLM calls in the current session.
 
 ```sema
 (llm/session-usage)
+; => {:prompt-tokens 1280 :completion-tokens 410 :total-tokens 1690
+;     :cache-read-tokens 1024 :cache-creation-tokens 0 :cost-usd 0.012}
 ```
+
+#### Prompt-cache tokens
+
+`:cache-read-tokens` and `:cache-creation-tokens` report how many input tokens
+were served from (or written to) the provider's **prompt cache** — large savings
+when you repeat a stable prefix across calls.
+
+- **OpenAI** and **Gemini** (2.5+) cache *implicitly*: send the same long prefix
+  twice and the second call reports `:cache-read-tokens` automatically. Reads are
+  a subset of `:prompt-tokens`.
+- **Anthropic** reports `:cache-read-tokens` and `:cache-creation-tokens`
+  *separately* from `:prompt-tokens` (caching there is opt-in via `cache_control`).
+- Providers that don't report cache counts leave these at `0`.
+
+> Cost is currently priced at the standard input rate; cached reads are reported
+> for visibility but not yet discounted in `:cost-usd`.
 
 ### `llm/reset-usage`
 
@@ -32,23 +53,21 @@ Reset session usage counters.
 
 ## Pricing Sources
 
-Sema tracks LLM costs using pricing data from multiple sources, checked in this order:
+Sema tracks LLM costs using pricing data from these sources, checked in this order:
 
 1. **Custom pricing** — set via `(llm/set-pricing "model" input output)`, always wins
-2. **Dynamic pricing** — fetched from [llm-prices.com](https://www.llm-prices.com) during `(llm/auto-configure)`, cached locally at `~/.sema/pricing-cache.json`
-3. **Built-in estimates** — hardcoded fallback table (may be outdated)
-4. **Unknown** — if no source matches, cost tracking returns `nil` and budget enforcement is best-effort
+2. **Bundled price list** — a [models.dev](https://models.dev) snapshot (2,400+ models) that ships with Sema, so cost tracking works fully offline with no network calls
+3. **Unknown** — if no source matches, cost tracking returns `nil` and budget enforcement is best-effort
 
-Dynamic pricing is fetched with a short timeout (2s) and failures are silently ignored. The language works fully offline — the cache persists between sessions.
+The embedded snapshot is refreshed by maintainers with `make update-pricing` and shipped in patch releases. Prices are matched by model id, preferring the canonical first-party listing; when the serving provider is known (e.g. inside an `llm/with-fallback` chain), a reseller/gateway that lists the same model at a different rate is priced correctly.
 
 ### `llm/pricing-status`
 
-Check which pricing source is active and when it was last updated.
+Check the pricing source and the snapshot date.
 
 ```sema
 (llm/pricing-status)
-; => {:source fetched :updated-at "2025-10-10"}
-; or {:source hardcoded} if no dynamic pricing is available
+; => {:source "embedded" :updated-at "2026-06-18"}
 ```
 
 ## Budget Enforcement
@@ -91,6 +110,17 @@ Scoped budget — sets spending limits for the duration of a thunk, then restore
 ```
 
 When a token budget is active, `llm/budget-remaining` includes `:token-limit`, `:tokens-spent`, and `:tokens-remaining` in addition to the cost fields.
+
+#### Streaming and the budget
+
+By default, budgets enforce on **non-streaming** calls (the spend is known after each call completes). A stream's cost isn't known until it ends, so streams aren't budget-gated unless you opt in with `:on-stream :pre-gate` — which refuses to **open** a stream once the scope's spend is already at the cap:
+
+```sema
+(llm/with-budget {:max-cost-usd 0.50 :on-stream :pre-gate} (lambda ()
+  (llm/stream "..." on-token)))   ; blocked at open once $0.50 is spent
+```
+
+A single in-flight stream can still push *past* the cap (you only learn its cost when it finishes), but the next call is blocked. Usage is tracked either way.
 
 ### `llm/clear-budget`
 

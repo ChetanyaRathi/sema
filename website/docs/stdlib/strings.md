@@ -15,6 +15,15 @@ Split a string by a delimiter.
 (string/split "hello world" " ")  ; => ("hello" "world")
 ```
 
+### `string/lines`
+
+Split into lines on `\n` or `\r\n` (Clojure `split-lines` semantics). A trailing newline does not produce a final empty line — handy for processing logs, config, or file contents. Use `string/split` when you need a literal separator instead.
+
+```sema
+(string/lines "a\nb\r\nc\n")   ; => ("a" "b" "c")
+(string/lines "single")        ; => ("single")
+```
+
 ### `string/join`
 
 Join a list of strings with a separator.
@@ -67,10 +76,11 @@ Convert string to lowercase.
 
 ### `string/capitalize`
 
-Capitalize the first character.
+Uppercase the first character and lowercase the rest.
 
 ```sema
 (string/capitalize "hello")   ; => "Hello"
+(string/capitalize "hELLO")   ; => "Hello"
 ```
 
 ### `string/title-case`
@@ -168,6 +178,31 @@ Pad a string on the right to a given width.
 ```sema
 (string/pad-right "hi" 5)       ; => "hi   "
 (string/pad-right "42" 5 "0")   ; => "42000"
+```
+
+### `string/width`
+
+Terminal **display width** in columns (not character count): wide characters
+(CJK, most emoji) count as 2, combining marks as 0, and ANSI escape sequences as
+0. Use it for terminal layout, padding, and alignment, where `string-length` is
+wrong for non-ASCII or styled text.
+
+```sema
+(string/width "hello")   ; => 5
+(string/width "日本語")   ; => 6   (string-length is 3)
+(string/width "👋")       ; => 2
+```
+
+### `string/word-wrap`
+
+Word-wrap text to a list of lines of at most N display columns. Wraps on spaces,
+hard-breaks over-long words on grapheme boundaries, preserves newlines, and
+measures with `string/width` (correct for non-ASCII). Distinct from `string/wrap`,
+which wraps a string in delimiters.
+
+```sema
+(string/word-wrap "the quick brown fox" 10)   ; => ("the quick" "brown fox")
+(string/word-wrap "日本語 の テスト" 8)         ; => ("日本語" "の" "テスト")
 ```
 
 ### `string/number?`
@@ -312,7 +347,7 @@ Apply Unicode case folding to a string. Useful for case-insensitive comparisons 
 ```sema
 (string/foldcase "HELLO")        ; => "hello"
 (string/foldcase "Hello World")  ; => "hello world"
-(string/foldcase "Straße")       ; => "straße"
+(string/foldcase "Straße")       ; => "strasse"  (full folding maps ß → ss)
 (string/foldcase "ΩΜΕΓΑ")        ; => "ωμεγα"
 ```
 
@@ -791,10 +826,11 @@ Convert to Title Case headline.
 
 ### `string/words`
 
-Split a string into words (splits on non-alphanumeric boundaries).
+Split an identifier into words. Breaks on `_`, `-`, spaces, and `.`, plus
+camelCase / acronym case transitions. Other punctuation stays attached.
 
 ```sema
 (string/words "hello_world")     ; => ("hello" "world")
-(string/words "helloWorld")      ; => ("hello" "World")
-(string/words "Hello World!")    ; => ("Hello" "World")
+(string/words "helloWorld")      ; => ("hello" "World")   ; case transition
+(string/words "Hello World!")    ; => ("Hello" "World!")  ; "!" is not a boundary
 ```

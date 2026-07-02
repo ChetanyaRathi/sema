@@ -585,6 +585,29 @@ pub fn tokenize(input: &str) -> Result<Vec<SpannedToken>, SemaError> {
                             byte_start: token_byte_start,
                             byte_end: token_byte_end,
                         }),
+                        // IEEE 754 special floats, so they round-trip through the
+                        // printer (which emits `inf` / `-inf` / `NaN`). Accept a
+                        // few common spellings too.
+                        "inf" | "+inf" | "Inf" | "Infinity" | "+Infinity" => {
+                            tokens.push(SpannedToken {
+                                token: Token::Float(f64::INFINITY),
+                                span: token_span,
+                                byte_start: token_byte_start,
+                                byte_end: token_byte_end,
+                            })
+                        }
+                        "-inf" | "-Infinity" => tokens.push(SpannedToken {
+                            token: Token::Float(f64::NEG_INFINITY),
+                            span: token_span,
+                            byte_start: token_byte_start,
+                            byte_end: token_byte_end,
+                        }),
+                        "nan" | "NaN" | "NAN" | "+nan" | "-nan" => tokens.push(SpannedToken {
+                            token: Token::Float(f64::NAN),
+                            span: token_span,
+                            byte_start: token_byte_start,
+                            byte_end: token_byte_end,
+                        }),
                         _ => tokens.push(SpannedToken {
                             token: Token::Symbol(name),
                             span: token_span,
@@ -720,19 +743,41 @@ fn read_number(chars: &[char], span: &Span) -> Result<(Token, usize), SemaError>
     while i < chars.len() && chars[i].is_ascii_digit() {
         i += 1;
     }
+    let mut is_float = false;
+    // Fraction: a `.` followed by at least one digit (a trailing `.` is left to the
+    // symbol lexer, preserving the existing `1.` behavior).
     if i < chars.len() && chars[i] == '.' && i + 1 < chars.len() && chars[i + 1].is_ascii_digit() {
         i += 1; // skip dot
         while i < chars.len() && chars[i].is_ascii_digit() {
             i += 1;
         }
-        let s: String = chars[..i].iter().collect();
+        is_float = true;
+    }
+    // Exponent: `[eE] [+-]? digit+`. Only consumed when a digit actually follows
+    // (after an optional sign), so a bare `1e`, `1e+`, or an identifier like `e19`
+    // is NOT mis-lexed as a number — the `e`/`E` is left for the symbol lexer.
+    // `f64::parse` accepts the resulting `<mantissa>e<exp>` string directly.
+    if i < chars.len() && (chars[i] == 'e' || chars[i] == 'E') {
+        let mut j = i + 1;
+        if j < chars.len() && (chars[j] == '+' || chars[j] == '-') {
+            j += 1;
+        }
+        if j < chars.len() && chars[j].is_ascii_digit() {
+            i = j;
+            while i < chars.len() && chars[i].is_ascii_digit() {
+                i += 1;
+            }
+            is_float = true;
+        }
+    }
+    let s: String = chars[..i].iter().collect();
+    if is_float {
         let f: f64 = s.parse().map_err(|_| SemaError::Reader {
             message: format!("invalid float: {s}"),
             span: *span,
         })?;
         Ok((Token::Float(f), i))
     } else {
-        let s: String = chars[..i].iter().collect();
         let n: i64 = s.parse().map_err(|_| SemaError::Reader {
             message: format!("invalid integer: {s}"),
             span: *span,
@@ -769,6 +814,60 @@ mod tests {
             Token::Comment(text) => assert_eq!(text, "; comment"),
             _ => panic!("expected Comment token"),
         }
+    }
+
+    #[test]
+    fn test_scientific_notation_literals() {
+        let first = |src: &str| tokenize(src).unwrap().into_iter().next().unwrap().token;
+        let toks = |src: &str| -> Vec<Token> {
+            tokenize(src)
+                .unwrap()
+                .into_iter()
+                .map(|t| t.token)
+                .collect()
+        };
+        // Exponent forms parse as Float (f64::parse handles the string once consumed).
+        assert_eq!(first("1.0e19"), Token::Float(1e19));
+        assert_eq!(first("1e19"), Token::Float(1e19)); // bare exponent (no fraction)
+        assert_eq!(first("1.5e3"), Token::Float(1500.0));
+        assert_eq!(first("2e-5"), Token::Float(2e-5)); // signed (negative) exponent
+        assert_eq!(first("6.022e+23"), Token::Float(6.022e23)); // explicit + sign
+        assert_eq!(first("1E10"), Token::Float(1e10)); // uppercase E
+        assert_eq!(first("1E+10"), Token::Float(1e10)); // uppercase E + sign
+        assert_eq!(first("1E-10"), Token::Float(1e-10));
+        assert_eq!(first("-1.5e3"), Token::Float(-1500.0)); // negative mantissa + fraction
+        assert_eq!(first("-2e3"), Token::Float(-2000.0)); // negative bare-int mantissa
+        assert_eq!(first("-1e-3"), Token::Float(-1e-3)); // negative mantissa AND exponent
+                                                         // Out-of-range exponents follow IEEE-754 / `f64::parse` (matches the lexer
+                                                         // already accepting `inf`/`nan` literals): overflow → inf, underflow → 0.0.
+        assert_eq!(first("1e400"), Token::Float(f64::INFINITY));
+        assert_eq!(first("1e-400"), Token::Float(0.0));
+        // Plain integers/floats are unaffected.
+        assert_eq!(first("42"), Token::Int(42));
+        assert_eq!(first("1.5"), Token::Float(1.5));
+        assert_eq!(first("-7"), Token::Int(-7));
+        // The returned consumed-length must be exact (the caller advances i/col/byte
+        // offsets by it): a number resumes correct tokenization of what follows, both
+        // with a separating space and immediately against a delimiter.
+        assert_eq!(toks("1e5 2"), vec![Token::Float(1e5), Token::Int(2)]);
+        assert_eq!(
+            toks("(f 1e5)"),
+            vec![
+                Token::LParen,
+                Token::Symbol("f".to_string()),
+                Token::Float(1e5),
+                Token::RParen,
+            ]
+        );
+        // Guards: an `e`/`E` not followed by (sign+)digits is NOT consumed — `1e`
+        // is Int(1) plus a separate symbol, and a bare `e19` identifier stays a
+        // symbol, so existing code using `e…` names is unaffected.
+        assert_eq!(first("1e"), Token::Int(1));
+        assert_eq!(toks("1e").len(), 2);
+        assert!(matches!(&toks("1e")[1], Token::Symbol(s) if s == "e"));
+        assert_eq!(first("1e+"), Token::Int(1));
+        assert!(matches!(&toks("1e+")[1], Token::Symbol(_))); // leftover `e+` is a symbol
+        assert!(matches!(first("e19"), Token::Symbol(s) if s == "e19"));
     }
 
     #[test]

@@ -2,6 +2,27 @@
 //!
 //! This module handles HTTP routing and request/response serialization.
 //! All interpreter interaction goes through [`bridge::EngineHandle`].
+//!
+//! # Security model
+//!
+//! The notebook server is a **trusted-local** developer tool. Cells evaluate
+//! arbitrary Sema code (including file and network access) with the full
+//! privileges of the user running the server, and the server exposes no
+//! authentication or authorization layer.
+//!
+//! For that reason the server binds to the loopback interface
+//! ([`DEFAULT_HOST`], `127.0.0.1`) by default, so it is only reachable from the
+//! local machine. The bind host is configurable, but binding to a
+//! non-loopback address (e.g. `0.0.0.0`) exposes an unauthenticated remote
+//! code-execution endpoint to the network — doing so safely (firewalling,
+//! reverse proxy with auth, etc.) is the operator's responsibility.
+
+/// Default host the notebook server binds to.
+///
+/// Loopback only: the notebook server is a trusted-local tool with no auth
+/// layer (see the module-level security note). Callers may override this, but
+/// the safe default keeps it off the network.
+pub const DEFAULT_HOST: &str = "127.0.0.1";
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -65,7 +86,17 @@ pub async fn serve(notebook_path: Option<PathBuf>, host: &str, port: u16) {
         .and_then(|p| p.parent().map(|d| d.to_path_buf()))
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
 
-    let engine = EngineHandle::spawn(notebook, nb_path);
+    if notebook_path.is_none() {
+        eprintln!(
+            "warning: VFS root is current working directory ({}); use --notebook <file> to scope it",
+            vfs_root.display()
+        );
+    }
+
+    let engine = EngineHandle::spawn(notebook, nb_path).unwrap_or_else(|e| {
+        eprintln!("Failed to start notebook engine: {e}");
+        std::process::exit(1);
+    });
     let state = Arc::new(AppState { engine, vfs_root });
 
     let app = Router::new()
@@ -345,4 +376,25 @@ async fn vfs_list_handler(
     vfs::list_dir(&state.vfs_root, &q.path)
         .map_err(|e| (StatusCode::BAD_REQUEST, e))
         .map(Json)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{IpAddr, Ipv4Addr};
+
+    #[test]
+    fn default_host_binds_to_loopback() {
+        // The notebook server has no auth layer, so the default bind address
+        // must stay on the loopback interface (see the module security note).
+        assert_eq!(DEFAULT_HOST, "127.0.0.1");
+        let ip: IpAddr = DEFAULT_HOST
+            .parse()
+            .expect("DEFAULT_HOST must be a valid IP");
+        assert!(
+            ip.is_loopback(),
+            "default host {DEFAULT_HOST} must be loopback"
+        );
+        assert_eq!(ip, IpAddr::V4(Ipv4Addr::LOCALHOST));
+    }
 }

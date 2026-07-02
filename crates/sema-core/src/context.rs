@@ -1,6 +1,7 @@
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
+use std::time::Instant;
 
 use crate::{CallFrame, Env, Sandbox, SemaError, Span, SpanMap, StackTrace, Value};
 
@@ -24,6 +25,11 @@ pub struct EvalContext {
     pub max_eval_depth: Cell<usize>,
     pub eval_step_limit: Cell<usize>,
     pub eval_steps: Cell<usize>,
+    /// Optional wall-clock deadline for evaluation. When set, both the
+    /// tree-walker and the bytecode VM periodically check whether the current
+    /// time has passed this instant and, if so, abort with an error. Used by
+    /// the notebook engine to bound how long a single cell evaluation can run.
+    pub eval_deadline: Cell<Option<Instant>>,
     pub sandbox: Sandbox,
     pub user_context: RefCell<Vec<BTreeMap<Value, Value>>>,
     pub hidden_context: RefCell<Vec<BTreeMap<Value, Value>>>,
@@ -47,6 +53,7 @@ impl EvalContext {
             max_eval_depth: Cell::new(0),
             eval_step_limit: Cell::new(0),
             eval_steps: Cell::new(0),
+            eval_deadline: Cell::new(None),
             sandbox: Sandbox::allow_all(),
             user_context: RefCell::new(vec![BTreeMap::new()]),
             hidden_context: RefCell::new(vec![BTreeMap::new()]),
@@ -70,6 +77,7 @@ impl EvalContext {
             max_eval_depth: Cell::new(0),
             eval_step_limit: Cell::new(0),
             eval_steps: Cell::new(0),
+            eval_deadline: Cell::new(None),
             sandbox,
             user_context: RefCell::new(vec![BTreeMap::new()]),
             hidden_context: RefCell::new(vec![BTreeMap::new()]),
@@ -199,6 +207,66 @@ impl EvalContext {
 
     pub fn set_eval_step_limit(&self, limit: usize) {
         self.eval_step_limit.set(limit);
+    }
+
+    /// Set a wall-clock deadline after which evaluation should abort.
+    /// Passing `None` clears any existing deadline.
+    pub fn set_eval_deadline(&self, deadline: Option<Instant>) {
+        self.eval_deadline.set(deadline);
+    }
+
+    /// Returns true if a deadline is set and has been exceeded.
+    #[inline]
+    pub fn deadline_exceeded(&self) -> bool {
+        match self.eval_deadline.get() {
+            Some(d) => Instant::now() >= d,
+            None => false,
+        }
+    }
+
+    /// Returns an `eval` error if a deadline is set and exceeded; otherwise Ok(()).
+    #[inline]
+    pub fn check_deadline(&self) -> Result<(), SemaError> {
+        if self.deadline_exceeded() {
+            Err(SemaError::eval(
+                "evaluation exceeded time budget (looks like an infinite loop?)".to_string(),
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Per-iteration loop/recursion guard, called by the VM at loop back-edges
+    /// and frame transitions. Counts a step and aborts when:
+    ///   - the step limit is exceeded (wasm-safe runaway-loop guard — the wall
+    ///     clock is unavailable in wasm, so the step counter is the guard there);
+    ///   - the wall-clock deadline is exceeded (native);
+    ///   - a cancellation has been requested (e.g. the playground Stop button).
+    ///
+    /// The step compare runs every call (cheap); the clock read and the
+    /// cancellation thread-local read run only periodically to keep tight loops
+    /// fast. `eval_steps` is reset per top-level eval by the evaluator.
+    #[inline]
+    pub fn check_loop_interrupt(&self) -> Result<(), SemaError> {
+        let steps = self.eval_steps.get().wrapping_add(1);
+        self.eval_steps.set(steps);
+        let limit = self.eval_step_limit.get();
+        if limit != 0 && steps > limit {
+            return Err(SemaError::eval(
+                "evaluation exceeded step limit (looks like an infinite loop?)".to_string(),
+            ));
+        }
+        if steps & 0x3FFF == 0 {
+            if self.deadline_exceeded() {
+                return Err(SemaError::eval(
+                    "evaluation exceeded time budget (looks like an infinite loop?)".to_string(),
+                ));
+            }
+            if crate::async_signal::check_interrupt() {
+                return Err(SemaError::eval("evaluation cancelled".to_string()));
+            }
+        }
+        Ok(())
     }
 
     // --- User context methods ---
@@ -420,7 +488,7 @@ mod tests {
         ctx.cache_module(path.clone(), second);
 
         let cached = ctx.get_cached_module(&path).unwrap();
-        assert!(cached.get("old").is_none());
+        assert!(!cached.contains_key("old"));
         assert_eq!(cached.get("new"), Some(&Value::int(2)));
     }
 
@@ -460,7 +528,10 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("cyclic import"), "error should mention cyclic import: {msg}");
+        assert!(
+            msg.contains("cyclic import"),
+            "error should mention cyclic import: {msg}"
+        );
     }
 
     #[test]
@@ -485,7 +556,10 @@ mod tests {
         let result = ctx.begin_module_load(&a);
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
-        assert!(msg.contains("cyclic import"), "A should still be loading: {msg}");
+        assert!(
+            msg.contains("cyclic import"),
+            "A should still be loading: {msg}"
+        );
     }
 
     // --- Sandbox integration ---
@@ -532,21 +606,19 @@ pub fn set_call_callback(ctx: &EvalContext, f: CallCallbackFn) {
 }
 
 /// Evaluate an expression using the registered evaluator.
-/// Panics if no evaluator has been registered (programming error).
+/// Returns an error if no evaluator has been registered.
 pub fn eval_callback(ctx: &EvalContext, expr: &Value, env: &Env) -> Result<Value, SemaError> {
-    let f = ctx
-        .eval_fn
-        .get()
-        .expect("eval callback not registered — Interpreter::new() must be called first");
+    let f = ctx.eval_fn.get().ok_or_else(|| {
+        SemaError::eval("eval callback not registered — Interpreter::new() must be called first")
+    })?;
     f(ctx, expr, env)
 }
 
 /// Call a function value with arguments using the registered callback.
-/// Panics if no callback has been registered (programming error).
+/// Returns an error if no callback has been registered.
 pub fn call_callback(ctx: &EvalContext, func: &Value, args: &[Value]) -> Result<Value, SemaError> {
-    let f = ctx
-        .call_fn
-        .get()
-        .expect("call callback not registered — Interpreter::new() must be called first");
+    let f = ctx.call_fn.get().ok_or_else(|| {
+        SemaError::eval("call callback not registered — Interpreter::new() must be called first")
+    })?;
     f(ctx, func, args)
 }

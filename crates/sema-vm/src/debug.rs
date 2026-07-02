@@ -1,3 +1,4 @@
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::mpsc;
 
@@ -27,6 +28,25 @@ pub struct DapScope {
     pub expensive: bool,
 }
 
+#[derive(Debug, Clone)]
+pub struct DapBreakpoint {
+    pub id: u32,
+    pub verified: bool,
+    pub requested_line: u32,
+    pub line: u32,
+    pub message: Option<String>,
+}
+
+/// A source breakpoint as requested by the frontend: a line plus an optional
+/// condition expression that must evaluate truthy for the breakpoint to fire.
+#[derive(Debug, Clone)]
+pub struct SourceBreakpoint {
+    pub line: u32,
+    pub condition: Option<String>,
+}
+
+pub const DEBUG_VALUE_REF_BASE: u64 = 1_000_000;
+
 /// Current stepping mode for the debugger.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StepMode {
@@ -49,8 +69,12 @@ pub enum DebugCommand {
     Pause,
     SetBreakpoints {
         file: PathBuf,
-        lines: Vec<u32>,
-        reply: mpsc::SyncSender<Vec<u32>>,
+        breakpoints: Vec<SourceBreakpoint>,
+        reply: mpsc::SyncSender<Vec<DapBreakpoint>>,
+    },
+    /// Toggle stopping on uncaught runtime errors.
+    SetExceptionBreakpoints {
+        break_on_uncaught: bool,
     },
     GetStackTrace {
         reply: mpsc::SyncSender<Vec<DapStackFrame>>,
@@ -62,6 +86,17 @@ pub enum DebugCommand {
     GetVariables {
         reference: u64,
         reply: mpsc::SyncSender<Vec<DapVariable>>,
+    },
+    Evaluate {
+        frame_id: usize,
+        expression: String,
+        reply: mpsc::SyncSender<Result<DapVariable, String>>,
+    },
+    SetVariable {
+        variables_reference: u64,
+        name: String,
+        value_expression: String,
+        reply: mpsc::SyncSender<Result<DapVariable, String>>,
     },
     Disconnect,
 }
@@ -84,7 +119,7 @@ pub fn scope_upvalues_ref(frame_id: usize) -> u64 {
 
 /// Decode a scope variable reference into frame ID and kind.
 pub fn decode_scope_ref(reference: u64) -> Option<ScopeKind> {
-    if reference == 0 {
+    if reference == 0 || reference >= DEBUG_VALUE_REF_BASE {
         return None;
     }
     if reference % 2 == 1 {
@@ -114,12 +149,23 @@ pub enum StopReason {
     Step,
     Pause,
     Entry,
+    Exception,
 }
 
 /// Mutable debugger state carried alongside the VM.
 pub struct DebugState {
     /// Active breakpoints: (file_path, line) → breakpoint ID
-    pub breakpoints: std::collections::HashMap<(PathBuf, u32), u32>,
+    pub breakpoints: HashMap<(PathBuf, u32), u32>,
+    /// Conditional breakpoints: (file_path, line) → condition expression. A
+    /// breakpoint with a condition only fires when the expression evaluates
+    /// truthy in the stopped frame. Keys are a subset of `breakpoints`.
+    pub conditions: HashMap<(PathBuf, u32), String>,
+    /// Whether to stop on uncaught runtime errors (set via setExceptionBreakpoints).
+    pub break_on_uncaught: bool,
+    /// Message of the last uncaught error we stopped on, for the exceptionInfo request.
+    pub last_exception: Option<String>,
+    /// Valid executable source lines for the currently debugged program, keyed by source file.
+    pub valid_breakpoint_lines: BTreeMap<PathBuf, Vec<u32>>,
     /// Current step mode
     pub step_mode: StepMode,
     /// Frame depth when stepping was initiated
@@ -139,6 +185,13 @@ pub struct DebugState {
     pub event_tx: mpsc::Sender<DebugEvent>,
     /// Channel to receive commands from the DAP frontend
     pub command_rx: mpsc::Receiver<DebugCommand>,
+    /// True for a cooperative (WASM playground) session with no real command
+    /// channel: stops are surfaced by RETURNING `VmExecResult::Stopped` from
+    /// `run_cooperative`/`start_cooperative` and resumed by a later call, never
+    /// by blocking on `command_rx`. The async scheduler consults this to decide
+    /// whether a mid-task breakpoint blocks (`handle_debug_stop`, native DAP) or
+    /// surfaces as a cooperative stop (this flag, WASM). Set by `new_headless`.
+    headless: bool,
     next_bp_id: u32,
 }
 
@@ -148,7 +201,11 @@ impl DebugState {
         command_rx: mpsc::Receiver<DebugCommand>,
     ) -> Self {
         DebugState {
-            breakpoints: std::collections::HashMap::new(),
+            breakpoints: HashMap::new(),
+            conditions: HashMap::new(),
+            break_on_uncaught: false,
+            last_exception: None,
+            valid_breakpoint_lines: BTreeMap::new(),
             step_mode: StepMode::Continue,
             step_frame_depth: 0,
             last_stop_line: None,
@@ -157,6 +214,7 @@ impl DebugState {
             instructions_remaining: 0,
             event_tx,
             command_rx,
+            headless: false,
             next_bp_id: 1,
         }
     }
@@ -168,7 +226,11 @@ impl DebugState {
         let (event_tx, _) = mpsc::channel();
         let (_, command_rx) = mpsc::channel();
         DebugState {
-            breakpoints: std::collections::HashMap::new(),
+            breakpoints: HashMap::new(),
+            conditions: HashMap::new(),
+            break_on_uncaught: false,
+            last_exception: None,
+            valid_breakpoint_lines: BTreeMap::new(),
             step_mode: StepMode::Continue,
             step_frame_depth: 0,
             last_stop_line: None,
@@ -177,8 +239,15 @@ impl DebugState {
             instructions_remaining: 0,
             event_tx,
             command_rx,
+            headless: true,
             next_bp_id: 1,
         }
+    }
+
+    /// Whether this is a cooperative (WASM) session with no real command
+    /// channel. See [`DebugState::headless`].
+    pub fn is_headless(&self) -> bool {
+        self.headless
     }
 
     /// Check if we should stop at the given span and frame depth.
@@ -195,35 +264,133 @@ impl DebugState {
 
         match self.step_mode {
             StepMode::Continue => false,
-            StepMode::StepInto => match &self.last_stop_line {
-                Some((_, last_line)) => line != *last_line,
-                None => true,
-            },
+            StepMode::StepInto => self.moved_since_last_stop(file, line),
             StepMode::StepOver => {
-                frame_depth <= self.step_frame_depth
-                    && match &self.last_stop_line {
-                        Some((_, last_line)) => line != *last_line,
-                        None => true,
-                    }
+                frame_depth <= self.step_frame_depth && self.moved_since_last_stop(file, line)
             }
             StepMode::StepOut => frame_depth < self.step_frame_depth,
         }
     }
 
+    /// Whether `(file, line)` differs from the last place a step stopped — the guard
+    /// that keeps StepInto/StepOver from re-stopping on the SAME source location. Both
+    /// the file AND line must match the prior stop to be considered "same"; comparing
+    /// only the line would wrongly treat the same line number in a DIFFERENT file as no
+    /// movement (silently stepping past the callee's first line).
+    fn moved_since_last_stop(&self, file: Option<&PathBuf>, line: u32) -> bool {
+        match &self.last_stop_line {
+            Some((last_file, last_line)) => line != *last_line || file != Some(last_file),
+            None => true,
+        }
+    }
+
+    /// Whether a stop at `(file, line)` with the given frame depth is caused
+    /// *solely* by a breakpoint hit — i.e. there is no pending pause and the
+    /// step mode would not stop here on its own. Conditional breakpoints are
+    /// only gated by their condition in this case; a stop that would also be a
+    /// step/pause stop always fires regardless of any condition.
+    pub fn is_pure_breakpoint_stop(
+        &self,
+        file: Option<&PathBuf>,
+        line: u32,
+        frame_depth: usize,
+    ) -> bool {
+        if self.pause_requested {
+            return false;
+        }
+        let on_breakpoint = file.is_some_and(|f| self.breakpoints.contains_key(&(f.clone(), line)));
+        if !on_breakpoint {
+            return false;
+        }
+        let step_would_stop = match self.step_mode {
+            StepMode::Continue => false,
+            StepMode::StepInto => self.moved_since_last_stop(file, line),
+            StepMode::StepOver => {
+                frame_depth <= self.step_frame_depth && self.moved_since_last_stop(file, line)
+            }
+            StepMode::StepOut => frame_depth < self.step_frame_depth,
+        };
+        !step_would_stop
+    }
+
+    /// The condition expression for the breakpoint at `(file, line)`, if any.
+    pub fn condition_at(&self, file: Option<&PathBuf>, line: u32) -> Option<&str> {
+        let f = file?;
+        self.conditions.get(&(f.clone(), line)).map(|s| s.as_str())
+    }
+
     /// Set breakpoints for a file, replacing any existing ones for that file.
-    pub fn set_breakpoints(&mut self, file: &PathBuf, lines: &[u32]) -> Vec<u32> {
+    ///
+    /// Convenience wrapper for unconditional breakpoints (used by the WASM
+    /// cooperative debugger). Conditional breakpoints go through
+    /// [`set_breakpoints_with_conditions`].
+    pub fn set_breakpoints(&mut self, file: &PathBuf, lines: &[u32]) -> Vec<DapBreakpoint> {
+        let requested: Vec<SourceBreakpoint> = lines
+            .iter()
+            .map(|&line| SourceBreakpoint {
+                line,
+                condition: None,
+            })
+            .collect();
+        self.set_breakpoints_with_conditions(file, &requested)
+    }
+
+    /// Set breakpoints (optionally conditional) for a file, replacing any
+    /// existing ones for that file. A breakpoint whose `condition` is set only
+    /// fires when the expression evaluates truthy in the stopped frame; the
+    /// expression text is stored against the resolved (snapped) line.
+    pub fn set_breakpoints_with_conditions(
+        &mut self,
+        file: &PathBuf,
+        requested: &[SourceBreakpoint],
+    ) -> Vec<DapBreakpoint> {
         let file = std::fs::canonicalize(file).unwrap_or_else(|_| file.clone());
         self.breakpoints.retain(|(f, _), _| f != &file);
+        self.conditions.retain(|(f, _), _| f != &file);
 
-        lines
+        let valid_lines = self.valid_breakpoint_lines.get(&file);
+        requested
             .iter()
-            .map(|&line| {
-                let id = self.next_bp_id;
-                self.next_bp_id += 1;
-                self.breakpoints.insert((file.clone(), line), id);
-                id
+            .map(|bp| {
+                let requested_line = bp.line;
+                let resolved = match valid_lines {
+                    Some(valid) => crate::vm::snap_breakpoint_line(requested_line, valid),
+                    None => Some(requested_line),
+                };
+                match resolved {
+                    Some(line) => {
+                        let id = self.next_bp_id;
+                        self.next_bp_id += 1;
+                        self.breakpoints.insert((file.clone(), line), id);
+                        if let Some(cond) = &bp.condition {
+                            if !cond.trim().is_empty() {
+                                self.conditions.insert((file.clone(), line), cond.clone());
+                            }
+                        }
+                        DapBreakpoint {
+                            id,
+                            verified: true,
+                            requested_line,
+                            line,
+                            message: (line != requested_line).then(|| {
+                                format!("Breakpoint moved to nearest executable line {line}")
+                            }),
+                        }
+                    }
+                    None => DapBreakpoint {
+                        id: 0,
+                        verified: false,
+                        requested_line,
+                        line: requested_line,
+                        message: Some("No executable line exists in this source".to_string()),
+                    },
+                }
             })
             .collect()
+    }
+
+    pub fn set_valid_breakpoint_lines(&mut self, lines: BTreeMap<PathBuf, Vec<u32>>) {
+        self.valid_breakpoint_lines = lines;
     }
 }
 
@@ -237,6 +404,8 @@ pub enum VmExecResult {
     /// Execution yielded after exhausting the instruction budget.
     /// Call `run_cooperative` again to continue.
     Yielded,
+    /// Execution suspended for async yield (channel op, await, sleep).
+    AsyncYield(sema_core::YieldReason),
 }
 
 /// Information about why and where the VM stopped.

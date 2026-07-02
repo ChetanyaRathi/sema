@@ -1,12 +1,40 @@
 use crate::provider::LlmProvider;
 use crate::types::{ChatRequest, ChatResponse, LlmError, ToolCall, Usage};
 
+/// Map canonical reasoning effort → Gemini `thinkingBudget` (tokens). `none`/
+/// `minimal` disable thinking (0); others scale within the 2.5-flash 0..=24576
+/// range. Unrecognized values default to disabled.
+fn gemini_thinking_budget(effort: &str) -> u32 {
+    match effort.to_lowercase().as_str() {
+        "low" => 1024,
+        "medium" => 8192,
+        "high" | "xhigh" | "max" => 24576,
+        _ => 0, // none / minimal / unrecognized
+    }
+}
+
+/// Build the Gemini endpoint URL without embedding the API key (the key is sent
+/// via the `x-goog-api-key` header instead — see the call sites). Validates the
+/// request-controlled `model` so it cannot inject extra path segments or break
+/// out of the `/models/<model>:<action>` shape (SSRF / path injection).
+fn build_url(base_url: &str, model: &str, action: &str) -> Result<String, LlmError> {
+    if model.is_empty()
+        || model
+            .chars()
+            .any(|c| c == '/' || c == '?' || c == '#' || c == ':' || c.is_control())
+        || model.contains("..")
+    {
+        return Err(LlmError::Config(format!("invalid model name: {model:?}")));
+    }
+    Ok(format!("{base_url}/models/{model}:{action}"))
+}
+
 pub struct GeminiProvider {
     api_key: String,
     base_url: String,
     default_model: String,
     client: reqwest::Client,
-    runtime: tokio::runtime::Runtime,
+    runtime: crate::http::BlockingRuntime,
 }
 
 impl GeminiProvider {
@@ -15,7 +43,7 @@ impl GeminiProvider {
         Ok(GeminiProvider {
             api_key,
             base_url: "https://generativelanguage.googleapis.com/v1beta".to_string(),
-            default_model: default_model.unwrap_or_else(|| "gemini-2.0-flash".to_string()),
+            default_model: default_model.unwrap_or_else(|| "gemini-3.5-flash".to_string()),
             client: crate::http::create_client(None)?,
             runtime,
         })
@@ -31,17 +59,13 @@ impl GeminiProvider {
 
     async fn complete_async(&self, request: ChatRequest) -> Result<ChatResponse, LlmError> {
         let model = self.resolve_model(&request.model);
-        let url = format!(
-            "{}/models/{}:generateContent?key={}",
-            self.base_url, model, self.api_key
-        );
+        let url = build_url(&self.base_url, &model, "generateContent")?;
 
         let body = self.build_request_body(&request);
 
-        let resp = self
-            .client
-            .post(&url)
+        let resp = crate::http::with_timeout(self.client.post(&url), request.timeout_ms)
             .header("Content-Type", "application/json")
+            .header("x-goog-api-key", &self.api_key)
             .json(&body)
             .send()
             .await
@@ -76,8 +100,8 @@ impl GeminiProvider {
     ) -> Result<ChatResponse, LlmError> {
         let model = self.resolve_model(&request.model);
         let url = format!(
-            "{}/models/{}:streamGenerateContent?key={}&alt=sse",
-            self.base_url, model, self.api_key
+            "{}?alt=sse",
+            build_url(&self.base_url, &model, "streamGenerateContent")?
         );
 
         let body = self.build_request_body(&request);
@@ -86,6 +110,7 @@ impl GeminiProvider {
             .client
             .post(&url)
             .header("Content-Type", "application/json")
+            .header("x-goog-api-key", &self.api_key)
             .json(&body)
             .send()
             .await
@@ -108,6 +133,7 @@ impl GeminiProvider {
         let mut full_content = String::new();
         let mut prompt_tokens = 0u32;
         let mut completion_tokens = 0u32;
+        let mut cached_tokens = 0u32;
         let mut tool_calls: Vec<ToolCall> = Vec::new();
         let mut tool_call_idx = 0usize;
 
@@ -153,6 +179,13 @@ impl GeminiProvider {
                     if let Some(ct) = usage.get("candidatesTokenCount").and_then(|v| v.as_u64()) {
                         completion_tokens = ct as u32;
                     }
+                    // cachedContentTokenCount is a SUBSET of promptTokenCount (read hits).
+                    if let Some(cc) = usage
+                        .get("cachedContentTokenCount")
+                        .and_then(|v| v.as_u64())
+                    {
+                        cached_tokens = cc as u32;
+                    }
                 }
             }
             Ok(())
@@ -174,6 +207,8 @@ impl GeminiProvider {
                 prompt_tokens,
                 completion_tokens,
                 model,
+                cache_read_input_tokens: cached_tokens,
+                cache_creation_input_tokens: 0,
             },
             stop_reason,
         })
@@ -185,6 +220,36 @@ impl GeminiProvider {
         for msg in &request.messages {
             if msg.role == "system" {
                 continue; // handled separately
+            }
+            if !msg.tool_calls.is_empty() {
+                // Assistant turn → a "model" content with functionCall parts.
+                let mut parts: Vec<serde_json::Value> = Vec::new();
+                let text = msg.content.to_text();
+                if !text.is_empty() {
+                    parts.push(serde_json::json!({ "text": text }));
+                }
+                for tc in &msg.tool_calls {
+                    parts.push(serde_json::json!({
+                        "functionCall": { "name": tc.name, "args": tc.arguments }
+                    }));
+                }
+                contents.push(serde_json::json!({ "role": "model", "parts": parts }));
+                continue;
+            }
+            if msg.role == "tool" {
+                // Tool result → a "user" content with a functionResponse part keyed
+                // by the tool name (Gemini correlates results by name).
+                let name = msg.tool_name.clone().unwrap_or_default();
+                contents.push(serde_json::json!({
+                    "role": "user",
+                    "parts": [{
+                        "functionResponse": {
+                            "name": name,
+                            "response": { "result": msg.content.to_text() }
+                        }
+                    }]
+                }));
+                continue;
             }
             let role = match msg.role.as_str() {
                 "assistant" => "model",
@@ -229,6 +294,15 @@ impl GeminiProvider {
                 serde_json::json!(request.stop_sequences),
             );
         }
+        // Canonical reasoning_effort → Gemini thinkingConfig.thinkingBudget.
+        // minimal/none → 0 (disable thinking); others scale the budget.
+        if let Some(effort) = request.reasoning_effort.as_deref() {
+            let budget = gemini_thinking_budget(effort);
+            gen_config.insert(
+                "thinkingConfig".to_string(),
+                serde_json::json!({ "thinkingBudget": budget }),
+            );
+        }
         if !gen_config.is_empty() {
             body["generationConfig"] = serde_json::Value::Object(gen_config);
         }
@@ -262,9 +336,14 @@ impl GeminiProvider {
         let mut content = String::new();
         let mut tool_calls = Vec::new();
         let mut tool_call_idx = 0usize;
+        let mut finish_reason_str: Option<String> = None;
 
         if let Some(candidates) = resp.get("candidates").and_then(|c| c.as_array()) {
             if let Some(candidate) = candidates.first() {
+                finish_reason_str = candidate
+                    .get("finishReason")
+                    .and_then(|f| f.as_str())
+                    .map(|s| s.to_string());
                 if let Some(parts) = candidate
                     .pointer("/content/parts")
                     .and_then(|p| p.as_array())
@@ -300,6 +379,7 @@ impl GeminiProvider {
 
         let mut prompt_tokens = 0u32;
         let mut completion_tokens = 0u32;
+        let mut cached_tokens = 0u32;
         if let Some(usage) = resp.get("usageMetadata") {
             prompt_tokens = usage
                 .get("promptTokenCount")
@@ -309,6 +389,37 @@ impl GeminiProvider {
                 .get("candidatesTokenCount")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(0) as u32;
+            // cachedContentTokenCount is a SUBSET of promptTokenCount (read hits).
+            cached_tokens = usage
+                .get("cachedContentTokenCount")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0) as u32;
+        }
+        // Thinking tokens are reported separately and are NOT in candidatesTokenCount —
+        // when a small budget is spent entirely on reasoning, the visible output is empty.
+        let thoughts_tokens = resp
+            .get("usageMetadata")
+            .and_then(|u| u.get("thoughtsTokenCount"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as u32;
+
+        // Empty-output footgun: Gemini's default models are thinking models, so a small
+        // `:max-tokens` can be spent entirely on reasoning, leaving no visible text and a
+        // `MAX_TOKENS` finish — a silent empty string otherwise. Surface it instead.
+        if content.is_empty()
+            && tool_calls.is_empty()
+            && (finish_reason_str.as_deref() == Some("MAX_TOKENS") || thoughts_tokens > 0)
+        {
+            return Err(LlmError::Api {
+                status: 200,
+                message: format!(
+                    "Gemini returned an empty response (finishReason: {}; {thoughts_tokens} \
+                     reasoning tokens, 0 visible output tokens). Thinking models spend part of \
+                     `:max-tokens` reasoning before producing visible output — increase \
+                     `:max-tokens`, or lower `:reasoning-effort`.",
+                    finish_reason_str.as_deref().unwrap_or("unknown")
+                ),
+            });
         }
 
         let stop_reason = if tool_calls.is_empty() {
@@ -326,6 +437,8 @@ impl GeminiProvider {
                 prompt_tokens,
                 completion_tokens,
                 model: model.to_string(),
+                cache_read_input_tokens: cached_tokens,
+                cache_creation_input_tokens: 0,
             },
             stop_reason,
         })
@@ -385,5 +498,47 @@ fn serialize_gemini_parts(content: &crate::types::MessageContent) -> serde_json:
                 .collect();
             serde_json::Value::Array(parts)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn thinking_budget_mapping() {
+        assert_eq!(gemini_thinking_budget("low"), 1024);
+        assert_eq!(gemini_thinking_budget("medium"), 8192);
+        assert_eq!(gemini_thinking_budget("high"), 24576);
+        assert_eq!(gemini_thinking_budget("none"), 0);
+        assert_eq!(gemini_thinking_budget("minimal"), 0);
+    }
+
+    #[test]
+    fn build_url_omits_api_key() {
+        let url = build_url(
+            "https://generativelanguage.googleapis.com/v1beta",
+            "gemini-3.5-flash",
+            "generateContent",
+        )
+        .unwrap();
+        assert!(
+            !url.contains("key="),
+            "API key must not appear in URL: {url}"
+        );
+        assert!(url.contains("gemini-3.5-flash"));
+        assert!(url.ends_with(":generateContent"));
+    }
+
+    #[test]
+    fn build_url_rejects_path_injection_in_model() {
+        assert!(build_url(
+            "https://x/v1beta",
+            "../../v1/models/evil",
+            "generateContent"
+        )
+        .is_err());
+        assert!(build_url("https://x/v1beta", "a/b", "generateContent").is_err());
+        assert!(build_url("https://x/v1beta", "bad\nmodel", "generateContent").is_err());
     }
 }

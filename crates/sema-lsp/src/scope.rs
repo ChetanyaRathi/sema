@@ -56,19 +56,12 @@ fn expr_span(expr: &Value, span_map: &SpanMap) -> Option<Span> {
 
 /// Check if position (1-indexed line, col) falls within a span.
 fn span_contains_pos(span: &Span, line: usize, col: usize) -> bool {
-    let pos = (line, col);
-    let start = (span.line, span.col);
-    let end = (span.end_line, span.end_col);
-    pos >= start && pos <= end
+    span.contains_pos(line, col)
 }
 
 /// Check if `inner` span is fully contained within `outer` span.
 fn span_contains_span(outer: &Span, inner: &Span) -> bool {
-    let inner_start = (inner.line, inner.col);
-    let inner_end = (inner.end_line, inner.end_col);
-    let outer_start = (outer.line, outer.col);
-    let outer_end = (outer.end_line, outer.end_col);
-    inner_start >= outer_start && inner_end <= outer_end
+    outer.contains(inner)
 }
 
 /// Find the span of a symbol name within a parent span, using symbol_spans.
@@ -425,8 +418,12 @@ impl ScopeTree {
             None => return,
         };
 
-        // Check for named let: (let name ((var init) ...) body...)
-        if items[0].as_symbol().is_some() && items.len() >= 3 {
+        // Check for named let: (let name ((var init) ...) body...).
+        // The distinguishing feature is items[1] being a symbol (the loop name)
+        // AND items[2] being the bindings list. `items[0]` is always the `let`
+        // symbol, so guarding on it is meaningless and would misclassify a
+        // malformed `(let name non-list ...)` as a named let.
+        if items.len() >= 3 && items[2].as_list().is_some() {
             if let Some(loop_name) = items[1].as_symbol() {
                 let body_scope_idx = self.scopes.len();
                 self.scopes.push(Scope {

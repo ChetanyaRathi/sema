@@ -12,28 +12,36 @@ members = [
     "crates/sema-lsp",
     "crates/sema-dap",
     "crates/sema-notebook",
+    "crates/sema-docs",
+    "crates/sema-mcp",
+    "crates/sema-otel",
+    "crates/sema-workflow",
 ]
 exclude = ["pkg"]
 resolver = "2"
 
 [workspace.package]
-version = "1.13.0"
+version = "1.28.1"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/HelgeSverre/sema"
 homepage = "https://sema-lang.com"
 
 [workspace.dependencies]
-sema-core = { version = "=1.13.0", path = "crates/sema-core" }
-sema-reader = { version = "=1.13.0", path = "crates/sema-reader" }
-sema-eval = { version = "=1.13.0", path = "crates/sema-eval" }
-sema-llm = { version = "=1.13.0", path = "crates/sema-llm" }
-sema-stdlib = { version = "=1.13.0", path = "crates/sema-stdlib" }
-sema-vm = { version = "=1.13.0", path = "crates/sema-vm" }
-sema-fmt = { version = "=1.13.0", path = "crates/sema-fmt" }
-sema-lsp = { version = "=1.13.0", path = "crates/sema-lsp" }
-sema-dap = { version = "=1.13.0", path = "crates/sema-dap" }
-sema-notebook = { version = "=1.13.0", path = "crates/sema-notebook" }
+sema-core = { version = "=1.28.1", path = "crates/sema-core" }
+sema-reader = { version = "=1.28.1", path = "crates/sema-reader" }
+sema-eval = { version = "=1.28.1", path = "crates/sema-eval" }
+sema-llm = { version = "=1.28.1", path = "crates/sema-llm" }
+sema-stdlib = { version = "=1.28.1", path = "crates/sema-stdlib" }
+sema-vm = { version = "=1.28.1", path = "crates/sema-vm" }
+sema-fmt = { version = "=1.28.1", path = "crates/sema-fmt" }
+sema-lsp = { version = "=1.28.1", path = "crates/sema-lsp" }
+sema-dap = { version = "=1.28.1", path = "crates/sema-dap" }
+sema-notebook = { version = "=1.28.1", path = "crates/sema-notebook" }
+sema-docs = { version = "=1.28.1", path = "crates/sema-docs" }
+sema-mcp = { version = "=1.28.1", path = "crates/sema-mcp" }
+sema-otel = { version = "=1.28.1", path = "crates/sema-otel" }
+sema-workflow = { version = "=1.28.1", path = "crates/sema-workflow" }
 
 tower-lsp = "0.20"
 dashmap = "6"
@@ -42,10 +50,9 @@ regex = "1"
 thiserror = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "net"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "net", "io-std", "io-util", "process", "time"] }
 reqwest = { version = "0.13", features = ["json", "stream", "blocking", "multipart"] }
 futures = "0.3"
-rustyline = "17"
 clap = { version = "4", features = ["derive"] }
 clap_complete = "4"
 rand = "0.10"
@@ -57,28 +64,64 @@ csv = "1"
 md5 = "0.8"
 hmac = "0.12"
 hex = "0.4"
-memchr = "2"
 lasso = "0.7"
-hashbrown = "0.15"
+hashbrown = "0.17"
 unicode-normalization = "0.1"
+unicode-width = "0.1"
+unicode-segmentation = "1"
+caseless = "0.2"
 glob = "0.3"
 hostname = "0.4"
 libc = "0.2"
 pdf-extract = "0.10"
-lopdf = "0.38"
+lopdf = "0.41"
 axum = { version = "0.8", features = ["ws"] }
 tokio-stream = "0.1"
 mime_guess = "2"
-toml = "0.8"
-toml_edit = "0.22"
-rusqlite = { version = "0.31", features = ["bundled"] }
+toml = "1.1"
+toml_edit = "0.25"
+rusqlite = { version = "0.40", features = ["bundled"] }
 semver = "1"
 tar = "0.4"
 flate2 = "1"
+crc32fast = "1"
+zip = "2"
+similar = "2"
+pulldown-cmark = "0.12"
+scraper = "0.21"
+notify = "6"
+portable-pty = "0.9"
+
+# MCP client OAuth (native, hand-rolled per Option B). oauth2 provides PKCE-S256
+# + code/refresh exchange; we drive it with our own reqwest client. tiny_http is
+# the lean loopback-redirect listener; webbrowser opens the system browser;
+# keyring is the OS keychain (with a 0600-file fallback we implement). directories
+# resolves the config dir. Platform-native keyring backends avoid extra system
+# libs (no dbus) so CI builds stay green.
+oauth2 = { version = "5", default-features = false }
+url = "2"
+tiny_http = "0.12"
+webbrowser = "1"
+keyring = { version = "3", features = ["apple-native", "windows-native", "linux-native"] }
+directories = "6"
+
+wasm-bindgen = "0.2"
+js-sys = "0.3"
+web-sys = "0.3"
+wasm-bindgen-futures = "0.4"
+getrandom = "0.4"
+
+
+# Dev/test builds: keep file:line backtraces but drop variable-level debug info.
+# Shrinks test binaries (~84MB -> ~25MB) and the incremental cache substantially.
+# Does NOT affect benchmarking (uses [profile.release]) or profiling (uses
+# [profile.release-with-debug], which keeps full symbols).
+[profile.dev]
+debug = "line-tables-only"
 
 [profile.release]
 opt-level = 3
-lto = "thin"
+lto = "fat"
 codegen-units = 1
 panic = "abort"
 strip = "debuginfo"
@@ -91,7 +134,4 @@ strip = "none"
 # The profile that 'dist' will build with
 [profile.dist]
 inherits = "release"
-lto = "thin"
-
-[profile.release.package.sema-wasm]
-opt-level = "s"
+lto = "fat"

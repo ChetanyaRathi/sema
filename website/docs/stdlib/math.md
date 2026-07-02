@@ -4,6 +4,28 @@ outline: [2, 3]
 
 # Math & Arithmetic
 
+## Domain & error policy
+
+Sema's numeric error behavior follows one rule, split by type:
+
+- **Integer division or modulo by zero raises an error.** `(/ 1 0)`, `(modulo 7 0)`, and `(mod 7 0)` all raise (`division by zero` / `modulo by zero`). Integers have no infinity or NaN to return, so the failure surfaces where it happens.
+- **Floating-point follows IEEE 754** — overflow and undefined real-domain results return `inf`, `-inf`, or `NaN` instead of raising:
+
+```sema
+(/ 1.0 0)     ; => inf
+(/ -1.0 0)    ; => -inf
+(/ 0.0 0.0)   ; => NaN
+(sqrt -1)     ; => NaN
+(log 0)       ; => -inf
+(log -1)      ; => NaN
+(pow 0 0)     ; => 1
+(pow 2 -1)    ; => 0.5
+```
+
+This matches the hardware and mainstream numeric languages, so `NaN` propagates and `inf` accumulates rather than forcing error handling around every operation. If you need to reject these, test with `math/nan?` / `math/infinite?` explicitly.
+
+> **Integer overflow wraps** (two's-complement) — Sema does not yet have arbitrary-precision integers, so e.g. `(+ 9223372036854775807 1)` wraps to a negative number rather than raising or promoting. (See ADR #64.)
+
 ## Basic Arithmetic
 
 ### `+`
@@ -38,12 +60,12 @@ Multiply numbers together.
 
 ### `/`
 
-Divide numbers. Integer division when both operands are integers.
+Divide numbers. Returns a float when the division is not exact (so `(/ 10 3)` is `3.3333...`, not `3`). For truncated integer division use [`math/quotient`](#math-quotient).
 
 ```sema
-(/ 10 2)      ; => 5
-(/ 10 3)      ; => 3
-(/ 10.0 3)    ; => 3.333...
+(/ 10 2)      ;; => 5
+(/ 10 3)      ;; => 3.3333333333333335
+(/ 10.0 3)    ;; => 3.3333333333333335
 ```
 
 ### `mod`
@@ -96,11 +118,13 @@ Greater than or equal.
 
 ### `=`
 
-Numeric equality.
+Equality. For numbers this is numeric equality (so `(= 1 1.0)` is `#t`); for non-numbers it falls back to structural equality. Unlike `<` / `>`, comparing non-numbers does not error.
 
 ```sema
-(= 1 1)       ; => #t
-(= 1 2)       ; => #f
+(= 1 1)           ; => #t
+(= 1 1.0)         ; => #t
+(= 1 2)           ; => #f
+(= "abc" "abc")   ; => #t   (structural, not an error)
 ```
 
 ## Numeric Utilities
@@ -117,20 +141,22 @@ Absolute value.
 
 ### `min`
 
-Return the smallest of one or more numbers.
+Return the smallest of 1 or more numbers (the no-arg case errors).
 
 ```sema
-(min 1 2 3)   ; => 1
-(min 5)       ; => 5
+(min 1 2 3)   ;; => 1
+(min 5)       ;; => 5
+(min)         ;; error: Arity error: min expects 1+ args, got 0
 ```
 
 ### `max`
 
-Return the largest of one or more numbers.
+Return the largest of 1 or more numbers (the no-arg case errors).
 
 ```sema
-(max 1 2 3)   ; => 3
-(max 5)       ; => 5
+(max 1 2 3)   ;; => 3
+(max 5)       ;; => 5
+(max)         ;; error: Arity error: max expects 1+ args, got 0
 ```
 
 ### `pow`
@@ -185,6 +211,24 @@ Round to nearest integer.
 ```sema
 (round 3.5)   ; => 4
 (round 3.4)   ; => 3
+```
+
+### `math/round-to`
+
+Round to `places` decimal places, returning a float (where `round` only rounds to a whole integer).
+
+```sema
+(math/round-to 3.14159 2)   ; => 3.14
+(math/round-to 0.46666 3)   ; => 0.467
+```
+
+### `math/format-fixed`
+
+Format a number as a fixed-decimal **string**, padding trailing zeros to `places` digits — for money/metrics display where `math/round-to` (a float, which drops trailing zeros) isn't enough.
+
+```sema
+(math/format-fixed 1.2 3)     ; => "1.200"
+(math/format-fixed 3.14159 2) ; => "3.14"
 ```
 
 ## Trigonometry

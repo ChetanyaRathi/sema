@@ -1,265 +1,154 @@
 # Lisp Dialect Benchmark
 
-How does Sema compare to other Lisp dialects on a real-world I/O-heavy workload? We benchmarked fifteen implementations on the [1 Billion Row Challenge](https://github.com/gunnarmorling/1brc) — a data processing task that reads weather station measurements and computes min/mean/max per station. This is not a synthetic micro-benchmark; it exercises I/O, string parsing, hash table accumulation, and numeric aggregation in a tight loop.
+How does Sema compare to other Lisp dialects on a real-world I/O-heavy workload? This page benchmarks fifteen Lisp dialects on the [1 Billion Row Challenge](https://github.com/gunnarmorling/1brc) — read weather-station measurements and compute min/mean/max per station. It is not a synthetic micro-benchmark; it exercises I/O, string parsing, hash-table accumulation, and numeric aggregation in a tight loop.
 
-## Results (Optimized)
-
-**10 million rows (1.2 GB), best of 3 runs, single-threaded, Docker (linux/amd64):**
-
-| Dialect           | Implementation           | Time (ms) | Relative | Category     |
-| ----------------- | ------------------------ | --------- | -------- | ------------ |
-| **SBCL**          | Native compiler          | 2,068     | 1.0x     | Compiled     |
-| **Chez Scheme**   | Native compiler          | 2,777     | 1.3x     | Compiled     |
-| **Fennel/LuaJIT** | JIT compiler             | 3,254     | 1.6x     | JIT-compiled |
-| **Clojure**       | JVM (JIT)                | 5,576     | 2.7x     | JIT-compiled |
-| **Gambit**        | Native compiler (gsc)    | 5,608     | 2.7x     | Compiled     |
-| **Chicken**       | Native compiler (csc)    | 7,579     | 3.7x     | Compiled     |
-| **PicoLisp**      | Interpreter              | 9,611     | 4.6x     | Interpreted  |
-| **newLISP**       | Interpreter              | 12,657    | 6.1x     | Interpreted  |
-| **Janet**         | Bytecode VM              | 13,426    | 6.5x     | Interpreted  |
-| **Emacs Lisp**    | Bytecode VM              | 13,438    | 6.5x     | Interpreted  |
-| **ECL**           | Native compiler          | 14,416    | 7.0x     | Compiled     |
-| **Guile**         | Bytecode VM              | 14,564    | 7.0x     | Interpreted  |
-| **Kawa**          | JVM (JIT)                | 16,900    | 8.2x     | JIT-compiled |
-| **Gauche**        | Bytecode VM              | 22,534    | 10.9x    | Interpreted  |
-| **Sema**          | Bytecode VM (`--vm`)     | 23,117    | 11.2x    | Interpreted  |
-| **Sema**          | Tree-walking interpreter | 46,291    | 22.4x    | Interpreted  |
-
-Racket was excluded — we encountered crashes with both the CS (Chez Scheme) and BC (bytecode) backends in our Docker Desktop x86-64 emulation setup on Apple Silicon. This appears to be a [Docker/Rosetta emulation issue](https://racket.discourse.group/t/racket-docker-m1-rosetta/2947), not a Racket performance issue; Racket CS would likely land between Chez and Clojure.
-
-::: info Compiled mode
-Gambit, Chicken, and ECL are now benchmarked in compiled mode (compiling to native code via C), not interpreter mode. Previous versions of this benchmark ran them as interpreters, which was 3–6x slower. Guile now runs with bytecode auto-compilation enabled.
+::: warning A benchmark ranks implementations, not just runtimes
+Each dialect's **optimized** entry uses a comparable best effort — a hand-rolled integer×10 temperature parser and, where it helps the runtime, block/byte I/O. Even so, results partly reflect *how each program is written*, not pure runtime throughput. The [dialect notes](#dialect-notes) say where each number comes from; the [simple table](#simple-idiomatic) shows the same workload written the obvious way.
 :::
 
-::: info Native performance
-Sema runs significantly faster natively on Apple Silicon: ~28.4s (tree-walker) and ~15.9s (VM mode with `--vm`) on 10M rows, compared to 46.3s / 23.1s under x86-64 emulation. NaN-boxing (introduced in v1.5.0) adds overhead that is amplified by x86-64 emulation. All dialects in this table were measured under the same Docker/emulation environment for a fair comparison.
-:::
+## Benchmark
 
-## Why SBCL Wins
+One same-machine run: **macOS 15.6, Apple M2 Max, native Homebrew runtimes, 10,000,000 rows (~124 MiB), best of 3, single-threaded.** Sema is the **v1.19.2 PGO build**. All fifteen implementations produce byte-identical output. PicoLisp is omitted — no native Homebrew formula.
 
-SBCL compiles Common Lisp to native machine code. There is no interpreter loop, no bytecode dispatch — `(+ x y)` compiles to an `ADD` instruction. Combined with `(declare (optimize (speed 3) (safety 0)))`, the benchmark's inner loop runs at near-C speed:
+### Optimized — best effort per dialect
 
-- **Block I/O:** Reads 1MB chunks via `read-sequence`, parsing lines from a buffer — no per-line syscall overhead
-- **Custom integer parser:** Parses temperatures as integers (×10), avoiding float parsing entirely until the final division
-- **Hash table with `equal` test:** SBCL's hash table implementation is highly optimized with type-specialized hashing
-- **In-place struct mutation:** `station` structs are updated via `setf` with no allocation per row
+Each implementation tuned to a comparable level (hand-rolled int×10 parser; block/byte I/O where the runtime benefits). Relative to the fastest (Fennel).
 
-SBCL's compiler has had 25+ years of optimization work (descended from CMUCL, which traces back to the 1980s). When you tell it `(safety 0)`, it trusts your type declarations and removes all runtime checks — a trade-off most interpreted languages can't make.
+| Dialect           | Time (ms) | Relative | Runtime              |
+| ----------------- | --------- | -------- | -------------------- |
+| **Fennel/LuaJIT** | 532       | 1.0x     | JIT compiler         |
+| **SBCL**          | 899       | 1.7x     | Native compiler      |
+| **Racket**        | 1,434     | 2.7x     | JIT (Chez backend)   |
+| **Chez Scheme**   | 1,515     | 2.8x     | Native compiler      |
+| **Gambit**        | 2,298     | 4.3x     | Native compiler (C)  |
+| **Clojure**       | 2,805     | 5.3x     | JVM (JIT)            |
+| **Guile**         | 4,355     | 8.2x     | Bytecode VM + JIT    |
+| **Janet**         | 5,028     | 9.5x     | Bytecode VM          |
+| **Chicken**       | 5,772     | 10.8x    | Native compiler (C)  |
+| **Gauche**        | 7,153     | 13.4x    | Bytecode VM          |
+| **Sema**          | 8,096     | 15.2x    | Bytecode VM          |
+| **Emacs Lisp**    | 8,167     | 15.4x    | Bytecode VM          |
+| **ECL**           | 8,933     | 16.8x    | Native compiler (C)  |
+| **newLISP**       | 9,019     | 17.0x    | Interpreter          |
+| **Kawa**          | 18,395    | 34.6x    | JVM (JIT)            |
 
-## Chez Scheme: The Other Native Compiler
+### Simple / idiomatic
 
-Chez Scheme compiles to native code via a [nanopass compiler framework](https://nanopass.org/). It's 1.3x behind SBCL here, which is consistent with typical benchmarks — Chez tends to be slightly slower than SBCL on I/O-heavy workloads but competitive on computation.
+The same workload written the obvious way in each dialect — built-in number parser, per-line I/O, standard data structures. No hand-rolled parsers, no block reads. Closer to "raw runtime on naive code." Relative to the fastest (Gambit).
 
-The implementation uses:
+| Dialect           | Time (ms) | Relative |
+| ----------------- | --------- | -------- |
+| **Gambit**        | 2,351     | 1.0x     |
+| **Chez Scheme**   | 2,481     | 1.1x     |
+| **Fennel/LuaJIT** | 2,679     | 1.1x     |
+| **Clojure**       | 2,902     | 1.2x     |
+| **SBCL**          | 2,997     | 1.3x     |
+| **Guile**         | 5,186     | 2.2x     |
+| **newLISP**       | 8,206     | 3.5x     |
+| **Chicken**       | 9,094     | 3.9x     |
+| **Janet**         | 9,950     | 4.2x     |
+| **Sema**          | 10,026    | 4.3x     |
+| **ECL**           | 13,599    | 5.8x     |
+| **Emacs Lisp**    | 16,219    | 6.9x     |
+| **Gauche**        | 16,476    | 7.0x     |
+| **Kawa**          | 17,793    | 7.6x     |
 
-- `get-line` for line reading (one syscall per line, no block I/O optimization)
-- Custom character-by-character temperature parser
-- Mutable vectors in a `make-hashtable` with `string-hash`
+The gap between the two tables is itself the story. Where optimized ≪ simple (Fennel, Racket, Janet, Gauche), most of the win came from a hand-rolled parser or block I/O. Where they're close (Clojure, Sema, newLISP), the runtime was already doing the work and there was little left to hand-tune.
 
-The gap to SBCL is likely explained by the per-line I/O — `get-line` allocates a fresh string per call, while SBCL's block read amortizes this.
+## Dialect notes
 
-## Fennel/LuaJIT: The JIT Surprise
+What's behind each number — and which results are runtime ceilings versus implementation choices.
 
-Fennel compiling to LuaJIT at 1.6x is the biggest surprise — faster than both Clojure and compiled Gambit. LuaJIT's tracing JIT compiler generates native code for the hot loop after a few iterations, and Lua's table implementation (used for both hash maps and arrays) is famously efficient. The implementation is straightforward Fennel: `string.find` for semicolons, `tonumber` for parsing, Lua tables for accumulation. No special optimization tricks — LuaJIT's JIT does the heavy lifting.
+### Fennel / LuaJIT — the JIT runs away with it
 
-## Clojure: JVM Tax + Warmup
+Fennel compiled to LuaJIT is **the fastest entry, ahead of SBCL** (532 ms). LuaJIT's tracing JIT compiles the hot byte-scan loop to native code; with a `string.byte` integer parser and 1 MiB block reads it chews through ~250 MB/s. It's the clearest "runtime does the heavy lifting" result — but note its *simple* version is 2.7 s (5× slower), so the win is the optimized byte loop being unusually JIT-friendly, not a free lunch.
 
-Clojure's 2.7x result includes JVM startup and JIT warmup. The actual steady-state throughput after warmup is faster than the wall-clock time suggests, but for a single-shot script, the JVM overhead is real:
+### SBCL — native code + `(safety 0)`
 
-- **Startup:** ~1–2 seconds just to load the Clojure runtime
-- **`line-seq` + `reduce`:** Lazy line reading with a transient map for accumulation — idiomatic but not zero-cost
-- **`Double/parseDouble`:** JVM's float parser handles scientific notation and the full IEEE 754 spec, more work than a hand-rolled decimal parser
-- **GC pauses:** The JVM's garbage collector adds latency variance
+SBCL compiles to native machine code; in a type-specialized hot path there is no interpreter loop. With `(declare (optimize (speed 3) (safety 0)))`, block `read-sequence` I/O, an integer×10 parser, and in-place `setf` struct mutation, the inner loop runs near C speed. 25+ years of compiler work (descended from CMUCL). Its 1.3× → 1.0x optimization gain (simple 3.0 s → optimized 0.9 s) is the largest in the suite.
 
-Clojure's strength is that this code is _15 lines_ — the most concise implementation in the benchmark. It trades raw speed for developer productivity.
+### Racket — byte I/O over the Chez backend
 
-## PicoLisp: Integer Arithmetic Pays Off
+Racket reads 1 MiB byte blocks, scans for `;`/newline with O(1) `subbytes` slicing, and parses int×10. Its CS backend (Chez under the hood) plus byte strings put it third overall, just ahead of Chez itself — a notable result for a runtime usually thought of as "the teaching language."
 
-PicoLisp's 4.6x result is impressive for a pure interpreter with no bytecode compilation. PicoLisp has no native floating-point — all arithmetic is integer-based, using scaled fixed-point representation. The benchmark uses temperatures multiplied by 10 (e.g., "12.3" → 123), avoiding float parsing entirely. PicoLisp's `idx` binary search trees provide O(log n) average-case lookup and keep results sorted via in-order traversal. The lack of float overhead gives it a significant edge over implementations that parse and accumulate floats on every row.
+### Chez Scheme — the other native compiler
 
-## newLISP: Simple but Effective
+Chez compiles to native code via a [nanopass framework](https://nanopass.org/). With a custom char-by-char parser and `make-hashtable`/`string-hash` it lands just behind Racket. The remaining gap to SBCL is mostly per-line string allocation versus SBCL's block parser.
 
-newLISP at 6.1x is surprisingly competitive. Its association-list-based accumulation has O(n) lookup per station, but with only 40 stations, the list stays small enough that linear search is fast. newLISP's `read-line`/`current-line` idiom and `find`/`slice` string operations are efficient C implementations. The language's simplicity — no complex type system, no numeric tower — means less overhead per operation.
+### Gambit — compiled Scheme via C
 
-## Gambit: Compiled Scheme via C
+`gsc` compiles Scheme to C to a native binary. It got the same int×10 parser as the other Schemes, but the win was negligible here — `read-line` + `substring` + string hashing dominate the loop, so I/O, not number parsing, is the bottleneck.
 
-Gambit at 2.7x — virtually tied with Clojure — is the standout result among Scheme compilers. `gsc` compiles Scheme to C, then compiles C to a native binary. The result is competitive with Chez Scheme's native compiler, especially impressive given that Gambit's built-in `sort` crashes under x86-64 emulation (requiring a manual merge sort in the benchmark).
+### Clojure — JVM tax + warmup
 
-## Chicken: Compiled Scheme, I/O Bound
+Clojure's time includes JVM startup and JIT warmup, real costs for a single-shot script. `line-seq` + a transient map is idiomatic but not zero-cost, and `Double/parseDouble` handles the full IEEE-754 spec. Steady-state throughput is better than the wall-clock suggests; it trades raw speed for compactness.
 
-Chicken at 3.7x compiles Scheme to C via `csc -O3`. The optimized implementation uses a hand-rolled integer×10 temperature parser that avoids float parsing entirely — without it, Chicken drops to 13.6s (1.8x slower). The remaining gap to SBCL/Chez is due to per-line I/O allocation and Chicken's compilation strategy (continuation-passing style C), which produces correct but not maximally optimized code for this I/O-heavy workload.
+### Guile — Scheme bytecode VM + JIT
 
-## Janet: A Fair Comparison
+Guile 3 has a bytecode VM with a native JIT on supported platforms. With a hand-rolled int×10 parser it's the fastest of the "VM" tier here, ahead of Janet and Chicken.
 
-Janet is the most architecturally comparable to Sema — both are:
+### Janet — the closest architectural peer
 
-- Embeddable scripting languages written in C/Rust
-- GC-based memory management — Janet uses a tracing mark-and-sweep GC (with isolated per-thread heaps), Sema uses `Rc` reference counting
-- Focused on practical scripting rather than language theory
-- No JIT, no native compilation
+Janet is the most architecturally comparable to Sema: an embeddable scripting language, bytecode VM, GC-based, no native compiler. Head to head, **Janet (5.0 s) lands ~1.6× ahead of Sema (8.1 s)**. Two things help Janet — its strings *are* byte strings (O(1) slicing, no UTF-8 navigation), and it has a tracing GC instead of `Rc` reference counting, so a `slurp` + byte-scan + int parser goes a long way. This is the comparison to watch as Sema's runtime evolves.
 
-Janet compiles to bytecode and runs on a register-based VM, which should be faster than tree-walking. Under the same Docker environment, Janet is ~3.4x faster than Sema's tree-walker (13.4s vs 46.3s). Sema's bytecode VM (`--vm`) at 23.1s under emulation (~15.9s natively) is closing the gap — 1.7x behind Janet, down from 3.4x with the tree-walker.
+### Chicken — compiled Scheme, I/O bound
 
-Janet's implementation is straightforward: `file/read :line` in a loop, `string/find` + `string/slice` for parsing, mutable tables for accumulation. No special optimizations.
+Chicken compiles Scheme to C via `csc -O3` with an int×10 parser. The remaining gap is per-line I/O allocation and Chicken's continuation-passing-style C ("Cheney on the MTA"), whose trampolining the C compiler can't fully optimize away.
 
-## Guile and Gauche: Scheme Bytecode VMs
+### Gauche — byte scanning over UTF-8 strings
 
-Guile (7.0x) and Gauche (10.9x) are both R7RS Scheme implementations with bytecode VMs. Guile runs with bytecode auto-compilation enabled, which compiles source to bytecode on first execution and caches it for subsequent runs. Guile's optimized implementation uses a hand-rolled integer×10 parser, saving ~7% vs `string->number`. Gauche uses `string->number` in both versions — a hand-rolled char-by-char parser is actually _slower_ in Gauche because `string-ref` has O(k) cost in its multibyte (UTF-8) string representation, while `string->number` is implemented in C.
+Gauche stores strings as **UTF-8 indexed by character**, so a `substring`/`string-index` implementation pays O(k) navigation per slice to convert character positions to byte offsets — a trap that can make a mature, well-engineered runtime look slow. The implementation here sidesteps it: read the whole file into a `u8vector`, scan **bytes** directly, parse int×10. That lands Gauche mid-pack at 7.2 s, ahead of Sema — and is a good reminder that on a char-indexed runtime, byte-oriented I/O is the difference between near-last and respectable.
 
-## Sema: The Interpreter Tax
+### Sema — the interpreter floor
 
-Sema's tree-walker at 22.4x (46.3s under emulation, ~28.4s native) reflects the fundamental cost of tree-walking interpretation, amplified by NaN-boxing overhead under x86-64 emulation. Every operation — reading a line, splitting a string, parsing a number, updating a map — is a function call through the evaluator, with environment lookup, `Rc` reference counting, and trampoline dispatch.
+Sema (8.1 s) sits behind Gauche, Janet, Chicken, and Guile. It's a bytecode interpreter with NaN-boxed immutable values and `Rc` reference counting — no JIT, no native codegen — and its implementation is at the **interpreter floor**: the tricks that help the compiled dialects don't transfer here. Sema's native `string/split` and `string->float` already beat an interpreted hand-parser, and vectors are immutable with no mutable cell, so every row rebuilds the stat vector. The next gains are *runtime*, not implementation: a **tracing GC** (to kill the per-row `Rc` churn) and **mutable vectors / byte-buffer + string-slice APIs** (so a genuinely byte-oriented implementation, like the fast dialects use, becomes possible). See [Performance Internals](./performance.md).
 
-The bytecode VM (`--vm`, available since v1.5.0) cuts this to 11.2x (23.1s under emulation, ~15.9s native) — a **2× speedup** over the tree-walker. Under emulation, Sema's VM lands just behind Gauche (22.5s) and ahead of where the tree-walker was. Natively, the VM at ~15.9s is competitive with Janet (13.4s Docker) and Guile (14.6s Docker).
+### Emacs Lisp — buffer-based I/O
 
-Key optimizations that remain in the runtime:
+Emacs loads the whole file into a buffer with `insert-file-contents-literally` and parses int×10 directly from buffer characters with no substring extraction — strong for a venerable bytecode VM, essentially tied with Sema.
 
-- **`file/fold-lines`:** Reuses the lambda environment across iterations (no allocation per line)
-- **COW map mutation:** `assoc` mutates in-place when the `Rc` refcount is 1 (which `file/fold-lines` ensures by moving, not cloning, the accumulator)
-- **`hashmap/new`:** Amortized O(1) lookup via `hashbrown` instead of O(log n) `BTreeMap`
-- **Bytecode VM:** The `--vm` flag compiles to bytecode before execution, eliminating tree-walking overhead and significantly improving performance
+### ECL — Common Lisp via C
 
-See the [Performance Internals](./performance.md) page for the optimization journey.
+ECL compiles Common Lisp through C with `compile-file`, with an int×10 parser. The gap to SBCL is ECL's less aggressive native code generation.
 
-## Kawa: JVM Scheme, Slower Than Expected
+### newLISP — a small, simple interpreter
 
-Kawa at 8.2x is slower than Clojure despite both running on the JVM. Kawa compiles Scheme to JVM bytecode, but its `string->number` implementation handles the full Scheme numeric tower (exact rationals, complex numbers), which is more expensive than Clojure's `Double/parseDouble`. The `java.util.HashMap` usage should be fast, but Kawa's compilation model introduces overhead for Scheme-specific features like tail-call optimization and continuations that the JVM doesn't natively support.
+newLISP's accumulation uses a hash, but on this 40-station dataset the data structure hardly matters — with so few stations even a linear scan is cheap, and per-row interpreter overhead dominates either way. A faithful picture of a deliberately minimal interpreter.
 
-## ECL: Common Lisp via C
+### Kawa — JVM Scheme, slower than expected
 
-ECL at 7.0x compiles Common Lisp to C via `compile-file`, producing a native FASL. The optimized implementation uses a hand-rolled integer×10 parser; without it (using `read-from-string` instead), ECL drops to 21.5s — a 1.4x slowdown. The remaining gap to SBCL is due to ECL's less aggressive native code generation compared to SBCL's mature optimizer.
+Kawa compiles Scheme to JVM bytecode. Even with Java interop (`BufferedReader`, `java.util.HashMap`), Scheme-on-JVM data representation, startup, and JIT warmup leave it last.
 
-## Emacs Lisp: Buffer-Based I/O
+## What this benchmark doesn't show
 
-Emacs Lisp at 6.5x loads the entire file into a buffer with `insert-file-contents-literally`, then parses temperatures using a manual integer×10 parser that reads characters directly from the buffer without extracting substrings. Without this optimization (using `string-to-number` on extracted substrings instead), Emacs drops to 22.2s — a 1.6x slowdown. The in-buffer parsing avoids both string allocation and float overhead, which matters over 10 million rows.
+This is one workload. Different benchmarks would reorder things:
 
-## Results (Simple/Idiomatic)
-
-To measure raw language runtime speed — independent of implementation tricks — we also benchmarked "simple" versions of each implementation. These use the language's built-in number parser (`string/to-number`, `string-to-number`, `tonumber`, etc.), per-line I/O, and standard data structures. No custom integer parsers, no block reads, no `(safety 0)`, no SIMD.
-
-**10 million rows (1.2 GB), best of 3 runs, single-threaded, Docker (linux/amd64):**
-
-| Dialect           | Implementation           | Time (ms) | Relative | vs Optimized |
-| ----------------- | ------------------------ | --------- | -------- | ------------ |
-| **Fennel/LuaJIT** | JIT compiler             | 3,805     | 1.0x     | 1.2x slower  |
-| **Chez Scheme**   | Native compiler          | 4,253     | 1.1x     | 1.5x slower  |
-| **Gambit**        | Native compiler (gsc)    | 5,634     | 1.5x     | ~same        |
-| **Clojure**       | JVM (JIT)                | 5,634     | 1.5x     | ~same        |
-| **SBCL**          | Native compiler          | 7,342     | 1.9x     | 3.5x slower  |
-| **PicoLisp**      | Interpreter              | 9,542     | 2.5x     | ~same        |
-| **newLISP**       | Interpreter              | 12,193    | 3.2x     | ~same        |
-| **Chicken**       | Native compiler (csc)    | 13,486    | 3.5x     | 1.8x slower  |
-| **Janet**         | Bytecode VM              | 14,178    | 3.7x     | ~same        |
-| **Guile**         | Bytecode VM              | 16,723    | 4.4x     | 1.1x slower  |
-| **Kawa**          | JVM (JIT)                | 17,938    | 4.7x     | ~same        |
-| **ECL**           | Native compiler          | 22,607    | 5.9x     | 1.6x slower  |
-| **Emacs Lisp**    | Bytecode VM              | 22,627    | 5.9x     | 1.7x slower  |
-| **Gauche**        | Bytecode VM              | 23,016    | 6.0x     | ~same        |
-| **Sema**          | Bytecode VM (`--vm`)     | 25,841    | 6.8x     | 1.1x slower  |
-| **Sema**          | Tree-walking interpreter | 50,123    | 13.2x    | 1.1x slower  |
-
-The simple results are normalized to Fennel (the fastest simple implementation) rather than SBCL, since SBCL benefits the most from its optimizations.
-
-## What the Simple Benchmarks Reveal
-
-Comparing simple vs optimized times shows where optimization effort pays off and where the language runtime does the heavy lifting:
-
-| Dialect      | Optimized | Simple | Slowdown | What the Optimized Version Does                                  |
-| ------------ | --------- | ------ | -------- | ---------------------------------------------------------------- |
-| **SBCL**     | 2,068     | 7,342  | **3.5x** | Block I/O, `(safety 0)`, custom int×10 parser, typed structs     |
-| **Chicken**  | 7,579     | 13,486 | **1.8x** | Custom int×10 parser avoids `string->number` numeric tower       |
-| **Emacs**    | 13,438    | 22,627 | **1.7x** | In-buffer int×10 parser avoids string extraction + float parsing |
-| **ECL**      | 14,416    | 22,607 | **1.6x** | Custom int×10 parser avoids `read-from-string` (full CL reader)  |
-| **Chez**     | 2,777     | 4,253  | **1.5x** | Custom char-by-char parser avoids `string->number`               |
-| **Fennel**   | 3,254     | 3,805  | **1.2x** | Already simple — LuaJIT's JIT optimizes it                       |
-| **Guile**    | 14,564    | 16,723 | **1.1x** | Custom int×10 parser, modest improvement                         |
-| **Sema**     | 46,291    | 50,123 | **1.1x** | `string/to-float` + hashmap vs `string/to-number` + sorted map       |
-| **Gambit**   | 5,608     | 5,634  | ~same    | Already uses `string->number`                                    |
-| **Clojure**  | 5,576     | 5,634  | ~same    | Only transient→persistent map optimization                       |
-| **Janet**    | 13,426    | 14,178 | ~same    | Already simple                                                   |
-| **Kawa**     | 16,900    | 17,938 | ~same    | `Double/parseDouble` → `string->number` (similar cost)           |
-| **PicoLisp** | 9,611     | 9,542  | ~same    | No floats — int×10 is the only option                            |
-| **newLISP**  | 12,657    | 12,193 | ~same    | Already simple                                                   |
-| **Gauche**   | 22,534    | 23,016 | ~same    | `string->number` (C impl) is faster than hand-rolled Scheme      |
-
-**Key takeaways:**
-
-- **SBCL's 3.5x optimization gain is the largest** — block I/O + `(safety 0)` + type declarations transform it from 1.9x to 1.0x relative. Without its optimizations, SBCL would rank 5th, behind Fennel, Chez, Gambit, and Clojure.
-- **Number parsing is the dominant optimization** — every dialect that benefits from optimization does so primarily by replacing the language's built-in number parser with a hand-rolled integer×10 parser. This avoids the overhead of handling the full numeric tower, scientific notation, and float precision.
-- **Fennel/LuaJIT is the fastest with zero optimization effort.** The simple and optimized versions are nearly identical — LuaJIT's tracing JIT does all the work. This makes Fennel the clear winner in "performance per line of code."
-- **Gauche's `string-ref` is O(k) on multibyte strings** — a hand-rolled char-by-char parser is actually _slower_ than `string->number` (C implementation) because Gauche stores strings in UTF-8, where `string-ref` must scan forward from the nearest index point.
-- **Sema's optimization gain is very small** (46.3s vs 50.1s = 1.1x), because `file/fold-lines` and COW mutation work in both versions. The difference is just `string/to-float` + hashmap vs `string/to-number` + sorted map. The VM provides the same ~2× speedup in both modes.
-
-## What This Benchmark Doesn't Show
-
-This is one workload. Different benchmarks would produce different orderings:
-
-- **CPU-bound computation** (fibonacci, sorting): SBCL and Chez would dominate even more; the I/O amortizes some of the interpreter gap
-- **Startup time:** Janet and Sema start in <10ms; Clojure takes 1–2s; SBCL takes ~50ms
-- **Memory usage:** Janet and Sema use minimal memory (tens of MB); Clojure's JVM baseline is ~100MB+
-- **Multi-threaded:** Clojure (on the JVM) and SBCL (with `lparallel`) can parallelize; Sema, Janet, and Guile are single-threaded
-- **Developer experience:** Clojure's REPL, Racket's IDE (DrRacket), and SBCL's SLIME/Sly integration are far more mature than Sema's
-- **Compilation flags:** SBCL's `(safety 0)` and Chicken's `-O3` are used; other compilers may have additional optimization flags not explored here
+- **CPU-bound computation** (fibonacci, sorting): the native compilers and JITs would pull further ahead; the I/O here amortizes some of the interpreter gap.
+- **Startup time:** included in wall-clock but not isolated — it hits the JVM dialects (Clojure, Kawa) hardest.
+- **Memory usage:** not measured; JVM runtimes carry a higher baseline than small standalone ones like Janet or Sema.
+- **Multi-threaded:** Clojure, SBCL, Janet, and Guile can parallelize; Sema is single-threaded (its async/channels are cooperative, not parallel).
+- **Developer experience:** Clojure's REPL, Racket's DrRacket, and SBCL's SLIME are far more mature than Sema's.
 
 ## Methodology
 
-- **Dataset:** 10,000,000 rows, 40 weather stations, generated from the [1BRC specification](https://github.com/gunnarmorling/1brc) with fixed station statistics
-- **Environment:** Docker container (`debian:bookworm-slim`, linux/amd64), running on Apple Silicon via Rosetta/QEMU
-- **Measurement:** Wall-clock time via `date +%s%N`, best of 3 consecutive runs per dialect
-- **Verification:** All implementations produce identical output (sorted station results, 1 decimal place rounding)
-- **Code style:** Each implementation is idiomatic for its dialect — no artificial handicaps, but no heroic micro-optimization either (except SBCL's `(safety 0)` declarations, which are standard practice)
-- **Compilation:** Gambit (`gsc -exe`), Chicken (`csc -O3`), and ECL (`compile-file`) are compiled to native code before benchmarking. Guile uses bytecode auto-compilation. All other dialects run in their default mode.
-
-### Versions
-
-| Dialect     | Version | Package                                                |
-| ----------- | ------- | ------------------------------------------------------ |
-| SBCL        | 2.2.9   | `sbcl` (Debian bookworm)                               |
-| Chez Scheme | 9.5.8   | `chezscheme` (Debian bookworm)                         |
-| Fennel      | 1.5.1   | Downloaded binary                                      |
-| LuaJIT      | 2.1.0   | `luajit` (Debian bookworm)                             |
-| Clojure     | 1.12.0  | CLI tools                                              |
-| PicoLisp    | 23.2    | `picolisp` (Debian bookworm)                           |
-| newLISP     | 10.7.5  | `newlisp` (Debian bookworm)                            |
-| Sema        | 1.9.0   | Built from source (Docker)                             |
-| Janet       | 1.37.1  | Built from source                                      |
-| Kawa        | 3.1.1   | JAR from Maven Central                                 |
-| Gauche      | 0.9.15  | Built from source                                      |
-| Guile       | 3.0.8   | `guile-3.0` (Debian bookworm)                          |
-| Emacs       | 28.2    | `emacs-nox` (Debian bookworm)                          |
-| Gambit      | 4.9.3   | `gambc` compiled via `gsc -exe` (Debian bookworm)      |
-| ECL         | 21.2.1  | `ecl` compiled via `compile-file` (Debian bookworm)    |
-| Chicken     | 5.3.0   | `chicken-bin` compiled via `csc -O3` (Debian bookworm) |
+- **Dataset:** 10,000,000 rows (~124 MiB), 40 weather stations, from the [1BRC spec](https://github.com/gunnarmorling/1brc).
+- **Environment:** macOS 15.6 / Apple M2 Max, native Homebrew runtimes (June 2026). Sema 1.19.2 (PGO). Gauche 0.9.15. Others are the current Homebrew formulae / downloaded binaries.
+- **Measurement:** wall-clock, best of 3 consecutive runs per dialect, via `benchmarks/1brc/run-native-benchmarks.py` (all dialects measured together in one session). Sema is timed as the prebuilt PGO binary (`make build-pgo`, run with `SEMA_SKIP_BUILD=1`).
+- **Verification:** all fifteen implementations produce byte-identical normalized output (sorted stations, 1-decimal rounding) — checked every run.
+- **Implementations:** each *optimized* entry uses a comparable best effort (hand-rolled int×10 parser; block/byte I/O where the runtime benefits); the *simple* table uses each dialect's naive idiom. PicoLisp is omitted (no native Homebrew formula).
 
 ### Reproducing
 
 ```bash
-cd benchmarks/1brc
+# Generate test data (or use benchmarks/data/bench-10m.txt)
+python3 benchmarks/1brc/generate-test-data.py 10000000 benchmarks/data/bench-10m.txt
 
-# Generate test data (or use existing benchmarks/data/bench-10m.txt)
-python3 generate-test-data.py 10000000 benchmarks/data/measurements.txt
-
-# Build Docker image with all runtimes
-docker build --platform linux/amd64 -t sema-1brc-bench .
-
-# Run optimized benchmarks
-docker run --platform linux/amd64 --rm \
-  -v $(pwd)/../../benchmarks/data/bench-10m.txt:/data/measurements.txt:ro \
-  -v $(pwd)/results:/results \
-  sema-1brc-bench /data/measurements.txt
-
-# Run simple/idiomatic benchmarks
-docker run ... sema-1brc-bench --simple /data/measurements.txt
-
-# Run both
-docker run ... sema-1brc-bench --all /data/measurements.txt
-
-# Run Sema natively for comparison (tree-walker and VM)
-cargo run --release -- --no-llm examples/benchmarks/1brc.sema -- benchmarks/data/bench-10m.txt
-cargo run --release -- --no-llm --vm examples/benchmarks/1brc.sema -- benchmarks/data/bench-10m.txt
+# Build the PGO Sema binary, then run the native matrix against it
+make build-pgo
+SEMA_SKIP_BUILD=1 ./benchmarks/1brc/run-native-benchmarks.py benchmarks/data/bench-10m.txt
 ```
 
-Source code for all implementations is in [`benchmarks/1brc/`](https://github.com/HelgeSverre/sema/tree/main/benchmarks/1brc) (optimized) and [`benchmarks/1brc/simple/`](https://github.com/HelgeSverre/sema/tree/main/benchmarks/1brc/simple) (simple/idiomatic).
+Implementation source: [`benchmarks/1brc/`](https://github.com/HelgeSverre/sema/tree/main/benchmarks/1brc) (optimized) and [`benchmarks/1brc/simple/`](https://github.com/HelgeSverre/sema/tree/main/benchmarks/1brc/simple) (simple/idiomatic).
 
 <script setup>
 import { onMounted } from 'vue'

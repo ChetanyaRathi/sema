@@ -33,8 +33,16 @@ pub fn register(env: &sema_core::Env) {
         let fmt = args[1]
             .as_str()
             .ok_or_else(|| SemaError::type_error("string", args[1].type_name()))?;
-        let naive = NaiveDateTime::parse_from_str(s, fmt)
-            .map_err(|e| SemaError::eval(format!("time/parse: {e}")))?;
+        let naive = NaiveDateTime::parse_from_str(s, fmt).map_err(|e| {
+            SemaError::eval(format!("time/parse: parse error: {e}")).with_hint(
+                "time/parse uses chrono format specifiers like %Y-%m-%d %H:%M:%S (see https://docs.rs/chrono/latest/chrono/format/strftime/index.html)",
+            )
+        })?;
+        // Intentional: the parsed wall-clock time is interpreted as UTC, not
+        // local time, regardless of any offset in the string. Parsing via
+        // NaiveDateTime ignores timezone offsets, so callers needing another
+        // zone must convert to UTC themselves before parsing. Anchoring to UTC
+        // keeps time/parse deterministic and machine-independent.
         let dt: DateTime<Utc> = Utc.from_utc_datetime(&naive);
         Ok(Value::float(dt.timestamp() as f64))
     });
@@ -85,8 +93,15 @@ pub fn register(env: &sema_core::Env) {
 }
 
 fn timestamp_to_datetime(ts: f64) -> Result<DateTime<Utc>, SemaError> {
-    let secs = ts as i64;
-    let nanos = ((ts - secs as f64) * 1_000_000_000.0) as u32;
+    if !ts.is_finite() {
+        return Err(SemaError::eval("time: invalid timestamp"));
+    }
+    // Floor toward negative infinity so the nanosecond remainder stays
+    // non-negative. A plain `as i64` truncates toward zero, which for negative
+    // (pre-1970) timestamps lands in the wrong second — e.g. -0.5 would become
+    // 1970-01-01 instead of 1969-12-31 23:59:59.5.
+    let secs = ts.floor() as i64;
+    let nanos = ((ts - ts.floor()) * 1_000_000_000.0) as u32;
     Utc.timestamp_opt(secs, nanos)
         .single()
         .ok_or_else(|| SemaError::eval("time: invalid timestamp"))

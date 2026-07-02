@@ -1,6 +1,6 @@
 # Performance Internals
 
-Sema's default execution path is a tree-walking interpreter. A bytecode VM is available via `--vm` (see [Bytecode VM](./bytecode-vm.md)) and is significantly faster. Early optimizations brought the [1 Billion Row Challenge](https://github.com/gunnarmorling/1brc) benchmark from **~25s to ~9.6s** on 10M rows using a "mini-eval" — a minimal evaluator inlined in the stdlib that bypassed the full trampoline. The mini-eval was later **removed** for architectural reasons (semantic drift from the real evaluator, and blocking the path to a bytecode VM). Fast-path optimizations in the real evaluator partially recovered performance, bringing the tree-walker benchmark to **~2,900ms on 1M rows** (vs ~960ms with the mini-eval). The bytecode VM (`--vm`) now achieves **~1,700ms on 1M rows** and **~15,900ms on 10M rows**, recovering much of the mini-eval's performance through compilation rather than inlining. This page documents each optimization, its history, and measured impact.
+Sema's evaluator is a bytecode VM (see [Bytecode VM](./bytecode-vm.md)). It reached that design through a long optimization journey. Early optimizations brought the [1 Billion Row Challenge](https://github.com/gunnarmorling/1brc) benchmark from **~25s to ~9.6s** on 10M rows using a "mini-eval" — a minimal evaluator inlined in the stdlib that bypassed the full trampoline. The mini-eval was later **removed** for architectural reasons (semantic drift from the real evaluator, and blocking the path to a bytecode VM). Fast-path optimizations in the (then) tree-walking evaluator partially recovered performance, bringing it to **~2,700ms on 1M rows** (vs ~960ms with the mini-eval). The bytecode VM now achieves **~1,150ms on 1M rows** and **~12,600ms on 10M rows**, more than recovering the mini-eval's performance through compilation rather than inlining. (The tree-walking interpreter has since been retired entirely.) This page documents each optimization, its history, and measured impact.
 
 All benchmarks were run on Apple Silicon (M-series), processing the 1BRC dataset (semicolon-delimited weather station readings, one per line).
 
@@ -14,10 +14,10 @@ All benchmarks were run on Apple Silicon (M-series), processing the 1BRC dataset
 | + Mini-eval        | ~960 ms       | ~9,600 ms      | Inlined builtins, custom parser    | ❌ Removed               |
 | + String interning | —             | —              | Spur-based dispatch                | ✅ Active                |
 | + hashbrown        | —             | —              | Amortized O(1) accumulator         | ✅ Active                |
-| **Post-removal**   | **~2,900 ms** | **~28,400 ms** | Callback architecture + fast paths | ✅ Current (tree-walker) |
-| **Bytecode VM**    | **~1,700 ms** | **~15,900 ms** | Bytecode VM (`--vm`)               | ✅ Active                |
+| **Post-removal**   | **~2,700 ms** | **~29,700 ms** | Callback architecture + fast paths | ⏸ Tree-walker (retired)  |
+| **Bytecode VM**    | **~1,150 ms** | **~12,600 ms** | Bytecode VM (sole evaluator)       | ✅ Current               |
 
-> **Note:** The mini-eval and its associated optimizations (env reuse, inlined builtins, custom number parser, SIMD split fast path) were removed to unblock the bytecode VM, which is now implemented and available via `--vm`. The bytecode VM provides a ~1.7× speedup over the tree-walker (~1,700ms vs ~2,900ms on 1M rows), recovering much of the mini-eval's performance through compilation. The tree-walker remains the default; the current architecture uses `sema_core::call_callback` to route stdlib → real evaluator. Fast-path optimizations (self-evaluating short-circuit, inline NativeFn dispatch, thread-local EvalContext, deferred cloning) partially recovered performance.
+> **Note:** The mini-eval and its associated optimizations (env reuse, inlined builtins, custom number parser, SIMD split fast path) were removed to unblock the bytecode VM, which has since become Sema's sole evaluator. The bytecode VM provides a ~2.4× speedup over the (now-retired) tree-walker (~1,150ms vs ~2,700ms on 1M rows), more than recovering the mini-eval's performance through compilation. Fast-path optimizations (self-evaluating short-circuit, inline NativeFn dispatch, thread-local EvalContext, deferred cloning) partially recovered the tree-walker's performance before it was retired.
 
 > **VM compute benchmarks** (Feb 2026, post-stdlib intrinsics): TAK 1,248ms, upvalue-counter 450ms, deriv 887ms. The deriv benchmark — dominated by `car`/`cdr`/`cons`/`pair?` — improved 22% from stdlib intrinsic opcodes. The 1BRC numbers above are I/O-bound and less affected by VM compute optimizations.
 
@@ -145,7 +145,7 @@ sema_core::with_stdlib_ctx(|ctx| {
 3. **Thread-local shared EvalContext:** `with_stdlib_ctx` reuses a single `EvalContext` across all stdlib → evaluator callbacks, avoiding per-call allocation of `RefCell`/`Cell` fields.
 4. **Deferred cloning:** `eval_value_inner` avoids cloning the expression and environment on the first trampoline iteration, only cloning if a tail call (`Trampoline::Eval`) is returned.
 
-**Remaining gap:** The ~3× regression cannot be fully closed within the tree-walking architecture. The bytecode VM (`--vm`) — the reason the mini-eval was removed — reduces this to ~1.8× vs the mini-eval (~1,700ms vs ~960ms) and is ~1.7× faster than the tree-walker.
+**Remaining gap:** The ~3× regression could not be fully closed within the tree-walking architecture. The bytecode VM — the reason the mini-eval was removed, and now Sema's sole evaluator — gets to ~1.2× of the mini-eval on 1M (~1,150ms vs ~960ms) and is ~2.4× faster than the tree-walker was on the same workload.
 
 **Literature:**
 
@@ -168,6 +168,8 @@ env: BTreeMap<String, Value>
 Value::Symbol(Spur)  // u32
 env: BTreeMap<Spur, Value>
 ```
+
+(`Env` bindings have since moved from `BTreeMap` to `hashbrown::HashMap`, still keyed by `Spur`.)
 
 Special form dispatch uses pre-cached `Spur` constants:
 
@@ -260,7 +262,7 @@ let mut reader = std::io::BufReader::with_capacity(256 * 1024, file);
 
 ## 9. Bytecode VM Optimizations
 
-The bytecode VM (`--vm`) applies several optimizations beyond basic bytecode compilation. These are documented in detail in [Bytecode VM](./bytecode-vm.md); highlights below.
+The bytecode VM applies several optimizations beyond basic bytecode compilation. These are documented in detail in [Bytecode VM](./bytecode-vm.md); highlights below.
 
 ### Intrinsic Recognition
 
@@ -334,22 +336,47 @@ Each `LoadGlobal`/`CallGlobal` instruction gets a dedicated cache slot at compil
 
 Slots 0–3 have dedicated zero-operand opcodes (`LoadLocal0`..`LoadLocal3`, `StoreLocal0`..`StoreLocal3`), saving 2 bytes per access to the most common local variable slots.
 
+## Build Tuning: Fat LTO + PGO (v1.19.2)
+
+Beyond the VM itself, the **distributed binaries** are optimized at build time:
+
+- **Fat LTO** (`lto = "fat"` on the `release`/`dist` profiles): lets LLVM inline across crate boundaries — the dispatch loop in `sema-vm` calls `sema-core` value accessors (`view`, `as_int`, `type_name`, …) millions of times per benchmark, and thin LTO can't always inline those. Measured 3–9% across the suite, at the cost of ~2× longer release builds.
+- **Profile-Guided Optimization (PGO):** the cargo-dist GitHub-release binaries and Homebrew bottle are built with PGO. The build instruments the binary, trains it on the full benchmark suite + a 1BRC sample, merges the profile with `llvm-profdata`, then rebuilds — letting LLVM lay out the `match op` dispatch hot blocks by _measured_ opcode frequency. It runs on native release targets via cargo-dist's `github-build-setup`; cross-compiled and Windows targets fall back to fat LTO, and the step is fail-safe (a PGO failure ships LTO, never breaks the release). Run it locally with `make build-pgo`. (`cargo install` builds get fat LTO but not PGO — PGO needs the training step.)
+
+**Measured impact** (v1.19.2 PGO build vs the pre-optimization build, Apple Silicon, best-of-N):
+
+| Benchmark         | Before | v1.19.2 PGO | Δ      |
+| ----------------- | ------ | ----------- | ------ |
+| 1BRC (10M rows)   | 11.18s | 8.23s       | −26%   |
+| higher-order-fold | 552ms  | 334ms       | −39%   |
+| tak               | 1793ms | 1209ms      | −33%   |
+| mandelbrot        | 246ms  | 177ms       | −28%   |
+| deriv             | 767ms  | 570ms       | −26%   |
+| hashmap-bench     | 3976ms | 2967ms      | −25%   |
+| closure-storm     | 1040ms | 836ms       | −20%   |
+| bench-features    | 1373ms | 1098ms      | −20%   |
+| string-pipeline   | 633ms  | 537ms       | −15%   |
+| nqueens           | 2060ms | 1790ms      | −13%   |
+
+The win is dominated by PGO; fat LTO contributes ~3–9% of it. (`cargo install` builds get the LTO portion but not PGO.)
+
 ## Rejected Optimizations
 
 Not everything we tried worked:
 
 | Approach                                  | Result       | Why                                                                                                                                                                                 |
 | ----------------------------------------- | ------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **HashMap for Env**                       | Slower       | `BTreeMap` is faster for the very small maps (1–3 entries) typical of `let` scopes. HashMap's hashing overhead exceeds BTreeMap's few integer comparisons at that size.             |
+| **HashMap for Env**                       | Slower (later adopted) | At the time, hashing overhead exceeded BTreeMap's few integer comparisons on the very small maps (1–3 entries) typical of `let` scopes. The verdict was later reversed: `Env` bindings now use `hashbrown::HashMap<Spur, Value>`.               |
 | **im-rc / rpds (persistent collections)** | Slower       | Structural sharing fights the COW optimization — the whole point is to _avoid_ sharing and mutate in place when refcount is 1.                                                      |
 | **bumpalo / typed-arena**                 | Incompatible | Values need to escape the arena (returned from functions, stored in environments). Arena allocation only works for temporaries.                                                     |
 | **compact_str / smol_str**                | Redundant    | Once symbols/keywords are interned as `Spur`, small-string optimization for them is pointless. String _values_ are still `Rc<String>` but they're not in the hot path for dispatch. |
+| **`target-cpu=native`**                   | No-op (this workload) | Tested Jun 2026: the VM dispatch loop is branch-bound, not SIMD-bound, and the generic `aarch64` target already uses NEON on Apple Silicon. Zero measurable gain — and it breaks portable/distributable binaries, so it is not used.                                 |
 
-> **Note:** "Full evaluator callback" was previously listed here as rejected (4x slower than mini-eval). It is now the **current architecture** — the ~2.7× overhead vs the mini-eval is accepted as the cost of architectural correctness. The bytecode VM (`--vm`) is the path to eliminate this overhead entirely.
+> **Note:** "Full evaluator callback" was previously listed here as rejected (4x slower than mini-eval). It became the **tree-walker's architecture** — the ~2.7× overhead vs the mini-eval was accepted as the cost of architectural correctness. The bytecode VM, now Sema's sole evaluator, bypasses this overhead by compiling directly to bytecode.
 
 ## Architecture Diagram
 
-The hot path for `file/fold-lines` with the current callback architecture (tree-walker):
+The hot path for `file/fold-lines` under the callback architecture, as it ran on the (now-retired) tree-walking evaluator:
 
 ```
 file/fold-lines
@@ -367,4 +394,4 @@ file/fold-lines
         └── acc moved, not cloned → preserves refcount == 1
 ```
 
-When `--vm` is used, the bytecode VM bypasses the tree-walker entirely. Instead of `call_callback → eval_value → trampoline`, the VM compiles the lambda body to bytecode once and executes it in a tight instruction dispatch loop, eliminating trampoline overhead, per-call span tracking, and repeated AST traversal.
+The bytecode VM bypasses that callback path entirely. Instead of `call_callback → eval_value → trampoline`, the VM compiles the lambda body to bytecode once and executes it in a tight instruction dispatch loop, eliminating trampoline overhead, per-call span tracking, and repeated AST traversal.

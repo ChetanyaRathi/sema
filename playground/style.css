@@ -46,11 +46,24 @@
   }
 
   .logo {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    text-decoration: none;
+  }
+
+  .logo-mark {
+    height: 22px;
+    width: auto;
+    display: block;
+  }
+
+  .logo-sub {
     font-family: var(--serif);
-    font-size: 1.4rem;
+    font-size: 1rem;
     font-weight: 300;
-    letter-spacing: 0.06em;
-    color: var(--text-bright);
+    letter-spacing: 0.08em;
+    color: var(--text-dim);
   }
 
   .header-right {
@@ -667,13 +680,20 @@
     opacity: 0;
     pointer-events: none;
   }
-  .loading-title {
-    font-family: var(--serif);
-    font-size: 2.5rem;
-    font-weight: 300;
-    letter-spacing: 0.06em;
-    color: var(--text-bright);
+  .loading-logo {
+    height: 46px;
+    width: auto;
+    margin-bottom: 1.25rem;
+  }
+  .loading-joke {
+    font-family: var(--mono);
+    font-size: 0.85rem;
+    color: var(--text-dim);
+    max-width: 380px;
+    text-align: center;
+    line-height: 1.5;
     margin-bottom: 1.5rem;
+    padding: 0 1rem;
   }
   .loading-dots {
     display: flex;

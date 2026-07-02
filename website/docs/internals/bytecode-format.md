@@ -4,8 +4,8 @@ outline: [2, 3]
 
 # Bytecode File Format (`.semac`)
 
-::: tip Status: Implemented (Alpha)
-The `.semac` bytecode file format is implemented and available via `sema compile` and `sema disasm`. The format is not yet stable — breaking changes are expected before v1.0.
+::: tip Versioned build artifact
+The `.semac` format is stable and used in production — `sema compile`, `sema disasm`, and `sema build` all rely on it, and a verifier guarantees untrusted files can be loaded safely. It is **versioned** (currently `4`): the header records the format version, and the loader requires an exact match, so a `.semac` is a build artifact tied to the Sema version that produced it rather than a long-term portable interchange format. When a format change bumps the version, recompile from source. See [Versioning Strategy](#versioning-strategy).
 :::
 
 ## Overview
@@ -13,7 +13,7 @@ The `.semac` bytecode file format is implemented and available via `sema compile
 Sema supports compiling source files to bytecode files (`.semac`) for faster loading and distribution without source. The compilation pipeline is:
 
 ```
-Source (.sema) → Reader → Lower → Resolve → Compile → Serialize → .semac file
+Source (.sema) → Reader → Lower → Optimize → Resolve → Compile → Serialize → .semac file
 ```
 
 Loading a `.semac` file skips parsing, lowering, resolution, and compilation — the VM directly deserializes and executes the pre-compiled bytecode.
@@ -81,7 +81,7 @@ All multi-byte integers are **little-endian**. All strings are **UTF-8**.
 | Offset | Size | Field | Description |
 |--------|------|-------|-------------|
 | 0 | 4 | `magic` | `\x00SEM` (`0x00`, `0x53`, `0x45`, `0x4D`) |
-| 4 | 2 | `format_version` | Bytecode format version (currently `1`) |
+| 4 | 2 | `format_version` | Bytecode format version (currently `4`) |
 | 6 | 2 | `flags` | Bit flags (see below) |
 | 8 | 2 | `sema_major` | Sema version major that produced this file |
 | 10 | 2 | `sema_minor` | Sema version minor |
@@ -107,7 +107,7 @@ The magic bytes `\x00SEM` serve two purposes:
 | 2 | `HAS_BREAKPOINTS` | File contains a Breakpoints section |
 | 3–15 | — | Reserved (must be 0) |
 
-When `--strip` is used during compilation, bits 0–2 are cleared and debug sections are omitted.
+The current serializer always writes `flags = 0` — debug sections (and a `--strip` flag to omit them) are not yet implemented.
 
 ## Section Format
 
@@ -132,7 +132,7 @@ Each section begins with a section header:
 | `0x12` | Breakpoints | — | Reserved for breakpoint table |
 | `0x13` | Debug Scopes | — | Reserved for lexical scope ranges |
 
-Unknown section types are **skipped** (forward compatibility).
+The three required sections are always written, in the order above, so `n_sections` in the header is currently always `3`. The `0x10`–`0x13` debug sections are **reserved tags only** — the current serializer never emits them and defines no constants for them yet; they are documented here so a future writer and any third-party reader agree on the IDs. Unknown section types are **skipped** (forward compatibility), so a reader that ignores them stays compatible.
 
 ## String Table (Section `0x01`)
 
@@ -155,7 +155,7 @@ The string table contains all unique strings referenced by the bytecode, includi
 └────────────────────────────┘
 ```
 
-On load, each string is interned into the global `lasso::ThreadedRodeo`, producing a fresh `Spur`. The loader builds a **remap table** (`Vec<Spur>`) mapping file-local string indices to process-local Spurs.
+On load, each string is interned into the process-local `lasso::Rodeo` (a thread-local interner), producing a fresh `Spur`. The loader builds a **remap table** (`Vec<Spur>`) mapping file-local string indices to process-local Spurs.
 
 String index `0` is reserved and must be the empty string `""`.
 
@@ -179,6 +179,7 @@ The main chunk contains the top-level bytecode and its constant pool.
 ├────────────────────────────────┤
 │  max_stack: u16                │
 │  n_locals: u16                 │
+│  n_global_cache_slots: u16     │  Inline cache slots for global lookups
 ├────────────────────────────────┤
 │  n_exceptions: u16             │
 │  exceptions: [ExceptionEntry]  │  Exception table
@@ -207,15 +208,36 @@ The main chunk contains the top-level bytecode and its constant pool.
 │    has_rest: u8                │  0 or 1
 │    n_upvalue_descs: u16        │
 │    upvalue_descs: [UpvalueDesc]│
+│    n_upvalue_names: u16        │
+│    upvalue_names: [u32 name]   │  Lexical names aligned with upvalue_descs
 │    chunk: [Chunk data]         │  Same format as Main Chunk
 │    n_local_names: u16          │
 │    local_names: [(u16 slot,    │  Local variable debug info
 │                   u32 name)]   │  (name = string table index)
+│    n_local_scopes: u16         │
+│    local_scopes: [(u16 slot,   │  Block-scope ranges (debug metadata)
+│                    u32 start,  │  half-open [start_pc, end_pc) per
+│                    u32 end)]   │  block-introduced local
 ├────────────────────────────────┤
 │  Function Entry 1              │
 │    ...                         │
 └────────────────────────────────┘
 ```
+
+### Local Scopes (10 bytes each)
+
+`local_scopes` records the half-open bytecode PC range `[start_pc, end_pc)` over
+which each block-introduced local (from `let` / `let*` / `letrec` / `do`) is
+live. The debugger uses these ranges to hide locals that are not yet bound or
+already out of scope at the current PC. This is debug-only metadata — it is never
+read during execution. Functions whose `local_scopes` is empty (e.g. those with
+only parameters, or older `.semac` files) cause the debugger to show all locals.
+
+| Offset | Size | Field |
+|--------|------|-------|
+| 0 | 2 | `slot` — local variable slot |
+| 2 | 4 | `start_pc` — PC where the binding comes into scope |
+| 6 | 4 | `end_pc` — PC where the binding goes out of scope (exclusive) |
 
 ### Upvalue Descriptor (3 bytes each)
 
@@ -258,6 +280,8 @@ The following `ValueView` variants are **runtime-only** and must never appear in
 - `ToolDef` / `Agent` — constructed via `__vm-deftool` / `__vm-defagent`
 - `Thunk` — created by `delay`
 - `Record` — constructed by `define-record-type`
+- `AsyncPromise` (tag 28) — created by `async/spawn`, runtime-only
+- `Channel` (tag 29) — created by `channel/new`, runtime-only
 
 If the serializer encounters any of these in a constant pool, it should emit a compile error.
 
@@ -267,7 +291,7 @@ Sema uses `lasso::Spur` (process-local interned string handles) for symbols, key
 
 ### In the bytecode stream
 
-Global variable opcodes (`LoadGlobal`, `StoreGlobal`, `DefineGlobal`) encode Spur values as `u32`. On serialization:
+Global variable opcodes (`LoadGlobal`, `StoreGlobal`, `DefineGlobal`, `CallGlobal`) encode Spur values as `u32`. `LoadGlobal` additionally carries a `u16` inline-cache slot operand, and `CallGlobal` carries `u16 argc` + `u16` cache slot — these are copied through unchanged; only the `u32` Spur operand is remapped. On serialization:
 
 1. The serializer collects all Spurs referenced in the bytecode (globals, function names, local names)
 2. Each Spur's string is added to the string table, getting a file-local index
@@ -277,7 +301,7 @@ On deserialization:
 
 1. The string table is loaded and each string is interned → new process-local Spurs
 2. A remap table maps file-local indices to process-local Spurs
-3. The bytecode is walked: `LoadGlobal`/`StoreGlobal`/`DefineGlobal` operands are rewritten with the new Spur u32 values
+3. The bytecode is walked: `LoadGlobal`/`StoreGlobal`/`DefineGlobal`/`CallGlobal` operands are rewritten with the new Spur u32 values
 
 This is the same approach Lua uses for upvalue names, and Guile uses for its symbol table.
 
@@ -384,14 +408,44 @@ Debug scopes will map PC ranges to lexical scopes, enabling:
 When loading a `.semac` file, the loader performs these checks:
 
 1. **Magic number** — must be `\x00SEM`
-2. **Format version** — must be supported by this Sema version
-3. **Section completeness** — all three required sections must be present
-4. **String table bounds** — all string table indices in the file must be in range
-5. **Function table bounds** — all `func_id` references in `MakeClosure` must be valid
-6. **Constant pool types** — no runtime-only value types in the constant pool
-7. **Bytecode well-formedness** — opcodes must be valid, operand sizes must be correct
+2. **Format version** — must exactly match the version this Sema build supports
+3. **Reserved header field** — must be zero
+4. **Section completeness** — all three required sections must be present (and string index 0 must be `""`)
+5. **String table bounds** — all string table indices in the file must be in range
+6. **Function table bounds** — all `func_id` references in `MakeClosure` must be valid
+7. **Constant pool types** — no runtime-only value types in the constant pool
+8. **Bytecode well-formedness** — opcodes must be valid, operand sizes must be correct, constant/local/upvalue/`CallNative` native indices must be in bounds, and jump targets must land on instruction boundaries (the native table is process-local and unserialized, so its loaded length is `0` — any `CallNative` in a `.semac` is rejected)
+9. **Stack-depth balance** — an abstract-interpretation pass over every chunk (main chunk and each function) proves the operand stack never underflows and never exceeds the maximum depth
 
 If validation fails, the loader returns a `SemaError` with a descriptive message.
+
+### Stack-Depth Verifier (ADR #56)
+
+The VM's hot dispatch loop uses an unchecked stack pop (`pop_unchecked`) for speed, which is sound only if the bytecode is stack-balanced. In-process bytecode is balanced by construction; deserialized `.semac` bytecode is proven balanced by a verifier that runs inside `validate_bytecode` before `deserialize_from_bytes` returns.
+
+The verifier abstract-interprets each chunk:
+
+- Each opcode has a static stack effect (`Op::stack_effect()` — the single source of truth shared with the VM dispatch arms). Variable-arity opcodes (`Call`, `TailCall`, `CallGlobal`, `CallNative`, `MakeList`, `MakeVector`, `MakeMap`, `MakeHashMap`) compute their effect from the decoded operand count.
+- A worklist tracks the operand-stack depth on entry to every reachable instruction, following fallthrough and jump edges. Exception handlers are seeded as additional roots at their known entry depth (`stack_depth - n_locals + 1`).
+- Join points must agree on depth exactly (strict-equality lattice, like the JVM/CLR verifiers). A disagreement, a reachable pop deeper than the current depth (underflow), a depth above the maximum (overflow), or control falling off the end of a chunk are all rejected with a descriptive `SemaError`.
+
+The verifier is **sound** — it never accepts an underflowing chunk. It is intentionally conservative: it may reject exotic-but-safe bytecode that a future optimizing compiler could emit, but accepts every program Sema's compiler produces. Once verification succeeds, `.semac` files from untrusted sources can be loaded without risking the unchecked-pop undefined behavior.
+
+The loader also enforces two hard limits while deserializing, both of which a re-implementation must respect to stay compatible: a chunk may declare a maximum stack depth of at most **65535** (`MAX_STACK_DEPTH`), and a constant-pool value may nest at most **128** levels deep (`MAX_VALUE_DEPTH`) — the latter bounds recursion in the value deserializer so a hostile file can't blow the native stack. Both are defined in `serialize.rs`.
+
+## Opcodes
+
+The complete, numbered opcode set lives in `crates/sema-vm/src/opcodes.rs` (the `Op` enum and its `Op::from_u8` mapping are the single source of truth). Most opcodes are single-byte; a handful carry inline operands (`u16`/`u32`/`i32`) as noted in the encoding descriptions above.
+
+To keep the common path off the `CallGlobal` → hash-lookup → `NativeFn` route, a set of **inline stdlib intrinsics** are compiled directly to dedicated single-byte opcodes when the call site references the canonical global with the matching arity (and that global has not been redefined in the program). These include list/collection ops (`Car`, `Cdr`, `Cons`, `Append`, `Length`, `Get`, `Nth`, …), type predicates (`IsNull`, `IsString`, …), and **string ops**:
+
+| Opcode | Source name(s) | Arity | Stack effect | Behavior |
+|--------|----------------|-------|--------------|----------|
+| `StringLength` (0x42) | `string-length` | 1 | pop 1, push 1 | push char count (`chars().count()`) of the string; type error if not a string |
+| `StringRef` (0x43) | `string-ref` | 2 | pop 2, push 1 | push the char at the 0-based char index; errors on negative index, non-int index, non-string, or out-of-bounds index (matching the stdlib messages) |
+| `StringAppend` (0x44) | `string-append` | 2 | pop 2, push 1 | push the concatenation of two values (non-strings coerced via `Display`); the N-ary `string-append` stays on the generic path |
+
+String indexing is by **Unicode scalar (char)**, not byte, matching the stdlib semantics. These opcodes are additive within the existing encoding (single-byte, no new operand shapes), so they do not change the `format_version`.
 
 ## Example
 
@@ -411,19 +465,91 @@ The compiled `.semac` would contain:
 ```
 0000  CONST         0    ; "Hello, World!" (string constant)
 0003  DEFINE_GLOBAL 1    ; greeting (string table index → Spur)
-0008  LOAD_GLOBAL   2    ; println
-0013  LOAD_GLOBAL   1    ; greeting
-0018  CALL          1
-0021  RETURN
+0008  LOAD_GLOBAL   2    ; println (+ u16 inline-cache slot)
+0015  LOAD_GLOBAL   1    ; greeting (+ u16 inline-cache slot)
+0022  CALL          1
+0025  RETURN
 ```
 
 **Function Table**: (empty — no inner functions)
 
+## Reading a Real `.semac`, Byte by Byte
+
+The layout above is easier to trust when you can see every byte of an actual file. Here is the smallest interesting program, compiled and dumped in full — no diagrams, the real 85 bytes:
+
+```bash
+$ echo '(+ 1 2)' > tiny.sema
+$ sema compile tiny.sema -o tiny.semac
+$ sema disasm tiny.semac
+== <main> ==
+0000  CONST            0    ; 3
+0003  RETURN
+
+$ xxd tiny.semac
+00000000: 0053 454d 0400 0000 0100 1300 0100 0300  .SEM............
+00000010: d9b7 a83a 0000 0000 0100 0800 0000 0100  ...:............
+00000020: 0000 0000 0000 0200 0400 0000 0000 0000  ................
+00000030: 0300 1f00 0000 0400 0000 0000 0012 0100  ................
+00000040: 0203 0000 0000 0000 0000 0000 0000 0000  ................
+00000050: 0000 0000 00                             .....
+```
+
+Notice the compiler already **constant-folded** `(+ 1 2)` into the literal `3` — the [Optimize pass](./bytecode-vm.md) ran before serialization, so the only instruction is a `CONST` that pushes a pooled `3`, then `RETURN`. Now every byte:
+
+```
+offset  bytes                      meaning
+------  -----------------------    --------------------------------------------
+HEADER (24 bytes)
+ 0x00   00 53 45 4D                magic  "\x00SEM"
+ 0x04   04 00                      format_version = 4
+ 0x06   00 00                      flags = 0
+ 0x08   01 00                      sema major = 1   ┐
+ 0x0A   13 00                      sema minor = 19  ├ compiled by Sema 1.19.1
+ 0x0C   01 00                      sema patch = 1   ┘
+ 0x0E   03 00                      n_sections = 3
+ 0x10   D9 B7 A8 3A                source_hash = 0x3AA8B7D9  (CRC-32 of source)
+ 0x14   00 00 00 00                reserved
+
+SECTION 1 — String Table (type 0x01)
+ 0x18   01 00                      section type = 0x01
+ 0x1A   08 00 00 00                section length = 8 bytes
+ 0x1E   01 00 00 00                string count = 1
+ 0x22   00 00 00 00                string[0]: length 0  (the reserved empty string at index 0)
+
+SECTION 2 — Function Table (type 0x02)
+ 0x26   02 00                      section type = 0x02
+ 0x28   04 00 00 00                section length = 4 bytes
+ 0x2C   00 00 00 00                function count = 0   (no lambdas in this program)
+
+SECTION 3 — Main Chunk (type 0x03)
+ 0x30   03 00                      section type = 0x03
+ 0x32   1F 00 00 00                section length = 31 bytes
+        ── chunk body ──
+ 0x36   04 00 00 00                code length = 4 bytes
+ 0x3A   00                           CONST           (opcode 0)
+ 0x3B   00 00                        └ operand: constant index 0
+ 0x3D   12                           RETURN          (opcode 18 = 0x12)
+ 0x3E   01 00                      constant count = 1
+ 0x40   02                         const[0] tag = VAL_INT (0x02)
+ 0x41   03 00 00 00 00 00 00 00      └ i64 value = 3
+ 0x49   00 00 00 00                span count = 0
+ 0x4D   00 00                      max_stack = 0
+ 0x4F   00 00                      n_locals = 0
+ 0x51   00 00                      n_global_cache_slots = 0
+ 0x53   00 00                      exception count = 0
+```
+
+That is the whole format with nothing hidden: a 24-byte header, three length-prefixed sections, and a chunk whose four instruction-bytes (`00 00 00 12`) are literally `CONST 0` / `RETURN`. A program that referenced a global would add `"println"` to the string table and `LOAD_GLOBAL`/`CALL` opcodes to the chunk (as in the conceptual example above); a program with a `lambda` would add an entry to the function table. Everything else is more of the same.
+
+::: tip Want to build the instructions themselves first?
+[Build a Bytecode VM (in Sema)](./build-a-bytecode-vm.md) constructs a working compiler and stack machine from scratch in ~80 lines, so the `CONST`/`RETURN` stream above reads as the natural output of a process you've already seen end to end.
+:::
+
 ## Versioning Strategy
 
-- `format_version` starts at `1` and increments on any breaking change to the binary format
+- `format_version` started at `1` and increments on any breaking change to the binary format. Version `2` added `n_global_cache_slots` and the inline-cache operands; version `3` added per-function upvalue names to the debug metadata; version `4` (current) added per-function `local_scopes` (block-scope PC ranges) to the debug metadata.
 - `sema_major`/`sema_minor`/`sema_patch` record the compiler version for diagnostics
-- A newer Sema can refuse to load bytecode from an older format version with a clear error: `"Bytecode format v1 not supported by this Sema version (expected v2+). Recompile from source."`
+- The loader requires an exact `format_version` match and refuses anything else with a clear error: `"unsupported bytecode format version 1 (expected 4). Recompile from source."`
 - Within the same `format_version`, new section types can be added without breaking older loaders (unknown sections are skipped)
 
 ## Comparison with Other Languages

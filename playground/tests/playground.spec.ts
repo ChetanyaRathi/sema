@@ -15,6 +15,14 @@ const EXAMPLE_NAMES = [
   'perlin-noise.sema',
   'game-of-life.sema',
   'ascii-art.sema',
+  // Concurrency examples — exercise the async scheduler + channels in WASM
+  // (where async/sleep is a no-op yield), stressing fan-out/pipeline/fan-in.
+  'channels.sema',
+  'parallel-tasks.sema',
+  'timeout.sema',
+  'worker-pool.sema',
+  'pipeline.sema',
+  'fan-in.sema',
 ];
 
 const EXAMPLES = EXAMPLE_NAMES.map((name) => {
@@ -71,21 +79,11 @@ async function clickRunAndWait(page: Page) {
   await page.waitForSelector('#output .output-timing', { timeout: 30000 });
 }
 
-/** Select the VM engine. */
-async function selectVM(page: Page) {
-  await page.getByTestId('engine-vm').click();
-}
-
-/** Select the tree-walker engine. */
-async function selectTree(page: Page) {
-  await page.getByTestId('engine-tree').click();
-}
-
 test.beforeEach(async ({ page }) => {
   await waitForReady(page);
 });
 
-// ── Example smoke tests (tree-walker) ──
+// ── Example smoke tests ──
 
 for (const example of EXAMPLES) {
   test(`example: ${example.name}`, async ({ page, browser, browserName }) => {
@@ -115,9 +113,9 @@ for (const example of EXAMPLES) {
     const valueLines = await page.$$('#output .output-value');
     expect(outputLines.length + valueLines.length).toBeGreaterThan(0);
 
-    // Verify timing shows tree-walker
+    // Verify timing shows the bytecode VM (the sole evaluator)
     const timing = await page.$eval('#output .output-timing', el => el.textContent);
-    expect(timing).toContain('tree-walker');
+    expect(timing).toContain('bytecode VM');
   });
 }
 
@@ -138,80 +136,260 @@ test('whitespace preserved in output', async ({ page }) => {
   expect(style).toBe('pre');
 });
 
-// ── VM engine toggle tests ──
+// ── VM evaluation tests (bytecode VM is the sole evaluator) ──
 
-test('vm toggle: runs code with bytecode VM', async ({ page }) => {
+test('runs code with the bytecode VM', async ({ page }) => {
   await setEditorCode(page, '(+ 1 2)');
-  await selectVM(page);
   await clickRunAndWait(page);
 
   // Check result
   const value = await page.$eval('#output .output-value', el => el.textContent);
   expect(value).toContain('3');
 
-  // Verify timing shows bytecode VM
+  // Verify timing reports the bytecode VM
   const timing = await page.$eval('#output .output-timing', el => el.textContent);
   expect(timing).toContain('bytecode VM');
 });
 
-test('vm toggle: switching back to tree-walker works', async ({ page }) => {
-  await setEditorCode(page, '(* 6 7)');
-
-  // Run with VM first
-  await selectVM(page);
+test('async/sleep ordering works in WASM (virtual clock)', async ({ page }) => {
+  // Regression guard for the virtual clock: in WASM async/sleep has no real
+  // delay, but shorter sleeps must still wake before longer ones. Tasks are
+  // spawned c/a/b but sleep 30/10/20 — output must be a, b, c.
+  const code = `(async/all
+  (list (async (async/sleep 30) (println "c"))
+        (async (async/sleep 10) (println "a"))
+        (async (async/sleep 20) (println "b"))))`;
+  await setEditorCode(page, code);
   await clickRunAndWait(page);
-  let timing = await page.$eval('#output .output-timing', el => el.textContent);
-  expect(timing).toContain('bytecode VM');
-
-  // Switch back to tree-walker
-  await selectTree(page);
-  await clickRunAndWait(page);
-  timing = await page.$eval('#output .output-timing', el => el.textContent);
-  expect(timing).toContain('tree-walker');
+  const lines = await page.$$eval('#output .output-line', els =>
+    els.map(el => el.textContent)
+  );
+  expect(lines).toEqual(['a', 'b', 'c']);
 });
 
-test('vm toggle: tree and vm produce same result', async ({ page }) => {
+test('?no-worker forces the main-thread fallback (instant virtual-clock sleep)', async ({ page }) => {
+  // The worker path is the default under cross-origin isolation; ?no-worker
+  // opts out to the main-thread interpreter, where async/sleep is an instant
+  // no-op. A 2s sleep must therefore complete near-instantly (proving fallback).
+  await page.goto('/?no-worker');
+  await page.waitForSelector('[data-testid="status"].status-ready', { timeout: 20000 });
+
+  await setEditorCode(page, '(await (async (async/sleep 2000) 42))');
+  const t0 = Date.now();
+  await page.getByTestId('run-btn').click();
+  await page.waitForSelector('#output .output-timing', { timeout: 20000 });
+  const elapsed = Date.now() - t0;
+
+  expect(elapsed).toBeLessThan(1000); // instant on the main-thread path (not real-slept)
+  const value = await page.$eval('#output .output-value', (el) => el.textContent || '');
+  expect(value).toContain('42');
+});
+
+test('worker path: async/sleep paces in real wall-clock while the UI stays responsive', async ({ page }) => {
+  // Opt into the worker eval path (?worker). Requires cross-origin isolation,
+  // which the dev server provides via serve.json (COOP/COEP).
+  await page.goto('/?worker');
+  await page.waitForSelector('[data-testid="status"].status-ready', { timeout: 20000 });
+
+  // The worker path must actually be active (cross-origin isolated + SAB),
+  // otherwise this would silently fall back to the instant main-thread path.
+  const isolated = await page.evaluate(
+    () => self.crossOriginIsolated === true && 'SharedArrayBuffer' in globalThis
+  );
+  expect(isolated).toBe(true);
+
+  // Three concurrent sleeps (100/200/300ms) then a final print. On the worker
+  // these are REAL waits, so the run takes ~300ms wall-clock (vs instant on the
+  // main-thread virtual clock). Output is ordered by sleep duration.
+  const code = `(async/all
+  (list (async (async/sleep 300) (println "c"))
+        (async (async/sleep 100) (println "a"))
+        (async (async/sleep 200) (println "b"))))
+(println "done")`;
+  await setEditorCode(page, code);
+
+  // Main-thread responsiveness probe: a timer that must keep ticking while the
+  // worker is busy/blocked (it would be frozen on the old main-thread path).
+  await page.evaluate(() => {
+    (window as any).__ticks = 0;
+    (window as any).__t = setInterval(() => { (window as any).__ticks++; }, 20);
+  });
+
+  const t0 = Date.now();
+  await page.getByTestId('run-btn').click();
+  await page.waitForSelector('#output .output-timing', { timeout: 20000 });
+  const elapsed = Date.now() - t0;
+  const ticks = await page.evaluate(() => {
+    clearInterval((window as any).__t);
+    return (window as any).__ticks as number;
+  });
+
+  // Real wall-clock sleep happened (longest path = 300ms), not instant.
+  expect(elapsed).toBeGreaterThan(280);
+  // Main thread stayed responsive during the worker's real sleep.
+  expect(ticks).toBeGreaterThan(3);
+  // Output is correct and ordered by sleep duration, then the final print.
+  const lines = await page.$$eval('#output .output-line', (els) => els.map((e) => e.textContent));
+  expect(lines).toEqual(['a', 'b', 'c', 'done']);
+});
+
+test('worker path: upload a file and read it from a script (VFS upload + mirror)', async ({ page }) => {
+  await page.goto('/?worker');
+  await page.waitForSelector('[data-testid="status"].status-ready', { timeout: 20000 });
+
+  // Upload a file via the hidden file input — it lands in the VFS at /uploads/.
+  await page.setInputFiles('#vfs-upload', {
+    name: 'notes.txt',
+    mimeType: 'text/plain',
+    buffer: Buffer.from('hello from an uploaded file'),
+  });
+
+  // It shows up in the file tree.
+  await page.waitForSelector('.vfs-tree-file:has-text("notes.txt")', { timeout: 5000 });
+
+  // A worker-run script can read it — the uploaded file is seeded into the
+  // worker via the VFS mirror (dumpVfs/loadVfs).
+  await setEditorCode(page, '(file/read "/uploads/notes.txt")');
+  await page.getByTestId('run-btn').click();
+  await page.waitForFunction(
+    () => {
+      const s = document.getElementById('status')?.textContent || '';
+      return s === 'Ready' || s === 'Error';
+    },
+    { timeout: 20000 }
+  );
+  const value = await page.$eval('#output .output-value', (el) => el.textContent || '');
+  expect(value).toContain('hello from an uploaded file');
+});
+
+test('worker path: a file written during eval shows up in the file tree (VFS mirror)', async ({ page }) => {
+  // Eval runs on the worker (its own VFS); the main-thread interp is a mirror
+  // synced via dumpVfs/loadVfs after each run, so the file tree must reflect
+  // files the worker created.
+  await page.goto('/?worker');
+  await page.waitForSelector('[data-testid="status"].status-ready', { timeout: 20000 });
+
+  await setEditorCode(page, '(file/write "/from-worker.txt" "hi from the worker")\n(println "wrote it")');
+  await page.getByTestId('run-btn').click();
+  await page.waitForSelector('#output .output-timing', { timeout: 20000 });
+
+  // The file the worker created must appear in the (mirror-backed) file tree.
+  await page.waitForSelector('.vfs-tree-file:has-text("from-worker.txt")', { timeout: 5000 });
+  const files = await page.$$eval('.vfs-tree-file', (els) =>
+    els.map((e) => (e.textContent || '').trim())
+  );
+  expect(files.some((f) => f.includes('from-worker.txt'))).toBe(true);
+});
+
+test('worker path: http/get works via synchronous XHR (no replay)', async ({ page }) => {
+  // On the worker, http uses a blocking synchronous XHR instead of the
+  // main-thread replay-the-whole-program hack. Hit a same-origin file so the
+  // test is reliable (no network, no cross-origin CORP/COEP concerns).
+  await page.goto('/?worker');
+  await page.waitForSelector('[data-testid="status"].status-ready', { timeout: 20000 });
+
+  const origin = await page.evaluate(() => location.origin);
+  await setEditorCode(page, `(:status (http/get "${origin}/index.html"))`);
+  await page.getByTestId('run-btn').click();
+  await page.waitForSelector('#output .output-timing', { timeout: 20000 });
+
+  const errors = await page.$$eval('#output .output-error', (els) => els.map((e) => e.textContent || ''));
+  expect(errors.join('\n')).not.toContain('window');
+  const value = await page.$eval('#output .output-value', (el) => el.textContent || '');
+  expect(value).toContain('200');
+});
+
+test('worker path: output streams live (incrementally), not all at the end', async ({ page }) => {
+  await page.goto('/?worker');
+  await page.waitForSelector('[data-testid="status"].status-ready', { timeout: 20000 });
+
+  // Three prints separated by real ~300ms sleeps. With live streaming the lines
+  // must appear one at a time as the program runs — not batched at the end.
+  await setEditorCode(
+    page,
+    '(let loop ((i 1)) (if (> i 3) (println "fin") (begin (await (async (async/sleep 300))) (println (str "nap " i)) (loop (+ i 1)))))'
+  );
+  await page.getByTestId('run-btn').click();
+
+  // While still running, at least one line should already be visible.
+  await page.waitForFunction(
+    () => document.querySelectorAll('#output .output-line').length >= 1,
+    { timeout: 2000 }
+  );
+  const midRun = await page.$$eval('#output .output-line', (els) => els.length);
+  // Not all 4 lines yet (the later naps haven't elapsed) — proves it's live.
+  expect(midRun).toBeLessThan(4);
+
+  await page.waitForFunction(
+    () => {
+      const s = document.getElementById('status')?.textContent || '';
+      return s === 'Ready' || s === 'Error';
+    },
+    { timeout: 5000 }
+  );
+  const lines = await page.$$eval('#output .output-line', (els) => els.map((e) => e.textContent));
+  expect(lines).toEqual(['nap 1', 'nap 2', 'nap 3', 'fin']);
+});
+
+test('worker path: Stop cancels a running program and the worker survives', async ({ page }) => {
+  await page.goto('/?worker');
+  await page.waitForSelector('[data-testid="status"].status-ready', { timeout: 20000 });
+
+  // A long real sleep (5s) via the scheduler (async/await), so on the worker it
+  // actually blocks ~5s on Atomics.wait — giving us a window to cancel it.
+  await setEditorCode(page, '(await (async (async/sleep 5000) (println "should not print")))');
+  await page.getByTestId('run-btn').click();
+
+  // The Run button becomes "Stop" while running.
+  await page.waitForFunction(
+    () => document.getElementById('run-btn')?.textContent?.includes('Stop'),
+    { timeout: 5000 }
+  );
+
+  // Click Stop; it must cancel well under the 5s sleep.
+  const t0 = Date.now();
+  await page.getByTestId('run-btn').click();
+  await page.waitForSelector('#output .output-timing', { timeout: 4000 });
+  const elapsed = Date.now() - t0;
+  expect(elapsed).toBeLessThan(3000); // cancelled, not waited out
+
+  await page.waitForFunction(
+    () => document.getElementById('status')?.textContent === 'Stopped',
+    { timeout: 4000 }
+  );
+  const lines = await page.$$eval('#output .output-line', (els) => els.map((e) => e.textContent || ''));
+  expect(lines).not.toContain('should not print');
+
+  // The worker survived: a subsequent run works. Wait on the status settling
+  // (the prior run's output/timing is only cleared once this run renders).
+  await setEditorCode(page, '(+ 20 22)');
+  await page.getByTestId('run-btn').click();
+  await page.waitForFunction(
+    () => {
+      const s = document.getElementById('status')?.textContent || '';
+      return s === 'Ready' || s === 'Error';
+    },
+    { timeout: 20000 }
+  );
+  const value = await page.$eval('#output .output-value', (el) => el.textContent || '');
+  expect(value).toContain('42');
+});
+
+test('evaluates a recursive fib correctly', async ({ page }) => {
   const code = `(define (fib n)
   (define (go a b i)
     (if (= i 0) a (go b (+ a b) (- i 1))))
   (go 0 1 n))
 (fib 20)`;
 
-  // Run with tree-walker
-  await selectTree(page);
   await setEditorCode(page, code);
   await clickRunAndWait(page);
-  const treeValue = await page.$eval('#output .output-value', el => el.textContent);
-
-  // Run with VM
-  await selectVM(page);
-  await clickRunAndWait(page);
-  const vmValue = await page.$eval('#output .output-value', el => el.textContent);
-
-  expect(treeValue).toBe(vmValue);
+  const value = await page.$eval('#output .output-value', el => el.textContent);
+  expect(value).toContain('6765');
 });
 
-test('vm toggle: active class updates on toggle', async ({ page }) => {
-  // Tree should be active by default
-  const treeLabel = page.getByTestId('engine-tree');
-  const vmLabel = page.getByTestId('engine-vm');
-  await expect(treeLabel).toHaveClass(/active/);
-  await expect(vmLabel).not.toHaveClass(/active/);
-
-  // Click VM
-  await selectVM(page);
-  await expect(vmLabel).toHaveClass(/active/);
-  await expect(treeLabel).not.toHaveClass(/active/);
-
-  // Click Tree
-  await selectTree(page);
-  await expect(treeLabel).toHaveClass(/active/);
-  await expect(vmLabel).not.toHaveClass(/active/);
-});
-
-test('vm toggle: hello.sema works in VM mode', async ({ page }) => {
+test('hello.sema runs', async ({ page }) => {
   await page.click('.tree-file:text("hello.sema")');
-  await selectVM(page);
   await clickRunAndWait(page);
 
   const errorEl = await page.$('#output .output-error');

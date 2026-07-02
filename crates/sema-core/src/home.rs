@@ -15,35 +15,36 @@ pub fn sema_home() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    // `SEMA_HOME` is a PROCESS-GLOBAL env var — spawning a thread does NOT isolate
+    // it, so env-mutating tests race (one sets "/custom/sema" while the other reads
+    // it, intermittently failing under parallel/coverage runs). Serialize the
+    // env-mutating sections with a shared lock; poison-tolerant so a panic in one
+    // test doesn't wedge the other.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn test_sema_home_from_env_var() {
-        // Run in a fresh thread so env manipulation is isolated
-        std::thread::spawn(|| {
-            std::env::set_var("SEMA_HOME", "/custom/sema");
-            let p = sema_home();
-            std::env::remove_var("SEMA_HOME");
-            assert_eq!(p, PathBuf::from("/custom/sema"));
-        })
-        .join()
-        .unwrap();
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("SEMA_HOME", "/custom/sema");
+        let p = sema_home();
+        std::env::remove_var("SEMA_HOME");
+        assert_eq!(p, PathBuf::from("/custom/sema"));
     }
 
     #[test]
     fn test_sema_home_default_uses_home_dir() {
-        std::thread::spawn(|| {
-            std::env::remove_var("SEMA_HOME");
-            // HOME is expected to be set in normal environments
-            if std::env::var("HOME").is_ok() || std::env::var("USERPROFILE").is_ok() {
-                let p = sema_home();
-                assert!(
-                    p.to_string_lossy().ends_with(".sema"),
-                    "expected path ending in .sema, got: {}",
-                    p.display()
-                );
-            }
-        })
-        .join()
-        .unwrap();
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("SEMA_HOME");
+        // HOME is expected to be set in normal environments
+        if std::env::var("HOME").is_ok() || std::env::var("USERPROFILE").is_ok() {
+            let p = sema_home();
+            assert!(
+                p.to_string_lossy().ends_with(".sema"),
+                "expected path ending in .sema, got: {}",
+                p.display()
+            );
+        }
     }
 }

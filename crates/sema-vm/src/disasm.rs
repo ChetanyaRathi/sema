@@ -1,6 +1,6 @@
 use std::fmt::Write;
 
-use sema_core::resolve;
+use sema_core::{bits_to_spur, resolve};
 
 use crate::chunk::Chunk;
 use crate::opcodes::Op;
@@ -95,6 +95,9 @@ fn op_name(op: Op) -> &'static str {
         Op::ContainsQ => "CONTAINS_Q",
         Op::Mod => "MOD",
         Op::Nth => "NTH",
+        Op::StringLength => "STRING_LENGTH",
+        Op::StringRef => "STRING_REF",
+        Op::StringAppend => "STRING_APPEND",
     }
 }
 
@@ -135,7 +138,7 @@ pub fn disassemble(chunk: &Chunk, name: Option<&str>) -> String {
             Op::LoadGlobal => {
                 let spur_bits = read_u32(code, pc + 1);
                 let cache_slot = read_u16(code, pc + 5);
-                let spur = unsafe { std::mem::transmute::<u32, lasso::Spur>(spur_bits) };
+                let spur = bits_to_spur(spur_bits);
                 let name_str = resolve(spur);
                 writeln!(
                     out,
@@ -148,7 +151,7 @@ pub fn disassemble(chunk: &Chunk, name: Option<&str>) -> String {
 
             Op::StoreGlobal | Op::DefineGlobal => {
                 let spur_bits = read_u32(code, pc + 1);
-                let spur = unsafe { std::mem::transmute::<u32, lasso::Spur>(spur_bits) };
+                let spur = bits_to_spur(spur_bits);
                 let name_str = resolve(spur);
                 writeln!(
                     out,
@@ -212,7 +215,7 @@ pub fn disassemble(chunk: &Chunk, name: Option<&str>) -> String {
                 let spur_bits = read_u32(code, pc + 1);
                 let argc = read_u16(code, pc + 5);
                 let cache_slot = read_u16(code, pc + 7);
-                let spur = unsafe { std::mem::transmute::<u32, lasso::Spur>(spur_bits) };
+                let spur = bits_to_spur(spur_bits);
                 let name_str = resolve(spur);
                 writeln!(
                     out,
@@ -241,7 +244,7 @@ pub fn disassemble(chunk: &Chunk, name: Option<&str>) -> String {
 }
 
 fn op_from_u8(byte: u8) -> Option<Op> {
-    const MAX_OP: u8 = Op::Nth as u8;
+    const MAX_OP: u8 = Op::StringAppend as u8;
     if byte > MAX_OP {
         return None;
     }
@@ -251,7 +254,7 @@ fn op_from_u8(byte: u8) -> Option<Op> {
 
 #[cfg(test)]
 mod tests {
-    use sema_core::{intern, Value};
+    use sema_core::{intern, spur_to_bits, Value};
 
     use super::*;
     use crate::emit::Emitter;
@@ -259,8 +262,8 @@ mod tests {
     #[test]
     fn test_disassemble_simple() {
         let mut e = Emitter::new();
-        e.emit_const(Value::int(1));
-        e.emit_const(Value::int(2));
+        e.emit_const(Value::int(1)).unwrap();
+        e.emit_const(Value::int(2)).unwrap();
         e.emit_op(Op::AddInt);
         e.emit_op(Op::Return);
         let chunk = e.into_chunk();
@@ -318,7 +321,7 @@ mod tests {
     #[test]
     fn test_disassemble_globals() {
         let spur = intern("my-var");
-        let bits: u32 = unsafe { std::mem::transmute(spur) };
+        let bits = spur_to_bits(spur);
 
         let mut e = Emitter::new();
         e.emit_op(Op::LoadGlobal);
@@ -368,7 +371,7 @@ mod tests {
     #[test]
     fn test_disassemble_call_global() {
         let spur = intern("println");
-        let bits: u32 = unsafe { std::mem::transmute(spur) };
+        let bits = spur_to_bits(spur);
 
         let mut e = Emitter::new();
         e.emit_op(Op::CallGlobal);
@@ -441,6 +444,9 @@ mod tests {
         e.emit_op(Op::Length);
         e.emit_op(Op::Get);
         e.emit_op(Op::ContainsQ);
+        e.emit_op(Op::StringLength);
+        e.emit_op(Op::StringRef);
+        e.emit_op(Op::StringAppend);
         e.emit_op(Op::Return);
         let chunk = e.into_chunk();
         let output = disassemble(&chunk, Some("zero_ops"));
@@ -458,6 +464,9 @@ mod tests {
         assert!(output.contains("LENGTH"));
         assert!(output.contains("GET"));
         assert!(output.contains("CONTAINS_Q"));
+        assert!(output.contains("STRING_LENGTH"));
+        assert!(output.contains("STRING_REF"));
+        assert!(output.contains("STRING_APPEND"));
     }
 
     #[test]

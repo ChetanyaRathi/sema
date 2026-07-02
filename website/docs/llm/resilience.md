@@ -11,9 +11,60 @@ outline: [2, 3]
 Wraps a thunk with a fallback chain of providers. If the LLM call fails with one provider, automatically tries the next provider in the list.
 
 ```sema
-(llm/with-fallback [:anthropic :openai :groq]
+(llm/with-fallback [:anthropic :openai :deepseek]
   (lambda () (llm/complete "Hello")))
 ```
+
+#### Model selection across the chain
+
+Model ids are provider-specific (a Claude id is meaningless to OpenAI), so each chain entry resolves its own model:
+
+- A **bare provider keyword** (e.g. `:anthropic`) uses that provider's [default model](./providers#default-models), or whatever you set via `(llm/configure :anthropic {:default-model "..."})`. This is the recommended form — leave the body's `(llm/complete ...)` **unpinned** so every provider gets a model id valid for itself.
+- If the body pins a `:model`, that exact string is sent to **every** provider in the chain. That's fine for a homogeneous chain, but pinning a provider-specific id (e.g. a Claude model) will fail on any other provider it falls back to.
+
+#### Per-provider model overrides
+
+To target a different model per provider within a single chain, give chain entries as `[provider model]` pairs or `{:provider :model}` maps. A per-provider override **wins over any `:model` pinned in the body**:
+
+```sema
+;; Anthropic uses Opus, OpenAI uses GPT-5.5, DeepSeek uses its default
+(llm/with-fallback [[:anthropic "claude-opus-4-8"]
+                    [:openai    "gpt-5.5"]
+                    :deepseek]
+  (lambda () (llm/complete "Hello")))
+
+;; Map form is equivalent and lets you omit :model to use the provider default
+(llm/with-fallback [{:provider :anthropic :model "claude-opus-4-8"}
+                    {:provider :openai}]
+  (lambda () (llm/complete "Hello")))
+```
+
+## Automatic Retry on Transient Errors
+
+LLM calls (`llm/complete`, `llm/chat`, `agent/run`, and the fallback-chain path)
+**automatically retry transient failures** — no configuration needed:
+
+- Retried: HTTP 429 (rate limited), 5xx server errors, and network/timeout errors.
+- Not retried: 4xx client errors other than 429 (e.g. 400 bad request), and parse
+  errors — these won't succeed on a retry, so they fail fast.
+- Backoff: capped **exponential backoff with full jitter** (base 500ms, doubling
+  per attempt, capped at 30s), up to 3 retries. A 429 honors the provider's
+  `retry-after` hint when present.
+
+This is distinct from [`llm/with-fallback`](#fallback-provider-chains) (which
+switches *providers* on failure) and the generic [`retry`](#generic-retry) (which
+wraps *any* thunk). They compose: each provider in a fallback chain does its own
+transient-error retry before the chain moves on.
+
+### Streaming and resilience
+
+`llm/stream` applies these guarantees **at stream-open** — before the first token:
+
+- **Fallback** — if a provider fails to *open* the stream, the chain fails over to the next, just like non-streaming. Once the first token has been delivered, a **mid-stream** failure is **not** failed over (switching providers mid-answer would re-emit the partial you already received); the error surfaces and the partial text is kept.
+- **Rate-limiting** — `llm/with-rate-limit` gates the stream-open call the same as a non-streaming one.
+- **Budget** — opt in with `llm/with-budget {... :on-stream :pre-gate}`: the stream is refused at open if the scope's spend is already at the cap. By default streams are **not** budget-gated (a stream's cost is unknown until it ends), though usage is still tracked afterward.
+
+Two things still **don't** apply to streams: the **response cache** (a live stream isn't cached — for deterministic replay use [cassettes](/docs/llm/cassettes)) and **mid-stream retry** (a retry would duplicate already-emitted output — see above).
 
 ## Rate Limiting
 
@@ -32,7 +83,7 @@ Wraps a thunk with token-bucket rate limiting. Takes a rate (requests per second
 Retries a thunk on failure with exponential backoff. Takes a thunk and an optional options map.
 
 ```sema
-;; Default: 3 attempts, 100ms base delay, 2.0 backoff
+;; Default: 3 retries, 100ms base delay, 2.0 backoff
 (retry (lambda () (http/get "https://example.com")))
 
 ;; Custom options

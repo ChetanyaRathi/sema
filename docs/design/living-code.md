@@ -1,5 +1,17 @@
 # Living Code: Self-Aware Programs in Sema
 
+> ⚠️ **RETIRED (2026-06-20) — none of this currently exists.** Living Code (all
+> layers 0–6) was implemented on the tree-walker and silently dropped when the
+> tree-walker was retired as the sole evaluator in 1.18.0. Every form below
+> (`doc`, `meta`, `doctest`, `read-source`, `ask`, `heal!`, `evolve`,
+> `observe!`, `become!`, `history`, `rollback!`, `freeze!`) is unbound at
+> runtime today. The LLM-driven layers (3–6) are **killed for good** — see
+> `docs/deferred.md`. The deterministic foundation (docstrings `doc`/`meta`,
+> layer 0) was confirmed clean to build but also **cut for maintainability** and
+> parked (2026-06-20); doctests (layer 1) were dropped as YAGNI. Nothing from
+> this document is implemented. It is kept only as historical design context,
+> not a description of shipping behavior.
+
 > Design document for Sema's introspection, doctest, and LLM-driven metaprogramming features.
 
 ## Vision

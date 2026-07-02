@@ -1,0 +1,53 @@
+# Reusable verification gate — the same correctness checks CI runs, callable from
+# the publish workflows so a release can NEVER ship when tests are red.
+# (CI runs on branch pushes; the tag-triggered publishes call this to gate.)
+name: Verify
+
+on:
+  workflow_call:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libudev-dev pkg-config
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      # Smart Rust cache: derives its key from the toolchain + Cargo.lock and
+      # partial-restores on changes (vs. the old exact-match key that cold-rebuilt
+      # the whole workspace whenever Cargo.lock moved — i.e. every release).
+      - name: Cache cargo + target
+        uses: Swatinem/rust-cache@v2
+
+      # Gate the publish on a complete crate list: every publishable workspace
+      # crate must be in publish.yml's order, so a release can't half-publish on a
+      # newly-added crate (as happened with sema-otel in 1.22.0).
+      - name: Check publish list is complete
+        run: ./scripts/check-publish-list.sh
+
+      - name: Check formatting
+        run: cargo fmt -- --check
+
+      - name: Clippy
+        run: cargo clippy --workspace -- -D warnings
+
+      - name: Check builtin docs
+        run: make docs-check
+
+      - name: Run tests
+        run: cargo test --workspace
+
+      - name: Smoke test examples
+        run: make examples
+
+      - name: Smoke test bytecode
+        run: make smoke-bytecode

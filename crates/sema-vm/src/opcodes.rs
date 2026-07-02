@@ -104,6 +104,11 @@ pub enum Op {
 
     // Vector/list indexed access (fast path for nth)
     Nth, // pop collection, pop index → push element
+
+    // Inline string intrinsics (bypass CallGlobal overhead)
+    StringLength, // pop string, push char count as int (1-arg only)
+    StringRef,    // pop index, pop string → push char at index
+    StringAppend, // pop two values, push concatenated string (2-arg only)
 }
 
 impl Op {
@@ -180,9 +185,114 @@ impl Op {
             63 => Some(Op::ContainsQ),
             64 => Some(Op::Mod),
             65 => Some(Op::Nth),
+            66 => Some(Op::StringLength),
+            67 => Some(Op::StringRef),
+            68 => Some(Op::StringAppend),
             _ => None,
         }
     }
+
+    /// Static stack effect of this opcode.
+    ///
+    /// For variable-arity opcodes (`Call`, `TailCall`, `CallGlobal`, `CallNative`,
+    /// `MakeList`, `MakeVector`, `MakeMap`, `MakeHashMap`) the caller must pass the
+    /// decoded operand count (`argc` / `n` / `n_pairs`); for all other opcodes the
+    /// `operand` argument is ignored — pass `0`.
+    ///
+    /// This is the single source of truth used by the bytecode verifier
+    /// (`crate::serialize::validate_bytecode`) to prove stack balance before the
+    /// VM is allowed to run deserialized bytecode through its unchecked
+    /// `pop_unchecked` hot path. It must agree exactly with the pops/pushes the
+    /// dispatch arms in `vm.rs` perform. The match is exhaustive: adding a new
+    /// opcode without a case here fails to compile.
+    pub fn stack_effect(self, operand: u16) -> StackEffect {
+        use Op::*;
+        let operand = operand as u32;
+        match self {
+            // 0 pops, 1 push — produce a value
+            Const | Nil | True | False | Dup | LoadLocal | LoadUpvalue | LoadGlobal
+            | LoadLocal0 | LoadLocal1 | LoadLocal2 | LoadLocal3 | MakeClosure => StackEffect {
+                pops: 0,
+                pushes: 1,
+                exits_frame: false,
+            },
+            // 1 pop, 0 pushes — consume a value
+            Pop | StoreLocal | StoreUpvalue | StoreGlobal | DefineGlobal | StoreLocal0
+            | StoreLocal1 | StoreLocal2 | StoreLocal3 | JumpIfFalse | JumpIfTrue => StackEffect {
+                pops: 1,
+                pushes: 0,
+                exits_frame: false,
+            },
+            // unconditional branch — no stack effect, depth flows to target
+            Jump => StackEffect {
+                pops: 0,
+                pushes: 0,
+                exits_frame: false,
+            },
+            // variable-arity calls
+            Call => StackEffect {
+                pops: operand + 1, // callee + args
+                pushes: 1,
+                exits_frame: false,
+            },
+            TailCall => StackEffect {
+                pops: operand + 1, // callee + args
+                pushes: 0,
+                exits_frame: true,
+            },
+            CallGlobal | CallNative => StackEffect {
+                pops: operand, // args only (callee resolved by id/spur)
+                pushes: 1,
+                exits_frame: false,
+            },
+            // variable-arity constructors
+            MakeList | MakeVector => StackEffect {
+                pops: operand,
+                pushes: 1,
+                exits_frame: false,
+            },
+            MakeMap | MakeHashMap => StackEffect {
+                pops: operand * 2,
+                pushes: 1,
+                exits_frame: false,
+            },
+            // frame-exiting
+            Return | Throw => StackEffect {
+                pops: 1,
+                pushes: 0,
+                exits_frame: true,
+            },
+            // binary ops — 2 pops, 1 push
+            Add | Sub | Mul | Div | Eq | Lt | Gt | Le | Ge | AddInt | SubInt | MulInt | LtInt
+            | EqInt | Cons | Append | Get | ContainsQ | Mod | Nth | StringRef | StringAppend => {
+                StackEffect {
+                    pops: 2,
+                    pushes: 1,
+                    exits_frame: false,
+                }
+            }
+            // unary ops — 1 pop, 1 push
+            Negate | Not | Car | Cdr | Length | IsNull | IsPair | IsList | IsNumber | IsString
+            | IsSymbol | StringLength => StackEffect {
+                pops: 1,
+                pushes: 1,
+                exits_frame: false,
+            },
+        }
+    }
+}
+
+/// Static description of an opcode's effect on the operand stack.
+///
+/// `pops` values are removed and `pushes` values are added (net change is
+/// `pushes - pops`). `exits_frame` is true for opcodes that terminate the
+/// current frame (`Return`, `TailCall`, `Throw`) — these have no fallthrough
+/// successor in the control-flow graph.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StackEffect {
+    pub pops: u32,
+    pub pushes: u32,
+    pub exits_frame: bool,
 }
 
 // Compile-time assertion: every `Op` variant is covered by `from_u8`.
@@ -258,6 +368,9 @@ const _: () = {
             Op::ContainsQ => {}
             Op::Mod => {}
             Op::Nth => {}
+            Op::StringLength => {}
+            Op::StringRef => {}
+            Op::StringAppend => {}
         }
     }
 };
@@ -331,6 +444,9 @@ pub mod op {
     pub const CONTAINS_Q: u8 = Op::ContainsQ as u8;
     pub const MOD: u8 = Op::Mod as u8;
     pub const NTH: u8 = Op::Nth as u8;
+    pub const STRING_LENGTH: u8 = Op::StringLength as u8;
+    pub const STRING_REF: u8 = Op::StringRef as u8;
+    pub const STRING_APPEND: u8 = Op::StringAppend as u8;
 
     // Instruction sizes (opcode byte + operand bytes)
     /// Size of a bare opcode with no operands: 1
@@ -338,6 +454,7 @@ pub mod op {
     /// Size of an instruction with a u16 operand (e.g., CALL, LOAD_LOCAL): 1 + 2 = 3
     pub const SIZE_OP_U16: usize = 3;
     /// Size of an instruction with a u32 operand (e.g., STORE_GLOBAL, DEFINE_GLOBAL): 1 + 4 = 5
+    #[allow(dead_code)]
     pub const SIZE_OP_U32: usize = 5;
     /// Size of LOAD_GLOBAL: 1 + u32 spur + u16 cache_slot = 7
     pub const SIZE_LOAD_GLOBAL: usize = 7;

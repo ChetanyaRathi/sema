@@ -1,0 +1,170 @@
+[
+  {
+    "name": "sbcl",
+    "best_ms": 2997,
+    "runs_ms": [
+      3015,
+      2997,
+      3006
+    ],
+    "rows": 10000000,
+    "verified": true,
+    "output_sha256": "1da0a14cd0d60ac47b76a68a95eba1d46782802b33a248d8f227416ff5b857cc"
+  },
+  {
+    "name": "chez",
+    "best_ms": 2481,
+    "runs_ms": [
+      2511,
+      2491,
+      2481
+    ],
+    "rows": 10000000,
+    "verified": true,
+    "output_sha256": "1da0a14cd0d60ac47b76a68a95eba1d46782802b33a248d8f227416ff5b857cc"
+  },
+  {
+    "name": "chicken",
+    "best_ms": 9094,
+    "runs_ms": [
+      9249,
+      9094,
+      9215
+    ],
+    "rows": 10000000,
+    "verified": true,
+    "output_sha256": "1da0a14cd0d60ac47b76a68a95eba1d46782802b33a248d8f227416ff5b857cc"
+  },
+  {
+    "name": "gambit",
+    "best_ms": 2351,
+    "runs_ms": [
+      2554,
+      2351,
+      2364
+    ],
+    "rows": 10000000,
+    "verified": true,
+    "output_sha256": "1da0a14cd0d60ac47b76a68a95eba1d46782802b33a248d8f227416ff5b857cc"
+  },
+  {
+    "name": "fennel",
+    "best_ms": 2679,
+    "runs_ms": [
+      4024,
+      2699,
+      2679
+    ],
+    "rows": 10000000,
+    "verified": true,
+    "output_sha256": "1da0a14cd0d60ac47b76a68a95eba1d46782802b33a248d8f227416ff5b857cc"
+  },
+  {
+    "name": "clojure",
+    "best_ms": 2902,
+    "runs_ms": [
+      3730,
+      3072,
+      2902
+    ],
+    "rows": 10000000,
+    "verified": true,
+    "output_sha256": "1da0a14cd0d60ac47b76a68a95eba1d46782802b33a248d8f227416ff5b857cc"
+  },
+  {
+    "name": "kawa",
+    "best_ms": 17793,
+    "runs_ms": [
+      17915,
+      17793,
+      18933
+    ],
+    "rows": 10000000,
+    "verified": true,
+    "output_sha256": "1da0a14cd0d60ac47b76a68a95eba1d46782802b33a248d8f227416ff5b857cc"
+  },
+  {
+    "name": "sema-vm",
+    "best_ms": 10026,
+    "runs_ms": [
+      10272,
+      10333,
+      10026
+    ],
+    "rows": 10000000,
+    "verified": true,
+    "output_sha256": "1da0a14cd0d60ac47b76a68a95eba1d46782802b33a248d8f227416ff5b857cc"
+  },
+  {
+    "name": "guile",
+    "best_ms": 5186,
+    "runs_ms": [
+      5186,
+      5212,
+      5201
+    ],
+    "rows": 10000000,
+    "verified": true,
+    "output_sha256": "1da0a14cd0d60ac47b76a68a95eba1d46782802b33a248d8f227416ff5b857cc"
+  },
+  {
+    "name": "gauche",
+    "best_ms": 16476,
+    "runs_ms": [
+      16483,
+      16476,
+      16536
+    ],
+    "rows": 10000000,
+    "verified": true,
+    "output_sha256": "1da0a14cd0d60ac47b76a68a95eba1d46782802b33a248d8f227416ff5b857cc"
+  },
+  {
+    "name": "janet",
+    "best_ms": 9950,
+    "runs_ms": [
+      10024,
+      9962,
+      9950
+    ],
+    "rows": 10000000,
+    "verified": true,
+    "output_sha256": "1da0a14cd0d60ac47b76a68a95eba1d46782802b33a248d8f227416ff5b857cc"
+  },
+  {
+    "name": "ecl",
+    "best_ms": 13599,
+    "runs_ms": [
+      14089,
+      13599,
+      13623
+    ],
+    "rows": 10000000,
+    "verified": true,
+    "output_sha256": "1da0a14cd0d60ac47b76a68a95eba1d46782802b33a248d8f227416ff5b857cc"
+  },
+  {
+    "name": "emacs",
+    "best_ms": 16219,
+    "runs_ms": [
+      18061,
+      16408,
+      16219
+    ],
+    "rows": 10000000,
+    "verified": true,
+    "output_sha256": "1da0a14cd0d60ac47b76a68a95eba1d46782802b33a248d8f227416ff5b857cc"
+  },
+  {
+    "name": "newlisp",
+    "best_ms": 8206,
+    "runs_ms": [
+      8206,
+      8207,
+      8213
+    ],
+    "rows": 10000000,
+    "verified": true,
+    "output_sha256": "1da0a14cd0d60ac47b76a68a95eba1d46782802b33a248d8f227416ff5b857cc"
+  }
+]

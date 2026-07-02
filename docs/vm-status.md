@@ -1,22 +1,22 @@
 # Bytecode VM Status
 
-> Last updated: 2026-03-11 (v1.12.0+)
+> Last updated: 2026-06-18 (tree-walker retired; VM is the sole evaluator)
 
 ## Current State
 
-The bytecode VM (`sema-vm` crate) is opt-in via `--vm` CLI flag. All known bugs are **fixed**. The VM is mature and passes all dual-eval tests — both backends produce identical results for all pure-computation features.
+The bytecode VM (`sema-vm` crate) is the **sole** execution backend. The tree-walking interpreter was retired and its source deleted; the VM is now the only evaluator. The `--tw` and `--vm` CLI flags were removed in 1.18.0 (there is only one evaluator). Async/concurrency features are VM-only by design.
 
-- **sema-vm unit tests:** 309 passing
-- **Dual-eval tests:** 812 test cases × 2 backends across 9 test files
-- **Total project tests:** 4,300+ passing, 0 failures
+- **sema-vm unit tests:** 524 passing
+- **Evaluator tests:** 840+ test cases across 11 test files (formerly dual-eval; now VM-only)
+- **Total project tests:** 4,300+ passing, 0 failures (4 ignored — see *Known Limitations* below)
 
 ## Architecture
 
 ```
 Source → Reader → Macro Expand → Lower (Expr<Spur>) → Optimize → Resolve (Expr<VarRef>) → Compile (bytecode) → VM Execute
-                  ↑ tree-walker                                                                         ↑
-                  └── defmacro evaluated here                                                           |
-                      before compilation                                           VM closures: same-VM CallFrame push
+                  ↑ VM-native                                                                            ↑
+                  └── defmacro expanded here (expand_for_vm_in                                           |
+                      in sema-eval) before compilation                            VM closures: same-VM CallFrame push
                                                                                    NativeFn fallback for stdlib HOF interop
 ```
 
@@ -47,9 +47,17 @@ Source → Reader → Macro Expand → Lower (Expr<Spur>) → Optimize → Resol
 
 **Per-instruction inline cache:** `LoadGlobal` (7 bytes: op + u32 spur + u16 cache_slot) and `CallGlobal` (9 bytes: op + u32 spur + u16 argc + u16 cache_slot) each get a dedicated cache slot in a side array. On hit (matching spur + env version), global access is a single array index — no HashMap lookup. Cache entries store `(spur_bits, version, value)` to guard against cross-VM closure slot collisions. Bytecode format version 2.
 
+## Known Limitations
+
+One structural bug found during the May 2026 audit remains documented as planned multi-session work, not a blocker:
+
+- **`.semac` bytecode loading is unsafe from untrusted sources** (audit finding C11). `validate_bytecode` does not abstract-interpret the instruction stream for stack balance; the VM's `pop_unchecked` (90+ call sites) assumes stack-balanced bytecode, so a hand-crafted `.semac` with a leading `Pop` triggers UB in release builds. Treat `.semac` files as trusted-source-only until the stack-depth verifier in `adr.md` #56 lands. See `limitations.md` #32.
+
+The May 2026 audit's other structural finding, **VM `set!` through stdlib HOF callbacks loses the mutation** (audit finding C1), is now **FIXED** (2026-06-18). `(let ((c 0)) (map (fn (x) (set! c (+ c x))) (list 1 2 3)) c)` now returns `6` on the VM. The fix routes HOF callbacks back into the running VM via a thread-local `CURRENT_VM` plus nested-frame execution (`run_nested_closure`), rather than the open-upvalue-runtime approach once sketched in `adr.md` #55. Two minor follow-ups remain deferred: `(type (fn (x) x))` still reports `:native-fn` on the VM (TW-2), and ~~VM caught-error maps are still missing `:stack-trace` (TW-1)~~ **FIXED** (2026-06-27) — caught errors now include `:stack-trace`. See `docs/deferred.md`.
+
 ## Resolved Bugs
 
-All 10 known bugs are fixed:
+All 10 original VM bugs from the early bring-up are fixed:
 
 | Bug                                                     | Problem                                                                                                            | Fix                                                                                             |
 | ------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------- |
@@ -66,9 +74,11 @@ All 10 known bugs are fixed:
 
 ## Performance
 
+> **Note (Jun 2026):** the numbers below are **pre-PGO** and from older runs. v1.19.2 shipped fat LTO (3–9%) and PGO (~25–29% on 1BRC, −11% to −40% on compute) in the release binaries — see [Performance Roadmap](performance-roadmap.md) §10/§13. Re-measure before relying on these.
+
 - **1BRC (10M rows, VM):** ~15.9s — dominated by Rc/drop (~35%), VM dispatch (16.5%), HashMap::clone (5.8%)
 - **Compute benchmarks (VM):** TAK 8.04s, deriv 1.84s (post-NaN-boxing)
-- **VM vs tree-walker:** ~1.7–2× faster on compute-heavy workloads
+- **VM vs (retired) tree-walker:** the VM was ~1.7–2× faster on compute-heavy workloads, which motivated retiring the tree-walker
 - **Janet comparison:** ~1.7× behind Janet on 1BRC (both are embeddable bytecode VMs, no JIT)
 - See [Performance Roadmap](performance-roadmap.md) for detailed analysis and optimization plan
 
@@ -76,5 +86,5 @@ All 10 known bugs are fixed:
 
 - **Tracing GC:** Replace Rc-based reference counting — estimated ~1.3× speedup
 - **Direct threading:** Computed goto dispatch — estimated 15–30% on tight loops
-- **Macro expansion caching:** Cache expanded macros to avoid redundant tree-walker evaluation
+- **Macro expansion caching:** Cache expanded macros to avoid redundant VM-native macro expansion
 - **Register-based VM:** Would reduce push/pop traffic but requires full rewrite

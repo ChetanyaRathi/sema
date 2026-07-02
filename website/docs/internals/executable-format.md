@@ -4,10 +4,6 @@ outline: [2, 3]
 
 # Bundled Executable Format
 
-::: tip Status: Implemented (Alpha)
-The bundled executable format is implemented and available via `sema build`. The format is not yet stable — breaking changes are expected before v1.0.
-:::
-
 ## Overview
 
 `sema build` compiles a Sema program into a standalone executable by embedding a VFS (Virtual File System) archive into the Sema runtime binary. The resulting binary is self-contained and requires no Sema installation to run.
@@ -32,6 +28,11 @@ sema build script.sema --include assets/      # bundle a directory (recursive)
 # Use a specific runtime binary
 sema build script.sema --runtime /path/to/sema
 
+# Cross-compile for another platform (downloads a cached runtime)
+sema build script.sema --target linux         # x86_64-unknown-linux-gnu
+sema build script.sema --target all           # every supported target
+sema build --list-targets                     # list targets and aliases
+
 # Run the resulting standalone executable
 ./myapp --name hello
 ```
@@ -42,11 +43,14 @@ sema build script.sema --runtime /path/to/sema
 |--------|-------------|
 | `-o, --output <path>` | Output executable path (default: filename without extension) |
 | `--include <path>...` | Additional files or directories to bundle (repeatable) |
-| `--runtime <path>` | Sema binary to use as runtime base (default: current executable) |
+| `--runtime <path>` | Sema binary to use as runtime base (default: current executable); conflicts with `--target` |
+| `--target <target>` | Target triple or alias (`linux`, `macos`, `windows`, …) for cross-compilation; `all` builds every supported target |
+| `--list-targets` | Show all supported target platforms and aliases |
+| `--no-cache` | Skip the cached runtime and re-download it (no effect for host-target builds, which never download) |
 
 ## Binary Layout
 
-The injection strategy varies by platform to preserve binary integrity and OS loader compatibility.
+The injection strategy varies by binary format — detected from the runtime binary's magic bytes, not the build host, so cross-compilation works from any platform — to preserve binary integrity and OS loader compatibility.
 
 ### Linux (ELF): Raw Append
 
@@ -255,8 +259,26 @@ Write operations (`file/write`, `file/append`, `file/delete`, etc.) always targe
    - Dynamic imports (non-literal paths) emit a warning
 3. **Collect** `--include` assets (directories are expanded recursively)
 4. **Build** VFS archive with metadata and CRC32 checksum
-5. **Inject** archive into runtime binary (platform-specific)
+5. **Inject** archive into runtime binary (format-aware: ELF append, Mach-O/PE via libsui)
 6. **Set** executable permissions on Unix
+
+## Cross-Compilation
+
+`sema build --target <target>` produces executables for other platforms. Supported targets (matching the cargo-dist release matrix):
+
+| Triple | Aliases |
+|--------|---------|
+| `aarch64-apple-darwin` | `macos`, `darwin` |
+| `x86_64-apple-darwin` | `macos-intel`, `darwin-intel`, `macos-x86_64` |
+| `x86_64-unknown-linux-gnu` | `linux` |
+| `aarch64-unknown-linux-gnu` | `linux-arm`, `linux-aarch64` |
+| `x86_64-pc-windows-msvc` | `windows`, `win` |
+
+`--target all` builds for every supported target, producing one `<name>-<triple>` executable each.
+
+Runtime binaries for non-host targets are downloaded from GitHub Releases (capped at 200 MB), verified against the published SHA256 checksum, and cached at `~/.sema/cache/runtimes/v{version}/{target}/sema[.exe]`. Cached runtimes are validated by magic bytes against the expected format for the target; `--no-cache` skips the cached copy and re-downloads. If the target matches the host, the local `sema` binary is used directly (no download, and `--no-cache` is a no-op). `SEMA_RUNTIME_BASE_URL` overrides the download location (for mirrors or air-gapped builds).
+
+Injection is format-aware rather than host-specific — `libsui` performs Mach-O ad-hoc signing in pure Rust, so e.g. macOS ARM64 binaries can be produced from Linux.
 
 ## Platform Notes
 
@@ -272,6 +294,7 @@ Write operations (`file/write`, `file/append`, `file/delete`, etc.) always targe
 |-----------|------|
 | Archive serialization | `crates/sema/src/archive.rs` |
 | Import tracer | `crates/sema/src/import_tracer.rs` |
+| Cross-compilation (runtime download/cache) | `crates/sema/src/cross_compile.rs` |
 | Build command | `crates/sema/src/main.rs` |
 | VFS core | `crates/sema-core/src/vfs.rs` |
 | VFS I/O interception | `crates/sema-stdlib/src/io.rs` |
@@ -280,7 +303,6 @@ Write operations (`file/write`, `file/append`, `file/delete`, etc.) always targe
 ## Future Work
 
 - **Compression** — optional zstd/deflate compression for VFS entries
-- **Cross-compilation** — pre-download runtimes to `~/.sema/cache/runtimes/`
-- **`sema.toml` manifest** — declare includes, metadata, and build options in config
-- **Runtime-only binary** — strip tree-walker for smaller executables (requires architectural changes)
+- **Build options in `sema.toml`** — declare includes, metadata, and build options in the project manifest (`sema.toml` exists today for dependencies and formatter config, but `sema build` does not read it)
+- **Slimmer runtime** — trim unused runtime components for smaller executables (requires architectural changes)
 - **Code signing** — proper Apple notarization / Authenticode signing integration

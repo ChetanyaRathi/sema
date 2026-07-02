@@ -129,81 +129,49 @@ fn lower_list(items: &[Value], tail: bool) -> Result<CoreExpr, SemaError> {
     let args = &items[1..];
 
     if let Some(spur) = head.as_symbol_spur() {
-        let s = spur;
-        if s == sf("quote") {
-            return lower_quote(args);
-        } else if s == sf("if") {
-            return lower_if(args, tail);
-        } else if s == sf("cond") {
-            return lower_cond(args, tail);
-        } else if s == sf("define") || s == sf("def") {
-            return lower_define(args);
-        } else if s == sf("defun") || s == sf("defn") {
-            return lower_defun(args);
-        } else if s == sf("set!") {
-            return lower_set(args);
-        } else if s == sf("lambda") || s == sf("fn") {
-            return lower_lambda(args, None);
-        } else if s == sf("let") {
-            return lower_let(args, tail);
-        } else if s == sf("let*") {
-            return lower_let_star(args, tail);
-        } else if s == sf("letrec") {
-            return lower_letrec(args, tail);
-        } else if s == sf("begin") || s == sf("progn") {
-            return lower_begin(args, tail);
-        } else if s == sf("do") {
-            return lower_do(args, tail);
-        } else if s == sf("and") {
-            return lower_and(args, tail);
-        } else if s == sf("or") {
-            return lower_or(args, tail);
-        } else if s == sf("when") {
-            return lower_when(args, tail);
-        } else if s == sf("unless") {
-            return lower_unless(args, tail);
-        } else if s == sf("while") {
-            return lower_while(args);
-        } else if s == sf("defmacro") {
-            return lower_defmacro(args);
-        } else if s == sf("quasiquote") {
-            return lower_quasiquote(args);
-        } else if s == sf("throw") {
-            return lower_throw(args);
-        } else if s == sf("try") {
-            return lower_try(args, tail);
-        } else if s == sf("case") {
-            return lower_case(args, tail);
-        } else if s == sf("eval") {
-            return lower_eval(args);
-        } else if s == sf("macroexpand") {
-            return lower_macroexpand(args);
-        } else if s == sf("module") {
-            return lower_module(args, tail);
-        } else if s == sf("import") {
-            return lower_import(args);
-        } else if s == sf("load") {
-            return lower_load(args);
-        } else if s == sf("prompt") {
-            return lower_prompt(args);
-        } else if s == sf("message") {
-            return lower_message(args);
-        } else if s == sf("deftool") {
-            return lower_deftool(args);
-        } else if s == sf("defagent") {
-            return lower_defagent(args);
-        } else if s == sf("delay") {
-            return lower_delay(args);
-        } else if s == sf("force") {
-            return lower_force(args);
-        } else if s == sf("define-record-type") {
-            return lower_define_record_type(args);
-        } else if s == sf("match") {
-            return lower_match(args, tail);
-        } else if s == sf("defmulti") {
-            return lower_defmulti(args);
-        } else if s == sf("defmethod") {
-            return lower_defmethod(args);
+        if let Some(form) = special_form_for(spur) {
+            return match form {
+                SpecialForm::Quote => lower_quote(args),
+                SpecialForm::If => lower_if(args, tail),
+                SpecialForm::Cond => lower_cond(args, tail),
+                SpecialForm::Define => lower_define(args),
+                SpecialForm::Defun => lower_defun(args),
+                SpecialForm::Set => lower_set(args),
+                SpecialForm::Lambda => lower_lambda(args, None),
+                SpecialForm::Let => lower_let(args, tail),
+                SpecialForm::LetStar => lower_let_star(args, tail),
+                SpecialForm::Letrec => lower_letrec(args, tail),
+                SpecialForm::Begin => lower_begin(args, tail),
+                SpecialForm::Do => lower_do(args, tail),
+                SpecialForm::And => lower_and(args, tail),
+                SpecialForm::Or => lower_or(args, tail),
+                SpecialForm::When => lower_when(args, tail),
+                SpecialForm::Unless => lower_unless(args, tail),
+                SpecialForm::While => lower_while(args),
+                SpecialForm::Defmacro => lower_defmacro(args),
+                SpecialForm::Quasiquote => lower_quasiquote(args),
+                SpecialForm::Throw => lower_throw(args),
+                SpecialForm::Try => lower_try(args, tail),
+                SpecialForm::Case => lower_case(args, tail),
+                SpecialForm::Eval => lower_eval(args),
+                SpecialForm::Macroexpand => lower_macroexpand(args),
+                SpecialForm::Module => lower_module(args, tail),
+                SpecialForm::Import => lower_import(args),
+                SpecialForm::Load => lower_load(args),
+                SpecialForm::Prompt => lower_prompt(args),
+                SpecialForm::Message => lower_message(args),
+                SpecialForm::Deftool => lower_deftool(args),
+                SpecialForm::Defagent => lower_defagent(args),
+                SpecialForm::Delay => lower_delay(args),
+                SpecialForm::Force => lower_force(args),
+                SpecialForm::DefineRecordType => lower_define_record_type(args),
+                SpecialForm::Match => lower_match(args, tail, false),
+                SpecialForm::MatchStar => lower_match(args, tail, true),
+                SpecialForm::Defmulti => lower_defmulti(args),
+                SpecialForm::Defmethod => lower_defmethod(args),
+                SpecialForm::Async => lower_async(args),
+                SpecialForm::Await => lower_await(args),
+            };
         }
     }
 
@@ -220,9 +188,122 @@ fn lower_list(items: &[Value], tail: bool) -> Result<CoreExpr, SemaError> {
     })
 }
 
-/// Intern a string and return its Spur. Used for special form name matching.
-fn sf(name: &str) -> Spur {
-    intern(name)
+/// The set of special forms recognized by the lowerer. Each variant maps to a
+/// dedicated `lower_*` handler in [`lower_list`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SpecialForm {
+    Quote,
+    If,
+    Cond,
+    Define,
+    Defun,
+    Set,
+    Lambda,
+    Let,
+    LetStar,
+    Letrec,
+    Begin,
+    Do,
+    And,
+    Or,
+    When,
+    Unless,
+    While,
+    Defmacro,
+    Quasiquote,
+    Throw,
+    Try,
+    Case,
+    Eval,
+    Macroexpand,
+    Module,
+    Import,
+    Load,
+    Prompt,
+    Message,
+    Deftool,
+    Defagent,
+    Delay,
+    Force,
+    DefineRecordType,
+    Match,
+    MatchStar,
+    Defmulti,
+    Defmethod,
+    Async,
+    Await,
+}
+
+/// The canonical (name, form) table. Names that share a handler (e.g. `define`
+/// and `def`) appear as separate rows mapping to the same [`SpecialForm`].
+const SPECIAL_FORM_NAMES: &[(&str, SpecialForm)] = &[
+    ("quote", SpecialForm::Quote),
+    ("if", SpecialForm::If),
+    ("cond", SpecialForm::Cond),
+    ("define", SpecialForm::Define),
+    ("def", SpecialForm::Define),
+    ("defun", SpecialForm::Defun),
+    ("defn", SpecialForm::Defun),
+    ("set!", SpecialForm::Set),
+    ("lambda", SpecialForm::Lambda),
+    ("fn", SpecialForm::Lambda),
+    ("let", SpecialForm::Let),
+    ("let*", SpecialForm::LetStar),
+    ("letrec", SpecialForm::Letrec),
+    ("begin", SpecialForm::Begin),
+    ("progn", SpecialForm::Begin),
+    ("do", SpecialForm::Do),
+    ("and", SpecialForm::And),
+    ("or", SpecialForm::Or),
+    ("when", SpecialForm::When),
+    ("unless", SpecialForm::Unless),
+    ("while", SpecialForm::While),
+    ("defmacro", SpecialForm::Defmacro),
+    ("quasiquote", SpecialForm::Quasiquote),
+    ("throw", SpecialForm::Throw),
+    ("try", SpecialForm::Try),
+    ("case", SpecialForm::Case),
+    ("eval", SpecialForm::Eval),
+    ("macroexpand", SpecialForm::Macroexpand),
+    ("module", SpecialForm::Module),
+    ("import", SpecialForm::Import),
+    ("load", SpecialForm::Load),
+    ("prompt", SpecialForm::Prompt),
+    ("message", SpecialForm::Message),
+    ("deftool", SpecialForm::Deftool),
+    ("defagent", SpecialForm::Defagent),
+    ("delay", SpecialForm::Delay),
+    ("force", SpecialForm::Force),
+    ("define-record-type", SpecialForm::DefineRecordType),
+    ("match", SpecialForm::Match),
+    ("match*", SpecialForm::MatchStar),
+    ("defmulti", SpecialForm::Defmulti),
+    ("defmethod", SpecialForm::Defmethod),
+    ("async", SpecialForm::Async),
+    ("await", SpecialForm::Await),
+];
+
+thread_local! {
+    /// Per-thread cache of special-form name `Spur`s.
+    ///
+    /// `Spur` ids are only meaningful within the `thread_local!` interner that
+    /// produced them (see `sema_core::INTERNER`), so this cache MUST be
+    /// thread-local too — a process-global cache would resolve to garbage on
+    /// any thread other than the one that populated it. It is built lazily on
+    /// first use of each thread and reused for every subsequent lowering call,
+    /// replacing ~40 interner round-trips per list form with one map lookup.
+    static SPECIAL_FORMS: HashMap<Spur, SpecialForm> = {
+        let mut map = HashMap::with_capacity(SPECIAL_FORM_NAMES.len());
+        for &(name, form) in SPECIAL_FORM_NAMES {
+            map.insert(intern(name), form);
+        }
+        map
+    };
+}
+
+/// Resolve a head-position symbol's `Spur` to its [`SpecialForm`], if any.
+fn special_form_for(spur: Spur) -> Option<SpecialForm> {
+    SPECIAL_FORMS.with(|m| m.get(&spur).copied())
 }
 
 fn require_symbol(val: &Value, context: &str) -> Result<Spur, SemaError> {
@@ -416,7 +497,7 @@ fn lower_if(args: &[Value], tail: bool) -> Result<CoreExpr, SemaError> {
 }
 
 fn lower_cond(args: &[Value], tail: bool) -> Result<CoreExpr, SemaError> {
-    let else_spur = sf("else");
+    let else_spur = intern("else");
     lower_cond_clauses(args, 0, tail, else_spur)
 }
 
@@ -431,7 +512,8 @@ fn lower_cond_clauses(
     }
     let clause = require_list(&clauses[idx], "cond")?;
     if clause.is_empty() {
-        return Err(SemaError::eval("cond clause must not be empty"));
+        return Err(SemaError::eval("cond: clause must not be empty")
+            .with_hint("each clause is (test body...) or (else body...)"));
     }
 
     let is_else = clause[0].as_symbol_spur().is_some_and(|s| s == else_spur);
@@ -497,6 +579,7 @@ fn lower_define(args: &[Value]) -> Result<CoreExpr, SemaError> {
                     rest,
                     body,
                     upvalues: vec![],
+                    upvalue_names: vec![],
                     n_locals: 0,
                 })),
             ))
@@ -538,6 +621,7 @@ fn lower_defun(args: &[Value]) -> Result<CoreExpr, SemaError> {
             rest,
             body,
             upvalues: vec![],
+            upvalue_names: vec![],
             n_locals: 0,
         })),
     ))
@@ -609,6 +693,7 @@ fn lower_lambda(args: &[Value], name: Option<Spur>) -> Result<CoreExpr, SemaErro
             rest: rest_spur,
             body,
             upvalues: vec![],
+            upvalue_names: vec![],
             n_locals: 0,
         }))
     } else {
@@ -622,6 +707,7 @@ fn lower_lambda(args: &[Value], name: Option<Spur>) -> Result<CoreExpr, SemaErro
             rest,
             body,
             upvalues: vec![],
+            upvalue_names: vec![],
             n_locals: 0,
         }))
     }
@@ -663,6 +749,7 @@ fn lower_let(args: &[Value], tail: bool) -> Result<CoreExpr, SemaError> {
                     rest: None,
                     body,
                     upvalues: vec![],
+                    upvalue_names: vec![],
                     n_locals: 0,
                 }),
             )],
@@ -828,7 +915,7 @@ fn lower_while(args: &[Value]) -> Result<CoreExpr, SemaError> {
     }
     // Desugar (while test body...) into (do () ((not test)) body...)
     let test = CoreExpr::Call {
-        func: Box::new(CoreExpr::Var(sf("not"))),
+        func: Box::new(CoreExpr::Var(intern("not"))),
         args: vec![lower_expr(&args[0], false)?],
         tail: false,
     };
@@ -888,6 +975,44 @@ fn lower_defmethod(args: &[Value]) -> Result<CoreExpr, SemaError> {
     })
 }
 
+/// (async body ...) → wrap body in zero-arg lambda, call async/spawn
+fn lower_async(args: &[Value]) -> Result<CoreExpr, SemaError> {
+    if args.is_empty() {
+        return Err(SemaError::arity("async", "1+", 0));
+    }
+    let body = args
+        .iter()
+        .map(|a| lower_expr(a, false))
+        .collect::<Result<Vec<_>, _>>()?;
+    let thunk = CoreExpr::Lambda(LambdaDef {
+        name: None,
+        params: vec![],
+        rest: None,
+        body,
+        upvalues: vec![],
+        upvalue_names: vec![],
+        n_locals: 0,
+    });
+    Ok(CoreExpr::Call {
+        func: Box::new(CoreExpr::Var(intern("async/spawn"))),
+        args: vec![thunk],
+        tail: false,
+    })
+}
+
+/// (await expr) → call async/await with the expression
+fn lower_await(args: &[Value]) -> Result<CoreExpr, SemaError> {
+    if args.len() != 1 {
+        return Err(SemaError::arity("await", "1", args.len()));
+    }
+    let expr = lower_expr(&args[0], false)?;
+    Ok(CoreExpr::Call {
+        func: Box::new(CoreExpr::Var(intern("async/await"))),
+        args: vec![expr],
+        tail: false,
+    })
+}
+
 fn is_auto_gensym(sym: &str) -> bool {
     sym.len() > 1 && sym.ends_with('#') && !sym.ends_with("##")
 }
@@ -930,84 +1055,120 @@ fn expand_quasiquote(
                     return lower_expr(&items[1], false);
                 }
             }
-            // Expand each element, handling unquote-splicing
-            let mut has_splice = false;
-            for item in items.iter() {
-                if let Some(inner) = item.as_list() {
-                    if !inner.is_empty() {
-                        if let Some(sym) = inner[0].as_symbol() {
-                            if sym == "unquote-splicing" {
-                                has_splice = true;
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-
-            if has_splice {
-                // Build using append: collect segments, splice where needed
-                let mut segments: Vec<CoreExpr> = Vec::new();
-                let mut current_list: Vec<CoreExpr> = Vec::new();
-
-                for item in items.iter() {
-                    if let Some(inner) = item.as_list() {
-                        if !inner.is_empty() {
-                            if let Some(sym) = inner[0].as_symbol() {
-                                if sym == "unquote-splicing" {
-                                    if inner.len() != 2 {
-                                        return Err(SemaError::arity(
-                                            "unquote-splicing",
-                                            "1",
-                                            inner.len() - 1,
-                                        ));
-                                    }
-                                    // Flush current_list as a MakeList segment
-                                    if !current_list.is_empty() {
-                                        segments.push(CoreExpr::MakeList(std::mem::take(
-                                            &mut current_list,
-                                        )));
-                                    }
-                                    // The spliced expr evaluates to a list
-                                    segments.push(lower_expr(&inner[1], false)?);
-                                    continue;
-                                }
-                            }
-                        }
-                    }
-                    current_list.push(expand_quasiquote(item, gensym_map)?);
-                }
-                if !current_list.is_empty() {
-                    segments.push(CoreExpr::MakeList(current_list));
-                }
-
-                // Build (append seg1 seg2 ...) call
-                if segments.len() == 1 {
-                    Ok(segments.into_iter().next().unwrap())
-                } else {
-                    Ok(CoreExpr::Call {
-                        func: Box::new(CoreExpr::Var(intern("append"))),
-                        args: segments,
-                        tail: false,
-                    })
-                }
-            } else {
-                // No splicing — just expand each element
-                let exprs = items
-                    .iter()
-                    .map(|item| expand_quasiquote(item, gensym_map))
-                    .collect::<Result<_, _>>()?;
-                Ok(CoreExpr::MakeList(exprs))
-            }
+            expand_quasiquote_seq(&items, gensym_map, false)
         }
         ValueView::Vector(items) => {
-            let exprs = items
+            // Same splicing semantics as lists (EVAL-1): `[1 ,@xs 2]` must splice.
+            expand_quasiquote_seq(&items, gensym_map, true)
+        }
+        ValueView::Map(map) => {
+            // Honor unquotes inside map keys/values (EVAL-2). Splicing into a map
+            // isn't meaningful, so only `(unquote x)` is handled (via recursion);
+            // a top-level `(unquote-splicing ...)` key/value errors clearly rather
+            // than leaking literal `(unquote-splicing ...)` data.
+            let entries = map
                 .iter()
-                .map(|item| expand_quasiquote(item, gensym_map))
-                .collect::<Result<_, _>>()?;
-            Ok(CoreExpr::MakeVector(exprs))
+                .map(|(k, v)| {
+                    reject_splice_in_map(k)?;
+                    reject_splice_in_map(v)?;
+                    Ok((
+                        expand_quasiquote(k, gensym_map)?,
+                        expand_quasiquote(v, gensym_map)?,
+                    ))
+                })
+                .collect::<Result<Vec<_>, SemaError>>()?;
+            Ok(CoreExpr::MakeMap(entries))
         }
         _ => Ok(CoreExpr::Quote(val.clone())),
+    }
+}
+
+/// Error if `val` is a top-level `(unquote-splicing ...)` form. Used to guard
+/// map keys/values inside quasiquote, where splicing has no meaning (EVAL-2).
+fn reject_splice_in_map(val: &Value) -> Result<(), SemaError> {
+    if let Some(items) = val.as_list() {
+        if let Some(sym) = items.first().and_then(|v| v.as_symbol()) {
+            if sym == "unquote-splicing" {
+                return Err(SemaError::eval(
+                    "unquote-splicing is not allowed in a quasiquoted map key or value",
+                )
+                .with_hint("splicing only makes sense inside a list or vector"));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Expand a quasiquote sequence (list or vector elements), handling
+/// `unquote-splicing`. When `as_vector` is set the result is converted to a
+/// vector (via `list->vector`) so vectors splice the same way lists do.
+fn expand_quasiquote_seq(
+    items: &[Value],
+    gensym_map: &mut HashMap<String, String>,
+    as_vector: bool,
+) -> Result<CoreExpr, SemaError> {
+    let has_splice = items.iter().any(|item| {
+        item.as_list()
+            .and_then(|inner| inner.first().and_then(|h| h.as_symbol()))
+            .is_some_and(|sym| sym == "unquote-splicing")
+    });
+
+    if !has_splice {
+        let exprs = items
+            .iter()
+            .map(|item| expand_quasiquote(item, gensym_map))
+            .collect::<Result<_, _>>()?;
+        return Ok(if as_vector {
+            CoreExpr::MakeVector(exprs)
+        } else {
+            CoreExpr::MakeList(exprs)
+        });
+    }
+
+    // Build using append: collect segments, splice where needed.
+    let mut segments: Vec<CoreExpr> = Vec::new();
+    let mut current_list: Vec<CoreExpr> = Vec::new();
+    for item in items.iter() {
+        if let Some(inner) = item.as_list() {
+            if !inner.is_empty() {
+                if let Some(sym) = inner[0].as_symbol() {
+                    if sym == "unquote-splicing" {
+                        if inner.len() != 2 {
+                            return Err(SemaError::arity("unquote-splicing", "1", inner.len() - 1));
+                        }
+                        if !current_list.is_empty() {
+                            segments.push(CoreExpr::MakeList(std::mem::take(&mut current_list)));
+                        }
+                        segments.push(lower_expr(&inner[1], false)?);
+                        continue;
+                    }
+                }
+            }
+        }
+        current_list.push(expand_quasiquote(item, gensym_map)?);
+    }
+    if !current_list.is_empty() {
+        segments.push(CoreExpr::MakeList(current_list));
+    }
+
+    let list_expr = if segments.len() == 1 {
+        segments.into_iter().next().unwrap()
+    } else {
+        CoreExpr::Call {
+            func: Box::new(CoreExpr::Var(intern("append"))),
+            args: segments,
+            tail: false,
+        }
+    };
+
+    if as_vector {
+        Ok(CoreExpr::Call {
+            func: Box::new(CoreExpr::Var(intern("list->vector"))),
+            args: vec![list_expr],
+            tail: false,
+        })
+    } else {
+        Ok(list_expr)
     }
 }
 
@@ -1022,7 +1183,7 @@ fn lower_try(args: &[Value], tail: bool) -> Result<CoreExpr, SemaError> {
     if args.is_empty() {
         return Err(SemaError::arity("try", "1+", 0));
     }
-    let catch_spur = sf("catch");
+    let catch_spur = intern("catch");
     let last = &args[args.len() - 1];
     let catch_form = require_list(last, "try")?;
     if catch_form.is_empty() {
@@ -1065,7 +1226,7 @@ fn lower_case(args: &[Value], tail: bool) -> Result<CoreExpr, SemaError> {
 }
 
 fn lower_case_clauses(clauses: &[Value], key_var: Spur, tail: bool) -> Result<CoreExpr, SemaError> {
-    let else_spur = sf("else");
+    let else_spur = intern("else");
     if clauses.is_empty() {
         return Ok(CoreExpr::Const(Value::nil()));
     }
@@ -1127,13 +1288,17 @@ fn lower_case_clauses(clauses: &[Value], key_var: Spur, tail: bool) -> Result<Co
 
 /// Lower `(match expr [pattern body...] [pattern when guard body...] ...)`
 /// into nested if/let* chains calling `__vm-try-match`.
-fn lower_match(args: &[Value], tail: bool) -> Result<CoreExpr, SemaError> {
+/// `lenient` selects the no-match behavior: strict `match` (false) raises
+/// `:match-failed` when no clause matches, while `match*` (true) returns nil.
+fn lower_match(args: &[Value], tail: bool, lenient: bool) -> Result<CoreExpr, SemaError> {
+    let form = if lenient { "match*" } else { "match" };
     if args.len() < 2 {
-        return Err(SemaError::arity("match", "2+", args.len()));
+        return Err(SemaError::arity(form, "2+", args.len()));
     }
     let scrut = lower_expr(&args[0], false)?;
     let scrut_tmp = gensym("scrut");
     let try_match_spur = intern("__vm-try-match");
+    let match_failed_spur = intern("__vm-match-failed");
     let get_spur = intern("get");
     let nil_q_spur = intern("nil?");
     let when_spur = intern("when");
@@ -1142,10 +1307,12 @@ fn lower_match(args: &[Value], tail: bool) -> Result<CoreExpr, SemaError> {
         &args[1..],
         scrut_tmp,
         try_match_spur,
+        match_failed_spur,
         get_spur,
         nil_q_spur,
         when_spur,
         tail,
+        lenient,
     )?;
 
     Ok(CoreExpr::Let {
@@ -1154,17 +1321,29 @@ fn lower_match(args: &[Value], tail: bool) -> Result<CoreExpr, SemaError> {
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn lower_match_clauses(
     clauses: &[Value],
     scrut_var: Spur,
     try_match_spur: Spur,
+    match_failed_spur: Spur,
     get_spur: Spur,
     nil_q_spur: Spur,
     when_spur: Spur,
     tail: bool,
+    lenient: bool,
 ) -> Result<CoreExpr, SemaError> {
     if clauses.is_empty() {
-        return Ok(CoreExpr::Const(Value::nil()));
+        // No clause matched. `match*` is lenient (nil); `match` raises via the
+        // `__vm-match-failed` helper, which carries the unmatched value.
+        if lenient {
+            return Ok(CoreExpr::Const(Value::nil()));
+        }
+        return Ok(CoreExpr::Call {
+            func: Box::new(CoreExpr::Var(match_failed_spur)),
+            args: vec![CoreExpr::Var(scrut_var)],
+            tail: false,
+        });
     }
 
     let clause = if let Some(l) = clauses[0].as_list() {
@@ -1255,10 +1434,12 @@ fn lower_match_clauses(
             &clauses[1..],
             scrut_var,
             try_match_spur,
+            match_failed_spur,
             get_spur,
             nil_q_spur,
             when_spur,
             tail,
+            lenient,
         )?;
         // Need var bindings available for guard eval too
         let guard_body = CoreExpr::If {
@@ -1283,10 +1464,12 @@ fn lower_match_clauses(
         &clauses[1..],
         scrut_var,
         try_match_spur,
+        match_failed_spur,
         get_spur,
         nil_q_spur,
         when_spur,
         tail,
+        lenient,
     )?;
 
     // Build: (let ((map_tmp (try-match ...))) (if (nil? map_tmp) else then))
@@ -1373,7 +1556,7 @@ fn lower_module(args: &[Value], tail: bool) -> Result<CoreExpr, SemaError> {
     }
     let name = require_symbol(&args[0], "module")?;
     let export_list = require_list(&args[1], "module")?;
-    let export_spur = sf("export");
+    let export_spur = intern("export");
     if export_list.is_empty()
         || export_list[0]
             .as_symbol_spur()
@@ -1499,6 +1682,7 @@ fn lower_delay(args: &[Value]) -> Result<CoreExpr, SemaError> {
         rest: None,
         body: vec![body],
         upvalues: vec![],
+        upvalue_names: vec![],
         n_locals: 0,
     });
     Ok(CoreExpr::Call {
@@ -1585,6 +1769,84 @@ mod tests {
         match lower_str("\"hello\"") {
             CoreExpr::Const(v) => assert_eq!(v, Value::string("hello")),
             other => panic!("expected Const, got {other:?}"),
+        }
+    }
+
+    /// Regression guard for the per-thread special-form cache: this list is
+    /// maintained INDEPENDENTLY of `SPECIAL_FORM_NAMES`, so if a form is ever
+    /// dropped from that table it would silently lower as a plain function call
+    /// — and this test fails instead. Keep both in sync when adding a form.
+    #[test]
+    fn test_all_special_forms_recognized() {
+        let names = [
+            "quote",
+            "if",
+            "cond",
+            "define",
+            "def",
+            "defun",
+            "defn",
+            "set!",
+            "lambda",
+            "fn",
+            "let",
+            "let*",
+            "letrec",
+            "begin",
+            "progn",
+            "do",
+            "and",
+            "or",
+            "when",
+            "unless",
+            "while",
+            "defmacro",
+            "quasiquote",
+            "throw",
+            "try",
+            "case",
+            "eval",
+            "macroexpand",
+            "module",
+            "import",
+            "load",
+            "prompt",
+            "message",
+            "deftool",
+            "defagent",
+            "delay",
+            "force",
+            "define-record-type",
+            "match",
+            "match*",
+            "defmulti",
+            "defmethod",
+            "async",
+            "await",
+        ];
+        for name in names {
+            assert!(
+                special_form_for(intern(name)).is_some(),
+                "special form `{name}` is not recognized — missing from SPECIAL_FORM_NAMES?"
+            );
+        }
+    }
+
+    #[test]
+    fn test_lower_match_and_match_star_distinct() {
+        // Both must lower as special forms (not function calls), and to the
+        // right variant. A `match`/`match*` that lowered to a Call would mean the
+        // cache table lost the entry.
+        assert_eq!(special_form_for(intern("match")), Some(SpecialForm::Match));
+        assert_eq!(
+            special_form_for(intern("match*")),
+            Some(SpecialForm::MatchStar)
+        );
+        // Sanity: neither lowers to a Call whose head is the literal symbol.
+        for src in ["(match 1 (1 :a))", "(match* 1 (1 :a))"] {
+            if let CoreExpr::Call { .. } = lower_str(src) {
+                panic!("{src} wrongly lowered as a function call");
+            }
         }
     }
 

@@ -6,6 +6,8 @@ outline: [2, 3]
 
 Sema is a Scheme-like Lisp where prompts are s-expressions, conversations are persistent data structures, and LLM calls are just another form of evaluation. It combines a Scheme core with Clojure-style keywords (`:foo`), map literals (`{:key val}`), and vector literals (`[1 2 3]`).
 
+> Sema takes its name from Ancient Greek *sêma* (σῆμα), a sign or token of meaning — the same root as *semantics*, *semaphore*, and *semiotics*.
+
 ## Why Sema?
 
 - **LLMs as language primitives** — prompts, messages, conversations, tools, and agents are first-class data types, not string templates bolted on
@@ -22,7 +24,7 @@ Install pre-built binaries (no Rust required):
 curl -fsSL https://sema-lang.com/install.sh | sh
 
 # Windows (PowerShell)
-powershell -ExecutionPolicy ByPass -c "irm https://github.com/HelgeSverre/sema/releases/latest/download/sema-lang-installer.ps1 | iex"
+powershell -ExecutionPolicy ByPass -c "irm https://sema-lang.com/install.ps1 | iex"
 
 # Homebrew (macOS / Linux)
 brew install helgesverre/tap/sema-lang
@@ -111,11 +113,12 @@ sema> (:name person)
 ### Persistent Conversations
 
 ```sema
+;; Each conversation/say makes a real LLM call, threading prior turns as history.
 (define conv (conversation/new {:model "claude-haiku-4-5-20251001"}))
 (define conv (conversation/say conv "Remember: the secret number is 7"))
 (define conv (conversation/say conv "What is the secret number?"))
 (conversation/last-reply conv)
-; => "The secret number is 7."
+; => the model's reply, e.g. "The secret number is 7." — it recalls the earlier turn
 ```
 
 ## What's Next?

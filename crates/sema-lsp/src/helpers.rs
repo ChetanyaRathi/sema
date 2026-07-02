@@ -45,11 +45,31 @@ pub fn utf16_to_byte_offset(line: &str, utf16_offset: u32) -> usize {
     line.len()
 }
 
+/// Convert a byte offset in a UTF-8 string to a 0-indexed LSP UTF-16 `character`
+/// offset. LSP `Position.character` counts UTF-16 code units, not bytes; this is
+/// the conversion used when source-scanning machinery yields byte offsets that
+/// must be reported back to the editor. A byte offset past the end (or not on a
+/// char boundary) counts whole chars up to it.
+pub fn byte_offset_to_utf16(line: &str, byte_offset: usize) -> u32 {
+    let mut units = 0u32;
+    for (byte_idx, ch) in line.char_indices() {
+        if byte_idx >= byte_offset {
+            return units;
+        }
+        units += ch.len_utf16() as u32;
+    }
+    units
+}
+
 /// Look up the LSP Range for an expression via its Rc pointer in the SpanMap.
-pub(crate) fn expr_range(expr: &sema_core::Value, span_map: &SpanMap) -> Option<Range> {
+pub(crate) fn expr_range(
+    expr: &sema_core::Value,
+    span_map: &SpanMap,
+    lines: &[&str],
+) -> Option<Range> {
     let rc = expr.as_list_rc()?;
     let ptr = Rc::as_ptr(&rc) as usize;
-    span_map.get(&ptr).map(span_to_range)
+    span_map.get(&ptr).map(|s| span_to_range(s, lines))
 }
 
 /// Look up the raw Span for an expression via its Rc pointer in the SpanMap.
@@ -59,13 +79,125 @@ pub(crate) fn expr_span<'a>(expr: &sema_core::Value, span_map: &'a SpanMap) -> O
     span_map.get(&ptr)
 }
 
+/// The text of line `idx` (0-based) for an LSP position. Unlike `str::lines()`, this
+/// addresses the trailing empty line produced by a final `\n` (where the cursor sits
+/// when typing a new top-level form) and strips a trailing `\r`.
+pub(crate) fn line_at(text: &str, idx: usize) -> Option<&str> {
+    text.split('\n')
+        .nth(idx)
+        .map(|l| l.strip_suffix('\r').unwrap_or(l))
+}
+
 /// Check if `inner` span is fully contained within `outer` span.
 pub(crate) fn span_contains(outer: &Span, inner: &Span) -> bool {
-    let inner_start = (inner.line, inner.col);
-    let inner_end = (inner.end_line, inner.end_col);
-    let outer_start = (outer.line, outer.col);
-    let outer_end = (outer.end_line, outer.end_col);
-    inner_start >= outer_start && inner_end <= outer_end
+    outer.contains(inner)
+}
+
+/// Drop symbol occurrences that sit inside quoted (data) regions — a `(quote …)` form,
+/// or the non-unquoted parts of a `(quasiquote …)`. Quoted symbols are DATA, not code
+/// references: including them makes rename/references/highlight rewrite quoted literals
+/// (`(rename foo bar)` would silently rewrite `'(foo)` and change the program's meaning).
+pub(crate) fn filter_quoted_symbol_spans(
+    ast: &[sema_core::Value],
+    span_map: &SpanMap,
+    symbol_spans: Vec<(String, Span)>,
+) -> Vec<(String, Span)> {
+    let mut excl: Vec<Span> = Vec::new(); // quoted regions (data)
+    let mut reincl: Vec<Span> = Vec::new(); // `,x` / `,@x` holes inside quasiquote (code)
+    for e in ast {
+        collect_quote_regions(e, span_map, &symbol_spans, false, &mut excl, &mut reincl);
+    }
+    if excl.is_empty() {
+        return symbol_spans;
+    }
+    symbol_spans
+        .into_iter()
+        .filter(|(_, s)| {
+            let quoted = excl.iter().any(|q| span_contains(q, s))
+                && !reincl.iter().any(|u| span_contains(u, s));
+            !quoted
+        })
+        .collect()
+}
+
+/// The span covering a quoted/unquoted ARGUMENT. The `'`/`,` head span only covers the
+/// glyph, so the data is the argument's own extent: a list's `expr_span`, or a bare
+/// symbol's token — which begins exactly where the head glyph ends.
+fn quoted_arg_span(
+    arg: &sema_core::Value,
+    span_map: &SpanMap,
+    symbol_spans: &[(String, Span)],
+    head_span: &Span,
+) -> Option<Span> {
+    if let Some(s) = expr_span(arg, span_map) {
+        return Some(*s);
+    }
+    if arg.as_symbol().is_some() {
+        return symbol_spans
+            .iter()
+            .find(|(_, sp)| sp.line == head_span.end_line && sp.col == head_span.end_col)
+            .map(|(_, sp)| *sp);
+    }
+    None
+}
+
+/// Recursively mark quoted regions (and the unquoted holes inside quasiquote) for
+/// [`filter_quoted_symbol_spans`]. A plain `(quote …)` is wholly data; `(quasiquote …)`
+/// is data except inside `(unquote …)` / `(unquote-splicing …)`, which is code again.
+fn collect_quote_regions(
+    expr: &sema_core::Value,
+    span_map: &SpanMap,
+    symbol_spans: &[(String, Span)],
+    in_quote: bool,
+    excl: &mut Vec<Span>,
+    reincl: &mut Vec<Span>,
+) {
+    let Some(items) = expr.as_list() else {
+        return;
+    };
+    let head = items.first().and_then(|v| v.as_symbol());
+    let form_span = expr_span(expr, span_map).copied();
+    match head.as_deref() {
+        Some("quote") if !in_quote => {
+            if let Some(fs) = form_span {
+                for arg in items.iter().skip(1) {
+                    if let Some(s) = quoted_arg_span(arg, span_map, symbol_spans, &fs) {
+                        excl.push(s);
+                    }
+                }
+            }
+            // plain quote has no unquote semantics — the argument is wholly data.
+        }
+        Some("quasiquote") if !in_quote => {
+            if let Some(fs) = form_span {
+                for arg in items.iter().skip(1) {
+                    if let Some(s) = quoted_arg_span(arg, span_map, symbol_spans, &fs) {
+                        excl.push(s);
+                    }
+                }
+            }
+            for item in items.iter() {
+                collect_quote_regions(item, span_map, symbol_spans, true, excl, reincl);
+            }
+        }
+        Some("unquote") | Some("unquote-splicing") if in_quote => {
+            if let Some(fs) = form_span {
+                for arg in items.iter().skip(1) {
+                    if let Some(s) = quoted_arg_span(arg, span_map, symbol_spans, &fs) {
+                        reincl.push(s);
+                    }
+                }
+            }
+            for item in items.iter().skip(1) {
+                collect_quote_regions(item, span_map, symbol_spans, false, excl, reincl);
+            }
+        }
+        _ => {
+            for item in items.iter() {
+                collect_quote_regions(item, span_map, symbol_spans, in_quote, excl, reincl);
+            }
+        }
+    }
 }
 
 /// Find the precise span of a symbol `name` within a form's span.
@@ -74,11 +206,12 @@ pub(crate) fn find_name_span(
     name: &str,
     form_span: &Span,
     symbol_spans: &[(String, Span)],
+    lines: &[&str],
 ) -> Option<Range> {
     symbol_spans
         .iter()
         .find(|(sym_name, sym_span)| sym_name == name && span_contains(form_span, sym_span))
-        .map(|(_, span)| span_to_range(span))
+        .map(|(_, span)| span_to_range(span, lines))
 }
 
 /// Walk backwards from `pos` to find the byte offset where a symbol starts.
@@ -100,16 +233,56 @@ pub fn error_span(err: &SemaError) -> Option<&Span> {
     }
 }
 
-/// Convert a 1-indexed Sema `Span` to a 0-indexed LSP `Range`.
-pub fn span_to_range(span: &Span) -> Range {
+/// Convert a 1-indexed Sema char column to a 0-indexed LSP UTF-16 `character`.
+///
+/// Sema spans count **characters**; LSP `Position.character` counts **UTF-16
+/// code units**. They differ only on lines containing non-BMP characters
+/// (emoji, rare CJK-ext), where one char is two UTF-16 units. `line` is the
+/// source text of the span's line; when it is `None` we fall back to the raw
+/// char index (correct for BMP-only lines).
+pub fn char_col_to_utf16(line: Option<&str>, col_1indexed: usize) -> u32 {
+    let char_idx = col_1indexed.saturating_sub(1);
+    match line {
+        Some(l) => l.chars().take(char_idx).map(|c| c.len_utf16() as u32).sum(),
+        None => char_idx as u32,
+    }
+}
+
+/// Convert a 0-indexed LSP UTF-16 `character` offset to a 1-indexed Sema char
+/// column (the inverse of [`char_col_to_utf16`]). Used when mapping an incoming
+/// editor `Position` to the column the scope/lexer machinery expects.
+pub fn utf16_to_char_col(line: &str, utf16_offset: usize) -> usize {
+    let mut units = 0usize;
+    for (i, ch) in line.chars().enumerate() {
+        if units >= utf16_offset {
+            return i + 1;
+        }
+        units += ch.len_utf16();
+    }
+    line.chars().count() + 1
+}
+
+/// Convert a 1-indexed Sema `Span` to a 0-indexed LSP `Range`, mapping columns
+/// from char indices to UTF-16 code units using `lines` (the document's lines).
+///
+/// FOOTGUN: passing `&[]` (or lines that don't contain the span's line) silently
+/// falls back to emitting char-index columns instead of UTF-16 code units. That
+/// is only correct for BMP-only text — any astral-plane char (emoji, etc.) on or
+/// before the span on its line will yield wrong LSP positions. Only pass `&[]`
+/// when the returned `Range` is immediately discarded (e.g. callers that use just
+/// the symbol names). For any range that reaches the client, pass the real lines
+/// (e.g. `cached.source.lines().collect()` or `text.lines().collect()`).
+pub fn span_to_range(span: &Span, lines: &[&str]) -> Range {
+    let start_line = span.line.saturating_sub(1);
+    let end_line = span.end_line.saturating_sub(1);
     Range {
         start: Position {
-            line: span.line.saturating_sub(1) as u32,
-            character: span.col.saturating_sub(1) as u32,
+            line: start_line as u32,
+            character: char_col_to_utf16(lines.get(start_line).copied(), span.col),
         },
         end: Position {
-            line: span.end_line.saturating_sub(1) as u32,
-            character: span.end_col.saturating_sub(1) as u32,
+            line: end_line as u32,
+            character: char_col_to_utf16(lines.get(end_line).copied(), span.end_col),
         },
     }
 }
@@ -130,8 +303,14 @@ pub(crate) fn format_error_message(err: &SemaError) -> String {
 }
 
 /// Convert a SemaError into a diagnostic with the given severity.
-pub(crate) fn error_diagnostic(err: &SemaError, severity: DiagnosticSeverity) -> Diagnostic {
-    let range = error_span(err).map(span_to_range).unwrap_or_default();
+pub(crate) fn error_diagnostic(
+    err: &SemaError,
+    severity: DiagnosticSeverity,
+    lines: &[&str],
+) -> Diagnostic {
+    let range = error_span(err)
+        .map(|s| span_to_range(s, lines))
+        .unwrap_or_default();
     Diagnostic {
         range,
         severity: Some(severity),
@@ -143,33 +322,35 @@ pub(crate) fn error_diagnostic(err: &SemaError, severity: DiagnosticSeverity) ->
 
 /// Parse source text and return diagnostics.
 pub fn parse_diagnostics(text: &str) -> Vec<Diagnostic> {
+    let lines: Vec<&str> = text.lines().collect();
     match sema_reader::read_many_with_spans(text) {
         Ok(_) => vec![],
-        Err(err) => vec![error_diagnostic(&err, DiagnosticSeverity::ERROR)],
+        Err(err) => vec![error_diagnostic(&err, DiagnosticSeverity::ERROR, &lines)],
     }
 }
 
 /// Run the VM compilation pipeline on parsed expressions to catch
 /// deeper errors (unbound variables, arity mismatches, invalid forms).
-pub fn compile_diagnostics(exprs: &[sema_core::Value]) -> Vec<Diagnostic> {
+pub fn compile_diagnostics(exprs: &[sema_core::Value], lines: &[&str]) -> Vec<Diagnostic> {
     match sema_vm::compile_program(exprs, None) {
         Ok(_) => vec![],
-        Err(err) => vec![error_diagnostic(&err, DiagnosticSeverity::WARNING)],
+        Err(err) => vec![error_diagnostic(&err, DiagnosticSeverity::WARNING, lines)],
     }
 }
 
 /// Parse and compile-check source text, returning all diagnostics.
 /// Uses error recovery to report multiple parse errors at once.
 pub fn analyze_document(text: &str) -> Vec<Diagnostic> {
+    let lines: Vec<&str> = text.lines().collect();
     let (exprs, _spans, _symbol_spans, errors) = sema_reader::read_many_with_spans_recover(text);
     let mut diags: Vec<Diagnostic> = errors
         .iter()
-        .map(|err| error_diagnostic(err, DiagnosticSeverity::ERROR))
+        .map(|err| error_diagnostic(err, DiagnosticSeverity::ERROR, &lines))
         .collect();
     // Only run compile diagnostics when there are no parse errors,
     // since missing forms would cause false unbound-variable errors.
     if diags.is_empty() {
-        diags.extend(compile_diagnostics(&exprs));
+        diags.extend(compile_diagnostics(&exprs, &lines));
     }
     diags
 }
@@ -184,11 +365,15 @@ pub fn extract_prefix(line: &str, byte_offset: usize) -> &str {
 
 /// Return (index, LSP range) for each top-level list form that has a span.
 /// Non-list forms (bare atoms) and forms without spans are skipped.
-pub fn top_level_ranges(exprs: &[sema_core::Value], span_map: &SpanMap) -> Vec<(usize, Range)> {
+pub fn top_level_ranges(
+    exprs: &[sema_core::Value],
+    span_map: &SpanMap,
+    lines: &[&str],
+) -> Vec<(usize, Range)> {
     exprs
         .iter()
         .enumerate()
-        .filter_map(|(i, expr)| Some((i, expr_range(expr, span_map)?)))
+        .filter_map(|(i, expr)| Some((i, expr_range(expr, span_map, lines)?)))
         .collect()
 }
 
@@ -218,6 +403,7 @@ pub fn user_definitions_from_ast(
     ast: &[sema_core::Value],
     span_map: &SpanMap,
     symbol_spans: &[(String, Span)],
+    lines: &[&str],
 ) -> Vec<(String, Option<Range>)> {
     let mut defs = Vec::new();
     for expr in ast {
@@ -230,8 +416,9 @@ pub fn user_definitions_from_ast(
                             // (define name ...) or (defun name (...) ...)
                             if let Some(name) = items[1].as_symbol() {
                                 let name_range = form_span
-                                    .and_then(|fs| find_name_span(&name, fs, symbol_spans));
-                                let range = name_range.or_else(|| form_span.map(span_to_range));
+                                    .and_then(|fs| find_name_span(&name, fs, symbol_spans, lines));
+                                let range = name_range
+                                    .or_else(|| form_span.map(|s| span_to_range(s, lines)));
                                 defs.push((name, range));
                             }
                             // (define (name args...) body) - function shorthand
@@ -240,10 +427,11 @@ pub fn user_definitions_from_ast(
                                     if let Some(name) = sig[0].as_symbol() {
                                         // Search within the signature list's span
                                         let sig_span = expr_span(&items[1], span_map);
-                                        let name_range = sig_span
-                                            .and_then(|ss| find_name_span(&name, ss, symbol_spans));
-                                        let range =
-                                            name_range.or_else(|| form_span.map(span_to_range));
+                                        let name_range = sig_span.and_then(|ss| {
+                                            find_name_span(&name, ss, symbol_spans, lines)
+                                        });
+                                        let range = name_range
+                                            .or_else(|| form_span.map(|s| span_to_range(s, lines)));
                                         defs.push((name, range));
                                     }
                                 }
@@ -260,11 +448,12 @@ pub fn user_definitions_from_ast(
 
 /// Convenience wrapper: parse text and collect user definitions with spans.
 pub fn user_definitions_with_spans(text: &str) -> Vec<(String, Option<Range>)> {
+    let lines: Vec<&str> = text.lines().collect();
     let (ast, span_map, symbol_spans) = match sema_reader::read_many_with_symbol_spans(text) {
         Ok(result) => result,
         Err(_) => return vec![],
     };
-    user_definitions_from_ast(&ast, &span_map, &symbol_spans)
+    user_definitions_from_ast(&ast, &span_map, &symbol_spans, &lines)
 }
 
 /// Extract parameter list string from a pre-parsed AST for hover display.
@@ -274,7 +463,7 @@ pub fn extract_params_from_ast(ast: &[sema_core::Value], name: &str) -> Option<S
             if items.len() >= 3 {
                 if let Some(head) = items[0].as_symbol() {
                     match head.as_str() {
-                        "defun" | "defn" => {
+                        "defun" | "defn" | "defmacro" | "deftool" => {
                             if let Some(sym) = items[1].as_symbol() {
                                 if sym == name {
                                     return Some(sema_core::pretty_print(&items[2], 80));
@@ -301,6 +490,57 @@ pub fn extract_params_from_ast(ast: &[sema_core::Value], name: &str) -> Option<S
                 }
             }
         }
+    }
+    None
+}
+
+/// Extract the docstring of a user-defined function `name` from the AST.
+///
+/// Follows the Clojure convention: a leading string literal in a function body is the docstring
+/// **only when at least one more body form follows** (otherwise the string is the function's return
+/// value, not documentation). `(defun f (x) "doc" body)` → `Some("doc")`; `(defun f (x) "ret")` →
+/// `None`. No language change is needed — a leading string body form is already legal.
+pub fn extract_docstring_from_ast(ast: &[sema_core::Value], name: &str) -> Option<String> {
+    for expr in ast {
+        let items = match expr.as_list() {
+            Some(items) if items.len() >= 2 => items,
+            _ => continue,
+        };
+        let head = match items[0].as_symbol() {
+            Some(h) => h,
+            None => continue,
+        };
+        // Body starts at index 2 for (defun name (params) body...) and the (define (name ...) ...)
+        // shorthand. Match the function's name.
+        let matches_name = match head.as_str() {
+            "defun" | "defn" | "defmacro" => items[1].as_symbol().as_deref() == Some(name),
+            "define" => {
+                items[1]
+                    .as_list()
+                    .and_then(|sig| sig.first().and_then(|v| v.as_symbol()))
+                    .as_deref()
+                    == Some(name)
+            }
+            _ => false,
+        };
+        if !matches_name {
+            continue;
+        }
+        // Body start: `(defun name (params) body...)` → index 3; `(define (name ..) body...)` → 2.
+        let body_start = match head.as_str() {
+            "define" => 2,
+            _ => 3,
+        };
+        let body = items.get(body_start..).unwrap_or(&[]);
+        if body.len() >= 2 {
+            if let Some(s) = body[0].as_str() {
+                let s = s.trim();
+                if !s.is_empty() {
+                    return Some(s.to_string());
+                }
+            }
+        }
+        return None; // found the definition; no docstring
     }
     None
 }
@@ -341,9 +581,14 @@ pub fn import_path_from_ast(
                 if let Some(head) = items[0].as_symbol() {
                     if head == "import" || head == "load" {
                         if let Some(path) = items[1].as_str() {
-                            // Use SpanMap to check if this form covers the cursor line
-                            let covers_line = expr_range(expr, span_map)
-                                .map(|r| line >= r.start.line && line <= r.end.line)
+                            // Use SpanMap to check if this form covers the cursor line.
+                            // Line numbers are encoding-independent, so compare the
+                            // raw span directly (no char↔UTF-16 conversion needed).
+                            let covers_line = expr_span(expr, span_map)
+                                .map(|s| {
+                                    line >= s.line.saturating_sub(1) as u32
+                                        && line <= s.end_line.saturating_sub(1) as u32
+                                })
                                 .unwrap_or(false);
                             if covers_line {
                                 return Some(path.to_string());
@@ -532,6 +777,41 @@ pub(crate) fn find_arg_positions_in_form(
 
 /// Extract parameter names from a builtin doc string by parsing the first
 /// code example. Looks for `(func_name arg1 arg2 ...)` in a ```sema block.
+/// True if `token` looks like a parameter name rather than an argument expression.
+/// Rejects compound expressions (anything with parens/brackets/braces), string literals,
+/// quoted forms, numbers, and empty tokens.
+fn looks_like_param_name(token: &str) -> bool {
+    if token.is_empty() {
+        return false;
+    }
+    // Reject compound expressions
+    if token.contains(&['(', ')', '[', ']', '{', '}'][..]) {
+        return false;
+    }
+    // Reject string literals
+    if token.starts_with('"') {
+        return false;
+    }
+    // Reject quoted / quasiquoted / unquoted forms
+    if token.starts_with('\'') || token.starts_with('`') || token.starts_with(",") {
+        return false;
+    }
+    // Reject pure numbers (integers, floats, scientific notation)
+    if token.parse::<f64>().is_ok() {
+        return false;
+    }
+    true
+}
+
+/// Best-effort fallback: extract parameter names from the first ` ```sema ` code example
+/// in a doc body. This is only used when the entry has no structured `params` — it
+/// presumes the first example shows a function *signature* like `(foo a b)` rather than
+/// a function *call* with complex argument expressions like `(map (fn (x) x) lst)`.
+///
+/// Tokens that don't look like simple parameter names (compound expressions, literals,
+/// quoted forms, numbers) are discarded. If any token in the first matching call fails
+/// this check, the whole call is skipped so that higher-order functions don't produce
+/// nonsensical inlay hints like `(fn (x) (* x x)):`.
 pub(crate) fn extract_params_from_doc(doc: &str, func_name: &str) -> Option<Vec<String>> {
     // Find the first sema code block
     let code_start = doc.find("```sema\n")?;
@@ -575,7 +855,10 @@ pub(crate) fn extract_params_from_doc(doc: &str, func_name: &str) -> Option<Vec<
                     _ => current.push(ch),
                 }
             }
-            if !params.is_empty() {
+            // Only accept this call if EVERY token looks like a parameter name.
+            // This prevents `(map (fn (x) x) '(1 2 3))` from yielding nonsensical
+            // hints like `(fn (x) x):` — instead we skip it and return None.
+            if !params.is_empty() && params.iter().all(|p| looks_like_param_name(p)) {
                 return Some(params);
             }
         }
@@ -762,6 +1045,7 @@ pub fn document_symbols_from_ast(
     ast: &[sema_core::Value],
     span_map: &SpanMap,
     symbol_spans: &[(String, Span)],
+    lines: &[&str],
 ) -> Vec<DocumentSymbol> {
     let mut symbols = Vec::new();
     for expr in ast {
@@ -772,7 +1056,8 @@ pub fn document_symbols_from_ast(
                         "defun" | "defn" => {
                             if let Some(name) = items[1].as_symbol() {
                                 let fs = expr_span(expr, span_map);
-                                let nr = fs.and_then(|s| find_name_span(&name, s, symbol_spans));
+                                let nr =
+                                    fs.and_then(|s| find_name_span(&name, s, symbol_spans, lines));
                                 (name, SymbolKind::FUNCTION, nr)
                             } else {
                                 continue;
@@ -781,7 +1066,8 @@ pub fn document_symbols_from_ast(
                         "defmacro" => {
                             if let Some(name) = items[1].as_symbol() {
                                 let fs = expr_span(expr, span_map);
-                                let nr = fs.and_then(|s| find_name_span(&name, s, symbol_spans));
+                                let nr =
+                                    fs.and_then(|s| find_name_span(&name, s, symbol_spans, lines));
                                 (name, SymbolKind::OPERATOR, nr)
                             } else {
                                 continue;
@@ -790,7 +1076,8 @@ pub fn document_symbols_from_ast(
                         "defagent" => {
                             if let Some(name) = items[1].as_symbol() {
                                 let fs = expr_span(expr, span_map);
-                                let nr = fs.and_then(|s| find_name_span(&name, s, symbol_spans));
+                                let nr =
+                                    fs.and_then(|s| find_name_span(&name, s, symbol_spans, lines));
                                 (name, SymbolKind::CLASS, nr)
                             } else {
                                 continue;
@@ -799,7 +1086,8 @@ pub fn document_symbols_from_ast(
                         "deftool" => {
                             if let Some(name) = items[1].as_symbol() {
                                 let fs = expr_span(expr, span_map);
-                                let nr = fs.and_then(|s| find_name_span(&name, s, symbol_spans));
+                                let nr =
+                                    fs.and_then(|s| find_name_span(&name, s, symbol_spans, lines));
                                 (name, SymbolKind::METHOD, nr)
                             } else {
                                 continue;
@@ -808,14 +1096,16 @@ pub fn document_symbols_from_ast(
                         "define" => {
                             if let Some(name) = items[1].as_symbol() {
                                 let fs = expr_span(expr, span_map);
-                                let nr = fs.and_then(|s| find_name_span(&name, s, symbol_spans));
+                                let nr =
+                                    fs.and_then(|s| find_name_span(&name, s, symbol_spans, lines));
                                 (name, SymbolKind::VARIABLE, nr)
                             } else if let Some(sig) = items[1].as_list() {
                                 if !sig.is_empty() {
                                     if let Some(name) = sig[0].as_symbol() {
                                         let ss = expr_span(&items[1], span_map);
-                                        let nr =
-                                            ss.and_then(|s| find_name_span(&name, s, symbol_spans));
+                                        let nr = ss.and_then(|s| {
+                                            find_name_span(&name, s, symbol_spans, lines)
+                                        });
                                         (name, SymbolKind::FUNCTION, nr)
                                     } else {
                                         continue;
@@ -830,7 +1120,7 @@ pub fn document_symbols_from_ast(
                         _ => continue,
                     };
 
-                    let form_range = expr_range(expr, span_map).unwrap_or_default();
+                    let form_range = expr_range(expr, span_map, lines).unwrap_or_default();
                     let selection_range = name_range.unwrap_or(form_range);
 
                     let detail = if kind == SymbolKind::FUNCTION {

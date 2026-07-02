@@ -17,13 +17,11 @@ sema [OPTIONS] [FILE] [-- SCRIPT_ARGS...]
 | `-l, --load <FILE>`  | Load file(s) before executing (repeatable)   |
 | `-q, --quiet`        | Suppress REPL banner                         |
 | `-i, --interactive`  | Enter REPL after running file or eval        |
-| `--no-init`          | Skip LLM auto-configuration                  |
-| `--no-llm`           | Disable LLM features (same as `--no-init`)   |
+| `--no-llm`           | Disable LLM features (skip provider auto-configuration) |
 | `--chat-model <NAME>`       | Set default chat model                |
 | `--chat-provider <NAME>`    | Set chat provider                     |
 | `--embedding-model <NAME>`  | Set embedding model                   |
 | `--embedding-provider <NAME>` | Set embedding provider              |
-| `--vm`               | Use bytecode VM instead of tree-walker       |
 | `--sandbox <MODE>`   | Restrict dangerous operations (see below)    |
 | `-V, --version`      | Print version                                |
 | `-h, --help`         | Print help                                   |
@@ -60,7 +58,6 @@ sema eval [OPTIONS]
 | `--sandbox <MODE>`    | Sandbox mode (`strict`, `all`, or comma-separated capabilities)  |
 | `--no-llm`            | Disable LLM features                                             |
 | `--timeout <MS>`      | Kill evaluation after N ms (default: 5000)                       |
-| `--vm`                | Use bytecode VM instead of tree-walker                           |
 
 **Examples:**
 
@@ -151,7 +148,7 @@ sema compile --check script.semac
 Build a standalone executable from a Sema source file. The resulting binary embeds the compiled bytecode, all transitive imports, and any explicitly included assets into a self-contained executable. See [Executable Format](./internals/executable-format.md) for details on the binary format.
 
 ```
-sema build [OPTIONS] <FILE>
+sema build [OPTIONS] [FILE]
 ```
 
 | Flag                     | Description                                               |
@@ -235,7 +232,7 @@ sema pkg <COMMAND>
 | --------------------------- | --------------------------------------------------- |
 | `init`                      | Initialize a new `sema.toml` in the current directory |
 | `add <spec> [--registry]`   | Add a package from the registry or git              |
-| `install`                   | Install all deps from `sema.toml`                   |
+| `install [--locked]`        | Install all deps from `sema.toml` (`--locked` fails if `sema.lock` is missing or out of sync — for CI) |
 | `update [name]`             | Update packages (all or specific)                   |
 | `remove <name>`             | Remove an installed package                         |
 | `list`                      | List installed packages                             |
@@ -304,6 +301,7 @@ sema fmt [OPTIONS] [FILES...]
 | `--width <N>` | Max line width (default: `80`) |
 | `--indent <N>` | Indentation width (default: `2`) |
 | `--align` | Align consecutive similar forms |
+| `--json` | Output result as JSON (useful for editor integrations) |
 
 ```bash
 # Format all .sema files recursively
@@ -370,7 +368,7 @@ sema notebook export [OPTIONS] <FILE>
 
 | Flag                  | Description                           |
 | --------------------- | ------------------------------------- |
-| `-f, --format <FMT>`  | Output format (default: `md`)         |
+| `--format <FMT>`      | Output format (default: `md`)         |
 | `-o, --output <FILE>` | Output file (default: stdout)         |
 
 #### `sema notebook new`
@@ -395,7 +393,7 @@ sema notebook run my-project.sema-nb
 sema notebook export my-project.sema-nb -o output.md
 ```
 
-See the full [Notebook documentation](/docs/notebook.html) for details on the file format, UI features, and keyboard shortcuts.
+See the full [Notebook documentation](/docs/notebook) for details on the file format, UI features, and keyboard shortcuts.
 
 ### `sema lsp`
 
@@ -405,7 +403,26 @@ Start the Language Server Protocol (LSP) server. Communicates over stdio using t
 sema lsp
 ```
 
-Provides diagnostics, completion, hover, go-to-definition, and code lenses. See the [LSP documentation](/docs/lsp.html) for full feature details and editor setup instructions.
+Provides diagnostics, completion, hover, go-to-definition, and code lenses. See the [LSP documentation](/docs/lsp) for full feature details and editor setup instructions.
+
+### `sema mcp`
+
+Start the [Model Context Protocol](/docs/mcp) server (exposes Sema's tools to LLM clients), or manage **MCP client** authentication.
+
+```
+sema mcp [FILES]...                 # run the MCP server (optionally loading tool files)
+sema mcp login  <url> [--device] [--client-id ID]
+sema mcp logout <url>
+```
+
+- `sema mcp` (no subcommand) starts the stdio MCP **server** — see the [MCP documentation](/docs/mcp).
+- `sema mcp login <url>` authenticates to a remote MCP **server** you want to *consume* and caches the OAuth token so later `mcp/connect` calls are silent. `--device` uses the headless device-code flow; `--client-id` supplies a pre-registered OAuth client.
+- `sema mcp logout <url>` clears the cached credentials for a server.
+
+```bash
+sema mcp login https://mcp.asana.com/mcp
+sema mcp logout https://mcp.asana.com/mcp
+```
 
 ## Examples
 
@@ -431,9 +448,6 @@ sema -p '(string/join (map str (range 10)) ",")'
 # Run without LLM features (faster startup)
 sema --no-llm script.sema
 
-# Use the bytecode VM (faster execution for compute-heavy code)
-sema --vm script.sema
-
 # Compile to bytecode and run
 sema compile script.sema
 sema script.semac
@@ -447,7 +461,7 @@ sema --sandbox=no-shell script.sema
 # Deny multiple capabilities
 sema --sandbox=no-shell,no-network,no-fs-write script.sema
 
-# Strict mode (no shell, fs-write, network, env-write, process, llm)
+# Strict mode (no shell, fs-write, network, env-write, process, llm, serial)
 sema --sandbox=strict script.sema
 
 # Maximum restriction (deny all dangerous operations)
@@ -486,24 +500,34 @@ The `--sandbox` flag restricts access to dangerous operations. Functions remain 
 
 | Mode            | Description                                                            |
 | --------------- | ---------------------------------------------------------------------- |
-| `strict`        | Deny shell, fs-write, network, env-write, process, llm (reads allowed) |
+| `none`          | Deny no capabilities                                                    |
+| `strict`        | Deny shell, fs-write, network, env-write, process, llm, serial (reads allowed) |
 | `all`           | Deny all capabilities                                                  |
 | Comma-separated | e.g. `no-shell,no-network` — deny specific capabilities                |
 
 ### Capabilities
 
+Capability names may be written with or without the `no-` prefix. For example,
+`no-network` and `network` both deny the `network` capability. The `no-*`
+form is preferred in examples because `--sandbox` is a denial list.
+
+The table below lists every function gated by each capability. It mirrors the `register_fn_gated` / `register_fn_path_gated` call sites in the stdlib — if a function is not listed it is never sandboxed.
+
 | Capability  | Functions affected                                                         |
 | ----------- | -------------------------------------------------------------------------- |
-| `shell`     | `shell`                                                                    |
-| `fs-read`   | `file/read`, `file/exists?`, `file/list`, `file/info`, `load`, ...         |
-| `fs-write`  | `file/write`, `file/append`, `file/delete`, `file/mkdir`, `file/copy`, ... |
-| `network`   | `http/get`, `http/post`, `http/put`, `http/delete`, `http/request`         |
-| `env-read`  | `env`, `sys/env-all`                                                       |
+| `shell`     | `shell` (also requires `process`)                                          |
+| `fs-read`   | `file/read`, `file/read-bytes`, `file/read-lines`, `file/for-each-line`, `file/fold-lines`, `file/exists?`, `file/list`, `file/info`, `file/is-file?`, `file/is-directory?`, `file/is-symlink?`, `file/glob`, `path/absolute`, `load`, `pdf/extract-text`, `pdf/extract-text-pages`, `pdf/page-count`, `pdf/metadata`, `stream/open-input`, `http/file`, `db/query`, `db/query-one`, `db/last-insert-id`, `db/tables`, `db/open-memory` |
+| `fs-write`  | `file/write`, `file/write-bytes`, `file/write-lines`, `file/append`, `file/delete`, `file/rename`, `file/mkdir`, `file/copy`, `stream/open-output`, `kv/open`, `kv/set`, `kv/delete`, `db/open`, `db/exec`, `db/exec-batch` |
+| `network`   | `http/get`, `http/post`, `http/put`, `http/delete`, `http/request`, `http/serve` |
+| `env-read`  | `env`, `sys/env-all`, `sys/cwd`, `sys/home-dir`, `sys/user`, `sys/temp-dir` |
 | `env-write` | `sys/set-env`                                                              |
-| `process`   | `exit`, `sys/pid`, `sys/args`, `sys/which`                                 |
-| `llm`       | `llm/complete`, `llm/chat`, `llm/send`                                     |
+| `process`   | `exit`, `sys/pid`, `sys/args`, `sys/which`, `shell`                        |
+| `llm`       | `llm/complete`, `llm/chat`, `llm/send`, `llm/extract-from-image`           |
+| `serial`    | `serial/list`, `serial/open`, `serial/close`, `serial/write`, `serial/read-line`, `serial/send` |
 
-Functions not listed (arithmetic, strings, lists, maps, `println`, `path/join`, etc.) are never restricted.
+`shell` is the only function gated by two capabilities — it requires both `shell` (to launch a system shell) and `process` (because it spawns a child process). Denying either blocks it.
+
+Functions not listed (arithmetic, strings, lists, maps, `println`, `path/join`, `sys/platform`, `sys/arch`, `sys/os`, `sys/hostname`, `sys/sema-home`, `time/now-ms`, etc.) are never restricted.
 
 ### Path Restrictions
 
@@ -543,6 +567,7 @@ sema --sandbox=no-shell,no-network --allowed-paths=./data script.sema
 | `SEMA_EMBEDDING_PROVIDER` | Preferred embedding provider                    |
 | `SEMA_REGISTRY_URL`  | Override default package registry URL                 |
 | `SEMA_RUNTIME_BASE_URL` | Override base URL for cross-compilation runtime downloads |
+| `SEMA_MCP_TOKEN_STORE` | MCP client token backend: `file` (0600 file) or `keychain` (OS keychain). Default: keychain when available, else file. |
 | `NO_COLOR`           | Disable colored output when set                       |
 
 

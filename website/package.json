@@ -5,12 +5,19 @@
   "scripts": {
     "dev": "vitepress dev",
     "build": "vitepress build",
-    "preview": "vitepress preview"
+    "preview": "vitepress preview",
+    "og": "node scripts/generate-og.mjs",
+    "og:check": "node scripts/check-og-determinism.mjs"
   },
   "devDependencies": {
-    "vitepress": "^1.6.4"
+    "playwright": "1.60.0",
+    "vitepress": "2.0.0-alpha.17",
+    "vitepress-plugin-llms": "^1.13.2"
   },
   "overrides": {
-    "esbuild": ">=0.25.0"
+    "esbuild": "^0.28.1"
+  },
+  "dependencies": {
+    "vercel": "^54.18.0"
   }
 }

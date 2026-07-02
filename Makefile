@@ -1,14 +1,31 @@
-.PHONY: all build release install uninstall test test-lsp test-embedding-bench test-http test-llm check clippy fmt fmt-check clean run lint lint-links examples examples-vm smoke-bytecode test-providers fuzz fuzz-reader fuzz-eval setup bench-1m bench-10m bench-100m site-dev site-build site-preview site-deploy deploy coverage coverage-html bench bench-vm bench-tree bench-save bench-suite bench-closure bench-numeric bench-compare bench-baseline profile profile-vm profile-tree ts-setup ts-generate ts-test ts-playground js-lib-build js-lib-dev sema-web-example sema-web-example-build
+.PHONY: all build release build-pgo pgo-profile install install-pgo uninstall test test-lsp test-embedding-bench test-http test-llm check clippy fmt fmt-check clean run lint lint-links docs docs-check update-pricing examples examples-vm smoke-bytecode rag-demo test-providers fuzz fuzz-reader fuzz-eval fuzz-grammar fuzz-grammar-emit setup docs-search-gate bench-1m bench-10m bench-100m site-dev site-build site-preview site-deploy deploy coverage coverage-html bench bench-vm bench-save bench-suite bench-closure bench-numeric bench-compare bench-baseline profile profile-vm ts-setup ts-generate ts-test ts-playground js-lib-build js-lib-dev sema-web-example sema-web-example-build
 
 SEMA_WEB_EXAMPLE_DIR := examples/sema-web-app
+
 build:
 	cargo build
 
 release:
 	cargo build --release
 
+# PGO build (instrument -> train -> rebuild). ~25% faster on 1BRC; see
+# docs/performance-roadmap.md. `make pgo-profile` emits only the .profdata
+# (target/pgo/merged.profdata) that CI consumes via -Cprofile-use.
+build-pgo:
+	./scripts/pgo-build.sh
+
+pgo-profile:
+	./scripts/pgo-build.sh --profile-only
+
 install:
 	cargo install --path crates/sema
+
+# Like `install`, but PGO-optimized: runs the full instrument->train->rebuild
+# pipeline and drops the resulting binary into the cargo bin dir (replacing any
+# `sema` already there). Slower to build than `install`, faster at runtime.
+install-pgo: build-pgo
+	@install -m 0755 target/release/sema "$${CARGO_HOME:-$$HOME/.cargo}/bin/sema"
+	@echo "Installed PGO-optimized sema -> $${CARGO_HOME:-$$HOME/.cargo}/bin/sema"
 
 uninstall:
 	cargo uninstall sema-lang
@@ -49,54 +66,44 @@ run:
 
 lint: fmt-check clippy
 
+# Fail if a publishable workspace crate is missing from publish.yml's order
+# (guards against a half-published release on a newly-added crate).
+.PHONY: check-publish-list
+check-publish-list:
+	@./scripts/check-publish-list.sh
+
+# Regenerate the builtin doc index (and, later, the API-reference site) from the canonical
+# structured source in crates/sema-docs/entries/stdlib + special-forms.
+docs:
+	cargo run -q -p sema-docs -- gen
+
+# Regenerate the vendored LLM pricing snapshot (crates/sema-llm/src/pricing-data.json) from
+# models.dev. Run this and commit the diff to ship updated prices in a patch release; we embed
+# the snapshot at build time and do not fetch pricing at runtime.
+update-pricing:
+	./scripts/update-pricing.sh
+
+# CI gate: every entry must have a summary (--strict), the committed index must be up to date with
+# the source, and every registered builtin/special form must be documented (coverage test).
+docs-check:
+	cargo run -q -p sema-docs -- gen --strict
+	git diff --exit-code crates/sema-docs/builtin_docs.generated.json
+	cargo test -q -p sema-lsp builtin_doc_coverage
+
 lint-links:
 	lychee --config lychee.toml --no-progress '**/*.md'
 
-examples: build
-	@echo "=== Running examples ==="
-	@for f in examples/*.sema; do \
-		case "$$(basename $$f)" in \
-			web-server.sema|eliza-web.sema) echo "  SKIP $$f (server)"; continue;; \
-			eliza.sema) echo "  SKIP $$f (interactive)"; continue;; \
-		esac; \
-		echo "--- $$f ---"; \
-		timeout 30 cargo run --quiet -- --no-llm "$$f" || true; \
-	done
-	@echo "=== Running stdlib examples ==="
-	@for f in examples/stdlib/*.sema; do \
-		echo "--- $$f ---"; \
-		timeout 30 cargo run --quiet -- --no-llm "$$f" || true; \
-	done
+# Run every runnable example headless and report pass/skip/fail. Interactive,
+# server, and hardware examples are skipped (see scripts/run-examples.sh for the
+# blacklist + rationale). Uses the release binary and a per-example timeout so it
+# never hangs; exits non-zero if any runnable example fails.
+examples: release
+	@EXAMPLE_TIMEOUT=30 ./scripts/run-examples.sh
 
-examples-vm: build
-	@echo "=== Running examples (--vm) ==="
-	@failed=""; \
-	for f in examples/*.sema; do \
-		case "$$(basename $$f)" in \
-			web-server.sema|eliza-web.sema) echo "  SKIP $$f (server)"; continue;; \
-			eliza.sema) echo "  SKIP $$f (interactive)"; continue;; \
-		esac; \
-		echo "--- $$f ---"; \
-		if ! timeout 30 cargo run --quiet -- --vm --no-llm "$$f"; then \
-			failed="$$failed $$f"; \
-		fi; \
-	done; \
-	echo "=== Running stdlib examples (--vm) ==="; \
-	for f in examples/stdlib/*.sema; do \
-		echo "--- $$f ---"; \
-		if ! timeout 30 cargo run --quiet -- --vm --no-llm "$$f"; then \
-			failed="$$failed $$f"; \
-		fi; \
-	done; \
-	if [ -n "$$failed" ]; then \
-		echo ""; \
-		echo "=== FAILED (--vm) ==="; \
-		for f in $$failed; do echo "  $$f"; done; \
-		echo ""; \
-	else \
-		echo ""; \
-		echo "=== ALL PASSED (--vm) ==="; \
-	fi
+# Stress test: compile every runnable example into a standalone binary with
+# `sema build` and execute it (exercises the whole release/portability path).
+examples-build: release
+	@EXAMPLE_TIMEOUT=30 ./scripts/build-examples.sh
 
 example-notebook: build
 	@echo "=== Running example notebook ==="
@@ -126,12 +133,23 @@ example-notebook-serve: build
 smoke-bytecode: build
 	@./scripts/smoke-bytecode.sh ./target/debug/sema
 
+# Hermetic gate: docs_search must work from the binary alone in a FROM-scratch
+# container (no source, no uncompiled docs, --network none). Requires docker + jq.
+docs-search-gate:
+	@./scripts/docs-search-gate.sh
+
 test-providers: build
 	@echo "=== Testing all LLM providers ==="
 	cargo run --quiet -- examples/providers/test-all.sema
 
 test-provider-%: build
 	cargo run --quiet -- examples/providers/test-$*.sema
+
+# Live RAG smoke test: index Sema's docs, retrieve → rerank → answer. Needs an
+# embedding+rerank key (JINA/VOYAGE/COHERE) and a chat key. Caches to /tmp.
+rag-demo: build
+	@echo "=== RAG over Sema docs (embed -> search -> rerank -> answer) ==="
+	cargo run --quiet -- examples/llm/rag-docs-search.sema
 
 setup:
 	rustup toolchain install nightly
@@ -146,6 +164,21 @@ fuzz-reader:
 fuzz-eval:
 	cd crates/sema-eval && rustup run nightly cargo fuzz run fuzz_eval -- -max_total_time=120 -timeout=10
 
+# Grammar-based fuzzer written in Sema itself (fuzz/grammar-fuzz.sema). Generates
+# random *valid* Sema programs and checks two correctness oracles: printer/reader
+# round-trip and a compiler/VM value oracle. No nightly / cargo-fuzz needed — runs
+# on the release binary. Every finding is reproducible from one integer seed.
+#   make fuzz-grammar                  # default sweep (random seed)
+#   make fuzz-grammar SEED=123 N=20000 DEPTH=5
+#   make fuzz-grammar-emit             # print a few sample generated programs
+fuzz-grammar: release
+	@./scripts/grammar-fuzz.sh check \
+		$(if $(N),-n $(N)) $(if $(DEPTH),-d $(DEPTH)) $(if $(SEED),-s $(SEED)) $(if $(V),-v)
+
+fuzz-grammar-emit: release
+	@./scripts/grammar-fuzz.sh emit \
+		$(if $(N),-n $(N)) $(if $(DEPTH),-d $(DEPTH)) $(if $(SEED),-s $(SEED)) $(if $(OUT),-o $(OUT))
+
 bench-1m: release
 	time ./target/release/sema examples/benchmarks/1brc.sema -- bench-1m.txt
 
@@ -158,10 +191,17 @@ bench-100m: release
 all: lint test build
 
 # Website
-.PHONY: site-dev site-build site-preview site-deploy
+.PHONY: site-dev site-build site-preview site-deploy site-og
 
 site-dev:
 	cd website && npm run dev
+
+# Check vendored OG assets and regenerate per-page cards (public/og/*.jpg).
+# Run after editing the template, logo, page titles, or the version, then
+# commit the regenerated images before deploying.
+site-og:
+	cd website && npm run og:check
+	cd website && npm run og
 
 site-build:
 	cd website && npm run build
@@ -176,7 +216,7 @@ site-deploy: site-build
 .PHONY: js-lib-build js-lib-dev
 
 js-lib-build:
-	wasm-pack build crates/sema-wasm --target web --release --scope sema-lang --out-dir ../../packages/sema-wasm/pkg
+	wasm-pack build crates/sema-wasm --target web --release --scope sema-lang --out-dir ../../packages/sema-wasm/pkg -- --config 'profile.release.package.sema-wasm.opt-level="s"'
 	cd packages/sema && npm install && npm run build
 
 js-lib-dev:
@@ -209,13 +249,24 @@ sema-web-example: sema-web-example-build
 # Playground
 deploy: site-deploy playground-deploy
 
-.PHONY: playground-build playground-dev playground-deploy deploy
+# One-shot "ship the web" pipeline: build the WASM playground, gate on the
+# playground + notebook E2E suites, then deploy both the docs site and the
+# playground to production. `deploy` is the quick path that skips the E2E gate.
+# (Run `make site-og` first and commit the cards if titles/version changed.)
+deploy-all: playground-build
+	cd playground && npx playwright test
+	$(MAKE) test-notebook-e2e
+	$(MAKE) site-deploy
+	$(MAKE) playground-deploy
+
+.PHONY: playground-build playground-dev playground-deploy deploy deploy-all
 
 playground-build:
-	cd crates/sema-wasm && wasm-pack build --target web --out-dir ../../playground/pkg
+	cd crates/sema-wasm && wasm-pack build --target web --out-dir ../../playground/pkg -- --config 'profile.release.package.sema-wasm.opt-level="s"'
 	cd playground && node build.mjs
 
 playground-dev: playground-build
+	cd playground && node scripts/gen-devtools-json.mjs
 	cd playground && npx serve -l 8787
 
 playground-deploy: playground-build
@@ -234,38 +285,36 @@ BENCH_RUNS ?= 10
 BENCH_WARMUP ?= 3
 BENCH_SUITE ?= all
 
+# The bytecode VM is the sole evaluator; `bench` == `bench-vm`.
 bench: release
-	@./scripts/bench.sh --mode both --suite $(BENCH_SUITE) --runs $(BENCH_RUNS) --warmup $(BENCH_WARMUP)
+	@./scripts/bench.sh --suite $(BENCH_SUITE) --runs $(BENCH_RUNS) --warmup $(BENCH_WARMUP)
 
 bench-vm: release
-	@./scripts/bench.sh --mode vm --suite $(BENCH_SUITE) --runs $(BENCH_RUNS) --warmup $(BENCH_WARMUP)
-
-bench-tree: release
-	@./scripts/bench.sh --mode tree --suite $(BENCH_SUITE) --runs $(BENCH_RUNS) --warmup $(BENCH_WARMUP)
+	@./scripts/bench.sh --suite $(BENCH_SUITE) --runs $(BENCH_RUNS) --warmup $(BENCH_WARMUP)
 
 bench-save: release
 	@mkdir -p target/bench
-	@./scripts/bench.sh --mode both --suite $(BENCH_SUITE) --runs $(BENCH_RUNS) --warmup $(BENCH_WARMUP) \
+	@./scripts/bench.sh --suite $(BENCH_SUITE) --runs $(BENCH_RUNS) --warmup $(BENCH_WARMUP) \
 		--export target/bench/bench-$$(git rev-parse --short HEAD 2>/dev/null || echo "nogit").json
 
 bench-suite: release
-	@./scripts/bench.sh --mode both --suite $(BENCH_SUITE) --runs $(BENCH_RUNS) --warmup $(BENCH_WARMUP)
+	@./scripts/bench.sh --suite $(BENCH_SUITE) --runs $(BENCH_RUNS) --warmup $(BENCH_WARMUP)
 
 bench-closure: release
-	@./scripts/bench.sh --mode vm --suite closure --runs $(BENCH_RUNS) --warmup $(BENCH_WARMUP)
+	@./scripts/bench.sh --suite closure --runs $(BENCH_RUNS) --warmup $(BENCH_WARMUP)
 
 bench-numeric: release
-	@./scripts/bench.sh --mode vm --suite numeric --runs $(BENCH_RUNS) --warmup $(BENCH_WARMUP)
+	@./scripts/bench.sh --suite numeric --runs $(BENCH_RUNS) --warmup $(BENCH_WARMUP)
 
 bench-compare: release
 	@mkdir -p target/bench
-	@./scripts/bench.sh --mode vm --runs $(BENCH_RUNS) --warmup $(BENCH_WARMUP) \
+	@./scripts/bench.sh --runs $(BENCH_RUNS) --warmup $(BENCH_WARMUP) \
 		--export target/bench/current.json \
 		--compare target/bench/baseline.json
 
 bench-baseline: release
 	@mkdir -p target/bench
-	@./scripts/bench.sh --mode vm --runs $(BENCH_RUNS) --warmup $(BENCH_WARMUP) \
+	@./scripts/bench.sh --runs $(BENCH_RUNS) --warmup $(BENCH_WARMUP) \
 		--export target/bench/baseline.json
 
 # Profiling (requires: cargo install samply)
@@ -276,17 +325,13 @@ PROFILE_MODE ?= vm
 profile:
 	@mkdir -p $(PROFILE_DIR)
 	RUSTFLAGS="-C force-frame-pointers=yes" cargo build --profile release-with-debug -p sema-lang
-	@modeflag=""; if [ "$(PROFILE_MODE)" = "vm" ]; then modeflag="--vm"; fi; \
 	samply record --save-only --output $(PROFILE_DIR)/$(PROFILE_BENCH)-$(PROFILE_MODE).json -- \
-		./target/release-with-debug/sema --no-llm $$modeflag examples/benchmarks/$(PROFILE_BENCH).sema
+		./target/release-with-debug/sema --no-llm examples/benchmarks/$(PROFILE_BENCH).sema
 	@echo "Profile saved: $(PROFILE_DIR)/$(PROFILE_BENCH)-$(PROFILE_MODE).json"
 	@echo "Open with: samply load $(PROFILE_DIR)/$(PROFILE_BENCH)-$(PROFILE_MODE).json"
 
-profile-vm: 
+profile-vm:
 	@$(MAKE) profile PROFILE_MODE=vm PROFILE_BENCH=$(PROFILE_BENCH)
-
-profile-tree:
-	@$(MAKE) profile PROFILE_MODE=tree PROFILE_BENCH=$(PROFILE_BENCH)
 
 # Tree-sitter grammar
 TS_DIR := editors/tree-sitter-sema

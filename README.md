@@ -1,9 +1,10 @@
 <p align="center">
-  <img src="https://raw.githubusercontent.com/helgesverre/sema/main/assets/logo.png" alt="Sema" width="640">
+  <img src="https://raw.githubusercontent.com/helgesverre/sema/main/assets/og-github.jpg" alt="Sema — Stop rewriting the agent loop." width="800">
 </p>
 
 <p align="center">
-  A Lisp with first-class LLM primitives, implemented in Rust.
+  A Lisp where LLM agents are language primitives, not an SDK —<br>
+  compiled to a fast bytecode VM, shipped as a single binary.
 </p>
 
 <p align="center">
@@ -13,7 +14,17 @@
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-c8a855?style=flat" alt="License"></a>
 </p>
 
-Sema is a Scheme-like Lisp where **prompts are s-expressions**, **conversations are persistent data structures**, and **LLM calls are just another form of evaluation**. It combines a Scheme core with Clojure-style keywords (`:foo`), map literals (`{:key val}`), and vector literals (`[1 2 3]`).
+<p align="center">
+  <a href="https://sema-lang.com/docs/"><b>Docs</b></a> ·
+  <a href="https://sema.run"><b>Playground</b></a> ·
+  <a href="https://sema-lang.com/docs/for-agents"><b>For Agents</b></a> ·
+  <a href="https://github.com/helgesverre/sema/tree/main/examples"><b>Examples</b></a> ·
+  <a href="https://github.com/HelgeSverre/sema/issues"><b>Issues</b></a>
+</p>
+
+**Stop rewriting the agent loop.** Every LLM script grows the same scaffolding — retries, caching, cost caps, rate limits, tool dispatch, conversation state. Sema makes that scaffolding the runtime: your script stays the size of its idea, ships as a single binary, and your coding agent already speaks the language.
+
+Sema is a Scheme-like Lisp where **prompts are s-expressions**, **conversations are persistent data structures**, and **LLM calls are just another form of evaluation** — with Clojure-style keywords (`:foo`), map literals (`{:key val}`), and vector literals (`[1 2 3]`).
 
 ## What It Looks Like
 
@@ -43,8 +54,7 @@ A coding agent with file tools, safety checks, and budget tracking — in ~40 li
 (defagent coder
   {:system (format "You are a coding assistant. Working directory: ~a" (sys/cwd))
    :tools [read-file edit-file run-command]
-   :model "claude-sonnet-4-20250514"
-   :max-turns 20})
+   :max-turns 20})   ; no :model → uses the configured default provider
 
 ;; Run it — budget is scoped, automatically restored after the block
 (llm/with-budget {:max-cost-usd 0.50} (lambda ()
@@ -101,6 +111,10 @@ A coding agent with file tools, safety checks, and budget tracking — in ~40 li
 (llm/with-cache (lambda ()
   (llm/complete "Explain monads")))
 
+;; Cassettes — record real responses once, replay them in CI (no keys, no network)
+(llm/with-cassette "fixtures/run.jsonl" {:mode :auto} (lambda ()
+  (llm/complete "Explain monads")))
+
 ;; Fallback chains — automatic provider failover
 (llm/with-fallback [:anthropic :openai :groq]
   (lambda () (llm/complete "Hello")))
@@ -109,6 +123,12 @@ A coding agent with file tools, safety checks, and budget tracking — in ~40 li
 (vector-store/create "docs")
 (vector-store/add "docs" "id" (llm/embed "text") {:source "file.txt"})
 (vector-store/search "docs" (llm/embed "query") 5)
+
+;; Cross-encoder reranking — the retrieve-many → rerank-to-a-few RAG move
+(llm/rerank "how do I read a file?"
+            ["file/read returns a string" "http/get fetches a URL"]
+            {:top-k 3})
+;; => ({:index 0 :score 0.98 :document "file/read returns a string"} ...)
 
 ;; Text chunking for LLM pipelines
 (text/chunk long-document {:size 500 :overlap 100})
@@ -200,6 +220,23 @@ Hundreds of built-in functions, tail-call optimization, macros, modules, error h
 > **[sema.run](https://sema.run)** — Browser-based playground with 20+ example programs.
 > No install required. Runs entirely in WebAssembly.
 
+## Teach Your Coding Agent Sema in One Line
+
+Sema is new, so your agent hasn't seen it. Fix that in one command — append the
+agent crib sheet to your repo's `AGENTS.md` (and point `CLAUDE.md` at it):
+
+```bash
+curl -fsSL https://sema-lang.com/docs/for-agents.md >> AGENTS.md
+ln -s AGENTS.md CLAUDE.md     # Claude Code, Cursor, etc. read this
+```
+
+[`for-agents.md`](https://sema-lang.com/docs/for-agents) is a single terse page —
+*everything that differs from other Lisps* — written for an LLM that already knows a
+Lisp. It links to [`/llms.txt`](https://sema-lang.com/llms.txt), a machine index of every
+doc page so the agent can fetch just the page it needs (e.g. `/docs/llm/tools-agents.md`)
+on demand, instead of loading the whole manual. Every doc URL also serves raw Markdown —
+append `.md` to any `sema-lang.com/docs/...` link and your agent gets the source, not HTML.
+
 ## Installation
 
 Install pre-built binaries (no Rust required):
@@ -255,23 +292,23 @@ sema completions bash > ~/.local/share/bash-completion/completions/sema
 sema completions fish > ~/.config/fish/completions/sema.fish
 ```
 
-> 📖 Full setup instructions for all shells: **[sema-lang.com/docs/shell-completions](https://sema-lang.com/docs/shell-completions.html)**
+> 📖 Full setup instructions for all shells: **[sema-lang.com/docs/shell-completions](https://sema-lang.com/docs/shell-completions)**
 
-> 📖 Full CLI reference, flags, and REPL commands: **[sema-lang.com/docs/cli](https://sema-lang.com/docs/cli.html)**
+> 📖 Full CLI reference, flags, and REPL commands: **[sema-lang.com/docs/cli](https://sema-lang.com/docs/cli)**
 
 ### Editor Support
 
 | Editor           | Install                                                                                   |
 | ---------------- | ----------------------------------------------------------------------------------------- |
-| **VS Code**      | See [install instructions](https://sema-lang.com/docs/editors.html)                       |
+| **VS Code**      | See [install instructions](https://sema-lang.com/docs/editors)                       |
 | **Zed**          | Install Dev Extension → select `editors/zed`                                              |
 | **Vim / Neovim** | `Plug 'helgesverre/sema', { 'rtp': 'editors/vim' }`                                       |
-| **Emacs**        | `(require 'sema-mode)` — see [docs](https://sema-lang.com/docs/editors.html)              |
-| **Helix**        | Copy `languages.toml` + query files — see [docs](https://sema-lang.com/docs/editors.html) |
+| **Emacs**        | `(require 'sema-mode)` — see [docs](https://sema-lang.com/docs/editors)              |
+| **Helix**        | Copy `languages.toml` + query files — see [docs](https://sema-lang.com/docs/editors) |
 
 All editors provide syntax highlighting for builtins, special forms, keyword literals, character literals, LLM primitives, and more.
 
-> 📖 Full installation instructions: **[sema-lang.com/docs/editors](https://sema-lang.com/docs/editors.html)**
+> 📖 Full installation instructions: **[sema-lang.com/docs/editors](https://sema-lang.com/docs/editors)**
 
 ### Notebook
 
@@ -286,7 +323,22 @@ sema notebook export my-notebook.sema-nb     # Export to Markdown
 
 Cells share a persistent environment — definitions in earlier cells are visible in later ones. Notebooks are saved as `.sema-nb` JSON files.
 
-> 📖 Full notebook documentation: **[sema-lang.com/docs/notebook](https://sema-lang.com/docs/notebook.html)**
+> 📖 Full notebook documentation: **[sema-lang.com/docs/notebook](https://sema-lang.com/docs/notebook)**
+
+### Language Tooling
+
+A full toolchain ships in the box — no plugins to assemble:
+
+```bash
+sema fmt script.sema     # Canonical code formatter
+sema lsp                 # Language Server (completions, hover, go-to-def, rename)
+sema dap                 # Debug Adapter (breakpoints, stepping, variable inspection)
+sema mcp                 # Model Context Protocol server for LLM clients
+```
+
+The **MCP server** lets LLM clients (Claude Desktop, Cursor, Claude Code) compile, format, evaluate, and build Sema code — and call your own `deftool` Lisp tools — directly in your environment.
+
+> 📖 [Formatter](https://sema-lang.com/docs/formatter) · [LSP](https://sema-lang.com/docs/lsp) · [Debugger](https://sema-lang.com/docs/dap) · [MCP](https://sema-lang.com/docs/mcp)
 
 ## Example Programs
 
@@ -317,13 +369,19 @@ The [`examples/`](https://github.com/helgesverre/sema/tree/main/examples) direct
 
 ## Why Sema?
 
+The pitch in one line: **no LangChain, no provider SDK, no agent framework, no glue
+script** — the agent loop, retries, caching, budgets, tracing, and tool dispatch are the
+language runtime, and the whole thing is one binary you can `scp` to a box.
+
 - **LLMs as language primitives** — prompts, messages, conversations, tools, and agents are first-class data types, not string templates bolted on
 - **Multi-provider** — swap between Anthropic, OpenAI, Gemini, Ollama, any OpenAI-compatible endpoint, or define your own provider in Sema
 - **Pipeline-ready** — response caching, fallback chains, rate limiting, retry with backoff, text chunking, prompt templates, vector store, and a persistent KV store
-- **Cost-aware** — built-in budget tracking with dynamic pricing from [llm-prices.com](https://www.llm-prices.com)
+- **Cost-aware** — built-in budget tracking with a bundled pricing snapshot ([models.dev](https://models.dev)), updated per release
+- **Observable** — every LLM/agent run is auto-traced with OpenTelemetry (GenAI semantic conventions): tokens, cost, latency, and the full `invoke_agent → chat → execute_tool` tree, exportable to Jaeger, Grafana, Datadog, Langfuse, Arize Phoenix, and more — zero manual instrumentation, off by default
 - **Practical Lisp** — closures, TCO, macros, modules, error handling, HTTP, file I/O, regex, JSON, and a comprehensive stdlib
 - **Standalone executables** — `sema build` compiles programs into self-contained binaries with auto-traced imports and bundled assets
-- **Embeddable** — [available on crates.io](https://crates.io/crates/sema-lang), clean Rust crate structure with a builder API
+- **Embeddable** — [a Rust crate](https://crates.io/crates/sema-lang) with a builder API, or [`@sema-lang/sema`](https://www.npmjs.com/package/@sema-lang/sema) to run Sema client-side in JS via WebAssembly
+- **Full toolchain** — formatter, language server (LSP), debugger (DAP), and an MCP server for LLM clients, all built in
 - **Developer-friendly** — REPL with tab completion, structured error messages with hints, and 50+ example programs
 
 ### Why Not Sema?
@@ -331,7 +389,7 @@ The [`examples/`](https://github.com/helgesverre/sema/tree/main/examples) direct
 - No full numeric tower (rationals, bignums, complex numbers)
 - No continuations (`call/cc`) or fully hygienic macros (`syntax-rules`) — has auto-gensym (`foo#`) for preventing variable capture
 - Single-threaded — `Rc`-based, no cross-thread sharing of values
-- No JIT — tree-walking interpreter and bytecode VM, no native code generation
+- No JIT — bytecode compiler + stack-based VM, no native code generation
 - Package manager is git-based — central registry not yet live
 - Young language — solid but not battle-tested at scale
 
@@ -345,12 +403,18 @@ crates/
   sema-eval/     Trampoline-based evaluator, special forms, modules
   sema-stdlib/   Built-in functions across many modules
   sema-llm/      LLM provider trait + multi-provider clients
+  sema-otel/     OpenTelemetry tracing (GenAI semantic conventions)
+  sema-docs/     Canonical builtin docs (powers LSP hover + REPL apropos)
+  sema-lsp/      Language Server Protocol implementation
+  sema-dap/      Debug Adapter Protocol server
+  sema-fmt/      Source code formatter
+  sema-mcp/      Model Context Protocol server
   sema-notebook/ Jupyter-inspired notebook interface with browser UI
   sema-wasm/     WebAssembly build for sema.run playground
   sema/          CLI binary: REPL + file runner + standalone builder
 ```
 
-> 🔬 Deep-dive into the internals: [Architecture](https://sema-lang.com/docs/internals/architecture.html) · [Evaluator](https://sema-lang.com/docs/internals/evaluator.html) · [Lisp Comparison](https://sema-lang.com/docs/internals/lisp-comparison.html)
+> 🔬 Deep-dive into the internals: [Architecture](https://sema-lang.com/docs/internals/architecture) · [Evaluator](https://sema-lang.com/docs/internals/evaluator) · [Lisp Comparison](https://sema-lang.com/docs/internals/lisp-comparison)
 
 ## License
 

@@ -17,6 +17,32 @@ Sema's stdlib follows consistent naming patterns:
 | `type->type`      | Arrow conversions    | `string/to-symbol`, `list->vector`      |
 | `predicate?`      | Predicate suffix     | `null?`, `list?`, `even?`              |
 
+### Naming aliases
+
+Several functions are registered under both a legacy (Scheme-style) name and a canonical
+slash-namespaced or `predicate?` name (Decision #24). Both forms are kept for backward
+compatibility; new code should prefer the canonical form on the right.
+
+| Legacy name           | Canonical alias        |
+| --------------------- | ---------------------- |
+| `any`                 | `any?`                 |
+| `every`               | `every?`               |
+| `time-ms`             | `time/now-ms`          |
+| `hash-map`            | `map/new`              |
+| `promise-forced?`     | `async/forced?`        |
+| `tools->routes`       | `route/from-tools`     |
+| `make-bytevector`     | `bytevector/make` (also `bytevector/new`) |
+| `bytevector-length`   | `bytevector/length`    |
+| `bytevector-u8-ref`   | `bytevector/u8-ref` (also `bytevector/ref`) |
+| `bytevector-u8-set!`  | `bytevector/u8-set!` (also `bytevector/set!`) |
+| `bytevector-copy`     | `bytevector/copy`      |
+| `bytevector-append`   | `bytevector/append`    |
+| `bytevector->list`    | `bytevector/to-list`   |
+| `list->bytevector`    | `bytevector/from-list` (also `list/to-bytevector`) |
+
+Predicates (`bytevector?` etc.) and the bare `bytevector` varargs constructor keep their
+short canonical names — predicates always stay un-namespaced.
+
 ## Quick Reference
 
 ### [Math & Arithmetic](./math)
@@ -122,7 +148,7 @@ Sema's stdlib follows consistent naming patterns:
 
 | Function                                                                                                      | Description                  |
 | ------------------------------------------------------------------------------------------------------------- | ---------------------------- |
-| `display`, `println`, `pprint`, `print`, `io/print-error`, `io/println-error`, `newline`, `io/read-line`, `io/read-stdin` | Console I/O                  |
+| `display`, `println`, `pprint`, `print`, `io/print-error`, `io/println-error`, `newline`, `io/read-line`, `io/read-stdin`, `io/eof?`, `io/flush` | Console I/O                  |
 | `file/read`, `file/write`, `file/append`                                                                      | File read/write              |
 | `file/read-bytes`, `file/write-bytes`                                                                         | Binary file I/O              |
 | `file/read-lines`, `file/write-lines`                                                                         | Line-based I/O               |
@@ -199,8 +225,19 @@ Sema's stdlib follows consistent naming patterns:
 | `sys/pid`, `sys/tty`, `sys/which`, `sys/elapsed`            | Process info          |
 | `sys/interactive?`, `sys/hostname`, `sys/user`              | Session info          |
 | `sys/home-dir`, `sys/temp-dir`                              | Directory paths       |
+| `sys/term-size`                                             | Terminal size (Unix)  |
+| `sys/on-signal`, `sys/check-signals`                        | Signal hooks (Unix)   |
 | `shell`                                                     | Run shell commands    |
 | `exit`                                                      | Exit process          |
+
+### [Serial Ports](./serial)
+
+| Function                                                   | Description                              |
+| ---------------------------------------------------------- | ---------------------------------------- |
+| `serial/list`                                              | List available device paths              |
+| `serial/open`, `serial/close`                              | Open/close a port (returns int handle)   |
+| `serial/write`, `serial/read-line`                         | Raw I/O                                  |
+| `serial/send`                                              | Write line + read JSON response          |
 
 ### [Bytevectors](./bytevectors)
 
@@ -226,6 +263,19 @@ Sema's stdlib follows consistent naming patterns:
 | `*stdin*`, `*stdout*`, `*stderr*`                                     | Standard I/O globals     |
 | `with-stream`                                                         | Resource management macro |
 
+### [Concurrency](./concurrency)
+
+| Function                                                              | Description              |
+| --------------------------------------------------------------------- | ------------------------ |
+| `async/spawn`, `async/await`, `async/all`, `async/race`               | Async task management    |
+| `async/resolved`, `async/rejected`                                     | Pre-settled promises     |
+| `async/run`, `async/sleep`, `async/timeout`                            | Scheduler control & deadlines |
+| `async/cancel`, `async/cancelled?`                                     | Cancellation             |
+| `async/promise?`, `async/resolved?`, `async/rejected?`, `async/pending?` | Promise predicates       |
+| `channel/new`, `channel/send`, `channel/recv`, `channel/try-recv`      | Channel operations       |
+| `channel/close`                                                        | Channel lifecycle        |
+| `channel?`, `channel/closed?`, `channel/empty?`, `channel/full?`, `channel/count` | Channel predicates       |
+
 ### [Records](./records)
 
 | Function             | Description          |
@@ -243,6 +293,8 @@ Sema's stdlib follows consistent naming patterns:
 | `term/rgb`                                                       | 24-bit true color                   |
 | `term/strip`                                                     | Remove ANSI escape codes            |
 | `term/spinner-start`, `term/spinner-stop`, `term/spinner-update` | Animated spinners                   |
+| `io/tty-raw!`, `io/tty-restore!`                                 | Raw-mode TTY (Unix)                 |
+| `io/read-key`, `io/read-key-timeout`                             | Per-keystroke input (Unix)          |
 
 ### [Text Processing](./text-processing)
 

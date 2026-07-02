@@ -1,10 +1,10 @@
 use std::cell::RefCell;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::rc::Rc;
 
 use sema_core::{
-    intern, resolve, CallFrame, Env, EvalContext, Lambda, Macro, MultiMethod, NativeFn, SemaError,
-    Span, Spur, Thunk, Value, ValueView,
+    intern, resolve, Env, EvalContext, Macro, MultiMethod, NativeFn, SemaError, Spur, Thunk, Value,
+    ValueView,
 };
 
 use crate::special_forms;
@@ -29,28 +29,6 @@ pub fn create_module_env(env: &Env) -> Env {
         }
     }
     Env::with_parent(Rc::new(current))
-}
-
-/// Look up a span for an expression via the span table in the context.
-fn span_of_expr(ctx: &EvalContext, expr: &Value) -> Option<Span> {
-    if let Some(items) = expr.as_list_rc() {
-        let ptr = Rc::as_ptr(&items) as usize;
-        ctx.lookup_span(ptr)
-    } else {
-        None
-    }
-}
-
-/// RAII guard that truncates the call stack on drop.
-struct CallStackGuard<'a> {
-    ctx: &'a EvalContext,
-    entry_depth: usize,
-}
-
-impl Drop for CallStackGuard<'_> {
-    fn drop(&mut self) {
-        self.ctx.truncate_call_stack(self.entry_depth);
-    }
 }
 
 /// Collect the names of all native functions in an environment.
@@ -79,7 +57,7 @@ impl Interpreter {
         let env = Env::new();
         let ctx = EvalContext::new();
         // Register eval/call callbacks so stdlib can invoke the real evaluator
-        sema_core::set_eval_callback(&ctx, eval_value);
+        sema_core::set_eval_callback(&ctx, eval_value_vm);
         sema_core::set_call_callback(&ctx, call_value);
         // Register stdlib
         sema_stdlib::register_stdlib(&env, &sema_core::Sandbox::allow_all());
@@ -88,7 +66,6 @@ impl Interpreter {
         {
             sema_llm::builtins::reset_runtime_state();
             sema_llm::builtins::register_llm_builtins(&env, &sema_core::Sandbox::allow_all());
-            sema_llm::builtins::set_eval_callback(eval_value);
         }
         let global_env = Rc::new(env);
         register_vm_delegates(&global_env);
@@ -99,14 +76,13 @@ impl Interpreter {
     pub fn new_with_sandbox(sandbox: &sema_core::Sandbox) -> Self {
         let env = Env::new();
         let ctx = EvalContext::new_with_sandbox(sandbox.clone());
-        sema_core::set_eval_callback(&ctx, eval_value);
+        sema_core::set_eval_callback(&ctx, eval_value_vm);
         sema_core::set_call_callback(&ctx, call_value);
         sema_stdlib::register_stdlib(&env, sandbox);
         #[cfg(not(target_arch = "wasm32"))]
         {
             sema_llm::builtins::reset_runtime_state();
             sema_llm::builtins::register_llm_builtins(&env, sandbox);
-            sema_llm::builtins::set_eval_callback(eval_value);
         }
         let global_env = Rc::new(env);
         register_vm_delegates(&global_env);
@@ -114,46 +90,73 @@ impl Interpreter {
         Interpreter { global_env, ctx }
     }
 
+    /// Evaluate a single expression on the VM. M6: the VM is the sole evaluator.
+    ///
+    /// NOTE (deliberate behavior change vs. the retired tree-walker): all eval
+    /// entry points now run in the global env, so top-level `define`s persist
+    /// across calls. The old `eval`/`eval_str` child-env isolation is gone —
+    /// maintaining two env semantics was the dual-evaluator complexity being
+    /// removed. Use a fresh `Interpreter` for an isolated evaluation.
     pub fn eval(&self, expr: &Value) -> EvalResult {
-        eval_value(&self.ctx, expr, &Env::with_parent(self.global_env.clone()))
+        self.eval_in_global(expr)
     }
 
+    /// Parse and evaluate on the VM (global env; `define`s persist — see `eval`).
     pub fn eval_str(&self, input: &str) -> EvalResult {
-        eval_string(&self.ctx, input, &Env::with_parent(self.global_env.clone()))
+        self.eval_str_in_global(input)
     }
 
     /// Evaluate in the global environment so that `define` persists across calls.
     pub fn eval_in_global(&self, expr: &Value) -> EvalResult {
-        eval_value(&self.ctx, expr, &self.global_env)
+        self.run_exprs_on_vm(std::slice::from_ref(expr), &self.global_env)
     }
 
     /// Parse and evaluate in the global environment so that `define` persists across calls.
     pub fn eval_str_in_global(&self, input: &str) -> EvalResult {
-        eval_string(&self.ctx, input, &self.global_env)
+        let (exprs, spans) = sema_reader::read_many_with_spans(input)?;
+        self.ctx.merge_span_table(spans);
+        if exprs.is_empty() {
+            return Ok(Value::nil());
+        }
+        self.run_exprs_on_vm(&exprs, &self.global_env)
     }
 
-    /// Parse, compile to bytecode, and execute via the VM.
+    /// Parse, compile to bytecode, and execute via the VM (global env, persists).
     pub fn eval_str_compiled(&self, input: &str) -> EvalResult {
         let (exprs, spans) = sema_reader::read_many_with_spans(input)?;
         self.ctx.merge_span_table(spans);
         if exprs.is_empty() {
             return Ok(Value::nil());
         }
+        self.run_exprs_on_vm(&exprs, &self.global_env)
+    }
 
-        let mut expanded = Vec::new();
-        for expr in &exprs {
-            let exp = self.expand_for_vm(expr)?;
-            expanded.push(exp);
+    /// Macro-expand, compile, and run a sequence of top-level forms on the VM,
+    /// rooted at `globals`. Shared by every eval entry point (M6: single
+    /// evaluator). `define`s land in `globals`.
+    fn run_exprs_on_vm(&self, exprs: &[Value], globals: &Rc<Env>) -> EvalResult {
+        let mut expanded = Vec::with_capacity(exprs.len());
+        for expr in exprs {
+            expanded.push(expand_for_vm_in(&self.ctx, globals, expr)?);
         }
-
-        let known_natives = collect_native_names(&self.global_env);
-        let prog = sema_vm::compile_program(&expanded, Some(known_natives))?;
+        let known_natives = collect_native_names(globals);
+        let span_map = self.ctx.span_table.borrow().clone();
+        let prog = sema_vm::compile_program_with_spans_and_natives(
+            &expanded,
+            &span_map,
+            None,
+            Some(known_natives),
+        )?;
         let mut vm = sema_vm::VM::new(
-            self.global_env.clone(),
+            globals.clone(),
             prog.functions,
             &prog.native_table,
             prog.main_cache_slots,
         )?;
+        sema_vm::init_scheduler(self.global_env.clone(), prog.native_table.clone());
+        // Reset the loop-guard step counter so the limit (if any) is per top-level
+        // eval, not cumulative across calls on a reused interpreter.
+        self.ctx.eval_steps.set(0);
         vm.execute(prog.closure, &self.ctx)
     }
 
@@ -182,75 +185,126 @@ impl Interpreter {
         ))
     }
 
-    /// Pre-process a top-level expression for VM compilation.
-    /// Evaluates `defmacro` forms via the tree-walker to register macros,
-    /// then expands macro calls in all other forms.
+    /// Pre-process a top-level expression for VM compilation: register any
+    /// `defmacro` forms, then expand macro calls in all other forms.
     pub fn expand_for_vm(&self, expr: &Value) -> EvalResult {
-        if let Some(items) = expr.as_list() {
-            if let Some(s) = items.first().and_then(|v| v.as_symbol_spur()) {
-                let name = resolve(s);
-                if name == "defmacro" {
-                    eval_value(&self.ctx, expr, &self.global_env)?;
-                    return Ok(Value::nil());
-                }
-                if name == "begin" || name == "progn" {
-                    let mut new_items = vec![Value::symbol_from_spur(s)];
-                    let mut changed = false;
-                    for item in &items[1..] {
-                        let expanded = self.expand_for_vm(item)?;
-                        if expanded.raw_bits() != item.raw_bits() {
-                            changed = true;
-                        }
-                        new_items.push(expanded);
-                    }
-                    if !changed {
-                        return Ok(expr.clone());
-                    }
-                    return Ok(Value::list(new_items));
-                }
-            }
-        }
-        self.expand_macros(expr)
-    }
-
-    /// Recursively expand macro calls in an expression.
-    /// Preserves Rc pointer identity when no actual expansion occurs,
-    /// so that span lookups (keyed by Rc pointer) remain valid.
-    fn expand_macros(&self, expr: &Value) -> EvalResult {
-        if let Some(items) = expr.as_list() {
-            if !items.is_empty() {
-                if let Some(s) = items.first().and_then(|v| v.as_symbol_spur()) {
-                    let name = resolve(s);
-                    if name == "quote" {
-                        return Ok(expr.clone());
-                    }
-                    if let Some(mac_val) = self.global_env.get(s) {
-                        if let Some(mac) = mac_val.as_macro_rc() {
-                            let expanded =
-                                apply_macro(&self.ctx, &mac, &items[1..], &self.global_env)?;
-                            return self.expand_macros(&expanded);
-                        }
-                    }
-                }
-                let expanded: Vec<Value> = items
-                    .iter()
-                    .map(|v| self.expand_macros(v))
-                    .collect::<Result<_, _>>()?;
-                // If no item changed, return original to preserve Rc identity (and spans)
-                let changed = expanded
-                    .iter()
-                    .zip(items.iter())
-                    .any(|(a, b)| a.raw_bits() != b.raw_bits());
-                if !changed {
-                    return Ok(expr.clone());
-                }
-                return Ok(Value::list(expanded));
-            }
-        }
-        Ok(expr.clone())
+        expand_for_vm_in(&self.ctx, &self.global_env, expr)
     }
 }
 
+/// Pre-process a top-level expression for VM compilation, expanding macro calls
+/// and eagerly registering `defmacro` forms — against `env` rather than a fixed
+/// global env. For top-level code `env` is the global env (unchanged behavior);
+/// for a `load`ed module body it is the same shared global env, so a `defmacro`
+/// registers where `expand_macros_in` looks it up and inherited macros still
+/// resolve via the parent chain.
+pub fn expand_for_vm_in(ctx: &EvalContext, env: &Env, expr: &Value) -> EvalResult {
+    if let Some(items) = expr.as_list() {
+        if let Some(s) = items.first().and_then(|v| v.as_symbol_spur()) {
+            let name = resolve(s);
+            if name == "defmacro" {
+                // Register the macro directly (pure destructure) — the VM macro
+                // path must not route through the tree-walker's `eval_value`.
+                register_defmacro(items, env)?;
+                return Ok(Value::nil());
+            }
+            if name == "begin" || name == "progn" {
+                let mut new_items = vec![Value::symbol_from_spur(s)];
+                let mut changed = false;
+                for item in &items[1..] {
+                    let expanded = expand_for_vm_in(ctx, env, item)?;
+                    if expanded.raw_bits() != item.raw_bits() {
+                        changed = true;
+                    }
+                    new_items.push(expanded);
+                }
+                if !changed {
+                    return Ok(expr.clone());
+                }
+                return Ok(Value::list(new_items));
+            }
+        }
+    }
+    expand_macros_in(ctx, env, expr)
+}
+
+/// Recursively expand macro calls, resolving macros via `env` (walking the
+/// parent chain). Preserves Rc pointer identity when no expansion occurs so span
+/// lookups (keyed by Rc pointer) remain valid.
+fn expand_macros_in(ctx: &EvalContext, env: &Env, expr: &Value) -> EvalResult {
+    if let Some(items) = expr.as_list() {
+        if !items.is_empty() {
+            if let Some(s) = items.first().and_then(|v| v.as_symbol_spur()) {
+                let name = resolve(s);
+                if name == "quote" {
+                    return Ok(expr.clone());
+                }
+                if let Some(mac_val) = env.get(s) {
+                    if let Some(mac) = mac_val.as_macro_rc() {
+                        // VM-native expansion: apply the transformer on the VM,
+                        // not the tree-walker.
+                        let expanded = apply_macro_vm(ctx, &mac, &items[1..], env)?;
+                        return expand_macros_in(ctx, env, &expanded);
+                    }
+                }
+            }
+            let expanded: Vec<Value> = items
+                .iter()
+                .map(|v| expand_macros_in(ctx, env, v))
+                .collect::<Result<_, _>>()?;
+            let changed = expanded
+                .iter()
+                .zip(items.iter())
+                .any(|(a, b)| a.raw_bits() != b.raw_bits());
+            if !changed {
+                return Ok(expr.clone());
+            }
+            return Ok(Value::list(expanded));
+        }
+    }
+
+    match expr.view() {
+        ValueView::Vector(items) => {
+            let expanded: Vec<Value> = items
+                .iter()
+                .map(|v| expand_macros_in(ctx, env, v))
+                .collect::<Result<_, _>>()?;
+            let changed = expanded
+                .iter()
+                .zip(items.iter())
+                .any(|(a, b)| a.raw_bits() != b.raw_bits());
+            if changed {
+                Ok(Value::vector(expanded))
+            } else {
+                Ok(expr.clone())
+            }
+        }
+        ValueView::Map(map) => {
+            let mut changed = false;
+            let mut expanded = BTreeMap::new();
+            for (key, value) in map.iter() {
+                let expanded_key = expand_macros_in(ctx, env, key)?;
+                let expanded_value = expand_macros_in(ctx, env, value)?;
+                changed |= expanded_key.raw_bits() != key.raw_bits()
+                    || expanded_value.raw_bits() != value.raw_bits();
+                expanded.insert(expanded_key, expanded_value);
+            }
+            if changed {
+                Ok(Value::map(expanded))
+            } else {
+                Ok(expr.clone())
+            }
+        }
+        _ => Ok(expr.clone()),
+    }
+}
+
+/// Run deserialized bytecode (a `.semac` payload) on a fresh VM rooted at
+/// `globals`. Used to `load`/`import` precompiled bytecode modules (e.g.
+/// embedded in a standalone-executable or web-archive VFS) the same way
+/// `eval_module_body_vm` runs source modules. Does NOT (re)initialize the
+/// async scheduler — callers nest this inside an already-running program and
+/// reuse the scheduler installed by the top-level VM driver.
 pub fn execute_compile_result(
     ctx: &EvalContext,
     globals: Rc<Env>,
@@ -263,102 +317,86 @@ pub fn execute_compile_result(
             name: None,
             chunk: result.chunk,
             upvalue_descs: Vec::new(),
+            upvalue_names: Vec::new(),
             arity: 0,
             has_rest: false,
             local_names: Vec::new(),
+            local_scopes: Vec::new(),
             source_file: None,
             cache_offset: 0,
         }),
         upvalues: Vec::new(),
+        globals: None,
+        functions: None,
     });
 
     let mut vm = sema_vm::VM::new(globals, functions, &[], main_cache_slots)?;
     vm.execute(closure, ctx)
 }
 
-/// Evaluate a string containing one or more expressions.
-pub fn eval_string(ctx: &EvalContext, input: &str, env: &Env) -> EvalResult {
-    let (exprs, spans) = sema_reader::read_many_with_spans(input)?;
-    ctx.merge_span_table(spans);
-    ctx.max_eval_depth.set(0);
+/// Compile and run a `load`ed module body on the VM, one top-level form at a
+/// time so a `defmacro` / nested `load` that registers a macro is visible to
+/// later forms before they compile. `env` is the caller's shared global env, so
+/// defines land in the global scope (matching `load` semantics). Returns the
+/// value of the last form (nil for an empty body).
+///
+/// Only used for `load` (not `import`): `load` shares the global env, so module
+/// functions resolve their globals against the same env every VM uses — avoiding
+/// the per-module-globals problem that makes VM-backed `import` incorrect (see
+/// docs/plans/2026-06-16-vm-module-loading.md). Does NOT (re)initialize the async
+/// scheduler — it reuses the one installed by the top-level VM driver.
+pub fn eval_module_body_vm(
+    ctx: &EvalContext,
+    env: &Env,
+    exprs: &[Value],
+    span_map: &sema_core::SpanMap,
+    source_file: Option<std::path::PathBuf>,
+) -> EvalResult {
     let mut result = Value::nil();
-    for expr in &exprs {
-        result = eval_value(ctx, expr, env)?;
+    for expr in exprs {
+        let expanded = expand_for_vm_in(ctx, env, expr)?;
+        // `defmacro` (and forms that expand to nothing) are applied by expansion;
+        // there is nothing to compile/run for them.
+        if expanded.is_nil() {
+            continue;
+        }
+        let prog = sema_vm::compile_program_with_spans(
+            std::slice::from_ref(&expanded),
+            span_map,
+            source_file.clone(),
+        )?;
+        let globals = Rc::new(env.clone());
+        let mut vm = sema_vm::VM::new(
+            globals,
+            prog.functions,
+            &prog.native_table,
+            prog.main_cache_slots,
+        )?;
+        result = vm.execute(prog.closure, ctx)?;
     }
+    // Each per-form VM ran on a clone of `env` with its own version cell, so any
+    // globals (re)defined by the body did not bump `env`'s version. Bump it now
+    // so the calling VM (whose globals share `env`'s bindings) invalidates its
+    // inline global cache and re-reads, rather than serving stale cached values.
+    env.bump_version();
     Ok(result)
 }
 
-/// The core eval function: evaluate a Value in an environment.
-pub fn eval(ctx: &EvalContext, expr: &Value, env: &Env) -> EvalResult {
-    eval_value(ctx, expr, env)
-}
-
-/// Maximum eval nesting depth before we bail with an error.
-/// This prevents native stack overflow from unbounded recursion
-/// (both function calls and special form nesting like deeply nested if/let/begin).
-/// WASM has a much smaller call stack (~1MB V8 limit) so we use a lower depth.
-#[cfg(target_arch = "wasm32")]
-const MAX_EVAL_DEPTH: usize = 256;
-#[cfg(not(target_arch = "wasm32"))]
-const MAX_EVAL_DEPTH: usize = 1024;
-
-pub fn eval_value(ctx: &EvalContext, expr: &Value, env: &Env) -> EvalResult {
-    // Fast path: self-evaluating forms skip depth/step tracking entirely.
-    match expr.view() {
-        ValueView::Nil
-        | ValueView::Bool(_)
-        | ValueView::Int(_)
-        | ValueView::Float(_)
-        | ValueView::String(_)
-        | ValueView::Char(_)
-        | ValueView::Keyword(_)
-        | ValueView::Thunk(_)
-        | ValueView::Bytevector(_)
-        | ValueView::NativeFn(_)
-        | ValueView::Lambda(_)
-        | ValueView::HashMap(_) => return Ok(expr.clone()),
-        ValueView::Symbol(spur) => {
-            if let Some(val) = env.get(spur) {
-                return Ok(val);
-            }
-            let name = resolve(spur);
-            let mut err = SemaError::Unbound(name.clone());
-            // Check for common names from other Lisp dialects first
-            if let Some(hint) = sema_core::error::veteran_hint(&name) {
-                err = err.with_hint(hint);
-            } else {
-                // Fall back to fuzzy matching
-                let all_names: Vec<String> = env.all_names().iter().map(|s| resolve(*s)).collect();
-                let candidates: Vec<&str> = all_names.iter().map(|s| s.as_str()).collect();
-                if let Some(suggestion) = sema_core::error::suggest_similar(&name, &candidates) {
-                    err = err.with_hint(format!("Did you mean '{suggestion}'?"));
-                }
-            }
-            let trace = ctx.capture_stack_trace();
-            return Err(err.with_stack_trace(trace));
-        }
-        _ => {}
+/// VM-native evaluation for callback consumers (e.g. sema-llm tool handlers):
+/// macro-expand, compile, and run `expr` on a fresh bytecode VM rooted at `env`.
+/// This is the VM-backed counterpart of `eval_value`, used to keep the
+/// eval-callback path off the tree-walker (M5 / Phase 1c). Each call builds a
+/// throwaway VM over a clone of `env` (sharing its bindings), so it is suited to
+/// one-shot evaluation rather than a persistent define-accumulating session.
+pub fn eval_value_vm(ctx: &EvalContext, expr: &Value, env: &Env) -> EvalResult {
+    let env_rc = Rc::new(env.clone());
+    let expanded = expand_for_vm_in(ctx, &env_rc, expr)?;
+    if expanded.is_nil() {
+        return Ok(Value::nil());
     }
-
-    let depth = ctx.eval_depth.get();
-    ctx.eval_depth.set(depth + 1);
-    if depth + 1 > ctx.max_eval_depth.get() {
-        ctx.max_eval_depth.set(depth + 1);
-    }
-    if depth == 0 {
-        ctx.eval_steps.set(0);
-    }
-    if depth > MAX_EVAL_DEPTH {
-        ctx.eval_depth.set(ctx.eval_depth.get().saturating_sub(1));
-        return Err(SemaError::eval(format!(
-            "maximum eval depth exceeded ({MAX_EVAL_DEPTH})"
-        )).with_hint("this usually means infinite recursion; ensure recursive calls are in tail position for TCO, or use 'do' for iteration"));
-    }
-
-    let result = eval_value_inner(ctx, expr, env);
-
-    ctx.eval_depth.set(ctx.eval_depth.get().saturating_sub(1));
-    result
+    let prog = sema_vm::compile_program(std::slice::from_ref(&expanded), None)?;
+    let mut vm = sema_vm::VM::new(env_rc, prog.functions, &[], prog.main_cache_slots)?;
+    vm.execute(prog.closure, ctx)
 }
 
 /// Call a function value with already-evaluated arguments.
@@ -370,9 +408,14 @@ pub fn eval_value(ctx: &EvalContext, expr: &Value, env: &Env) -> EvalResult {
 pub fn call_value(ctx: &EvalContext, func: &Value, args: &[Value]) -> EvalResult {
     match func.view() {
         ValueView::NativeFn(native) => (native.func)(ctx, args),
-        ValueView::Lambda(lambda) => {
-            let trampoline = apply_lambda(ctx, &lambda, args)?;
-            run_trampoline(ctx, trampoline)
+        ValueView::Lambda(_) => {
+            // Raw `Lambda` values never occur on the VM path (user lambdas are
+            // NativeFn-wrapped VM closures); the tree-walker that produced them
+            // has been retired.
+            Err(SemaError::eval(
+                "internal: raw lambda value reached call_value (VM closures are native-fn-wrapped)"
+                    .to_string(),
+            ))
         }
         ValueView::Keyword(spur) => {
             if args.len() != 1 {
@@ -425,366 +468,29 @@ fn call_multimethod(ctx: &EvalContext, mm: &Rc<MultiMethod>, args: &[Value]) -> 
 /// Run a trampoline to completion iteratively.
 /// Used by `call_value` so that stdlib HOF callbacks (map, for-each, etc.)
 /// don't grow the Rust call stack for every evaluation step.
-fn run_trampoline(ctx: &EvalContext, trampoline: Trampoline) -> EvalResult {
-    let limit = ctx.eval_step_limit.get();
-    let mut current = trampoline;
-    loop {
-        match current {
-            Trampoline::Value(v) => return Ok(v),
-            Trampoline::Eval(expr, env) => {
-                if limit > 0 {
-                    let v = ctx.eval_steps.get() + 1;
-                    ctx.eval_steps.set(v);
-                    if v > limit {
-                        return Err(SemaError::eval("eval step limit exceeded".to_string()));
-                    }
-                }
-                match eval_step(ctx, &expr, &env) {
-                    Ok(t) => current = t,
-                    Err(e) => {
-                        if e.stack_trace().is_none() {
-                            let trace = ctx.capture_stack_trace();
-                            return Err(e.with_stack_trace(trace));
-                        }
-                        return Err(e);
-                    }
-                }
-            }
-        }
-    }
-}
-
-fn eval_value_inner(ctx: &EvalContext, expr: &Value, env: &Env) -> EvalResult {
-    let entry_depth = ctx.call_stack_depth();
-    let guard = CallStackGuard { ctx, entry_depth };
-    let limit = ctx.eval_step_limit.get();
-
-    // First iteration: use borrowed expr/env to avoid cloning
-    if limit > 0 {
-        let v = ctx.eval_steps.get() + 1;
-        ctx.eval_steps.set(v);
-        if v > limit {
-            return Err(SemaError::eval("eval step limit exceeded".to_string()));
-        }
-    }
-
-    match eval_step(ctx, expr, env) {
-        Ok(Trampoline::Value(v)) => {
-            drop(guard);
-            Ok(v)
-        }
-        Ok(Trampoline::Eval(next_expr, next_env)) => {
-            // Need to continue — enter the trampoline loop
-            let mut current_expr = next_expr;
-            let mut current_env = next_env;
-
-            // Trim call stack for TCO
-            {
-                let mut stack = ctx.call_stack.borrow_mut();
-                if stack.len() > entry_depth + 1 {
-                    let top = stack.last().cloned();
-                    stack.truncate(entry_depth);
-                    if let Some(frame) = top {
-                        stack.push(frame);
-                    }
-                }
-            }
-
-            loop {
-                if limit > 0 {
-                    let v = ctx.eval_steps.get() + 1;
-                    ctx.eval_steps.set(v);
-                    if v > limit {
-                        return Err(SemaError::eval("eval step limit exceeded".to_string()));
-                    }
-                }
-
-                match eval_step(ctx, &current_expr, &current_env) {
-                    Ok(Trampoline::Value(v)) => {
-                        drop(guard);
-                        return Ok(v);
-                    }
-                    Ok(Trampoline::Eval(next_expr, next_env)) => {
-                        {
-                            let mut stack = ctx.call_stack.borrow_mut();
-                            if stack.len() > entry_depth + 1 {
-                                let top = stack.last().cloned();
-                                stack.truncate(entry_depth);
-                                if let Some(frame) = top {
-                                    stack.push(frame);
-                                }
-                            }
-                        }
-                        current_expr = next_expr;
-                        current_env = next_env;
-                    }
-                    Err(e) => {
-                        if e.stack_trace().is_none() {
-                            let trace = ctx.capture_stack_trace();
-                            drop(guard);
-                            return Err(e.with_stack_trace(trace));
-                        }
-                        drop(guard);
-                        return Err(e);
-                    }
-                }
-            }
-        }
-        Err(e) => {
-            if e.stack_trace().is_none() {
-                let trace = ctx.capture_stack_trace();
-                drop(guard);
-                return Err(e.with_stack_trace(trace));
-            }
-            drop(guard);
-            Err(e)
-        }
-    }
-}
-
-fn eval_step(ctx: &EvalContext, expr: &Value, env: &Env) -> Result<Trampoline, SemaError> {
-    match expr.view() {
-        // Self-evaluating forms
-        ValueView::Nil
-        | ValueView::Bool(_)
-        | ValueView::Int(_)
-        | ValueView::Float(_)
-        | ValueView::String(_)
-        | ValueView::Char(_)
-        | ValueView::Thunk(_)
-        | ValueView::Bytevector(_) => Ok(Trampoline::Value(expr.clone())),
-        ValueView::Keyword(_) => Ok(Trampoline::Value(expr.clone())),
-        ValueView::Vector(items) => {
-            let mut result = Vec::with_capacity(items.len());
-            for item in items.iter() {
-                result.push(eval_value(ctx, item, env)?);
-            }
-            Ok(Trampoline::Value(Value::vector(result)))
-        }
-        ValueView::Map(map) => {
-            let mut result = std::collections::BTreeMap::new();
-            for (k, v) in map.iter() {
-                let ek = eval_value(ctx, k, env)?;
-                let ev = eval_value(ctx, v, env)?;
-                result.insert(ek, ev);
-            }
-            Ok(Trampoline::Value(Value::map(result)))
-        }
-        ValueView::HashMap(_) => Ok(Trampoline::Value(expr.clone())),
-
-        // Symbol lookup
-        ValueView::Symbol(spur) => env.get(spur).map(Trampoline::Value).ok_or_else(|| {
-            let name = resolve(spur);
-            let mut err = SemaError::Unbound(name.clone());
-            if let Some(hint) = sema_core::error::veteran_hint(&name) {
-                err = err.with_hint(hint);
-            } else {
-                let all_names: Vec<String> = env.all_names().iter().map(|s| resolve(*s)).collect();
-                let candidates: Vec<&str> = all_names.iter().map(|s| s.as_str()).collect();
-                if let Some(suggestion) = sema_core::error::suggest_similar(&name, &candidates) {
-                    err = err.with_hint(format!("Did you mean '{suggestion}'?"));
-                }
-            }
-            err
-        }),
-
-        // Function application / special forms
-        ValueView::List(items) => {
-            if items.is_empty() {
-                return Ok(Trampoline::Value(Value::nil()));
-            }
-
-            let head = &items[0];
-            let args = &items[1..];
-
-            // O(1) special form dispatch: compare the symbol's Spur (u32 interned handle)
-            // against cached constants, avoiding string resolution entirely.
-            if let Some(spur) = head.as_symbol_spur() {
-                if let Some(result) = special_forms::try_eval_special(spur, args, env, ctx) {
-                    return result;
-                }
-            }
-
-            // Evaluate the head to get the callable
-            let func = eval_value(ctx, head, env)?;
-
-            // Look up the span of the call site expression
-            let call_span = span_of_expr(ctx, expr);
-
-            match func.view() {
-                ValueView::NativeFn(native) => {
-                    // Evaluate arguments
-                    let mut eval_args = Vec::with_capacity(args.len());
-                    for arg in args {
-                        eval_args.push(eval_value(ctx, arg, env)?);
-                    }
-                    // Push frame, call native fn
-                    let frame = CallFrame {
-                        name: native.name.to_string(),
-                        file: ctx.current_file_path(),
-                        span: call_span,
-                    };
-                    ctx.push_call_frame(frame);
-                    match (native.func)(ctx, &eval_args) {
-                        Ok(v) => {
-                            // Pop on success (native fns don't trampoline)
-                            ctx.truncate_call_stack(ctx.call_stack_depth().saturating_sub(1));
-                            Ok(Trampoline::Value(v))
-                        }
-                        // On error, leave frame for stack trace capture
-                        Err(e) => Err(annotate_arity_error(e, expr)),
-                    }
-                }
-                ValueView::Lambda(lambda) => {
-                    // Evaluate arguments
-                    let mut eval_args = Vec::with_capacity(args.len());
-                    for arg in args {
-                        eval_args.push(eval_value(ctx, arg, env)?);
-                    }
-                    // Push frame — trampoline continues, eval_value guard handles cleanup
-                    let frame = CallFrame {
-                        name: lambda
-                            .name
-                            .map(resolve)
-                            .unwrap_or_else(|| "<lambda>".to_string()),
-                        file: ctx.current_file_path(),
-                        span: call_span,
-                    };
-                    ctx.push_call_frame(frame);
-                    apply_lambda(ctx, &lambda, &eval_args)
-                        .map_err(|e| annotate_arity_error(e, expr))
-                }
-                ValueView::Macro(mac) => {
-                    // Macros receive unevaluated arguments
-                    let expanded = apply_macro(ctx, &mac, args, env)?;
-                    // Evaluate the expansion in the current env (TCO)
-                    Ok(Trampoline::Eval(expanded, env.clone()))
-                }
-                ValueView::Keyword(spur) => {
-                    // Keywords as functions: (:key map) => (get map :key)
-                    if args.len() != 1 {
-                        let name = resolve(spur);
-                        return Err(SemaError::arity(format!(":{name}"), "1", args.len()));
-                    }
-                    let map_val = eval_value(ctx, &args[0], env)?;
-                    let key = Value::keyword_from_spur(spur);
-                    match map_val.view() {
-                        ValueView::Map(map) => Ok(Trampoline::Value(
-                            map.get(&key).cloned().unwrap_or(Value::nil()),
-                        )),
-                        ValueView::HashMap(map) => Ok(Trampoline::Value(
-                            map.get(&key).cloned().unwrap_or(Value::nil()),
-                        )),
-                        _ => Err(SemaError::type_error_with_value(
-                            "map",
-                            map_val.type_name(),
-                            &map_val,
-                        )),
-                    }
-                }
-                ValueView::MultiMethod(mm) => {
-                    let mut eval_args = Vec::with_capacity(args.len());
-                    for arg in args {
-                        eval_args.push(eval_value(ctx, arg, env)?);
-                    }
-                    let result = call_multimethod(ctx, &mm, &eval_args)?;
-                    Ok(Trampoline::Value(result))
-                }
-                _ => Err(
-                    SemaError::eval(format!("not callable: {} ({})", func, func.type_name()))
-                        .with_hint("the first element of a list must be a function or macro"),
-                ),
-            }
-        }
-
-        _other => Ok(Trampoline::Value(expr.clone())),
-    }
-}
-
-/// If `err` is an arity error, attach a note showing the original call form.
-fn annotate_arity_error(err: SemaError, expr: &Value) -> SemaError {
-    if matches!(err.inner(), SemaError::Arity { .. }) && err.note().is_none() {
-        let form_str = format!("{}", expr);
-        let truncated = if form_str.len() > 80 {
-            format!("{}…", &form_str[..79])
-        } else {
-            form_str
-        };
-        err.with_note(format!("in: {truncated}"))
-    } else {
-        err
-    }
-}
-
-/// Apply a lambda to evaluated arguments with TCO.
-fn apply_lambda(
-    ctx: &EvalContext,
-    lambda: &Rc<Lambda>,
-    args: &[Value],
-) -> Result<Trampoline, SemaError> {
-    let new_env = Env::with_parent(Rc::new(lambda.env.clone()));
-
-    // Bind parameters
-    if let Some(rest) = lambda.rest_param {
-        if args.len() < lambda.params.len() {
-            return Err(SemaError::arity(
-                lambda
-                    .name
-                    .map(resolve)
-                    .unwrap_or_else(|| "lambda".to_string()),
-                format!("{}+", lambda.params.len()),
-                args.len(),
-            ));
-        }
-        for (param, arg) in lambda.params.iter().zip(args.iter()) {
-            new_env.set(*param, arg.clone());
-        }
-        let rest_args = args[lambda.params.len()..].to_vec();
-        new_env.set(rest, Value::list(rest_args));
-    } else {
-        if args.len() != lambda.params.len() {
-            return Err(SemaError::arity(
-                lambda
-                    .name
-                    .map(resolve)
-                    .unwrap_or_else(|| "lambda".to_string()),
-                lambda.params.len().to_string(),
-                args.len(),
-            ));
-        }
-        for (param, arg) in lambda.params.iter().zip(args.iter()) {
-            new_env.set(*param, arg.clone());
-        }
-    }
-
-    // Self-reference for recursion — just clone the Rc pointer
-    if let Some(name) = lambda.name {
-        new_env.set(name, Value::lambda_from_rc(Rc::clone(lambda)));
-    }
-
-    // Evaluate body with TCO on last expression
-    if lambda.body.is_empty() {
-        return Ok(Trampoline::Value(Value::nil()));
-    }
-    for expr in &lambda.body[..lambda.body.len() - 1] {
-        eval_value(ctx, expr, &new_env)?;
-    }
-    Ok(Trampoline::Eval(
-        lambda.body.last().unwrap().clone(),
-        new_env,
-    ))
-}
-
-/// Apply a macro: bind unevaluated args, evaluate body to produce expansion.
-pub fn apply_macro(
+/// Apply a macro by evaluating its body on the **bytecode VM** (no tree-walker).
+///
+/// This is the VM-native counterpart of [`apply_macro`]. The macro's
+/// (unevaluated) arguments are bound — together with a possible rest list — as
+/// *globals* in a transient child env of `caller_env`; the transformer body is
+/// then compiled fresh per call site (so auto-gensym stays hygienic — a cached
+/// transformer would reuse the same gensym across call sites) and run on a VM
+/// rooted at that env. Rooting at `caller_env` lets transformer bodies call
+/// global helpers and reference module-level bindings, and binding params as
+/// globals lets the compiled body resolve them via `GetGlobal`.
+///
+/// Used by the VM macro pre-expansion path (`expand_macros_in`) and
+/// `__vm-macroexpand`. The tree-walker's own lazy expansion keeps using
+/// [`apply_macro`] until the tree-walker is retired.
+pub fn apply_macro_vm(
     ctx: &EvalContext,
     mac: &sema_core::Macro,
     args: &[Value],
     caller_env: &Env,
 ) -> Result<Value, SemaError> {
-    let env = Env::with_parent(Rc::new(caller_env.clone()));
+    let env = Rc::new(Env::with_parent(Rc::new(caller_env.clone())));
 
-    // Bind parameters to unevaluated forms
+    // Bind parameters to unevaluated forms (same arity rules as apply_macro).
     if let Some(rest) = mac.rest_param {
         if args.len() < mac.params.len() {
             return Err(SemaError::arity(
@@ -796,8 +502,7 @@ pub fn apply_macro(
         for (param, arg) in mac.params.iter().zip(args.iter()) {
             env.set(*param, arg.clone());
         }
-        let rest_args = args[mac.params.len()..].to_vec();
-        env.set(rest, Value::list(rest_args));
+        env.set(rest, Value::list(args[mac.params.len()..].to_vec()));
     } else {
         if args.len() != mac.params.len() {
             return Err(SemaError::arity(
@@ -811,26 +516,80 @@ pub fn apply_macro(
         }
     }
 
-    // Evaluate the macro body to get the expansion
+    // Compile and run each body form on the VM, fresh per call site (no cache)
+    // to keep auto-gensym hygienic. The body is the *transformer* code; it is
+    // NOT macro-pre-expanded here — quasiquote templates inside it (which may
+    // legitimately mention the macro's own name, as the recursive threading
+    // macros do) must be compiled as data, not re-expanded. Any macro call the
+    // transformer *produces* is re-expanded by the caller (`expand_macros_in`
+    // recurses on the returned form). `compile_program` lowers quasiquote /
+    // unquote / unquote-splicing directly, matching the tree-walker's
+    // `eval_value` over the same body.
     let mut result = Value::nil();
     for expr in &mac.body {
-        result = eval_value(ctx, expr, &env)?;
+        let prog = sema_vm::compile_program(std::slice::from_ref(expr), None)?;
+        let mut vm = sema_vm::VM::new(env.clone(), prog.functions, &[], prog.main_cache_slots)?;
+        result = vm.execute(prog.closure, ctx)?;
     }
     Ok(result)
+}
+
+/// Register a `defmacro` form's macro in `env` **without** the tree-walker — a
+/// pure destructure mirroring `special_forms::eval_defmacro`. Used by the VM
+/// pre-expansion path so registering a macro never routes through `eval_value`.
+fn register_defmacro(items: &[Value], env: &Env) -> Result<(), SemaError> {
+    // items[0] is the `defmacro` symbol; the rest are name, params, body…
+    let args = &items[1..];
+    if args.len() < 3 {
+        return Err(SemaError::arity("defmacro", "3+", args.len()));
+    }
+    let name_spur = args[0]
+        .as_symbol_spur()
+        .ok_or_else(|| SemaError::eval("defmacro: name must be a symbol"))?;
+    let param_list = args[1]
+        .as_list()
+        .ok_or_else(|| SemaError::eval("defmacro: params must be a list"))?;
+    let param_names: Vec<sema_core::Spur> = param_list
+        .iter()
+        .map(|v| {
+            v.as_symbol_spur()
+                .ok_or_else(|| SemaError::eval("defmacro: parameter must be a symbol"))
+        })
+        .collect::<Result<_, _>>()?;
+    let (params, rest_param) = special_forms::parse_params(&param_names);
+    let body = args[2..].to_vec();
+    env.set(
+        name_spur,
+        Value::macro_val(Macro {
+            params,
+            rest_param,
+            body,
+            name: name_spur,
+        }),
+    );
+    Ok(())
 }
 
 /// Register `__vm-*` native functions that the bytecode VM calls back into
 /// the tree-walker for forms that cannot be fully compiled.
 /// Load built-in macros (threading, when-let, if-let) into the global environment.
-fn load_prelude(ctx: &EvalContext, env: &Rc<Env>) {
-    let exprs = sema_reader::read_many(crate::prelude::PRELUDE).expect("prelude parse error");
+pub fn load_prelude(ctx: &EvalContext, env: &Rc<Env>) {
+    let exprs = sema_reader::read_many(crate::prelude::PRELUDE)
+        .unwrap_or_else(|e| panic!("internal: prelude failed to parse: {e}"));
+    // The prelude is exclusively `defmacro` forms. Register them via the
+    // VM-native pre-expansion path so prelude loading never routes macro
+    // registration through the tree-walker's `eval_value`.
     for expr in &exprs {
-        eval_value(ctx, expr, env).expect("prelude eval error");
+        expand_for_vm_in(ctx, env, expr)
+            .unwrap_or_else(|e| panic!("internal: prelude failed to load: {e}"));
     }
 }
 
-fn register_vm_delegates(env: &Rc<Env>) {
-    // __vm-eval: evaluate an expression via the tree-walker
+pub fn register_vm_delegates(env: &Rc<Env>) {
+    // __vm-eval: macro-expand, compile, and run the expression on the bytecode
+    // VM (rooted at the global env so top-level `define`s persist). The runtime
+    // `(eval ...)` meta path is thus VM-native — it no longer round-trips
+    // through the tree-walker's `eval_value` (M3 / Phase 1c).
     let eval_env = env.clone();
     env.set(
         intern("__vm-eval"),
@@ -838,14 +597,52 @@ fn register_vm_delegates(env: &Rc<Env>) {
             if args.len() != 1 {
                 return Err(SemaError::arity("eval", "1", args.len()));
             }
-            sema_core::eval_callback(ctx, &args[0], &eval_env)
+            let expanded = expand_for_vm_in(ctx, &eval_env, &args[0])?;
+            // A form that expands to nothing (e.g. a `defmacro`) yields nil.
+            if expanded.is_nil() {
+                return Ok(Value::nil());
+            }
+            let prog = sema_vm::compile_program(std::slice::from_ref(&expanded), None)?;
+            let mut vm =
+                sema_vm::VM::new(eval_env.clone(), prog.functions, &[], prog.main_cache_slots)?;
+            vm.execute(prog.closure, ctx)
         })),
     );
 
-    // __vm-load: delegate to the tree-walker's eval_load via eval_callback,
-    // mirroring how __vm-import delegates to eval_import. This ensures VFS
-    // resolution, file path push/pop, and all other load semantics are
-    // handled by a single code path in special_forms.rs.
+    // __vm-module-exports: register a `(module name (export ...) ...)` form's
+    // declared export list with the active module-load scope, so `import`
+    // restricts the copied bindings to exactly those names. Without this the VM
+    // exported every top-level binding (private helpers leaked). Mirrors the
+    // tree-walker's `set_module_exports` call in eval_module.
+    env.set(
+        intern("__vm-module-exports"),
+        Value::native_fn(NativeFn::with_ctx(
+            "__vm-module-exports",
+            move |ctx, args| {
+                if args.len() != 1 {
+                    return Err(SemaError::arity("module-exports", "1", args.len()));
+                }
+                let names: Vec<String> = match args[0].as_list() {
+                    Some(items) => items
+                        .iter()
+                        .map(|v| {
+                            v.as_symbol().map(|s| s.to_string()).ok_or_else(|| {
+                                SemaError::eval("module: export names must be symbols")
+                            })
+                        })
+                        .collect::<Result<_, _>>()?,
+                    None => return Err(SemaError::type_error("list", args[0].type_name())),
+                };
+                ctx.set_module_exports(names);
+                Ok(Value::nil())
+            },
+        )),
+    );
+
+    // __vm-load: call the load driver (special_forms::eval_load) directly, not
+    // through the tree-walker's eval_step dispatch. The driver handles VFS
+    // resolution, file path push/pop, caching, and runs the loaded body on the
+    // VM (M4). The path arrives already evaluated from the VM.
     let load_env = env.clone();
     env.set(
         intern("__vm-load"),
@@ -853,12 +650,21 @@ fn register_vm_delegates(env: &Rc<Env>) {
             if args.len() != 1 {
                 return Err(SemaError::arity("load", "1", args.len()));
             }
-            let load_expr = Value::list(vec![Value::symbol("load"), args[0].clone()]);
-            sema_core::eval_callback(ctx, &load_expr, &load_env)
+            // Target the *currently executing* VM's env (the module being run),
+            // falling back to the global env at top level, so a nested `load`
+            // adds definitions to the right module env — not always the globals.
+            let target = sema_vm::current_vm_globals().unwrap_or_else(|| load_env.clone());
+            match special_forms::eval_load(std::slice::from_ref(&args[0]), &target, ctx)? {
+                Trampoline::Value(v) => Ok(v),
+                Trampoline::Eval(..) => Ok(Value::nil()),
+            }
         })),
     );
 
-    // __vm-import: import a module via the tree-walker
+    // __vm-import: call the import driver (special_forms::eval_import) directly,
+    // not through the tree-walker's eval_step dispatch. Under the VM backend the
+    // driver compiles and runs the module body on the VM (M4). The path and
+    // selective-import symbols arrive already evaluated from the VM.
     let import_env = env.clone();
     env.set(
         intern("__vm-import"),
@@ -867,16 +673,19 @@ fn register_vm_delegates(env: &Rc<Env>) {
                 return Err(SemaError::arity("import", "2", args.len()));
             }
             ctx.sandbox.check(sema_core::Caps::FS_READ, "import")?;
-            let mut form = vec![Value::symbol("import"), args[0].clone()];
+            let mut imp_args = vec![args[0].clone()];
             if let Some(items) = args[1].as_list() {
-                if !items.is_empty() {
-                    for item in items.iter() {
-                        form.push(item.clone());
-                    }
-                }
+                imp_args.extend(items.iter().cloned());
             }
-            let import_expr = Value::list(form);
-            sema_core::eval_callback(ctx, &import_expr, &import_env)
+            // Copy exports into the *currently executing* VM's env (the module
+            // being run), falling back to the global env at top level. This keeps
+            // a nested module's imports private to that module instead of leaking
+            // into the global env (M4 nested-module isolation).
+            let target = sema_vm::current_vm_globals().unwrap_or_else(|| import_env.clone());
+            match special_forms::eval_import(&imp_args, &target, ctx)? {
+                Trampoline::Value(v) => Ok(v),
+                Trampoline::Eval(..) => Ok(Value::nil()),
+            }
         })),
     );
 
@@ -923,49 +732,52 @@ fn register_vm_delegates(env: &Rc<Env>) {
         })),
     );
 
-    // __vm-defmacro-form: delegate complete defmacro form to the tree-walker
+    // __vm-defmacro-form: register a complete `(defmacro ...)` form directly
+    // (pure destructure) — no tree-walker round-trip. Used for defmacro that
+    // reaches compilation (e.g. non-top-level) rather than expand-time
+    // registration.
     let dmf_env = env.clone();
     env.set(
         intern("__vm-defmacro-form"),
-        Value::native_fn(NativeFn::with_ctx(
-            "__vm-defmacro-form",
-            move |ctx, args| {
-                if args.len() != 1 {
-                    return Err(SemaError::arity("defmacro-form", "1", args.len()));
-                }
-                sema_core::eval_callback(ctx, &args[0], &dmf_env)
-            },
-        )),
+        Value::native_fn(NativeFn::simple("__vm-defmacro-form", move |args| {
+            if args.len() != 1 {
+                return Err(SemaError::arity("defmacro-form", "1", args.len()));
+            }
+            let items = args[0]
+                .as_list()
+                .ok_or_else(|| SemaError::type_error("list", args[0].type_name()))?;
+            register_defmacro(items, &dmf_env)?;
+            Ok(Value::nil())
+        })),
     );
 
     // __vm-define-record-type: delegate to the tree-walker
     let drt_env = env.clone();
     env.set(
         intern("__vm-define-record-type"),
-        Value::native_fn(NativeFn::with_ctx(
-            "__vm-define-record-type",
-            move |ctx, args| {
-                if args.len() != 5 {
-                    return Err(SemaError::arity("define-record-type", "5", args.len()));
+        Value::native_fn(NativeFn::simple("__vm-define-record-type", move |args| {
+            if args.len() != 5 {
+                return Err(SemaError::arity("define-record-type", "5", args.len()));
+            }
+            // Build the `(define-record-type ...)` argument list (without the head
+            // symbol) and register the type directly via the pure destructure —
+            // no tree-walker round-trip. eval_define_record_type only sets native
+            // ctor/predicate/accessor fns in the env; it evaluates no user code.
+            let mut ctor_form = vec![args[1].clone()];
+            if let Some(fields) = args[3].as_list() {
+                ctor_form.extend(fields.iter().cloned());
+            }
+            let mut dr_args = vec![args[0].clone(), Value::list(ctor_form), args[2].clone()];
+            if let Some(specs) = args[4].as_list() {
+                for spec in specs.iter() {
+                    dr_args.push(spec.clone());
                 }
-                let mut ctor_form = vec![args[1].clone()];
-                if let Some(fields) = args[3].as_list() {
-                    ctor_form.extend(fields.iter().cloned());
-                }
-                let mut form = vec![
-                    Value::symbol("define-record-type"),
-                    args[0].clone(),
-                    Value::list(ctor_form),
-                    args[2].clone(),
-                ];
-                if let Some(specs) = args[4].as_list() {
-                    for spec in specs.iter() {
-                        form.push(spec.clone());
-                    }
-                }
-                sema_core::eval_callback(ctx, &Value::list(form), &drt_env)
-            },
-        )),
+            }
+            match special_forms::eval_define_record_type(&dr_args, &drt_env)? {
+                Trampoline::Value(v) => Ok(v),
+                Trampoline::Eval(..) => Ok(Value::nil()),
+            }
+        })),
     );
 
     // __vm-delay: create a thunk with unevaluated body
@@ -1000,12 +812,14 @@ fn register_vm_delegates(env: &Rc<Env>) {
                 {
                     sema_core::call_callback(ctx, &thunk.body, &[])?
                 } else {
-                    sema_core::eval_callback(ctx, &thunk.body, &force_env)?
+                    // Non-callable thunk body (a raw expr) — evaluate on the VM.
+                    eval_value_vm(ctx, &thunk.body, &force_env)?
                 };
                 *thunk.forced.borrow_mut() = Some(val.clone());
                 Ok(val)
             } else {
-                Ok(args[0].clone())
+                Err(SemaError::type_error("thunk", args[0].type_name())
+                    .with_hint("force: argument must be a (delay ...) or promise — non-promise values are an error"))
             }
         })),
     );
@@ -1023,7 +837,8 @@ fn register_vm_delegates(env: &Rc<Env>) {
                     if let Some(spur) = items[0].as_symbol_spur() {
                         if let Some(mac_val) = me_env.get(spur) {
                             if let Some(mac) = mac_val.as_macro_rc() {
-                                return apply_macro(ctx, &mac, &items[1..], &me_env);
+                                // VM-native: expand the transformer on the VM.
+                                return apply_macro_vm(ctx, &mac, &items[1..], &me_env);
                             }
                         }
                     }
@@ -1137,38 +952,42 @@ fn register_vm_delegates(env: &Rc<Env>) {
     );
 
     // __vm-deftool: delegate to tree-walker
+    // __vm-deftool: the VM has already evaluated description/parameters/handler
+    // and passes them as values, so build the tool directly — no tree-walker
+    // round-trip.
     let tool_env = env.clone();
     env.set(
         intern("__vm-deftool"),
-        Value::native_fn(NativeFn::with_ctx("__vm-deftool", move |ctx, args| {
+        Value::native_fn(NativeFn::simple("__vm-deftool", move |args| {
             if args.len() != 4 {
                 return Err(SemaError::arity("deftool", "4", args.len()));
             }
-            let form = Value::list(vec![
-                Value::symbol("deftool"),
-                args[0].clone(),
+            let name = args[0]
+                .as_symbol()
+                .ok_or_else(|| SemaError::eval("deftool: name must be a symbol"))?;
+            special_forms::register_tool(
+                &name,
                 args[1].clone(),
                 args[2].clone(),
                 args[3].clone(),
-            ]);
-            sema_core::eval_callback(ctx, &form, &tool_env)
+                &tool_env,
+            )
         })),
     );
 
-    // __vm-defagent: delegate to tree-walker
+    // __vm-defagent: the VM has already evaluated the options map, so build the
+    // agent directly — no tree-walker round-trip.
     let agent_env = env.clone();
     env.set(
         intern("__vm-defagent"),
-        Value::native_fn(NativeFn::with_ctx("__vm-defagent", move |ctx, args| {
+        Value::native_fn(NativeFn::simple("__vm-defagent", move |args| {
             if args.len() != 2 {
                 return Err(SemaError::arity("defagent", "2", args.len()));
             }
-            let form = Value::list(vec![
-                Value::symbol("defagent"),
-                args[0].clone(),
-                args[1].clone(),
-            ]);
-            sema_core::eval_callback(ctx, &form, &agent_env)
+            let name = args[0]
+                .as_symbol()
+                .ok_or_else(|| SemaError::eval("defagent: name must be a symbol"))?;
+            special_forms::register_agent(&name, args[1].clone(), &agent_env)
         })),
     );
 
@@ -1207,6 +1026,21 @@ fn register_vm_delegates(env: &Rc<Env>) {
                 }
                 None => Ok(Value::nil()),
             }
+        })),
+    );
+
+    // __vm-match-failed: the strict `(match ...)` no-clause-matched path. Always
+    // raises an :eval error carrying the unmatched value. `match*` never calls
+    // this (it returns nil instead).
+    env.set(
+        intern("__vm-match-failed"),
+        Value::native_fn(NativeFn::simple("__vm-match-failed", |args| {
+            let val = args.first().cloned().unwrap_or_else(Value::nil);
+            Err(
+                SemaError::eval(format!("match: no clause matched value: {val}")).with_hint(
+                    "add a catch-all `(_ ...)` clause, or use `match*` to return nil on no match",
+                ),
+            )
         })),
     );
 

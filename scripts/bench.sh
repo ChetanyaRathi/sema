@@ -19,7 +19,7 @@ suite_benchmarks() {
 }
 
 # ── Defaults ───────────────────────────────────────────────────────
-MODE="both"
+MODE="vm"  # the bytecode VM is the sole evaluator
 RUNS=10
 WARMUP=3
 EXPORT=""
@@ -32,7 +32,6 @@ usage() {
 Usage: $0 [OPTIONS]
 
 Options:
-  --mode tree|vm|both   Execution mode (default: both)
   --suite SUITE         Predefined suite: core, closure, data, string, numeric,
                         exception, all (default: all)
   --bench NAME,...      Run specific benchmarks by basename (comma-separated)
@@ -53,9 +52,9 @@ Suites:
   all         everything (default)
 
 Examples:
-  $0                                   # run all benchmarks, tree+vm
-  $0 --suite core --mode vm            # core suite, vm only
-  $0 --bench tak,nqueens --mode vm     # specific benchmarks
+  $0                                   # run all benchmarks
+  $0 --suite core                     # core suite only
+  $0 --bench tak,nqueens               # specific benchmarks
   $0 --export results.json             # save unified results
   $0 --export cur.json --compare base.json  # run and compare to baseline
 EOF
@@ -65,7 +64,6 @@ EOF
 # ── Argument parsing ───────────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --mode)    MODE="$2"; shift 2 ;;
     --suite)   SUITE="$2"; shift 2 ;;
     --bench)   BENCH_LIST="$2"; shift 2 ;;
     --runs)    RUNS="$2"; shift 2 ;;
@@ -78,11 +76,6 @@ while [[ $# -gt 0 ]]; do
 done
 
 # ── Validation ─────────────────────────────────────────────────────
-if [[ "$MODE" != "tree" && "$MODE" != "vm" && "$MODE" != "both" ]]; then
-  echo "Error: --mode must be tree, vm, or both"
-  exit 1
-fi
-
 if [[ -n "$BENCH_LIST" && "$SUITE" != "all" ]]; then
   echo "Error: --bench and --suite cannot be used together"
   exit 1
@@ -160,21 +153,8 @@ for name in "${BENCHMARKS[@]}"; do
   HYPERFINE_ARGS=(--runs "$RUNS" --warmup "$WARMUP" --style full --ignore-failure)
   HYPERFINE_ARGS+=(--export-json "$TMPDIR_BENCH/${name}.json")
 
-  case "$MODE" in
-    tree)
-      hyperfine "${HYPERFINE_ARGS[@]}" \
-        -n "tree: $name" "$SEMA_BIN --no-llm $bench"
-      ;;
-    vm)
-      hyperfine "${HYPERFINE_ARGS[@]}" \
-        -n "vm: $name" "$SEMA_BIN --no-llm --vm $bench"
-      ;;
-    both)
-      hyperfine "${HYPERFINE_ARGS[@]}" \
-        -n "tree: $name" "$SEMA_BIN --no-llm $bench" \
-        -n "vm: $name" "$SEMA_BIN --no-llm --vm $bench"
-      ;;
-  esac
+  hyperfine "${HYPERFINE_ARGS[@]}" \
+    -n "$name" "$SEMA_BIN --no-llm $bench"
 
   echo
 done

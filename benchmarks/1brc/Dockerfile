@@ -1,25 +1,22 @@
 # Stage 1: Build Sema from local source
 FROM rust:bookworm AS sema-builder
-COPY sema-src /sema-src
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    pkg-config libudev-dev libssl-dev \
+    && rm -rf /var/lib/apt/lists/*
+COPY . /sema-src
 WORKDIR /sema-src
 RUN cargo install --path crates/sema
 
 # Stage 2: Benchmark image
 FROM debian:bookworm-slim
+ARG TARGETARCH
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    sbcl \
-    chezscheme \
-    guile-3.0 \
-    chicken-bin \
-    gambc \
-    ecl \
-    newlisp \
-    picolisp \
-    emacs-nox \
-    luajit \
-    default-jdk \
-    curl ca-certificates python3 \
+RUN apt-get update && \
+    packages="sbcl guile-3.0 chicken-bin gambc ecl newlisp picolisp emacs-nox luajit default-jdk curl ca-certificates python3" && \
+    if [ "$TARGETARCH" != "arm64" ]; then \
+        packages="$packages chezscheme"; \
+    fi && \
+    apt-get install -y --no-install-recommends $packages \
     && rm -rf /var/lib/apt/lists/*
 
 # Chicken SRFI-69 (hash tables)
@@ -50,19 +47,26 @@ RUN curl -fsSL https://repo1.maven.org/maven2/com/github/arvyy/kawa/3.1.1/kawa-3
     printf '#!/bin/sh\nexec java -jar /usr/local/lib/kawa.jar "$@"\n' > /usr/local/bin/kawa && \
     chmod +x /usr/local/bin/kawa
 
-# Racket BC (bytecode backend avoids Chez Scheme boot file conflicts)
-RUN curl -fsSL https://download.racket-lang.org/installers/8.15/racket-8.15-x86_64-linux-bc.sh -o /tmp/racket.sh && \
-    chmod +x /tmp/racket.sh && \
-    echo "yes\n1\n" | /tmp/racket.sh --in-place --dest /opt/racket 2>/dev/null; \
-    rm -f /tmp/racket.sh
+# Racket
+# Racket 8.15 has Linux x86_64 installers, but not Linux arm64 installers.
+# Use the upstream BC installer on amd64 and Debian's native package on arm64.
+RUN if [ "$TARGETARCH" = "amd64" ]; then \
+        curl -fsSL https://download.racket-lang.org/installers/8.15/racket-8.15-x86_64-linux-bc.sh -o /tmp/racket.sh && \
+        chmod +x /tmp/racket.sh && \
+        printf 'yes\n1\n' | /tmp/racket.sh --in-place --dest /opt/racket && \
+        rm -f /tmp/racket.sh; \
+    else \
+        apt-get update && apt-get install -y --no-install-recommends racket && \
+        rm -rf /var/lib/apt/lists/*; \
+    fi
 ENV PATH="/opt/racket/bin:$PATH"
-RUN racket -e '(displayln "ready")' || echo "Racket install needs fixup"
+RUN racket -e '(displayln "ready")'
 
 # Sema binary from build stage
 COPY --from=sema-builder /usr/local/cargo/bin/sema /usr/local/bin/sema
 
 WORKDIR /bench
-COPY . .
+COPY benchmarks/1brc/ .
 
 # Compile benchmarks for dialects that have compilers
 RUN apt-get update && apt-get install -y --no-install-recommends build-essential libssl-dev && \

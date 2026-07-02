@@ -26,6 +26,44 @@ thread_local! {
     static HTTP_CACHE: RefCell<BTreeMap<String, Value>> = const { RefCell::new(BTreeMap::new()) };
     /// Total bytes currently stored in the VFS
     static VFS_TOTAL_BYTES: Cell<usize> = const { Cell::new(0) };
+    /// Int32Array view over the control SharedArrayBuffer used for real
+    /// `Atomics.wait` sleep when running inside a Web Worker (installed via
+    /// `installAtomicsSleep`). `None` on the main thread (sleep stays an
+    /// instant virtual-clock advance — `Atomics.wait` is illegal there anyway).
+    static SLEEP_I32: RefCell<Option<js_sys::Int32Array>> = const { RefCell::new(None) };
+    /// Optional sink called with each completed output line as it is produced
+    /// (installed via `setOutputSink`). The Web Worker uses it to stream
+    /// `println` output to the main thread live, so a long-running program
+    /// (e.g. one that really sleeps) shows output as it happens instead of all
+    /// at once at the end. `None` on the main thread (output is batched).
+    static OUTPUT_SINK: RefCell<Option<js_sys::Function>> = const { RefCell::new(None) };
+}
+
+/// Blocking-sleep callback installed in the Web Worker: block this (worker)
+/// thread for `ms` real milliseconds via `Atomics.wait` on the control SAB. The
+/// cell value stays 0, so the wait simply times out after `ms` (a later cancel
+/// can store a non-zero value + `Atomics.notify` to wake it early — see M6).
+/// A plain `fn` (no captures) so it fits `sema_core::BlockingSleepFn`; it reads
+/// the SAB view from the thread-local. Never called on the main thread.
+fn worker_atomics_sleep(ms: u64) {
+    SLEEP_I32.with(|s| {
+        if let Some(arr) = s.borrow().as_ref() {
+            // Slot 0 == 0 → block for `ms`; a cancel stores 1 + notifies, which
+            // wakes this wait immediately so a Stop interrupts a sleep promptly.
+            let _ = js_sys::Atomics::wait_with_timeout(arr, 0, 0, ms as f64);
+        }
+    });
+}
+
+/// Interrupt callback installed in the Web Worker: the main thread requests a
+/// cancel by storing a non-zero value in control slot 0 (+ `Atomics.notify`).
+/// The VM loop guard polls this so a Stop button aborts a running program.
+fn worker_check_interrupt() -> bool {
+    SLEEP_I32.with(|s| {
+        s.borrow()
+            .as_ref()
+            .is_some_and(|arr| js_sys::Atomics::load(arr, 0).unwrap_or(0) != 0)
+    })
 }
 
 /// Active debug session state for cooperative VM execution.
@@ -118,10 +156,17 @@ fn append_output(s: &str) {
 
 /// Flush the current line buffer as a completed line.
 fn flush_line() {
-    LINE_BUF.with(|b| {
+    let line = LINE_BUF.with(|b| {
         let line = b.borrow().clone();
         b.borrow_mut().clear();
-        OUTPUT.with(|o| o.borrow_mut().push(line));
+        line
+    });
+    OUTPUT.with(|o| o.borrow_mut().push(line.clone()));
+    // Stream the line live if a sink is installed (Web Worker path).
+    OUTPUT_SINK.with(|s| {
+        if let Some(f) = s.borrow().as_ref() {
+            let _ = f.call1(&JsValue::NULL, &JsValue::from_str(&line));
+        }
     });
 }
 
@@ -295,6 +340,15 @@ fn wasm_http_request(
 
     let key = http_cache_key(method, url, body_str.as_deref(), &headers);
 
+    // In a Web Worker there is no `window`. Do a real *synchronous* XHR: it
+    // blocks the worker thread and returns the response directly, so http works
+    // without the main-thread replay-the-whole-program hack — and it composes
+    // correctly with real `Atomics.wait` sleeps (no re-runs). Cross-origin
+    // targets still need CORS/CORP (a same-origin proxy covers the rest).
+    if web_sys::window().is_none() {
+        return perform_fetch_sync(method, url, body_str.as_deref(), &headers);
+    }
+
     let cached = HTTP_CACHE.with(|c| c.borrow().get(&key).cloned());
     if let Some(val) = cached {
         return Ok(val);
@@ -307,6 +361,61 @@ fn wasm_http_request(
         &headers,
         timeout_ms,
     ))
+}
+
+/// Synchronous HTTP via `XMLHttpRequest` (worker-only — sync XHR is illegal on
+/// the main thread). Blocks the calling (worker) thread until the response,
+/// returning the same `{:status :headers :body}` map shape as `perform_fetch`.
+/// (Per-request timeout is not applied on this path; the worker can be cancelled
+/// via the M6 control buffer instead.)
+fn perform_fetch_sync(
+    method: &str,
+    url: &str,
+    body: Option<&str>,
+    headers: &[(String, String)],
+) -> Result<Value, SemaError> {
+    let xhr = web_sys::XmlHttpRequest::new()
+        .map_err(|_| SemaError::Io("failed to create XMLHttpRequest".to_string()))?;
+    // async = false → synchronous (blocks this worker thread).
+    xhr.open_with_async(method, url, false)
+        .map_err(|e| SemaError::Io(format!("http: open failed: {}", js_err(&e))))?;
+    for (k, v) in headers {
+        let _ = xhr.set_request_header(k, v);
+    }
+    let send = match body {
+        Some(b) => xhr.send_with_opt_str(Some(b)),
+        None => xhr.send(),
+    };
+    send.map_err(|e| SemaError::Io(format!("http: request failed: {}", js_err(&e))))?;
+
+    let status = xhr.status().unwrap_or(0) as i64;
+    let body_text = xhr.response_text().ok().flatten().unwrap_or_default();
+
+    let mut resp_headers = BTreeMap::new();
+    if let Ok(raw) = xhr.get_all_response_headers() {
+        for line in raw.split("\r\n").filter(|l| !l.is_empty()) {
+            if let Some((k, v)) = line.split_once(':') {
+                resp_headers.insert(Value::keyword(k.trim()), Value::string(v.trim()));
+            }
+        }
+    }
+
+    let mut result = BTreeMap::new();
+    result.insert(Value::keyword("status"), Value::int(status));
+    result.insert(Value::keyword("headers"), Value::map(resp_headers));
+    result.insert(Value::keyword("body"), Value::string(&body_text));
+    Ok(Value::map(result))
+}
+
+/// Best-effort string for a JS error value.
+fn js_err(e: &JsValue) -> String {
+    e.as_string()
+        .or_else(|| {
+            js_sys::Reflect::get(e, &JsValue::from_str("message"))
+                .ok()
+                .and_then(|m| m.as_string())
+        })
+        .unwrap_or_else(|| "error".to_string())
 }
 
 /// Perform an HTTP fetch via the browser's `fetch()` API.
@@ -360,7 +469,7 @@ async fn perform_fetch(
         });
         let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(
             closure.as_ref().unchecked_ref(),
-            ms as i32,
+            clamp_timeout_ms(ms),
         );
         closure.forget();
     }
@@ -795,64 +904,63 @@ fn register_wasm_io(env: &Env) {
         }),
     );
 
-    // path/dirname: parent directory of a path
-    register(
-        "path/dirname",
-        Box::new(|args: &[Value]| {
-            if args.len() != 1 {
-                return Err(SemaError::arity("path/dirname", "1", args.len()));
-            }
-            let s = args[0]
-                .as_str()
-                .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
-            let trimmed = s.trim_end_matches('/');
-            match trimmed.rfind('/') {
-                Some(0) => Ok(Value::string("/")),
-                Some(pos) => Ok(Value::string(&trimmed[..pos])),
-                None => Ok(Value::nil()),
-            }
-        }),
-    );
+    // path/dir (canonical) + path/dirname (legacy alias): parent directory of a path.
+    // Returns "" when there is no parent component.
+    fn wasm_path_dir(args: &[Value]) -> Result<Value, SemaError> {
+        if args.len() != 1 {
+            return Err(SemaError::arity("path/dir", "1", args.len()));
+        }
+        let s = args[0]
+            .as_str()
+            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
+        let trimmed = s.trim_end_matches('/');
+        match trimmed.rfind('/') {
+            Some(0) => Ok(Value::string("/")),
+            Some(pos) => Ok(Value::string(&trimmed[..pos])),
+            None => Ok(Value::string("")),
+        }
+    }
+    register("path/dir", Box::new(wasm_path_dir));
+    register("path/dirname", Box::new(wasm_path_dir));
 
-    // path/basename: filename component of a path
-    register(
-        "path/basename",
-        Box::new(|args: &[Value]| {
-            if args.len() != 1 {
-                return Err(SemaError::arity("path/basename", "1", args.len()));
-            }
-            let s = args[0]
-                .as_str()
-                .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
-            let trimmed = s.trim_end_matches('/');
-            match trimmed.rfind('/') {
-                Some(pos) => Ok(Value::string(&trimmed[pos + 1..])),
-                None => Ok(Value::string(trimmed)),
-            }
-        }),
-    );
+    // path/filename (canonical) + path/basename (legacy alias): filename component of a path.
+    fn wasm_path_filename(args: &[Value]) -> Result<Value, SemaError> {
+        if args.len() != 1 {
+            return Err(SemaError::arity("path/filename", "1", args.len()));
+        }
+        let s = args[0]
+            .as_str()
+            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
+        let trimmed = s.trim_end_matches('/');
+        match trimmed.rfind('/') {
+            Some(pos) => Ok(Value::string(&trimmed[pos + 1..])),
+            None => Ok(Value::string(trimmed)),
+        }
+    }
+    register("path/filename", Box::new(wasm_path_filename));
+    register("path/basename", Box::new(wasm_path_filename));
 
-    // path/extension: file extension (without dot)
-    register(
-        "path/extension",
-        Box::new(|args: &[Value]| {
-            if args.len() != 1 {
-                return Err(SemaError::arity("path/extension", "1", args.len()));
-            }
-            let s = args[0]
-                .as_str()
-                .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
-            let trimmed = s.trim_end_matches('/');
-            let basename = match trimmed.rfind('/') {
-                Some(pos) => &trimmed[pos + 1..],
-                None => trimmed,
-            };
-            match basename.rfind('.') {
-                Some(0) | None => Ok(Value::nil()),
-                Some(pos) => Ok(Value::string(&basename[pos + 1..])),
-            }
-        }),
-    );
+    // path/extension (canonical) + path/ext (legacy alias): file extension (without dot).
+    // Returns "" when the path has no extension.
+    fn wasm_path_extension(args: &[Value]) -> Result<Value, SemaError> {
+        if args.len() != 1 {
+            return Err(SemaError::arity("path/extension", "1", args.len()));
+        }
+        let s = args[0]
+            .as_str()
+            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
+        let trimmed = s.trim_end_matches('/');
+        let basename = match trimmed.rfind('/') {
+            Some(pos) => &trimmed[pos + 1..],
+            None => trimmed,
+        };
+        match basename.rfind('.') {
+            Some(0) | None => Ok(Value::string("")),
+            Some(pos) => Ok(Value::string(&basename[pos + 1..])),
+        }
+    }
+    register("path/extension", Box::new(wasm_path_extension));
+    register("path/ext", Box::new(wasm_path_extension));
 
     // path/absolute: in WASM, just return the input unchanged
     register(
@@ -1452,6 +1560,7 @@ fn register_wasm_io(env: &Env) {
             let path = args[0]
                 .as_str()
                 .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
+            let path = &normalize_path(path)?;
             let is_file = VFS.with(|vfs| vfs.borrow().contains_key(path));
             let is_dir = VFS_DIRS.with(|dirs| dirs.borrow().contains(path));
             if !is_file && !is_dir {
@@ -1594,8 +1703,7 @@ impl WasmInterpreter {
         OUTPUT.with(|o| o.borrow_mut().clear());
         LINE_BUF.with(|b| b.borrow_mut().clear());
 
-        let env = sema_core::Env::with_parent(self.inner.global_env.clone());
-        let json_str = match sema_eval::eval_string(&self.inner.ctx, code, &env) {
+        let json_str = match self.inner.eval_str_in_global(code) {
             Ok(val) => {
                 let output = take_output();
                 let val_str = if val.is_nil() {
@@ -1645,7 +1753,7 @@ impl WasmInterpreter {
         OUTPUT.with(|o| o.borrow_mut().clear());
         LINE_BUF.with(|b| b.borrow_mut().clear());
 
-        let json_str = match sema_eval::eval_string(&self.inner.ctx, code, &self.inner.global_env) {
+        let json_str = match self.inner.eval_str_in_global(code) {
             Ok(val) => {
                 let output = take_output();
                 let val_str = if val.is_nil() {
@@ -1739,7 +1847,8 @@ impl WasmInterpreter {
         js_sys::JSON::parse(&json_str).unwrap_or(JsValue::NULL)
     }
 
-    /// Evaluate code with async HTTP support (tree-walker, global env)
+    /// Evaluate code with async HTTP support in the persistent global env
+    /// (top-level defines persist across calls). Runs on the bytecode VM.
     #[wasm_bindgen(js_name = evalAsync)]
     pub async fn eval_async(&self, code: &str) -> JsValue {
         clear_http_cache();
@@ -1748,7 +1857,7 @@ impl WasmInterpreter {
             OUTPUT.with(|o| o.borrow_mut().clear());
             LINE_BUF.with(|b| b.borrow_mut().clear());
 
-            match sema_eval::eval_string(&self.inner.ctx, code, &self.inner.global_env) {
+            match self.inner.eval_str_in_global(code) {
                 Ok(val) => {
                     let output = take_output();
                     let val_str = if val.is_nil() {
@@ -1918,6 +2027,8 @@ impl WasmInterpreter {
     /// Returns JSON: { status: "stopped"|"finished"|"error"|"http_needed", ... }
     #[wasm_bindgen(js_name = debugStart)]
     pub fn debug_start(&self, code: &str, breakpoint_lines: &js_sys::Array) -> JsValue {
+        // The debugger always executes on the VM, so a `(load ...)` runs the
+        // loaded body on the VM regardless of which eval the playground ran last.
         // End any existing session
         DEBUG_SESSION.with(|s| {
             *s.borrow_mut() = None;
@@ -1925,6 +2036,8 @@ impl WasmInterpreter {
 
         OUTPUT.with(|o| o.borrow_mut().clear());
         LINE_BUF.with(|b| b.borrow_mut().clear());
+        // Reset the loop-guard step counter so the limit is per debug session.
+        self.inner.ctx.eval_steps.set(0);
 
         let bp_lines: Vec<u32> = breakpoint_lines
             .iter()
@@ -1987,6 +2100,13 @@ impl WasmInterpreter {
             Ok(vm) => vm,
             Err(e) => return JsValue::from_str(&format!("VM init error: {e}")),
         };
+
+        // Register the async scheduler, exactly like the normal eval path
+        // (run_exprs_on_vm) and the native DAP server do. Without this, debugging
+        // a program that uses async/await/channels fails with "async/spawn: no
+        // async scheduler registered".
+        sema_vm::init_scheduler(self.inner.global_env.clone(), prog.native_table.clone());
+
         let mut debug = sema_vm::DebugState::new_headless();
 
         // Set snapped breakpoints
@@ -1994,8 +2114,14 @@ impl WasmInterpreter {
             debug.set_breakpoints(&source_file, &snapped_bp_lines);
         }
 
-        // Stop on entry
-        debug.step_mode = sema_vm::StepMode::StepInto;
+        // If breakpoints are set, run straight to the first one. With no
+        // breakpoints, stop on entry so the user can step from the top
+        // (otherwise Debug would behave identically to Run).
+        debug.step_mode = if snapped_bp_lines.is_empty() {
+            sema_vm::StepMode::StepInto
+        } else {
+            sema_vm::StepMode::Continue
+        };
         debug.instructions_remaining = WASM_DEBUG_INSTRUCTION_BUDGET;
 
         // Helper: attach validLines and breakpoints to a debug response
@@ -2031,6 +2157,7 @@ impl WasmInterpreter {
             Ok(sema_vm::VmExecResult::Finished(v)) => {
                 attach_bp_info(self.debug_finished_result(&v))
             }
+            Ok(sema_vm::VmExecResult::AsyncYield(_)) => attach_bp_info(self.debug_yielded_result()),
             Err(e) => self.debug_maybe_http_error(&e),
         }
     }
@@ -2084,6 +2211,7 @@ impl WasmInterpreter {
             match sess.vm.run_cooperative(&self.inner.ctx, &mut sess.debug) {
                 Ok(sema_vm::VmExecResult::Stopped(info)) => self.debug_stopped_result(&info),
                 Ok(sema_vm::VmExecResult::Yielded) => self.debug_yielded_result(),
+                Ok(sema_vm::VmExecResult::AsyncYield(_)) => self.debug_yielded_result(),
                 Ok(sema_vm::VmExecResult::Finished(v)) => {
                     let result = self.debug_finished_result(&v);
                     *session = None;
@@ -2108,12 +2236,22 @@ impl WasmInterpreter {
     #[wasm_bindgen(js_name = debugGetLocals)]
     pub fn debug_get_locals(&self) -> JsValue {
         DEBUG_SESSION.with(|s| {
-            let session = s.borrow();
-            let Some(ref sess) = *session else {
+            let mut session = s.borrow_mut();
+            let Some(ref mut sess) = *session else {
                 return JsValue::NULL;
             };
-            let frame_idx = sess.vm.frame_count().saturating_sub(1);
-            let locals = sess.vm.debug_locals(frame_idx);
+            // When paused at a breakpoint INSIDE an async task, inspect that
+            // task's per-task VM (its frames hold the task-locals); the main VM
+            // is parked at the `await`. Falls back to the main VM for ordinary
+            // synchronous stops.
+            let locals = sema_vm::with_coop_paused_task_vm(|tvm| {
+                let frame_idx = tvm.frame_count().saturating_sub(1);
+                tvm.debug_locals(frame_idx)
+            })
+            .unwrap_or_else(|| {
+                let frame_idx = sess.vm.frame_count().saturating_sub(1);
+                sess.vm.debug_locals(frame_idx)
+            });
             let arr = js_sys::Array::new();
             for var in &locals {
                 let obj = js_sys::Object::new();
@@ -2134,7 +2272,10 @@ impl WasmInterpreter {
             let Some(ref sess) = *session else {
                 return js_sys::Array::new().into();
             };
-            let frames = sess.vm.debug_stack_trace();
+            // Mirror debug_get_locals: at an async stop, show the PAUSED TASK's
+            // call stack, not the main VM's (which is parked at the `await`).
+            let frames = sema_vm::with_coop_paused_task_vm(|tvm| tvm.debug_stack_trace())
+                .unwrap_or_else(|| sess.vm.debug_stack_trace());
             let arr = js_sys::Array::new();
             for frame in &frames {
                 let obj = js_sys::Object::new();
@@ -2232,7 +2373,7 @@ impl WasmInterpreter {
             use std::rc::Rc;
             let env = sema_core::Env::new();
             let ctx = sema_core::EvalContext::new();
-            sema_core::set_eval_callback(&ctx, sema_eval::eval_value);
+            sema_core::set_eval_callback(&ctx, sema_eval::eval_value_vm);
             sema_core::set_call_callback(&ctx, sema_eval::call_value);
             let global_env = Rc::new(env);
             sema_eval::Interpreter { global_env, ctx }
@@ -2437,14 +2578,20 @@ impl WasmInterpreter {
                 .map_err(|e| SemaError::eval(format!("{e}")))?;
             self.inner.ctx.merge_span_table(spans);
 
-            let module_env = Env::with_parent(self.inner.global_env.clone());
+            let module_env = std::rc::Rc::new(Env::with_parent(self.inner.global_env.clone()));
             self.inner.ctx.clear_module_exports();
 
-            for expr in &exprs {
-                sema_eval::eval_value(&self.inner.ctx, expr, &module_env)?;
-            }
+            let empty_spans = std::collections::HashMap::new();
+            let eval_result = sema_eval::eval_module_body_vm(
+                &self.inner.ctx,
+                &module_env,
+                &exprs,
+                &empty_spans,
+                None,
+            );
 
             let declared = self.inner.ctx.take_module_exports();
+            eval_result?;
             let exports: BTreeMap<String, Value> = match declared {
                 Some(names) => names
                     .iter()
@@ -2794,9 +2941,98 @@ impl WasmInterpreter {
         VFS_TOTAL_BYTES.with(|t| t.set(0));
     }
 
+    /// Snapshot the entire VFS as a plain JS object `{ files: {path: content},
+    /// dirs: [path] }` — structured-clonable across `postMessage`. Used by the
+    /// playground to mirror the worker's VFS back to the main thread after each
+    /// eval (and to seed the worker before one). See `loadVfs`.
+    #[wasm_bindgen(js_name = dumpVfs)]
+    pub fn dump_vfs(&self) -> JsValue {
+        let obj = js_sys::Object::new();
+        let files = js_sys::Object::new();
+        VFS.with(|vfs| {
+            for (k, v) in vfs.borrow().iter() {
+                let _ = js_sys::Reflect::set(&files, &JsValue::from_str(k), &JsValue::from_str(v));
+            }
+        });
+        let dirs = js_sys::Array::new();
+        VFS_DIRS.with(|d| {
+            for p in d.borrow().iter() {
+                dirs.push(&JsValue::from_str(p));
+            }
+        });
+        let _ = js_sys::Reflect::set(&obj, &JsValue::from_str("files"), &files);
+        let _ = js_sys::Reflect::set(&obj, &JsValue::from_str("dirs"), &dirs);
+        obj.into()
+    }
+
+    /// Replace the entire VFS from a snapshot produced by `dumpVfs`. Resets
+    /// first, so the VFS exactly matches the snapshot.
+    #[wasm_bindgen(js_name = loadVfs)]
+    pub fn load_vfs(&self, snapshot: JsValue) {
+        self.reset_vfs();
+        if !snapshot.is_object() {
+            return;
+        }
+        if let Ok(files) = js_sys::Reflect::get(&snapshot, &JsValue::from_str("files")) {
+            if files.is_object() {
+                let files_obj: js_sys::Object = files.unchecked_into();
+                for key in js_sys::Object::keys(&files_obj).iter() {
+                    let (Some(path), Ok(val)) =
+                        (key.as_string(), js_sys::Reflect::get(&files_obj, &key))
+                    else {
+                        continue;
+                    };
+                    if let Some(content) = val.as_string() {
+                        VFS_TOTAL_BYTES.with(|t| t.set(t.get() + content.len()));
+                        VFS.with(|vfs| {
+                            vfs.borrow_mut().insert(path, content);
+                        });
+                    }
+                }
+            }
+        }
+        if let Ok(dirs) = js_sys::Reflect::get(&snapshot, &JsValue::from_str("dirs")) {
+            if let Ok(arr) = dirs.dyn_into::<js_sys::Array>() {
+                VFS_DIRS.with(|d| {
+                    let mut set = d.borrow_mut();
+                    for item in arr.iter() {
+                        if let Some(p) = item.as_string() {
+                            set.insert(p);
+                        }
+                    }
+                });
+            }
+        }
+    }
+
     /// Get the Sema version
     pub fn version(&self) -> String {
         env!("CARGO_PKG_VERSION").to_string()
+    }
+
+    /// Enable real wall-clock `async/sleep` via `Atomics.wait` on the given
+    /// control buffer. Call this once from a Web Worker (where blocking is
+    /// allowed), passing an `Int32Array` over a `SharedArrayBuffer` shared with
+    /// the main thread. After this, the scheduler's virtual-clock advances also
+    /// block the worker for the real duration. Do NOT call on the main thread —
+    /// `Atomics.wait` is illegal there; leaving it uninstalled keeps the
+    /// instant virtual-clock behavior.
+    #[wasm_bindgen(js_name = installAtomicsSleep)]
+    pub fn install_atomics_sleep(&self, view: js_sys::Int32Array) {
+        SLEEP_I32.with(|s| *s.borrow_mut() = Some(view));
+        sema_core::set_blocking_sleep_callback(worker_atomics_sleep);
+        // The same control buffer carries the cancel flag (slot 0): the VM loop
+        // guard polls this so a Stop aborts a running program (incl. mid-sleep).
+        sema_core::set_interrupt_callback(worker_check_interrupt);
+    }
+
+    /// Install a sink called with each completed output line as it is produced,
+    /// so the Web Worker can stream `println` output to the main thread live
+    /// (a long-running / sleeping program shows output as it happens). Pass a
+    /// JS function `(line: string) => void`.
+    #[wasm_bindgen(js_name = setOutputSink)]
+    pub fn set_output_sink(&self, sink: js_sys::Function) {
+        OUTPUT_SINK.with(|s| *s.borrow_mut() = Some(sink));
     }
 }
 
@@ -2865,7 +3101,15 @@ impl WasmInterpreter {
                 let source = String::from_utf8(bytes).map_err(|e| {
                     SemaError::eval(format!("embedded entry is not valid UTF-8: {e}"))
                 })?;
-                sema_eval::eval_string(&self.inner.ctx, &source, &self.inner.global_env)
+                let (exprs, spans) = sema_reader::read_many_with_spans(&source)?;
+                self.inner.ctx.merge_span_table(spans.clone());
+                sema_eval::eval_module_body_vm(
+                    &self.inner.ctx,
+                    &self.inner.global_env,
+                    &exprs,
+                    &spans,
+                    Some(entry_path.clone()),
+                )
             }
         })();
         self.inner.ctx.pop_file_path();
@@ -2881,13 +3125,21 @@ impl WasmInterpreter {
 
             sess.debug.step_mode = mode;
             if mode != sema_vm::StepMode::Continue {
-                sess.debug.step_frame_depth = sess.vm.frame_count();
+                // Step depth must be measured against the VM that will actually be
+                // stepped. At a stop INSIDE an async task the resume re-drives that
+                // task's per-task VM (not the main VM, which is parked at the
+                // await), so StepOver/StepOut depth comparisons must use the task's
+                // frame count. Falls back to the main VM for ordinary sync stops.
+                sess.debug.step_frame_depth =
+                    sema_vm::with_coop_paused_task_vm(|tvm| tvm.frame_count())
+                        .unwrap_or_else(|| sess.vm.frame_count());
             }
             sess.debug.instructions_remaining = WASM_DEBUG_INSTRUCTION_BUDGET;
 
             match sess.vm.run_cooperative(&self.inner.ctx, &mut sess.debug) {
                 Ok(sema_vm::VmExecResult::Stopped(info)) => self.debug_stopped_result(&info),
                 Ok(sema_vm::VmExecResult::Yielded) => self.debug_yielded_result(),
+                Ok(sema_vm::VmExecResult::AsyncYield(_)) => self.debug_yielded_result(),
                 Ok(sema_vm::VmExecResult::Finished(v)) => {
                     let result = self.debug_finished_result(&v);
                     *session = None;
@@ -2914,6 +3166,7 @@ impl WasmInterpreter {
             sema_vm::StopReason::Step => "step",
             sema_vm::StopReason::Pause => "pause",
             sema_vm::StopReason::Entry => "entry",
+            sema_vm::StopReason::Exception => "exception",
         };
         let json_str = format!(
             "{{\"status\":\"stopped\",\"line\":{},\"reason\":\"{}\",\"output\":[{}]}}",
@@ -3131,7 +3384,12 @@ fn js_value_to_sema_value_with_callbacks(
 /// or {"formatted": null, "error": "..."}
 #[wasm_bindgen(js_name = formatCode)]
 pub fn format_code(code: &str, width: usize, indent: usize, align: bool) -> JsValue {
-    match sema_fmt::format_source_opts(code, width, indent, align) {
+    let opts = sema_fmt::FormatOptions {
+        width,
+        indent,
+        align,
+    };
+    match sema_fmt::format_source(code, &opts) {
         Ok(formatted) => {
             let json_str = format!(
                 "{{\"formatted\":\"{}\",\"error\":null}}",
@@ -3150,11 +3408,66 @@ pub fn format_code(code: &str, width: usize, indent: usize, align: bool) -> JsVa
 }
 
 fn escape_json(s: &str) -> String {
-    s.replace('\\', "\\\\")
-        .replace('"', "\\\"")
-        .replace('\n', "\\n")
-        .replace('\r', "\\r")
-        .replace('\t', "\\t")
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            // Other C0 control characters must be \uXXXX-escaped; emitting them
+            // raw produces invalid JSON that the browser parses as `null`.
+            c if (c as u32) < 0x20 => {
+                use std::fmt::Write;
+                let _ = write!(out, "\\u{:04x}", c as u32);
+            }
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// Clamp a user-supplied timeout (milliseconds, u64) to a valid setTimeout
+/// delay. A bare `as i32` wrapped values > ~2.1e9 ms to negative/zero, which
+/// made the abort controller fire immediately and break the request.
+fn clamp_timeout_ms(ms: u64) -> i32 {
+    i32::try_from(ms).unwrap_or(i32::MAX)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clamp_timeout_ms_does_not_wrap_to_negative() {
+        // ~ 3 billion ms is well past i32::MAX; old `as i32` wrapped negative.
+        assert_eq!(clamp_timeout_ms(3_000_000_000), i32::MAX);
+        assert_eq!(clamp_timeout_ms(u64::MAX), i32::MAX);
+        assert_eq!(clamp_timeout_ms(5000), 5000);
+        assert!(clamp_timeout_ms(3_000_000_000) > 0);
+    }
+
+    #[test]
+    fn escape_json_handles_basic_escapes() {
+        assert_eq!(escape_json("a\"b\\c\nd\re\tf"), "a\\\"b\\\\c\\nd\\re\\tf");
+        assert_eq!(escape_json("plain"), "plain");
+    }
+
+    #[test]
+    fn escape_json_escapes_c0_control_chars() {
+        // WASM-3: control chars < 0x20 (other than \n \r \t) must become
+        // \uXXXX escapes, otherwise the emitted JSON is invalid and parses as null.
+        assert_eq!(escape_json("\u{0}"), "\\u0000");
+        assert_eq!(escape_json("\u{1}\u{1f}"), "\\u0001\\u001f");
+        // A bell + backspace + escape char interleaved with text.
+        assert_eq!(
+            escape_json("x\u{7}y\u{8}z\u{1b}"),
+            "x\\u0007y\\u0008z\\u001b"
+        );
+        // The dedicated escapes are still preferred over the generic form.
+        assert_eq!(escape_json("\t"), "\\t");
+    }
 }
 
 #[cfg(test)]

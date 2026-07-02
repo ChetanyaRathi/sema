@@ -11,7 +11,7 @@ Sema has a rich set of built-in data types covering numbers, text, collections, 
 | Type         | Syntax               | Examples                                                           |
 | ------------ | -------------------- | ------------------------------------------------------------------ |
 | Integer      | digits               | `42`, `-7`, `0`                                                    |
-| Float        | digits with `.`      | `3.14`, `-0.5`, `1e10`                                             |
+| Float        | `.` or exponent      | `3.14`, `-0.5`, `0.001`, `6.022e23`, `1e-9`                        |
 | String       | double-quoted        | `"hello"`, `"line\nbreak"`, `"\x1B;"`                              |
 | F-String     | `f"...${expr}..."` | `f"Hello ${name}"`, `f"${(+ 1 2)}"`                               |
 | Boolean      | `#t` / `#f`          | `#t`, `#f`                                                         |
@@ -31,6 +31,8 @@ Sema has a rich set of built-in data types covering numbers, text, collections, 
 | Promise      | `(delay expr)`       | Lazy evaluation                                                    |
 | Record       | `define-record-type` | `(define-record-type point ...)`                                   |
 | Bytevector   | `#u8(...)` literal   | `#u8(1 2 3)`, `#u8()`                                              |
+| Async Promise | `(async expr)` or `(async/resolved val)` | An async task result (pending, resolved, or rejected) |
+| Channel      | `(channel/new)` or `(channel/new capacity)` | Bounded FIFO channel for inter-task communication |
 
 ## Scalars
 
@@ -46,13 +48,27 @@ Whole numbers. Standard arithmetic applies.
 
 ### Float
 
-Floating-point numbers with a decimal point.
+Floating-point numbers, written with a decimal point and/or a scientific
+(exponent) suffix `e`/`E`:
 
 ```sema
 3.14
 -0.5
 0.001
+
+;; Scientific notation — <mantissa>e<exponent>, with an optional sign on the
+;; exponent. The mantissa may be a bare integer (no decimal point required).
+6.022e23     ;; Avogadro's number  → 6.022 × 10²³
+1.0e19       ;; 10000000000000000000.0
+1e-9         ;; one nano  → 0.000000001
+-2.5E6       ;; uppercase E works too → -2500000.0
+(* 2 3e2)    ;; usable anywhere a number is → 600.0
 ```
+
+A literal whose magnitude exceeds `f64` range follows IEEE-754 (`1e400` → `inf`,
+`1e-400` → `0.0`). Note that an `e`/`E` not immediately followed by (an optional
+sign and) digits is *not* part of a number — `1e` reads as the integer `1` and a
+separate symbol `e` — so identifiers like `e` or `exp` are never mis-parsed.
 
 ### String
 
@@ -66,11 +82,12 @@ Double-quoted text with escape sequences.
 
 ### F-String (Interpolated String)
 
-String interpolation with embedded expressions. `f"..."` expands to a `(str ...)` call at read time.
+String interpolation with embedded expressions. `f"..."` reads as a `(str ...)` call (i.e. `f"Hello ${name}"` is the same as `(str "Hello " name)`).
 
 ```sema
-f"Hello ${name}"              ; => (str "Hello " name)
-f"2 + 2 = ${(+ 2 2)}"        ; => "2 + 2 = 4"
+(define name "Alice")
+f"Hello ${name}"                ; => "Hello Alice"
+f"2 + 2 = ${(+ 2 2)}"           ; => "2 + 2 = 4"
 f"${(:name user)} is ${(:age user)} years old"
 ```
 
@@ -237,7 +254,10 @@ User-defined record types with constructors, predicates, and field accessors.
 (positive? 1)      (negative? -1)
 (eq? 'a 'a)        (= 1 1)
 
-;; Scheme aliases: boolean? = bool?, procedure? = fn?, equal? = eq?
+;; Scheme aliases: boolean? = bool?, procedure? = fn?
+;; eq? and equal? are the same function in Sema — both do structural
+;; equality without numeric coercion. Use = for numeric comparison
+;; (e.g. (= 1 1.0) is #t, but (eq? 1 1.0) is #f).
 
 ;; LLM type predicates
 (prompt? p)        (message? m)       (conversation? c)
@@ -266,5 +286,5 @@ User-defined record types with constructors, predicates, and field accessors.
 (list/to-bytevector '(1 2 3))  ; => #u8(1 2 3)
 (utf8/to-string #u8(104 105))  ; => "hi"
 (string/to-utf8 "hi")          ; => #u8(104 105)
-(type 42)                    ; => "integer"
+(type 42)                    ; => :int
 ```

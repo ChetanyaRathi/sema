@@ -132,6 +132,14 @@ impl PackageSpec {
                 "invalid package spec: NUL byte in git ref".to_string(),
             ));
         }
+        // BIN-2: a ref starting with '-' would be parsed by `git checkout` as a
+        // flag (e.g. `-f`). Reject it here; `git checkout` has no safe `--`
+        // separator for refs (that turns the ref into a pathspec).
+        if git_ref.starts_with('-') {
+            return Err(SemaError::eval(format!(
+                "invalid package spec: git ref cannot start with '-': {git_ref}"
+            )));
+        }
 
         Ok(Self {
             path,

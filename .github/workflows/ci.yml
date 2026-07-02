@@ -12,23 +12,26 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
+
+      - name: Install system dependencies
+        # libudev-dev is required by `serialport` (transitive `libudev-sys`)
+        # on Linux. The release workflow installs this via cargo-dist's
+        # apt dependency hook (see dist-workspace.toml); CI needs to do it
+        # explicitly.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libudev-dev
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
 
-      - name: Cache cargo
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/bin/
-            ~/.cargo/registry/index/
-            ~/.cargo/registry/cache/
-            ~/.cargo/git/db/
-            target/
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+      # Smart Rust cache (partial-restores across Cargo.lock changes) instead of
+      # the old exact-match key that cold-rebuilt the whole workspace each time.
+      - name: Cache cargo + target
+        uses: Swatinem/rust-cache@v2
 
       - name: Check formatting
         run: cargo fmt -- --check
@@ -36,14 +39,14 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace -- -D warnings
 
+      - name: Check builtin docs (committed index fresh + fully documented)
+        run: make docs-check
+
       - name: Run tests
         run: cargo test --workspace
 
-      - name: Smoke test examples (tree-walk)
+      - name: Smoke test examples
         run: make examples
-
-      - name: Smoke test examples (VM)
-        run: make examples-vm
 
       - name: Smoke test bytecode
         run: make smoke-bytecode

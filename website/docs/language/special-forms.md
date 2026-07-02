@@ -310,13 +310,31 @@ Nested patterns are supported:
 
 ### `match`
 
-Match a value against patterns with optional guards. Returns `nil` if no clause matches.
+Match a value against patterns with optional guards.
 
 ```sema
 (match value
   (pattern body ...)
   (pattern when guard body ...)
   ...)
+```
+
+If no clause matches, `match` **raises an error** (`match: no clause matched value: …`) — a non-exhaustive match is almost always a bug, so it fails loudly rather than returning `nil` silently. Add a catch-all `(_ ...)` clause to handle the rest:
+
+```sema
+(match status
+  (:ok "success")
+  (_   "other"))          ; catch-all; without it, an unmatched status raises
+```
+
+#### `match*` — lenient variant
+
+When "no match" is a normal outcome (e.g. a lookup), use `match*`, which returns `nil` instead of raising:
+
+```sema
+(match* 42
+  (1 "one")
+  (2 "two"))              ; => nil  (no clause matched)
 ```
 
 #### Literal Matching
@@ -415,6 +433,20 @@ Short-circuit logical OR. Returns the first truthy value or `#f`.
 ```
 
 ## Iteration
+
+### `while`
+
+Loop while a condition is truthy. Returns `nil`. Use `set!` to mutate loop state.
+
+```sema
+(let ((n 0))
+  (while (< n 3)
+    (println n)
+    (set! n (+ n 1)))
+  n)
+;; prints 0, 1, 2
+;; => 3
+```
 
 ### `do`
 
@@ -562,7 +594,7 @@ Catch errors with structured error maps.
 
 #### Error map fields
 
-Every caught error is a map with at least `:type`, `:message`, and `:stack-trace`. Some error types include additional fields:
+Every caught error is a map with at least `:type`, `:message`, and `:stack-trace`. User-thrown values appear under `:value`, and some error types include additional fields:
 
 | `:type` | Description | Extra fields |
 |---|---|---|
@@ -600,4 +632,37 @@ Throw any value as an error.
 ```sema
 (throw "something went wrong")
 (throw {:code 404 :reason "not found"})
+```
+
+## Async / Await
+
+### `async`
+
+Create an async task that evaluates `body` concurrently and returns a promise.
+
+```
+(async body ...)
+```
+
+The task runs on the VM's cooperative scheduler. Multiple async tasks interleave at yield points (channel operations, await, sleep).
+
+```sema
+(define p (async (+ 1 2)))
+(await p)  ; => 3
+```
+
+### `await`
+
+Wait for an async promise to resolve and return its value.
+
+```
+(await promise)
+```
+
+If the promise was rejected, raises an error. Inside an async task, `await` yields to the scheduler allowing other tasks to run. At the top level, `await` runs the scheduler until the promise resolves.
+
+```sema
+(let ((p1 (async (* 3 3)))
+      (p2 (async (* 4 4))))
+  (+ (await p1) (await p2)))  ; => 25
 ```

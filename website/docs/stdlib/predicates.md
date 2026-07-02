@@ -8,32 +8,38 @@ Predicates return `#t` or `#f` and conventionally end with `?`.
 
 ## Emptiness Predicates
 
+These three predicates overlap but are not interchangeable. `null?` returns `#t` for both `'()` and `nil` — it tests for "absence of a value or empty list". `nil?` is true only for the `nil` value itself (not for `'()`). `empty?` is the broadest: it accepts `nil`, strings, lists, vectors, maps, and other collections, returning `#t` when the value has no elements. Reach for `empty?` when you have a collection of any shape; reach for `nil?` when you specifically need to distinguish `nil` from `'()`.
+
 ### `null?`
 
-Test if a value is the empty list.
+Test if a value is the empty list or `nil`.
 
 ```sema
-(null? '())    ; => #t
-(null? '(1))   ; => #f
+(null? '())    ;; => #t
+(null? nil)    ;; => #t
+(null? '(1))   ;; => #f
 ```
 
 ### `nil?`
 
-Test if a value is `nil`.
+Test if a value is `nil` specifically (not the empty list).
 
 ```sema
-(nil? nil)     ; => #t
-(nil? 0)       ; => #f
+(nil? nil)     ;; => #t
+(nil? '())     ;; => #f
+(nil? 0)       ;; => #f
 ```
 
 ### `empty?`
 
-Test if a collection or string is empty.
+Test if a collection, string, or `nil` is empty. Accepts strings, lists, vectors, maps, and `nil`.
 
 ```sema
-(empty? "")        ; => #t
-(empty? '())       ; => #t
-(empty? "hello")   ; => #f
+(empty? "")        ;; => #t
+(empty? '())       ;; => #t
+(empty? nil)       ;; => #t
+(empty? "hello")   ;; => #f
+(empty? [1 2 3])   ;; => #f
 ```
 
 ## Collection Predicates
@@ -259,12 +265,13 @@ Test structural equality. `equal?` is an alias.
 
 ### `=`
 
-Numeric equality.
+Equality. For numbers this is numeric equality (so `(= 1 1.0)` is `#t`); for non-numbers it falls back to structural equality. Unlike `<` / `>`, comparing non-numbers does not error.
 
 ```sema
-(= 1 1)       ; => #t
-(= 1 1.0)     ; => #t
-(= 1 2)       ; => #f
+(= 1 1)           ; => #t
+(= 1 1.0)         ; => #t
+(= 1 2)           ; => #f
+(= "abc" "abc")   ; => #t   (structural, not an error)
 ```
 
 ## LLM Type Predicates

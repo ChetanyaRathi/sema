@@ -27,7 +27,9 @@ pub type Result<T> = std::result::Result<T, SemaError>;
 pub struct InterpreterBuilder {
     stdlib: bool,
     llm: bool,
+    mcp: bool,
     sandbox: Sandbox,
+    telemetry: sema_otel::TelemetryMode,
 }
 
 impl Default for InterpreterBuilder {
@@ -42,8 +44,21 @@ impl InterpreterBuilder {
         Self {
             stdlib: true,
             llm: true,
+            mcp: true,
             sandbox: Sandbox::allow_all(),
+            telemetry: sema_otel::TelemetryMode::Off,
         }
+    }
+
+    /// Configure how this interpreter emits OpenTelemetry (default
+    /// [`TelemetryMode::Off`](sema_otel::TelemetryMode::Off) — no telemetry, never
+    /// touches any global provider). For `FromEnv`, the self-installed provider is owned
+    /// by the built [`Interpreter`] and flushes when it is dropped. An embedder that
+    /// already runs OTel should use `UseHostGlobal` or `OwnProvider` (which install
+    /// nothing) rather than `FromEnv`.
+    pub fn with_telemetry(mut self, mode: sema_otel::TelemetryMode) -> Self {
+        self.telemetry = mode;
+        self
     }
 
     /// Enable or disable the standard library (default: `true`).
@@ -55,6 +70,12 @@ impl InterpreterBuilder {
     /// Enable or disable the LLM builtins (default: `true`).
     pub fn with_llm(mut self, enable: bool) -> Self {
         self.llm = enable;
+        self
+    }
+
+    /// Enable or disable the MCP client builtins (default: `true`).
+    pub fn with_mcp(mut self, enable: bool) -> Self {
+        self.mcp = enable;
         self
     }
 
@@ -80,14 +101,27 @@ impl InterpreterBuilder {
         self.with_llm(false)
     }
 
+    /// Disable the MCP client builtins.
+    pub fn without_mcp(self) -> Self {
+        self.with_mcp(false)
+    }
+
     /// Build the [`Interpreter`] with the configured options.
+    ///
+    /// Any telemetry guard (for `TelemetryMode::FromEnv`) is owned BY the returned
+    /// interpreter, so it flushes when the interpreter is dropped (and the process-exit
+    /// hook covers `std::process::exit`). No separate guard handling is required.
     pub fn build(self) -> Interpreter {
         sema_llm::builtins::reset_runtime_state();
+        // Activate telemetry AFTER reset_runtime_state so the per-thread reset can't
+        // wipe facade state. `new()`/`build()` with the default `Off` is a pure no-op
+        // that never touches global OTel state.
+        let guard = sema_otel::activate(self.telemetry);
 
         let env = Env::new();
         let ctx = sema_eval::EvalContext::new();
 
-        sema_core::set_eval_callback(&ctx, sema_eval::eval_value);
+        sema_core::set_eval_callback(&ctx, sema_eval::eval_value_vm);
         sema_core::set_call_callback(&ctx, sema_eval::call_value);
 
         if self.stdlib {
@@ -96,14 +130,23 @@ impl InterpreterBuilder {
 
         if self.llm {
             sema_llm::builtins::register_llm_builtins(&env, &self.sandbox);
-            sema_llm::builtins::set_eval_callback(sema_eval::eval_value);
         }
 
+        if self.mcp {
+            sema_mcp::register_mcp_builtins(&env, &self.sandbox);
+        }
+
+        let global_env = Rc::new(env);
+        // The VM is the sole evaluator: register the __vm-* delegates (eval/load/
+        // import/macroexpand/...) and load the prelude macros, exactly as
+        // sema_eval::Interpreter::new does. Without this, an embedder built via
+        // this builder would lose import/load and all prelude macros on the VM.
+        sema_eval::register_vm_delegates(&global_env);
+        sema_eval::load_prelude(&ctx, &global_env);
+
         Interpreter {
-            inner: sema_eval::Interpreter {
-                global_env: Rc::new(env),
-                ctx,
-            },
+            inner: sema_eval::Interpreter { global_env, ctx },
+            _otel_guard: guard,
         }
     }
 }
@@ -114,6 +157,9 @@ impl InterpreterBuilder {
 /// [`Interpreter::new`] for a default interpreter with stdlib enabled.
 pub struct Interpreter {
     inner: sema_eval::Interpreter,
+    /// Owns any self-installed OpenTelemetry provider (TelemetryMode::FromEnv) for the
+    /// interpreter's lifetime; flushes on drop. `None` for all other modes.
+    _otel_guard: Option<sema_otel::OtelGuard>,
 }
 
 impl Default for Interpreter {
@@ -228,15 +274,22 @@ impl Interpreter {
         let (exprs, spans) = sema_reader::read_many_with_spans(source)?;
         self.inner.ctx.merge_span_table(spans);
 
-        // Evaluate in an isolated child env (like a real import does).
-        let module_env = Env::with_parent(self.inner.global_env.clone());
+        // Evaluate in an isolated module env (like a real import does), on the
+        // VM (the sole evaluator).
+        let module_env = Rc::new(Env::with_parent(self.inner.global_env.clone()));
         self.inner.ctx.clear_module_exports();
 
-        for expr in &exprs {
-            sema_eval::eval_value(&self.inner.ctx, expr, &module_env)?;
-        }
+        let empty_spans = std::collections::HashMap::new();
+        let eval_result = sema_eval::eval_module_body_vm(
+            &self.inner.ctx,
+            &module_env,
+            &exprs,
+            &empty_spans,
+            None,
+        );
 
         let declared = self.inner.ctx.take_module_exports();
+        eval_result?;
 
         // Collect exports: if (export ...) was used, only those; else all bindings.
         let exports: BTreeMap<String, Value> = match declared {

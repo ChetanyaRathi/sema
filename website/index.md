@@ -1,6 +1,7 @@
 ---
-layout: page
-title: Sema — A Lisp with LLM Primitives
+layout: false
+title: Sema — Agent-native Lisp for LLM Workflows
+titleTemplate: false
 ---
 
-<CustomHome />
+<HomepageV2 />

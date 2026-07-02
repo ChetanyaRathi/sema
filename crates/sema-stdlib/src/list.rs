@@ -1,12 +1,29 @@
-use sema_core::{check_arity, SemaError, Value, ValueView};
+use sema_core::{check_arity, SemaError, Value, ValueViewRef};
 
 use crate::register_fn;
 
+/// Sort category of a value for the comparator-free `sort`. Ints and floats
+/// share the `Number` family (they must compare by numeric value, not by tag);
+/// every other type is only comparable to its own kind. `sort` refuses to order
+/// values whose categories differ, because `Value`'s cross-type `Ord` falls back
+/// to an internal tag order that is arbitrary and never what the caller meant.
+#[derive(PartialEq, Eq)]
+enum SortCategory {
+    Number,
+    Other(&'static str),
+}
+
+fn sort_category(v: &Value) -> SortCategory {
+    if v.is_int() || v.is_float() {
+        SortCategory::Number
+    } else {
+        SortCategory::Other(v.type_name())
+    }
+}
+
 fn repeat_impl(args: &[Value]) -> Result<Value, SemaError> {
     check_arity!(args, "list/repeat", 2);
-    let n = args[0]
-        .as_int()
-        .ok_or_else(|| SemaError::type_error("int", args[0].type_name()))? as usize;
+    let n = args[0].as_index("list/repeat")?;
     let val = args[1].clone();
     Ok(Value::list(vec![val; n]))
 }
@@ -57,7 +74,8 @@ pub fn register(env: &sema_core::Env) {
             Err(SemaError::type_error(
                 "list, vector, string, map, bytevector, or typed array",
                 args[0].type_name(),
-            ))
+            )
+            .with_hint("length: expected a sequence or collection"))
         }
     });
 
@@ -69,7 +87,8 @@ pub fn register(env: &sema_core::Env) {
             } else if let Some(v) = arg.as_vector() {
                 result.extend(v.iter().cloned());
             } else {
-                return Err(SemaError::type_error("list or vector", arg.type_name()));
+                return Err(SemaError::type_error("list or vector", arg.type_name())
+                    .with_hint("append: every argument must be a list or vector"));
             }
         }
         Ok(Value::list(result))
@@ -86,16 +105,30 @@ pub fn register(env: &sema_core::Env) {
             items.reverse();
             Ok(Value::vector(items))
         } else {
-            Err(SemaError::type_error("list or vector", args[0].type_name()))
+            Err(SemaError::type_error("list or vector", args[0].type_name())
+                .with_hint("reverse: argument 1 must be a list or vector"))
         }
     });
 
     register_fn(env, "nth", |args| {
         check_arity!(args, "nth", 2);
-        let idx = args[1]
-            .as_int()
-            .ok_or_else(|| SemaError::type_error("int", args[1].type_name()))?
-            as usize;
+        let idx_i = args[1].as_int().ok_or_else(|| {
+            // A collection in the index slot almost always means swapped args.
+            let swapped = args[1].as_list().is_some() || args[1].as_vector().is_some();
+            let hint = if swapped {
+                "nth: argument order is (nth collection index) — looks like the arguments are swapped"
+            } else {
+                "nth: argument order is (nth collection index); the index must be an integer"
+            };
+            SemaError::type_error("int", args[1].type_name()).with_hint(hint)
+        })?;
+        if idx_i < 0 {
+            return Err(
+                SemaError::eval(format!("nth: index must be non-negative, got {idx_i}"))
+                    .with_hint("indices are 0-based; use (last xs) for the last element"),
+            );
+        }
+        let idx = idx_i as usize;
         if let Some(l) = args[0].as_list() {
             l.get(idx).cloned().ok_or_else(|| {
                 SemaError::eval(format!("index {idx} out of bounds (length {})", l.len()))
@@ -105,7 +138,8 @@ pub fn register(env: &sema_core::Env) {
                 SemaError::eval(format!("index {idx} out of bounds (length {})", v.len()))
             })
         } else {
-            Err(SemaError::type_error("list or vector", args[0].type_name()))
+            Err(SemaError::type_error("list or vector", args[0].type_name())
+                .with_hint("nth: argument 1 must be a list or vector"))
         }
     });
 
@@ -114,13 +148,13 @@ pub fn register(env: &sema_core::Env) {
         if args.len() == 2 {
             let items = get_sequence(&args[1], "map")?;
             let mut result = Vec::with_capacity(items.len());
-            for item in &items {
+            for item in items {
                 result.push(call_function(&args[0], &[item.clone()])?);
             }
             Ok(Value::list(result))
         } else {
             // Multi-list map: iterate in lockstep (shortest wins)
-            let lists: Vec<Vec<Value>> = args[1..]
+            let lists: Vec<&[Value]> = args[1..]
                 .iter()
                 .map(|a| get_sequence(a, "map"))
                 .collect::<Result<_, _>>()?;
@@ -138,10 +172,11 @@ pub fn register(env: &sema_core::Env) {
         check_arity!(args, "filter", 2);
         let items = get_sequence(&args[1], "filter")?;
         let mut result = Vec::new();
-        for item in &items {
-            let keep = call_function(&args[0], &[item.clone()])?;
+        for item in items {
+            let owned = item.clone();
+            let keep = call_function(&args[0], std::slice::from_ref(&owned))?;
             if keep.is_truthy() {
-                result.push(item.clone());
+                result.push(owned);
             }
         }
         Ok(Value::list(result))
@@ -151,7 +186,7 @@ pub fn register(env: &sema_core::Env) {
         check_arity!(args, "foldl", 3);
         let items = get_sequence(&args[2], "foldl")?;
         let mut acc = args[1].clone();
-        for item in &items {
+        for item in items {
             acc = call_function(&args[0], &[acc, item.clone()])?;
         }
         Ok(acc)
@@ -160,7 +195,7 @@ pub fn register(env: &sema_core::Env) {
     register_fn(env, "for-each", |args| {
         check_arity!(args, "for-each", 2);
         let items = get_sequence(&args[1], "for-each")?;
-        for item in &items {
+        for item in items {
             call_function(&args[0], &[item.clone()])?;
         }
         Ok(Value::nil())
@@ -224,16 +259,13 @@ pub fn register(env: &sema_core::Env) {
         let last = &args[args.len() - 1];
         let last_items = get_sequence(last, "apply")?;
         let mut all_args: Vec<Value> = args[1..args.len() - 1].to_vec();
-        all_args.extend(last_items);
+        all_args.extend(last_items.iter().cloned());
         call_function(func, &all_args)
     });
 
     register_fn(env, "take", |args| {
         check_arity!(args, "take", 2);
-        let n = args[0]
-            .as_int()
-            .ok_or_else(|| SemaError::type_error("int", args[0].type_name()))?
-            as usize;
+        let n = args[0].as_index("take")?;
         let items = get_sequence(&args[1], "take")?;
         let end = n.min(items.len());
         Ok(Value::list(items[..end].to_vec()))
@@ -241,10 +273,7 @@ pub fn register(env: &sema_core::Env) {
 
     register_fn(env, "drop", |args| {
         check_arity!(args, "drop", 2);
-        let n = args[0]
-            .as_int()
-            .ok_or_else(|| SemaError::type_error("int", args[0].type_name()))?
-            as usize;
+        let n = args[0].as_index("drop")?;
         let items = get_sequence(&args[1], "drop")?;
         let start = n.min(items.len());
         Ok(Value::list(items[start..].to_vec()))
@@ -258,7 +287,7 @@ pub fn register(env: &sema_core::Env) {
 
     register_fn(env, "zip", |args| {
         check_arity!(args, "zip", 2..);
-        let lists: Vec<Vec<Value>> = args
+        let lists: Vec<&[Value]> = args
             .iter()
             .map(|a| get_sequence(a, "zip"))
             .collect::<Result<_, _>>()?;
@@ -275,7 +304,7 @@ pub fn register(env: &sema_core::Env) {
         check_arity!(args, "flatten", 1);
         let items = get_sequence(&args[0], "flatten")?;
         let mut result = Vec::new();
-        for item in &items {
+        for item in items {
             if let Some(l) = item.as_list() {
                 result.extend(l.iter().cloned());
             } else if let Some(v) = item.as_vector() {
@@ -301,7 +330,7 @@ pub fn register(env: &sema_core::Env) {
     register_fn(env, "any", |args| {
         check_arity!(args, "any", 2);
         let items = get_sequence(&args[1], "any")?;
-        for item in &items {
+        for item in items {
             if call_function(&args[0], &[item.clone()])?.is_truthy() {
                 return Ok(Value::bool(true));
             }
@@ -312,13 +341,15 @@ pub fn register(env: &sema_core::Env) {
     register_fn(env, "every", |args| {
         check_arity!(args, "every", 2);
         let items = get_sequence(&args[1], "every")?;
-        for item in &items {
+        for item in items {
             if !call_function(&args[0], &[item.clone()])?.is_truthy() {
                 return Ok(Value::bool(false));
             }
         }
         Ok(Value::bool(true))
     });
+    // Note: canonical predicate-? aliases (`any?`, `every?`) are registered
+    // at the end of this fn (see below).
 
     register_fn(env, "reduce", |args| {
         check_arity!(args, "reduce", 2);
@@ -338,7 +369,7 @@ pub fn register(env: &sema_core::Env) {
         let items = get_sequence(&args[1], "partition")?;
         let mut matching = Vec::new();
         let mut non_matching = Vec::new();
-        for item in &items {
+        for item in items {
             if call_function(&args[0], &[item.clone()])?.is_truthy() {
                 matching.push(item.clone());
             } else {
@@ -363,9 +394,35 @@ pub fn register(env: &sema_core::Env) {
 
     register_fn(env, "sort", |args| {
         check_arity!(args, "sort", 1..=2);
-        let mut items = get_sequence(&args[0], "sort")?;
+        let mut items = get_sequence(&args[0], "sort")?.to_vec();
         if args.len() == 1 {
-            items.sort();
+            // Reject heterogeneous input up front: comparing across unrelated
+            // types would silently fall back to `Value`'s arbitrary tag order.
+            // Pass an explicit comparator (`sort-by` / 2-arg `sort`) to order
+            // mixed types deliberately.
+            if let Some(first) = items.first() {
+                let cat = sort_category(first);
+                if let Some(bad) = items.iter().find(|v| sort_category(v) != cat) {
+                    return Err(SemaError::type_error(first.type_name(), bad.type_name())
+                        .with_hint(
+                            "sort orders one type at a time; use `sort-by` or `(sort xs cmp)` \
+                             with a comparator to order mixed types",
+                        ));
+                }
+            }
+            // All-number lists must compare by numeric value: `Value`'s `Ord`
+            // orders every int before every float regardless of magnitude, so
+            // `(sort (list 3 1.5))` would otherwise misorder. Floats use a total
+            // order (NaN last) to keep the sort well-defined.
+            if matches!(items.first().map(sort_category), Some(SortCategory::Number)) {
+                items.sort_by(|a, b| {
+                    let x = a.as_float().unwrap();
+                    let y = b.as_float().unwrap();
+                    x.total_cmp(&y)
+                });
+            } else {
+                items.sort();
+            }
         } else {
             // Sort with comparator
             let mut err = None;
@@ -411,12 +468,46 @@ pub fn register(env: &sema_core::Env) {
         Ok(Value::nil())
     });
 
+    // Boolean membership — unlike `member` (which returns the Scheme tail-or-#f), this
+    // reads as a predicate and allocates nothing.
+    register_fn(env, "list/contains?", |args| {
+        check_arity!(args, "list/contains?", 2);
+        let items = get_sequence(&args[0], "list/contains?")?;
+        Ok(Value::bool(items.iter().any(|item| item == &args[1])))
+    });
+
+    // Safe indexed access: returns `default` instead of erroring when out of bounds.
+    register_fn(env, "list/nth-or", |args| {
+        check_arity!(args, "list/nth-or", 3);
+        let items = get_sequence(&args[0], "list/nth-or")?;
+        let idx = args[1].as_index("list/nth-or")?;
+        Ok(items.get(idx).cloned().unwrap_or_else(|| args[2].clone()))
+    });
+
+    // The last `n` elements (inverse of `take`). Clamps to the sequence length.
+    register_fn(env, "list/take-last", |args| {
+        check_arity!(args, "list/take-last", 2);
+        let n = args[0].as_index("list/take-last")?;
+        let items = get_sequence(&args[1], "list/take-last")?;
+        let start = items.len().saturating_sub(n);
+        Ok(Value::list(items[start..].to_vec()))
+    });
+
+    // All but the last `n` elements (drop from the tail). Clamps to empty.
+    register_fn(env, "list/drop-last", |args| {
+        check_arity!(args, "list/drop-last", 2);
+        let n = args[0].as_index("list/drop-last")?;
+        let items = get_sequence(&args[1], "list/drop-last")?;
+        let end = items.len().saturating_sub(n);
+        Ok(Value::list(items[..end].to_vec()))
+    });
+
     register_fn(env, "list/unique", |args| {
         check_arity!(args, "list/unique", 1);
         let items = get_sequence(&args[0], "list/unique")?;
         let mut seen: std::collections::BTreeSet<Value> = std::collections::BTreeSet::new();
         let mut result = Vec::new();
-        for item in &items {
+        for item in items {
             if seen.insert(item.clone()) {
                 result.push(item.clone());
             }
@@ -428,7 +519,7 @@ pub fn register(env: &sema_core::Env) {
         check_arity!(args, "list/group-by", 2);
         let items = get_sequence(&args[1], "list/group-by")?;
         let mut groups: Vec<(Value, Vec<Value>)> = Vec::new();
-        for item in &items {
+        for item in items {
             let key = call_function(&args[0], &[item.clone()])?;
             if let Some(group) = groups.iter_mut().find(|(k, _)| k == &key) {
                 group.1.push(item.clone());
@@ -445,7 +536,7 @@ pub fn register(env: &sema_core::Env) {
 
     register_fn(env, "list/interleave", |args| {
         check_arity!(args, "list/interleave", 2..);
-        let lists: Vec<Vec<Value>> = args
+        let lists: Vec<&[Value]> = args
             .iter()
             .map(|a| get_sequence(a, "list/interleave"))
             .collect::<Result<_, _>>()?;
@@ -464,7 +555,7 @@ pub fn register(env: &sema_core::Env) {
         let items = get_sequence(&args[1], "sort-by")?;
         // Extract keys for each element
         let mut keyed: Vec<(Value, Value)> = Vec::with_capacity(items.len());
-        for item in &items {
+        for item in items {
             let key = call_function(&args[0], &[item.clone()])?;
             keyed.push((key, item.clone()));
         }
@@ -500,7 +591,7 @@ pub fn register(env: &sema_core::Env) {
         check_arity!(args, "frequencies", 1);
         let items = get_sequence(&args[0], "frequencies")?;
         let mut counts: std::collections::BTreeMap<Value, i64> = std::collections::BTreeMap::new();
-        for item in &items {
+        for item in items {
             *counts.entry(item.clone()).or_insert(0) += 1;
         }
         let map: std::collections::BTreeMap<Value, Value> = counts
@@ -515,7 +606,8 @@ pub fn register(env: &sema_core::Env) {
         if let Some(l) = args[0].as_list() {
             Ok(Value::vector(l.to_vec()))
         } else {
-            Err(SemaError::type_error("list", args[0].type_name()))
+            Err(SemaError::type_error("list", args[0].type_name())
+                .with_hint("list->vector: argument 1 must be a list"))
         }
     });
 
@@ -524,16 +616,14 @@ pub fn register(env: &sema_core::Env) {
         if let Some(v) = args[0].as_vector() {
             Ok(Value::list(v.to_vec()))
         } else {
-            Err(SemaError::type_error("vector", args[0].type_name()))
+            Err(SemaError::type_error("vector", args[0].type_name())
+                .with_hint("vector->list: argument 1 must be a vector"))
         }
     });
 
     register_fn(env, "list/chunk", |args| {
         check_arity!(args, "list/chunk", 2);
-        let n = args[0]
-            .as_int()
-            .ok_or_else(|| SemaError::type_error("int", args[0].type_name()))?
-            as usize;
+        let n = args[0].as_index("list/chunk")?;
         if n == 0 {
             return Err(SemaError::eval("list/chunk: chunk size must be positive"));
         }
@@ -549,7 +639,7 @@ pub fn register(env: &sema_core::Env) {
         check_arity!(args, "take-while", 2);
         let items = get_sequence(&args[1], "take-while")?;
         let mut result = Vec::new();
-        for item in &items {
+        for item in items {
             if call_function(&args[0], &[item.clone()])?.is_truthy() {
                 result.push(item.clone());
             } else {
@@ -564,7 +654,7 @@ pub fn register(env: &sema_core::Env) {
         let items = get_sequence(&args[1], "drop-while")?;
         let mut dropping = true;
         let mut result = Vec::new();
-        for item in &items {
+        for item in items {
             if dropping && call_function(&args[0], &[item.clone()])?.is_truthy() {
                 continue;
             }
@@ -578,7 +668,7 @@ pub fn register(env: &sema_core::Env) {
         check_arity!(args, "list/dedupe", 1);
         let items = get_sequence(&args[0], "list/dedupe")?;
         let mut result = Vec::new();
-        for item in &items {
+        for item in items {
             if result.last() != Some(item) {
                 result.push(item.clone());
             }
@@ -590,7 +680,7 @@ pub fn register(env: &sema_core::Env) {
         check_arity!(args, "flat-map", 2);
         let items = get_sequence(&args[1], "flat-map")?;
         let mut result = Vec::new();
-        for item in &items {
+        for item in items {
             let mapped = call_function(&args[0], &[item.clone()])?;
             if let Some(l) = mapped.as_list() {
                 result.extend(l.iter().cloned());
@@ -605,7 +695,7 @@ pub fn register(env: &sema_core::Env) {
 
     register_fn(env, "list/shuffle", |args| {
         check_arity!(args, "list/shuffle", 1);
-        let mut items = get_sequence(&args[0], "list/shuffle")?;
+        let mut items = get_sequence(&args[0], "list/shuffle")?.to_vec();
         use rand::seq::SliceRandom;
         items.shuffle(&mut rand::rng());
         Ok(Value::list(items))
@@ -614,10 +704,7 @@ pub fn register(env: &sema_core::Env) {
     register_fn(env, "list/split-at", |args| {
         check_arity!(args, "list/split-at", 2);
         let items = get_sequence(&args[0], "list/split-at")?;
-        let n = args[1]
-            .as_int()
-            .ok_or_else(|| SemaError::type_error("int", args[1].type_name()))?
-            as usize;
+        let n = args[1].as_index("list/split-at")?;
         let n = n.min(items.len());
         let left = items[..n].to_vec();
         let right = items[n..].to_vec();
@@ -628,7 +715,7 @@ pub fn register(env: &sema_core::Env) {
         check_arity!(args, "list/take-while", 2);
         let items = get_sequence(&args[1], "list/take-while")?;
         let mut result = Vec::new();
-        for item in &items {
+        for item in items {
             let keep = call_function(&args[0], &[item.clone()])?;
             if keep.is_truthy() {
                 result.push(item.clone());
@@ -644,7 +731,7 @@ pub fn register(env: &sema_core::Env) {
         let items = get_sequence(&args[1], "list/drop-while")?;
         let mut dropping = true;
         let mut result = Vec::new();
-        for item in &items {
+        for item in items {
             if dropping {
                 let drop = call_function(&args[0], &[item.clone()])?;
                 if drop.is_truthy() {
@@ -663,7 +750,7 @@ pub fn register(env: &sema_core::Env) {
         let mut int_sum: i64 = 0;
         let mut has_float = false;
         let mut float_sum: f64 = 0.0;
-        for item in &items {
+        for item in items {
             if let Some(n) = item.as_int() {
                 int_sum += n;
                 float_sum += n as f64;
@@ -770,7 +857,7 @@ pub fn register(env: &sema_core::Env) {
         check_arity!(args, "list/reject", 2);
         let items = get_sequence(&args[1], "list/reject")?;
         let mut result = Vec::new();
-        for item in &items {
+        for item in items {
             let reject = call_function(&args[0], &[item.clone()])?;
             if !reject.is_truthy() {
                 result.push(item.clone());
@@ -785,10 +872,10 @@ pub fn register(env: &sema_core::Env) {
         let key = &args[0];
         let items = get_sequence(&args[1], "list/pluck")?;
         let mut result = Vec::with_capacity(items.len());
-        for item in &items {
-            let val = match item.view() {
-                ValueView::Map(m) => m.get(key).cloned().unwrap_or(Value::nil()),
-                ValueView::HashMap(m) => m.get(key).cloned().unwrap_or(Value::nil()),
+        for item in items {
+            let val = match item.view_ref() {
+                ValueViewRef::Map(m) => m.get(key).cloned().unwrap_or(Value::nil()),
+                ValueViewRef::HashMap(m) => m.get(key).cloned().unwrap_or(Value::nil()),
                 _ => Value::nil(),
             };
             result.push(val);
@@ -804,7 +891,7 @@ pub fn register(env: &sema_core::Env) {
             return Err(SemaError::eval("list/avg: empty list"));
         }
         let mut sum: f64 = 0.0;
-        for item in &items {
+        for item in items {
             if let Some(n) = item.as_int() {
                 sum += n as f64;
             } else if let Some(f) = item.as_float() {
@@ -824,7 +911,7 @@ pub fn register(env: &sema_core::Env) {
             return Err(SemaError::eval("list/median: empty list"));
         }
         let mut nums: Vec<f64> = Vec::with_capacity(items.len());
-        for item in &items {
+        for item in items {
             if let Some(n) = item.as_int() {
                 nums.push(n as f64);
             } else if let Some(f) = item.as_float() {
@@ -851,7 +938,7 @@ pub fn register(env: &sema_core::Env) {
         }
         let mut counts: std::collections::BTreeMap<Value, usize> =
             std::collections::BTreeMap::new();
-        for item in &items {
+        for item in items {
             *counts.entry(item.clone()).or_insert(0) += 1;
         }
         let max_count = counts.values().copied().max().unwrap();
@@ -872,8 +959,12 @@ pub fn register(env: &sema_core::Env) {
         check_arity!(args, "list/diff", 2);
         let a = get_sequence(&args[0], "list/diff")?;
         let b = get_sequence(&args[1], "list/diff")?;
-        let b_set: std::collections::BTreeSet<Value> = b.into_iter().collect();
-        let result: Vec<Value> = a.into_iter().filter(|item| !b_set.contains(item)).collect();
+        let b_set: std::collections::BTreeSet<Value> = b.iter().cloned().collect();
+        let result: Vec<Value> = a
+            .iter()
+            .filter(|item| !b_set.contains(item))
+            .cloned()
+            .collect();
         Ok(Value::list(result))
     });
 
@@ -882,8 +973,12 @@ pub fn register(env: &sema_core::Env) {
         check_arity!(args, "list/intersect", 2);
         let a = get_sequence(&args[0], "list/intersect")?;
         let b = get_sequence(&args[1], "list/intersect")?;
-        let b_set: std::collections::BTreeSet<Value> = b.into_iter().collect();
-        let result: Vec<Value> = a.into_iter().filter(|item| b_set.contains(item)).collect();
+        let b_set: std::collections::BTreeSet<Value> = b.iter().cloned().collect();
+        let result: Vec<Value> = a
+            .iter()
+            .filter(|item| b_set.contains(item))
+            .cloned()
+            .collect();
         Ok(Value::list(result))
     });
 
@@ -891,15 +986,9 @@ pub fn register(env: &sema_core::Env) {
     register_fn(env, "list/sliding", |args| {
         check_arity!(args, "list/sliding", 2..=3);
         let items = get_sequence(&args[0], "list/sliding")?;
-        let size = args[1]
-            .as_int()
-            .ok_or_else(|| SemaError::type_error("int", args[1].type_name()))?
-            as usize;
+        let size = args[1].as_index("list/sliding")?;
         let step = if args.len() == 3 {
-            args[2]
-                .as_int()
-                .ok_or_else(|| SemaError::type_error("int", args[2].type_name()))?
-                as usize
+            args[2].as_index("list/sliding")?
         } else {
             1
         };
@@ -923,7 +1012,7 @@ pub fn register(env: &sema_core::Env) {
         check_arity!(args, "list/key-by", 2);
         let items = get_sequence(&args[1], "list/key-by")?;
         let mut map = std::collections::BTreeMap::new();
-        for item in &items {
+        for item in items {
             let key = call_function(&args[0], &[item.clone()])?;
             map.insert(key, item.clone());
         }
@@ -933,10 +1022,7 @@ pub fn register(env: &sema_core::Env) {
     // list/times — generate list by calling fn N times
     register_fn(env, "list/times", |args| {
         check_arity!(args, "list/times", 2);
-        let n = args[0]
-            .as_int()
-            .ok_or_else(|| SemaError::type_error("int", args[0].type_name()))?
-            as usize;
+        let n = args[0].as_index("list/times")?;
         let mut result = Vec::with_capacity(n);
         for i in 0..n {
             result.push(call_function(&args[1], &[Value::int(i as i64)])?);
@@ -950,7 +1036,7 @@ pub fn register(env: &sema_core::Env) {
         let items = get_sequence(&args[0], "list/duplicates")?;
         let mut seen: std::collections::BTreeSet<Value> = std::collections::BTreeSet::new();
         let mut dupes: std::collections::BTreeSet<Value> = std::collections::BTreeSet::new();
-        for item in &items {
+        for item in items {
             if !seen.insert(item.clone()) {
                 dupes.insert(item.clone());
             }
@@ -964,8 +1050,8 @@ pub fn register(env: &sema_core::Env) {
         let a = get_sequence(&args[0], "list/cross-join")?;
         let b = get_sequence(&args[1], "list/cross-join")?;
         let mut result = Vec::with_capacity(a.len() * b.len());
-        for ai in &a {
-            for bi in &b {
+        for ai in a {
+            for bi in b {
                 result.push(Value::list(vec![ai.clone(), bi.clone()]));
             }
         }
@@ -979,10 +1065,7 @@ pub fn register(env: &sema_core::Env) {
         let page = args[1]
             .as_int()
             .ok_or_else(|| SemaError::type_error("int", args[1].type_name()))?;
-        let per_page = args[2]
-            .as_int()
-            .ok_or_else(|| SemaError::type_error("int", args[2].type_name()))?
-            as usize;
+        let per_page = args[2].as_index("list/page")?;
         if page < 1 {
             return Err(SemaError::eval("list/page: page must be >= 1"));
         }
@@ -998,7 +1081,7 @@ pub fn register(env: &sema_core::Env) {
     register_fn(env, "list/find", |args| {
         check_arity!(args, "list/find", 2);
         let items = get_sequence(&args[1], "list/find")?;
-        for item in &items {
+        for item in items {
             let result = call_function(&args[0], &[item.clone()])?;
             if result.is_truthy() {
                 return Ok(item.clone());
@@ -1010,11 +1093,8 @@ pub fn register(env: &sema_core::Env) {
     // list/pad — pad list to length
     register_fn(env, "list/pad", |args| {
         check_arity!(args, "list/pad", 3);
-        let mut items = get_sequence(&args[0], "list/pad")?;
-        let target_len = args[1]
-            .as_int()
-            .ok_or_else(|| SemaError::type_error("int", args[1].type_name()))?
-            as usize;
+        let mut items = get_sequence(&args[0], "list/pad")?.to_vec();
+        let target_len = args[1].as_index("list/pad")?;
         let fill = args[2].clone();
         while items.len() < target_len {
             items.push(fill.clone());
@@ -1027,7 +1107,7 @@ pub fn register(env: &sema_core::Env) {
         check_arity!(args, "list/sole", 2);
         let items = get_sequence(&args[1], "list/sole")?;
         let mut found: Option<Value> = None;
-        for item in &items {
+        for item in items {
             let result = call_function(&args[0], &[item.clone()])?;
             if result.is_truthy() {
                 if found.is_some() {
@@ -1058,17 +1138,16 @@ pub fn register(env: &sema_core::Env) {
         if items.is_empty() {
             return Ok(Value::string(""));
         }
-        let strs: Vec<String> = items.iter().map(|v| format!("{}", v)).collect();
-        if strs.len() == 1 {
-            return Ok(Value::string(&strs[0]));
+        use std::fmt::Write;
+        let mut out = String::with_capacity(items.len().saturating_mul(8));
+        let last = items.len().saturating_sub(1);
+        for (i, v) in items.iter().enumerate() {
+            if i > 0 {
+                out.push_str(if i == last { &final_sep } else { &sep });
+            }
+            write!(&mut out, "{}", v).unwrap();
         }
-        let init = strs[..strs.len() - 1].join(&sep);
-        Ok(Value::string(&format!(
-            "{}{}{}",
-            init,
-            final_sep,
-            strs[strs.len() - 1]
-        )))
+        Ok(Value::string(&out))
     });
 
     // tap — side-effect then return original
@@ -1099,7 +1178,7 @@ pub fn register(env: &sema_core::Env) {
         check_arity!(args, "assq", 2);
         let key = &args[0];
         let alist = get_sequence(&args[1], "assq")?;
-        for pair in &alist {
+        for pair in alist {
             if let Some(p) = pair.as_list() {
                 if !p.is_empty() && &p[0] == key {
                     return Ok(pair.clone());
@@ -1113,7 +1192,7 @@ pub fn register(env: &sema_core::Env) {
         check_arity!(args, "assv", 2);
         let key = &args[0];
         let alist = get_sequence(&args[1], "assv")?;
-        for pair in &alist {
+        for pair in alist {
             if let Some(p) = pair.as_list() {
                 if !p.is_empty() && &p[0] == key {
                     return Ok(pair.clone());
@@ -1154,7 +1233,8 @@ fn first(args: &[Value]) -> Result<Value, SemaError> {
             Ok(v[0].clone())
         }
     } else {
-        Err(SemaError::type_error("list or vector", args[0].type_name()))
+        Err(SemaError::type_error("list or vector", args[0].type_name())
+            .with_hint("first: argument 1 must be a list or vector"))
     }
 }
 
@@ -1173,20 +1253,21 @@ fn rest(args: &[Value]) -> Result<Value, SemaError> {
             Ok(Value::vector(v[1..].to_vec()))
         }
     } else {
-        Err(SemaError::type_error("list or vector", args[0].type_name()))
+        Err(SemaError::type_error("list or vector", args[0].type_name())
+            .with_hint("rest: argument 1 must be a list or vector"))
     }
 }
 
-fn get_sequence(val: &Value, ctx: &str) -> Result<Vec<Value>, SemaError> {
+fn get_sequence<'a>(val: &'a Value, ctx: &str) -> Result<&'a [Value], SemaError> {
     if let Some(l) = val.as_list() {
-        Ok(l.to_vec())
+        Ok(l)
     } else if let Some(v) = val.as_vector() {
-        Ok(v.to_vec())
+        Ok(v)
     } else {
-        Err(SemaError::type_error(
-            "list or vector",
-            format!("{} in {ctx}", val.type_name()),
-        ))
+        Err(
+            SemaError::type_error("list or vector", format!("{} in {ctx}", val.type_name()))
+                .with_hint(format!("{ctx}: expected a list or vector to iterate over")),
+        )
     }
 }
 
@@ -1205,21 +1286,39 @@ fn flatten_recursive(val: &Value, out: &mut Vec<Value>) {
 }
 
 fn num_lt(a: &Value, b: &Value) -> Result<bool, SemaError> {
-    match (a.view(), b.view()) {
-        (ValueView::Int(a), ValueView::Int(b)) => Ok(a < b),
-        (ValueView::Float(a), ValueView::Float(b)) => Ok(a < b),
-        (ValueView::Int(a), ValueView::Float(b)) => Ok((a as f64) < b),
-        (ValueView::Float(a), ValueView::Int(b)) => Ok(a < (b as f64)),
+    match (a.view_ref(), b.view_ref()) {
+        (ValueViewRef::Int(a), ValueViewRef::Int(b)) => Ok(a < b),
+        (ValueViewRef::Float(a), ValueViewRef::Float(b)) => Ok(a < b),
+        (ValueViewRef::Int(a), ValueViewRef::Float(b)) => Ok((a as f64) < b),
+        (ValueViewRef::Float(a), ValueViewRef::Int(b)) => Ok(a < (b as f64)),
         _ => Err(SemaError::type_error("number", a.type_name())),
     }
 }
 
 /// Call a Sema function (lambda or native) with given args.
 /// Delegates to the real evaluator via the registered callback.
+///
+/// VM closures called from inside an async task route through the scheduler
+/// (see `run_closure_as_inline_task` in sema-vm), so yields suspend cleanly.
+/// Plain native callbacks (e.g. `(map channel/recv ...)`) don't have that
+/// affordance — their yield signal would be silently dropped or coalesced
+/// with subsequent calls, producing wrong results. Surface that case as an
+/// explicit error pointing to the lambda-wrap workaround.
 pub fn call_function(func: &Value, args: &[Value]) -> Result<Value, SemaError> {
-    if let Some(native) = func.as_native_fn_rc() {
+    let result = if let Some(native) = func.as_native_fn_rc() {
         sema_core::with_stdlib_ctx(|ctx| (native.func)(ctx, args))
     } else {
         sema_core::with_stdlib_ctx(|ctx| sema_core::call_callback(ctx, func, args))
+    };
+
+    if sema_core::in_async_context() && sema_core::take_yield_signal().is_some() {
+        return Err(SemaError::eval(
+            "yielding native passed directly to a higher-order function — \
+             wrap it in a lambda so the yield can suspend cleanly. \
+             For example, `(map (fn (x) (channel/recv x)) ...)` instead of \
+             `(map channel/recv ...)`.",
+        ));
     }
+
+    result
 }

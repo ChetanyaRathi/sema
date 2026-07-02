@@ -1,0 +1,39 @@
+;; async-race-timeout.sema — Racing replicas + deadlines with async/race & async/timeout
+;;
+;; Two real-world resilience patterns:
+;;   1. Hedged request: fire the same query at several "replicas" with different
+;;      latencies and take whichever answers first (`async/race`).
+;;   2. Deadline: cap how long an operation may take (`async/timeout`), handling
+;;      the timeout as a normal error with `try`/`catch`.
+
+;; --- 1. Race several replicas, fastest wins --------------------------------
+(println "=== Hedged request: race 3 replicas ===")
+(define (replica name latency)
+  (async
+    (async/sleep latency)
+    (str name " (" latency "ms)")))
+
+(define winner
+  (async/race
+    (list (replica "us-east" 30)
+          (replica "eu-west" 12)      ; fastest
+          (replica "ap-south" 45))))
+(println "  fastest replica: " winner)   ; eu-west
+
+;; --- 2. Deadline with async/timeout ----------------------------------------
+;; `async/timeout` rejects if the promise doesn't settle within the budget.
+(println "")
+(println "=== Deadlines: async/timeout ===")
+
+(define (query ms) (async (async/sleep ms) (str "ok after " ms "ms")))
+
+;; Fast enough — completes within budget. `async/timeout` takes the budget (ms)
+;; first, then the promise, and returns the resolved value directly.
+(println "  20ms query, 50ms budget -> "
+  (try (async/timeout 50 (query 20))
+       (catch e (str "timed out: " (:message e)))))
+
+;; Too slow — exceeds the budget, surfaces as a catchable error.
+(println "  80ms query, 30ms budget -> "
+  (try (async/timeout 30 (query 80))
+       (catch e "deadline exceeded (handled gracefully)")))

@@ -41,6 +41,15 @@ With a callback function:
   {:max-tokens 200})
 ```
 
+`llm/stream` **returns the full accumulated response string** once streaming finishes — so
+you can show the live stream *and* keep the final text:
+
+```sema
+(define story
+  (llm/stream "Tell me a story" (fn (c) (display c)) {:max-tokens 200}))
+;; `story` is the complete text after the stream ends.
+```
+
 ## Chat
 
 ### `llm/chat`
@@ -53,6 +62,11 @@ Send a list of messages and get a response. Supports system, user, and assistant
         (message :user "What is Lisp? One sentence."))
   {:max-tokens 100})
 ```
+
+When you pass `:tools`, `llm/chat` runs the tool-execution loop for you (see
+[Tools & Agents](./tools-agents)). Two options bound it: `:tool-mode :none` lets the model
+*see* the tools but never auto-executes them, and `:max-tool-rounds N` caps the loop
+(default 10).
 
 ### Multi-Modal Chat
 
@@ -94,8 +108,32 @@ All completion and chat functions accept an options map with these keys:
 
 | Key            | Description                                                   |
 | -------------- | ------------------------------------------------------------- |
-| `:model`       | Model name (e.g. `"claude-haiku-4-5-20251001"`)               |
-| `:max-tokens`  | Maximum tokens in response                                    |
-| `:temperature` | Sampling temperature (0.0–1.0)                                |
-| `:system`      | System prompt (for `llm/complete`)                            |
-| `:tools`       | List of tool values (see [Tools & Agents](./tools-agents.md)) |
+| `:model`            | Model name (e.g. `"claude-haiku-4-5-20251001"`)               |
+| `:max-tokens`       | Maximum tokens in response                                    |
+| `:temperature`      | Sampling temperature (0.0–1.0)                                |
+| `:system`           | System prompt (for `llm/complete`)                            |
+| `:reasoning-effort` | Reasoning effort for thinking models — see below              |
+| `:tools`            | List of tool values (see [Tools & Agents](./tools-agents.md)) |
+| `:timeout`          | Per-call HTTP timeout in **milliseconds** (network providers; non-streaming) |
+| `:tags` / `:metadata` | Observability tags/metadata — see [Backend Compatibility](./otel-compat.md) |
+
+### Reasoning effort
+
+`:reasoning-effort` controls how much a reasoning/thinking model deliberates
+before answering. It takes a keyword or string: `:minimal`, `:low`, `:medium`,
+`:high`, `:none`, or `:xhigh`. It is a single **portable** option — Sema maps it
+to each provider's native control, so the same code works everywhere:
+
+```sema
+(llm/complete "Prove that sqrt(2) is irrational."
+  {:model "gpt-5.4-mini" :reasoning-effort :high :max-tokens 4000})
+```
+
+| Provider  | Mapped to                                                                              |
+| --------- | ------------------------------------------------------------------------------------- |
+| OpenAI    | native `reasoning_effort` (gpt-5 / o-series)                                           |
+| Anthropic | extended **thinking** — effort sets the thinking `budget_tokens` (and raises `max_tokens` above it; `temperature` is forced to default while thinking) |
+| Gemini    | `thinkingConfig.thinkingBudget` (`:none`/`:minimal` disable thinking)                  |
+
+Models and providers that don't support reasoning effort ignore the option (no-op).
+It is also accepted by `llm/chat` and per-run on `agent/run` (`{:reasoning-effort :high}`).

@@ -4,6 +4,10 @@ outline: [2, 3]
 
 # File I/O & Paths
 
+::: tip Sandbox capability
+`file/*` functions require the `FS_READ` capability (for reads, listings, predicates) or `FS_WRITE` capability (for writes, deletes, renames, mkdir). They run unrestricted under `sema` by default, but are gated in sandboxed environments (e.g., the WASM playground). A sandboxed script that attempts to use them without the capability will receive an error.
+:::
+
 ## Console I/O
 
 ### `display`
@@ -26,10 +30,11 @@ Print a value followed by a newline.
 
 ### `print`
 
-Alias for `display`. Print without a trailing newline.
+Write values in read-syntax form (strings are quoted) like Scheme's `write`. No trailing newline. Use `display` for human-readable output without quotes.
 
 ```sema
-(print "also no newline")
+(print "hello")   ;; outputs: "hello"
+(display "hello") ;; outputs: hello
 ```
 
 ### `io/print-error`
@@ -58,11 +63,26 @@ Print a newline character.
 
 ### `io/read-line`
 
-Read a line of input from stdin.
+Read a line of input from stdin (trailing `\n` / `\r\n` stripped).
 
 ```sema
 (define name (io/read-line))
 ```
+
+Returns `nil` when stdin is closed (Ctrl-D in cooked mode, end of a piped file). Use this to distinguish "user pressed Enter on an empty line" (returns `""`) from "stdin is exhausted" (returns `nil`).
+
+```sema
+(let loop ()
+  (let ((line (io/read-line)))
+    (cond
+      ((nil? line)         (println "(eof)"))
+      ((= line "")         (loop))            ; blank line, keep reading
+      (else                (println "got: " line) (loop)))))
+```
+
+::: warning Breaking change in 1.14.0
+Previously `io/read-line` returned `""` on both EOF and empty input, making them indistinguishable. It now returns `nil` on EOF. If you don't want to refactor for this, use `io/eof?` after the call instead.
+:::
 
 ### `io/read-stdin`
 
@@ -70,6 +90,26 @@ Read all of stdin as a string (until EOF).
 
 ```sema
 (define input (io/read-stdin))
+```
+
+### `io/eof?`
+
+Return `#t` after any stdin read (`io/read-line`, `io/read-stdin`, `io/read-key`) has signalled EOF. Non-breaking alternative to checking `io/read-line` for `nil`.
+
+```sema
+(define line (io/read-line))
+(when (io/eof?)
+  (println "stdin closed"))
+```
+
+### `io/flush`
+
+Flush stdout. Useful when writing a prompt without a trailing newline before reading input.
+
+```sema
+(display "name> ")
+(io/flush)
+(define name (io/read-line))
 ```
 
 ## File Operations
@@ -240,10 +280,11 @@ Find files matching a glob pattern.
 
 ### `file/info`
 
-Get file metadata. Returns a map with `:size`, `:modified`, and other keys.
+Get file metadata. Returns a map with `:size` (bytes), `:modified` (Unix epoch **milliseconds**), `:is-file`, and `:is-dir`.
 
 ```sema
-(file/info "data.txt")   ; => {:size 1234 :modified 1707955200 ...}
+(file/info "data.txt")
+; => {:is-dir #f :is-file #t :modified 1782248141021 :size 1234}
 ```
 
 ## Path Manipulation
@@ -257,30 +298,44 @@ Join path components.
 (path/join "a" "b" "c.txt")  ; => "a/b/c.txt"
 ```
 
-### `path/dirname`
+### `path/dir`
 
-Return the directory portion of a path.
-
-```sema
-(path/dirname "/a/b/c.txt")   ; => "/a/b"
-```
-
-### `path/basename`
-
-Return the filename portion of a path.
+Return the directory portion of a path. Returns `""` when the path has no parent component.
 
 ```sema
-(path/basename "/a/b/c.txt")   ; => "c.txt"
+(path/dir "/a/b/c.txt")   ;; => "/a/b"
+(path/dir "foo")          ;; => ""
 ```
+
+`path/dirname` is a legacy alias for `path/dir` — same implementation, same return value.
+
+### `path/filename`
+
+Return the filename portion of a path. Returns `""` when there is no filename component (e.g. for `""`).
+
+```sema
+(path/filename "/a/b/c.txt")   ;; => "c.txt"
+(path/filename "plain.rs")     ;; => "plain.rs"
+```
+
+`path/basename` is a legacy alias for `path/filename` — same implementation, same return value.
 
 ### `path/extension`
 
-Return the file extension (without the dot).
+Return the file extension (without the dot). Returns `""` when the path has no extension.
 
 ```sema
-(path/extension "file.rs")     ; => "rs"
-(path/extension "Makefile")    ; => ""
+(path/extension "file.rs")        ;; => "rs"
+(path/extension "file.tar.gz")    ;; => "gz"
+(path/extension "Makefile")       ;; => ""
+(path/extension ".hidden")        ;; => ""
 ```
+
+`path/ext` is a legacy alias for `path/extension` — same implementation, same return value.
+
+::: warning Behavior change
+Previous versions registered `path/dirname`, `path/basename`, and `path/extension` as independent functions that returned `nil` on the no-parent / no-filename / no-extension case. As of the current release, all six names share one implementation per concept and consistently return `""` (matching `path/dir`, `path/filename`, `path/ext`).
+:::
 
 ### `path/absolute`
 
@@ -288,15 +343,6 @@ Return the absolute path.
 
 ```sema
 (path/absolute ".")   ; => "/full/path/to/current/dir"
-```
-
-### `path/ext`
-
-Return the file extension (without the dot).
-
-```sema
-(path/ext "file.rs")     ; => "rs"
-(path/ext "Makefile")    ; => ""
 ```
 
 ### `path/stem`
@@ -308,22 +354,6 @@ Return the filename without extension.
 (path/stem "archive.tar.gz")  ; => "archive.tar"
 ```
 
-### `path/dir`
-
-Return the directory portion of a path.
-
-```sema
-(path/dir "/a/b/c.txt")   ; => "/a/b"
-```
-
-### `path/filename`
-
-Return the filename portion of a path.
-
-```sema
-(path/filename "/a/b/c.txt")   ; => "c.txt"
-```
-
 ### `path/absolute?`
 
 Test if a path is absolute.
@@ -331,4 +361,27 @@ Test if a path is absolute.
 ```sema
 (path/absolute? "/usr/bin")   ; => #t
 (path/absolute? "relative")  ; => #f
+```
+
+## File watching
+
+Watch a path for changes and drain events non-blockingly. Requires `FS_READ`.
+
+```sema
+(define w (fs/watch "src" {:recursive true}))
+(for-each
+  (lambda (ev) (println (:kind ev) (:paths ev)))  ; :create/:modify/:remove/...
+  (fs/watch-events w))                            ; non-blocking drain
+(fs/unwatch w)
+```
+
+## Path safety
+
+Helpers for sandboxing file access — `path/within?` is the cornerstone
+(it resolves symlinks, so it catches `../` *and* symlink escapes).
+
+```sema
+(path/within? "/repo" "/repo/src/x")  ; => #t   (catches ../ and symlink escapes)
+(path/canonicalize "./src/../x")      ; real absolute path (errors if missing)
+(path/relative-to "/a/b" "/a/b/c/d")  ; => "c/d"
 ```

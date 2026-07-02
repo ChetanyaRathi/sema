@@ -156,53 +156,60 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
         Ok(Value::map(result))
     });
 
-    register_fn(env, "http/file", |args| {
-        if args.is_empty() || args.len() > 2 {
-            return Err(SemaError::arity("http/file", "1-2", args.len()));
-        }
-        let file_path = args[0]
-            .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
-
-        // Resolve to absolute path
-        let path = std::path::Path::new(file_path);
-        let abs_path = if path.is_absolute() {
-            path.to_path_buf()
-        } else {
-            std::env::current_dir()
-                .map_err(|e| SemaError::eval(format!("http/file: {e}")))?
-                .join(path)
-        };
-
-        // Canonicalize to resolve symlinks and ..
-        let abs_path = abs_path
-            .canonicalize()
-            .map_err(|e| SemaError::eval(format!("http/file: {}: {e}", abs_path.display())))?;
-
-        // Determine content type: explicit override or guess from extension
-        let content_type = if args.len() == 2 {
-            args[1]
+    crate::register_fn_path_gated(
+        env,
+        sandbox,
+        sema_core::Caps::FS_READ,
+        "http/file",
+        &[0],
+        |args| {
+            if args.is_empty() || args.len() > 2 {
+                return Err(SemaError::arity("http/file", "1-2", args.len()));
+            }
+            let file_path = args[0]
                 .as_str()
-                .ok_or_else(|| SemaError::type_error("string", args[1].type_name()))?
-                .to_string()
-        } else {
-            mime_guess::from_path(&abs_path)
-                .first_or_octet_stream()
-                .to_string()
-        };
+                .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
 
-        let mut map = BTreeMap::new();
-        map.insert(Value::keyword("__file"), Value::bool(true));
-        map.insert(
-            Value::keyword("__file_path"),
-            Value::string(&abs_path.to_string_lossy()),
-        );
-        map.insert(
-            Value::keyword("__file_content_type"),
-            Value::string(&content_type),
-        );
-        Ok(Value::map(map))
-    });
+            // Resolve to absolute path
+            let path = std::path::Path::new(file_path);
+            let abs_path = if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                std::env::current_dir()
+                    .map_err(|e| SemaError::eval(format!("http/file: {e}")))?
+                    .join(path)
+            };
+
+            // Canonicalize to resolve symlinks and ..
+            let abs_path = abs_path
+                .canonicalize()
+                .map_err(|e| SemaError::eval(format!("http/file: {}: {e}", abs_path.display())))?;
+
+            // Determine content type: explicit override or guess from extension
+            let content_type = if args.len() == 2 {
+                args[1]
+                    .as_str()
+                    .ok_or_else(|| SemaError::type_error("string", args[1].type_name()))?
+                    .to_string()
+            } else {
+                mime_guess::from_path(&abs_path)
+                    .first_or_octet_stream()
+                    .to_string()
+            };
+
+            let mut map = BTreeMap::new();
+            map.insert(Value::keyword("__file"), Value::bool(true));
+            map.insert(
+                Value::keyword("__file_path"),
+                Value::string(&abs_path.to_string_lossy()),
+            );
+            map.insert(
+                Value::keyword("__file_content_type"),
+                Value::string(&content_type),
+            );
+            Ok(Value::map(map))
+        },
+    );
 
     register_fn(env, "http/stream", |args| {
         check_arity!(args, "http/stream", 1);
@@ -368,6 +375,11 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
         }
         Ok(Value::list(routes))
     });
+
+    // Canonical slash-namespaced alias (Decision #24)
+    if let Some(v) = env.get(sema_core::intern("tools->routes")) {
+        env.set(sema_core::intern("route/from-tools"), v);
+    }
 
     register_router(env);
     register_serve(env, sandbox);
@@ -592,6 +604,30 @@ fn register_router(env: &sema_core::Env) {
                                     continue;
                                 }
 
+                                // Security (STD-11): confirm the resolved file stays
+                                // inside dir_path. The ".." substring check above can't
+                                // catch symlink/junction escapes; canonicalize() resolves
+                                // links, then we verify the prefix.
+                                let escapes = match (
+                                    std::fs::canonicalize(dir_path),
+                                    std::fs::canonicalize(&file_path),
+                                ) {
+                                    (Ok(base), Ok(real)) => !real.starts_with(&base),
+                                    _ => true,
+                                };
+                                if escapes {
+                                    let mut headers = BTreeMap::new();
+                                    headers.insert(
+                                        Value::string("content-type"),
+                                        Value::string("text/plain"),
+                                    );
+                                    let mut result = BTreeMap::new();
+                                    result.insert(Value::keyword("status"), Value::int(403));
+                                    result.insert(Value::keyword("headers"), Value::map(headers));
+                                    result.insert(Value::keyword("body"), Value::string("Forbidden"));
+                                    return Ok(Value::map(result));
+                                }
+
                                 let content_type = mime_guess::from_path(&file_path)
                                     .first_or_octet_stream()
                                     .to_string();
@@ -663,6 +699,19 @@ fn register_router(env: &sema_core::Env) {
 }
 
 /// Convert an HTTP method string (e.g. "GET") to a lowercase keyword Value (e.g. :get).
+/// Validate a user-supplied port number. A bare `as u16` silently wrapped
+/// out-of-range values (70000 -> 4464, -1 -> 65535), binding the wrong port
+/// while logging the original. Reject anything outside 1..=65535.
+fn parse_port(p: i64) -> Result<u16, SemaError> {
+    if (1..=65535).contains(&p) {
+        Ok(p as u16)
+    } else {
+        Err(SemaError::eval(format!(
+            "http/serve: port must be in 1..=65535, got {p}"
+        )))
+    }
+}
+
 fn method_keyword(method: &str) -> Value {
     Value::keyword(&method.to_ascii_lowercase())
 }
@@ -809,14 +858,20 @@ async fn handle_axum_request(
         headers.push((n, v));
     }
 
-    // Read body (no size limit)
-    let body_bytes = match axum::body::to_bytes(req.into_body(), usize::MAX).await {
+    // Read body with a size cap so a client can't stream an unbounded body into
+    // memory and exhaust the process (DoS). `to_bytes` returns Err once the
+    // limit is exceeded; surface that as 413 rather than a generic read error.
+    const MAX_BODY_BYTES: usize = 16 * 1024 * 1024; // 16 MiB
+    let body_bytes = match axum::body::to_bytes(req.into_body(), MAX_BODY_BYTES).await {
         Ok(b) => b,
         Err(_) => {
             return raw_response_to_axum(&RawResponse {
-                status: 400,
+                status: 413,
                 headers: vec![("content-type".to_string(), "text/plain".to_string())],
-                body: "Failed to read request body".to_string(),
+                body: format!(
+                    "Request body too large or unreadable (max {} bytes)",
+                    MAX_BODY_BYTES
+                ),
             });
         }
     };
@@ -926,11 +981,10 @@ async fn bridge_websocket(
     let recv_task = tokio::spawn(async move {
         while let Some(Ok(msg)) = ws_stream.next().await {
             match msg {
-                Message::Text(text) => {
-                    if incoming_tx_clone.send(text.to_string()).await.is_err() {
-                        break;
-                    }
+                Message::Text(text) if incoming_tx_clone.send(text.to_string()).await.is_err() => {
+                    break;
                 }
+                Message::Text(_) => {}
                 Message::Close(_) => break,
                 _ => {} // ignore binary, ping, pong
             }
@@ -1079,14 +1133,23 @@ fn handle_ws_response(
     });
 
     // Build the connection map for the Sema handler: {:send fn :recv fn :close fn}
+    //
+    // Share a single outgoing sender between `send` and `close`. axum's send
+    // task only exits (and the socket only closes) when the *last* `Sender` is
+    // dropped, so `ws/close` must release the sole sender — not a throwaway
+    // clone. Mirrors the `in_rx` Option pattern below.
+    let out_tx = Rc::new(RefCell::new(Some(out_tx)));
     let out_tx_for_send = out_tx.clone();
     let send_fn = Value::native_fn(NativeFn::simple("ws/send", move |args| {
         check_arity!(args, "ws/send", 1);
         let msg = args[0]
             .as_str()
             .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
-        out_tx_for_send
-            .blocking_send(msg.to_string())
+        let guard = out_tx_for_send.borrow();
+        let tx = guard
+            .as_ref()
+            .ok_or_else(|| SemaError::eval("WebSocket closed"))?;
+        tx.blocking_send(msg.to_string())
             .map_err(|_| SemaError::eval("WebSocket closed"))?;
         Ok(Value::nil())
     }));
@@ -1115,9 +1178,10 @@ fn handle_ws_response(
     let in_rx_for_close = in_rx;
     let close_fn = Value::native_fn(NativeFn::simple("ws/close", move |args| {
         check_arity!(args, "ws/close", 0);
-        // Drop sender to signal close to the axum side
-        drop(out_tx_for_close.clone());
-        // Drop receiver
+        // Take + drop the sole outgoing sender: this closes `out_rx`, so axum's
+        // send task exits and the socket actually closes.
+        out_tx_for_close.borrow_mut().take();
+        // Drop the incoming receiver too.
         let mut rx_opt = in_rx_for_close.borrow_mut();
         *rx_opt = None;
         Ok(Value::nil())
@@ -1180,7 +1244,7 @@ fn http_serve_impl(ctx: &sema_core::EvalContext, args: &[Value]) -> Result<Value
     if args.len() == 2 {
         if let Some(opts) = args[1].as_map_rc() {
             if let Some(p) = opts.get(&Value::keyword("port")).and_then(|v| v.as_int()) {
-                port = p as u16;
+                port = parse_port(p)?;
             }
             if let Some(h) = opts.get(&Value::keyword("host")).and_then(|v| v.as_str()) {
                 host = h.to_string();
@@ -1313,6 +1377,16 @@ mod tests {
         let params = match_path("/users", "/users");
         assert!(params.is_some());
         assert!(params.unwrap().is_empty());
+    }
+
+    #[test]
+    fn parse_port_rejects_out_of_range() {
+        // `p as u16` silently wrapped: 70000 -> 4464, -1 -> 65535. Must error now.
+        assert!(parse_port(70000).is_err());
+        assert!(parse_port(-1).is_err());
+        assert!(parse_port(0).is_err());
+        assert_eq!(parse_port(3000).unwrap(), 3000);
+        assert_eq!(parse_port(65535).unwrap(), 65535);
     }
 
     #[test]

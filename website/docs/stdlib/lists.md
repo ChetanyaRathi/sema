@@ -112,7 +112,7 @@ Like `assoc` but uses `eq?` comparison (pointer/symbol equality).
 
 ### `assv`
 
-Like `assoc` but uses `eqv?` comparison (value equality for numbers).
+Find the first pair whose key equals `key`. In Sema this compares by value, so `assv`, `assq`, and `assoc` all match structurally equal keys (including compound keys) — they are not distinguished by object identity the way Scheme's `eqv?`/`eq?` would be.
 
 ```sema
 (assv 2 '((1 "one") (2 "two")))   ; => (2 "two")
@@ -263,6 +263,24 @@ Drop the first N elements.
 (drop 2 '(1 2 3 4 5))   ; => (3 4 5)
 ```
 
+### `list/take-last`
+
+Take the last N elements (the tail counterpart to `take`). Clamps to the list length.
+
+```sema
+(list/take-last 2 '(1 2 3 4))   ; => (3 4)
+(list/take-last 9 '(1 2))       ; => (1 2)
+```
+
+### `list/drop-last`
+
+Drop the last N elements (drops from the tail; the counterpart to `drop`). Clamps to empty.
+
+```sema
+(list/drop-last 2 '(1 2 3 4))   ; => (1 2)
+(list/drop-last 9 '(1 2))       ; => ()
+```
+
 ### `flatten`
 
 Flatten nested lists into a single list.
@@ -306,6 +324,24 @@ Return the tail of the list starting from the first matching element.
 (member 9 '(1 2 3))     ; => #f
 ```
 
+### `list/contains?`
+
+Return `#t` if the list contains the element, else `#f`. Unlike `member` (which returns the Scheme-style tail or `#f`), this reads as a predicate.
+
+```sema
+(list/contains? '(1 2 3) 2)   ; => #t
+(list/contains? '(1 2 3) 9)   ; => #f
+```
+
+### `list/nth-or`
+
+Indexed access with a fallback: returns the element at `index`, or `default` when out of bounds (the safe counterpart to `nth`, which errors).
+
+```sema
+(list/nth-or '(10 20 30) 1 :none)   ; => 20
+(list/nth-or '(10 20 30) 9 :none)   ; => :none
+```
+
 ### `any`
 
 Test if any element satisfies a predicate.
@@ -326,11 +362,11 @@ Test if all elements satisfy a predicate.
 
 ### `list/index-of`
 
-Return the index of the first occurrence of a value, or -1 if not found.
+Return the index of the first occurrence of a value, or `nil` if not found.
 
 ```sema
-(list/index-of '(10 20 30) 20)   ; => 1
-(list/index-of '(10 20 30) 99)   ; => -1
+(list/index-of '(10 20 30) 20)   ;; => 1
+(list/index-of '(10 20 30) 99)   ;; => nil
 ```
 
 ### `list/unique`

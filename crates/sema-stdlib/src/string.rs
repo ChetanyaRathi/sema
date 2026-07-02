@@ -4,8 +4,86 @@ use std::rc::Rc;
 
 use sema_core::{check_arity, SemaError, Value, ValueView};
 use unicode_normalization::UnicodeNormalization;
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 use crate::register_fn;
+
+/// Terminal display width of `s`: ANSI escapes count as 0, wide chars as 2,
+/// combining marks as 0. Shared by `string/width` and `string/word-wrap`.
+fn display_width(s: &str) -> usize {
+    UnicodeWidthStr::width(crate::strip_ansi(s).as_str())
+}
+
+/// Hard-break a single word (no spaces) into chunks each ≤ `width` display
+/// columns, splitting on grapheme-cluster boundaries so combining sequences and
+/// emoji clusters are never split mid-cluster.
+fn grapheme_chunks(word: &str, width: usize) -> Vec<String> {
+    let mut chunks = Vec::new();
+    let mut cur = String::new();
+    let mut cur_w = 0usize;
+    for g in word.graphemes(true) {
+        let gw = UnicodeWidthStr::width(g);
+        if cur_w + gw > width && !cur.is_empty() {
+            chunks.push(std::mem::take(&mut cur));
+            cur_w = 0;
+        }
+        cur.push_str(g);
+        cur_w += gw;
+    }
+    if !cur.is_empty() {
+        chunks.push(cur);
+    }
+    if chunks.is_empty() {
+        chunks.push(String::new());
+    }
+    chunks
+}
+
+/// Word-wrap one paragraph (no embedded newlines) to `width` display columns.
+fn wrap_paragraph(para: &str, width: usize) -> Vec<String> {
+    if para.trim().is_empty() {
+        return vec![String::new()];
+    }
+    let mut lines = Vec::new();
+    let mut cur = String::new();
+    let mut cur_w = 0usize;
+    // Start a fresh current line from `word`, hard-breaking it if it's too wide.
+    let place = |word: &str, lines: &mut Vec<String>| -> (String, usize) {
+        let ww = display_width(word);
+        if ww <= width {
+            (word.to_string(), ww)
+        } else {
+            let mut chunks = grapheme_chunks(word, width);
+            let last = chunks.pop().unwrap_or_default();
+            lines.extend(chunks);
+            let lw = display_width(&last);
+            (last, lw)
+        }
+    };
+    for word in para.split(' ') {
+        if word.is_empty() {
+            continue; // collapse runs of spaces
+        }
+        let ww = display_width(word);
+        if cur.is_empty() {
+            let (c, w) = place(word, &mut lines);
+            cur = c;
+            cur_w = w;
+        } else if cur_w + 1 + ww <= width {
+            cur.push(' ');
+            cur.push_str(word);
+            cur_w += 1 + ww;
+        } else {
+            lines.push(std::mem::take(&mut cur));
+            let (c, w) = place(word, &mut lines);
+            cur = c;
+            cur_w = w;
+        }
+    }
+    lines.push(cur);
+    lines
+}
 
 thread_local! {
     static STRING_INTERN_TABLE: RefCell<HashMap<String, Rc<String>>> = RefCell::new(HashMap::new());
@@ -13,12 +91,13 @@ thread_local! {
 
 pub fn register(env: &sema_core::Env) {
     register_fn(env, "string-append", |args| {
+        use std::fmt::Write;
         let mut result = String::new();
         for arg in args {
             if let Some(s) = arg.as_str() {
                 result.push_str(s);
             } else {
-                result.push_str(&arg.to_string());
+                write!(&mut result, "{}", arg).unwrap();
             }
         }
         Ok(Value::string(&result))
@@ -46,10 +125,13 @@ pub fn register(env: &sema_core::Env) {
             )));
         }
         let idx = idx_signed as usize;
-        s.chars()
-            .nth(idx)
-            .map(Value::char)
-            .ok_or_else(|| SemaError::eval(format!("string-ref: index {idx} out of bounds")))
+        let len = s.chars().count();
+        s.chars().nth(idx).map(Value::char).ok_or_else(|| {
+            SemaError::eval(format!(
+                "string-ref: index {idx} out of bounds (string length {len})"
+            ))
+            .with_hint("indices are 0-based")
+        })
     });
 
     register_fn(env, "substring", |args| {
@@ -106,6 +188,16 @@ pub fn register(env: &sema_core::Env) {
             .ok_or_else(|| SemaError::type_error("string", args[1].type_name()))?;
         let parts: Vec<Value> = s.split(sep).map(Value::string).collect();
         Ok(Value::list(parts))
+    });
+
+    // Split into lines on `\n` / `\r\n` (Clojure split-lines semantics); no trailing
+    // empty line from a final newline. Use `string/split` when you need a literal sep.
+    register_fn(env, "string/lines", |args| {
+        check_arity!(args, "string/lines", 1);
+        let s = args[0]
+            .as_str()
+            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
+        Ok(Value::list(s.lines().map(Value::string).collect()))
     });
 
     register_fn(env, "string/trim", |args| {
@@ -278,18 +370,6 @@ pub fn register(env: &sema_core::Env) {
         Ok(Value::string(&kw))
     });
 
-    register_fn(env, "str", |args| {
-        let mut result = String::new();
-        for arg in args {
-            if let Some(s) = arg.as_str() {
-                result.push_str(s);
-            } else {
-                result.push_str(&arg.to_string());
-            }
-        }
-        Ok(Value::string(&result))
-    });
-
     register_fn(env, "number->string", |args| {
         check_arity!(args, "number->string", 1);
         match args[0].view() {
@@ -360,10 +440,16 @@ pub fn register(env: &sema_core::Env) {
         let s = args[0]
             .as_str()
             .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
-        let n = args[1]
-            .as_int()
-            .ok_or_else(|| SemaError::type_error("int", args[1].type_name()))?
-            as usize;
+        let n = args[1].as_index("string/repeat")?;
+        if s.len().checked_mul(n).is_none() {
+            return Err(
+                SemaError::eval("string/repeat: result length overflows usize").with_hint(format!(
+                    "input length {} * count {} exceeds addressable memory",
+                    s.len(),
+                    n
+                )),
+            );
+        }
         Ok(Value::string(&s.repeat(n)))
     });
 
@@ -397,10 +483,7 @@ pub fn register(env: &sema_core::Env) {
         let s = args[0]
             .as_str()
             .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
-        let width = args[1]
-            .as_int()
-            .ok_or_else(|| SemaError::type_error("int", args[1].type_name()))?
-            as usize;
+        let width = args[1].as_index("string/pad")?;
         let pad_char = if args.len() == 3 {
             let p = args[2]
                 .as_str()
@@ -423,10 +506,7 @@ pub fn register(env: &sema_core::Env) {
         let s = args[0]
             .as_str()
             .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
-        let width = args[1]
-            .as_int()
-            .ok_or_else(|| SemaError::type_error("int", args[1].type_name()))?
-            as usize;
+        let width = args[1].as_index("string/pad")?;
         let pad_char = if args.len() == 3 {
             let p = args[2]
                 .as_str()
@@ -791,7 +871,11 @@ pub fn register(env: &sema_core::Env) {
         let s = args[0]
             .as_str()
             .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
-        Ok(Value::string(&s.to_lowercase()))
+        // Full Unicode case folding (CaseFolding.txt C+F), NOT plain lowercasing:
+        // e.g. "Straße" -> "strasse", final-sigma "ς" folds like "σ". This is what
+        // makes foldcase the correct basis for caseless comparison, distinct from
+        // string/lower (which leaves "ß" intact).
+        Ok(Value::string(&caseless::default_case_fold_str(s)))
     });
 
     register_fn(env, "string-ci=?", |args| {
@@ -802,7 +886,8 @@ pub fn register(env: &sema_core::Env) {
         let b = args[1]
             .as_str()
             .ok_or_else(|| SemaError::type_error("string", args[1].type_name()))?;
-        Ok(Value::bool(a.to_lowercase() == b.to_lowercase()))
+        // Caseless comparison via full case folding so "Straße" == "STRASSE".
+        Ok(Value::bool(caseless::default_caseless_match_str(a, b)))
     });
 
     // string/after — everything after first occurrence of needle
@@ -1232,6 +1317,39 @@ pub fn register(env: &sema_core::Env) {
         Ok(Value::string_from_rc(interned_rc))
     });
 
+    // (string/width s) -> display columns S occupies in a terminal.
+    // Unlike string-length (which counts Unicode scalar values), this counts
+    // TERMINAL COLUMNS: CJK and other wide characters count as 2, combining
+    // marks as 0, and ANSI escape sequences (colors, cursor moves) as 0. This is
+    // what TUI layout, padding, and alignment need — char count is wrong there.
+    register_fn(env, "string/width", |args| {
+        check_arity!(args, "string/width", 1);
+        let s = args[0]
+            .as_str()
+            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
+        Ok(Value::int(display_width(s) as i64))
+    });
+
+    // (string/word-wrap text width) -> list of lines, each ≤ WIDTH display
+    // columns. Word-wraps on spaces (collapsing runs), hard-breaks words longer
+    // than WIDTH by grapheme cluster, preserves explicit newlines as line breaks,
+    // and measures with display width so wrapping is correct for non-ASCII text.
+    // (Distinct from `string/wrap`, which wraps a string in delimiters.)
+    register_fn(env, "string/word-wrap", |args| {
+        check_arity!(args, "string/word-wrap", 2);
+        let text = args[0]
+            .as_str()
+            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
+        let width = args[1].as_index("string/word-wrap")?.max(1);
+        let mut out = Vec::new();
+        for para in text.split('\n') {
+            for line in wrap_paragraph(para, width) {
+                out.push(Value::string(&line));
+            }
+        }
+        Ok(Value::list(out))
+    });
+
     // Silent aliases for other Lisp dialects (undocumented)
     if let Some(v) = env.get(sema_core::intern("string/join")) {
         env.set(sema_core::intern("string-join"), v);
@@ -1254,7 +1372,9 @@ pub fn register(env: &sema_core::Env) {
 
     // module/function aliases for legacy Scheme names
     if let Some(v) = env.get(sema_core::intern("string-append")) {
-        env.set(sema_core::intern("string/append"), v);
+        env.set(sema_core::intern("string/append"), v.clone());
+        // `str` is Clojure-style stringify; identical to string-append today.
+        env.set(sema_core::intern("str"), v);
     }
     if let Some(v) = env.get(sema_core::intern("string-length")) {
         env.set(sema_core::intern("string/length"), v);

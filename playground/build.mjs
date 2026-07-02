@@ -10,6 +10,7 @@ const DIST_DIR = 'dist';
 const categoryNames = {
   'getting-started': 'Getting Started',
   'functional': 'Functional',
+  'concurrency': 'Concurrency',
   'data': 'Data & Text',
   'filesystem': 'Filesystem',
   'patterns': 'Patterns',
@@ -22,6 +23,7 @@ const categoryNames = {
 const categoryOrder = [
   'getting-started',
   'functional',
+  'concurrency',
   'data',
   'filesystem',
   'http',
@@ -68,12 +70,13 @@ if (!existsSync(DIST_DIR)) {
 }
 
 await build({
-  entryPoints: ['src/app.js'],
-  outfile: 'dist/app.js',
+  entryPoints: ['src/app.js', 'src/sema-worker.js'],
+  outdir: 'dist',
   bundle: true,
   format: 'esm',
   minify: false,
+  sourcemap: true, // source-level debugging in DevTools (maps dist -> src)
   target: 'es2020',
   external: ['../pkg/*'],
 });
-console.log('Bundled dist/app.js');
+console.log('Bundled dist/app.js + dist/sema-worker.js');

@@ -3,7 +3,11 @@ target/
 node_modules/
 playground/node_modules/
 website/node_modules/
-benchmarks/
+benchmarks/*
+!benchmarks/1brc/
+!benchmarks/1brc/**
+benchmarks/1brc/results/
+benchmarks/1brc/sema-src/
 corpus/
 artifacts/
 *.md

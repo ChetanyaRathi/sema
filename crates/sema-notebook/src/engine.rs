@@ -5,14 +5,31 @@
 //! in earlier cells are visible to later ones.
 
 use std::collections::BTreeMap;
-use std::io::Read as _;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use sema_core::{pretty_print, resolve, Spur, Value};
 use sema_eval::Interpreter;
 
 use crate::format::{CellOutput, CellType, Notebook, OutputType};
+
+/// Default wall-clock budget for a single cell evaluation.
+/// Override via the `SEMA_NOTEBOOK_TIMEOUT_MS` environment variable; set the
+/// variable to `0` to disable the timeout entirely.
+pub const DEFAULT_CELL_TIMEOUT_MS: u64 = 30_000;
+
+/// Resolve the configured cell evaluation timeout. Reads
+/// `SEMA_NOTEBOOK_TIMEOUT_MS` (milliseconds). Returns `None` to disable.
+fn resolve_cell_timeout() -> Option<Duration> {
+    match std::env::var("SEMA_NOTEBOOK_TIMEOUT_MS") {
+        Ok(s) => match s.trim().parse::<u64>() {
+            Ok(0) => None,
+            Ok(ms) => Some(Duration::from_millis(ms)),
+            Err(_) => Some(Duration::from_millis(DEFAULT_CELL_TIMEOUT_MS)),
+        },
+        Err(_) => Some(Duration::from_millis(DEFAULT_CELL_TIMEOUT_MS)),
+    }
+}
 
 /// Snapshot of the global environment bindings before a cell eval.
 struct EnvSnapshot {
@@ -22,6 +39,10 @@ struct EnvSnapshot {
     cell_id: String,
     /// The cell's outputs before evaluation (for restore).
     cell_outputs: Vec<CellOutput>,
+    /// IDs of downstream code cells that were freshly transitioned to `stale=true`
+    /// by this evaluation (i.e. they were `stale == false` with non-empty outputs
+    /// before `mark_downstream_stale` ran). Undo restores them to `stale = false`.
+    downstream_stale_ids: Vec<String>,
 }
 
 /// Result of evaluating a single cell.
@@ -48,6 +69,8 @@ pub struct Engine {
     pub notebook: Notebook,
     /// Snapshot from before the last cell eval (for single-step undo).
     snapshot: Option<EnvSnapshot>,
+    /// Per-cell wall-clock evaluation budget. `None` disables the limit.
+    cell_timeout: Option<Duration>,
 }
 
 impl Engine {
@@ -58,6 +81,7 @@ impl Engine {
             interpreter,
             notebook,
             snapshot: None,
+            cell_timeout: resolve_cell_timeout(),
         }
     }
 
@@ -65,6 +89,16 @@ impl Engine {
     pub fn from_file(path: &std::path::Path) -> Result<Self, String> {
         let notebook = Notebook::load(path)?;
         Ok(Self::new(notebook))
+    }
+
+    /// Override the per-cell wall-clock evaluation budget. Pass `None` to disable.
+    pub fn set_cell_timeout(&mut self, timeout: Option<Duration>) {
+        self.cell_timeout = timeout;
+    }
+
+    /// The currently configured per-cell evaluation budget.
+    pub fn cell_timeout(&self) -> Option<Duration> {
+        self.cell_timeout
     }
 
     /// Evaluate a single cell by ID. Returns the result and updates the notebook.
@@ -82,19 +116,34 @@ impl Engine {
             return Err("Cannot evaluate a markdown cell".to_string());
         }
 
-        // Snapshot env + cell outputs before evaluation
+        // Snapshot env + cell outputs before evaluation.
         let mut bindings = Vec::new();
         self.interpreter
             .global_env
             .iter_bindings(|spur, value| bindings.push((spur, value.clone())));
+        // Record the downstream code cells that will be flipped to stale by
+        // `mark_downstream_stale` below — those are the ones currently
+        // `stale == false` with non-empty outputs.
+        let downstream_stale_ids: Vec<String> = self.notebook.cells[idx + 1..]
+            .iter()
+            .filter(|c| c.cell_type == CellType::Code && !c.stale && !c.outputs.is_empty())
+            .map(|c| c.id.clone())
+            .collect();
         self.snapshot = Some(EnvSnapshot {
             bindings,
             cell_id: cell_id.to_string(),
             cell_outputs: cell.outputs.clone(),
+            downstream_stale_ids,
         });
 
         let source = cell.source.clone();
-        let result = self.eval_source(&source);
+        // INTERNAL span per evaluated cell. Nests under the `notebook.run_all` root
+        // when invoked from eval_all; otherwise it's a standalone one-cell trace.
+        // LLM/tool spans emitted during the cell nest beneath it via the TL stack.
+        let result = {
+            let _cell_span = sema_otel::vm_span(&format!("notebook.cell {cell_id}"));
+            self.eval_source(&source)
+        };
 
         // Mark downstream cells as stale
         self.notebook.mark_downstream_stale(idx);
@@ -127,17 +176,36 @@ impl Engine {
     pub fn eval_source(&mut self, source: &str) -> EvalResult {
         let start = Instant::now();
 
-        // Capture stdout during evaluation
-        let mut captured = String::new();
-        let eval_result = if let Ok(mut redirect) = gag::BufferRedirect::stdout() {
-            let result = self.interpreter.eval_str_in_global(source);
-            let _ = redirect.read_to_string(&mut captured);
-            drop(redirect);
-            result
+        // Apply the wall-clock deadline to the interpreter context so an
+        // infinite loop in a cell does not hang the engine thread forever.
+        // The deadline is cleared after the eval regardless of outcome.
+        if let Some(budget) = self.cell_timeout {
+            self.interpreter
+                .ctx
+                .set_eval_deadline(Some(Instant::now() + budget));
         } else {
-            // Fallback: eval without capture (shouldn't happen)
-            self.interpreter.eval_str_in_global(source)
-        };
+            self.interpreter.ctx.set_eval_deadline(None);
+        }
+
+        // Capture stdout during evaluation via the thread-local output hook
+        // rather than redirecting the process stdout fd. Hooks are per-thread,
+        // so concurrent cell evaluations on different engine threads don't
+        // contend for a single global fd redirect, and program output can never
+        // leak into a server's protocol stream on the real stdout.
+        let buf = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let sink = buf.clone();
+        sema_core::set_stdout_hook(Some(Box::new(move |s: &str| {
+            if let Ok(mut b) = sink.lock() {
+                b.push_str(s);
+            }
+        })));
+        let eval_result = self.interpreter.eval_str_compiled(source);
+        sema_core::set_stdout_hook(None);
+        let captured = buf.lock().map(|b| b.clone()).unwrap_or_default();
+
+        // Always clear the deadline so subsequent cells (and unrelated
+        // interpreter usage) are not poisoned by it.
+        self.interpreter.ctx.set_eval_deadline(None);
 
         let duration_ms = start.elapsed().as_millis() as u64;
 
@@ -184,6 +252,8 @@ impl Engine {
             .map(|c| c.id.clone())
             .collect();
 
+        // One root trace per "Run All"; each cell becomes a child span.
+        let _root = sema_otel::vm_span("notebook.run_all");
         cell_ids
             .into_iter()
             .map(|id| {
@@ -252,6 +322,13 @@ impl Engine {
         // Restore the cell's outputs
         if let Some(cell) = self.notebook.cell_mut(&snapshot.cell_id) {
             cell.outputs = snapshot.cell_outputs;
+        }
+
+        // Revert the downstream `stale` flags that this evaluation flipped on.
+        for id in &snapshot.downstream_stale_ids {
+            if let Some(cell) = self.notebook.cell_mut(id) {
+                cell.stale = false;
+            }
         }
 
         Ok(UndoInfo {
@@ -506,6 +583,105 @@ mod tests {
 
         engine.undo_last_cell().unwrap();
         assert!(!engine.can_undo());
+    }
+
+    // ── Infinite-loop / timeout tests ───────────────────────────
+
+    #[test]
+    fn infinite_recursion_aborts_within_budget() {
+        let mut engine = test_engine();
+        engine.set_cell_timeout(Some(Duration::from_millis(500)));
+
+        let start = Instant::now();
+        let (_, result) = engine
+            .create_and_eval("(define (loop) (loop)) (loop)")
+            .unwrap();
+        let elapsed = start.elapsed();
+
+        assert_eq!(
+            result.output.output_type,
+            OutputType::Error,
+            "infinite recursion should produce an Error output, got {:?}",
+            result.output
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "eval should abort well before 2s; took {elapsed:?}"
+        );
+        assert!(
+            result.output.display.to_lowercase().contains("time budget")
+                || result
+                    .output
+                    .display
+                    .to_lowercase()
+                    .contains("infinite loop"),
+            "error message should mention the time budget / infinite loop; got: {}",
+            result.output.display
+        );
+    }
+
+    #[test]
+    fn infinite_while_loop_aborts_within_budget() {
+        let mut engine = test_engine();
+        engine.set_cell_timeout(Some(Duration::from_millis(500)));
+
+        let start = Instant::now();
+        let (_, result) = engine.create_and_eval("(while #t 1)").unwrap();
+        let elapsed = start.elapsed();
+
+        assert_eq!(result.output.output_type, OutputType::Error);
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "while-loop eval should abort well before 2s; took {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn engine_recovers_after_timeout() {
+        let mut engine = test_engine();
+        engine.set_cell_timeout(Some(Duration::from_millis(300)));
+
+        // First cell hangs and should time out
+        let (_, hang) = engine
+            .create_and_eval("(define (loop) (loop)) (loop)")
+            .unwrap();
+        assert_eq!(hang.output.output_type, OutputType::Error);
+
+        // Engine must still be usable for subsequent cells
+        let (_, ok) = engine.create_and_eval("(+ 1 2)").unwrap();
+        assert_eq!(ok.output.output_type, OutputType::Value);
+        assert_eq!(ok.output.display, "3");
+
+        // And undo should still work for the most recent cell
+        assert!(engine.can_undo());
+        engine.undo_last_cell().unwrap();
+    }
+
+    #[test]
+    fn undo_reverts_downstream_stale() {
+        let mut engine = test_engine();
+        let id_a = engine.notebook.add_code_cell("(define x 1)");
+        let id_b = engine.notebook.add_code_cell("(* x 10)");
+
+        // Evaluate both cells.
+        engine.eval_cell(&id_a).unwrap();
+        engine.eval_cell(&id_b).unwrap();
+        assert!(!engine.notebook.cell(&id_b).unwrap().stale);
+
+        // Edit cell A and re-evaluate — cell B should be marked stale.
+        engine.notebook.cell_mut(&id_a).unwrap().source = "(define x 2)".to_string();
+        engine.eval_cell(&id_a).unwrap();
+        assert!(
+            engine.notebook.cell(&id_b).unwrap().stale,
+            "B should be stale after re-evaluating A"
+        );
+
+        // Undo the re-eval of A — B should no longer be stale.
+        engine.undo_last_cell().unwrap();
+        assert!(
+            !engine.notebook.cell(&id_b).unwrap().stale,
+            "undo must clear the stale flag it set on downstream cells"
+        );
     }
 
     #[test]

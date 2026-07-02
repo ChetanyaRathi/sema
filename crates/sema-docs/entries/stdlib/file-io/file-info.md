@@ -1,0 +1,13 @@
+---
+name: "file/info"
+module: "file-io"
+section: "Directory Operations"
+---
+
+Get file metadata. Returns a map with `:size` (bytes), `:modified` (Unix epoch
+**milliseconds**), `:is-file`, and `:is-dir`.
+
+```sema
+(file/info "data.txt")
+; => {:is-dir #f :is-file #t :modified 1782248141021 :size 1234}
+```

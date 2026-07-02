@@ -44,11 +44,62 @@ fn parse_tool_calls(message: &serde_json::Value) -> Vec<ToolCall> {
         .collect()
 }
 
+/// Build the Ollama `messages` array, handling assistant tool_calls and
+/// correlated tool results (Ollama's chat API is OpenAI-shaped).
+fn build_ollama_messages(request: &ChatRequest) -> Vec<serde_json::Value> {
+    let mut messages = Vec::new();
+    if let Some(ref system) = request.system {
+        messages.push(serde_json::json!({ "role": "system", "content": system }));
+    }
+    for msg in &request.messages {
+        if !msg.tool_calls.is_empty() {
+            // Assistant turn that invoked tools (Ollama takes arguments as an object).
+            let tcs: Vec<serde_json::Value> = msg
+                .tool_calls
+                .iter()
+                .map(|tc| serde_json::json!({ "function": { "name": tc.name, "arguments": tc.arguments } }))
+                .collect();
+            messages.push(serde_json::json!({
+                "role": "assistant",
+                "content": msg.content.to_text(),
+                "tool_calls": tcs,
+            }));
+            continue;
+        }
+        if msg.role == "tool" {
+            let mut m = serde_json::json!({ "role": "tool", "content": msg.content.to_text() });
+            if let Some(name) = &msg.tool_name {
+                m["tool_name"] = serde_json::json!(name);
+            }
+            messages.push(m);
+            continue;
+        }
+        let mut m = serde_json::json!({ "role": msg.role, "content": msg.content.to_text() });
+        if let crate::types::MessageContent::Blocks(blocks) = &msg.content {
+            let images: Vec<&str> = blocks
+                .iter()
+                .filter_map(|b| {
+                    if let crate::types::ContentBlock::Image { data, .. } = b {
+                        Some(data.as_str())
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            if !images.is_empty() {
+                m["images"] = serde_json::json!(images);
+            }
+        }
+        messages.push(m);
+    }
+    messages
+}
+
 pub struct OllamaProvider {
     host: String,
     default_model: String,
     client: reqwest::Client,
-    runtime: tokio::runtime::Runtime,
+    runtime: crate::http::BlockingRuntime,
 }
 
 impl OllamaProvider {
@@ -60,7 +111,7 @@ impl OllamaProvider {
                 std::env::var("OLLAMA_HOST")
                     .unwrap_or_else(|_| "http://localhost:11434".to_string())
             }),
-            default_model: default_model.unwrap_or_else(|| "qwen3:8b".to_string()),
+            default_model: default_model.unwrap_or_else(|| "gemma4".to_string()),
             client,
             runtime,
         })
@@ -78,36 +129,7 @@ impl OllamaProvider {
         let model = self.resolve_model(&request.model);
         let url = format!("{}/api/chat", self.host);
 
-        let mut messages = Vec::new();
-        // Add system message if present
-        if let Some(ref system) = request.system {
-            messages.push(serde_json::json!({
-                "role": "system",
-                "content": system,
-            }));
-        }
-        for msg in &request.messages {
-            let mut m = serde_json::json!({
-                "role": msg.role,
-                "content": msg.content.to_text(),
-            });
-            if let crate::types::MessageContent::Blocks(blocks) = &msg.content {
-                let images: Vec<&str> = blocks
-                    .iter()
-                    .filter_map(|b| {
-                        if let crate::types::ContentBlock::Image { data, .. } = b {
-                            Some(data.as_str())
-                        } else {
-                            None
-                        }
-                    })
-                    .collect();
-                if !images.is_empty() {
-                    m["images"] = serde_json::json!(images);
-                }
-            }
-            messages.push(m);
-        }
+        let messages = build_ollama_messages(&request);
 
         let mut body = serde_json::json!({
             "model": model,
@@ -190,6 +212,7 @@ impl OllamaProvider {
                 prompt_tokens,
                 completion_tokens,
                 model,
+                ..Default::default()
             },
             stop_reason: Some(stop_reason.to_string()),
         })
@@ -203,35 +226,7 @@ impl OllamaProvider {
         let model = self.resolve_model(&request.model);
         let url = format!("{}/api/chat", self.host);
 
-        let mut messages = Vec::new();
-        if let Some(ref system) = request.system {
-            messages.push(serde_json::json!({
-                "role": "system",
-                "content": system,
-            }));
-        }
-        for msg in &request.messages {
-            let mut m = serde_json::json!({
-                "role": msg.role,
-                "content": msg.content.to_text(),
-            });
-            if let crate::types::MessageContent::Blocks(blocks) = &msg.content {
-                let images: Vec<&str> = blocks
-                    .iter()
-                    .filter_map(|b| {
-                        if let crate::types::ContentBlock::Image { data, .. } = b {
-                            Some(data.as_str())
-                        } else {
-                            None
-                        }
-                    })
-                    .collect();
-                if !images.is_empty() {
-                    m["images"] = serde_json::json!(images);
-                }
-            }
-            messages.push(m);
-        }
+        let messages = build_ollama_messages(&request);
 
         let mut body = serde_json::json!({
             "model": model,
@@ -320,6 +315,7 @@ impl OllamaProvider {
                 prompt_tokens,
                 completion_tokens,
                 model,
+                ..Default::default()
             },
             stop_reason: Some(stop_reason.to_string()),
         })

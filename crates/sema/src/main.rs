@@ -1,15 +1,12 @@
 use std::cell::RefCell;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::Shell;
-use rustyline::completion::Completer;
-use rustyline::error::ReadlineError;
-use rustyline::Editor;
 
-use sema_core::{archive, intern, pretty_print, Env, SemaError, Value, ValueView};
-use sema_eval::{Interpreter, SPECIAL_FORM_NAMES};
+use sema_core::{archive, intern, pretty_print, SemaError, Value, ValueView};
+use sema_eval::Interpreter;
 use serde::Deserialize;
 
 #[derive(Debug, Default, Deserialize)]
@@ -39,10 +36,10 @@ impl Default for FmtConfig {
 }
 
 fn default_width() -> usize {
-    80
+    sema_fmt::FormatOptions::default().width
 }
 fn default_indent() -> usize {
-    2
+    sema_fmt::FormatOptions::default().indent
 }
 
 /// Walk up from cwd to find sema.toml
@@ -60,138 +57,37 @@ fn find_config() -> Option<SemaConfig> {
     }
 }
 
+mod colors;
 mod cross_compile;
+mod docs;
 mod import_tracer;
 mod pkg;
+mod repl;
+mod workflow_check;
+mod workflow_view;
 
-mod colors {
-    use std::io::IsTerminal;
-
-    fn enabled() -> bool {
-        std::io::stderr().is_terminal() && std::env::var_os("NO_COLOR").is_none()
-    }
-
-    pub fn red_bold(s: &str) -> String {
-        if enabled() {
-            format!("\x1b[1;31m{s}\x1b[0m")
-        } else {
-            s.to_string()
+/// Read a source file with consistent, friendly error messages.
+///
+/// Standardises the wording across all subcommands so users see the same
+/// phrasing for not-found / permission-denied errors regardless of which
+/// command they ran.
+fn read_source_file(path: impl AsRef<Path>) -> Result<String, String> {
+    let p = path.as_ref();
+    std::fs::read_to_string(p).map_err(|e| match e.kind() {
+        std::io::ErrorKind::NotFound => format!("file not found: {}", p.display()),
+        std::io::ErrorKind::PermissionDenied => {
+            format!("permission denied: {}", p.display())
         }
-    }
-    pub fn yellow(s: &str) -> String {
-        if enabled() {
-            format!("\x1b[33m{s}\x1b[0m")
-        } else {
-            s.to_string()
-        }
-    }
-    pub fn cyan(s: &str) -> String {
-        if enabled() {
-            format!("\x1b[36m{s}\x1b[0m")
-        } else {
-            s.to_string()
-        }
-    }
-    pub fn dim(s: &str) -> String {
-        if enabled() {
-            format!("\x1b[2m{s}\x1b[0m")
-        } else {
-            s.to_string()
-        }
-    }
+        _ => format!("reading {}: {}", p.display(), e),
+    })
 }
 
 thread_local! {
-    static LAST_SOURCE: RefCell<Option<String>> = const { RefCell::new(None) };
-    static LAST_FILE: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
+    pub(crate) static LAST_SOURCE: RefCell<Option<String>> = const { RefCell::new(None) };
+    pub(crate) static LAST_FILE: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
 }
 
-const REPL_COMMANDS: &[&str] = &[
-    ",quit",
-    ",exit",
-    ",q",
-    ",help",
-    ",h",
-    ",env",
-    ",builtins",
-    ",type",
-    ",time",
-    ",doc",
-];
-
-struct SemaCompleter {
-    env: Rc<Env>,
-}
-
-impl SemaCompleter {
-    fn all_completions(&self, prefix: &str) -> Vec<String> {
-        let mut candidates = Vec::new();
-
-        // Collect all env bindings (walk parent chain)
-        self.collect_env_bindings(&self.env, prefix, &mut candidates);
-
-        // Special forms
-        for &sf in SPECIAL_FORM_NAMES {
-            if sf.starts_with(prefix) {
-                candidates.push(sf.to_string());
-            }
-        }
-
-        // REPL commands
-        if prefix.starts_with(',') {
-            for &cmd in REPL_COMMANDS {
-                if cmd.starts_with(prefix) {
-                    candidates.push(cmd.to_string());
-                }
-            }
-        }
-
-        candidates.sort();
-        candidates.dedup();
-        candidates
-    }
-
-    fn collect_env_bindings(&self, env: &Env, prefix: &str, candidates: &mut Vec<String>) {
-        env.iter_bindings(|spur, _| {
-            let name = sema_core::resolve(spur);
-            if name.starts_with(prefix) {
-                candidates.push(name);
-            }
-        });
-        if let Some(parent) = &env.parent {
-            self.collect_env_bindings(parent, prefix, candidates);
-        }
-    }
-}
-
-impl Completer for SemaCompleter {
-    type Candidate = String;
-
-    fn complete(
-        &self,
-        line: &str,
-        pos: usize,
-        _ctx: &rustyline::Context<'_>,
-    ) -> rustyline::Result<(usize, Vec<String>)> {
-        let before = &line[..pos];
-        let start = before
-            .rfind(|c: char| c.is_whitespace() || c == '(' || c == '[' || c == '{' || c == '\'')
-            .map(|i| i + 1)
-            .unwrap_or(0);
-        let prefix = &before[start..];
-        if prefix.is_empty() {
-            return Ok((start, vec![]));
-        }
-        Ok((start, self.all_completions(prefix)))
-    }
-}
-
-impl rustyline::hint::Hinter for SemaCompleter {
-    type Hint = String;
-}
-impl rustyline::highlight::Highlighter for SemaCompleter {}
-impl rustyline::validate::Validator for SemaCompleter {}
-impl rustyline::Helper for SemaCompleter {}
+// REPL completer, command set, and trait impls have moved to `src/repl/`.
 
 #[derive(Parser)]
 #[command(name = "sema", about = "Sema: A Lisp with LLM primitives", version)]
@@ -201,14 +97,15 @@ struct Cli {
     command: Option<Commands>,
 
     /// File to execute
+    #[arg(conflicts_with_all = ["eval", "print"])]
     file: Option<String>,
 
     /// Evaluate an expression and print result (if non-nil)
-    #[arg(short, long, conflicts_with = "print")]
+    #[arg(short, long, conflicts_with_all = ["print", "file"])]
     eval: Option<String>,
 
     /// Evaluate an expression and always print result
-    #[arg(short, long, conflicts_with = "eval")]
+    #[arg(short, long, conflicts_with_all = ["eval", "file"])]
     print: Option<String>,
 
     /// Load file(s) before executing
@@ -223,17 +120,13 @@ struct Cli {
     #[arg(short, long)]
     interactive: bool,
 
-    /// Skip LLM auto-configuration
+    /// Disable LLM features (skip provider auto-configuration)
     #[arg(long)]
-    no_init: bool,
-
-    /// Disable LLM features (same as --no-init)
-    #[arg(long, conflicts_with = "no_init")]
     no_llm: bool,
 
     /// Sandbox mode: restrict dangerous operations.
     /// Values: "strict", "all", or comma-separated list like "no-shell,no-network,no-fs-write"
-    /// Available capabilities: shell, fs-read, fs-write, network, env-read, env-write, process, llm
+    /// Available capabilities: shell, fs-read, fs-write, network, env-read, env-write, process, llm, serial
     #[arg(long)]
     sandbox: Option<String>,
 
@@ -256,10 +149,6 @@ struct Cli {
     /// Restrict file operations to these directories (comma-separated)
     #[arg(long, value_name = "DIRS")]
     allowed_paths: Option<String>,
-
-    /// Use bytecode VM instead of tree-walker
-    #[arg(long)]
-    vm: bool,
 
     /// Arguments passed to the script (after --)
     #[arg(last = true)]
@@ -312,6 +201,23 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Browse builtin and special-form documentation
+    #[command(args_conflicts_with_subcommands = true)]
+    Doc {
+        /// Show docs in a pager even when the output fits on one screen
+        #[arg(long, conflicts_with = "no_pager")]
+        pager: bool,
+
+        /// Print directly without invoking a pager
+        #[arg(long, conflicts_with = "pager")]
+        no_pager: bool,
+
+        #[command(subcommand)]
+        command: Option<DocCommands>,
+
+        /// Symbol to show documentation for (implicit `show`)
+        symbol: Option<String>,
+    },
     /// Package manager
     Pkg {
         #[command(subcommand)]
@@ -361,11 +267,11 @@ enum Commands {
         #[arg(long)]
         diff: bool,
 
-        /// Max line width
+        /// Max line width (default: 80, or value from sema.toml)
         #[arg(long)]
         width: Option<usize>,
 
-        /// Indentation width for body forms
+        /// Indentation width for body forms (default: 2, or value from sema.toml)
         #[arg(long)]
         indent: Option<usize>,
 
@@ -381,10 +287,31 @@ enum Commands {
     Lsp,
     /// Start the Debug Adapter Protocol server
     Dap,
+    /// Start the MCP server, or manage MCP client auth (`mcp login`/`logout`)
+    #[command(args_conflicts_with_subcommands = true)]
+    Mcp {
+        /// Client-auth subcommand; when omitted, runs the MCP server
+        #[command(subcommand)]
+        auth: Option<McpAuthCommands>,
+        /// Optional source files to run/load tools from (server mode)
+        #[arg(value_name = "FILES")]
+        files: Vec<String>,
+        /// Comma-separated list of tool names to explicitly include
+        #[arg(long, value_name = "TOOLS")]
+        include: Option<String>,
+        /// Comma-separated list of tool names to explicitly exclude
+        #[arg(long, value_name = "TOOLS")]
+        exclude: Option<String>,
+    },
     /// Notebook interface — cell-based evaluation with browser UI
     Notebook {
         #[command(subcommand)]
         command: NotebookCommands,
+    },
+    /// Dynamic workflows — run journaled workflows and view their runs
+    Workflow {
+        #[command(subcommand)]
+        command: WorkflowCommands,
     },
     /// Evaluate code and return results (designed for machine consumption by editors/LSP)
     Eval {
@@ -415,10 +342,50 @@ enum Commands {
         /// Disable LLM features
         #[arg(long)]
         no_llm: bool,
+    },
+}
 
-        /// Use bytecode VM instead of tree-walker
+#[derive(Subcommand)]
+enum DocCommands {
+    /// Show documentation for a symbol
+    Show {
+        /// Symbol to show documentation for
+        symbol: String,
+    },
+    /// Search documentation by natural-language query
+    Search {
+        /// Query to search for
+        #[arg(required = true, num_args = 1..)]
+        query: Vec<String>,
+
+        /// Maximum number of results to show
+        #[arg(short = 'n', long, default_value_t = sema_mcp::docs_search::DEFAULT_LIMIT)]
+        limit: usize,
+    },
+    /// Search symbol names by prefix, substring, and fuzzy match
+    Apropos {
+        /// Pattern to search for
+        pattern: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum McpAuthCommands {
+    /// Log in to a remote (HTTP) MCP server and cache the OAuth token
+    Login {
+        /// The MCP server URL (e.g. https://mcp.example.com/mcp)
+        url: String,
+        /// Use the device-authorization flow instead of opening a browser
         #[arg(long)]
-        vm: bool,
+        device: bool,
+        /// A pre-registered OAuth client id (when the server has no dynamic registration)
+        #[arg(long = "client-id", value_name = "ID")]
+        client_id: Option<String>,
+    },
+    /// Remove cached credentials for a remote MCP server
+    Logout {
+        /// The MCP server URL whose cached credentials to clear
+        url: String,
     },
 }
 
@@ -509,14 +476,88 @@ enum PkgCommands {
 }
 
 #[derive(Subcommand)]
+enum WorkflowCommands {
+    /// Run a workflow file (a `.sema` program that `defworkflow`s and runs it),
+    /// journaling a frozen run-directory and writing `result.json`.
+    Run {
+        /// Path to the `.sema` workflow file.
+        file: String,
+
+        /// JSON object bound to the global `*workflow-args*` for the run.
+        #[arg(long, default_value = "{}")]
+        args: String,
+
+        /// Base directory for run journals; the run lands in `<run-dir>/<run-id>/`.
+        /// Defaults to the project-local `.sema/runs`.
+        #[arg(long, default_value = ".sema/runs")]
+        run_dir: String,
+
+        /// Also start the live web viewer and keep it open after the run, so you
+        /// can watch the run progress and inspect it afterwards.
+        #[arg(long)]
+        view: bool,
+
+        /// Port for the `--view` viewer.
+        #[arg(short, long, default_value = "8899")]
+        port: u16,
+
+        /// Resume a prior run by its run-id: reuse `<run-dir>/<run-id>/`, skip leaves
+        /// already recorded in its `memo/` dir (no re-call of the model), and write a
+        /// fresh `events.resume-N.jsonl` segment. A workflow edit changes the code
+        /// version and re-runs everything.
+        #[arg(long)]
+        resume: Option<String>,
+    },
+    /// Backfill the cross-run SQLite index (`<run-dir>/index.db`) from every run's
+    /// journal — for offline/CI use; the viewer also syncs lazily on request.
+    Index {
+        /// Base directory holding `<run-id>/events.jsonl` run journals.
+        #[arg(long, default_value = ".sema/runs")]
+        run_dir: String,
+    },
+    /// Open the web viewer for a run directory's workflow journals
+    View {
+        /// Base directory holding `<run-id>/events.jsonl` run journals.
+        #[arg(long, default_value = ".sema/runs")]
+        run_dir: String,
+
+        /// Host to bind. Defaults to loopback; binding elsewhere exposes the run
+        /// directory to the network (the viewer has no auth).
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
+
+        /// Port to listen on.
+        #[arg(short, long, default_value = "8899")]
+        port: u16,
+    },
+    /// Statically validate a workflow `.sema` file WITHOUT evaluating it or calling any LLM
+    /// — catches arity traps, bad step opts, and layout issues before a run.
+    Check {
+        /// Path to the `.sema` workflow file.
+        file: String,
+
+        /// Treat warnings as errors (exit non-zero if any warning fires).
+        #[arg(long)]
+        strict: bool,
+
+        /// Emit machine-readable JSON diagnostics instead of human-readable text.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
+#[command(subcommand_required = true, arg_required_else_help = true)]
 enum NotebookCommands {
     /// Start the notebook server with browser UI
     Serve {
         /// Path to .sema-nb file (created if absent)
         file: Option<String>,
 
-        /// Host address to bind to
-        #[arg(long, default_value = "127.0.0.1")]
+        /// Host address to bind to. Defaults to loopback (127.0.0.1); the
+        /// notebook server has no auth layer, so binding to a non-loopback
+        /// address exposes unauthenticated code execution to the network.
+        #[arg(long, default_value = sema_notebook::server::DEFAULT_HOST)]
         host: String,
 
         /// Port to listen on
@@ -556,13 +597,45 @@ enum NotebookCommands {
     },
 }
 
+/// Build the standard CLI interpreter: stdlib + LLM (registered inside sema-eval)
+/// plus the MCP *client* builtins (`mcp/connect`, `mcp/tools`, `mcp/tools->sema`,
+/// …). The MCP builtins live in `sema-mcp`, which depends on `sema-eval`, so they
+/// can't be registered inside `sema-eval` itself — the binary wires them in here.
+fn build_interpreter(sandbox: &sema_core::Sandbox) -> Interpreter {
+    let interpreter = Interpreter::new_with_sandbox(sandbox);
+    sema_mcp::register_mcp_builtins(&interpreter.global_env, sandbox);
+    interpreter
+}
+
 fn main() {
     // Check for embedded archive before parsing CLI args
     if let Some(exit_code) = try_run_embedded() {
         std::process::exit(exit_code);
     }
 
+    // Shell-completion helper for `sema doc` symbols, handled before clap parses.
+    // It is intentionally NOT a clap subcommand: a hidden subcommand makes
+    // `clap_complete`'s bash generator panic (find_subcommand_with_path), which
+    // would break `sema completions bash`. The generated completion scripts still
+    // invoke `sema __complete-doc-symbols <prefix>`.
+    {
+        let mut args = std::env::args().skip(1);
+        if args.next().as_deref() == Some("__complete-doc-symbols") {
+            let prefix = args.next().unwrap_or_default();
+            for name in docs::completion_candidates(&prefix) {
+                println!("{name}");
+            }
+            return;
+        }
+    }
+
     let cli = Cli::parse();
+
+    // Opt-in OpenTelemetry: installs a provider only when SEMA_OTEL_FILE or an OTLP
+    // endpoint is configured (zero-cost no-op otherwise). Held for the process
+    // lifetime; its Drop does the bounded flush+shutdown on normal return. (The JSONL
+    // file exporter writes synchronously, so it survives a `std::process::exit` too.)
+    let _otel_guard = sema_otel::init_from_env();
 
     let sandbox = match &cli.sandbox {
         Some(value) => sema_core::Sandbox::parse_cli(value).unwrap_or_else(|e| {
@@ -589,12 +662,7 @@ fn main() {
                 if install {
                     install_completions(shell);
                 } else {
-                    clap_complete::generate(
-                        shell,
-                        &mut Cli::command(),
-                        "sema",
-                        &mut std::io::stdout(),
-                    );
+                    print!("{}", generate_completions(shell));
                 }
             }
             Commands::Compile {
@@ -610,6 +678,24 @@ fn main() {
             }
             Commands::Disasm { file, json } => {
                 run_disasm(&file, json);
+            }
+            Commands::Doc {
+                pager,
+                no_pager,
+                command,
+                symbol,
+            } => {
+                let pager = if no_pager {
+                    docs::PagerMode::Never
+                } else if pager {
+                    docs::PagerMode::Always
+                } else {
+                    docs::PagerMode::Auto
+                };
+                if let Err(msg) = run_doc(command, symbol, pager) {
+                    eprintln!("Error: {msg}");
+                    std::process::exit(1);
+                }
             }
             Commands::Pkg { command } => {
                 let result = match command {
@@ -678,18 +764,12 @@ fn main() {
                 json,
             } => {
                 let config = find_config().unwrap_or_default();
-                let effective_width = width.unwrap_or(config.fmt.width);
-                let effective_indent = indent.unwrap_or(config.fmt.indent);
-                let effective_align = if align { true } else { config.fmt.align };
-                run_fmt(
-                    &files,
-                    check,
-                    diff,
-                    effective_width,
-                    effective_indent,
-                    effective_align,
-                    json,
-                );
+                let opts = sema_fmt::FormatOptions {
+                    width: width.unwrap_or(config.fmt.width),
+                    indent: indent.unwrap_or(config.fmt.indent),
+                    align: align || config.fmt.align,
+                };
+                run_fmt(&files, check, diff, &opts, json);
             }
             Commands::Lsp => {
                 eprintln!("Sema LSP server starting on stdio...");
@@ -706,8 +786,76 @@ fn main() {
                     .expect("Failed to create tokio runtime")
                     .block_on(sema_dap::run_server());
             }
+            Commands::Mcp {
+                auth,
+                files,
+                include,
+                exclude,
+            } => {
+                if let Some(auth) = auth {
+                    let result = match auth {
+                        McpAuthCommands::Login {
+                            url,
+                            device,
+                            client_id,
+                        } => sema_mcp::mcp_login(&url, device, client_id.as_deref()),
+                        McpAuthCommands::Logout { url } => sema_mcp::mcp_logout(&url),
+                    };
+                    if let Err(e) = result {
+                        eprintln!("mcp: {e}");
+                        std::process::exit(1);
+                    }
+                    return;
+                }
+                let inc_tools = include.map(|s| {
+                    s.split(',')
+                        .map(|x| x.trim().to_string())
+                        .collect::<Vec<String>>()
+                });
+                let exc_tools = exclude.map(|s| {
+                    s.split(',')
+                        .map(|x| x.trim().to_string())
+                        .collect::<Vec<String>>()
+                });
+
+                let sandbox = sema_core::Sandbox::allow_all();
+                let interpreter = build_interpreter(&sandbox);
+
+                let _ = interpreter.eval_str("(llm/auto-configure)");
+
+                for file in files {
+                    match read_source_file(&file) {
+                        Ok(content) => {
+                            if let Err(e) = interpreter.eval_str_compiled(&content) {
+                                eprintln!("Error loading tool file {file}: {e}");
+                                std::process::exit(1);
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("Error reading tool file {file}: {e}");
+                            std::process::exit(1);
+                        }
+                    }
+                }
+
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("Failed to create tokio runtime")
+                    .block_on(async {
+                        if let Err(e) =
+                            sema_mcp::run_mcp_server(interpreter, inc_tools, exc_tools).await
+                        {
+                            eprintln!("MCP server error: {e}");
+                            std::process::exit(1);
+                        }
+                    });
+            }
             Commands::Notebook { command } => {
                 run_notebook_command(command);
+            }
+            Commands::Workflow { command } => {
+                run_workflow_command(command, &sandbox);
             }
             Commands::Eval {
                 stdin,
@@ -717,15 +865,14 @@ fn main() {
                 timeout: _timeout,
                 sandbox,
                 no_llm,
-                vm,
             } => {
-                run_eval(stdin, expr, json, path, sandbox, no_llm, vm);
+                run_eval(stdin, expr, json, path, sandbox, no_llm);
             }
         }
         return;
     }
 
-    let interpreter = Interpreter::new_with_sandbox(&sandbox);
+    let interpreter = build_interpreter(&sandbox);
 
     // Set LLM env vars before auto-configure
     if let Some(model) = cli.chat_model.as_ref() {
@@ -741,8 +888,8 @@ fn main() {
         std::env::set_var("SEMA_EMBEDDING_PROVIDER", provider);
     }
 
-    // Auto-configure LLM unless --no-init or --no-llm
-    if !cli.no_init && !cli.no_llm {
+    // Auto-configure LLM unless --no-llm
+    if !cli.no_llm {
         if let Err(e) = interpreter.eval_str("(llm/auto-configure)") {
             if cli.chat_provider.is_some() || cli.chat_model.is_some() {
                 print_error(&e);
@@ -757,13 +904,14 @@ fn main() {
         if let Ok(canonical) = path.canonicalize() {
             interpreter.ctx.push_file_path(canonical);
         }
-        match std::fs::read_to_string(load_file) {
+        match read_source_file(load_file) {
             Ok(content) => {
                 LAST_SOURCE.with(|s| *s.borrow_mut() = Some(content.clone()));
                 LAST_FILE.with(|f| *f.borrow_mut() = Some(PathBuf::from(load_file)));
-                match eval_with_mode(&interpreter, &content, cli.vm) {
+                match interpreter.eval_str_compiled(&content) {
                     Ok(_) => {
                         interpreter.ctx.pop_file_path();
+                        drain_async_scheduler(&interpreter);
                     }
                     Err(e) => {
                         interpreter.ctx.pop_file_path();
@@ -773,8 +921,8 @@ fn main() {
                     }
                 }
             }
-            Err(e) => {
-                eprintln!("Error reading {load_file}: {e}");
+            Err(msg) => {
+                eprintln!("error: {msg}");
                 std::process::exit(1);
             }
         }
@@ -784,8 +932,9 @@ fn main() {
     if let Some(expr) = &cli.eval {
         LAST_SOURCE.with(|s| *s.borrow_mut() = Some(expr.clone()));
         LAST_FILE.with(|f| *f.borrow_mut() = None);
-        match eval_with_mode(&interpreter, expr, cli.vm) {
+        match interpreter.eval_str_compiled(expr) {
             Ok(val) => {
+                drain_async_scheduler(&interpreter);
                 if !val.is_nil() {
                     println!("{}", pretty_print(&val, 80));
                 }
@@ -796,7 +945,7 @@ fn main() {
             }
         }
         if cli.interactive {
-            repl(interpreter, cli.quiet, cli.sandbox.as_deref(), cli.vm);
+            repl::run(interpreter, cli.quiet, cli.sandbox.as_deref());
         }
         return;
     }
@@ -805,15 +954,18 @@ fn main() {
     if let Some(expr) = &cli.print {
         LAST_SOURCE.with(|s| *s.borrow_mut() = Some(expr.clone()));
         LAST_FILE.with(|f| *f.borrow_mut() = None);
-        match eval_with_mode(&interpreter, expr, cli.vm) {
-            Ok(val) => println!("{val}"),
+        match interpreter.eval_str_compiled(expr) {
+            Ok(val) => {
+                drain_async_scheduler(&interpreter);
+                println!("{val}");
+            }
             Err(e) => {
                 print_error(&e);
                 std::process::exit(1);
             }
         }
         if cli.interactive {
-            repl(interpreter, cli.quiet, cli.sandbox.as_deref(), cli.vm);
+            repl::run(interpreter, cli.quiet, cli.sandbox.as_deref());
         }
         return;
     }
@@ -826,14 +978,16 @@ fn main() {
         if let Ok(bytes) = std::fs::read(path) {
             if sema_vm::is_bytecode_file(&bytes) {
                 match run_bytecode_bytes(&interpreter, &bytes) {
-                    Ok(_) => {}
+                    Ok(_) => {
+                        drain_async_scheduler(&interpreter);
+                    }
                     Err(e) => {
                         print_error(&e);
                         std::process::exit(1);
                     }
                 }
                 if cli.interactive {
-                    repl(interpreter, cli.quiet, cli.sandbox.as_deref(), cli.vm);
+                    repl::run(interpreter, cli.quiet, cli.sandbox.as_deref());
                 }
                 return;
             }
@@ -842,13 +996,14 @@ fn main() {
         if let Ok(canonical) = path.canonicalize() {
             interpreter.ctx.push_file_path(canonical);
         }
-        match std::fs::read_to_string(file) {
+        match read_source_file(file) {
             Ok(content) => {
                 LAST_SOURCE.with(|s| *s.borrow_mut() = Some(content.clone()));
                 LAST_FILE.with(|f| *f.borrow_mut() = Some(PathBuf::from(file)));
-                match eval_with_mode(&interpreter, &content, cli.vm) {
+                match interpreter.eval_str_compiled(&content) {
                     Ok(_) => {
                         interpreter.ctx.pop_file_path();
+                        drain_async_scheduler(&interpreter);
                     }
                     Err(e) => {
                         interpreter.ctx.pop_file_path();
@@ -857,34 +1012,265 @@ fn main() {
                     }
                 }
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            Err(msg) if msg.starts_with("file not found:") => {
                 eprintln!("error: '{file}' not found (not a file or command)\n\nRun 'sema --help' for available commands.");
                 std::process::exit(1);
             }
-            Err(e) => {
-                eprintln!("error: could not read '{file}': {e}");
+            Err(msg) => {
+                eprintln!("error: {msg}");
                 std::process::exit(1);
             }
         }
         if cli.interactive {
-            repl(interpreter, cli.quiet, cli.sandbox.as_deref(), cli.vm);
+            repl::run(interpreter, cli.quiet, cli.sandbox.as_deref());
         }
         return;
     }
 
     // REPL mode
-    repl(interpreter, cli.quiet, cli.sandbox.as_deref(), cli.vm);
+    repl::run(interpreter, cli.quiet, cli.sandbox.as_deref());
 }
 
-fn eval_with_mode(
-    interpreter: &Interpreter,
-    input: &str,
-    use_vm: bool,
-) -> Result<sema_core::Value, sema_core::SemaError> {
-    if use_vm {
-        interpreter.eval_str_compiled(input)
+/// `sema workflow run <file>` — evaluate a workflow `.sema` file (which
+/// `defworkflow`s and runs it) with the run-directory + args seams wired, then
+/// exit non-zero if the run's `{:status …}` envelope reports failure.
+fn run_workflow_command(command: WorkflowCommands, sandbox: &sema_core::Sandbox) {
+    let (file, args, run_dir, view, view_port, resume) = match command {
+        WorkflowCommands::Run {
+            file,
+            args,
+            run_dir,
+            view,
+            port,
+            resume,
+        } => (file, args, run_dir, view, port, resume),
+        WorkflowCommands::View {
+            run_dir,
+            host,
+            port,
+        } => {
+            tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .expect("Failed to create tokio runtime")
+                .block_on(workflow_view::serve(PathBuf::from(run_dir), &host, port));
+            return;
+        }
+        WorkflowCommands::Index { run_dir } => {
+            let root = PathBuf::from(&run_dir);
+            match workflow_view::ingest::open(&root.join(sema_workflow::INDEX_DB)) {
+                Ok(conn) => {
+                    workflow_view::ingest::backfill_all(&conn, &root);
+                    match workflow_view::ingest::runs_summary(&conn) {
+                        Ok(rows) => println!(
+                            "indexed {} run(s) → {}",
+                            rows.len(),
+                            root.join(sema_workflow::INDEX_DB).display()
+                        ),
+                        Err(e) => eprintln!("warning: index summary: {e}"),
+                    }
+                }
+                Err(e) => {
+                    eprintln!("error: cannot open index db: {e}");
+                    std::process::exit(1);
+                }
+            }
+            return;
+        }
+        WorkflowCommands::Check { file, strict, json } => {
+            let src = match read_source_file(&file) {
+                Ok(s) => s,
+                Err(msg) => {
+                    eprintln!("error: {msg}");
+                    std::process::exit(2);
+                }
+            };
+            let diags = workflow_check::check_source(&src);
+            std::process::exit(workflow_check::report(&file, &diags, strict, json));
+        }
+    };
+
+    // The workflow runtime (sema-workflow) reads this seam to choose the run-dir
+    // base; the run lands in `<run-dir>/<run-id>/`.
+    std::env::set_var("SEMA_WORKFLOW_RUN_DIR", &run_dir);
+
+    // `--resume <run-id>`: reuse that run's dir + memo cache. Sanitize the operator-
+    // supplied id against path traversal (it joins into a filesystem path), require the
+    // prior run's events.jsonl to exist, then set the seams the runtime reads.
+    if let Some(run_id) = &resume {
+        if run_id.is_empty()
+            || run_id.contains('/')
+            || run_id.contains('\\')
+            || run_id.contains("..")
+        {
+            eprintln!("error: --resume run-id must be a bare directory name (no path separators)");
+            std::process::exit(1);
+        }
+        let prior = PathBuf::from(&run_dir).join(run_id).join("events.jsonl");
+        if !prior.exists() {
+            eprintln!("error: no prior run to resume at {}", prior.display());
+            std::process::exit(1);
+        }
+        std::env::set_var("SEMA_WORKFLOW_RUN_ID", run_id);
+        std::env::set_var("SEMA_WORKFLOW_RESUME", "1");
+    }
+    // Recorded verbatim on the run.started event (shown in the viewer's stream/meta).
+    std::env::set_var("SEMA_WORKFLOW_ARGS_JSON", &args);
+
+    let content = match read_source_file(&file) {
+        Ok(c) => c,
+        Err(msg) => {
+            eprintln!("error: {msg}");
+            std::process::exit(1);
+        }
+    };
+
+    let mut effective_sandbox = sandbox.clone();
+    let permission_specs = match workflow_check::declared_permission_specs(&content) {
+        Ok(specs) => specs,
+        Err(e) => {
+            eprintln!("error: invalid workflow permissions: {e}");
+            std::process::exit(1);
+        }
+    };
+    for spec in permission_specs {
+        let declared = sema_core::Sandbox::parse_cli(&spec).unwrap_or_else(|e| {
+            eprintln!("error: invalid defworkflow :permissions {spec:?}: {e}");
+            std::process::exit(1);
+        });
+        effective_sandbox = effective_sandbox.with_more_denied(declared.denied);
+    }
+
+    // `--view`: start the live viewer on a background thread BEFORE the run, so the
+    // journal (written flush-per-event) is watchable in real time, and keep it up
+    // afterwards for inspection. A bind failure degrades to a warning (the run still
+    // proceeds). Best-effort open the browser.
+    if view {
+        let vd = run_dir.clone();
+        std::thread::spawn(move || {
+            tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .expect("Failed to create tokio runtime")
+                .block_on(async {
+                    if let Err(e) = workflow_view::serve_result(
+                        PathBuf::from(vd),
+                        "127.0.0.1",
+                        view_port,
+                        false,
+                    )
+                    .await
+                    {
+                        eprintln!("warning: --view could not start the viewer: {e}");
+                    }
+                });
+        });
+        let url = format!("http://127.0.0.1:{view_port}");
+        println!("Live viewer: {url}");
+        open_in_browser(&url);
+        // Give the listener a moment to bind before the run starts producing events.
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+
+    let interpreter = build_interpreter(&effective_sandbox);
+
+    // Auto-configure an LLM provider from the environment (mirrors the default run
+    // path), so a workflow whose leaves call `llm/*` works without self-configuring.
+    // Best-effort: a workflow with no LLM leaves needs no provider, so ignore errors.
+    let _ = interpreter.eval_str("(llm/auto-configure)");
+
+    // Bind the parsed --args JSON object to the global `*workflow-args*` so the
+    // workflow body can read its inputs.
+    let args_value = match serde_json::from_str::<serde_json::Value>(&args) {
+        Ok(json) => sema_core::json::json_to_value(&json),
+        Err(e) => {
+            eprintln!("error: --args is not valid JSON: {e}");
+            std::process::exit(1);
+        }
+    };
+    interpreter
+        .global_env
+        .set(sema_core::intern("*workflow-args*"), args_value);
+
+    // Code version: a deterministic hash of the source, folded into every resume
+    // content-key. Editing the workflow changes this ⇒ memos no longer match ⇒ a
+    // resumed run re-executes from scratch (correct invalidation). DefaultHasher uses
+    // fixed keys, so the value is stable across separate invocations of this binary.
+    {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        content.hash(&mut h);
+        std::env::set_var("SEMA_WORKFLOW_CODE_VERSION", format!("{:016x}", h.finish()));
+    }
+
+    // The file's last form is the `defworkflow` (which expands to `workflow/run`),
+    // so eval returns the `{:status …}` envelope; journaling is its side effect.
+    let exit_code = match interpreter.eval_str_compiled(&content) {
+        Ok(envelope) => {
+            drain_async_scheduler(&interpreter);
+            let failed = envelope
+                .as_map_rc()
+                .and_then(|m| m.get(&Value::keyword("status")).cloned())
+                .and_then(|s| s.as_keyword())
+                .is_some_and(|s| s == "failed");
+            if failed {
+                eprintln!("workflow failed: {}", pretty_print(&envelope, 80));
+                1
+            } else {
+                0
+            }
+        }
+        Err(e) => {
+            eprint!("Error running workflow {file}: ");
+            print_error(&e);
+            1
+        }
+    };
+
+    // With `--view`, keep the viewer up so the finished run can be inspected.
+    if view {
+        println!("\nRun complete — viewer live at http://127.0.0.1:{view_port}  (Ctrl-C to stop)");
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(3600));
+        }
+    }
+    std::process::exit(exit_code);
+}
+
+/// Best-effort: open `url` in the default browser via the platform opener. Silent
+/// no-op if the opener isn't present (e.g. headless) — the URL is always printed.
+fn open_in_browser(url: &str) {
+    let opener = if cfg!(target_os = "macos") {
+        "open"
+    } else if cfg!(target_os = "windows") {
+        "explorer"
     } else {
-        interpreter.eval_str(input)
+        "xdg-open"
+    };
+    let _ = std::process::Command::new(opener)
+        .arg(url)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+}
+
+/// Drain any pending async tasks scheduled by a top-level form.
+///
+/// Top-level `(async ...)` forms spawn a task but don't implicitly await it,
+/// so their side effects would silently vanish on exit unless we explicitly
+/// run the scheduler. This drains all pending tasks (target = `All`).
+///
+/// The scheduler callback is only registered once an eval has run, so we
+/// silently ignore the "no async scheduler registered" error (nothing async was
+/// scheduled). Other scheduler errors are reported to stderr as warnings but do
+/// not fail the program — the side effects already ran.
+pub(crate) fn drain_async_scheduler(interpreter: &Interpreter) {
+    if let Err(e) = sema_core::call_run_scheduler(&interpreter.ctx, None) {
+        let msg = e.to_string();
+        if msg.contains("no async scheduler registered") {
+            return;
+        }
+        eprintln!("warning: background task error: {msg}");
     }
 }
 
@@ -908,29 +1294,56 @@ fn run_notebook_command(command: NotebookCommands) {
                 }
             };
 
-            let results = if let Some(cell_spec) = cells {
+            // Collect the code cell IDs to evaluate, either specific indices
+            // (--cells 1,3,5) or all code cells.
+            let cell_ids: Vec<String> = if let Some(cell_spec) = &cells {
                 let indices: Vec<usize> = cell_spec
                     .split(',')
                     .filter_map(|s| s.trim().parse().ok())
                     .collect();
-                engine.eval_cells(&indices)
+                engine
+                    .notebook
+                    .cells
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, c)| {
+                        if indices.contains(&(i + 1))
+                            && c.cell_type == sema_notebook::format::CellType::Code
+                        {
+                            Some(c.id.clone())
+                        } else {
+                            None
+                        }
+                    })
+                    .collect()
             } else {
-                engine.eval_all()
+                engine
+                    .notebook
+                    .cells
+                    .iter()
+                    .filter(|c| c.cell_type == sema_notebook::format::CellType::Code)
+                    .map(|c| c.id.clone())
+                    .collect()
             };
 
+            let total = cell_ids.len();
             let mut had_error = false;
-            for (id, result) in &results {
-                match result {
+
+            for (i, id) in cell_ids.into_iter().enumerate() {
+                match engine.eval_cell(&id) {
                     Ok(r) => {
+                        if !r.stdout.is_empty() {
+                            print!("[{}/{}] (stdout) {}", i + 1, total, r.stdout);
+                        }
                         if !r.output.display.is_empty() {
-                            println!("[{id}] {}", r.output.display);
+                            println!("[{}/{}] {}", i + 1, total, r.output.display);
                         }
                         if r.output.output_type == sema_notebook::format::OutputType::Error {
                             had_error = true;
                         }
                     }
                     Err(e) => {
-                        eprintln!("[{id}] Error: {e}");
+                        eprintln!("[{}/{}] Error: {e}", i + 1, total);
                         had_error = true;
                     }
                 }
@@ -1004,7 +1417,6 @@ fn run_eval(
     path: Option<String>,
     sandbox_arg: Option<String>,
     no_llm: bool,
-    use_vm: bool,
 ) {
     // Get the program text
     let program = if use_stdin {
@@ -1075,7 +1487,7 @@ fn run_eval(
         None => sema_core::Sandbox::allow_all(),
     };
 
-    let interpreter = Interpreter::new_with_sandbox(&sandbox);
+    let interpreter = build_interpreter(&sandbox);
 
     // Auto-configure LLM unless --no-llm
     if !no_llm {
@@ -1102,7 +1514,10 @@ fn run_eval(
     }
 
     let start = std::time::Instant::now();
-    let result = eval_with_mode(&interpreter, &program, use_vm);
+    let result = interpreter.eval_str_compiled(&program);
+    if result.is_ok() {
+        drain_async_scheduler(&interpreter);
+    }
     let elapsed_ms = start.elapsed().as_millis() as u64;
 
     let stdout_text = captured_stdout.borrow();
@@ -1268,10 +1683,10 @@ fn print_eval_json(r: &EvalJsonResult) {
 
 fn run_compile(file: &str, output: Option<&str>) {
     let path = std::path::Path::new(file);
-    let source = match std::fs::read_to_string(path) {
+    let source = match read_source_file(path) {
         Ok(s) => s,
-        Err(e) => {
-            eprintln!("Error reading {file}: {e}");
+        Err(msg) => {
+            eprintln!("error: {msg}");
             std::process::exit(1);
         }
     };
@@ -1281,7 +1696,7 @@ fn run_compile(file: &str, output: Option<&str>) {
 
     // Use Interpreter for macro expansion before compilation
     let sandbox = sema_core::Sandbox::allow_all();
-    let interpreter = Interpreter::new_with_sandbox(&sandbox);
+    let interpreter = build_interpreter(&sandbox);
 
     let result = match interpreter.compile_to_bytecode(&source) {
         Ok(r) => r,
@@ -1358,15 +1773,67 @@ fn try_run_embedded() -> Option<i32> {
     sema_core::vfs::init_vfs(arch.files);
 
     let sandbox = sema_core::Sandbox::allow_all();
-    let interpreter = Interpreter::new_with_sandbox(&sandbox);
+    let interpreter = build_interpreter(&sandbox);
 
     let _ = interpreter.eval_str("(llm/auto-configure)");
 
-    match run_bytecode_bytes(&interpreter, &bytecode) {
-        Ok(_) => Some(0),
-        Err(e) => {
+    let args: Vec<String> = std::env::args().collect();
+    let is_mcp = args
+        .iter()
+        .any(|arg| arg == "--mcp" || arg.starts_with("--mcp="));
+
+    if is_mcp {
+        let mut include = None;
+        let mut exclude = None;
+        for window in args.windows(2) {
+            if window[0] == "--include" {
+                include = Some(window[1].clone());
+            } else if window[0] == "--exclude" {
+                exclude = Some(window[1].clone());
+            }
+        }
+        for arg in &args {
+            if let Some(rest) = arg.strip_prefix("--include=") {
+                include = Some(rest.to_string());
+            } else if let Some(rest) = arg.strip_prefix("--exclude=") {
+                exclude = Some(rest.to_string());
+            }
+        }
+
+        let inc_tools = include.map(|s| {
+            s.split(',')
+                .map(|x| x.trim().to_string())
+                .collect::<Vec<String>>()
+        });
+        let exc_tools = exclude.map(|s| {
+            s.split(',')
+                .map(|x| x.trim().to_string())
+                .collect::<Vec<String>>()
+        });
+
+        if let Err(e) = run_bytecode_bytes(&interpreter, &bytecode) {
             print_error(&e);
-            Some(1)
+            return Some(1);
+        }
+
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("Failed to create tokio runtime")
+            .block_on(async {
+                if let Err(e) = sema_mcp::run_mcp_server(interpreter, inc_tools, exc_tools).await {
+                    eprintln!("MCP server error: {e}");
+                    std::process::exit(1);
+                }
+            });
+        Some(0)
+    } else {
+        match run_bytecode_bytes(&interpreter, &bytecode) {
+            Ok(_) => Some(0),
+            Err(e) => {
+                print_error(&e);
+                Some(1)
+            }
         }
     }
 }
@@ -1423,24 +1890,35 @@ fn run_build(
 
     let path = std::path::Path::new(file);
 
-    // Validate input file exists
-    if !path.exists() {
-        return Err(format!("source file not found: {file}"));
-    }
+    let source = read_source_file(path)?;
 
-    let source = match std::fs::read_to_string(path) {
-        Ok(s) => s,
-        Err(e) => {
-            return Err(format!("reading {file}: {e}"));
+    // Pre-flight: resolve output path now so we can probe the parent directory
+    // for writability before running any compilation steps. This avoids the
+    // frustrating "failed at step 5 of 5" experience when the user gave an
+    // unwritable -o path.
+    let output_path: std::path::PathBuf = match output {
+        Some(o) => std::path::PathBuf::from(o),
+        None => {
+            let stem = path.file_stem().unwrap_or(path.as_os_str());
+            let needs_exe = target
+                .and_then(|t| cross_compile::resolve_target(t).ok())
+                .is_some_and(cross_compile::is_windows_target)
+                || (target.is_none() && cfg!(windows));
+            if needs_exe {
+                std::path::PathBuf::from(format!("{}.exe", stem.to_string_lossy()))
+            } else {
+                std::path::PathBuf::from(stem)
+            }
         }
     };
+    probe_output_writable(&output_path)?;
 
     eprintln!("[1/5] Compiling {file}...");
 
     // Compute source hash and compile to bytecode
     let source_hash = crc32fast::hash(source.as_bytes());
     let sandbox = sema_core::Sandbox::allow_all();
-    let interpreter = Interpreter::new_with_sandbox(&sandbox);
+    let interpreter = build_interpreter(&sandbox);
 
     let result = match interpreter.compile_to_bytecode(&source) {
         Ok(r) => r,
@@ -1542,23 +2020,6 @@ fn run_build(
     let archive_bytes = archive::serialize_archive(&metadata, &files);
 
     eprintln!("[5/5] Writing executable...");
-
-    // Determine output path
-    let output_path = match output {
-        Some(o) => std::path::PathBuf::from(o),
-        None => {
-            let stem = path.file_stem().unwrap_or(path.as_os_str());
-            let needs_exe = target
-                .and_then(|t| cross_compile::resolve_target(t).ok())
-                .is_some_and(cross_compile::is_windows_target)
-                || (target.is_none() && cfg!(windows));
-            if needs_exe {
-                std::path::PathBuf::from(format!("{}.exe", stem.to_string_lossy()))
-            } else {
-                std::path::PathBuf::from(stem)
-            }
-        }
-    };
 
     // Check that output doesn't overwrite the source file
     let input_canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
@@ -1814,6 +2275,67 @@ fn run_build_web(file: &str, output: Option<&str>, includes: &[String]) -> Resul
     Ok(())
 }
 
+/// Probe whether we can write to the directory that will hold `output_path`.
+///
+/// Creates and immediately deletes a tiny probe file in the parent directory.
+/// Returns a clear error before the build commits to any work if the directory
+/// doesn't exist or denies writes (e.g. /readonly/sema, /no/such/dir/sema).
+fn probe_output_writable(output_path: &Path) -> Result<(), String> {
+    let parent = output_path.parent().unwrap_or_else(|| Path::new("."));
+    let parent = if parent.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        parent
+    };
+    if !parent.exists() {
+        return Err(format!(
+            "output directory does not exist: {}",
+            parent.display()
+        ));
+    }
+    let probe_name = format!(
+        ".sema-build-probe-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(0)
+    );
+    let probe = parent.join(probe_name);
+    match std::fs::File::create(&probe) {
+        Ok(_) => {
+            let _ = std::fs::remove_file(&probe);
+            Ok(())
+        }
+        Err(e) => match e.kind() {
+            std::io::ErrorKind::PermissionDenied => Err(format!(
+                "permission denied writing to {} (for output {})",
+                parent.display(),
+                output_path.display()
+            )),
+            std::io::ErrorKind::NotFound => Err(format!(
+                "output directory does not exist: {}",
+                parent.display()
+            )),
+            _ => Err(format!(
+                "cannot write to {}: {}",
+                parent.display(),
+                strip_os_error(&e.to_string())
+            )),
+        },
+    }
+}
+
+/// Strip trailing " (os error N)" from a system error string for nicer output.
+fn strip_os_error(s: &str) -> String {
+    if let Some(idx) = s.rfind(" (os error ") {
+        if s.ends_with(')') {
+            return s[..idx].to_string();
+        }
+    }
+    s.to_string()
+}
+
 /// Write the executable using format-aware injection.
 ///
 /// Detects the binary format at runtime (not compile-time) so that
@@ -1975,7 +2497,12 @@ fn run_disasm(file: &str, json: bool) {
     let bytes = match std::fs::read(file) {
         Ok(b) => b,
         Err(e) => {
-            eprintln!("Error reading {file}: {e}");
+            let msg = match e.kind() {
+                std::io::ErrorKind::NotFound => format!("file not found: {file}"),
+                std::io::ErrorKind::PermissionDenied => format!("permission denied: {file}"),
+                _ => format!("reading {file}: {e}"),
+            };
+            eprintln!("error: {msg}");
             std::process::exit(1);
         }
     };
@@ -2085,9 +2612,9 @@ fn chunk_to_json(chunk: &sema_vm::Chunk, name: &str) -> serde_json::Value {
             ) => {
                 let spur_bits =
                     u32::from_le_bytes([code[pc + 1], code[pc + 2], code[pc + 3], code[pc + 4]]);
-                // Safety: the deserialized bytecode has already remapped indices to valid Spurs
+                // The deserialized bytecode has already remapped indices to valid Spurs.
                 let name_str = if spur_bits != 0 {
-                    let spur = unsafe { std::mem::transmute::<u32, sema_core::Spur>(spur_bits) };
+                    let spur = sema_core::bits_to_spur(spur_bits);
                     sema_core::resolve(spur)
                 } else {
                     format!("spur({spur_bits})")
@@ -2182,16 +2709,50 @@ fn run_bytecode_bytes(
     bytes: &[u8],
 ) -> Result<sema_core::Value, SemaError> {
     let result = sema_vm::deserialize_from_bytes(bytes)?;
-    sema_eval::execute_compile_result(&interpreter.ctx, interpreter.global_env.clone(), result)
+
+    let functions: Vec<std::rc::Rc<sema_vm::Function>> =
+        result.functions.into_iter().map(std::rc::Rc::new).collect();
+    let main_cache_slots = result.chunk.n_global_cache_slots;
+    let closure = std::rc::Rc::new(sema_vm::Closure {
+        func: std::rc::Rc::new(sema_vm::Function {
+            name: None,
+            chunk: result.chunk,
+            upvalue_descs: Vec::new(),
+            upvalue_names: Vec::new(),
+            arity: 0,
+            has_rest: false,
+            local_names: Vec::new(),
+            local_scopes: Vec::new(),
+            source_file: None,
+            cache_offset: 0,
+        }),
+        upvalues: Vec::new(),
+        // Top-level main closure: uses the VM's own globals and function table.
+        globals: None,
+        functions: None,
+    });
+
+    let mut vm = sema_vm::VM::new(
+        interpreter.global_env.clone(),
+        functions,
+        &[],
+        main_cache_slots,
+    )?;
+    // Initialize the async scheduler so async/await and channels work in a
+    // `.semac` program (top-level or inside a `(load ...)`). A `.semac` carries
+    // no native table (the format is process-local), and bytecode compiled with
+    // `known_natives=None` uses CallGlobal rather than CallNative, so task VMs
+    // resolve natives via the shared global env — an empty native table is
+    // correct here.
+    sema_vm::init_scheduler(interpreter.global_env.clone(), Vec::new());
+    vm.execute(closure, &interpreter.ctx)
 }
 
 fn run_fmt(
     patterns: &[String],
     check: bool,
     show_diff: bool,
-    width: usize,
-    indent: usize,
-    align: bool,
+    opts: &sema_fmt::FormatOptions,
     json: bool,
 ) {
     // Handle stdin ("-")
@@ -2211,7 +2772,7 @@ fn run_fmt(
             }
             std::process::exit(1);
         }
-        match sema_fmt::format_source_opts(&source, width, indent, align) {
+        match sema_fmt::format_source(&source, opts) {
             Ok(formatted) => {
                 if json {
                     println!(
@@ -2291,27 +2852,27 @@ fn run_fmt(
     let mut errors = 0;
 
     for file in &files {
-        let source = match std::fs::read_to_string(file) {
+        let source = match read_source_file(file) {
             Ok(s) => s,
-            Err(e) => {
+            Err(msg) => {
                 if json {
                     println!(
                         "{}",
                         serde_json::json!({
                             "file": file,
                             "formatted": false,
-                            "error": format!("Error reading {file}: {e}")
+                            "error": msg,
                         })
                     );
                 } else {
-                    eprintln!("Error reading {file}: {e}");
+                    eprintln!("error: {msg}");
                 }
                 errors += 1;
                 continue;
             }
         };
 
-        let formatted = match sema_fmt::format_source_opts(&source, width, indent, align) {
+        let formatted = match sema_fmt::format_source(&source, opts) {
             Ok(f) => f,
             Err(e) => {
                 if json {
@@ -2427,10 +2988,10 @@ fn print_simple_diff(filename: &str, old: &str, new: &str) {
 
 fn run_ast(file: Option<String>, eval: Option<String>, json: bool) {
     let source = match (&file, &eval) {
-        (Some(path), None) => match std::fs::read_to_string(path) {
+        (Some(path), None) => match read_source_file(path) {
             Ok(content) => content,
-            Err(e) => {
-                eprintln!("Error reading {path}: {e}");
+            Err(msg) => {
+                eprintln!("error: {msg}");
                 std::process::exit(1);
             }
         },
@@ -2646,7 +3207,7 @@ fn print_ast(val: &Value, indent: usize) {
     }
 }
 
-fn format_source_snippet(
+pub(crate) fn format_source_snippet(
     span: &sema_core::Span,
     file_override: Option<&std::path::Path>,
 ) -> Option<String> {
@@ -2690,7 +3251,7 @@ fn format_source_snippet(
     Some(out)
 }
 
-fn print_error(e: &SemaError) {
+pub(crate) fn print_error(e: &SemaError) {
     let inner = e.inner();
     eprintln!("{} {}", colors::red_bold("Error:"), inner);
 
@@ -2743,314 +3304,105 @@ fn print_error(e: &SemaError) {
     }
 }
 
-fn repl(interpreter: Interpreter, quiet: bool, sandbox_mode: Option<&str>, use_vm: bool) {
-    let env = interpreter.global_env.clone();
-    env.set(intern("*1"), Value::nil());
-    env.set(intern("*2"), Value::nil());
-    env.set(intern("*3"), Value::nil());
-    env.set(intern("*e"), Value::nil());
-    interpreter.ctx.interactive.set(true);
-    let mut rl = Editor::new().expect("failed to create editor");
-    rl.set_helper(Some(SemaCompleter { env: env.clone() }));
-    let history_path = dirs_path().join("history.txt");
-    let _ = rl.load_history(&history_path);
-
-    if !quiet {
-        println!(
-            "Sema v{} — A Lisp with LLM primitives",
-            env!("CARGO_PKG_VERSION")
-        );
-        if let Some(mode) = sandbox_mode {
-            println!("Sandbox: {mode}");
-        }
-        println!("Type ,help for help, ,quit to exit\n");
-    }
-
-    let mut buffer = String::new();
-    let mut in_multiline = false;
-
-    loop {
-        let prompt = if in_multiline { "  ... " } else { "sema> " };
-        match rl.readline(prompt) {
-            Ok(line) => {
-                let trimmed = line.trim();
-
-                // Handle REPL commands
-                if !in_multiline {
-                    match trimmed {
-                        ",quit" | ",exit" | ",q" => break,
-                        ",help" | ",h" => {
-                            print_help();
-                            continue;
-                        }
-                        ",env" => {
-                            print_env(&interpreter);
-                            continue;
-                        }
-                        ",builtins" => {
-                            print_builtins(&interpreter);
-                            continue;
-                        }
-                        _ => {}
-                    }
-
-                    if trimmed == ",doc" || trimmed == ",type" || trimmed == ",time" {
-                        println!("Usage: {trimmed} <expr>");
-                        continue;
-                    }
-
-                    if let Some(stripped) = trimmed.strip_prefix(",doc ") {
-                        let name = stripped.trim();
-                        let spur = sema_core::intern(name);
-                        match env.get(spur) {
-                            Some(val) => match val.view() {
-                                ValueView::NativeFn(_f) => {
-                                    println!(
-                                        "  {} {} native-fn",
-                                        colors::cyan(name),
-                                        colors::dim(":"),
-                                    );
-                                }
-                                ValueView::Lambda(l) => {
-                                    let params: Vec<String> =
-                                        l.params.iter().map(|s| sema_core::resolve(*s)).collect();
-                                    let rest = l
-                                        .rest_param
-                                        .map(|s| format!(" . {}", sema_core::resolve(s)))
-                                        .unwrap_or_default();
-                                    println!(
-                                        "  {} {} lambda ({}{})",
-                                        colors::cyan(name),
-                                        colors::dim(":"),
-                                        params.join(" "),
-                                        rest
-                                    );
-                                }
-                                _ => {
-                                    println!(
-                                        "  {} {} {} = {}",
-                                        colors::cyan(name),
-                                        colors::dim(":"),
-                                        val.type_name(),
-                                        val
-                                    );
-                                }
-                            },
-                            None => {
-                                if SPECIAL_FORM_NAMES.contains(&name) {
-                                    println!(
-                                        "  {} {} special form",
-                                        colors::cyan(name),
-                                        colors::dim(":")
-                                    );
-                                } else {
-                                    eprintln!("  {} {name}", colors::red_bold("not found:"));
-                                }
-                            }
-                        }
-                        continue;
-                    }
-
-                    if let Some(expr) = trimmed.strip_prefix(",type ") {
-                        LAST_SOURCE.with(|s| *s.borrow_mut() = Some(expr.to_string()));
-                        LAST_FILE.with(|f| *f.borrow_mut() = None);
-                        match eval_with_mode(&interpreter, expr, use_vm) {
-                            Ok(val) => {
-                                let type_name = match val.view() {
-                                    ValueView::Record(r) => {
-                                        format!(":{}", sema_core::resolve(r.type_tag))
-                                    }
-                                    _ => format!(":{}", val.type_name()),
-                                };
-                                println!("{}", colors::dim(&type_name));
-                            }
-                            Err(e) => print_error(&e),
-                        }
-                        continue;
-                    }
-                    if let Some(expr) = trimmed.strip_prefix(",time ") {
-                        LAST_SOURCE.with(|s| *s.borrow_mut() = Some(expr.to_string()));
-                        LAST_FILE.with(|f| *f.borrow_mut() = None);
-                        let start = std::time::Instant::now();
-                        match eval_with_mode(&interpreter, expr, use_vm) {
-                            Ok(val) => {
-                                let elapsed = start.elapsed();
-                                if !val.is_nil() {
-                                    println!("{}", pretty_print(&val, 80));
-                                }
-                                eprintln!("{} {elapsed:.3?}", colors::dim("elapsed:"));
-                            }
-                            Err(e) => {
-                                let elapsed = start.elapsed();
-                                print_error(&e);
-                                eprintln!("{} {elapsed:.3?}", colors::dim("elapsed:"));
-                            }
-                        }
-                        continue;
-                    }
-                }
-
-                if in_multiline {
-                    buffer.push('\n');
-                    buffer.push_str(&line);
-                } else {
-                    buffer = line.clone();
-                }
-
-                // Check if parens are balanced
-                if !is_balanced(&buffer) {
-                    in_multiline = true;
-                    continue;
-                }
-
-                in_multiline = false;
-                let input = buffer.trim().to_string();
-                buffer.clear();
-
-                if input.is_empty() {
-                    continue;
-                }
-
-                let _ = rl.add_history_entry(&input);
-
-                LAST_SOURCE.with(|s| *s.borrow_mut() = Some(input.clone()));
-                LAST_FILE.with(|f| *f.borrow_mut() = None);
-                match eval_with_mode(&interpreter, &input, use_vm) {
-                    Ok(val) => {
-                        if let Some(v1) = env.get(intern("*1")) {
-                            if let Some(v2) = env.get(intern("*2")) {
-                                env.set(intern("*3"), v2);
-                            }
-                            env.set(intern("*2"), v1);
-                        }
-                        env.set(intern("*1"), val.clone());
-                        if !val.is_nil() {
-                            println!("{}", pretty_print(&val, 80));
-                        }
-                    }
-                    Err(e) => {
-                        env.set(intern("*e"), Value::string(&e.to_string()));
-                        print_error(&e);
-                    }
-                }
+fn run_doc(
+    command: Option<DocCommands>,
+    symbol: Option<String>,
+    pager: docs::PagerMode,
+) -> Result<(), String> {
+    match command {
+        Some(DocCommands::Show { symbol }) => show_doc(&symbol, pager),
+        Some(DocCommands::Search { query, limit }) => {
+            let query = query.join(" ");
+            let query = query.trim().to_string();
+            if query.is_empty() {
+                return Err("usage: sema doc search <query>".to_string());
             }
-            Err(ReadlineError::Interrupted) => {
-                if in_multiline {
-                    buffer.clear();
-                    in_multiline = false;
-                    println!("^C");
-                    continue;
-                }
-                break;
-            }
-            Err(ReadlineError::Eof) => break,
-            Err(e) => {
-                eprintln!("Error: {e}");
-                break;
-            }
+            let rendered =
+                docs::render_search_results(&query, &docs::doc_search_results(&query, limit));
+            docs::print_rendered(&rendered, pager).map_err(|e| format!("writing docs: {e}"))
         }
-    }
-
-    let _ = std::fs::create_dir_all(dirs_path());
-    let _ = rl.save_history(&history_path);
-    println!("Goodbye!");
-}
-
-fn is_balanced(input: &str) -> bool {
-    let mut depth = 0i32;
-    let mut in_string = false;
-    let mut escape = false;
-    for ch in input.chars() {
-        if escape {
-            escape = false;
-            continue;
+        Some(DocCommands::Apropos { pattern }) => {
+            let hits = docs::builtin_apropos_hits(&pattern);
+            let rendered = docs::render_apropos_hits(&pattern, &hits);
+            docs::print_rendered(&rendered, pager).map_err(|e| format!("writing docs: {e}"))
         }
-        if ch == '\\' && in_string {
-            escape = true;
-            continue;
-        }
-        if ch == '"' {
-            in_string = !in_string;
-            continue;
-        }
-        if in_string {
-            continue;
-        }
-        match ch {
-            '(' | '[' | '{' => depth += 1,
-            ')' | ']' | '}' => depth -= 1,
-            _ => {}
-        }
-    }
-    depth <= 0 && !in_string
-}
-
-fn print_help() {
-    println!("Sema REPL Commands:");
-    println!("  ,quit / ,q    Exit the REPL");
-    println!("  ,help / ,h    Show this help");
-    println!("  ,env          Show defined variables");
-    println!("  ,builtins     List all builtin functions");
-    println!("  ,type EXPR    Show the type of a value");
-    println!("  ,time EXPR    Evaluate and show elapsed time");
-    println!("  ,doc NAME     Show info about a binding");
-    println!();
-    println!("LLM Quick Start:");
-    println!("  Set ANTHROPIC_API_KEY or OPENAI_API_KEY env var, then:");
-    println!("  (llm/complete \"Hello!\")");
-    println!("  (llm/chat [(message :user \"Hi\")] {{:model \"claude-haiku-4-5-20251001\"}})");
-    println!();
-    println!("History Variables:");
-    println!("  *1, *2, *3   Last three results (most recent first)");
-    println!("  *e           Last error message");
-    println!();
-    println!("Core Forms:");
-    println!("  define/defun, lambda/fn, if, cond, let, let*, begin/do");
-    println!("  quote, quasiquote, defmacro, and, or, when, unless");
-}
-
-fn print_env(interpreter: &Interpreter) {
-    let mut user_bindings: Vec<(String, String)> = Vec::new();
-    interpreter.global_env.iter_bindings(|spur, val| {
-        if val.as_native_fn_rc().is_none() {
-            user_bindings.push((sema_core::resolve(spur), format!("{val}")));
-        }
-    });
-    user_bindings.sort_by(|(a, _), (b, _)| a.cmp(b));
-    if user_bindings.is_empty() {
-        println!("(no user-defined bindings)");
-    } else {
-        for (name, val) in &user_bindings {
-            println!("  {name} = {val}");
+        None => {
+            let Some(symbol) = symbol else {
+                return Err("usage: sema doc <symbol> | sema doc search <query> | sema doc apropos <pattern>".to_string());
+            };
+            show_doc(&symbol, pager)
         }
     }
 }
 
-fn print_builtins(interpreter: &Interpreter) {
-    let mut names: Vec<String> = Vec::new();
-    interpreter.global_env.iter_bindings(|spur, val| {
-        if val.as_native_fn_rc().is_some() {
-            names.push(sema_core::resolve(spur));
+fn show_doc(symbol: &str, pager: docs::PagerMode) -> Result<(), String> {
+    let Some(rendered) = docs::rendered_doc(symbol) else {
+        return Err(format!("documentation not found: {symbol}"));
+    };
+    docs::print_rendered(&rendered, pager).map_err(|e| format!("writing docs: {e}"))
+}
+
+fn generate_completions(shell: Shell) -> String {
+    let mut buf = Vec::new();
+    clap_complete::generate(shell, &mut Cli::command(), "sema", &mut buf);
+    let mut out = String::from_utf8(buf).expect("clap completion output is utf-8");
+    out.push_str(dynamic_doc_completion_script(shell));
+    out
+}
+
+fn dynamic_doc_completion_script(shell: Shell) -> &'static str {
+    match shell {
+        Shell::Bash => {
+            r#"
+
+# Dynamic Sema doc symbol completion.
+_sema_doc_complete() {
+    local cur="${COMP_WORDS[COMP_CWORD]}"
+    if [[ ${COMP_WORDS[1]} == doc && ${COMP_CWORD} -eq 2 ]]; then
+        COMPREPLY=( $(compgen -W "$(sema __complete-doc-symbols "$cur")" -- "$cur") )
+        return
+    fi
+    if [[ ${COMP_WORDS[1]} == doc && ${COMP_WORDS[2]} == show && ${COMP_CWORD} -eq 3 ]]; then
+        COMPREPLY=( $(compgen -W "$(sema __complete-doc-symbols "$cur")" -- "$cur") )
+        return
+    fi
+    _sema "$@"
+}
+complete -o nosort -o bashdefault -o default -F _sema_doc_complete sema
+"#
         }
-    });
-    names.sort();
+        Shell::Zsh => {
+            r#"
 
-    if names.is_empty() {
-        println!("(no builtin functions)");
-        return;
-    }
-
-    let max_width = names.iter().map(|n| n.len()).max().unwrap_or(0) + 2;
-    let term_width = 80;
-    let cols = (term_width / max_width).max(1);
-
-    for chunk in names.chunks(cols) {
-        for name in chunk {
-            print!("{name:<max_width$}");
+# Dynamic Sema doc symbol completion.
+_sema_doc_complete() {
+  if (( CURRENT == 3 )) && [[ "${words[2]}" == "doc" ]]; then
+    local -a matches
+    matches=("${(@f)$(sema __complete-doc-symbols "${words[CURRENT]}")}")
+    _describe 'Sema doc symbol' matches
+    return
+  fi
+  if (( CURRENT == 4 )) && [[ "${words[2]}" == "doc" && "${words[3]}" == "show" ]]; then
+    local -a matches
+    matches=("${(@f)$(sema __complete-doc-symbols "${words[CURRENT]}")}")
+    _describe 'Sema doc symbol' matches
+    return
+  fi
+  _sema "$@"
+}
+compdef _sema_doc_complete sema
+"#
         }
-        println!();
+        Shell::Fish => {
+            r#"
+
+# Dynamic Sema doc symbol completion.
+complete -c sema -n '__fish_seen_subcommand_from doc; and not __fish_seen_subcommand_from show search apropos' -a '(sema __complete-doc-symbols (commandline -ct))'
+complete -c sema -n '__fish_seen_subcommand_from doc show' -a '(sema __complete-doc-symbols (commandline -ct))'
+"#
+        }
+        _ => "",
     }
-    println!("\n{} builtin functions", names.len());
 }
 
 fn install_completions(shell: Shell) {
@@ -3087,9 +3439,8 @@ fn install_completions(shell: Shell) {
         });
     }
 
-    let mut buf = Vec::new();
-    clap_complete::generate(shell, &mut Cli::command(), "sema", &mut buf);
-    std::fs::write(&path, &buf).unwrap_or_else(|e| {
+    let completions = generate_completions(shell);
+    std::fs::write(&path, completions).unwrap_or_else(|e| {
         eprintln!("Error writing {}: {e}", path.display());
         std::process::exit(1);
     });
@@ -3106,7 +3457,7 @@ fn dirs_path() -> std::path::PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::compile_source_to_bytecode;
+    use super::{compile_source_to_bytecode, run_bytecode_bytes};
     use sema_core::{intern, NativeFn, Sandbox, Value};
     use sema_eval::Interpreter;
 
@@ -3119,7 +3470,6 @@ mod tests {
         "##;
 
         let bytes = compile_source_to_bytecode(source).expect("compile should succeed");
-        let compiled = sema_vm::deserialize_from_bytes(&bytes).expect("bytecode should deserialize");
 
         let interp = Interpreter::new_with_sandbox(&Sandbox::allow_all());
         interp.global_env.set(
@@ -3127,8 +3477,7 @@ mod tests {
             Value::native_fn(NativeFn::simple("component/mount!", |_args| Ok(Value::nil()))),
         );
 
-        sema_eval::execute_compile_result(&interp.ctx, interp.global_env.clone(), compiled)
-            .expect("compiled program should execute");
+        run_bytecode_bytes(&interp, &bytes).expect("compiled program should execute");
 
         let counter_view = interp
             .global_env
@@ -3148,7 +3497,6 @@ mod tests {
         "#;
 
         let bytes = compile_source_to_bytecode(source).expect("compile should succeed");
-        let compiled = sema_vm::deserialize_from_bytes(&bytes).expect("bytecode should deserialize");
 
         let interp = Interpreter::new_with_sandbox(&Sandbox::allow_all());
         interp.global_env.set(
@@ -3164,8 +3512,7 @@ mod tests {
             })),
         );
 
-        sema_eval::execute_compile_result(&interp.ctx, interp.global_env.clone(), compiled)
-            .expect("compiled program should execute");
+        run_bytecode_bytes(&interp, &bytes).expect("compiled program should execute");
 
         let doubled = interp
             .global_env

@@ -1,14 +1,30 @@
 use std::cell::RefCell;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::rc::Rc;
 
 use sema_core::{
-    resolve as resolve_spur, Env, EvalContext, NativeFn, SemaError, Spur, Value,
+    bits_to_spur,
+    error::{suggest_similar, veteran_hint, CallFrame as CoreCallFrame, StackTrace},
+    resolve as resolve_spur, Env, EvalContext, NativeFn, SemaError, Spur, Value, ValueViewRef,
     NAN_INT_SMALL_PATTERN, NAN_PAYLOAD_BITS, NAN_PAYLOAD_MASK, NAN_TAG_MASK, TAG_NATIVE_FN,
 };
 
 use crate::chunk::Function;
 use crate::opcodes::op;
+use crate::opcodes::Op;
+
+const DEBUG_VALUE_REF_BASE: u64 = crate::debug::DEBUG_VALUE_REF_BASE;
+
+/// Outcome of [`VM::handle_debug_stop`]: whether the caller should resume
+/// execution (step mode already set per the resume command) or terminate the
+/// debug session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DebugStopResume {
+    /// Continue running (Continue/Step*/closed-channel).
+    Resume,
+    /// The frontend disconnected; stop the program.
+    Disconnect,
+}
 
 /// State of a captured variable (upvalue).
 #[derive(Debug)]
@@ -44,6 +60,25 @@ impl UpvalueCell {
 pub struct Closure {
     pub func: Rc<Function>,
     pub upvalues: Vec<Rc<UpvalueCell>>,
+    /// Home globals env: the global environment in which this closure was
+    /// *defined*. `GetGlobal`/`SetGlobal`/`DefineGlobal` resolve against this
+    /// env (not the executing VM's `self.globals`) so a closure exported from
+    /// one module and run inside another module's VM still sees its own
+    /// module-level defines. `None` for the top-level "main" closure, which is
+    /// always run by the VM that owns its globals — it falls back to
+    /// `self.globals` at execution time. Closures built via `MakeClosure`
+    /// always carry a concrete `Some(home)` so they remain correct when
+    /// exported across VMs (M1: closure home-globals).
+    pub globals: Option<Rc<Env>>,
+    /// Home function table: the compilation unit (`Vec<Function>`) this closure's
+    /// `func`/upvalue indices and `MakeClosure`/`Call` func-ids point into. The
+    /// executing VM sets `self.functions` to this on every frame activation, so
+    /// an imported closure (whose table differs from the importer's) resolves
+    /// its own functions even when called from the importer's VM — and the
+    /// importer's frames restore *their* table on return. `None` for the
+    /// top-level main closure, which uses the VM's own (base) table (M4: import
+    /// on the VM).
+    pub functions: Option<Rc<Vec<Rc<Function>>>>,
 }
 
 /// Payload stored in NativeFn for VM closures.
@@ -51,6 +86,40 @@ pub struct Closure {
 struct VmClosurePayload {
     closure: Rc<Closure>,
     functions: Rc<Vec<Rc<Function>>>,
+}
+
+/// Extracted VM closure: the closure itself and the function table from its compilation context.
+pub type VmClosureInfo = (Rc<Closure>, Rc<Vec<Rc<Function>>>);
+
+/// Extract a VM closure from a Value, if it wraps a VmClosurePayload.
+/// Returns the closure and the function table needed to create a task VM.
+pub fn extract_vm_closure(val: &Value) -> Option<VmClosureInfo> {
+    let nf = val.as_native_fn_ref()?;
+    let payload = nf.payload.as_ref()?.downcast_ref::<VmClosurePayload>()?;
+    Some((payload.closure.clone(), payload.functions.clone()))
+}
+
+/// Build an `Unbound` error decorated with a "Did you mean ...?" hint
+/// when the name closely matches one in `globals`. Mirrors the tree-walker
+/// path in `sema-eval/src/eval.rs::eval_step` so users get the same
+/// suggestions regardless of backend.
+fn unbound_global_error(name_spur: Spur, globals: &Env) -> SemaError {
+    let name = resolve_spur(name_spur);
+    let mut err = SemaError::Unbound(name.clone());
+    if let Some(hint) = veteran_hint(&name) {
+        err = err.with_hint(hint);
+    } else {
+        let all_names: Vec<String> = globals
+            .all_names()
+            .iter()
+            .map(|s| resolve_spur(*s))
+            .collect();
+        let candidates: Vec<&str> = all_names.iter().map(|s| s.as_str()).collect();
+        if let Some(suggestion) = suggest_similar(&name, &candidates) {
+            err = err.with_hint(format!("Did you mean '{suggestion}'?"));
+        }
+    }
+    err
 }
 
 /// A call frame in the VM's call stack.
@@ -81,6 +150,329 @@ pub struct VM {
     /// Resolved native function table: native_id → (NativeFn Rc, name).
     /// Populated at VM creation from the compiler's native_table + global env.
     native_fns: Vec<Rc<NativeFn>>,
+    debug_values: HashMap<u64, Value>,
+    next_debug_value_ref: u64,
+    /// Frame-count floor at which the dispatch loop treats a RETURN as
+    /// "finished". Normally 0 (run until the call stack is empty). Raised
+    /// temporarily by `run_nested_closure` so a re-entrant in-VM HOF callback
+    /// returns to its native caller without unwinding the parent's frames.
+    frame_floor: usize,
+}
+
+thread_local! {
+    /// Stack of pointers to VMs that are currently executing a native call on
+    /// this thread. When a stdlib higher-order function invokes a VM closure
+    /// via `call_callback`, the closure's fallback consults this stack so it can
+    /// run *inside* the live VM (keeping open upvalue cells connected to the
+    /// parent stack) instead of spawning a fresh VM that loses `set!` mutations.
+    ///
+    /// SAFETY: each pointer is valid for as long as the corresponding native
+    /// call is on the Rust call stack. A `CurrentVmGuard` pushes the pointer
+    /// immediately before a synchronous native call and pops it immediately
+    /// after, so the pointer is only observed while the owning VM is paused at
+    /// that exact call site and is not otherwise touched.
+    static CURRENT_VM: RefCell<Vec<*mut VM>> = const { RefCell::new(Vec::new()) };
+}
+
+/// RAII guard that registers a VM as the current re-entrant target for the
+/// duration of a native call, then unregisters it on drop.
+struct CurrentVmGuard;
+
+impl CurrentVmGuard {
+    fn enter(vm: &mut VM) -> Self {
+        let ptr = vm as *mut VM;
+        CURRENT_VM.with(|stack| stack.borrow_mut().push(ptr));
+        CurrentVmGuard
+    }
+}
+
+impl Drop for CurrentVmGuard {
+    fn drop(&mut self) {
+        CURRENT_VM.with(|stack| {
+            stack.borrow_mut().pop();
+        });
+    }
+}
+
+/// Try to run `closure` on the live VM currently executing a native call on
+/// this thread. Returns `Some(result)` if a compatible VM was found and the
+/// closure was dispatched in-VM; `None` if no compatible VM is registered (the
+/// caller should fall back to a fresh VM).
+///
+/// "Compatible" means the running VM shares the same `functions` table and
+/// `globals` as the closure's compilation context — i.e. the closure belongs to
+/// that VM, so its open upvalue cells point into that VM's live stack.
+fn try_run_on_current_vm(
+    closure: &Rc<Closure>,
+    functions: &Rc<Vec<Rc<Function>>>,
+    globals: &Rc<Env>,
+    args: &[Value],
+    ctx: &EvalContext,
+) -> Option<Result<Value, SemaError>> {
+    // Snapshot the top compatible VM pointer, then release the borrow before
+    // re-entering the VM (the nested run may itself register a new current VM).
+    let vm_ptr = CURRENT_VM.with(|stack| {
+        let stack = stack.borrow();
+        stack.iter().rev().copied().find(|&ptr| {
+            // SAFETY: see CURRENT_VM docs — the pointer is valid while the
+            // native call that registered it is on the Rust stack, which is
+            // strictly the case here (we are inside that native call).
+            let vm = unsafe { &*ptr };
+            Rc::ptr_eq(&vm.functions, functions) && Rc::ptr_eq(&vm.globals, globals)
+        })
+    })?;
+    // SAFETY: the owning VM is paused at the native call site that registered
+    // this pointer and does not touch `self` until the call returns. Args have
+    // been copied into an owned slice by the native caller, so there is no
+    // outstanding borrow of the VM's stack. The reference does not escape this
+    // call.
+    let vm = unsafe { &mut *vm_ptr };
+    Some(vm.run_nested_closure(closure.clone(), args, ctx))
+}
+
+/// The home globals env of the VM currently executing a native call on this
+/// thread (the innermost `CURRENT_VM`), if any. A native invoked from a running
+/// VM uses this to act on the *current* environment — e.g. a nested `import`/
+/// `load` copies bindings into the executing module's env rather than a fixed
+/// global env (M4 nested-module isolation).
+///
+/// SAFETY: the top `CURRENT_VM` pointer is valid while the native call that
+/// registered it is on the Rust stack, which is exactly the case when this is
+/// called from inside that native. The VM is paused at the call site.
+pub fn current_vm_globals() -> Option<Rc<Env>> {
+    CURRENT_VM.with(|stack| {
+        stack
+            .borrow()
+            .last()
+            .map(|&ptr| unsafe { &*ptr }.globals.clone())
+    })
+}
+
+thread_local! {
+    /// Stack of pointers to the `DebugState` of an active debug session on this
+    /// thread. Set by `execute_debug` (and the cooperative WASM start) around the
+    /// run loop, popped on exit. The async scheduler is reached through the
+    /// `RUN_SCHEDULER_CALLBACK` fn-pointer seam (`async_signal.rs`), which cannot
+    /// carry a borrowed `&mut DebugState`; it consults this thread-local instead so
+    /// task steps run in debug mode and a mid-task breakpoint can stop/resume.
+    ///
+    /// SAFETY mirrors `CURRENT_VM`: each pointer is valid for as long as the
+    /// `execute_debug` frame that pushed it is on the Rust call stack. While that
+    /// frame is blocked inside a native call that re-enters the scheduler, the
+    /// `&mut DebugState` it owns is DORMANT (not otherwise touched) — the scheduler
+    /// reborrows it through this raw pointer for the duration of one task step and
+    /// drops the borrow before returning, so no two live `&mut` ever alias.
+    static ACTIVE_DEBUG: RefCell<Vec<*mut crate::debug::DebugState>> =
+        const { RefCell::new(Vec::new()) };
+}
+
+thread_local! {
+    /// The `StopInfo` of a breakpoint that fired inside an async task during a
+    /// COOPERATIVE (headless) debug session. Set by the scheduler's
+    /// `step_task_debug` when, instead of blocking in `handle_debug_stop`, it
+    /// leaves the task paused and unwinds so the cooperative call can surface the
+    /// stop to JS. Consumed by `start_cooperative`/`run_cooperative`, which
+    /// translate it into `VmExecResult::Stopped(info)`. Cleared on resume.
+    static COOP_TASK_STOP: RefCell<Option<crate::debug::StopInfo>> = const { RefCell::new(None) };
+
+    /// Id of the async task currently paused at a cooperative breakpoint. Set
+    /// alongside `COOP_TASK_STOP` so inspection requests between JS calls
+    /// (`with_coop_paused_task_vm`) can relocate the paused task in the scheduler
+    /// and read ITS frames/locals — the task's own per-task VM, not the main VM
+    /// which is parked at the `await`. Cleared on resume.
+    static COOP_PAUSED_TASK_ID: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+/// Record the location a task stopped at for a cooperative (headless) debug
+/// session, plus the id of the paused task so its VM can be inspected while the
+/// cooperative session is suspended in JS. Called by the scheduler.
+pub fn set_coop_task_stop(task_id: u64, info: crate::debug::StopInfo) {
+    COOP_TASK_STOP.with(|s| *s.borrow_mut() = Some(info));
+    COOP_PAUSED_TASK_ID.with(|c| c.set(Some(task_id)));
+}
+
+/// Take the pending cooperative task-stop location, if any. Called by
+/// `run_cooperative`/`start_cooperative` to surface the stop to JS.
+pub fn take_coop_task_stop() -> Option<crate::debug::StopInfo> {
+    COOP_TASK_STOP.with(|s| s.borrow_mut().take())
+}
+
+/// Id of the async task paused at a cooperative breakpoint, if any.
+pub fn coop_paused_task_id() -> Option<u64> {
+    COOP_PAUSED_TASK_ID.with(|c| c.get())
+}
+
+/// Clear the paused-task id once the cooperative session resumes (the task is
+/// about to be re-driven, so inspecting it as "paused" is no longer meaningful).
+pub fn clear_coop_paused_task_id() {
+    COOP_PAUSED_TASK_ID.with(|c| c.set(None));
+}
+
+/// Surface a cooperative async-task stop to JS as `VmExecResult::Stopped`,
+/// enforcing the invariant that the scheduler-driving native registered HOW to
+/// resume (`set_debug_coop_resume`). Every cooperative task pause is triggered by
+/// a scheduler-driving combinator (`async/await`/`all`/`race`/`run`/`timeout`),
+/// each of which records a [`DebugCoopResume`] before yielding the main VM. If a
+/// stop surfaces with no pending resume, a NEW combinator paused the scheduler
+/// without recording one — `run_cooperative`'s resume path would then take the
+/// non-resume branch and silently wedge (the paused task never re-drives, the
+/// awaited value is never reconstructed). Fail loudly here instead so the gap is
+/// caught the first time that combinator is debugged, not shipped.
+fn surface_coop_task_stop(
+    info: crate::debug::StopInfo,
+) -> Result<crate::debug::VmExecResult, SemaError> {
+    if !sema_core::debug_coop_resume_pending() {
+        return Err(SemaError::eval(
+            "internal: cooperative debug stop surfaced without a registered \
+             DebugCoopResume — a scheduler-driving async combinator paused for a \
+             breakpoint but did not call set_debug_coop_resume",
+        ));
+    }
+    Ok(crate::debug::VmExecResult::Stopped(info))
+}
+
+/// Reconstruct the value a scheduler-driving native (await/all/timeout/race/run)
+/// would have returned, now that its target promise(s) have settled — used by the
+/// cooperative debug-resume path to resume the main VM after a task breakpoint.
+/// A rejected/cancelled target surfaces as the same error the native would have
+/// produced. Mirrors the success/error mapping in `sema-stdlib/src/async_ops.rs`.
+fn reconstruct_coop_resume_value(how: &sema_core::DebugCoopResume) -> Result<Value, SemaError> {
+    use sema_core::{DebugCoopResume, PromiseState};
+    match how {
+        DebugCoopResume::Run => Ok(Value::nil()),
+        DebugCoopResume::Await(p) => match &*p.state.borrow() {
+            PromiseState::Resolved(v) => Ok(v.clone()),
+            PromiseState::Rejected(e) => {
+                Err(SemaError::eval(format!("async/await: task rejected: {e}")))
+            }
+            PromiseState::Cancelled => Err(SemaError::eval("async/await: task was cancelled")),
+            PromiseState::Pending => Err(SemaError::eval(
+                "async/await: still pending after scheduler run",
+            )),
+        },
+        DebugCoopResume::All(promises) => {
+            let mut results = Vec::with_capacity(promises.len());
+            for p in promises {
+                match &*p.state.borrow() {
+                    PromiseState::Resolved(v) => results.push(v.clone()),
+                    PromiseState::Rejected(e) => {
+                        return Err(SemaError::eval(format!("async/all: task rejected: {e}")))
+                    }
+                    PromiseState::Cancelled => {
+                        return Err(SemaError::eval("async/all: task was cancelled"))
+                    }
+                    PromiseState::Pending => {
+                        return Err(SemaError::eval("async/all: task still pending"))
+                    }
+                }
+            }
+            Ok(Value::list(results))
+        }
+        DebugCoopResume::Race(promises) => {
+            for p in promises {
+                if let PromiseState::Resolved(v) = &*p.state.borrow() {
+                    return Ok(v.clone());
+                }
+            }
+            for p in promises {
+                if let PromiseState::Rejected(e) = &*p.state.borrow() {
+                    return Err(SemaError::eval(format!("async/race: task rejected: {e}")));
+                }
+            }
+            Err(SemaError::eval("async/race: no promise resolved"))
+        }
+    }
+}
+
+/// RAII guard registering a `DebugState` as the active debug session for the
+/// duration of a debug run, unregistering it on drop (including panic unwind).
+struct ActiveDebugGuard;
+
+impl ActiveDebugGuard {
+    fn enter(debug: &mut crate::debug::DebugState) -> Self {
+        let ptr = debug as *mut crate::debug::DebugState;
+        ACTIVE_DEBUG.with(|stack| stack.borrow_mut().push(ptr));
+        ActiveDebugGuard
+    }
+}
+
+impl Drop for ActiveDebugGuard {
+    fn drop(&mut self) {
+        ACTIVE_DEBUG.with(|stack| {
+            stack.borrow_mut().pop();
+        });
+    }
+}
+
+/// True when a debug session is active on this thread (cheap: a thread-local
+/// length check). The async scheduler gates its debug-aware task-step path on
+/// this so the non-debug hot path stays byte-identical when not debugging.
+pub fn is_debug_session_active() -> bool {
+    ACTIVE_DEBUG.with(|stack| !stack.borrow().is_empty())
+}
+
+/// Run `f` with a mutable borrow of the innermost active `DebugState`, if any.
+/// Returns `None` when no debug session is active on this thread (the scheduler's
+/// non-debug path). Used by the scheduler to reach the `DebugState` it cannot
+/// receive by reference through the fn-pointer callback seam.
+///
+/// SAFETY: see `ACTIVE_DEBUG`. The top pointer was registered by a live
+/// `execute_debug` frame on this thread's Rust stack; that frame is blocked in the
+/// native call that re-entered the scheduler and does not touch its
+/// `&mut DebugState` while blocked. The reborrow does not escape `f`.
+pub fn with_active_debug<R>(f: impl FnOnce(&mut crate::debug::DebugState) -> R) -> Option<R> {
+    let ptr = ACTIVE_DEBUG.with(|stack| stack.borrow().last().copied())?;
+    // SAFETY: as documented above.
+    let debug = unsafe { &mut *ptr };
+    Some(f(debug))
+}
+
+/// Close `closure`'s still-open upvalue cells against the VM(s) currently
+/// running a native call on this thread, snapshotting their values from the
+/// owning VM's live stack.
+///
+/// MUST be called before a VM closure is dispatched onto a *foreign* stack — a
+/// fresh fallback VM, or an async task VM created by `spawn` /
+/// `run_closure_as_inline_task`. An Open cell holds `{ frame_base, slot }`
+/// indices into the VM that created it; reading it on a different VM's stack is
+/// out-of-bounds. Snapshotting here (while the owning VM is paused at its native
+/// call) detaches the cells safely.
+///
+/// A no-op for cells that are already Closed or whose owning frame is no longer
+/// on any registered VM's stack.
+pub fn close_closure_upvalues_for_foreign_run(closure: &Closure) {
+    // Snapshot the registered VM pointers, then operate through them. The
+    // pointers are valid for the duration of this call (see CURRENT_VM docs).
+    let ptrs: Vec<*mut VM> = CURRENT_VM.with(|stack| stack.borrow().clone());
+    for cell in &closure.upvalues {
+        let (frame_base, slot) = {
+            let state = cell.state.borrow();
+            match &*state {
+                UpvalueState::Open { frame_base, slot } => (*frame_base, *slot),
+                UpvalueState::Closed(_) => continue,
+            }
+        };
+        // Find the registered VM that owns this cell (its frame is on that
+        // VM's stack). Walk most-recent first.
+        for &ptr in ptrs.iter().rev() {
+            // SAFETY: pointer registered by a live CurrentVmGuard on the Rust
+            // stack; the owning VM is paused and not otherwise borrowed.
+            let vm = unsafe { &mut *ptr };
+            if frame_base + slot < vm.stack.len() && vm.frames.iter().any(|f| f.base == frame_base)
+            {
+                let value = vm.stack[frame_base + slot].clone();
+                *cell.state.borrow_mut() = UpvalueState::Closed(value);
+                if let Some(frame) = vm.frames.iter_mut().find(|f| f.base == frame_base) {
+                    if let Some(open) = frame.open_upvalues.as_mut() {
+                        if let Some(entry) = open.get_mut(slot) {
+                            *entry = None;
+                        }
+                    }
+                }
+                break;
+            }
+        }
+    }
 }
 
 /// Close all open upvalues in the given open_upvalues vec, reading from the stack.
@@ -141,6 +533,9 @@ impl VM {
             functions: Rc::new(functions),
             inline_cache: vec![(u32::MAX, 0, Value::nil()); total_cache_slots],
             native_fns,
+            debug_values: HashMap::new(),
+            next_debug_value_ref: DEBUG_VALUE_REF_BASE,
+            frame_floor: 0,
         })
     }
 
@@ -189,7 +584,34 @@ impl VM {
             functions,
             inline_cache: vec![(u32::MAX, 0, Value::nil()); total_cache_slots],
             native_fns: Vec::new(),
+            debug_values: HashMap::new(),
+            next_debug_value_ref: DEBUG_VALUE_REF_BASE,
+            frame_floor: 0,
         }
+    }
+
+    /// Create a new VM for an async task, sharing globals and functions with the parent.
+    pub fn new_for_task(
+        globals: Rc<Env>,
+        functions: Rc<Vec<Rc<Function>>>,
+        native_spurs: &[Spur],
+    ) -> Result<Self, SemaError> {
+        let native_fns = Self::resolve_native_table(&globals, native_spurs)?;
+        let total_cache_slots: usize = functions
+            .iter()
+            .map(|f| f.chunk.n_global_cache_slots as usize)
+            .sum();
+        Ok(VM {
+            stack: Vec::with_capacity(256),
+            frames: Vec::with_capacity(64),
+            globals,
+            functions,
+            inline_cache: vec![(u32::MAX, 0, Value::nil()); total_cache_slots],
+            native_fns,
+            debug_values: HashMap::new(),
+            next_debug_value_ref: DEBUG_VALUE_REF_BASE,
+            frame_floor: 0,
+        })
     }
 
     pub fn execute(&mut self, closure: Rc<Closure>, ctx: &EvalContext) -> Result<Value, SemaError> {
@@ -226,65 +648,231 @@ impl VM {
             open_upvalues: None,
         });
 
+        // Register this DebugState as the active session so the async scheduler
+        // (reached via the RUN_SCHEDULER_CALLBACK seam during a native call) can
+        // run task steps in debug mode and stop/resume on a mid-task breakpoint.
+        // Popped on return/panic by the guard's Drop.
+        let _active = ActiveDebugGuard::enter(debug);
+
         loop {
-            match self.run_inner(ctx, Some(debug))? {
+            let step = match self.run_inner(ctx, Some(debug)) {
+                Ok(step) => step,
+                Err(e) => {
+                    // Uncaught runtime error. If the exception breakpoint filter
+                    // is enabled, stop and let the user inspect before the
+                    // session ends; the program cannot resume past an uncaught
+                    // error, so any resume/disconnect command just propagates it.
+                    // Note: by the time the error reaches here the VM has already
+                    // unwound its frames, so stack/variable inspection at the
+                    // exception stop is best-effort (typically empty). The error
+                    // message itself is delivered via the Stopped description and
+                    // the exceptionInfo request.
+                    if debug.break_on_uncaught {
+                        debug.last_exception = Some(e.to_string());
+                        self.debug_values.clear();
+                        self.next_debug_value_ref = DEBUG_VALUE_REF_BASE;
+                        let _ = debug.event_tx.send(crate::debug::DebugEvent::Stopped {
+                            reason: crate::debug::StopReason::Exception,
+                            description: Some(e.to_string()),
+                        });
+                        self.debug_exception_park(ctx, debug);
+                    }
+                    return Err(e);
+                }
+            };
+            match step {
                 crate::debug::VmExecResult::Finished(v) => return Ok(v),
                 crate::debug::VmExecResult::Yielded => continue,
+                crate::debug::VmExecResult::AsyncYield(_) => {
+                    return Err(SemaError::eval(
+                        "async yield outside of scheduler context".to_string(),
+                    ));
+                }
                 crate::debug::VmExecResult::Stopped(info) => {
-                    let _ = debug.event_tx.send(crate::debug::DebugEvent::Stopped {
-                        reason: info.reason,
-                        description: None,
-                    });
-
-                    loop {
-                        match debug.command_rx.recv() {
-                            Ok(crate::debug::DebugCommand::Continue) => {
-                                debug.step_mode = crate::debug::StepMode::Continue;
-                                break;
-                            }
-                            Ok(crate::debug::DebugCommand::StepInto) => {
-                                debug.step_mode = crate::debug::StepMode::StepInto;
-                                debug.step_frame_depth = self.frames.len();
-                                break;
-                            }
-                            Ok(crate::debug::DebugCommand::StepOver) => {
-                                debug.step_mode = crate::debug::StepMode::StepOver;
-                                debug.step_frame_depth = self.frames.len();
-                                break;
-                            }
-                            Ok(crate::debug::DebugCommand::StepOut) => {
-                                debug.step_mode = crate::debug::StepMode::StepOut;
-                                debug.step_frame_depth = self.frames.len();
-                                break;
-                            }
-                            Ok(crate::debug::DebugCommand::Pause) => {}
-                            Ok(crate::debug::DebugCommand::SetBreakpoints {
-                                file,
-                                lines,
-                                reply,
-                            }) => {
-                                let ids = debug.set_breakpoints(&file, &lines);
-                                let _ = reply.send(ids);
-                            }
-                            Ok(crate::debug::DebugCommand::GetStackTrace { reply }) => {
-                                let _ = reply.send(self.debug_stack_trace());
-                            }
-                            Ok(crate::debug::DebugCommand::GetScopes { frame_id, reply }) => {
-                                let _ = reply.send(self.debug_scopes(frame_id));
-                            }
-                            Ok(crate::debug::DebugCommand::GetVariables { reference, reply }) => {
-                                let _ = reply.send(self.debug_variables(reference));
-                            }
-                            Ok(crate::debug::DebugCommand::Disconnect) => {
-                                return Ok(Value::nil());
-                            }
-                            Err(_) => {
-                                debug.step_mode = crate::debug::StepMode::Continue;
-                                break;
-                            }
-                        }
+                    match self.handle_debug_stop(ctx, debug, info) {
+                        DebugStopResume::Resume => {}
+                        DebugStopResume::Disconnect => return Ok(Value::nil()),
                     }
                 }
+            }
+        }
+    }
+
+    /// Handle a `Stopped` mid-execution: reset variable handles, emit the
+    /// `Stopped` event, then block on `command_rx` serving inspection requests
+    /// until a resume/step/disconnect arrives. Shared by the main VM debug loop
+    /// (`execute_debug`) and the async scheduler's debug task step, so a breakpoint
+    /// hit inside a task stops/resumes with the SAME loop — and the inspection
+    /// commands (GetStackTrace/GetScopes/GetVariables/Evaluate) target `self`,
+    /// which is the STOPPED task's VM in the scheduler case.
+    ///
+    /// Returns [`DebugStopResume::Resume`] to continue execution (the step mode was
+    /// set per the resume command) or [`DebugStopResume::Disconnect`] to terminate.
+    pub fn handle_debug_stop(
+        &mut self,
+        ctx: &EvalContext,
+        debug: &mut crate::debug::DebugState,
+        info: crate::debug::StopInfo,
+    ) -> DebugStopResume {
+        // Per the DAP spec, variablesReferences are only valid until the next stop.
+        // Reset the handle map on each stop so Values expanded in prior stops are
+        // not retained for the whole session (otherwise debug_values grows
+        // unbounded across a long stepping session, pinning the underlying heap).
+        self.debug_values.clear();
+        self.next_debug_value_ref = DEBUG_VALUE_REF_BASE;
+
+        let _ = debug.event_tx.send(crate::debug::DebugEvent::Stopped {
+            reason: info.reason,
+            description: None,
+        });
+
+        loop {
+            match debug.command_rx.recv() {
+                Ok(crate::debug::DebugCommand::Continue) => {
+                    debug.step_mode = crate::debug::StepMode::Continue;
+                    return DebugStopResume::Resume;
+                }
+                Ok(crate::debug::DebugCommand::StepInto) => {
+                    debug.step_mode = crate::debug::StepMode::StepInto;
+                    debug.step_frame_depth = self.frames.len();
+                    return DebugStopResume::Resume;
+                }
+                Ok(crate::debug::DebugCommand::StepOver) => {
+                    debug.step_mode = crate::debug::StepMode::StepOver;
+                    debug.step_frame_depth = self.frames.len();
+                    return DebugStopResume::Resume;
+                }
+                Ok(crate::debug::DebugCommand::StepOut) => {
+                    debug.step_mode = crate::debug::StepMode::StepOut;
+                    debug.step_frame_depth = self.frames.len();
+                    return DebugStopResume::Resume;
+                }
+                Ok(crate::debug::DebugCommand::Pause) => {}
+                Ok(crate::debug::DebugCommand::SetBreakpoints {
+                    file,
+                    breakpoints,
+                    reply,
+                }) => {
+                    let ids = debug.set_breakpoints_with_conditions(&file, &breakpoints);
+                    let _ = reply.send(ids);
+                }
+                Ok(crate::debug::DebugCommand::SetExceptionBreakpoints { break_on_uncaught }) => {
+                    debug.break_on_uncaught = break_on_uncaught;
+                }
+                Ok(crate::debug::DebugCommand::GetStackTrace { reply }) => {
+                    let _ = reply.send(self.debug_stack_trace());
+                }
+                Ok(crate::debug::DebugCommand::GetScopes { frame_id, reply }) => {
+                    let _ = reply.send(self.debug_scopes(frame_id));
+                }
+                Ok(crate::debug::DebugCommand::GetVariables { reference, reply }) => {
+                    let _ = reply.send(self.debug_variables(reference));
+                }
+                Ok(crate::debug::DebugCommand::Evaluate {
+                    frame_id,
+                    expression,
+                    reply,
+                }) => {
+                    let result = sema_reader::read(&expression)
+                        .map_err(|e| e.to_string())
+                        .and_then(|expr| {
+                            self.debug_evaluate_mut(frame_id, &expr, ctx, debug)
+                                .map(|value| self.debug_value_to_variable("result", value))
+                                .map_err(|e| e.to_string())
+                        });
+                    let _ = reply.send(result);
+                }
+                Ok(crate::debug::DebugCommand::SetVariable {
+                    variables_reference,
+                    name,
+                    value_expression,
+                    reply,
+                }) => {
+                    let result = match crate::debug::decode_scope_ref(variables_reference) {
+                        Some(crate::debug::ScopeKind::Locals(frame_id))
+                        | Some(crate::debug::ScopeKind::Upvalues(frame_id)) => {
+                            sema_reader::read(&value_expression)
+                                .map_err(|e| e.to_string())
+                                .and_then(|expr| {
+                                    self.debug_evaluate(frame_id, &expr, ctx, debug)
+                                        .map_err(|e| e.to_string())
+                                })
+                                .and_then(|value| {
+                                    self.debug_set_variable(variables_reference, &name, value)
+                                        .map_err(|e| e.to_string())
+                                })
+                        }
+                        None => Err("setVariable: invalid variablesReference".to_string()),
+                    };
+                    let _ = reply.send(result);
+                }
+                Ok(crate::debug::DebugCommand::Disconnect) => {
+                    return DebugStopResume::Disconnect;
+                }
+                Err(_) => {
+                    debug.step_mode = crate::debug::StepMode::Continue;
+                    return DebugStopResume::Resume;
+                }
+            }
+        }
+    }
+
+    /// Park after an uncaught exception, serving inspection requests until the
+    /// user resumes or disconnects (or the command channel closes). Unlike the
+    /// normal stop loop, the program cannot continue past an uncaught error, so
+    /// any resume command simply releases the park and the caller propagates the
+    /// error to terminate the session.
+    fn debug_exception_park(&mut self, ctx: &EvalContext, debug: &mut crate::debug::DebugState) {
+        loop {
+            match debug.command_rx.recv() {
+                Ok(crate::debug::DebugCommand::SetBreakpoints {
+                    file,
+                    breakpoints,
+                    reply,
+                }) => {
+                    let ids = debug.set_breakpoints_with_conditions(&file, &breakpoints);
+                    let _ = reply.send(ids);
+                }
+                Ok(crate::debug::DebugCommand::SetExceptionBreakpoints { break_on_uncaught }) => {
+                    debug.break_on_uncaught = break_on_uncaught;
+                }
+                Ok(crate::debug::DebugCommand::GetStackTrace { reply }) => {
+                    let _ = reply.send(self.debug_stack_trace());
+                }
+                Ok(crate::debug::DebugCommand::GetScopes { frame_id, reply }) => {
+                    let _ = reply.send(self.debug_scopes(frame_id));
+                }
+                Ok(crate::debug::DebugCommand::GetVariables { reference, reply }) => {
+                    let _ = reply.send(self.debug_variables(reference));
+                }
+                Ok(crate::debug::DebugCommand::Evaluate {
+                    frame_id,
+                    expression,
+                    reply,
+                }) => {
+                    let result = sema_reader::read(&expression)
+                        .map_err(|e| e.to_string())
+                        .and_then(|expr| {
+                            self.debug_evaluate_mut(frame_id, &expr, ctx, debug)
+                                .map(|value| self.debug_value_to_variable("result", value))
+                                .map_err(|e| e.to_string())
+                        });
+                    let _ = reply.send(result);
+                }
+                Ok(crate::debug::DebugCommand::SetVariable { reply, .. }) => {
+                    let _ = reply.send(Err(
+                        "setVariable is unavailable after an uncaught exception".to_string(),
+                    ));
+                }
+                // Any resume command, a disconnect, or a closed channel ends the
+                // park; the caller then propagates the uncaught error.
+                Ok(crate::debug::DebugCommand::Continue)
+                | Ok(crate::debug::DebugCommand::StepInto)
+                | Ok(crate::debug::DebugCommand::StepOver)
+                | Ok(crate::debug::DebugCommand::StepOut)
+                | Ok(crate::debug::DebugCommand::Pause)
+                | Ok(crate::debug::DebugCommand::Disconnect)
+                | Err(_) => break,
             }
         }
     }
@@ -296,11 +884,239 @@ impl VM {
         ctx: &EvalContext,
         debug: &mut crate::debug::DebugState,
     ) -> Result<crate::debug::VmExecResult, SemaError> {
-        self.run_inner(ctx, Some(debug))
+        // Resume a cooperative debug pause that occurred inside an async task: a
+        // scheduler-driving native (await/all/timeout/race/run) yielded the main
+        // VM for a task breakpoint. Before resuming the main VM, re-drive the
+        // scheduler so the paused task continues; if it pauses again surface the
+        // new stop, otherwise reconstruct the native's value and resume the main
+        // VM via the stack-top placeholder it left (`set_resume_value` semantics).
+        if let Some((target, how)) = sema_core::take_debug_coop_resume() {
+            // The paused task is about to be re-driven; inspecting it as "paused"
+            // is no longer meaningful (a later stop re-records a fresh id).
+            clear_coop_paused_task_id();
+            // The scheduler runs in debug mode for this re-drive too, so a later
+            // breakpoint in the same or a sibling task stops as well.
+            let _active = ActiveDebugGuard::enter(debug);
+            match sema_core::call_run_scheduler_target(ctx, target.clone()) {
+                Ok(sema_core::SchedulerRunResult::DebugPaused) => {
+                    // Paused again on another breakpoint. Re-arm the resume so the
+                    // NEXT call drives the scheduler once more, and surface the new
+                    // stop. (The native already consumed its yield; we re-store the
+                    // coop resume here since we took it above.)
+                    sema_core::set_debug_coop_resume(target, how);
+                    if let Some(info) = take_coop_task_stop() {
+                        // Resume was just re-armed above, so the guard's invariant
+                        // holds by construction here.
+                        return surface_coop_task_stop(info);
+                    }
+                    // Shouldn't happen, but don't wedge: fall through to a yield.
+                    return Ok(crate::debug::VmExecResult::Yielded);
+                }
+                Ok(_) => {
+                    // Target settled. Reconstruct the value the yielded native
+                    // (await/all/timeout/race/run) would have returned, put it on
+                    // the main VM's stack top (the native left a nil placeholder
+                    // there), and resume the main VM from after that native call.
+                    // A rejected/cancelled target surfaces as an error here — the
+                    // same error the native would have produced had it not paused.
+                    match reconstruct_coop_resume_value(&how) {
+                        Ok(resume_value) => {
+                            self.replace_stack_top(resume_value);
+                            return self.run_inner(ctx, Some(debug));
+                        }
+                        Err(e) => return Err(e),
+                    }
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        // Normal cooperative step (no pending debug-pause resume): run with the
+        // session registered so a task breakpoint hit during this step (e.g. the
+        // main VM reaches an await whose task then breaks) surfaces as a stop.
+        let _active = ActiveDebugGuard::enter(debug);
+        let result = self.run_inner(ctx, Some(debug))?;
+        if let Some(info) = take_coop_task_stop() {
+            return surface_coop_task_stop(info);
+        }
+        Ok(result)
     }
 
     /// Start cooperative debug execution: push the initial frame and run.
     pub fn start_cooperative(
+        &mut self,
+        closure: Rc<Closure>,
+        ctx: &EvalContext,
+        debug: &mut crate::debug::DebugState,
+    ) -> Result<crate::debug::VmExecResult, SemaError> {
+        // Session-boundary hygiene: a fresh cooperative session must not inherit
+        // ANY cooperative-debug state from a prior session that was abandoned
+        // (Stop) while paused at an async breakpoint. Without this, the next
+        // session's first Continue would consume a stale `DEBUG_COOP_RESUME` and
+        // re-drive a dead target — clobbering this program's VM stack — or surface
+        // a stale `COOP_TASK_STOP`, or inspect a leftover task by a reused id, or
+        // silently run an abandoned `Ready` task left in the reused scheduler.
+        // The normal resume path clears these thread-locals; this covers the
+        // Stop-while-paused path, which never resumes.
+        clear_coop_paused_task_id();
+        let _ = take_coop_task_stop();
+        let _ = sema_core::take_debug_coop_resume();
+        crate::scheduler::reset_scheduler_tasks();
+        self.ensure_cache_space(&closure.func);
+        let base = self.stack.len();
+        let n_locals = closure.func.chunk.n_locals as usize;
+        self.stack.resize(base + n_locals, Value::nil());
+        self.frames.push(CallFrame {
+            cache_base: closure.func.cache_offset,
+            closure,
+            pc: 0,
+            base,
+            open_upvalues: None,
+        });
+        // Register this DebugState as the active session so the async scheduler
+        // (reached via the RUN_SCHEDULER_CALLBACK seam during a native call) runs
+        // task steps in debug mode; a mid-task breakpoint then surfaces as a
+        // cooperative stop (see `step_task_debug`). The guard drops when control
+        // returns to JS — correct, since no scheduler runs between JS calls.
+        let _active = ActiveDebugGuard::enter(debug);
+        let result = self.run_inner(ctx, Some(debug))?;
+        // If a task breakpoint fired during this drive, the scheduler-driving
+        // native yielded the main VM (AsyncYield) and recorded the stop; surface
+        // it to JS as a cooperative Stop instead of the raw AsyncYield.
+        if let Some(info) = take_coop_task_stop() {
+            return surface_coop_task_stop(info);
+        }
+        Ok(result)
+    }
+
+    /// Number of active call frames.
+    pub fn frame_count(&self) -> usize {
+        self.frames.len()
+    }
+
+    fn run(&mut self, ctx: &EvalContext) -> Result<Value, SemaError> {
+        match self.run_inner(ctx, None)? {
+            crate::debug::VmExecResult::Finished(v) => Ok(v),
+            crate::debug::VmExecResult::Stopped(_) | crate::debug::VmExecResult::Yielded => {
+                unreachable!("Stopped/Yielded without debug state")
+            }
+            crate::debug::VmExecResult::AsyncYield(_) => Err(SemaError::eval(
+                "async yield outside of scheduler context".to_string(),
+            )),
+        }
+    }
+
+    /// Run `closure` with `args` as a nested frame on this *live* VM and return
+    /// its result, leaving the parent frames and stack intact.
+    ///
+    /// This is the in-VM routing path for stdlib higher-order callbacks (C1).
+    /// Because the closure executes on the same VM, its open upvalue cells stay
+    /// connected to the parent frame's live stack slots, so `set!` inside the
+    /// callback propagates back to the caller — fixing the divergence where the
+    /// fresh-VM fallback mutated a detached closed snapshot.
+    ///
+    /// The dispatch loop is bounded by `frame_floor`: it returns as soon as the
+    /// frame it pushed (and any frames pushed beneath it) have returned, without
+    /// unwinding the caller's frames.
+    fn run_nested_closure(
+        &mut self,
+        closure: Rc<Closure>,
+        args: &[Value],
+        ctx: &EvalContext,
+    ) -> Result<Value, SemaError> {
+        // Floor = the parent's current frame depth. After setup_for_call pushes
+        // the callee frame, the loop must stop unwinding once it pops back to
+        // this depth (rather than emptying the whole call stack).
+        let floor = self.frames.len();
+        let stack_floor = self.stack.len();
+        self.setup_for_call(closure, args)?;
+        let saved_floor = self.frame_floor;
+        self.frame_floor = floor;
+        let result = self.run_inner(ctx, None);
+        self.frame_floor = saved_floor;
+        match result {
+            Ok(crate::debug::VmExecResult::Finished(v)) => Ok(v),
+            Ok(crate::debug::VmExecResult::Stopped(_))
+            | Ok(crate::debug::VmExecResult::Yielded) => {
+                unreachable!("Stopped/Yielded without debug state")
+            }
+            Ok(crate::debug::VmExecResult::AsyncYield(_)) => {
+                // Re-entrant HOF callbacks are synchronous; a yield here cannot
+                // be resumed. Roll back the partial nested frames/stack so the
+                // parent VM stays consistent, then surface the same error the
+                // fresh-VM fallback would have produced.
+                self.frames.truncate(floor);
+                self.stack.truncate(stack_floor);
+                Err(SemaError::eval(
+                    "async yield outside of scheduler context".to_string(),
+                ))
+            }
+            Err(e) => {
+                // The error propagated past every handler in the nested frames
+                // without being caught. run_inner leaves those frames in place
+                // on error, so unwind them back to the parent's depth before
+                // returning so the parent VM can handle/propagate cleanly.
+                self.frames.truncate(floor);
+                self.stack.truncate(stack_floor);
+                Err(e)
+            }
+        }
+    }
+
+    /// Run the VM without debug state, returning the raw VmExecResult.
+    /// Used by the async scheduler for task execution and resume.
+    pub fn run_async(
+        &mut self,
+        ctx: &EvalContext,
+    ) -> Result<crate::debug::VmExecResult, SemaError> {
+        self.run_inner(ctx, None)
+    }
+
+    /// Debug-aware resume of an async task step: like [`run_async`] but with the
+    /// breakpoint/step machinery live (`run_inner(ctx, Some(debug))`). The async
+    /// scheduler uses this for parked-task resumes when a debug session is active,
+    /// so a breakpoint on a line that runs only inside the task can stop. A
+    /// returned `Stopped` is handled by the scheduler via [`handle_debug_stop`].
+    pub fn run_async_debug(
+        &mut self,
+        ctx: &EvalContext,
+        debug: &mut crate::debug::DebugState,
+    ) -> Result<crate::debug::VmExecResult, SemaError> {
+        self.run_inner(ctx, Some(debug))
+    }
+
+    /// Replace the top of the stack with a value.
+    /// Used by the scheduler to set the resume value before continuing
+    /// a yielded task (the yield left a nil placeholder on the stack).
+    pub fn replace_stack_top(&mut self, val: Value) {
+        if let Some(top) = self.stack.last_mut() {
+            *top = val;
+        }
+    }
+
+    /// Execute a closure and return the raw VmExecResult (for async scheduler).
+    pub fn execute_async(
+        &mut self,
+        closure: Rc<Closure>,
+        ctx: &EvalContext,
+    ) -> Result<crate::debug::VmExecResult, SemaError> {
+        self.ensure_cache_space(&closure.func);
+        let base = self.stack.len();
+        let n_locals = closure.func.chunk.n_locals as usize;
+        self.stack.resize(base + n_locals, Value::nil());
+        self.frames.push(CallFrame {
+            cache_base: closure.func.cache_offset,
+            closure,
+            pc: 0,
+            base,
+            open_upvalues: None,
+        });
+        self.run_inner(ctx, None)
+    }
+
+    /// Debug-aware first step of an async task: like [`execute_async`] but with the
+    /// breakpoint/step machinery live. Used by the scheduler to start a task when a
+    /// debug session is active.
+    pub fn execute_async_debug(
         &mut self,
         closure: Rc<Closure>,
         ctx: &EvalContext,
@@ -320,18 +1136,61 @@ impl VM {
         self.run_inner(ctx, Some(debug))
     }
 
-    /// Number of active call frames.
-    pub fn frame_count(&self) -> usize {
-        self.frames.len()
-    }
+    /// Prepare the VM to run `closure` with `args` already bound to its
+    /// parameters, but do not run it. The scheduler uses this to register
+    /// a closure-as-task whose first call will be `run_async`.
+    pub fn setup_for_call(
+        &mut self,
+        closure: Rc<Closure>,
+        args: &[Value],
+    ) -> Result<(), SemaError> {
+        let func = &closure.func;
+        let arity = func.arity as usize;
+        let has_rest = func.has_rest;
+        let n_locals = func.chunk.n_locals as usize;
 
-    fn run(&mut self, ctx: &EvalContext) -> Result<Value, SemaError> {
-        match self.run_inner(ctx, None)? {
-            crate::debug::VmExecResult::Finished(v) => Ok(v),
-            crate::debug::VmExecResult::Stopped(_) | crate::debug::VmExecResult::Yielded => {
-                unreachable!("Stopped/Yielded without debug state")
+        if has_rest {
+            if args.len() < arity {
+                return Err(SemaError::arity(
+                    func.name
+                        .map(resolve_spur)
+                        .unwrap_or_else(|| "<lambda>".to_string()),
+                    format!("{}+", arity),
+                    args.len(),
+                ));
+            }
+        } else if args.len() != arity {
+            return Err(SemaError::arity(
+                func.name
+                    .map(resolve_spur)
+                    .unwrap_or_else(|| "<lambda>".to_string()),
+                arity.to_string(),
+                args.len(),
+            ));
+        }
+
+        self.ensure_cache_space(func);
+        let base = self.stack.len();
+        self.stack.resize(base + n_locals, Value::nil());
+        if has_rest {
+            for i in 0..arity {
+                self.stack[base + i] = args.get(i).cloned().unwrap_or(Value::nil());
+            }
+            let rest: Vec<Value> = args[arity..].to_vec();
+            self.stack[base + arity] = Value::list(rest);
+        } else {
+            for i in 0..arity {
+                self.stack[base + i] = args.get(i).cloned().unwrap_or(Value::nil());
             }
         }
+        self.frames.push(CallFrame {
+            cache_base: func.cache_offset,
+            closure,
+            pc: 0,
+            base,
+            open_upvalues: None,
+        });
+        Ok(())
     }
 
     fn run_inner(
@@ -340,6 +1199,13 @@ impl VM {
         mut debug: Option<&mut crate::debug::DebugState>,
     ) -> Result<crate::debug::VmExecResult, SemaError> {
         // Raw-pointer macros for reading operands without bounds checks in inner loop
+        //
+        // SAFETY for read_u16!/read_u32!/read_i32!: $pc..$pc+N must be in-bounds
+        // for $code. The in-process emitter (sema-vm/src/lower.rs) emits complete
+        // instructions where every opcode is followed by its full operand bytes.
+        // Deserialized bytecode is validated by advance_pc in serialize.rs, which
+        // rejects truncated chunks. See FIXME(C11) above pop_unchecked for the
+        // known gap with hand-crafted .semac files.
         macro_rules! read_u16 {
             ($code:expr, $pc:expr) => {{
                 let v = unsafe { u16::from_le_bytes([*$code.add($pc), *$code.add($pc + 1)]) };
@@ -376,7 +1242,18 @@ impl VM {
             }};
         }
 
-        // Unsafe unchecked pop — valid when compiler guarantees stack correctness.
+        // Unsafe unchecked pop — valid when the bytecode is stack-balanced.
+        //
+        // SAFETY (C11 closed): every chunk reaching the VM is stack-balanced.
+        // In-process bytecode is balanced by construction (the compiler emits
+        // matched push/pop sequences). Deserialized `.semac` bytecode is proven
+        // balanced by the abstract stack-depth verifier in
+        // `crate::serialize::verify_stack_balance`, which runs inside
+        // `validate_bytecode` before `deserialize_from_bytes` returns and rejects
+        // any chunk where a reachable opcode could pop from an empty operand
+        // stack. That verifier is the safety guarantee for this `set_len` /
+        // `ptr::read`; the `debug_assert!` below catches verifier/dispatch drift
+        // in debug builds. See `docs/adr.md` ADR #56 and `docs/limitations.md` #32.
         #[inline(always)]
         unsafe fn pop_unchecked(stack: &mut Vec<Value>) -> Value {
             let len = stack.len();
@@ -401,6 +1278,19 @@ impl VM {
             }};
         }
 
+        // Snapshot the VM's base function table — the table used by the
+        // top-level main closure (and any closure carrying no explicit table).
+        // `self.functions` is reset from each frame's closure on every frame
+        // activation; this immutable snapshot is the fallback for `None`
+        // closures so it never observes a cross-module callee's swapped table
+        // (M4: import on the VM).
+        let base_functions = self.functions.clone();
+        // Snapshot the VM's base globals — the env the top-level main closure
+        // (which carries no explicit home env) resolves against. `self.globals`
+        // is kept pointing at the running frame's home env (below); this
+        // immutable snapshot is the fallback for `None` closures (M1).
+        let base_globals = self.globals.clone();
+
         // Two-level dispatch: outer loop caches frame locals, inner loop dispatches opcodes.
         // We only break to the outer loop when frames change (Call/TailCall/Return/exceptions).
         let mut debug_poll_counter: u32 = 0;
@@ -415,6 +1305,10 @@ impl VM {
                 }
             }
             dispatch_count += 1;
+            // Loop/recursion guard on every frame transition. Catches infinite
+            // tail recursion like `(define (loop) (loop))` (re-enters here on
+            // every TailCall) and honors step-limit / deadline / cancellation.
+            ctx.check_loop_interrupt()?;
             let fi = self.frames.len() - 1;
             let frame = &self.frames[fi];
             let code = frame.closure.func.chunk.code.as_ptr();
@@ -422,6 +1316,35 @@ impl VM {
             let base = frame.base;
             let mut pc = frame.pc;
             let code_len = frame.closure.func.chunk.code.len();
+            // Point `self.globals` and `self.functions` at the running closure's
+            // home env / function table (a `None` closure — the top-level main
+            // closure — uses the VM's base snapshots). The hot global opcodes
+            // read `self.globals` directly, so this pays no per-instruction cost.
+            // Skip the Rc clone when already current (the common same-VM case):
+            // tak-style call-dense code keeps the same env/table across millions
+            // of frames, so the ptr-eq guard avoids needless refcount churn while
+            // an imported (cross-module) closure still gets its own env/table
+            // restored, and the caller regains theirs on return (M1 + M4).
+            match &frame.closure.globals {
+                Some(g) if !Rc::ptr_eq(g, &self.globals) => {
+                    let g = g.clone();
+                    self.globals = g;
+                }
+                None if !Rc::ptr_eq(&self.globals, &base_globals) => {
+                    self.globals = base_globals.clone();
+                }
+                _ => {}
+            }
+            match &frame.closure.functions {
+                Some(f) if !Rc::ptr_eq(f, &self.functions) => {
+                    let f = f.clone();
+                    self.functions = f;
+                }
+                None if !Rc::ptr_eq(&self.functions, &base_functions) => {
+                    self.functions = base_functions.clone();
+                }
+                _ => {}
+            }
 
             // Cache the next span boundary to avoid binary_search per instruction
             let (mut next_span_idx, mut next_span_pc) = if debug.is_some() {
@@ -463,12 +1386,48 @@ impl VM {
                                 }
                                 crate::debug::DebugCommand::SetBreakpoints {
                                     file,
-                                    lines,
+                                    breakpoints,
                                     reply,
                                 } => {
-                                    let ids = dbg.set_breakpoints(&file, &lines);
+                                    let ids =
+                                        dbg.set_breakpoints_with_conditions(&file, &breakpoints);
                                     let _ = reply.send(ids);
                                 }
+                                crate::debug::DebugCommand::SetExceptionBreakpoints {
+                                    break_on_uncaught,
+                                } => {
+                                    dbg.break_on_uncaught = break_on_uncaught;
+                                }
+                                // State queries are valid while the program is
+                                // running. Reply with the current state instead
+                                // of dropping them: the DAP server blocks a
+                                // spawn_blocking thread on `reply_rx.recv()`, so
+                                // a dropped reply leaks that thread and hangs the
+                                // session (the `stackTrace`-while-running case).
+                                crate::debug::DebugCommand::GetStackTrace { reply } => {
+                                    self.frames[fi].pc = pc; // sync live pc for the trace
+                                    let _ = reply.send(self.debug_stack_trace());
+                                }
+                                crate::debug::DebugCommand::GetScopes { frame_id, reply } => {
+                                    let _ = reply.send(self.debug_scopes(frame_id));
+                                }
+                                crate::debug::DebugCommand::GetVariables { reference, reply } => {
+                                    let _ = reply.send(self.debug_variables(reference));
+                                }
+                                crate::debug::DebugCommand::Evaluate { reply, .. } => {
+                                    let _ = reply.send(Err(
+                                        "evaluate is only available while execution is stopped"
+                                            .to_string(),
+                                    ));
+                                }
+                                crate::debug::DebugCommand::SetVariable { reply, .. } => {
+                                    let _ = reply.send(Err(
+                                        "setVariable is only available while execution is stopped"
+                                            .to_string(),
+                                    ));
+                                }
+                                // Step/Continue have no paused frame to act on
+                                // while running; ignore them.
                                 _ => {}
                             }
                         }
@@ -552,7 +1511,9 @@ impl VM {
                         }
                         if !dbg.resume_skip {
                             let frame_depth = self.frames.len();
-                            if dbg.should_stop(file.as_ref(), line, frame_depth) {
+                            if dbg.should_stop(file.as_ref(), line, frame_depth)
+                                && self.debug_condition_allows_stop(file.as_ref(), line, dbg, ctx)
+                            {
                                 self.frames[fi].pc = pc - 1;
                                 let reason = if dbg.pause_requested {
                                     crate::debug::StopReason::Pause
@@ -606,8 +1567,18 @@ impl VM {
                         unsafe { pop_unchecked(&mut self.stack) };
                     }
                     op::DUP => {
-                        let val =
-                            unsafe { &*self.stack.as_ptr().add(self.stack.len() - 1) }.clone();
+                        // `len() - 1` underflows to usize::MAX on an empty stack and
+                        // reads far out of bounds (UB). A crafted .semac can declare a
+                        // `max_stack` that doesn't match actual stack effects and lead
+                        // with a bare DUP, so guard rather than trust the verifier.
+                        let val = match self.stack.last() {
+                            Some(v) => v.clone(),
+                            None => {
+                                return Err(SemaError::eval(
+                                    "DUP on empty stack (corrupt or malicious bytecode)",
+                                ))
+                            }
+                        };
                         self.stack.push(val);
                     }
 
@@ -661,14 +1632,14 @@ impl VM {
                         if entry.0 == bits && entry.1 == version {
                             self.stack.push(entry.2.clone());
                         } else {
-                            let spur: Spur = unsafe { std::mem::transmute::<u32, Spur>(bits) };
+                            let spur = bits_to_spur(bits);
                             match self.globals.get(spur) {
                                 Some(val) => {
                                     self.inline_cache[cache_idx] = (bits, version, val.clone());
                                     self.stack.push(val);
                                 }
                                 None => {
-                                    let err = SemaError::Unbound(resolve_spur(spur));
+                                    let err = unbound_global_error(spur, &self.globals);
                                     handle_err!(self, fi, pc, err, pc - op::SIZE_LOAD_GLOBAL, 'dispatch);
                                 }
                             }
@@ -676,7 +1647,7 @@ impl VM {
                     }
                     op::STORE_GLOBAL => {
                         let bits = read_u32!(code, pc);
-                        let spur: Spur = unsafe { std::mem::transmute::<u32, Spur>(bits) };
+                        let spur = bits_to_spur(bits);
                         let val = unsafe { pop_unchecked(&mut self.stack) };
                         if !self.globals.set_existing(spur, val.clone()) {
                             self.globals.set(spur, val);
@@ -684,7 +1655,7 @@ impl VM {
                     }
                     op::DEFINE_GLOBAL => {
                         let bits = read_u32!(code, pc);
-                        let spur: Spur = unsafe { std::mem::transmute::<u32, Spur>(bits) };
+                        let spur = bits_to_spur(bits);
                         let val = unsafe { pop_unchecked(&mut self.stack) };
                         self.globals.set(spur, val);
                     }
@@ -693,12 +1664,21 @@ impl VM {
                     op::JUMP => {
                         let offset = read_i32!(code, pc);
                         pc = (pc as i64 + offset as i64) as usize;
+                        // Backward jump = loop iteration boundary: run the
+                        // step-limit / deadline / cancellation guard so tight
+                        // loops like `(while #t)` are bounded and interruptible.
+                        if offset < 0 {
+                            ctx.check_loop_interrupt()?;
+                        }
                     }
                     op::JUMP_IF_FALSE => {
                         let offset = read_i32!(code, pc);
                         let val = unsafe { pop_unchecked(&mut self.stack) };
                         if !val.is_truthy() {
                             pc = (pc as i64 + offset as i64) as usize;
+                            if offset < 0 {
+                                ctx.check_loop_interrupt()?;
+                            }
                         }
                     }
                     op::JUMP_IF_TRUE => {
@@ -706,6 +1686,9 @@ impl VM {
                         let val = unsafe { pop_unchecked(&mut self.stack) };
                         if val.is_truthy() {
                             pc = (pc as i64 + offset as i64) as usize;
+                            if offset < 0 {
+                                ctx.check_loop_interrupt()?;
+                            }
                         }
                     }
 
@@ -715,10 +1698,21 @@ impl VM {
                         self.frames[fi].pc = pc;
                         let saved_pc = pc - op::SIZE_OP_U16;
                         if let Err(err) = self.call_value(argc, ctx) {
+                            // Drain any stale yield signal set before the error
+                            drop(sema_core::take_yield_signal());
                             match self.handle_exception(err, saved_pc)? {
                                 ExceptionAction::Handled => {}
                                 ExceptionAction::Propagate(e) => return Err(e),
                             }
+                        }
+                        // Check if a native function (dispatched via call_value)
+                        // signaled an async yield
+                        if let Some(reason) = sema_core::take_yield_signal() {
+                            if let Some(top) = self.stack.last_mut() {
+                                *top = Value::nil();
+                            }
+                            self.frames[fi].pc = pc;
+                            return Ok(crate::debug::VmExecResult::AsyncYield(reason));
                         }
                         continue 'dispatch;
                     }
@@ -727,10 +1721,21 @@ impl VM {
                         self.frames[fi].pc = pc;
                         let saved_pc = pc - op::SIZE_OP_U16;
                         if let Err(err) = self.tail_call_value(argc, ctx) {
+                            // Drain any stale yield signal set before the error
+                            drop(sema_core::take_yield_signal());
                             match self.handle_exception(err, saved_pc)? {
                                 ExceptionAction::Handled => {}
                                 ExceptionAction::Propagate(e) => return Err(e),
                             }
+                        }
+                        // Check if a native function (dispatched via tail_call_value
+                        // → call_value) signaled an async yield
+                        if let Some(reason) = sema_core::take_yield_signal() {
+                            if let Some(top) = self.stack.last_mut() {
+                                *top = Value::nil();
+                            }
+                            self.frames[fi].pc = pc;
+                            return Ok(crate::debug::VmExecResult::AsyncYield(reason));
                         }
                         continue 'dispatch;
                     }
@@ -747,7 +1752,10 @@ impl VM {
                         }
                         let frame = self.frames.pop().unwrap();
                         self.stack.truncate(frame.base);
-                        if self.frames.is_empty() {
+                        if self.frames.len() == self.frame_floor {
+                            // Either the top-level program finished (floor == 0)
+                            // or a re-entrant nested closure returned to its
+                            // native caller (floor raised by run_nested_closure).
                             return Ok(crate::debug::VmExecResult::Finished(result));
                         }
                         self.stack.push(result);
@@ -769,26 +1777,51 @@ impl VM {
 
                         // Direct dispatch: index into pre-resolved native function table.
                         // No env lookup, no cache — resolved at VM creation.
-                        debug_assert!(
-                            native_id < self.native_fns.len(),
-                            "CallNative invalid native_id {native_id}"
-                        );
-
-                        // Close open upvalues before non-VM call (native may invoke VM closures via callback)
-                        if let Some(ref mut open) = self.frames[fi].open_upvalues {
-                            close_open_upvalues(open, &self.stack, base);
+                        // Real bounds check (not debug_assert!): a crafted .semac can
+                        // carry an out-of-range native_id that passes load-time
+                        // validation, and the index below would panic in release.
+                        if native_id >= self.native_fns.len() {
+                            return Err(SemaError::eval(format!(
+                                "CallNative: native_id {} out of range (table has {} entries)",
+                                native_id,
+                                self.native_fns.len()
+                            )));
                         }
 
-                        // Borrow args directly from stack (no Vec allocation).
-                        // Rc::clone is cheap; it avoids holding &self.native_fns
-                        // and &self.stack simultaneously.
+                        // C1: keep open upvalues open across the call so a
+                        // re-entrant in-VM HOF callback (routed via
+                        // try_run_on_current_vm) can write `set!` back through
+                        // them. Closures that instead cross onto a foreign stack
+                        // (fresh fallback VM / async task VM) are snapshotted at
+                        // that crossing point (see close_closure_upvalues_for_foreign_run).
                         let native = self.native_fns[native_id].clone();
                         let args_start = self.stack.len() - argc;
-                        let result = (native.func)(ctx, &self.stack[args_start..]);
-                        self.stack.truncate(args_start);
+                        // Copy args into an owned Vec and drop them from the stack
+                        // before the call so no borrow of self.stack is held while
+                        // the native may re-enter this VM (run_nested_closure needs
+                        // &mut self via the CURRENT_VM pointer).
+                        let call_args: Vec<Value> = self.stack.split_off(args_start);
+                        let result = {
+                            let _vm_guard = CurrentVmGuard::enter(self);
+                            (native.func)(ctx, &call_args)
+                        };
                         match result {
-                            Ok(val) => self.stack.push(val),
+                            Ok(val) => {
+                                // Check if the native function signaled an async yield
+                                if let Some(reason) = sema_core::take_yield_signal() {
+                                    // Args are already truncated. Push nil as a placeholder
+                                    // for the call result slot. On resume, the scheduler will
+                                    // pop this and push the actual resume value before
+                                    // continuing execution.
+                                    self.stack.push(Value::nil());
+                                    self.frames[fi].pc = pc; // PC already past CALL_NATIVE
+                                    return Ok(crate::debug::VmExecResult::AsyncYield(reason));
+                                }
+                                self.stack.push(val);
+                            }
                             Err(err) => {
+                                // Drain any stale yield signal set before the error
+                                drop(sema_core::take_yield_signal());
                                 handle_err!(self, fi, pc, err, saved_pc, 'dispatch);
                             }
                         }
@@ -799,13 +1832,13 @@ impl VM {
                     op::MAKE_LIST => {
                         let n = read_u16!(code, pc) as usize;
                         let start = self.stack.len() - n;
-                        let items: Vec<Value> = self.stack.drain(start..).collect();
+                        let items = self.stack.split_off(start);
                         self.stack.push(Value::list(items));
                     }
                     op::MAKE_VECTOR => {
                         let n = read_u16!(code, pc) as usize;
                         let start = self.stack.len() - n;
-                        let items: Vec<Value> = self.stack.drain(start..).collect();
+                        let items = self.stack.split_off(start);
                         self.stack.push(Value::vector(items));
                     }
                     op::MAKE_MAP => {
@@ -926,6 +1959,12 @@ impl VM {
                     // These operate directly on raw u64 bits to avoid Clone/Drop overhead.
                     // Small ints are immediates (no heap pointer), so we can safely
                     // overwrite stack slots and adjust length without running destructors.
+                    //
+                    // SAFETY: *_INT opcodes are emitted only when the compiler has placed
+                    // two values on the stack (lower.rs guarantees this). The NAN_TAG_MASK
+                    // check confirms both slots hold small-int immediates — pure bit patterns
+                    // with no Rc to leak — so ptr::write skipping Drop is safe. The result
+                    // bits encode a valid small-int Value (NAN_INT_SMALL_PATTERN | 45-bit payload).
                     op::ADD_INT => {
                         let len = self.stack.len();
                         let a_bits = unsafe { (*self.stack.as_ptr().add(len - 2)).raw_bits() };
@@ -933,12 +1972,19 @@ impl VM {
                         if (a_bits & NAN_TAG_MASK) == NAN_INT_SMALL_PATTERN
                             && (b_bits & NAN_TAG_MASK) == NAN_INT_SMALL_PATTERN
                         {
-                            let sum = (a_bits.wrapping_add(b_bits)) & NAN_PAYLOAD_MASK;
-                            let result = NAN_INT_SMALL_PATTERN | sum;
+                            // Sign-extend to i64 and add through Value::int, which boxes
+                            // the result when it overflows the 45-bit small-int range.
+                            // (The old raw-bit `& NAN_PAYLOAD_MASK` trick silently
+                            // truncated sums past ±2^44 — see the dual-eval
+                            // big_int_add_* regression tests.)
+                            let ax =
+                                (((a_bits & NAN_PAYLOAD_MASK) << SIGN_SHIFT) as i64) >> SIGN_SHIFT;
+                            let bx =
+                                (((b_bits & NAN_PAYLOAD_MASK) << SIGN_SHIFT) as i64) >> SIGN_SHIFT;
                             unsafe {
                                 std::ptr::write(
                                     self.stack.as_mut_ptr().add(len - 2),
-                                    Value::from_raw_bits(result),
+                                    Value::int(ax.wrapping_add(bx)),
                                 );
                                 self.stack.set_len(len - 1);
                             }
@@ -960,12 +2006,17 @@ impl VM {
                         if (a_bits & NAN_TAG_MASK) == NAN_INT_SMALL_PATTERN
                             && (b_bits & NAN_TAG_MASK) == NAN_INT_SMALL_PATTERN
                         {
-                            let diff = (a_bits.wrapping_sub(b_bits)) & NAN_PAYLOAD_MASK;
-                            let result = NAN_INT_SMALL_PATTERN | diff;
+                            // Sign-extend to i64 and subtract through Value::int, which
+                            // boxes the result when it overflows the 45-bit small-int
+                            // range (a raw-bit subtract would truncate past ±2^44).
+                            let ax =
+                                (((a_bits & NAN_PAYLOAD_MASK) << SIGN_SHIFT) as i64) >> SIGN_SHIFT;
+                            let bx =
+                                (((b_bits & NAN_PAYLOAD_MASK) << SIGN_SHIFT) as i64) >> SIGN_SHIFT;
                             unsafe {
                                 std::ptr::write(
                                     self.stack.as_mut_ptr().add(len - 2),
-                                    Value::from_raw_bits(result),
+                                    Value::int(ax.wrapping_sub(bx)),
                                 );
                                 self.stack.set_len(len - 1);
                             }
@@ -1048,7 +2099,7 @@ impl VM {
                         if (a_bits & NAN_TAG_MASK) == NAN_INT_SMALL_PATTERN
                             && (b_bits & NAN_TAG_MASK) == NAN_INT_SMALL_PATTERN
                         {
-                            // Small ints: equal iff same bits
+                            // Small ints: equal exactly when their bits match
                             unsafe {
                                 std::ptr::write(
                                     self.stack.as_mut_ptr().add(len - 2),
@@ -1092,14 +2143,14 @@ impl VM {
                         let func_val = if entry.0 == bits && entry.1 == version {
                             entry.2.clone()
                         } else {
-                            let spur: Spur = unsafe { std::mem::transmute::<u32, Spur>(bits) };
+                            let spur = bits_to_spur(bits);
                             match self.globals.get(spur) {
                                 Some(val) => {
                                     self.inline_cache[cache_idx] = (bits, version, val.clone());
                                     val
                                 }
                                 None => {
-                                    let err = SemaError::Unbound(resolve_spur(spur));
+                                    let err = unbound_global_error(spur, &self.globals);
                                     handle_err!(self, fi, pc, err, saved_pc, 'dispatch);
                                 }
                             }
@@ -1138,10 +2189,22 @@ impl VM {
 
                         // Slow path: non-VM callable — use call_value_with
                         if let Err(err) = self.call_value_with(func_val, argc, ctx) {
+                            drop(sema_core::take_yield_signal());
                             match self.handle_exception(err, saved_pc)? {
                                 ExceptionAction::Handled => {}
                                 ExceptionAction::Propagate(e) => return Err(e),
                             }
+                        }
+                        // Check if a native function (called via call_value_with) signaled async yield
+                        if let Some(reason) = sema_core::take_yield_signal() {
+                            // call_value_with already pushed a result value. Replace it
+                            // with nil placeholder. On resume, the scheduler replaces
+                            // this with the actual resume value.
+                            if let Some(top) = self.stack.last_mut() {
+                                *top = Value::nil();
+                            }
+                            self.frames[fi].pc = pc; // PC already past CALL_GLOBAL
+                            return Ok(crate::debug::VmExecResult::AsyncYield(reason));
                         }
                         continue 'dispatch;
                     }
@@ -1302,7 +2365,8 @@ impl VM {
                             self.stack
                                 .push(map.get(&key).cloned().unwrap_or(Value::nil()));
                         } else {
-                            let err = SemaError::type_error("map or hashmap", coll.type_name());
+                            let err = SemaError::type_error("map or hashmap", coll.type_name())
+                                .with_hint(map_access_hint("get", &coll));
                             handle_err!(self, fi, pc, err, pc - op::SIZE_OP, 'dispatch);
                         }
                     }
@@ -1314,7 +2378,8 @@ impl VM {
                         } else if let Some(map) = coll.as_map_ref() {
                             self.stack.push(Value::bool(map.contains_key(&key)));
                         } else {
-                            let err = SemaError::type_error("map or hashmap", coll.type_name());
+                            let err = SemaError::type_error("map or hashmap", coll.type_name())
+                                .with_hint(map_access_hint("contains?", &coll));
                             handle_err!(self, fi, pc, err, pc - op::SIZE_OP, 'dispatch);
                         }
                     }
@@ -1349,11 +2414,28 @@ impl VM {
                     op::NTH => {
                         let idx_val = unsafe { pop_unchecked(&mut self.stack) };
                         let coll = unsafe { pop_unchecked(&mut self.stack) };
-                        let idx = if let Some(i) = idx_val.as_int() {
-                            i as usize
-                        } else {
-                            let err = SemaError::type_error("int", idx_val.type_name());
-                            handle_err!(self, fi, pc, err, pc - op::SIZE_OP, 'dispatch);
+                        let idx = match idx_val.as_int() {
+                            Some(i) if i >= 0 => i as usize,
+                            Some(i) => {
+                                let err = SemaError::eval(format!(
+                                    "nth: index must be non-negative, got {i}"
+                                ));
+                                handle_err!(self, fi, pc, err, pc - op::SIZE_OP, 'dispatch);
+                            }
+                            None => {
+                                // A collection in the index slot almost always
+                                // means the args are swapped — nth is (nth coll idx).
+                                let swapped =
+                                    idx_val.as_list().is_some() || idx_val.as_vector().is_some();
+                                let hint = if swapped {
+                                    "nth: argument order is (nth collection index) — looks like the arguments are swapped"
+                                } else {
+                                    "nth: argument order is (nth collection index); the index must be an integer"
+                                };
+                                let err = SemaError::type_error("int", idx_val.type_name())
+                                    .with_hint(hint);
+                                handle_err!(self, fi, pc, err, pc - op::SIZE_OP, 'dispatch);
+                            }
                         };
                         if let Some(l) = coll.as_list() {
                             match l.get(idx) {
@@ -1383,6 +2465,61 @@ impl VM {
                             let err = SemaError::type_error("list or vector", coll.type_name());
                             handle_err!(self, fi, pc, err, pc - op::SIZE_OP, 'dispatch);
                         }
+                    }
+
+                    // --- String intrinsics (semantics mirror sema-stdlib/src/string.rs) ---
+                    op::STRING_LENGTH => {
+                        let val = unsafe { pop_unchecked(&mut self.stack) };
+                        if let Some(s) = val.as_str() {
+                            self.stack.push(Value::int(s.chars().count() as i64));
+                        } else {
+                            let err = SemaError::type_error("string", val.type_name());
+                            handle_err!(self, fi, pc, err, pc - op::SIZE_OP, 'dispatch);
+                        }
+                    }
+                    op::STRING_REF => {
+                        let idx_val = unsafe { pop_unchecked(&mut self.stack) };
+                        let str_val = unsafe { pop_unchecked(&mut self.stack) };
+                        let Some(s) = str_val.as_str() else {
+                            let err = SemaError::type_error("string", str_val.type_name());
+                            handle_err!(self, fi, pc, err, pc - op::SIZE_OP, 'dispatch);
+                        };
+                        let Some(idx_signed) = idx_val.as_int() else {
+                            let err = SemaError::type_error("int", idx_val.type_name());
+                            handle_err!(self, fi, pc, err, pc - op::SIZE_OP, 'dispatch);
+                        };
+                        if idx_signed < 0 {
+                            let err = SemaError::eval(format!(
+                                "string-ref: index {idx_signed} must be non-negative"
+                            ));
+                            handle_err!(self, fi, pc, err, pc - op::SIZE_OP, 'dispatch);
+                        }
+                        let idx = idx_signed as usize;
+                        match s.chars().nth(idx) {
+                            Some(c) => self.stack.push(Value::char(c)),
+                            None => {
+                                let len = s.chars().count();
+                                let err = SemaError::eval(format!(
+                                    "string-ref: index {idx} out of bounds (string length {len})"
+                                ))
+                                .with_hint("indices are 0-based");
+                                handle_err!(self, fi, pc, err, pc - op::SIZE_OP, 'dispatch);
+                            }
+                        }
+                    }
+                    op::STRING_APPEND => {
+                        use std::fmt::Write;
+                        let b = unsafe { pop_unchecked(&mut self.stack) };
+                        let a = unsafe { pop_unchecked(&mut self.stack) };
+                        let mut result = String::new();
+                        for arg in [&a, &b] {
+                            if let Some(s) = arg.as_str() {
+                                result.push_str(s);
+                            } else {
+                                write!(&mut result, "{}", arg).unwrap();
+                            }
+                        }
+                        self.stack.push(Value::string(&result));
                     }
 
                     _ => {
@@ -1423,16 +2560,18 @@ impl VM {
                 }
                 return self.call_vm_closure(closure, argc);
             }
-            // Close open upvalues before non-VM call (native may invoke VM closures via callback)
-            let caller_base = self.frames.last().unwrap().base;
-            if let Some(ref mut open) = self.frames.last_mut().unwrap().open_upvalues {
-                close_open_upvalues(open, &self.stack, caller_base);
-            }
-            // Regular native fn — borrow args directly from stack (no Vec allocation)
+            // C1: keep open upvalues open across the call so a re-entrant
+            // in-VM HOF callback can write back through them. Copy args into an
+            // owned Vec (releasing the stack borrow) so the native may re-enter
+            // this VM via run_nested_closure. Closures crossing onto a foreign
+            // stack are snapshotted at the crossing point.
             let func_rc = self.stack[func_idx].as_native_fn_rc().unwrap();
-            let args_start = func_idx + 1;
-            let result = (func_rc.func)(ctx, &self.stack[args_start..]);
-            self.stack.truncate(func_idx);
+            let call_args: Vec<Value> = self.stack.split_off(func_idx + 1);
+            self.stack.pop(); // pop the native fn value
+            let result = {
+                let _vm_guard = CurrentVmGuard::enter(self);
+                (func_rc.func)(ctx, &call_args)
+            };
             result.map(|val| self.stack.push(val))?;
             Ok(())
         } else if let Some(kw) = self.stack[func_idx].as_keyword_spur() {
@@ -1453,18 +2592,18 @@ impl VM {
             self.stack.push(result);
             Ok(())
         } else {
-            // Close open upvalues before non-VM call (callback may invoke VM closures)
-            let caller_base = self.frames.last().unwrap().base;
-            if let Some(ref mut open) = self.frames.last_mut().unwrap().open_upvalues {
-                close_open_upvalues(open, &self.stack, caller_base);
-            }
-            // Lambda or other callable — borrow args directly from stack.
-            // Safety: call_callback dispatches to the tree-walking evaluator,
-            // which has its own environment and does not mutate the VM's stack.
+            // C1: keep upvalues open across the callback. The callback may
+            // re-enter this VM (e.g. a multimethod whose handler is a VM
+            // closure). Copy args into an owned Vec so no stack borrow is held
+            // during the (possibly re-entrant) call. Closures crossing onto a
+            // foreign stack are snapshotted at the crossing point.
             let func_val = self.stack[func_idx].clone();
-            let args_start = func_idx + 1;
-            let result = sema_core::call_callback(ctx, &func_val, &self.stack[args_start..]);
-            self.stack.truncate(func_idx);
+            let call_args: Vec<Value> = self.stack.split_off(func_idx + 1);
+            self.stack.pop(); // pop the callable value
+            let result = {
+                let _vm_guard = CurrentVmGuard::enter(self);
+                sema_core::call_callback(ctx, &func_val, &call_args)
+            };
             let result = result?;
             self.stack.push(result);
             Ok(())
@@ -1511,15 +2650,16 @@ impl VM {
         ctx: &EvalContext,
     ) -> Result<(), SemaError> {
         if func_val.raw_tag() == Some(TAG_NATIVE_FN) {
-            // Close open upvalues before non-VM call (native may invoke VM closures via callback)
-            let caller_base = self.frames.last().unwrap().base;
-            if let Some(ref mut open) = self.frames.last_mut().unwrap().open_upvalues {
-                close_open_upvalues(open, &self.stack, caller_base);
-            }
+            // C1: keep upvalues open; copy args so the native may re-enter this
+            // VM via run_nested_closure without an outstanding stack borrow.
+            // Closures crossing onto a foreign stack are snapshotted there.
             let func_rc = func_val.as_native_fn_rc().unwrap();
             let args_start = self.stack.len() - argc;
-            let result = (func_rc.func)(ctx, &self.stack[args_start..]);
-            self.stack.truncate(args_start);
+            let call_args: Vec<Value> = self.stack.split_off(args_start);
+            let result = {
+                let _vm_guard = CurrentVmGuard::enter(self);
+                (func_rc.func)(ctx, &call_args)
+            };
             result.map(|val| self.stack.push(val))?;
             Ok(())
         } else if let Some(kw) = func_val.as_keyword_spur() {
@@ -1538,16 +2678,15 @@ impl VM {
             self.stack.push(result);
             Ok(())
         } else {
-            // Close open upvalues before non-VM call (callback may invoke VM closures)
-            let caller_base = self.frames.last().unwrap().base;
-            if let Some(ref mut open) = self.frames.last_mut().unwrap().open_upvalues {
-                close_open_upvalues(open, &self.stack, caller_base);
-            }
-            // Safety: call_callback dispatches to the tree-walking evaluator,
-            // which does not mutate the VM's stack.
+            // C1: keep upvalues open; copy args so a re-entrant callback can
+            // run in-VM without an outstanding stack borrow. Closures crossing
+            // onto a foreign stack are snapshotted at the crossing point.
             let args_start = self.stack.len() - argc;
-            let result = sema_core::call_callback(ctx, &func_val, &self.stack[args_start..]);
-            self.stack.truncate(args_start);
+            let call_args: Vec<Value> = self.stack.split_off(args_start);
+            let result = {
+                let _vm_guard = CurrentVmGuard::enter(self);
+                sema_core::call_callback(ctx, &func_val, &call_args)
+            };
             let result = result?;
             self.stack.push(result);
             Ok(())
@@ -1565,6 +2704,9 @@ impl VM {
         if self.frames.len() >= MAX_FRAMES {
             return Err(SemaError::eval(
                 "stack overflow: maximum call depth exceeded",
+            )
+            .with_hint(
+                "this usually means unbounded recursion; ensure recursive calls are in tail position for TCO, or use 'do' for iteration",
             ));
         }
         self.ensure_cache_space(&closure.func);
@@ -1626,6 +2768,9 @@ impl VM {
         if self.frames.len() >= MAX_FRAMES {
             return Err(SemaError::eval(
                 "stack overflow: maximum call depth exceeded",
+            )
+            .with_hint(
+                "this usually means unbounded recursion; ensure recursive calls are in tail position for TCO, or use 'do' for iteration",
             ));
         }
         self.ensure_cache_space(&closure.func);
@@ -1817,19 +2962,37 @@ impl VM {
         // Update pc past the entire instruction
         self.frames.last_mut().unwrap().pc = uv_pc;
 
-        let closure = Rc::new(Closure { func, upvalues });
+        // Concretize the closure's home globals: the env the defining frame
+        // resolves globals against. The defining frame's closure carries
+        // `Some(home)` if it was itself a MakeClosure result, or `None` if it
+        // is the top-level main closure — in which case the home is the VM's
+        // own globals. Recording a concrete `Some(home)` here keeps the closure
+        // correct if it is later exported and run inside a different VM (M1).
+        let home_globals = match &self.frames.last().unwrap().closure.globals {
+            Some(g) => g.clone(),
+            None => self.globals.clone(),
+        };
+
+        let closure = Rc::new(Closure {
+            func,
+            upvalues,
+            globals: Some(home_globals.clone()),
+            // The new closure's func-ids index the table the defining frame is
+            // running against (set per frame activation in the dispatch loop).
+            functions: Some(self.functions.clone()),
+        });
         let payload: Rc<dyn std::any::Any> = Rc::new(VmClosurePayload {
             closure: closure.clone(),
             functions: self.functions.clone(),
         });
         let closure_for_fallback = closure.clone();
         let functions = self.functions.clone();
-        let globals = self.globals.clone();
+        let globals = home_globals;
 
         // The NativeFn wrapper is used as a fallback when called from outside the VM
         // (e.g., from stdlib HOFs like map/filter). Inside the VM, call_value detects
         // the payload and pushes a CallFrame instead — no Rust recursion.
-        let native = Value::native_fn_from_rc(Rc::new(sema_core::NativeFn::with_payload(
+        let mut native_fn = sema_core::NativeFn::with_payload(
             closure_for_fallback
                 .func
                 .name
@@ -1837,57 +3000,48 @@ impl VM {
                 .unwrap_or_else(|| "<vm-closure>".to_string()),
             payload,
             move |ctx, args| {
+                // Inside an async task, route through the scheduler so any
+                // yield in the inner closure (channel/send, channel/recv,
+                // await, sleep) suspends cleanly. Otherwise the inner VM's
+                // AsyncYield would surface as "async yield outside of
+                // scheduler context" and crash the calling HOF.
+                if sema_core::in_async_context() {
+                    // In async context the VM call sites close this closure's
+                    // open upvalues before invoking the HOF (see call_value /
+                    // CALL_NATIVE), so the cells are already snapshotted and safe
+                    // to run on the fresh task VM stack.
+                    return crate::scheduler::run_closure_as_inline_task(
+                        ctx,
+                        closure_for_fallback.clone(),
+                        functions.clone(),
+                        args,
+                    );
+                }
+
+                // C1: if this closure belongs to a VM currently running a native
+                // call on this thread (e.g. a stdlib HOF like map/filter/foldl
+                // invoked us), run it as a nested frame on that *live* VM. This
+                // keeps the closure's open upvalue cells connected to the
+                // parent's stack slots so `set!` mutations flow back to the
+                // caller. Falls back to a fresh VM only when no compatible VM is
+                // on the stack (e.g. called directly from the tree-walker).
+                if let Some(result) =
+                    try_run_on_current_vm(&closure_for_fallback, &functions, &globals, args, ctx)
+                {
+                    return result;
+                }
+
+                // Foreign fresh VM: snapshot open upvalues against the owning
+                // VM (if any) before running on a different stack.
+                close_closure_upvalues_for_foreign_run(&closure_for_fallback);
                 let mut vm = VM::new_with_rc_functions(globals.clone(), functions.clone());
-                let func = &closure_for_fallback.func;
-                let arity = func.arity as usize;
-                let has_rest = func.has_rest;
-                let n_locals = func.chunk.n_locals as usize;
-
-                if has_rest {
-                    if args.len() < arity {
-                        return Err(SemaError::arity(
-                            func.name
-                                .map(resolve_spur)
-                                .unwrap_or_else(|| "<lambda>".to_string()),
-                            format!("{}+", arity),
-                            args.len(),
-                        ));
-                    }
-                } else if args.len() != arity {
-                    return Err(SemaError::arity(
-                        func.name
-                            .map(resolve_spur)
-                            .unwrap_or_else(|| "<lambda>".to_string()),
-                        arity.to_string(),
-                        args.len(),
-                    ));
-                }
-
-                vm.stack.resize(n_locals, Value::nil());
-
-                if has_rest {
-                    for i in 0..arity {
-                        vm.stack[i] = args.get(i).cloned().unwrap_or(Value::nil());
-                    }
-                    let rest: Vec<Value> = args[arity..].to_vec();
-                    vm.stack[arity] = Value::list(rest);
-                } else {
-                    for i in 0..arity {
-                        vm.stack[i] = args.get(i).cloned().unwrap_or(Value::nil());
-                    }
-                }
-
-                vm.ensure_cache_space(&closure_for_fallback.func);
-                vm.frames.push(CallFrame {
-                    cache_base: closure_for_fallback.func.cache_offset,
-                    closure: closure_for_fallback.clone(),
-                    pc: 0,
-                    base: 0,
-                    open_upvalues: None,
-                });
+                vm.setup_for_call(closure_for_fallback.clone(), args)?;
                 vm.run(ctx)
             },
-        )));
+        );
+        // Mark this wrapper so `type`/`type_name` report `:lambda`, not `:native-fn`.
+        native_fn.is_closure = true;
+        let native = Value::native_fn_from_rc(Rc::new(native_fn));
 
         self.stack.push(native);
         Ok(())
@@ -1897,14 +3051,69 @@ impl VM {
 
     #[cold]
     #[inline(never)]
+    /// Capture the current VM call stack as a `StackTrace` for error reporting.
+    ///
+    /// Walks `self.frames` top-to-bottom (innermost first), mirroring
+    /// `debug_stack_trace` but producing `sema_core::CallFrame` instead of
+    /// `DapStackFrame`. For the innermost frame, decodes the opcode at
+    /// `failing_pc` to synthesize a leading intrinsic frame (e.g. `+`, `car`)
+    /// when the error originated from an inline opcode rather than a function
+    /// call.
+    fn capture_vm_stack_trace(&self, failing_pc: usize) -> StackTrace {
+        let mut frames: Vec<CoreCallFrame> = Vec::new();
+
+        // Try to synthesize an intrinsic frame for the innermost opcode.
+        if let Some(top) = self.frames.last() {
+            let code = &top.closure.func.chunk.code;
+            if failing_pc < code.len() {
+                let opcode = Op::from_u8(code[failing_pc]);
+                if let Some(name) = opcode.and_then(intrinsic_name) {
+                    let span = self.span_at_pc_raw(top, failing_pc);
+                    frames.push(CoreCallFrame {
+                        name: name.to_string(),
+                        file: top.closure.func.source_file.clone(),
+                        span,
+                    });
+                }
+            }
+        }
+
+        // Walk frames innermost-to-outermost.
+        for (i, frame) in self.frames.iter().rev().enumerate() {
+            let func = &frame.closure.func;
+            let name = func
+                .name
+                .map(resolve_spur)
+                .unwrap_or_else(|| "<lambda>".to_string());
+            // Use failing_pc for the innermost frame, frame.pc for the rest.
+            let pc = if i == 0 { failing_pc } else { frame.pc };
+            let span = self.span_at_pc_raw(frame, pc);
+            frames.push(CoreCallFrame {
+                name,
+                file: func.source_file.clone(),
+                span,
+            });
+        }
+
+        StackTrace(frames)
+    }
+
     fn handle_exception(
         &mut self,
-        err: SemaError,
+        mut err: SemaError,
         failing_pc: usize,
     ) -> Result<ExceptionAction, SemaError> {
+        // Capture the stack trace before unwinding frames.
+        let trace = self.capture_vm_stack_trace(failing_pc);
+        err = err.with_stack_trace(trace);
+
         let mut pc_for_lookup = failing_pc as u32;
-        // Walk frames from top looking for a handler
-        while let Some(frame) = self.frames.last() {
+        // Walk frames from top looking for a handler. Stop at `frame_floor`:
+        // during a re-entrant nested run (run_nested_closure) the frames below
+        // the floor belong to the parent VM execution, which must handle or
+        // propagate the error itself once control returns to it.
+        while self.frames.len() > self.frame_floor {
+            let frame = self.frames.last().unwrap();
             let chunk = &frame.closure.func.chunk;
 
             // Check exception table for this frame
@@ -1986,32 +3195,79 @@ impl VM {
             .collect()
     }
 
-    pub fn debug_locals(&self, frame_idx: usize) -> Vec<crate::debug::DapVariable> {
-        let Some(frame) = self.frames.get(frame_idx) else {
+    /// Locals in scope at the frame's current pc, as `(slot, name-spur)`, with
+    /// the innermost binding chosen when a name is shadowed by nested blocks.
+    ///
+    /// A slot with recorded block scopes (`let`/`do` bindings) is in scope only
+    /// while pc lies within one of them — hiding not-yet-bound and already-exited
+    /// block locals. Params and slots with no recorded scope (e.g. functions
+    /// loaded from bytecode, which carry no `local_scopes`) are always in scope.
+    /// This is the single source of truth used by the locals display and by the
+    /// `setVariable` / `set!` write-back and `evaluate` read paths, so all three
+    /// resolve a shadowed name to the same slot.
+    fn in_scope_locals(&self, frame_id: usize) -> Vec<(u16, Spur)> {
+        let Some(frame) = self.frames.get(frame_id) else {
             return Vec::new();
         };
+        let pc = frame.pc as u32;
         let func = &frame.closure.func;
-        let mut vars = Vec::new();
+        // name -> (slot, spur, priority); higher priority = innermost block.
+        let mut chosen: hashbrown::HashMap<String, (u16, Spur, u32)> = hashbrown::HashMap::new();
         for &(slot, spur) in &func.local_names {
-            let idx = frame.base + slot as usize;
+            let mut scopes = func
+                .local_scopes
+                .iter()
+                .filter(|(s, _, _)| *s == slot)
+                .peekable();
+            let priority = if scopes.peek().is_none() {
+                0 // param / no scope info: always in scope, lowest priority
+            } else {
+                match scopes
+                    .filter(|(_, start, end)| pc >= *start && pc < *end)
+                    .map(|(_, start, _)| *start)
+                    .max()
+                {
+                    Some(start) => start.saturating_add(1),
+                    None => continue, // out of scope at this pc
+                }
+            };
+            let name = sema_core::resolve(spur);
+            match chosen.get(&name) {
+                Some((_, _, p)) if *p >= priority => {}
+                _ => {
+                    chosen.insert(name, (slot, spur, priority));
+                }
+            }
+        }
+        let mut result: Vec<(u16, Spur)> = chosen
+            .into_values()
+            .map(|(slot, spur, _)| (slot, spur))
+            .collect();
+        result.sort_by_key(|(slot, _)| *slot);
+        result
+    }
+
+    pub fn debug_locals(&mut self, frame_idx: usize) -> Vec<crate::debug::DapVariable> {
+        let Some(base) = self.frames.get(frame_idx).map(|f| f.base) else {
+            return Vec::new();
+        };
+        let in_scope = self.in_scope_locals(frame_idx);
+        let mut vars = Vec::new();
+        for (slot, spur) in in_scope {
+            let idx = base + slot as usize;
             let val = self.stack.get(idx).cloned().unwrap_or(Value::nil());
-            vars.push(crate::debug::DapVariable {
-                name: sema_core::resolve(spur),
-                value: sema_core::pretty_print(&val, 80),
-                type_name: val.type_name().to_string(),
-                variables_reference: 0,
-            });
+            vars.push(self.debug_value_to_variable(&sema_core::resolve(spur), val));
         }
         vars
     }
 
-    pub fn debug_upvalues(&self, frame_idx: usize) -> Vec<crate::debug::DapVariable> {
+    pub fn debug_upvalues(&mut self, frame_idx: usize) -> Vec<crate::debug::DapVariable> {
         let Some(frame) = self.frames.get(frame_idx) else {
             return Vec::new();
         };
-        frame
-            .closure
-            .upvalues
+        let upvalues = frame.closure.upvalues.clone();
+        let names = frame.closure.func.upvalue_names.clone();
+        upvalues
             .iter()
             .enumerate()
             .map(|(i, uv)| {
@@ -2021,17 +3277,16 @@ impl VM {
                         self.stack[*frame_base + *slot].clone()
                     }
                 };
-                crate::debug::DapVariable {
-                    name: format!("upvalue_{i}"),
-                    value: sema_core::pretty_print(&val, 80),
-                    type_name: val.type_name().to_string(),
-                    variables_reference: 0,
-                }
+                let name = names
+                    .get(i)
+                    .map(|spur| sema_core::resolve(*spur))
+                    .unwrap_or_else(|| format!("upvalue_{i}"));
+                self.debug_value_to_variable(&name, val)
             })
             .collect()
     }
 
-    pub fn debug_scopes(&self, frame_id: usize) -> Vec<crate::debug::DapScope> {
+    pub fn debug_scopes(&mut self, frame_id: usize) -> Vec<crate::debug::DapScope> {
         let mut scopes = vec![crate::debug::DapScope {
             name: "Locals".to_string(),
             variables_reference: crate::debug::scope_locals_ref(frame_id),
@@ -2047,7 +3302,10 @@ impl VM {
         scopes
     }
 
-    pub fn debug_variables(&self, reference: u64) -> Vec<crate::debug::DapVariable> {
+    pub fn debug_variables(&mut self, reference: u64) -> Vec<crate::debug::DapVariable> {
+        if let Some(value) = self.debug_values.get(&reference).cloned() {
+            return self.debug_children(value);
+        }
         match crate::debug::decode_scope_ref(reference) {
             None => Vec::new(),
             Some(crate::debug::ScopeKind::Locals(frame_id)) => self.debug_locals(frame_id),
@@ -2055,20 +3313,416 @@ impl VM {
         }
     }
 
+    /// Evaluate a debugger expression, writing through any top-level
+    /// `(set! <local-or-upvalue> <value>)` to the real frame.
+    ///
+    /// Plain `debug_evaluate` runs in a throwaway env that copies locals/upvalues
+    /// by value, so a `set!` on a local would only mutate that scratch env and
+    /// silently fail to persist. This mut variant detects that case and routes
+    /// the assignment through the same write-back path as `setVariable`, keeping
+    /// the two requests consistent.
+    ///
+    /// Precedence rules for the write-back short-circuit (all must hold; otherwise
+    /// the expression is handed to the normal evaluator unchanged):
+    ///
+    /// 1. The expression must be syntactically a builtin `set!` form — exactly
+    ///    `(set! <symbol> <value-expr>)`. Anything else (wrong arity, non-symbol
+    ///    target, head not the `set!` symbol) is evaluated normally.
+    /// 2. The head `set!` must NOT be shadowed by an in-scope local or upvalue in
+    ///    this frame. If the user rebound `set!` (e.g. `(let ((set! ...)) ...)`),
+    ///    the form is an ordinary call to that binding, not the assignment special
+    ///    form, so we must not hijack it.
+    /// 3. The assignment target must name an in-scope frame binding (local
+    ///    preferred over upvalue, matching the locals display). If it names a
+    ///    global or an unknown symbol, the normal evaluator handles it so global
+    ///    `set!` semantics are preserved.
+    pub fn debug_evaluate_mut(
+        &mut self,
+        frame_id: usize,
+        expr: &Value,
+        ctx: &EvalContext,
+        debug: &crate::debug::DebugState,
+    ) -> Result<Value, SemaError> {
+        if let Some((target, value_expr)) = Self::as_local_set(expr) {
+            // Rule 2: don't hijack a `set!` that the user has rebound in-frame.
+            let set_shadowed = self.frame_has_binding(frame_id, "set!");
+            let name = sema_core::resolve(target);
+            // Rule 3: only write back to an actual frame binding.
+            if !set_shadowed && self.frame_has_binding(frame_id, &name) {
+                let value = self.debug_evaluate(frame_id, &value_expr, ctx, debug)?;
+                self.debug_set_named(frame_id, &name, value.clone())?;
+                return Ok(value);
+            }
+        }
+        self.debug_evaluate(frame_id, expr, ctx, debug)
+    }
+
+    /// If `expr` is a builtin `set!` form `(set! <symbol> <value-expr>)`, return
+    /// the target symbol and the value expression. Returns `None` for anything
+    /// that is not syntactically that exact shape — including a head symbol other
+    /// than `set!`, the wrong number of arguments, or a non-symbol target. The
+    /// caller is responsible for confirming that the head `set!` is the builtin
+    /// special form and not a shadowing in-scope binding (see `debug_evaluate_mut`).
+    fn as_local_set(expr: &Value) -> Option<(Spur, Value)> {
+        let items = expr.as_list()?;
+        if items.len() != 3 {
+            return None;
+        }
+        let head = items[0].as_symbol_spur()?;
+        if sema_core::resolve(head) != "set!" {
+            return None;
+        }
+        let target = items[1].as_symbol_spur()?;
+        Some((target, items[2].clone()))
+    }
+
+    /// True if `name` is a local or upvalue of the given frame.
+    /// The slot of the in-scope local named `name` at the frame's current pc, if
+    /// any (innermost when shadowed). Shared by the write/read paths so they
+    /// agree with the locals display on which binding a name refers to.
+    fn in_scope_local_slot(&self, frame_id: usize, name: &str) -> Option<u16> {
+        self.in_scope_locals(frame_id)
+            .into_iter()
+            .find(|(_, spur)| sema_core::resolve(*spur) == name)
+            .map(|(slot, _)| slot)
+    }
+
+    fn frame_has_binding(&self, frame_id: usize, name: &str) -> bool {
+        if self.in_scope_local_slot(frame_id, name).is_some() {
+            return true;
+        }
+        self.frames.get(frame_id).is_some_and(|frame| {
+            frame
+                .closure
+                .func
+                .upvalue_names
+                .iter()
+                .any(|spur| sema_core::resolve(*spur) == name)
+        })
+    }
+
+    /// Write `value` back to the local (preferred) or upvalue named `name`.
+    fn debug_set_named(
+        &mut self,
+        frame_id: usize,
+        name: &str,
+        value: Value,
+    ) -> Result<crate::debug::DapVariable, SemaError> {
+        if let Some(slot) = self.in_scope_local_slot(frame_id, name) {
+            self.debug_set_local_slot(frame_id, slot, name, value)
+        } else {
+            self.debug_set_upvalue(frame_id, name, value)
+        }
+    }
+
+    /// Decide whether a debug stop should actually fire, applying any
+    /// conditional-breakpoint expression. Returns `true` to stop.
+    ///
+    /// Only *pure* breakpoint stops (no pending pause, no step that would land
+    /// here on its own) are gated: a stop that is also a step/pause stop always
+    /// fires. The condition is evaluated against the topmost (innermost) frame.
+    /// If the condition fails to parse or evaluate we fail open and stop, so a
+    /// bad condition surfaces to the user rather than silently swallowing the
+    /// breakpoint.
+    fn debug_condition_allows_stop(
+        &self,
+        file: Option<&std::path::PathBuf>,
+        line: u32,
+        debug: &crate::debug::DebugState,
+        ctx: &EvalContext,
+    ) -> bool {
+        let frame_depth = self.frames.len();
+        if !debug.is_pure_breakpoint_stop(file, line, frame_depth) {
+            return true;
+        }
+        let Some(condition) = debug.condition_at(file, line) else {
+            return true;
+        };
+        if self.frames.is_empty() {
+            return true;
+        }
+        let frame_id = self.frames.len() - 1;
+        match sema_reader::read(condition) {
+            Ok(expr) => match self.debug_evaluate(frame_id, &expr, ctx, debug) {
+                Ok(value) => value.is_truthy(),
+                Err(_) => true,
+            },
+            Err(_) => true,
+        }
+    }
+
+    pub fn debug_evaluate(
+        &self,
+        frame_id: usize,
+        expr: &Value,
+        ctx: &EvalContext,
+        _debug: &crate::debug::DebugState,
+    ) -> Result<Value, SemaError> {
+        let env = self.debug_env_for_frame(frame_id)?;
+        match sema_core::eval_callback(ctx, expr, &env) {
+            Ok(value) => Ok(value),
+            Err(_) if ctx.eval_fn.get().is_none() => {
+                let prog = compile_program(std::slice::from_ref(expr), None)?;
+                let mut vm = VM::new(
+                    env,
+                    prog.functions,
+                    &prog.native_table,
+                    prog.main_cache_slots,
+                )?;
+                vm.execute(prog.closure, ctx)
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    pub fn debug_set_variable(
+        &mut self,
+        variables_reference: u64,
+        name: &str,
+        value: Value,
+    ) -> Result<crate::debug::DapVariable, SemaError> {
+        match crate::debug::decode_scope_ref(variables_reference) {
+            Some(crate::debug::ScopeKind::Locals(frame_id)) => {
+                self.debug_set_local(frame_id, name, value)
+            }
+            Some(crate::debug::ScopeKind::Upvalues(frame_id)) => {
+                self.debug_set_upvalue(frame_id, name, value)
+            }
+            None => Err(SemaError::eval(
+                "setVariable: invalid variablesReference".to_string(),
+            )),
+        }
+    }
+
     fn span_at_pc(&self, frame: &CallFrame) -> (u64, u64) {
-        let pc32 = frame.pc as u32;
+        match self.span_at_pc_raw(frame, frame.pc) {
+            Some(span) => (span.line as u64, span.col as u64 + 1),
+            None => (0, 0),
+        }
+    }
+
+    /// Resolve a `Span` from the chunk's span table at a given PC.
+    fn span_at_pc_raw(&self, frame: &CallFrame, pc: usize) -> Option<sema_core::error::Span> {
+        let pc32 = pc as u32;
         let spans = &frame.closure.func.chunk.spans;
-        // Find the most recent span at or before the current PC
         match spans.binary_search_by_key(&pc32, |(p, _)| *p) {
-            Ok(idx) => {
-                let span = &spans[idx].1;
-                (span.line as u64, span.col as u64 + 1)
+            Ok(idx) => Some(spans[idx].1),
+            Err(idx) if idx > 0 => Some(spans[idx - 1].1),
+            _ => None,
+        }
+    }
+
+    fn debug_env_for_frame(&self, frame_id: usize) -> Result<Rc<Env>, SemaError> {
+        let frame = self.frames.get(frame_id).ok_or_else(|| {
+            SemaError::eval(format!("debug evaluate: invalid frame id {frame_id}"))
+        })?;
+        let env = Rc::new(Env::with_parent(self.globals.clone()));
+
+        for (i, upvalue) in frame.closure.upvalues.iter().enumerate() {
+            let value = self.debug_upvalue_value(upvalue);
+            env.set(sema_core::intern(&format!("upvalue_{i}")), value.clone());
+            if let Some(name) = frame.closure.func.upvalue_names.get(i) {
+                env.set(*name, value);
             }
-            Err(idx) if idx > 0 => {
-                let span = &spans[idx - 1].1;
-                (span.line as u64, span.col as u64 + 1)
+        }
+
+        // Inject only the locals in scope at the current pc (innermost binding
+        // for shadowed names), so an evaluated expression sees the same binding
+        // the locals display and setVariable resolve to.
+        for (slot, spur) in self.in_scope_locals(frame_id) {
+            let idx = frame.base + slot as usize;
+            if let Some(value) = self.stack.get(idx) {
+                env.set(spur, value.clone());
             }
-            _ => (0, 0),
+        }
+
+        Ok(env)
+    }
+
+    fn debug_upvalue_value(&self, upvalue: &UpvalueCell) -> Value {
+        match &*upvalue.state.borrow() {
+            UpvalueState::Closed(value) => value.clone(),
+            UpvalueState::Open { frame_base, slot } => self
+                .stack
+                .get(*frame_base + *slot)
+                .cloned()
+                .unwrap_or_else(Value::nil),
+        }
+    }
+
+    fn debug_set_local(
+        &mut self,
+        frame_id: usize,
+        name: &str,
+        value: Value,
+    ) -> Result<crate::debug::DapVariable, SemaError> {
+        let Some(slot) = self.in_scope_local_slot(frame_id, name) else {
+            return Err(SemaError::eval(format!(
+                "setVariable: local '{name}' not found"
+            )));
+        };
+        self.debug_set_local_slot(frame_id, slot, name, value)
+    }
+
+    /// Write `value` to a specific local `slot` of the frame, resolving the
+    /// stack index from the frame base. The caller has already mapped the name
+    /// to the pc-active slot (so shadowed locals write the binding actually in
+    /// scope, matching the locals display).
+    fn debug_set_local_slot(
+        &mut self,
+        frame_id: usize,
+        slot: u16,
+        name: &str,
+        value: Value,
+    ) -> Result<crate::debug::DapVariable, SemaError> {
+        let base = self
+            .frames
+            .get(frame_id)
+            .ok_or_else(|| SemaError::eval(format!("setVariable: invalid frame id {frame_id}")))?
+            .base;
+        let idx = base + slot as usize;
+        let Some(slot_value) = self.stack.get_mut(idx) else {
+            return Err(SemaError::eval(format!(
+                "setVariable: local '{name}' is out of range"
+            )));
+        };
+        *slot_value = value.clone();
+        Ok(self.debug_value_to_variable(name, value))
+    }
+
+    fn debug_set_upvalue(
+        &mut self,
+        frame_id: usize,
+        name: &str,
+        value: Value,
+    ) -> Result<crate::debug::DapVariable, SemaError> {
+        let frame = self
+            .frames
+            .get(frame_id)
+            .ok_or_else(|| SemaError::eval(format!("setVariable: invalid frame id {frame_id}")))?;
+        let index = if let Some(index) = name
+            .strip_prefix("upvalue_")
+            .and_then(|suffix| suffix.parse::<usize>().ok())
+        {
+            index
+        } else if let Some(index) = frame
+            .closure
+            .func
+            .upvalue_names
+            .iter()
+            .position(|spur| sema_core::resolve(*spur) == name)
+        {
+            index
+        } else {
+            return Err(SemaError::eval(format!(
+                "setVariable: upvalue '{name}' not found"
+            )));
+        };
+        let Some(upvalue) = frame.closure.upvalues.get(index) else {
+            return Err(SemaError::eval(format!(
+                "setVariable: upvalue '{name}' not found"
+            )));
+        };
+
+        {
+            let mut state = upvalue.state.borrow_mut();
+            match &mut *state {
+                UpvalueState::Closed(slot_value) => {
+                    *slot_value = value.clone();
+                }
+                UpvalueState::Open { frame_base, slot } => {
+                    let Some(slot_value) = self.stack.get_mut(*frame_base + *slot) else {
+                        return Err(SemaError::eval(format!(
+                            "setVariable: upvalue '{name}' is out of range"
+                        )));
+                    };
+                    *slot_value = value.clone();
+                }
+            }
+        }
+
+        Ok(self.debug_value_to_variable(name, value))
+    }
+
+    fn debug_value_to_variable(&mut self, name: &str, value: Value) -> crate::debug::DapVariable {
+        let variables_reference = self.debug_expandable_ref(&value);
+        crate::debug::DapVariable {
+            name: name.to_string(),
+            value: sema_core::pretty_print(&value, 80),
+            type_name: value.type_name().to_string(),
+            variables_reference,
+        }
+    }
+
+    fn debug_expandable_ref(&mut self, value: &Value) -> u64 {
+        if !Self::is_debug_expandable(value) {
+            return 0;
+        }
+        let reference = self.next_debug_value_ref;
+        self.next_debug_value_ref += 1;
+        self.debug_values.insert(reference, value.clone());
+        reference
+    }
+
+    fn is_debug_expandable(value: &Value) -> bool {
+        matches!(
+            value.view_ref(),
+            ValueViewRef::List(_)
+                | ValueViewRef::Vector(_)
+                | ValueViewRef::Map(_)
+                | ValueViewRef::HashMap(_)
+                | ValueViewRef::Record(_)
+                | ValueViewRef::Bytevector(_)
+        )
+    }
+
+    fn debug_children(&mut self, value: Value) -> Vec<crate::debug::DapVariable> {
+        match value.view_ref() {
+            ValueViewRef::List(items) | ValueViewRef::Vector(items) => items
+                .iter()
+                .enumerate()
+                .map(|(i, child)| self.debug_value_to_variable(&format!("[{i}]"), child.clone()))
+                .collect(),
+            ValueViewRef::Map(map) => map
+                .iter()
+                .map(|(key, child)| {
+                    self.debug_value_to_variable(&sema_core::pretty_print(key, 80), child.clone())
+                })
+                .collect(),
+            ValueViewRef::HashMap(map) => {
+                let mut entries: Vec<_> = map.iter().collect();
+                entries.sort_by_key(|(key, _)| (*key).clone());
+                entries
+                    .into_iter()
+                    .map(|(key, child)| {
+                        self.debug_value_to_variable(
+                            &sema_core::pretty_print(key, 80),
+                            child.clone(),
+                        )
+                    })
+                    .collect()
+            }
+            ValueViewRef::Record(record) => record
+                .fields
+                .iter()
+                .enumerate()
+                .map(|(i, child)| {
+                    let name = if record.field_names.len() == record.fields.len() {
+                        sema_core::resolve(record.field_names[i])
+                    } else {
+                        format!("field_{i}")
+                    };
+                    self.debug_value_to_variable(&name, child.clone())
+                })
+                .collect(),
+            ValueViewRef::Bytevector(bytes) => bytes
+                .iter()
+                .enumerate()
+                .map(|(i, byte)| {
+                    self.debug_value_to_variable(&format!("[{i}]"), Value::int(*byte as i64))
+                })
+                .collect(),
+            _ => Vec::new(),
         }
     }
 }
@@ -2164,39 +3818,125 @@ fn error_to_value(err: &SemaError) -> Value {
             unreachable!("inner() already unwraps these")
         }
     }
+
+    // Serialize stack trace if present
+    if let Some(trace) = err.stack_trace() {
+        let frames: Vec<Value> = trace
+            .0
+            .iter()
+            .map(|frame| {
+                let mut fm = BTreeMap::new();
+                fm.insert(Value::keyword("name"), Value::string(&frame.name));
+                if let Some(file) = &frame.file {
+                    fm.insert(
+                        Value::keyword("file"),
+                        Value::string(&file.display().to_string()),
+                    );
+                }
+                if let Some(span) = &frame.span {
+                    fm.insert(Value::keyword("line"), Value::int(span.line as i64));
+                    fm.insert(Value::keyword("col"), Value::int(span.col as i64));
+                }
+                Value::map(fm)
+            })
+            .collect();
+        map.insert(Value::keyword("stack-trace"), Value::list(frames));
+    }
+
     Value::map(map)
+}
+
+// --- Stack trace intrinsic name mapping ---
+
+/// Map an inline opcode to its Sema-level name for stack trace frames.
+/// Returns `None` for opcodes that don't correspond to a user-visible
+/// operation (e.g. `Const`, `Pop`, `Jump`).
+fn intrinsic_name(opcode: Op) -> Option<&'static str> {
+    match opcode {
+        Op::Add | Op::AddInt => Some("+"),
+        Op::Sub | Op::SubInt => Some("-"),
+        Op::Mul | Op::MulInt => Some("*"),
+        Op::Div => Some("/"),
+        Op::Mod => Some("mod"),
+        Op::Negate => Some("-"),
+        Op::Not => Some("not"),
+        Op::Eq | Op::EqInt => Some("="),
+        Op::Lt | Op::LtInt => Some("<"),
+        Op::Gt => Some(">"),
+        Op::Le => Some("<="),
+        Op::Ge => Some(">="),
+        Op::Car => Some("car"),
+        Op::Cdr => Some("cdr"),
+        Op::Cons => Some("cons"),
+        Op::IsNull => Some("null?"),
+        Op::IsPair => Some("pair?"),
+        Op::IsList => Some("list?"),
+        Op::IsNumber => Some("number?"),
+        Op::IsString => Some("string?"),
+        Op::IsSymbol => Some("symbol?"),
+        Op::Length => Some("length"),
+        Op::Append => Some("append"),
+        Op::Get => Some("get"),
+        Op::ContainsQ => Some("contains?"),
+        Op::Nth => Some("nth"),
+        Op::StringLength => Some("string-length"),
+        Op::StringRef => Some("string-ref"),
+        Op::StringAppend => Some("string-append"),
+        Op::Throw => Some("throw"),
+        _ => None,
+    }
 }
 
 // --- Arithmetic helpers ---
 
 #[inline(always)]
+/// Hint for `get`/`contains?` called on the wrong collection type. These work
+/// on maps only; users from Clojure expect them to index vectors too, so when
+/// the collection is a list/vector we redirect them to `nth`.
+fn map_access_hint(func: &str, coll: &Value) -> String {
+    if coll.as_list().is_some() || coll.as_vector().is_some() {
+        format!("{func} works on maps; use (nth coll i) to index a list or vector")
+    } else {
+        format!("{func}: expected a map as the first argument")
+    }
+}
+
 fn vm_add(a: &Value, b: &Value) -> Result<Value, SemaError> {
-    use sema_core::ValueView;
-    match (a.view(), b.view()) {
-        (ValueView::Int(x), ValueView::Int(y)) => Ok(Value::int(x.wrapping_add(y))),
-        (ValueView::Float(x), ValueView::Float(y)) => Ok(Value::float(x + y)),
-        (ValueView::Int(x), ValueView::Float(y)) => Ok(Value::float(x as f64 + y)),
-        (ValueView::Float(x), ValueView::Int(y)) => Ok(Value::float(x + y as f64)),
-        (ValueView::String(x), ValueView::String(y)) => {
-            let mut s = (*x).clone();
-            s.push_str(&y);
+    match (a.view_ref(), b.view_ref()) {
+        (ValueViewRef::Int(x), ValueViewRef::Int(y)) => Ok(Value::int(x.wrapping_add(y))),
+        (ValueViewRef::Float(x), ValueViewRef::Float(y)) => Ok(Value::float(x + y)),
+        (ValueViewRef::Int(x), ValueViewRef::Float(y)) => Ok(Value::float(x as f64 + y)),
+        (ValueViewRef::Float(x), ValueViewRef::Int(y)) => Ok(Value::float(x + y as f64)),
+        (ValueViewRef::String(x), ValueViewRef::String(y)) => {
+            let mut s = x.to_string();
+            s.push_str(y);
             Ok(Value::string(&s))
         }
-        _ => Err(SemaError::type_error(
-            "number or string",
-            format!("{} and {}", a.type_name(), b.type_name()),
-        )),
+        _ => {
+            let err = SemaError::type_error(
+                "number or string",
+                format!("{} and {}", a.type_name(), b.type_name()),
+            );
+            let mixing_string = matches!(a.view_ref(), ValueViewRef::String(_))
+                || matches!(b.view_ref(), ValueViewRef::String(_));
+            Err(if mixing_string {
+                err.with_hint(
+                    "+: cannot mix strings with other types; use (str a b ...) to build a string",
+                )
+            } else {
+                err
+            })
+        }
     }
 }
 
 #[inline(always)]
 fn vm_sub(a: &Value, b: &Value) -> Result<Value, SemaError> {
-    use sema_core::ValueView;
-    match (a.view(), b.view()) {
-        (ValueView::Int(x), ValueView::Int(y)) => Ok(Value::int(x.wrapping_sub(y))),
-        (ValueView::Float(x), ValueView::Float(y)) => Ok(Value::float(x - y)),
-        (ValueView::Int(x), ValueView::Float(y)) => Ok(Value::float(x as f64 - y)),
-        (ValueView::Float(x), ValueView::Int(y)) => Ok(Value::float(x - y as f64)),
+    match (a.view_ref(), b.view_ref()) {
+        (ValueViewRef::Int(x), ValueViewRef::Int(y)) => Ok(Value::int(x.wrapping_sub(y))),
+        (ValueViewRef::Float(x), ValueViewRef::Float(y)) => Ok(Value::float(x - y)),
+        (ValueViewRef::Int(x), ValueViewRef::Float(y)) => Ok(Value::float(x as f64 - y)),
+        (ValueViewRef::Float(x), ValueViewRef::Int(y)) => Ok(Value::float(x - y as f64)),
         _ => Err(SemaError::type_error(
             "number",
             format!("{} and {}", a.type_name(), b.type_name()),
@@ -2206,12 +3946,11 @@ fn vm_sub(a: &Value, b: &Value) -> Result<Value, SemaError> {
 
 #[inline(always)]
 fn vm_mul(a: &Value, b: &Value) -> Result<Value, SemaError> {
-    use sema_core::ValueView;
-    match (a.view(), b.view()) {
-        (ValueView::Int(x), ValueView::Int(y)) => Ok(Value::int(x.wrapping_mul(y))),
-        (ValueView::Float(x), ValueView::Float(y)) => Ok(Value::float(x * y)),
-        (ValueView::Int(x), ValueView::Float(y)) => Ok(Value::float(x as f64 * y)),
-        (ValueView::Float(x), ValueView::Int(y)) => Ok(Value::float(x * y as f64)),
+    match (a.view_ref(), b.view_ref()) {
+        (ValueViewRef::Int(x), ValueViewRef::Int(y)) => Ok(Value::int(x.wrapping_mul(y))),
+        (ValueViewRef::Float(x), ValueViewRef::Float(y)) => Ok(Value::float(x * y)),
+        (ValueViewRef::Int(x), ValueViewRef::Float(y)) => Ok(Value::float(x as f64 * y)),
+        (ValueViewRef::Float(x), ValueViewRef::Int(y)) => Ok(Value::float(x * y as f64)),
         _ => Err(SemaError::type_error(
             "number",
             format!("{} and {}", a.type_name(), b.type_name()),
@@ -2221,19 +3960,18 @@ fn vm_mul(a: &Value, b: &Value) -> Result<Value, SemaError> {
 
 #[inline(always)]
 fn vm_div(a: &Value, b: &Value) -> Result<Value, SemaError> {
-    use sema_core::ValueView;
-    match (a.view(), b.view()) {
-        (ValueView::Int(_), ValueView::Int(0)) => Err(SemaError::eval("division by zero")),
-        (ValueView::Int(x), ValueView::Int(y)) => {
+    match (a.view_ref(), b.view_ref()) {
+        (ValueViewRef::Int(_), ValueViewRef::Int(0)) => Err(SemaError::eval("division by zero")),
+        (ValueViewRef::Int(x), ValueViewRef::Int(y)) => {
             if x % y == 0 {
                 Ok(Value::int(x / y))
             } else {
                 Ok(Value::float(x as f64 / y as f64))
             }
         }
-        (ValueView::Float(x), ValueView::Float(y)) => Ok(Value::float(x / y)),
-        (ValueView::Int(x), ValueView::Float(y)) => Ok(Value::float(x as f64 / y)),
-        (ValueView::Float(x), ValueView::Int(y)) => Ok(Value::float(x / y as f64)),
+        (ValueViewRef::Float(x), ValueViewRef::Float(y)) => Ok(Value::float(x / y)),
+        (ValueViewRef::Int(x), ValueViewRef::Float(y)) => Ok(Value::float(x as f64 / y)),
+        (ValueViewRef::Float(x), ValueViewRef::Int(y)) => Ok(Value::float(x / y as f64)),
         _ => Err(SemaError::type_error(
             "number",
             format!("{} and {}", a.type_name(), b.type_name()),
@@ -2244,25 +3982,22 @@ fn vm_div(a: &Value, b: &Value) -> Result<Value, SemaError> {
 /// Numeric-coercing equality: matches stdlib `=` semantics.
 #[inline(always)]
 fn vm_eq(a: &Value, b: &Value) -> bool {
-    use sema_core::ValueView;
-    match (a.view(), b.view()) {
-        (ValueView::Int(x), ValueView::Int(y)) => x == y,
-        (ValueView::Float(x), ValueView::Float(y)) => x == y,
-        (ValueView::Int(x), ValueView::Float(y)) | (ValueView::Float(y), ValueView::Int(x)) => {
-            (x as f64) == y
-        }
+    match (a.view_ref(), b.view_ref()) {
+        (ValueViewRef::Int(x), ValueViewRef::Int(y)) => x == y,
+        (ValueViewRef::Float(x), ValueViewRef::Float(y)) => x == y,
+        (ValueViewRef::Int(x), ValueViewRef::Float(y))
+        | (ValueViewRef::Float(y), ValueViewRef::Int(x)) => (x as f64) == y,
         _ => a == b,
     }
 }
 
 fn vm_lt(a: &Value, b: &Value) -> Result<bool, SemaError> {
-    use sema_core::ValueView;
-    match (a.view(), b.view()) {
-        (ValueView::Int(x), ValueView::Int(y)) => Ok(x < y),
-        (ValueView::Float(x), ValueView::Float(y)) => Ok(x < y),
-        (ValueView::Int(x), ValueView::Float(y)) => Ok((x as f64) < y),
-        (ValueView::Float(x), ValueView::Int(y)) => Ok(x < (y as f64)),
-        (ValueView::String(x), ValueView::String(y)) => Ok(x < y),
+    match (a.view_ref(), b.view_ref()) {
+        (ValueViewRef::Int(x), ValueViewRef::Int(y)) => Ok(x < y),
+        (ValueViewRef::Float(x), ValueViewRef::Float(y)) => Ok(x < y),
+        (ValueViewRef::Int(x), ValueViewRef::Float(y)) => Ok((x as f64) < y),
+        (ValueViewRef::Float(x), ValueViewRef::Int(y)) => Ok(x < (y as f64)),
+        (ValueViewRef::String(x), ValueViewRef::String(y)) => Ok(x < y),
         _ => Err(SemaError::type_error(
             "comparable values",
             format!("{} and {}", a.type_name(), b.type_name()),
@@ -2276,6 +4011,15 @@ pub fn compile_program_with_spans(
     span_map: &sema_core::SpanMap,
     source_file: Option<std::path::PathBuf>,
 ) -> Result<CompiledProgram, SemaError> {
+    compile_program_with_spans_and_natives(vals, span_map, source_file, None)
+}
+
+pub fn compile_program_with_spans_and_natives(
+    vals: &[Value],
+    span_map: &sema_core::SpanMap,
+    source_file: Option<std::path::PathBuf>,
+    known_natives: Option<std::collections::HashSet<Spur>>,
+) -> Result<CompiledProgram, SemaError> {
     let source_file = source_file.map(|p| std::fs::canonicalize(&p).unwrap_or(p));
     let mut resolved = Vec::new();
     let mut total_locals: u16 = 0;
@@ -2286,7 +4030,7 @@ pub fn compile_program_with_spans(
         total_locals = total_locals.max(n);
         resolved.push(res);
     }
-    let result = crate::compiler::compile(&resolved, total_locals, None)?;
+    let result = crate::compiler::compile(&resolved, total_locals, known_natives)?;
 
     let functions: Vec<Rc<Function>> = result
         .functions
@@ -2304,19 +4048,24 @@ pub fn compile_program_with_spans(
             name: None,
             chunk: result.chunk,
             upvalue_descs: Vec::new(),
+            upvalue_names: Vec::new(),
             arity: 0,
             has_rest: false,
             local_names: Vec::new(),
             source_file,
+            local_scopes: Vec::new(),
             cache_offset: 0,
         }),
         upvalues: Vec::new(),
+        // Top-level main closure: uses the VM's own globals and function table.
+        globals: None,
+        functions: None,
     });
 
     Ok(CompiledProgram {
         closure,
         functions,
-        native_table: Vec::new(),
+        native_table: result.native_table,
         main_cache_slots,
     })
 }
@@ -2325,6 +4074,9 @@ pub fn compile_program_with_spans(
 /// Includes spans from the main chunk and all sub-functions.
 pub fn valid_breakpoint_lines(closure: &Closure, functions: &[Rc<Function>]) -> Vec<u32> {
     let mut lines = std::collections::BTreeSet::new();
+    for file_lines in valid_breakpoint_lines_by_file(closure, functions).values() {
+        lines.extend(file_lines.iter().copied());
+    }
     for (_, s) in &closure.func.chunk.spans {
         lines.insert(s.line as u32);
     }
@@ -2334,6 +4086,36 @@ pub fn valid_breakpoint_lines(closure: &Closure, functions: &[Rc<Function>]) -> 
         }
     }
     lines.into_iter().collect()
+}
+
+/// Extract executable source lines grouped by canonical source file.
+pub fn valid_breakpoint_lines_by_file(
+    closure: &Closure,
+    functions: &[Rc<Function>],
+) -> BTreeMap<std::path::PathBuf, Vec<u32>> {
+    let mut lines_by_file: BTreeMap<std::path::PathBuf, std::collections::BTreeSet<u32>> =
+        BTreeMap::new();
+    collect_function_breakpoint_lines(&closure.func, &mut lines_by_file);
+    for function in functions {
+        collect_function_breakpoint_lines(function, &mut lines_by_file);
+    }
+    lines_by_file
+        .into_iter()
+        .map(|(file, lines)| (file, lines.into_iter().collect()))
+        .collect()
+}
+
+fn collect_function_breakpoint_lines(
+    function: &Function,
+    lines_by_file: &mut BTreeMap<std::path::PathBuf, std::collections::BTreeSet<u32>>,
+) {
+    let Some(source_file) = &function.source_file else {
+        return;
+    };
+    let lines = lines_by_file.entry(source_file.clone()).or_default();
+    for (_, span) in &function.chunk.spans {
+        lines.insert(span.line as u32);
+    }
 }
 
 /// Snap a requested breakpoint line to the nearest valid line with bytecode spans.
@@ -2403,13 +4185,18 @@ pub fn compile_program(
             name: None,
             chunk: result.chunk,
             upvalue_descs: Vec::new(),
+            upvalue_names: Vec::new(),
             arity: 0,
             has_rest: false,
             local_names: Vec::new(),
             source_file: None,
+            local_scopes: Vec::new(),
             cache_offset: 0,
         }),
         upvalues: Vec::new(),
+        // Top-level main closure: uses the VM's own globals and function table.
+        globals: None,
+        functions: None,
     });
 
     Ok(CompiledProgram {
@@ -2423,7 +4210,48 @@ pub fn compile_program(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::chunk::{Chunk, Function};
     use sema_core::{intern, NativeFn};
+
+    /// The cooperative-stop guard: surfacing a task stop with NO pending
+    /// `DebugCoopResume` is an internal error (a scheduler-driving combinator
+    /// forgot `set_debug_coop_resume`), while a stop WITH one surfaces normally.
+    /// This pins the invariant so a future combinator that paginates the
+    /// scheduler without registering a resume fails loudly instead of wedging.
+    #[test]
+    fn surface_coop_task_stop_requires_a_pending_resume() {
+        use crate::debug::{StopInfo, StopReason, VmExecResult};
+
+        let info = || StopInfo {
+            reason: StopReason::Breakpoint,
+            file: None,
+            line: 7,
+        };
+
+        // No resume registered → loud internal error.
+        let _ = sema_core::take_debug_coop_resume(); // ensure clean slate
+        let err = surface_coop_task_stop(info()).unwrap_err();
+        assert!(
+            err.to_string().contains("DebugCoopResume"),
+            "guard error should name the missing resume: {err}"
+        );
+
+        // With a resume registered → surfaces as Stopped on the same line.
+        let promise = Rc::new(sema_core::AsyncPromise {
+            state: std::cell::RefCell::new(sema_core::PromiseState::Pending),
+            task_id: std::cell::Cell::new(0),
+        });
+        sema_core::set_debug_coop_resume(
+            sema_core::SchedulerTarget::One(promise.clone()),
+            sema_core::DebugCoopResume::Await(promise),
+        );
+        let surfaced = surface_coop_task_stop(info());
+        let Ok(VmExecResult::Stopped(got)) = surfaced else {
+            panic!("expected Stopped(line 7), got {surfaced:?}");
+        };
+        assert_eq!(got.line, 7);
+        let _ = sema_core::take_debug_coop_resume(); // leave the thread-local clean
+    }
 
     /// Convenience: compile and run a string expression in the VM.
     fn eval_str(input: &str, globals: &Rc<Env>, ctx: &EvalContext) -> Result<Value, SemaError> {
@@ -2489,6 +4317,100 @@ mod tests {
         let globals = make_test_env();
         let ctx = EvalContext::new();
         eval_str(input, &globals, &ctx)
+    }
+
+    #[test]
+    fn closure_home_globals_resolve_against_defining_env() {
+        // M1: a closure carries its home globals env. When run on a VM whose
+        // own globals differ, GetGlobal must resolve against the closure's home
+        // env (the env it was *defined* in), not the executing VM's globals.
+        // This is the keystone enabler for module-isolated `import` on the VM.
+        let ctx = EvalContext::new();
+
+        // A trivial program whose body just loads the global `x`.
+        let vals = sema_reader::read_many("x").unwrap();
+        let prog = compile_program(&vals, None).unwrap();
+
+        // Home env G1 defines x = 999; the executing VM's own env G2 does NOT.
+        let g1 = Rc::new(Env::new());
+        g1.set(intern("x"), Value::int(999));
+        let g2 = Rc::new(Env::new()); // no `x`
+
+        // Closure whose home globals = G1, executed by a VM whose globals = G2.
+        let closure = Rc::new(Closure {
+            func: prog.closure.func.clone(),
+            upvalues: vec![],
+            globals: Some(g1.clone()),
+            functions: None,
+        });
+        let mut vm = VM::new(
+            g2.clone(),
+            prog.functions.clone(),
+            &[],
+            prog.main_cache_slots,
+        )
+        .unwrap();
+        let result = vm.execute(closure, &ctx).unwrap();
+        assert_eq!(
+            result,
+            Value::int(999),
+            "GetGlobal must resolve `x` against the closure's home env G1, not the VM's G2"
+        );
+
+        // Negative control: with no home globals (`None`), the same func
+        // resolves against the executing VM's own env G2, where x is unbound.
+        let closure_no_home = Rc::new(Closure {
+            func: prog.closure.func.clone(),
+            upvalues: vec![],
+            globals: None,
+            functions: None,
+        });
+        let mut vm2 = VM::new(g2, prog.functions, &[], prog.main_cache_slots).unwrap();
+        let err = vm2
+            .execute(closure_no_home, &ctx)
+            .expect_err("x must be unbound against the VM's own globals (G2)");
+        let msg = err.to_string().to_lowercase();
+        assert!(
+            msg.contains("unbound") && msg.contains('x'),
+            "expected an unbound-`x` error against G2, got: {err}"
+        );
+    }
+
+    #[test]
+    fn dup_on_empty_stack_errors_instead_of_ub() {
+        // A crafted/corrupt .semac can declare a generous `max_stack` but lead
+        // with a bare DUP. Before the guard this read `stack[usize::MAX]` (UB);
+        // now it must return a clean error.
+        let mut chunk = Chunk::new();
+        chunk.code = vec![op::DUP, op::RETURN];
+        chunk.max_stack = 8;
+        let func = Rc::new(Function {
+            name: None,
+            chunk,
+            upvalue_descs: vec![],
+            upvalue_names: vec![],
+            arity: 0,
+            has_rest: false,
+            local_names: vec![],
+            source_file: None,
+            local_scopes: Vec::new(),
+            cache_offset: 0,
+        });
+        let closure = Rc::new(Closure {
+            func: func.clone(),
+            upvalues: vec![],
+            globals: None,
+            functions: None,
+        });
+        let globals = make_test_env();
+        let ctx = EvalContext::new();
+        let mut vm = VM::new(globals, vec![func], &[], 0).unwrap();
+        let res = vm.execute(closure, &ctx);
+        let err = res.expect_err("DUP on empty stack must error, not panic/UB");
+        assert!(
+            err.to_string().contains("DUP on empty stack"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
@@ -2983,23 +4905,27 @@ mod tests {
         let globals = Rc::new(Env::new());
         let ctx = EvalContext::new();
         let mut e = Emitter::new();
-        e.emit_const(Value::int(1));
-        e.emit_const(Value::float(1.0));
+        e.emit_const(Value::int(1)).unwrap();
+        e.emit_const(Value::float(1.0)).unwrap();
         e.emit_op(Op::Eq);
         e.emit_op(Op::Return);
         let func = Rc::new(crate::chunk::Function {
             name: None,
             chunk: e.into_chunk(),
             upvalue_descs: vec![],
+            upvalue_names: vec![],
             arity: 0,
             has_rest: false,
             local_names: vec![],
             source_file: None,
+            local_scopes: Vec::new(),
             cache_offset: 0,
         });
         let closure = Rc::new(Closure {
             func,
             upvalues: vec![],
+            globals: None,
+            functions: None,
         });
         let mut vm = VM::new(globals, vec![], &[], 0).unwrap();
         let result = vm.execute(closure, &ctx).unwrap();
@@ -3007,6 +4933,46 @@ mod tests {
             result,
             Value::bool(true),
             "Op::Eq should coerce int 1 == float 1.0"
+        );
+    }
+
+    #[test]
+    fn call_native_out_of_range_id_errors_not_panics() {
+        // A crafted .semac can carry a CALL_NATIVE whose native_id exceeds the
+        // resolved native table. The bounds check must return a SemaError, not
+        // panic — a debug_assert! alone is compiled out in release builds (DoS).
+        use crate::emit::Emitter;
+        use crate::opcodes::Op;
+        let globals = Rc::new(Env::new());
+        let ctx = EvalContext::new();
+        let mut e = Emitter::new();
+        e.emit_op(Op::CallNative);
+        e.emit_u16(99); // native_id far past the (empty) table
+        e.emit_u16(0); // argc
+        e.emit_op(Op::Return);
+        let func = Rc::new(crate::chunk::Function {
+            name: None,
+            chunk: e.into_chunk(),
+            upvalue_descs: vec![],
+            upvalue_names: vec![],
+            arity: 0,
+            has_rest: false,
+            local_names: vec![],
+            source_file: None,
+            local_scopes: Vec::new(),
+            cache_offset: 0,
+        });
+        let closure = Rc::new(Closure {
+            func,
+            upvalues: vec![],
+            globals: None,
+            functions: None,
+        });
+        let mut vm = VM::new(globals, vec![], &[], 0).unwrap();
+        let result = vm.execute(closure, &ctx);
+        assert!(
+            result.is_err(),
+            "out-of-range native_id must error, got {result:?}"
         );
     }
 
@@ -3050,6 +5016,48 @@ mod tests {
     }
 
     #[test]
+    fn debug_get_stacktrace_while_running_replies() {
+        // DAP-1: a state query (GetStackTrace) sent while the program is still
+        // running must be answered by the running-VM poll loop, not dropped.
+        // A dropped reply leaves the DAP server's spawn_blocking thread blocked
+        // on recv() forever (session hang / leaked thread).
+        use crate::debug::{DebugCommand, DebugState, StepMode};
+        use std::sync::mpsc;
+
+        let globals = make_test_env();
+        let ctx = EvalContext::new();
+        // A loop long enough to cross the 128-instruction poll interval.
+        let input = "(define (loop n acc) (if (= n 0) acc (loop (- n 1) (+ acc n))))\n(loop 200 0)";
+        let (vals, span_map) = sema_reader::read_many_with_spans(input).unwrap();
+        let prog = compile_program_with_spans(&vals, &span_map, None).unwrap();
+
+        let (event_tx, _event_rx) = mpsc::channel();
+        let (cmd_tx, cmd_rx) = mpsc::channel();
+        let mut debug_state = DebugState::new(event_tx, cmd_rx);
+        debug_state.step_mode = StepMode::Continue; // run straight through, no stops
+
+        // Queue a stack-trace request to be serviced mid-run.
+        let (reply_tx, reply_rx) = mpsc::sync_channel(1);
+        cmd_tx
+            .send(DebugCommand::GetStackTrace { reply: reply_tx })
+            .unwrap();
+
+        let mut vm = VM::new(globals, prog.functions, &[], prog.main_cache_slots).unwrap();
+        let result = vm
+            .execute_debug(prog.closure, &ctx, &mut debug_state)
+            .unwrap();
+        assert_eq!(result, Value::int(20100)); // sum 1..=200
+
+        let frames = reply_rx
+            .try_recv()
+            .expect("GetStackTrace while running must receive a reply, not be dropped");
+        assert!(
+            !frames.is_empty(),
+            "stack trace should have at least one frame"
+        );
+    }
+
+    #[test]
     fn test_vm_oob_jump_returns_error() {
         // Issue #1: A jump that goes past the end of bytecode should return
         // an error, not cause undefined behavior from unsafe pointer reads.
@@ -3067,15 +5075,19 @@ mod tests {
             name: None,
             chunk: e.into_chunk(),
             upvalue_descs: vec![],
+            upvalue_names: vec![],
             arity: 0,
             has_rest: false,
             local_names: vec![],
             source_file: None,
+            local_scopes: Vec::new(),
             cache_offset: 0,
         });
         let closure = Rc::new(Closure {
             func,
             upvalues: vec![],
+            globals: None,
+            functions: None,
         });
         let mut vm = VM::new(globals, vec![], &[], 0).unwrap();
         let result = vm.execute(closure, &ctx);
@@ -3189,6 +5201,311 @@ mod tests {
     }
 
     #[test]
+    fn test_debug_evaluate_uses_paused_frame_locals_over_globals() {
+        use crate::debug::{DebugState, StepMode, VmExecResult};
+        use std::path::PathBuf;
+
+        let globals = make_test_env();
+        globals.set(sema_core::intern("x"), Value::int(1));
+        let ctx = EvalContext::new();
+
+        let input = "(define (f x)\n  ; body line\n  (+ x 1))\n(f 10)";
+        let (vals, span_map) = sema_reader::read_many_with_spans(input).unwrap();
+        let source_file = PathBuf::from("<debug-eval>");
+        let prog = compile_program_with_spans(&vals, &span_map, Some(source_file.clone())).unwrap();
+
+        let mut vm = VM::new(globals, prog.functions, &[], prog.main_cache_slots).unwrap();
+        let mut debug = DebugState::new_headless();
+        debug.set_breakpoints(&source_file, &[3]);
+        debug.step_mode = StepMode::Continue;
+
+        let result = vm
+            .start_cooperative(prog.closure, &ctx, &mut debug)
+            .unwrap();
+        assert!(matches!(result, VmExecResult::Stopped(_)));
+        let frame_id = vm.debug_stack_trace().first().unwrap().id as usize;
+
+        let expr = sema_reader::read("(+ x 5)").unwrap();
+        let value = vm.debug_evaluate(frame_id, &expr, &ctx, &debug).unwrap();
+        assert_eq!(value, Value::int(15));
+    }
+
+    #[test]
+    fn test_debug_set_local_updates_paused_stack_slot() {
+        use crate::debug::{DebugState, StepMode, VmExecResult};
+        use std::path::PathBuf;
+
+        let globals = make_test_env();
+        let ctx = EvalContext::new();
+
+        let input = "(define (f x)\n  ; body line\n  (+ x 1))\n(f 10)";
+        let (vals, span_map) = sema_reader::read_many_with_spans(input).unwrap();
+        let source_file = PathBuf::from("<debug-set>");
+        let prog = compile_program_with_spans(&vals, &span_map, Some(source_file.clone())).unwrap();
+
+        let mut vm = VM::new(globals, prog.functions, &[], prog.main_cache_slots).unwrap();
+        let mut debug = DebugState::new_headless();
+        debug.set_breakpoints(&source_file, &[3]);
+        debug.step_mode = StepMode::Continue;
+
+        let result = vm
+            .start_cooperative(prog.closure, &ctx, &mut debug)
+            .unwrap();
+        assert!(matches!(result, VmExecResult::Stopped(_)));
+        let frame_id = vm.debug_stack_trace().first().unwrap().id as usize;
+
+        let updated = vm
+            .debug_set_variable(
+                crate::debug::scope_locals_ref(frame_id),
+                "x",
+                Value::int(32),
+            )
+            .unwrap();
+        assert_eq!(updated.value, "32");
+
+        let expr = sema_reader::read("(+ x 5)").unwrap();
+        let value = vm.debug_evaluate(frame_id, &expr, &ctx, &debug).unwrap();
+        assert_eq!(value, Value::int(37));
+    }
+
+    #[test]
+    fn test_debug_upvalues_use_lexical_names_and_support_closed_mutation() {
+        use crate::debug::{DebugState, StepMode, VmExecResult};
+        use std::path::PathBuf;
+
+        let globals = make_test_env();
+        let ctx = EvalContext::new();
+        let input = "(define (make-adder base)\n  (lambda (x)\n    (+ base x)))\n(define add5 (make-adder 5))\n(add5 10)";
+        let (vals, span_map) = sema_reader::read_many_with_spans(input).unwrap();
+        let source_file = PathBuf::from("<debug-closed-upvalue>");
+        let prog = compile_program_with_spans(&vals, &span_map, Some(source_file.clone())).unwrap();
+
+        let mut vm = VM::new(globals, prog.functions, &[], prog.main_cache_slots).unwrap();
+        let mut debug = DebugState::new_headless();
+        debug.set_breakpoints(&source_file, &[3]);
+        debug.step_mode = StepMode::Continue;
+
+        let result = vm
+            .start_cooperative(prog.closure, &ctx, &mut debug)
+            .unwrap();
+        assert!(matches!(result, VmExecResult::Stopped(_)));
+        let frame_id = vm.debug_stack_trace().first().unwrap().id as usize;
+
+        let upvalues = vm.debug_variables(crate::debug::scope_upvalues_ref(frame_id));
+        assert!(
+            upvalues
+                .iter()
+                .any(|var| var.name == "base" && var.value == "5"),
+            "expected lexical upvalue name in debug variables: {upvalues:?}"
+        );
+
+        let expr = sema_reader::read("(+ base x)").unwrap();
+        assert_eq!(
+            vm.debug_evaluate(frame_id, &expr, &ctx, &debug).unwrap(),
+            Value::int(15)
+        );
+
+        let updated = vm
+            .debug_set_variable(
+                crate::debug::scope_upvalues_ref(frame_id),
+                "base",
+                Value::int(20),
+            )
+            .unwrap();
+        assert_eq!(updated.name, "base");
+        assert_eq!(updated.value, "20");
+        assert_eq!(
+            vm.debug_evaluate(frame_id, &expr, &ctx, &debug).unwrap(),
+            Value::int(30)
+        );
+    }
+
+    #[test]
+    fn test_debug_upvalues_support_open_mutation_by_lexical_name() {
+        use crate::debug::{DebugState, StepMode, VmExecResult};
+        use std::path::PathBuf;
+
+        let globals = make_test_env();
+        let ctx = EvalContext::new();
+        let input =
+            "(define (outer base)\n  (define f (lambda (x)\n    (+ base x)))\n  (f 10))\n(outer 5)";
+        let (vals, span_map) = sema_reader::read_many_with_spans(input).unwrap();
+        let source_file = PathBuf::from("<debug-open-upvalue>");
+        let prog = compile_program_with_spans(&vals, &span_map, Some(source_file.clone())).unwrap();
+
+        let mut vm = VM::new(globals, prog.functions, &[], prog.main_cache_slots).unwrap();
+        let mut debug = DebugState::new_headless();
+        debug.set_breakpoints(&source_file, &[3]);
+        debug.step_mode = StepMode::Continue;
+
+        let result = vm
+            .start_cooperative(prog.closure, &ctx, &mut debug)
+            .unwrap();
+        assert!(matches!(result, VmExecResult::Stopped(_)));
+        let frame_id = vm.debug_stack_trace().first().unwrap().id as usize;
+
+        vm.debug_set_variable(
+            crate::debug::scope_upvalues_ref(frame_id),
+            "base",
+            Value::int(40),
+        )
+        .unwrap();
+        let expr = sema_reader::read("(+ base x)").unwrap();
+        assert_eq!(
+            vm.debug_evaluate(frame_id, &expr, &ctx, &debug).unwrap(),
+            Value::int(50)
+        );
+    }
+
+    #[test]
+    fn test_debug_variables_expand_compound_values_lazily() {
+        use crate::debug::{DebugState, StepMode, VmExecResult};
+        use std::path::PathBuf;
+
+        let globals = make_test_env();
+        let ctx = EvalContext::new();
+        let input = "(define (f xs)\n  (list xs))\n(f (list 1 (list 2 3)))";
+        let (vals, span_map) = sema_reader::read_many_with_spans(input).unwrap();
+        let source_file = PathBuf::from("<debug-expand>");
+        let prog = compile_program_with_spans(&vals, &span_map, Some(source_file.clone())).unwrap();
+
+        let mut vm = VM::new(globals, prog.functions, &[], prog.main_cache_slots).unwrap();
+        let mut debug = DebugState::new_headless();
+        debug.set_breakpoints(&source_file, &[2]);
+        debug.step_mode = StepMode::Continue;
+
+        let result = vm
+            .start_cooperative(prog.closure, &ctx, &mut debug)
+            .unwrap();
+        assert!(matches!(result, VmExecResult::Stopped(_)));
+        let frame_id = vm.debug_stack_trace().first().unwrap().id as usize;
+
+        let locals = vm.debug_variables(crate::debug::scope_locals_ref(frame_id));
+        let xs = locals
+            .iter()
+            .find(|var| var.name == "xs")
+            .expect("xs local should be visible");
+        assert!(
+            xs.variables_reference > 0,
+            "xs should be expandable: {xs:?}"
+        );
+
+        let children = vm.debug_variables(xs.variables_reference);
+        assert_eq!(children.len(), 2);
+        assert_eq!(children[0].name, "[0]");
+        assert_eq!(children[0].value, "1");
+        assert_eq!(children[1].name, "[1]");
+        assert!(children[1].variables_reference > 0);
+
+        let nested = vm.debug_variables(children[1].variables_reference);
+        assert_eq!(nested.len(), 2);
+        assert_eq!(nested[0].value, "2");
+        assert_eq!(nested[1].value, "3");
+    }
+
+    #[test]
+    fn test_debug_variables_expand_records_with_field_names() {
+        let mut vm = VM::new(make_test_env(), vec![], &[], 0).unwrap();
+        let point_value = Value::record(sema_core::Record {
+            type_tag: intern("point"),
+            field_names: vec![intern("x"), intern("y")],
+            fields: vec![Value::int(3), Value::int(4)],
+        });
+        let point = vm.debug_value_to_variable("p", point_value);
+        assert!(
+            point.variables_reference > 0,
+            "record local should be expandable: {point:?}"
+        );
+
+        let fields = vm.debug_variables(point.variables_reference);
+        assert_eq!(fields.len(), 2);
+        assert_eq!(fields[0].name, "x");
+        assert_eq!(fields[0].value, "3");
+        assert_eq!(fields[1].name, "y");
+        assert_eq!(fields[1].value, "4");
+    }
+
+    #[test]
+    fn test_debug_variables_expand_records_with_fallback_field_names() {
+        let mut vm = VM::new(make_test_env(), vec![], &[], 0).unwrap();
+        let point_value = Value::record(sema_core::Record {
+            type_tag: intern("point"),
+            field_names: Vec::new(),
+            fields: vec![Value::int(3), Value::int(4)],
+        });
+        let point = vm.debug_value_to_variable("p", point_value);
+
+        let fields = vm.debug_variables(point.variables_reference);
+        assert_eq!(fields.len(), 2);
+        assert_eq!(fields[0].name, "field_0");
+        assert_eq!(fields[1].name, "field_1");
+    }
+
+    #[test]
+    fn test_valid_breakpoint_lines_are_grouped_by_source_file() {
+        use std::path::PathBuf;
+
+        let source_a = PathBuf::from("/tmp/sema-debug-a.sema");
+        let source_b = PathBuf::from("/tmp/sema-debug-b.sema");
+        let mut chunk_a = Chunk::new();
+        chunk_a.spans.push((
+            0,
+            sema_core::Span {
+                line: 10,
+                col: 0,
+                end_line: 10,
+                end_col: 1,
+            },
+        ));
+        let func_a = Rc::new(Function {
+            name: None,
+            chunk: chunk_a,
+            upvalue_descs: vec![],
+            arity: 0,
+            has_rest: false,
+            local_names: vec![],
+            upvalue_names: vec![],
+            source_file: Some(source_a.clone()),
+            local_scopes: Vec::new(),
+            cache_offset: 0,
+        });
+
+        let mut chunk_b = Chunk::new();
+        chunk_b.spans.push((
+            0,
+            sema_core::Span {
+                line: 20,
+                col: 0,
+                end_line: 20,
+                end_col: 1,
+            },
+        ));
+        let func_b = Rc::new(Function {
+            name: None,
+            chunk: chunk_b,
+            upvalue_descs: vec![],
+            arity: 0,
+            has_rest: false,
+            local_names: vec![],
+            upvalue_names: vec![],
+            source_file: Some(source_b.clone()),
+            local_scopes: Vec::new(),
+            cache_offset: 0,
+        });
+
+        let main = Rc::new(Closure {
+            func: func_a.clone(),
+            upvalues: vec![],
+            globals: None,
+            functions: None,
+        });
+        let lines = valid_breakpoint_lines_by_file(&main, &[func_a, func_b]);
+
+        assert_eq!(lines.get(&source_a), Some(&vec![10]));
+        assert_eq!(lines.get(&source_b), Some(&vec![20]));
+    }
+
+    #[test]
     fn test_global_redefinition_is_idempotent() {
         // Issue #3: The HTTP replay-restart strategy re-executes side effects.
         // Verify that re-defining globals doesn't error — (define x ...) twice
@@ -3238,23 +5555,27 @@ mod tests {
         let globals = Rc::new(Env::new());
         let ctx = EvalContext::new();
         let mut e = Emitter::new();
-        e.emit_const(Value::int(3));
-        e.emit_const(Value::int(2));
+        e.emit_const(Value::int(3)).unwrap();
+        e.emit_const(Value::int(2)).unwrap();
         e.emit_op(Op::Div);
         e.emit_op(Op::Return);
         let func = Rc::new(crate::chunk::Function {
             name: None,
             chunk: e.into_chunk(),
             upvalue_descs: vec![],
+            upvalue_names: vec![],
             arity: 0,
             has_rest: false,
             local_names: vec![],
             source_file: None,
+            local_scopes: Vec::new(),
             cache_offset: 0,
         });
         let closure = Rc::new(Closure {
             func,
             upvalues: vec![],
+            globals: None,
+            functions: None,
         });
         let mut vm = VM::new(globals, vec![], &[], 0).unwrap();
         let result = vm.execute(closure, &ctx).unwrap();
@@ -3420,7 +5741,7 @@ mod tests {
         let ctx = EvalContext::new();
         let result = eval_str_with_call_native("(list 1 2 3)", &globals, &ctx).unwrap();
         assert!(result.is_list());
-        let items: Vec<Value> = result.as_list().unwrap().iter().cloned().collect();
+        let items: Vec<Value> = result.as_list().unwrap().to_vec();
         assert_eq!(items, vec![Value::int(1), Value::int(2), Value::int(3)]);
     }
 
@@ -3666,5 +5987,38 @@ mod tests {
             let result = eval_str(&format!("g{i}"), &globals, &ctx).unwrap();
             assert_eq!(result, Value::int(i), "g{i} should be {i}");
         }
+    }
+
+    // ── as_local_set robustness (DAP-7) ─────────────────────────
+
+    fn parse_one(src: &str) -> Value {
+        sema_reader::read_many(src)
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap()
+    }
+
+    #[test]
+    fn test_as_local_set_matches_builtin_form() {
+        let expr = parse_one("(set! x 1)");
+        let (target, value) = VM::as_local_set(&expr).expect("should match a set! form");
+        assert_eq!(sema_core::resolve(target), "x");
+        assert_eq!(value, Value::int(1));
+    }
+
+    #[test]
+    fn test_as_local_set_rejects_non_set_forms() {
+        // Wrong head symbol — must not be treated as a write-back candidate.
+        assert!(VM::as_local_set(&parse_one("(define x 1)")).is_none());
+        assert!(VM::as_local_set(&parse_one("(+ x 1)")).is_none());
+        // Wrong arity.
+        assert!(VM::as_local_set(&parse_one("(set! x)")).is_none());
+        assert!(VM::as_local_set(&parse_one("(set! x 1 2)")).is_none());
+        // Non-symbol target (e.g. a place expression) — not a simple local set!.
+        assert!(VM::as_local_set(&parse_one("(set! (car xs) 1)")).is_none());
+        // Not a list at all.
+        assert!(VM::as_local_set(&parse_one("x")).is_none());
+        assert!(VM::as_local_set(&parse_one("42")).is_none());
     }
 }

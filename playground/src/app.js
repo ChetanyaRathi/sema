@@ -4,8 +4,15 @@ import { highlightSema } from './highlight.js';
 import { TextareaUndo } from './undo.js';
 import { makeVfsHost, BACKENDS } from './vfs-backends.js';
 import { initSplitters } from './splitters.js';
+import { workerEvalEnabled, initWorker, evalViaWorker, cancelWorker, setWorkerOutputHandler } from './worker-client.js';
 
 let interp = null;
+// When true, eval runs on a Web Worker (real wall-clock async/sleep, responsive
+// UI, cancellable). Active when the page is cross-origin isolated; opt out with
+// ?no-worker. See worker-client.js.
+let workerActive = false;
+// True while a worker eval is in flight (so the Run button acts as Stop).
+let workerRunning = false;
 let activeBtn = null;
 let vfsHost = null;
 let vfsBackend = null;
@@ -375,16 +382,6 @@ backendToggle.addEventListener('change', async (e) => {
   refreshVfsStats();
 });
 
-// ── Engine toggle ──
-
-let useVM = false;
-document.getElementById('engine-toggle').addEventListener('change', (e) => {
-  useVM = e.target.value === 'vm';
-  document.querySelectorAll('#engine-toggle label').forEach(l => {
-    l.classList.toggle('active', l.querySelector('input').value === e.target.value);
-  });
-});
-
 // ── Init ──
 
 async function main() {
@@ -393,6 +390,25 @@ async function main() {
   await init();
   interp = new SemaInterpreter();
   vfsHost = makeVfsHost(interp);
+
+  // Opt-in worker path: run eval off the main thread for real async/sleep.
+  if (workerEvalEnabled()) {
+    try {
+      await initWorker();
+      workerActive = true;
+      // Stream the worker's output lines into the pane live as they're produced.
+      setWorkerOutputHandler((line) => {
+        const div = document.createElement('div');
+        div.className = 'output-line';
+        div.textContent = line;
+        outputEl.appendChild(div);
+        outputEl.scrollTop = outputEl.scrollHeight;
+      });
+    } catch (e) {
+      console.warn('worker eval unavailable, using main thread:', e);
+      workerActive = false;
+    }
+  }
 
   // Restore backend preference
   const saved = loadState();
@@ -430,27 +446,69 @@ const outputEl = document.getElementById('output');
 
 async function run() {
   if (!interp) return;
+  if (workerRunning) return; // a worker eval is already in flight
   const code = editorEl.value;
   if (!code.trim()) return;
 
-  const engine = useVM ? 'vm' : 'tree';
   const runBtn = document.getElementById('run-btn');
-  runBtn.disabled = true;
+  const statusEl = document.getElementById('status');
+
+  // On the worker path the main thread stays free, so the Run button becomes a
+  // live "Stop" (cancellation), and a "Running…" status can actually paint
+  // (async/sleep paces in real wall-clock time). On the main-thread path the
+  // button just disables (the UI is blocked during eval anyway).
+  if (workerActive) {
+    workerRunning = true;
+    runBtn.textContent = 'Stop';
+    runBtn.classList.add('stop-btn');
+    statusEl.textContent = 'Running…';
+    statusEl.className = 'status-text status-loading';
+    // Clear now so streamed output lines (see setWorkerOutputHandler) land in a
+    // fresh pane and appear live as the program runs.
+    outputEl.innerHTML = '';
+  } else {
+    runBtn.disabled = true;
+  }
 
   const t0 = performance.now();
-  const result = useVM ? await interp.evalVMAsync(code) : await interp.evalAsync(code);
+  let result;
+  if (workerActive) {
+    // The worker owns eval; keep the main-thread interp as a synchronous VFS
+    // mirror so the existing file-tree/preview/persistence code is unchanged.
+    // Seed the worker with the mirror, then reflect any file changes back.
+    const { result: r, vfs } = await evalViaWorker(code, interp.dumpVfs());
+    result = r;
+    interp.loadVfs(vfs);
+  } else {
+    result = await interp.evalVMAsync(code);
+  }
   const elapsed = performance.now() - t0;
 
-  runBtn.disabled = false;
+  if (workerActive) {
+    workerRunning = false;
+    runBtn.innerHTML = 'Run<span class="shortcut">⌘↵</span>';
+    runBtn.classList.remove('stop-btn');
+    const cancelled = result.error && result.error.includes('cancelled');
+    statusEl.textContent = result.error ? (cancelled ? 'Stopped' : 'Error') : 'Ready';
+    statusEl.className = result.error
+      ? (cancelled ? 'status-text status-ready' : 'status-text status-error')
+      : 'status-text status-ready';
+  } else {
+    runBtn.disabled = false;
+  }
 
-  outputEl.innerHTML = '';
-
-  if (result.output && result.output.length > 0) {
-    for (const line of result.output) {
-      const div = document.createElement('div');
-      div.className = 'output-line';
-      div.textContent = line;
-      outputEl.appendChild(div);
+  // On the worker path the output lines already streamed in live (and the pane
+  // was cleared at run start), so we only append the value/error + timing here.
+  // On the main-thread path output is batched, so clear and render it now.
+  if (!workerActive) {
+    outputEl.innerHTML = '';
+    if (result.output && result.output.length > 0) {
+      for (const line of result.output) {
+        const div = document.createElement('div');
+        div.className = 'output-line';
+        div.textContent = line;
+        outputEl.appendChild(div);
+      }
     }
   }
 
@@ -468,7 +526,7 @@ async function run() {
 
   const timing = document.createElement('div');
   timing.className = 'output-timing';
-  timing.textContent = `Evaluated in ${elapsed.toFixed(1)}ms · ${engine === 'vm' ? 'bytecode VM' : 'tree-walker'}`;
+  timing.textContent = `Evaluated in ${elapsed.toFixed(1)}ms · bytecode VM`;
   outputEl.appendChild(timing);
 
   // Refresh VFS state
@@ -491,8 +549,11 @@ async function run() {
   }
 }
 
-// Run button
-document.getElementById('run-btn').addEventListener('click', run);
+// Run button (acts as Stop while a worker eval is in flight)
+document.getElementById('run-btn').addEventListener('click', () => {
+  if (workerActive && workerRunning) cancelWorker();
+  else run();
+});
 
 // Format button
 document.getElementById('fmt-btn').addEventListener('click', () => {

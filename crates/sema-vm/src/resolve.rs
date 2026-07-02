@@ -35,6 +35,7 @@ struct BlockScope {
 struct FunctionScope {
     blocks: Vec<BlockScope>,
     upvalues: Vec<UpvalueDesc>,
+    upvalue_names: Vec<Spur>,
     next_slot: u16,
     is_top_level: bool,
 }
@@ -44,6 +45,7 @@ impl FunctionScope {
         FunctionScope {
             blocks: vec![BlockScope { locals: Vec::new() }],
             upvalues: Vec::new(),
+            upvalue_names: Vec::new(),
             next_slot: 0,
             is_top_level,
         }
@@ -93,7 +95,7 @@ impl FunctionScope {
     }
 
     /// Add an upvalue, returning its index. Deduplicates.
-    fn add_upvalue(&mut self, info: UpvalueDesc) -> u16 {
+    fn add_upvalue(&mut self, info: UpvalueDesc, name: Spur) -> u16 {
         // Check if we already capture this exact source
         for (i, existing) in self.upvalues.iter().enumerate() {
             match (existing, &info) {
@@ -108,6 +110,7 @@ impl FunctionScope {
         }
         let idx = self.upvalues.len() as u16;
         self.upvalues.push(info);
+        self.upvalue_names.push(name);
         idx
     }
 }
@@ -191,12 +194,14 @@ impl Resolver {
         // Check parent function's locals
         if let Some(slot) = self.scopes[parent_idx].find_local(name) {
             self.scopes[parent_idx].mark_captured(slot);
-            return Some(self.scopes[scope_idx].add_upvalue(UpvalueDesc::ParentLocal(slot)));
+            return Some(self.scopes[scope_idx].add_upvalue(UpvalueDesc::ParentLocal(slot), name));
         }
 
         // Recurse: check if parent can resolve it as an upvalue
         if let Some(parent_uv) = self.resolve_upvalue(parent_idx, name) {
-            return Some(self.scopes[scope_idx].add_upvalue(UpvalueDesc::ParentUpvalue(parent_uv)));
+            return Some(
+                self.scopes[scope_idx].add_upvalue(UpvalueDesc::ParentUpvalue(parent_uv), name),
+            );
         }
 
         None
@@ -237,7 +242,11 @@ fn resolve_expr_inner(expr: &CoreExpr, r: &mut Resolver) -> Result<ResolvedExpr,
             // reference each other (letrec* semantics / R5RS internal defines).
             if !(r.current().is_top_level && r.current().blocks.len() == 1) {
                 for expr in exprs {
-                    if let CoreExpr::Define(spur, _) = expr {
+                    let inner = match expr {
+                        CoreExpr::Spanned(_, inner) => inner.as_ref(),
+                        other => other,
+                    };
+                    if let CoreExpr::Define(spur, _) = inner {
                         if r.current().find_local(*spur).is_none() {
                             r.define_local(*spur);
                         }
@@ -429,7 +438,11 @@ fn resolve_exprs(exprs: &[CoreExpr], r: &mut Resolver) -> Result<Vec<ResolvedExp
 fn resolve_body(exprs: &[CoreExpr], r: &mut Resolver) -> Result<Vec<ResolvedExpr>, SemaError> {
     if !(r.current().is_top_level && r.current().blocks.len() == 1) {
         for expr in exprs {
-            if let CoreExpr::Define(spur, _) = expr {
+            let inner = match expr {
+                CoreExpr::Spanned(_, inner) => inner.as_ref(),
+                other => other,
+            };
+            if let CoreExpr::Define(spur, _) = inner {
                 if r.current().find_local(*spur).is_none() {
                     r.define_local(*spur);
                 }
@@ -472,6 +485,7 @@ fn resolve_lambda(def: &LambdaDef<Spur>, r: &mut Resolver) -> Result<ResolvedExp
         rest: def.rest,
         body,
         upvalues: fn_scope.upvalues,
+        upvalue_names: fn_scope.upvalue_names,
         n_locals: fn_scope.next_slot,
     }))
 }
@@ -556,7 +570,11 @@ fn resolve_letrec(
     // Also pre-register body defines so letrec inits can reference them
     // (R5RS: internal defines in letrec body are visible to init expressions)
     for expr in body {
-        if let CoreExpr::Define(spur, _) = expr {
+        let inner = match expr {
+            CoreExpr::Spanned(_, inner) => inner.as_ref(),
+            other => other,
+        };
+        if let CoreExpr::Define(spur, _) = inner {
             if r.current().find_local(*spur).is_none() {
                 r.define_local(*spur);
             }
