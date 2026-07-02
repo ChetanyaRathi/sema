@@ -2976,30 +2976,42 @@ impl VM {
         let closure = Rc::new(Closure {
             func,
             upvalues,
-            globals: Some(home_globals.clone()),
+            globals: Some(home_globals),
             // The new closure's func-ids index the table the defining frame is
             // running against (set per frame activation in the dispatch loop).
             functions: Some(self.functions.clone()),
         });
-        let payload: Rc<dyn std::any::Any> = Rc::new(VmClosurePayload {
-            closure: closure.clone(),
+        let payload = Rc::new(VmClosurePayload {
+            closure,
             functions: self.functions.clone(),
         });
-        let closure_for_fallback = closure.clone();
-        let functions = self.functions.clone();
-        let globals = home_globals;
+        // The fallback box captures ONLY this payload Rc (invariant I2): the
+        // wrapper's strong edges into the closure graph are exactly payload ×2
+        // (the `payload` field + the box), both traced through the registered
+        // payload tracer. Closure/functions/globals are derived from it at call
+        // time.
+        let payload_for_box = Rc::clone(&payload);
+        let name = payload
+            .closure
+            .func
+            .name
+            .map(resolve_spur)
+            .unwrap_or_else(|| "<vm-closure>".to_string());
 
         // The NativeFn wrapper is used as a fallback when called from outside the VM
         // (e.g., from stdlib HOFs like map/filter). Inside the VM, call_value detects
         // the payload and pushes a CallFrame instead — no Rust recursion.
         let mut native_fn = sema_core::NativeFn::with_payload(
-            closure_for_fallback
-                .func
-                .name
-                .map(resolve_spur)
-                .unwrap_or_else(|| "<vm-closure>".to_string()),
-            payload,
+            name,
+            payload as Rc<dyn std::any::Any>,
             move |ctx, args| {
+                let closure = &payload_for_box.closure;
+                let functions = &payload_for_box.functions;
+                let globals = closure
+                    .globals
+                    .as_ref()
+                    .expect("MakeClosure closures always carry Some(home)");
+
                 // Inside an async task, route through the scheduler so any
                 // yield in the inner closure (channel/send, channel/recv,
                 // await, sleep) suspends cleanly. Otherwise the inner VM's
@@ -3012,7 +3024,7 @@ impl VM {
                     // to run on the fresh task VM stack.
                     return crate::scheduler::run_closure_as_inline_task(
                         ctx,
-                        closure_for_fallback.clone(),
+                        closure.clone(),
                         functions.clone(),
                         args,
                     );
@@ -3025,17 +3037,16 @@ impl VM {
                 // parent's stack slots so `set!` mutations flow back to the
                 // caller. Falls back to a fresh VM only when no compatible VM is
                 // on the stack (e.g. called directly from the tree-walker).
-                if let Some(result) =
-                    try_run_on_current_vm(&closure_for_fallback, &functions, &globals, args, ctx)
+                if let Some(result) = try_run_on_current_vm(closure, functions, globals, args, ctx)
                 {
                     return result;
                 }
 
                 // Foreign fresh VM: snapshot open upvalues against the owning
                 // VM (if any) before running on a different stack.
-                close_closure_upvalues_for_foreign_run(&closure_for_fallback);
+                close_closure_upvalues_for_foreign_run(closure);
                 let mut vm = VM::new_with_rc_functions(globals.clone(), functions.clone());
-                vm.setup_for_call(closure_for_fallback.clone(), args)?;
+                vm.setup_for_call(closure.clone(), args)?;
                 vm.run(ctx)
             },
         );
