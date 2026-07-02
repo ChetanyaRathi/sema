@@ -1237,9 +1237,15 @@ fn http_serve_impl(ctx: &sema_core::EvalContext, args: &[Value]) -> Result<Value
 
     let handler = args[0].clone();
 
-    // Parse options map (arg 1): {:port 3000 :host "0.0.0.0"}
+    // Parse options map (arg 1): {:port 3000 :host "0.0.0.0"
+    //                             :port-fallback true :on-listen (fn (info) ...)}
     let mut port: u16 = 3000;
     let mut host = "0.0.0.0".to_string();
+    // Off by default: `http/serve` fails fast on a taken port, preserving the
+    // long-standing contract. First-party servers (notebook, web dev server)
+    // opt in so users get automatic fallback there.
+    let mut port_fallback = false;
+    let mut on_listen: Option<Value> = None;
 
     if args.len() == 2 {
         if let Some(opts) = args[1].as_map_rc() {
@@ -1249,14 +1255,23 @@ fn http_serve_impl(ctx: &sema_core::EvalContext, args: &[Value]) -> Result<Value
             if let Some(h) = opts.get(&Value::keyword("host")).and_then(|v| v.as_str()) {
                 host = h.to_string();
             }
+            if let Some(f) = opts.get(&Value::keyword("port-fallback")) {
+                port_fallback = f.is_truthy();
+            }
+            if let Some(cb) = opts.get(&Value::keyword("on-listen")) {
+                if cb.as_native_fn_ref().is_some() || cb.as_lambda_rc().is_some() {
+                    on_listen = Some(cb.clone());
+                }
+            }
         }
     }
 
     // Create the mpsc channel for server requests (tokio async channel)
     let (tx, mut rx) = tokio::sync::mpsc::channel::<ServerRequest>(256);
 
-    // Create a std sync channel for ready signal
-    let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), String>>();
+    // Create a std sync channel for the ready signal, carrying the port the
+    // server actually bound to (may differ from `port` when fallback kicks in).
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<u16, String>>();
 
     let bind_host = host.clone();
     let bind_port = port;
@@ -1294,27 +1309,41 @@ fn http_serve_impl(ctx: &sema_core::EvalContext, args: &[Value]) -> Result<Value
                 }
             });
 
-            // Bind TCP listener
-            let addr = format!("{bind_host}:{bind_port}");
-            let listener = match tokio::net::TcpListener::bind(&addr).await {
-                Ok(l) => l,
+            // Bind the TCP listener. With fallback enabled, walk to the next
+            // free port on AddrInUse; otherwise bind the requested port only.
+            let bind_result = if port_fallback {
+                sema_core::net::bind_with_fallback(&bind_host, bind_port, 100).and_then(
+                    |(std_listener, actual)| {
+                        std_listener.set_nonblocking(true)?;
+                        let listener = tokio::net::TcpListener::from_std(std_listener)?;
+                        Ok((listener, actual))
+                    },
+                )
+            } else {
+                let addr = format!("{bind_host}:{bind_port}");
+                tokio::net::TcpListener::bind(&addr)
+                    .await
+                    .map(|listener| (listener, bind_port))
+            };
+            let (listener, actual_port) = match bind_result {
+                Ok(pair) => pair,
                 Err(e) => {
-                    let _ = ready_tx.send(Err(format!("bind {addr}: {e}")));
+                    let _ = ready_tx.send(Err(format!("bind {bind_host}:{bind_port}: {e}")));
                     return;
                 }
             };
 
-            // Signal success
-            let _ = ready_tx.send(Ok(()));
+            // Signal success with the port actually bound
+            let _ = ready_tx.send(Ok(actual_port));
 
             // Run the server
             let _ = axum::serve(listener, app).await;
         });
     });
 
-    // Wait for ready signal from the background thread
-    match ready_rx.recv() {
-        Ok(Ok(())) => {}
+    // Wait for the ready signal (carrying the actual bound port) from the thread
+    let actual_port = match ready_rx.recv() {
+        Ok(Ok(p)) => p,
         Ok(Err(e)) => {
             return Err(SemaError::Io(e));
         }
@@ -1323,9 +1352,25 @@ fn http_serve_impl(ctx: &sema_core::EvalContext, args: &[Value]) -> Result<Value
                 "http/serve: server thread died before binding",
             ));
         }
-    }
+    };
 
-    eprintln!("Listening on {host}:{port}");
+    eprintln!("Listening on {host}:{actual_port}");
+
+    // Hand the caller the address actually bound (host/port may differ from the
+    // request when :port-fallback picked the next free port) so it can print a
+    // URL or open a browser.
+    if let Some(cb) = &on_listen {
+        let mut info = BTreeMap::new();
+        info.insert(Value::keyword("host"), Value::string(&host));
+        info.insert(Value::keyword("port"), Value::int(actual_port as i64));
+        info.insert(
+            Value::keyword("url"),
+            Value::string(&format!("http://{host}:{actual_port}")),
+        );
+        if let Err(e) = call_callback(ctx, cb, &[Value::map(info)]) {
+            eprintln!("http/serve on-listen handler error: {e}");
+        }
+    }
 
     // Main evaluator loop: read requests from channel, call handler, send response
     while let Some(req) = rx.blocking_recv() {
