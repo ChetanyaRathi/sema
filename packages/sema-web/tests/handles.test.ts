@@ -20,6 +20,17 @@ describe("handles", () => {
     expect(id2).toBe(2);
   });
 
+  it("storeHandle reuses the existing ID for the same DOM object", () => {
+    const ctx = new SemaWebContext();
+    const el = document.createElement("div");
+
+    const id1 = storeHandle(el, ctx);
+    const id2 = storeHandle(el, ctx);
+
+    expect(id2).toBe(id1);
+    expect(ctx.handles.size).toBe(1);
+  });
+
   it("getElement retrieves a stored element", () => {
     const ctx = new SemaWebContext();
     const el = document.createElement("div");

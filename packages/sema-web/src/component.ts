@@ -35,7 +35,7 @@ import {
   withOwnerContext,
 } from "./context.js";
 import { renderSip } from "./sip.js";
-import { SEMA_IDENT_RE, storeHandle, releaseHandlesForSubtree } from "./handles.js";
+import { SEMA_IDENT_RE, storeHandle, releaseHandle, releaseHandlesForSubtree } from "./handles.js";
 import { toInvokableCallback, releaseCallback, type SemaCallback } from "./callbacks.js";
 
 interface SemaInterpreterLike {
@@ -94,12 +94,13 @@ function renderComponent(
     const sipNode = renderSip(sipData, interp, ctx);
     clone.appendChild(sipNode);
 
+    const activeElement = document.activeElement;
     morphdom(component.target, clone, {
       childrenOnly: true,
       onBeforeElUpdated(fromEl, toEl) {
         // Preserve focus and cursor position in active input elements
         if (
-          fromEl === document.activeElement &&
+          fromEl === activeElement &&
           (fromEl.tagName === "INPUT" || fromEl.tagName === "TEXTAREA" || fromEl.tagName === "SELECT")
         ) {
           for (const attr of Array.from(toEl.attributes)) {
@@ -274,10 +275,15 @@ class EventDelegator {
     const listeners: Array<{ event: string; listener: EventListener }> = [];
 
     for (const event of bubbling) {
+      const attr = `data-sema-on-${event}`;
       const listener = (ev: Event) => {
-        let el = ev.target as Element | null;
-        while (el && target.contains(el)) {
-          const attr = `data-sema-on-${event}`;
+        const start = ev.target;
+        if (!(start instanceof Element) || !target.contains(start)) {
+          return;
+        }
+
+        let el: Element | null = start;
+        while (el) {
           if (el.hasAttribute(attr)) {
             const fn = el.getAttribute(attr)!;
             if (SEMA_IDENT_RE.test(fn)) {
@@ -288,6 +294,7 @@ class EventDelegator {
               if (ev.cancelBubble || (ev as any).__sema_stop) break;
             }
           }
+          if (el === target) break;
           el = el.parentElement;
         }
       };
@@ -332,7 +339,7 @@ class EventDelegator {
     } catch (e) {
       ctx.onerror(e instanceof Error ? e : new Error(String(e)), `event:${ev.type}:${callbackName}`);
     } finally {
-      if (evHandle != null) ctx.handles.delete(evHandle);
+      if (evHandle != null) releaseHandle(evHandle, ctx);
     }
   }
 }

@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach } from "vitest";
+import { describe, it, expect, beforeEach, vi } from "vitest";
 import { registerStoreBindings } from "../src/store.js";
 import { SemaWebContext } from "../src/context.js";
 import { createMockInterpreter } from "./helpers.js";
@@ -77,6 +77,26 @@ describe("registerStoreBindings", () => {
     expect(interp.getFunction("store/keys")!().length).toBe(0);
   });
 
+  it("store/get returns null and reports corrupted JSON", () => {
+    const onerrorSpy = vi.fn();
+    ctx.onerror = onerrorSpy;
+    localStorage.setItem("bad", "{not json");
+
+    expect(interp.getFunction("store/get")!("bad")).toBeNull();
+    expect(onerrorSpy).toHaveBeenCalledWith(expect.any(SyntaxError), "store/get:bad");
+  });
+
+  it("store/set! reports values that cannot be JSON serialized", () => {
+    const onerrorSpy = vi.fn();
+    ctx.onerror = onerrorSpy;
+    const circular: any = {};
+    circular.self = circular;
+
+    expect(interp.getFunction("store/set!")!("circular", circular)).toBeNull();
+    expect(onerrorSpy).toHaveBeenCalledWith(expect.any(TypeError), "store/set!:circular");
+    expect(localStorage.getItem("circular")).toBeNull();
+  });
+
   // --- sessionStorage ---
 
   it("store/session-set! and store/session-get round-trip", () => {
@@ -95,5 +115,25 @@ describe("registerStoreBindings", () => {
     interp.getFunction("store/session-set!")!("a", 1);
     interp.getFunction("store/session-clear!")!();
     expect(interp.getFunction("store/session-get")!("a")).toBeNull();
+  });
+
+  it("store/session-get returns null and reports corrupted JSON", () => {
+    const onerrorSpy = vi.fn();
+    ctx.onerror = onerrorSpy;
+    sessionStorage.setItem("bad", "[");
+
+    expect(interp.getFunction("store/session-get")!("bad")).toBeNull();
+    expect(onerrorSpy).toHaveBeenCalledWith(expect.any(SyntaxError), "store/session-get:bad");
+  });
+
+  it("store/session-set! reports values that cannot be JSON serialized", () => {
+    const onerrorSpy = vi.fn();
+    ctx.onerror = onerrorSpy;
+    const circular: any = {};
+    circular.self = circular;
+
+    expect(interp.getFunction("store/session-set!")!("circular", circular)).toBeNull();
+    expect(onerrorSpy).toHaveBeenCalledWith(expect.any(TypeError), "store/session-set!:circular");
+    expect(sessionStorage.getItem("circular")).toBeNull();
   });
 });

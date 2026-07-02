@@ -1,4 +1,4 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import { signal, effect } from "@preact/signals-core";
 import { registerReactiveBindings } from "../src/reactive.js";
 import { SemaWebContext, disposeContextResources } from "../src/context.js";
@@ -143,6 +143,31 @@ describe("registerReactiveBindings", () => {
     expect(seen).toEqual([[1, 2], [2, 3]]);
   });
 
+  it("__state/watch throws on unknown state IDs", () => {
+    const { interp } = setup();
+
+    expect(() => interp.getFunction("__state/watch")!(999, () => {})).toThrow("Unknown state");
+  });
+
+  it("__state/watch routes callback errors through ctx.onerror and continues tracking", () => {
+    const { interp, ctx } = setup();
+    const onerrorSpy = vi.fn();
+    ctx.onerror = onerrorSpy;
+    const create = interp.getFunction("__state/create")!;
+    const put = interp.getFunction("__state/put!")!;
+    const watch = interp.getFunction("__state/watch")!;
+    const id = create(1);
+
+    watch(id, () => {
+      throw new Error("watch boom");
+    });
+    put(id, 2);
+    put(id, 3);
+
+    expect(onerrorSpy).toHaveBeenCalledTimes(2);
+    expect(onerrorSpy).toHaveBeenCalledWith(expect.any(Error), "watch");
+  });
+
   it("__state/watch binds ownership from the current execution context", () => {
     const { interp, ctx } = setup();
 
@@ -190,6 +215,25 @@ describe("registerReactiveBindings", () => {
     expect(batchCalls.length).toBeGreaterThan(0);
   });
 
+  it("__state/batch-run routes callback errors through ctx.onerror and releases direct callbacks", () => {
+    const { interp, ctx } = setup();
+    const onerrorSpy = vi.fn();
+    ctx.onerror = onerrorSpy;
+    let released = 0;
+    const callback = Object.assign(() => {
+      throw new Error("batch boom");
+    }, {
+      __semaRelease: () => {
+        released += 1;
+      },
+    });
+
+    expect(interp.getFunction("__state/batch-run")!(callback)).toBeUndefined();
+
+    expect(onerrorSpy).toHaveBeenCalledWith(expect.any(Error), "batch");
+    expect(released).toBe(1);
+  });
+
   it("__state/computed-create creates a computed signal via evalStr", () => {
     const { interp, ctx } = setup();
 
@@ -208,6 +252,18 @@ describe("registerReactiveBindings", () => {
       (c) => c.includes("my_thunk")
     );
     expect(computedCalls.length).toBeGreaterThan(0);
+  });
+
+  it("__state/computed-create routes callback errors through ctx.onerror and returns undefined", () => {
+    const { interp, ctx } = setup();
+    const onerrorSpy = vi.fn();
+    ctx.onerror = onerrorSpy;
+    const id = interp.getFunction("__state/computed-create")!(() => {
+      throw new Error("computed boom");
+    });
+
+    expect(interp.getFunction("__state/deref")!(id)).toBeUndefined();
+    expect(onerrorSpy).toHaveBeenCalledWith(expect.any(Error), "computed");
   });
 
   it("releases computed callback handles when the context is disposed", () => {
@@ -243,6 +299,13 @@ describe("registerReactiveBindings", () => {
     // Check that put! and update! wrappers are included
     const putCall = evalCalls.find((c) => c.includes("put!"));
     expect(putCall).toBeDefined();
+  });
+
+  it("throws a clear setup error when reactive wrapper registration fails", () => {
+    const interp = createMockInterpreter();
+    interp.evalStr = () => ({ value: null, output: [], error: "reactive wrapper boom" });
+
+    expect(() => registerReactiveBindings(interp, new SemaWebContext())).toThrow(/reactive wrapper boom/);
   });
 });
 

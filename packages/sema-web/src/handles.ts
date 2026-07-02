@@ -23,11 +23,17 @@ export const SEMA_IDENT_RE = /^[a-zA-Z_][a-zA-Z0-9_/\-?!*><=+.]*$/;
 // --- Module-level fallback state (for backward compatibility) ---
 // These will be removed once all modules are migrated to context-based usage.
 const _handles = new Map<number, Element | Text | Event>();
+const _handleIds = new WeakMap<Element | Text | Event, number>();
 let _nextHandle = 1;
 
 /** Get the handles map from ctx or the module-level fallback. */
 function getHandles(ctx?: SemaWebContext): Map<number, Element | Text | Event> {
   return ctx ? ctx.handles : _handles;
+}
+
+/** Get the reverse object-to-handle map from ctx or the module-level fallback. */
+function getHandleIds(ctx?: SemaWebContext): WeakMap<Element | Text | Event, number> {
+  return ctx ? ctx.handleIds : _handleIds;
 }
 
 /** Get and increment the next handle ID. */
@@ -44,8 +50,16 @@ function allocHandle(ctx?: SemaWebContext): number {
  */
 export function storeHandle(obj: Element | Text | Event | null, ctx?: SemaWebContext): number | null {
   if (obj == null) return null;
+  const handles = getHandles(ctx);
+  const handleIds = getHandleIds(ctx);
+  const existing = handleIds.get(obj);
+  if (existing != null && handles.get(existing) === obj) {
+    return existing;
+  }
+
   const id = allocHandle(ctx);
-  getHandles(ctx).set(id, obj);
+  handles.set(id, obj);
+  handleIds.set(obj, id);
   return id;
 }
 
@@ -90,7 +104,12 @@ export function getEvent(id: number, ctx?: SemaWebContext): Event {
  * No-op if the handle does not exist.
  */
 export function releaseHandle(id: number, ctx?: SemaWebContext): void {
-  getHandles(ctx).delete(id);
+  const handles = getHandles(ctx);
+  const value = handles.get(id);
+  if (value) {
+    getHandleIds(ctx).delete(value);
+  }
+  handles.delete(id);
 }
 
 /**
@@ -98,8 +117,10 @@ export function releaseHandle(id: number, ctx?: SemaWebContext): void {
  */
 export function releaseHandlesForSubtree(root: Node, ctx?: SemaWebContext): void {
   const handles = getHandles(ctx);
+  const handleIds = getHandleIds(ctx);
   for (const [id, value] of handles) {
     if ((value instanceof Element || value instanceof Text) && (value === root || root.contains(value))) {
+      handleIds.delete(value);
       handles.delete(id);
     }
   }

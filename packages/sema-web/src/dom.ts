@@ -220,13 +220,13 @@ export function registerDomBindings(interp: SemaInterpreterLike, ctx: SemaWebCon
       const evHandle = storeHandle(ev, ctx);
       try {
         withOwnerContext(ctx, ownerId, () => callback(evHandle));
-      } catch (e) {
-        ctx.onerror(e instanceof Error ? e : new Error(String(e)), `event:${event}`);
-      } finally {
-        // Auto-release event handle
-        if (evHandle != null) ctx.handles.delete(evHandle);
-      }
-    };
+    } catch (e) {
+      ctx.onerror(e instanceof Error ? e : new Error(String(e)), `event:${event}`);
+    } finally {
+      // Auto-release event handle
+      if (evHandle != null) releaseHandle(evHandle, ctx);
+    }
+  };
 
     ctx.listeners.set(key, { target: el, event, listener, callback });
     el.addEventListener(event, listener);

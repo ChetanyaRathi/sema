@@ -30,3 +30,16 @@ export function captureConsoleErrors(page: Page): string[] {
   });
   return errors;
 }
+
+/** Capture browser failure channels that should not fire during recoverable app errors. */
+export function captureBrowserFailures(page: Page): { consoleErrors: string[]; pageErrors: string[] } {
+  const consoleErrors: string[] = [];
+  const pageErrors: string[] = [];
+  page.on("console", (msg) => {
+    if (msg.type() === "error") consoleErrors.push(msg.text());
+  });
+  page.on("pageerror", (err) => {
+    pageErrors.push(err.message);
+  });
+  return { consoleErrors, pageErrors };
+}

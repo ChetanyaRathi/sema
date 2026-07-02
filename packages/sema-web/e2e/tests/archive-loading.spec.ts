@@ -16,6 +16,8 @@ const basicArchivePath = path.join(archiveDir, "basic.vfs");
 const basicEntryPath = path.join(fixtureDir, "scripts/basic.sema");
 const counterArchivePath = path.join(archiveDir, "counter-component.vfs");
 const counterEntryPath = path.join(fixtureDir, "scripts/counter.sema");
+const svgArchivePath = path.join(archiveDir, "svg-component.vfs");
+const svgEntryPath = path.join(fixtureDir, "scripts/svg-component.sema");
 
 function buildArchive(entryPath: string, archivePath: string): void {
   execFileSync(
@@ -44,11 +46,13 @@ test.beforeAll(() => {
   mkdirSync(archiveDir, { recursive: true });
   buildArchive(basicEntryPath, basicArchivePath);
   buildArchive(counterEntryPath, counterArchivePath);
+  buildArchive(svgEntryPath, svgArchivePath);
 });
 
 test.afterAll(() => {
   rmSync(basicArchivePath, { force: true });
   rmSync(counterArchivePath, { force: true });
+  rmSync(svgArchivePath, { force: true });
 });
 
 test("built .vfs archives load and execute in the browser", async ({ page }) => {
@@ -73,4 +77,26 @@ test("built .vfs archives support defcomponent and mount!", async ({ page }) => 
 
   await page.click("#btn-reset");
   await expect(display).toHaveText("0");
+});
+
+test("built .vfs archives preserve SVG SIP namespaces", async ({ page }) => {
+  await page.goto("/archive-svg.html");
+  await waitForSema(page);
+
+  const namespaces = await page.evaluate(() => {
+    const icon = document.querySelector("#icon")!;
+    const use = document.querySelector("#use-dot")!;
+    const htmlInside = document.querySelector("#html-inside")!;
+    return {
+      icon: icon.namespaceURI,
+      useHref: use.getAttributeNS("http://www.w3.org/1999/xlink", "href"),
+      htmlInside: htmlInside.namespaceURI,
+    };
+  });
+
+  expect(namespaces).toEqual({
+    icon: "http://www.w3.org/2000/svg",
+    useHref: "#dot",
+    htmlInside: "http://www.w3.org/1999/xhtml",
+  });
 });

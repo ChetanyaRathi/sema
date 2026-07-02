@@ -349,6 +349,13 @@ describe("renderSip — boolean HTML attributes", () => {
     // checked is deliberately NOT reflected as a plain attribute by this renderer
     expect(node.hasAttribute("checked")).toBe(false);
   });
+
+  it("muted=true sets both the content attribute and the live media property", () => {
+    const node = renderSip([":video", { ":muted": true }], interp, ctx) as HTMLVideoElement;
+    expect(node.hasAttribute("muted")).toBe(true);
+    expect(node.defaultMuted).toBe(true);
+    expect(node.muted).toBe(true);
+  });
 });
 
 describe("renderSip — SVG and MathML namespaces", () => {
@@ -628,6 +635,16 @@ describe("renderSip — on-* event handler validation", () => {
     expect(errors[0].context).toBe("sip-render:on-handler");
   });
 
+  it("empty event names route an error instead of creating an inert data-sema-on- attribute", () => {
+    const errors: Array<{ message: string; context: string }> = [];
+    ctx.onerror = (e, context) => errors.push({ message: e.message, context });
+    const node = renderSip([":button", { ":on-": "handle-click" }], interp, ctx) as HTMLElement;
+    expect(node.hasAttribute("data-sema-on-")).toBe(false);
+    expect(errors).toEqual([
+      { message: "Invalid event handler attribute: on-", context: "sip-render:on-handler" },
+    ]);
+  });
+
   it("very long handler name is still accepted (no arbitrary length cap)", () => {
     const longName = "a" + "-b".repeat(100);
     const node = renderSip([":button", { ":on-click": longName }], interp, ctx) as HTMLElement;
@@ -801,6 +818,42 @@ describe("renderSip — error isolation (one bad node/attribute shouldn't crash 
     expect(node.getAttribute("title")).toBe("ok-after");
     expect(node.hasAttribute("bad name")).toBe(false);
   });
+
+  it("attrs-map enumeration failures route through ctx.onerror and still render children", () => {
+    const errors: Array<{ message: string; context: string }> = [];
+    ctx.onerror = (e, context) => errors.push({ message: e.message, context });
+    const attrs = new Proxy({}, {
+      ownKeys: () => {
+        throw new Error("attrs boom");
+      },
+    });
+
+    let node: Node;
+    expect(() =>
+      node = renderSip([":div", attrs, [":span", "after"]], interp, ctx),
+    ).not.toThrow();
+
+    expect((node! as HTMLElement).textContent).toBe("after");
+    expect(errors.some((e) => e.context === "sip-render:attributes" && e.message === "attrs boom")).toBe(true);
+  });
+
+  it("fallback text coercion failures route through ctx.onerror and do not abort siblings", () => {
+    const errors: Array<{ message: string; context: string }> = [];
+    ctx.onerror = (e, context) => errors.push({ message: e.message, context });
+    const bad = {
+      toString: () => {
+        throw new Error("text boom");
+      },
+    };
+
+    let node: Node;
+    expect(() =>
+      node = renderSip([":div", "before", bad, "after"], interp, ctx),
+    ).not.toThrow();
+
+    expect((node! as HTMLElement).textContent).toBe("beforeafter");
+    expect(errors.some((e) => e.context === "sip-render:text" && e.message === "text boom")).toBe(true);
+  });
 });
 
 describe("renderSip — namespaced attributes (xlink:, xml:, xmlns:)", () => {
@@ -808,6 +861,7 @@ describe("renderSip — namespaced attributes (xlink:, xml:, xmlns:)", () => {
   let ctx: SemaWebContext;
   const XLINK_NS = "http://www.w3.org/1999/xlink";
   const XML_NS = "http://www.w3.org/XML/1998/namespace";
+  const XMLNS_NS = "http://www.w3.org/2000/xmlns/";
 
   beforeEach(() => {
     interp = createMockInterpreter();
@@ -828,6 +882,16 @@ describe("renderSip — namespaced attributes (xlink:, xml:, xmlns:)", () => {
   it("xml:lang is set via setAttributeNS in the XML namespace", () => {
     const node = renderSip([":div", { ":xml:lang": "en" }], interp, ctx) as HTMLElement;
     expect(node.getAttributeNS(XML_NS, "lang")).toBe("en");
+  });
+
+  it("default xmlns is set via setAttributeNS in the XMLNS namespace", () => {
+    const node = renderSip(
+      [":svg", { ":xmlns": "http://www.w3.org/2000/svg" }],
+      interp,
+      ctx,
+    ) as SVGElement;
+    expect(node.getAttribute("xmlns")).toBe("http://www.w3.org/2000/svg");
+    expect(node.getAttributeNS(XMLNS_NS, "xmlns")).toBe("http://www.w3.org/2000/svg");
   });
 
   it("an unrecognized colon-containing attribute name falls back to plain setAttribute", () => {

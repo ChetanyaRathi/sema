@@ -38,4 +38,22 @@ describe("registerCssBindings", () => {
     expect(ctx.styleEl).toBeNull();
     expect(styleEl?.isConnected).toBe(false);
   });
+
+  it("ignores nested selectors with non-object values and still emits root declarations", () => {
+    const className = interp.getFunction("css/scoped")!({
+      ":color": "blue",
+      ":&:hover": "not-a-rule-map",
+    });
+
+    const rules = Array.from(ctx.styleEl?.sheet?.cssRules ?? []).map((rule) => rule.cssText);
+    expect(rules.some((rule) => rule.includes(`.${className}`) && rule.includes("color: blue"))).toBe(true);
+    expect(rules.some((rule) => rule.includes(":hover"))).toBe(false);
+  });
+
+  it("throws a clear setup error when CSS wrapper registration fails", () => {
+    const badInterp = createMockInterpreter();
+    badInterp.evalStr = () => ({ value: null, output: [], error: "css wrapper boom" });
+
+    expect(() => registerCssBindings(badInterp, new SemaWebContext())).toThrow(/css wrapper boom/);
+  });
 });

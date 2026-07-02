@@ -62,6 +62,7 @@ export type ErrorHandler = (error: Error, context: string) => void;
 export class SemaWebContext {
   /** DOM element/text/event handles */
   handles = new Map<number, Element | Text | Event>();
+  handleIds = new WeakMap<Element | Text | Event, number>();
   nextHandle = 1;
 
   /** Reactive signals */

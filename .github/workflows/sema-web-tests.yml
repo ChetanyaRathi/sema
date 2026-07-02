@@ -2,13 +2,40 @@ name: sema-web tests
 on:
   push:
     paths:
+      - ".github/workflows/sema-web-tests.yml"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "crates/sema-core/**"
+      - "crates/sema-eval/**"
+      - "crates/sema-fmt/**"
+      - "crates/sema-otel/**"
+      - "crates/sema-reader/**"
+      - "crates/sema-stdlib/**"
+      - "crates/sema-vm/**"
+      - "crates/sema-wasm/**"
+      - "package-lock.json"
+      - "packages/llm-proxy/**"
       - "packages/sema-web/**"
       - "packages/sema/**"
-      - "packages/llm-proxy/**"
-      - "crates/sema-wasm/**"
+      - "packages/sema-wasm/**"
   pull_request:
     paths:
+      - ".github/workflows/sema-web-tests.yml"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "crates/sema-core/**"
+      - "crates/sema-eval/**"
+      - "crates/sema-fmt/**"
+      - "crates/sema-otel/**"
+      - "crates/sema-reader/**"
+      - "crates/sema-stdlib/**"
+      - "crates/sema-vm/**"
+      - "crates/sema-wasm/**"
+      - "package-lock.json"
+      - "packages/llm-proxy/**"
       - "packages/sema-web/**"
+      - "packages/sema/**"
+      - "packages/sema-wasm/**"
 
 jobs:
   unit:
@@ -34,7 +61,7 @@ jobs:
         id: wasm-cache
         with:
           path: packages/sema-wasm/pkg
-          key: wasm-${{ hashFiles('crates/sema-wasm/src/**', 'Cargo.lock') }}
+          key: wasm-${{ hashFiles('Cargo.toml', 'Cargo.lock', 'crates/sema-core/**', 'crates/sema-eval/**', 'crates/sema-fmt/**', 'crates/sema-otel/**', 'crates/sema-reader/**', 'crates/sema-stdlib/**', 'crates/sema-vm/**', 'crates/sema-wasm/**') }}
       - if: steps.wasm-cache.outputs.cache-hit != 'true'
         run: |
           cargo install wasm-pack
@@ -43,8 +70,8 @@ jobs:
         with:
           node-version: 22
       - run: npm ci
-      - run: npx tsup src/index.ts --format esm --no-dts
-        working-directory: packages/sema-web
+      - run: npm run build --workspace=@sema-lang/sema
+      - run: npm run build --workspace=@sema-lang/sema-web
       - run: npx playwright install --with-deps chromium
         working-directory: packages/sema-web
       - run: npx playwright test
