@@ -133,6 +133,25 @@ fn nonrecursive_local_closure_growth_is_bounded() {
     assert_bounded_churn(CHURN_FLAT, "non-recursive control churn");
 }
 
+const CHURN_CHANNELS: &str = r#"
+(define (churn) (channel/new 1))
+(define (run n)
+  (if (<= n 0) nil
+      (begin (churn) (run (- n 1)))))
+"#;
+
+/// CORE-2 oracle, data-birth shape: every cold data-cycle constructor
+/// (`channel/new` here) registers a collector candidate, and a dead
+/// candidate's registry `Weak` pins the allocation's `RcBox` (~100 B for a
+/// channel) until a pass prunes it. No closure is born in this loop, so only
+/// `register_candidate`'s own registry-growth trigger can run that pass
+/// mid-eval — without it, acyclic data churn retains O(total births), not
+/// O(live), until the eval returns (which a server-style loop never does).
+#[test]
+fn acyclic_channel_churn_growth_is_bounded() {
+    assert_bounded_churn(CHURN_CHANNELS, "acyclic channel-churn");
+}
+
 const TEARDOWN_ITERS: usize = 10;
 
 /// Net growth of TEARDOWN_ITERS create→eval→drop cycles. `programs` runs as

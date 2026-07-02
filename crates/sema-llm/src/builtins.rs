@@ -7349,6 +7349,16 @@ fn run_tool_loop(
                 return Err(SemaError::Llm(msg));
             }
         }
+
+        // Agent-turn safe point (CORE-2, plan §5.2 point c): the round's tool
+        // handlers just ran arbitrary Sema code (the long-running-agent leak
+        // shape — recursive local helpers, channels, promises created per
+        // turn), and a long agent run never returns to a top-level safe point
+        // until it finishes. Threshold-gated. No pins: sema-llm cannot see the
+        // executing VM's env (it depends only on sema-core), and pins are a
+        // pure descent-skip optimization — correctness comes from external
+        // strong counts. Message history/correlation is untouched.
+        sema_core::gc_maybe_collect(&[]);
     }
 
     // Push final assistant message if we exhausted rounds

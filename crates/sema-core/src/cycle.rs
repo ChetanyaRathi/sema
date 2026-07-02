@@ -40,8 +40,54 @@ pub type EnvBindings = RefCell<hashbrown::HashMap<Spur, Value>>;
 /// Never dereferenced by the collector itself except through the typed
 /// handles it holds; opaque participants (sema-vm's `UpvalueCell`, test node
 /// types) recover their `&T` from it inside their own `trace`/`sever` fns.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NodePtr(*const u8);
+
+impl std::hash::Hash for NodePtr {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        // One usize write, so PtrHasher::write_usize sees the raw address.
+        state.write_usize(self.0 as usize);
+    }
+}
+
+/// Hasher for [`NodePtr`]-keyed collector maps. Keys are unique allocation
+/// addresses, so a single Fibonacci multiply (splitmix/golden-ratio constant)
+/// spreads them across hashbrown's control bytes without running a
+/// general-purpose byte hasher per probe — the side map takes several probes
+/// per traced node, which makes this one of the hottest operations in a
+/// collection pass.
+#[derive(Default, Clone, Copy)]
+struct PtrHasher(u64);
+
+impl std::hash::Hasher for PtrHasher {
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        // Only pointer-sized keys are expected; fold anything else in so the
+        // hasher stays correct for arbitrary composite keys.
+        for &b in bytes {
+            self.0 = (self.0 ^ u64::from(b)).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        }
+        self.0 ^= self.0 >> 32;
+    }
+
+    #[inline]
+    fn write_usize(&mut self, n: usize) {
+        // The multiply pushes entropy toward the high bits; fold them back
+        // down because hashbrown takes the bucket index from the LOW bits
+        // (aligned pointers have zero low bits, and a bare multiply keeps
+        // them zero — every key would land in 1/8th of the buckets).
+        let h = (n as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        self.0 = h ^ (h >> 32);
+    }
+}
+
+type BuildPtrHasher = std::hash::BuildHasherDefault<PtrHasher>;
+type PtrMap<V> = HashMap<NodePtr, V, BuildPtrHasher>;
+type PtrSet = HashSet<NodePtr, BuildPtrHasher>;
 
 impl NodePtr {
     /// The raw data pointer (for opaque trace/sever fns to recover `&T`).
@@ -78,7 +124,15 @@ impl NodePtr {
 pub enum GcNode {
     /// A VM closure's `NativeFn` wrapper (registered by `make_closure`).
     ClosureFn(Weak<NativeFn>),
-    /// An env's bindings allocation (registered on first home-adoption).
+    /// An env *wrapper* allocation, registered on first home-adoption. The
+    /// wrapper (not just its bindings) is the candidate so a pass can reach
+    /// the whole parent chain: a cycle that closes through an ANCESTOR env's
+    /// bindings (e.g. module code `set!`-ing a root binding to a closure
+    /// homed in the module) is reachable from the home wrapper via `parent`
+    /// edges even when no registered bindings map holds the closure.
+    EnvWrapper(Weak<Env>),
+    /// An env's bindings allocation (data-path registration; home adoption
+    /// registers the wrapper above, which reaches the bindings anyway).
     EnvBindings(Weak<EnvBindings>),
     /// `delay` thunk (data-only cycles via `forced`).
     Thunk(Weak<Thunk>),
@@ -95,6 +149,7 @@ impl GcNode {
     fn strong_count(&self) -> usize {
         match self {
             GcNode::ClosureFn(w) => w.strong_count(),
+            GcNode::EnvWrapper(w) => w.strong_count(),
             GcNode::EnvBindings(w) => w.strong_count(),
             GcNode::Thunk(w) => w.strong_count(),
             GcNode::Promise(w) => w.strong_count(),
@@ -112,6 +167,9 @@ impl GcNode {
                 let ptr = NodePtr::of_rc(&rc);
                 (ptr, NodeHandle::Value(Value::native_fn_from_rc(rc)))
             }),
+            GcNode::EnvWrapper(w) => w
+                .upgrade()
+                .map(|rc| (NodePtr::of_rc(&rc), NodeHandle::EnvWrapper(rc))),
             GcNode::EnvBindings(w) => w
                 .upgrade()
                 .map(|rc| (NodePtr::of_rc(&rc), NodeHandle::Bindings(rc))),
@@ -215,59 +273,171 @@ impl GcStats {
 
 // ── Thread-local collector state ──────────────────────────────────
 
-thread_local! {
-    static REGISTRY: RefCell<Vec<GcNode>> = const { RefCell::new(Vec::new()) };
-    /// Seen-set for env home-adoption registration (plan §8: in the registry,
-    /// no core-type change). Keyed by bindings-allocation identity; the
-    /// `Weak` value both proves liveness and pins the allocation's address
-    /// against reuse while the entry exists. Pruned alongside the registry.
-    static ENV_SEEN: RefCell<HashMap<NodePtr, Weak<EnvBindings>>> =
-        RefCell::new(HashMap::new());
-    static PAYLOAD_TRACERS: RefCell<HashMap<TypeId, PayloadTracer>> =
-        RefCell::new(HashMap::new());
-    static COLLECTING: Cell<bool> = const { Cell::new(false) };
-    static LAST_SURVIVORS: Cell<usize> = const { Cell::new(0) };
+/// Collection-trigger floor: a pass runs no earlier than this many registry
+/// entries. Bounded by the churn leak oracle — the last un-collected batch
+/// (≈ floor × cycle size) is what a long eval retains at its high-water mark.
+const GC_FLOOR: usize = 1024;
+
+/// Survivor multiplier for the growth threshold (CPython's generation-0
+/// heuristic flattened to one generation): after a pass leaving S live
+/// entries, the next threshold-triggered pass waits for the registry to
+/// exceed `max(GC_FLOOR, GC_GROWTH × S)`. Live candidates are re-traced
+/// every pass (a registry, unlike a decrement buffer, cannot drop a
+/// proven-live entry), so the multiplier is what keeps live-closure-heavy
+/// workloads from paying O(live) tracing per O(live) births: at 4×, tracing
+/// S live entries is amortized over ≥ 3S births. Peak uncollected garbage is
+/// bounded by the same expression (M4 measured 4× as the knee where the
+/// closure-storm live-set tax drops under the gate with no oracle regression;
+/// 2× doubled the pass count for no memory benefit worth having).
+const GC_GROWTH: usize = 4;
+
+/// All collector state for one thread, behind a single `thread_local` so the
+/// hot path (`register_closure_birth`, one call per VM closure creation)
+/// pays one TLS access instead of one per sub-structure.
+struct GcState {
+    registry: RefCell<Vec<GcNode>>,
+    /// Seen-set for env home-adoption registration (plan §8: in the
+    /// registry, no core-type change). Keyed by wrapper-allocation identity;
+    /// the `Weak` value both proves liveness and pins the allocation's
+    /// address against reuse while the entry exists. Pruned alongside the
+    /// registry.
+    env_seen: RefCell<PtrMap<Weak<Env>>>,
+    payload_tracers: RefCell<HashMap<TypeId, PayloadTracer>>,
+    collecting: Cell<bool>,
+    last_survivors: Cell<usize>,
+    /// Registry length that triggers the next threshold collect —
+    /// `max(GC_FLOOR, GC_GROWTH × last survivors)`, precomputed at the end
+    /// of each pass so the birth path compares two integers.
+    threshold: Cell<usize>,
     /// Stats of the last *completed* (non-aborted) pass, for `(gc/stats)`.
-    static LAST_STATS: Cell<GcStats> = const { Cell::new(GcStats::new()) };
+    last_stats: Cell<GcStats>,
+    /// Reusable pass buffers (owned by at most one pass at a time — the
+    /// `collecting` guard excludes reentry before the scratch is taken).
+    scratch: RefCell<Scratch>,
 }
 
-/// Register a cycle-birth candidate. Plain O(1) push — no dedup: each of
+impl GcState {
+    fn new() -> Self {
+        GcState {
+            registry: RefCell::new(Vec::new()),
+            env_seen: RefCell::new(PtrMap::default()),
+            payload_tracers: RefCell::new(HashMap::new()),
+            collecting: Cell::new(false),
+            last_survivors: Cell::new(0),
+            threshold: Cell::new(GC_FLOOR),
+            last_stats: Cell::new(GcStats::new()),
+            scratch: RefCell::new(Scratch::default()),
+        }
+    }
+
+    /// Registry-growth trigger — two integer loads.
+    fn past_threshold(&self) -> bool {
+        !self.collecting.get() && self.registry.borrow().len() > self.threshold.get()
+    }
+
+    /// Register `home` as an env-wrapper candidate on first adoption.
+    fn adopt_home(&self, home: &Rc<Env>) -> bool {
+        match self.env_seen.borrow_mut().entry(NodePtr::of_rc(home)) {
+            hash_map::Entry::Occupied(entry) => {
+                // `home` is alive at this address, and the entry's `Weak`
+                // pins whatever allocation it was created from — same
+                // address ⇒ same (still live) allocation.
+                debug_assert!(entry.get().strong_count() > 0);
+                false
+            }
+            hash_map::Entry::Vacant(entry) => {
+                let weak = Rc::downgrade(home);
+                entry.insert(weak.clone());
+                self.registry.borrow_mut().push(GcNode::EnvWrapper(weak));
+                true
+            }
+        }
+    }
+}
+
+thread_local! {
+    static GC: GcState = GcState::new();
+}
+
+/// Register a cycle-birth candidate. One O(1) push — no dedup: each of
 /// these objects registers exactly once, at creation. Envs are the exception
 /// (they register at *home adoption*, which recurs per closure) and must go
-/// through [`register_env_candidate`] instead. `Weak`: never keeps garbage
-/// alive; dead entries self-prune during [`collect`], as does any duplicate
-/// entry for a live allocation.
+/// through [`register_env_candidate`] or [`register_closure_birth`] instead.
+/// `Weak`: never keeps garbage alive; dead entries self-prune during
+/// [`collect`], as does any duplicate entry for a live allocation.
+///
+/// Data births share the registry-growth trigger with closure births (plan
+/// §5.2): a push that crosses the threshold runs a [`threshold_collect`]
+/// right here, so a long eval that churns channels/thunks/promises/
+/// multimethods without ever creating a closure still prunes its dead
+/// entries — each one pins its allocation's `RcBox` through the `Weak` —
+/// and reclaims data-only cycles mid-eval, instead of retaining O(total
+/// births) until an outer safe point that a server-style `(loop …)` never
+/// reaches. The pass runs unpinned (sema-core has no view of the session
+/// env; pins are a pure optimization, exactly as at the agent-turn safe
+/// point): acyclic churn — the common case — takes the prune-only fast path
+/// and never traces, and a full trace amortizes over the ≥ 3×-survivors
+/// births the growth policy requires between passes. These constructors are
+/// cold (never in numeric hot loops), so the threshold compare is free in
+/// practice.
 pub fn register_candidate(node: GcNode) {
-    REGISTRY.with(|r| r.borrow_mut().push(node));
+    let past_threshold = GC.with(|gc| {
+        gc.registry.borrow_mut().push(node);
+        gc.past_threshold()
+    });
+    if past_threshold {
+        threshold_collect(&[]);
+    }
 }
 
-/// Register an env's bindings allocation as a cycle candidate, exactly once
-/// per allocation. Env candidates are discovered at *home adoption* (a
-/// closure taking the env as its `globals` home), which repeats for every
-/// closure the env homes — a workload like recursive-closure churn adopts
-/// one long-lived env hundreds of thousands of times, so this entry point
+/// Register an env wrapper as a cycle candidate, exactly once per wrapper
+/// allocation. Env candidates are discovered at *home adoption* (a closure
+/// taking the env as its `globals` home), which repeats for every closure
+/// the env homes — a workload like recursive-closure churn adopts one
+/// long-lived env hundreds of thousands of times, so this entry point
 /// deduplicates through a [`NodePtr`]-keyed seen-set. Returns whether this
 /// call registered the env (`false` = already registered).
 ///
-/// Address reuse is sound: a seen entry's `Weak` keeps the bindings
+/// Address reuse is sound: a seen entry's `Weak` keeps the wrapper
 /// allocation's memory pinned, so its address cannot be recycled by a fresh
 /// env while the entry exists, and entries are pruned alongside the registry
 /// during [`collect`].
-pub fn register_env_candidate(env: &Env) -> bool {
-    let ptr = NodePtr::of_env_bindings(env);
-    ENV_SEEN.with(|s| match s.borrow_mut().entry(ptr) {
-        hash_map::Entry::Occupied(entry) => {
-            // `env` is alive at `ptr`, and the entry's `Weak` pins whatever
-            // allocation it was created from — same address ⇒ same (still
-            // live) allocation.
-            debug_assert!(entry.get().strong_count() > 0);
-            false
+pub fn register_env_candidate(env: &Rc<Env>) -> bool {
+    GC.with(|gc| gc.adopt_home(env))
+}
+
+/// Cycle-birth registration for the VM's `make_closure` — the only hot
+/// candidate producer. One call (one TLS access) registers the closure's
+/// home env on first adoption and the closure wrapper itself, and reports
+/// whether the registry has grown past the collection threshold — the
+/// caller's cue to run a threshold safe-point [`collect`].
+///
+/// `home` is `None` when the caller already adopted this env (callers may
+/// cache the last adopted wrapper and skip the seen-set probe); `closure`
+/// is `None` when the caller proved the closure exempt from candidacy (it
+/// captured zero upvalues — see the exemption argument at the
+/// `make_closure` call site). Its home env is still adopted.
+pub fn register_closure_birth(home: Option<&Rc<Env>>, closure: Option<&Rc<NativeFn>>) -> bool {
+    GC.with(|gc| {
+        if let Some(home) = home {
+            gc.adopt_home(home);
         }
-        hash_map::Entry::Vacant(entry) => {
-            let weak = Rc::downgrade(&env.bindings);
-            entry.insert(weak.clone());
-            register_candidate(GcNode::EnvBindings(weak));
-            true
+        if !gc.collecting.get() {
+            let mut reg = gc.registry.borrow_mut();
+            if let Some(nf) = closure {
+                reg.push(GcNode::ClosureFn(Rc::downgrade(nf)));
+            }
+            reg.len() > gc.threshold.get()
+        } else {
+            // Defensive: no candidate producer can run inside a pass (a pass
+            // runs no user code), but stay a strict no-trigger if one ever
+            // does.
+            if let Some(nf) = closure {
+                gc.registry
+                    .borrow_mut()
+                    .push(GcNode::ClosureFn(Rc::downgrade(nf)));
+            }
+            false
         }
     })
 }
@@ -276,13 +446,13 @@ pub fn register_env_candidate(env: &Env) -> bool {
 /// whose payload has no registered tracer is treated as externally referenced
 /// (pinned — never collected, never descended into): conservative and safe.
 pub fn register_payload_tracer(type_id: TypeId, tracer: PayloadTracer) {
-    PAYLOAD_TRACERS.with(|t| {
-        t.borrow_mut().insert(type_id, tracer);
+    GC.with(|gc| {
+        gc.payload_tracers.borrow_mut().insert(type_id, tracer);
     });
 }
 
 fn registered_payload_tracer(type_id: TypeId) -> Option<PayloadTracer> {
-    PAYLOAD_TRACERS.with(|t| t.borrow().get(&type_id).copied())
+    GC.with(|gc| gc.payload_tracers.borrow().get(&type_id).copied())
 }
 
 // ── Tracing ───────────────────────────────────────────────────────
@@ -427,7 +597,26 @@ pub fn trace_value(v: &Value, sink: &mut dyn FnMut(GcEdge)) -> bool {
 /// env/cell borrows); if a borrow is found anyway, the pass aborts cleanly
 /// having mutated nothing.
 pub fn collect(pins: &[NodePtr]) -> GcStats {
-    if COLLECTING.with(|c| c.get()) {
+    collect_impl(pins, false)
+}
+
+/// Threshold safe-point collect ([`maybe_collect`] and the `make_closure`
+/// birth trigger): prunes dead registry entries first, and skips the trace
+/// when pruning alone brought the registry down to half the growth
+/// threshold — the signature of acyclic churn, where closures die by plain
+/// `Rc` drop and only their dead `Weak` entries accumulate. A skipped pass
+/// does NOT update survivors or the threshold (its candidates are unproven:
+/// they may include garbage cycles, and feeding them into the threshold
+/// would defer cycle detection geometrically), so cyclic garbage still
+/// forces a real trace as soon as it exceeds half the threshold — the same
+/// memory envelope the growth policy already allows. Explicit collects
+/// ([`collect`]: `(gc/collect)`, interpreter teardown) always trace.
+pub fn threshold_collect(pins: &[NodePtr]) -> GcStats {
+    collect_impl(pins, true)
+}
+
+fn collect_impl(pins: &[NodePtr], threshold_pass: bool) -> GcStats {
+    if GC.with(|gc| gc.collecting.get()) {
         // Reentrancy guard: severing cascades `Value::drop`s, which must not
         // re-enter the collector.
         return GcStats {
@@ -437,103 +626,136 @@ pub fn collect(pins: &[NodePtr]) -> GcStats {
     }
     let _guard = CollectingGuard::engage();
 
+    // Take the reusable pass buffers (put back, reset, on every exit path).
+    // `collecting` excludes reentry, so the scratch is never taken twice.
+    let mut st = Collector {
+        s: GC.with(|gc| std::mem::take(&mut *gc.scratch.borrow_mut())),
+        aborted: false,
+    };
+    st.s.pins.extend(pins.iter().copied());
+
     // 1. Snapshot + prune: upgrade live registry entries into strong handles
-    //    (each adds one strong count, subtracted back out via the adjust set),
-    //    drop dead ones.
+    //    and seed them straight into the side map (residual = strong − 1,
+    //    the handle's own +1 pre-subtracted), drop dead ones. Duplicate
+    //    registrations of one live allocation are pruned here — the extra
+    //    handle is dropped before any other count is read, and one entry
+    //    suffices to keep the object a candidate (so duplicates don't
+    //    inflate the registry or the survivor-derived threshold).
     let mut pruned = 0usize;
-    let mut snapshot: Vec<(NodePtr, NodeHandle)> = Vec::new();
-    let mut adjust: HashSet<NodePtr> = HashSet::new();
-    REGISTRY.with(|r| {
-        r.borrow_mut().retain(|node| match node.upgrade_handle() {
-            Some((ptr, handle)) => {
-                if adjust.insert(ptr) {
-                    snapshot.push((ptr, handle));
-                    true
-                } else {
-                    // Duplicate registration of one live allocation: the
-                    // extra handle is dropped here, before any strong count
-                    // is read, and one entry suffices to keep the object a
-                    // candidate — so the duplicate is pruned rather than
-                    // retained forever inflating the registry and the
-                    // survivor-derived growth threshold.
+    GC.with(|gc| {
+        gc.registry
+            .borrow_mut()
+            .retain(|node| match node.upgrade_handle() {
+                Some((ptr, handle)) => {
+                    if st.s.nodes.contains_key(&ptr) {
+                        pruned += 1;
+                        false
+                    } else {
+                        st.seed_candidate(ptr, &handle);
+                        st.s.snapshot.push((ptr, handle));
+                        true
+                    }
+                }
+                None => {
                     pruned += 1;
                     false
                 }
-            }
-            None => {
-                pruned += 1;
-                false
-            }
-        });
+            });
     });
-    let candidates = snapshot.len();
+    let candidates = st.s.snapshot.len();
 
-    let mut st = Collector {
-        nodes: HashMap::new(),
-        pins: pins.iter().copied().collect(),
-        snapshot_adjust: adjust,
-        pending: Vec::new(),
-        aborted: false,
-    };
-
-    // 2. MarkGray: trial-delete from every candidate over a shared side map,
-    //    so overlapping subgraphs are traced once.
-    for (ptr, handle) in &snapshot {
-        st.gray_root(*ptr, handle);
-        if st.aborted {
-            break;
-        }
+    // Prune-only fast pass: see [`threshold_collect`]. `candidates` counts
+    // live-at-snapshot entries only, so the comparison is against what the
+    // prune could not remove. Nothing has been traced yet (seeded nodes are
+    // queued, not descended), so bailing here costs only the seeding.
+    if threshold_pass && candidates <= GC.with(|gc| gc.threshold.get()) / 2 {
+        let stats = GcStats {
+            candidates,
+            traced: 0,
+            collected: 0,
+            pruned,
+            aborted: false,
+        };
+        let mut scratch = st.s;
+        scratch.reset();
+        GC.with(|gc| {
+            *gc.scratch.borrow_mut() = scratch;
+            gc.last_stats.set(stats);
+        });
+        return stats;
     }
+
+    // 2. MarkGray: trial-delete from every seeded candidate over a shared
+    //    side map, so overlapping subgraphs are traced once.
+    st.drain_pending();
     if st.aborted {
         // Nothing has been mutated: drop the side map and snapshot untouched.
-        return GcStats {
+        let stats = GcStats {
             candidates,
-            traced: st.nodes.len(),
+            traced: st.s.nodes.len(),
             collected: 0,
             pruned,
             aborted: true,
         };
+        let mut scratch = st.s;
+        scratch.reset();
+        GC.with(|gc| *gc.scratch.borrow_mut() = scratch);
+        return stats;
     }
 
     // 3. Scan: residual count > 0 ⇒ externally referenced ⇒ scan_black
     //    (restore counts, blacken transitively); the rest tentatively white.
-    let roots: Vec<NodePtr> = snapshot.iter().map(|(ptr, _)| *ptr).collect();
-    for root in roots {
+    for i in 0..st.s.snapshot.len() {
+        let root = st.s.snapshot[i].0;
         st.scan_node(root);
     }
 
     // 4. CollectWhite: identify the full white set first, then sever. All
-    //    extracted cell contents are deferred into `severed` so the Rc drop
-    //    cascade runs on a fully-severed heap.
-    let mut severed: Vec<Value> = Vec::new();
-    let collected = st.collect_white(&mut severed);
-    let traced = st.nodes.len();
+    //    extracted cell contents are deferred into `Scratch::severed` so the
+    //    Rc drop cascade runs on a fully-severed heap.
+    let collected = st.collect_white();
+    let traced = st.s.nodes.len();
 
-    // Release in order: side-map handles, then the extracted values and the
-    // snapshot — the cascade happens here, after all severing completed.
-    drop(st);
-    drop(severed);
-    drop(snapshot);
+    // Release pass state (side-map handles, then severed values, then the
+    // snapshot — see `Scratch::reset`); the Rc cascade happens here, after
+    // all severing completed.
+    let mut scratch = st.s;
+    scratch.reset();
+    GC.with(|gc| *gc.scratch.borrow_mut() = scratch);
 
     // Entries reclaimed by the cascade above are dead now; prune them so the
     // survivor count (and the growth threshold derived from it) is exact.
-    let survivors = REGISTRY.with(|r| {
-        let mut reg = r.borrow_mut();
-        reg.retain(|node| {
-            let live = node.strong_count() > 0;
-            if !live {
-                pruned += 1;
-            }
-            live
-        });
-        reg.len()
+    // A pass that severed nothing ran no cascade — liveness is unchanged
+    // since the snapshot prune, so the sweep (a strong-count read per entry)
+    // is skipped and the snapshot's live count is the survivor count.
+    GC.with(|gc| {
+        let survivors = if collected == 0 {
+            gc.registry.borrow().len()
+        } else {
+            let mut reg = gc.registry.borrow_mut();
+            reg.retain(|node| {
+                let live = node.strong_count() > 0;
+                if !live {
+                    pruned += 1;
+                }
+                live
+            });
+            let survivors = reg.len();
+            drop(reg);
+            // The env seen-set prunes in lockstep: dropping a dead entry's
+            // `Weak` unpins the allocation, so a later env reusing the
+            // address is correctly treated as unseen. (An aborted pass skips
+            // this; the next completed pass catches up — stale dead entries
+            // can never match a live env.)
+            gc.env_seen
+                .borrow_mut()
+                .retain(|_, weak| weak.strong_count() > 0);
+            survivors
+        };
+        gc.last_survivors.set(survivors);
+        gc.threshold
+            .set(std::cmp::max(GC_FLOOR, GC_GROWTH * survivors));
     });
-    // The env seen-set prunes in lockstep: dropping a dead entry's `Weak`
-    // unpins the allocation, so a later env reusing the address is correctly
-    // treated as unseen. (An aborted pass skips this; the next completed
-    // pass catches up — stale dead entries can never match a live env.)
-    ENV_SEEN.with(|s| s.borrow_mut().retain(|_, weak| weak.strong_count() > 0));
-    LAST_SURVIVORS.with(|c| c.set(survivors));
 
     let stats = GcStats {
         candidates,
@@ -542,31 +764,28 @@ pub fn collect(pins: &[NodePtr]) -> GcStats {
         pruned,
         aborted: false,
     };
-    LAST_STATS.with(|c| c.set(stats));
+    GC.with(|gc| gc.last_stats.set(stats));
     stats
 }
 
 /// Stats of the last completed collection pass (all-zero before the first
 /// one). Aborted passes mutate nothing and are not recorded.
 pub fn last_stats() -> GcStats {
-    LAST_STATS.with(|c| c.get())
+    GC.with(|gc| gc.last_stats.get())
 }
 
 /// Current registry length (live + not-yet-pruned dead entries) — the value
 /// the growth threshold is checked against.
 pub fn registry_len() -> usize {
-    REGISTRY.with(|r| r.borrow().len())
+    GC.with(|gc| gc.registry.borrow().len())
 }
 
 /// True when the registry has grown past the collection threshold and no
-/// collection is already running — the cheap pre-check that lets hot safe
-/// points (`make_closure`) skip building a pin set when no pass would run.
+/// collection is already running — the cheap pre-check that lets safe
+/// points skip building a pin set when no pass would run. (`make_closure`
+/// gets this for free from [`register_closure_birth`]'s return value.)
 pub fn should_collect() -> bool {
-    if COLLECTING.with(|c| c.get()) {
-        return false;
-    }
-    let threshold = std::cmp::max(1024, 2 * LAST_SURVIVORS.with(|c| c.get()));
-    registry_len() > threshold
+    GC.with(|gc| gc.past_threshold())
 }
 
 /// Pin set for a session root env: the wrapper allocation, its bindings, and
@@ -585,27 +804,27 @@ pub fn env_chain_pins(env: &Rc<Env>) -> Vec<NodePtr> {
     pins
 }
 
-/// Threshold-gated [`collect`] for safe points: runs when the registry has
-/// grown past `max(1024, 2 × survivors of the last collect)` (CPython's
-/// generation-0 heuristic flattened to one generation).
+/// Threshold-gated [`threshold_collect`] for safe points: runs when the
+/// registry has grown past `max(GC_FLOOR, GC_GROWTH × survivors of the last
+/// collect)` (CPython's generation-0 heuristic flattened to one generation).
 pub fn maybe_collect(pins: &[NodePtr]) -> Option<GcStats> {
-    should_collect().then(|| collect(pins))
+    should_collect().then(|| threshold_collect(pins))
 }
 
-/// RAII guard for the thread-local `COLLECTING` flag: engaged for the whole
+/// RAII guard for the thread-local `collecting` flag: engaged for the whole
 /// pass, released on every exit path (including abort).
 struct CollectingGuard;
 
 impl CollectingGuard {
     fn engage() -> Self {
-        COLLECTING.with(|c| c.set(true));
+        GC.with(|gc| gc.collecting.set(true));
         CollectingGuard
     }
 }
 
 impl Drop for CollectingGuard {
     fn drop(&mut self) {
-        COLLECTING.with(|c| c.set(false));
+        GC.with(|gc| gc.collecting.set(false));
     }
 }
 
@@ -650,37 +869,77 @@ struct NodeState {
     /// Whether MarkGray enumerated this node's children (pinned and
     /// unknown-payload nodes are never descended).
     descended: bool,
-    /// Outgoing edges recorded during MarkGray, with multiplicity — the
-    /// later phases replay these instead of re-tracing, so no `RefCell` is
-    /// touched again until severing.
-    children: Vec<NodePtr>,
+    /// `(start, len)` range into the pass's shared edge arena
+    /// ([`Scratch::edges`]): the node's outgoing edges recorded during
+    /// MarkGray, with multiplicity — the later phases replay these instead
+    /// of re-tracing, so no `RefCell` is touched again until severing, and
+    /// no per-node `Vec` is allocated (a churn pass traces thousands of
+    /// nodes; one arena beats thousands of tiny allocations).
+    children: (u32, u32),
     handle: NodeHandle,
 }
 
-struct Collector {
-    nodes: HashMap<NodePtr, NodeState>,
-    pins: HashSet<NodePtr>,
-    /// Nodes whose live strong count includes one snapshot handle.
-    snapshot_adjust: HashSet<NodePtr>,
+/// Reusable collection buffers, kept in a thread-local and recycled across
+/// passes (`clear()` keeps capacity): threshold-driven passes run every ~1k
+/// closure births under churn, and rebuilding the side map from scratch —
+/// growth rehashes included — dominated pass cost before reuse.
+#[derive(Default)]
+struct Scratch {
+    nodes: PtrMap<NodeState>,
+    /// Shared children arena; see [`NodeState::children`].
+    edges: Vec<NodePtr>,
     /// MarkGray worklist: nodes inserted but not yet descended. Every phase
     /// walks the graph with explicit worklists rather than Rust recursion —
     /// graph depth is user-controlled (deeply nested lists, long env parent
     /// chains), and a per-level native stack frame overflows (uncatchable
     /// SIGABRT) at depths ordinary Sema data reaches.
     pending: Vec<NodePtr>,
+    pins: PtrSet,
+    /// Live registry entries upgraded into strong handles for the pass.
+    snapshot: Vec<(NodePtr, NodeHandle)>,
+    /// The complete white set, identified before any severing starts.
+    whites: Vec<NodePtr>,
+    /// Extracted cell contents, dropped only after all severing completed.
+    severed: Vec<Value>,
+    /// Scan worklist (disjoint from `black_work`: scan_black runs while a
+    /// scan_node traversal is still in flight).
+    scan_work: Vec<NodePtr>,
+    black_work: Vec<NodePtr>,
+}
+
+impl Scratch {
+    /// Drop pass state and return the buffers to capacity-preserving empty.
+    /// Order matters: side-map handles first, then the extracted severed
+    /// contents, then the snapshot — the `Rc` drop cascade must run on a
+    /// fully-severed heap, exactly like the local-variable drop order the
+    /// collector used before buffer reuse.
+    fn reset(&mut self) {
+        self.nodes.clear();
+        self.severed.clear();
+        self.snapshot.clear();
+        self.edges.clear();
+        self.pending.clear();
+        self.pins.clear();
+        self.whites.clear();
+        self.scan_work.clear();
+        self.black_work.clear();
+    }
+}
+
+struct Collector {
+    s: Scratch,
     aborted: bool,
 }
 
 impl Collector {
     // -- MarkGray --
 
-    /// Seed trial deletion from a registered candidate, then trace its whole
-    /// reachable subgraph off the worklist. Candidates are starting points,
-    /// not edges: no decrement.
-    fn gray_root(&mut self, ptr: NodePtr, handle: &NodeHandle) {
-        if self.aborted || self.nodes.contains_key(&ptr) {
-            return;
-        }
+    /// Seed a snapshot candidate into the side map: residual count starts at
+    /// `strong − 1` (the snapshot handle's own +1 pre-subtracted), colored
+    /// gray and queued for descent — trial deletion then treats it exactly
+    /// like a discovered node. Candidates are starting points, not edges:
+    /// no decrement beyond the handle adjustment.
+    fn seed_candidate(&mut self, ptr: NodePtr, handle: &NodeHandle) {
         let strong = match handle {
             NodeHandle::Value(v) => v
                 .heap_strong_count()
@@ -692,15 +951,14 @@ impl Collector {
             }
         };
         let pin = matches!(handle, NodeHandle::Value(v) if has_unknown_payload(v));
-        self.insert_node(ptr, strong, pin, handle.clone());
-        self.drain_pending();
+        self.insert_node(ptr, strong - 1, pin, handle.clone());
     }
 
     /// MarkGray driver: descend queued nodes until the worklist is empty.
     /// Each node is queued exactly once (at insert), so this is one bounded
     /// pass over the subgraph with O(1) native stack per node.
     fn drain_pending(&mut self) {
-        while let Some(ptr) = self.pending.pop() {
+        while let Some(ptr) = self.s.pending.pop() {
             if self.aborted {
                 return;
             }
@@ -716,7 +974,7 @@ impl Collector {
         match edge {
             GcEdge::Value(v) => {
                 let ptr = value_node_ptr(v)?;
-                if !self.nodes.contains_key(&ptr) {
+                if !self.s.nodes.contains_key(&ptr) {
                     let strong = v
                         .heap_strong_count()
                         .expect("node values are heap allocations");
@@ -728,7 +986,7 @@ impl Collector {
             }
             GcEdge::Env(rc) => {
                 let ptr = NodePtr::of_rc(rc);
-                if !self.nodes.contains_key(&ptr) {
+                if !self.s.nodes.contains_key(&ptr) {
                     let strong = Rc::strong_count(rc);
                     self.insert_node(ptr, strong, false, NodeHandle::EnvWrapper(rc.clone()));
                 }
@@ -737,7 +995,7 @@ impl Collector {
             }
             GcEdge::EnvBindings(rc) => {
                 let ptr = NodePtr::of_rc(rc);
-                if !self.nodes.contains_key(&ptr) {
+                if !self.s.nodes.contains_key(&ptr) {
                     let strong = Rc::strong_count(rc);
                     self.insert_node(ptr, strong, false, NodeHandle::Bindings(rc.clone()));
                 }
@@ -750,7 +1008,7 @@ impl Collector {
                 trace,
                 sever,
             } => {
-                if !self.nodes.contains_key(&ptr) {
+                if !self.s.nodes.contains_key(&ptr) {
                     self.insert_node(
                         ptr,
                         strong_count,
@@ -764,52 +1022,54 @@ impl Collector {
         }
     }
 
-    /// First sighting of a node: record its strong count (adjusted for the
-    /// snapshot's own handle), color it, and queue it for descent. Pinned
-    /// nodes are black from birth and never descended (never queued).
-    fn insert_node(&mut self, ptr: NodePtr, strong: usize, pinned_extra: bool, handle: NodeHandle) {
-        let adj = usize::from(self.snapshot_adjust.contains(&ptr));
-        let pinned = pinned_extra || self.pins.contains(&ptr);
-        self.nodes.insert(
+    /// First sighting of a node: record its residual count (the caller has
+    /// already excluded any snapshot-handle contribution), color it, and
+    /// queue it for descent. Pinned nodes are black from birth and never
+    /// descended (never queued).
+    fn insert_node(&mut self, ptr: NodePtr, count: usize, pinned_extra: bool, handle: NodeHandle) {
+        let pinned = pinned_extra || self.s.pins.contains(&ptr);
+        self.s.nodes.insert(
             ptr,
             NodeState {
-                count: (strong - adj) as isize,
+                count: count as isize,
                 color: if pinned { Color::Black } else { Color::Gray },
                 descended: pinned,
-                children: Vec::new(),
+                children: (0, 0),
                 handle,
             },
         );
         if !pinned {
-            self.pending.push(ptr);
+            self.s.pending.push(ptr);
         }
     }
 
     fn dec(&mut self, ptr: NodePtr) {
-        self.nodes
+        self.s
+            .nodes
             .get_mut(&ptr)
             .expect("dec target was just ensured")
             .count -= 1;
     }
 
     /// Enumerate a node's children once, decrementing each target and
-    /// recording the edge list (with multiplicity) for the later phases.
+    /// recording the edge range (with multiplicity) for the later phases.
     /// Newly discovered children are queued on the worklist, not descended
-    /// inline — native stack use is O(1) regardless of graph depth.
+    /// inline — native stack use is O(1) regardless of graph depth, and each
+    /// node's edges land in one contiguous arena slice (descents never nest).
     fn descend(&mut self, ptr: NodePtr) {
-        let handle = match self.nodes.get_mut(&ptr) {
+        let handle = match self.s.nodes.get_mut(&ptr) {
             Some(node) if !node.descended => {
                 node.descended = true;
                 node.handle.clone()
             }
             _ => return,
         };
-        let mut children: Vec<NodePtr> = Vec::new();
+        let start = self.s.edges.len();
         let ok = {
             let this = &mut *self;
             let mut sink = |edge: GcEdge<'_>| {
                 if let Some(child) = this.gray_edge(edge) {
-                    children.push(child);
+                    this.s.edges.push(child);
                 }
             };
             match &handle {
@@ -837,10 +1097,12 @@ impl Collector {
             self.aborted = true;
             return;
         }
-        self.nodes
+        let len = self.s.edges.len() - start;
+        self.s
+            .nodes
             .get_mut(&ptr)
             .expect("descended node exists")
-            .children = children;
+            .children = (start as u32, len as u32);
     }
 
     // -- Scan / ScanBlack (replayed on the recorded side graph; explicit
@@ -852,9 +1114,10 @@ impl Collector {
     /// in this phase, and every increment blackens its target, so a node
     /// still gray when popped carries exactly its MarkGray residual.
     fn scan_node(&mut self, root: NodePtr) {
-        let mut work = vec![root];
-        while let Some(ptr) = work.pop() {
-            let Some(node) = self.nodes.get(&ptr) else {
+        debug_assert!(self.s.scan_work.is_empty());
+        self.s.scan_work.push(root);
+        while let Some(ptr) = self.s.scan_work.pop() {
+            let Some(node) = self.s.nodes.get_mut(&ptr) else {
                 continue;
             };
             if node.color != Color::Gray {
@@ -863,9 +1126,10 @@ impl Collector {
             if node.count > 0 {
                 self.scan_black(ptr);
             } else {
-                let node = self.nodes.get_mut(&ptr).expect("scanned node exists");
                 node.color = Color::White;
-                work.extend_from_slice(&node.children);
+                let (start, len) = node.children;
+                let range = start as usize..(start + len) as usize;
+                self.s.scan_work.extend_from_slice(&self.s.edges[range]);
             }
         }
     }
@@ -873,21 +1137,25 @@ impl Collector {
     /// Externally referenced: blacken the subgraph and restore the counts
     /// trial deletion took (one re-increment per recorded edge). Each node is
     /// blackened at most once and its edges replayed exactly once, so the
-    /// restore arithmetic is exact.
+    /// restore arithmetic is exact. (Separate worklist from `scan_node`'s: a
+    /// scan traversal is still in flight when this runs.)
     fn scan_black(&mut self, root: NodePtr) {
-        self.nodes
+        self.s
+            .nodes
             .get_mut(&root)
             .expect("scan_black node exists")
             .color = Color::Black;
-        let mut work = vec![root];
-        while let Some(ptr) = work.pop() {
-            let children = self.nodes[&ptr].children.clone();
-            for child in children {
-                let child_node = self.nodes.get_mut(&child).expect("recorded child exists");
+        debug_assert!(self.s.black_work.is_empty());
+        self.s.black_work.push(root);
+        while let Some(ptr) = self.s.black_work.pop() {
+            let (start, len) = self.s.nodes[&ptr].children;
+            for i in start as usize..(start + len) as usize {
+                let child = self.s.edges[i];
+                let child_node = self.s.nodes.get_mut(&child).expect("recorded child exists");
                 child_node.count += 1;
                 if child_node.color != Color::Black {
                     child_node.color = Color::Black;
-                    work.push(child);
+                    self.s.black_work.push(child);
                 }
             }
         }
@@ -897,24 +1165,28 @@ impl Collector {
 
     /// Identify the complete white set, then sever: version-bump every white
     /// env wrapper first (inline-cache hygiene), then clear each white node's
-    /// mutable cell, deferring all extracted contents into `severed`.
-    fn collect_white(&mut self, severed: &mut Vec<Value>) -> usize {
-        let whites: Vec<NodePtr> = self
-            .nodes
-            .iter()
-            .filter(|(_, node)| node.color == Color::White)
-            .map(|(ptr, _)| *ptr)
-            .collect();
-        for &ptr in &whites {
-            if let NodeHandle::EnvWrapper(env) = &self.nodes[&ptr].handle {
+    /// mutable cell, deferring all extracted contents into `Scratch::severed`.
+    fn collect_white(&mut self) -> usize {
+        debug_assert!(self.s.whites.is_empty());
+        let whites = &mut self.s.whites;
+        whites.extend(
+            self.s
+                .nodes
+                .iter()
+                .filter(|(_, node)| node.color == Color::White)
+                .map(|(ptr, _)| *ptr),
+        );
+        for i in 0..self.s.whites.len() {
+            let ptr = self.s.whites[i];
+            if let NodeHandle::EnvWrapper(env) = &self.s.nodes[&ptr].handle {
                 sever_white_env_wrapper(env);
             }
         }
-        for &ptr in &whites {
-            let handle = self.nodes[&ptr].handle.clone();
-            sever_node(ptr, &handle, severed);
+        for i in 0..self.s.whites.len() {
+            let ptr = self.s.whites[i];
+            sever_node(ptr, &self.s.nodes[&ptr].handle, &mut self.s.severed);
         }
-        whites.len()
+        self.s.whites.len()
     }
 }
 
@@ -1404,13 +1676,13 @@ mod tests {
         register_candidate(GcNode::Thunk(Rc::downgrade(&t)));
         drop(t);
 
-        COLLECTING.with(|c| c.set(true));
+        GC.with(|gc| gc.collecting.set(true));
         let stats = collect(&[]);
         assert!(stats.aborted);
         assert_eq!(stats.collected, 0);
         assert!(weak.upgrade().is_some(), "no-op left the graph alone");
         assert!(maybe_collect(&[]).is_none());
-        COLLECTING.with(|c| c.set(false));
+        GC.with(|gc| gc.collecting.set(false));
 
         collect(&[]);
         assert_eq!(weak.strong_count(), 0);
@@ -1473,7 +1745,10 @@ mod tests {
         assert_eq!(stats.collected, 0);
     }
 
-    // 13. maybe_collect: quiet below the threshold, collects above it.
+    // 13. threshold behavior: maybe_collect stays quiet below the threshold,
+    //     and a data-birth registration that crosses it self-collects inside
+    //     register_candidate — dead-entry retention between outer safe points
+    //     is bounded by the threshold, not by total births.
     #[test]
     fn maybe_collect_respects_threshold() {
         assert!(
@@ -1487,9 +1762,16 @@ mod tests {
             });
             register_candidate(GcNode::Thunk(Rc::downgrade(&t)));
         }
-        let stats = maybe_collect(&[]).expect("registry past threshold");
-        assert_eq!(stats.pruned, 1025);
-        assert!(maybe_collect(&[]).is_none(), "registry pruned back below");
+        // The 1025th push crossed GC_FLOOR and ran a threshold pass inline:
+        // 1024 dead entries pruned, the (then still live) current thunk kept.
+        let stats = last_stats();
+        assert_eq!(stats.pruned, 1024, "dead entries pruned at birth trigger");
+        assert_eq!(stats.candidates, 1, "the in-scope thunk was live");
+        assert!(registry_len() <= 1, "registry bounded by the trigger");
+        assert!(
+            maybe_collect(&[]).is_none(),
+            "already pruned below threshold"
+        );
     }
 
     // trace_value multiplicity spot-checks (the arithmetic's raw material).
@@ -1686,19 +1968,20 @@ mod tests {
 
     // 15a. register_env_candidate: first adoption registers, repeats dedup,
     //      the seen-set survives collects while the env lives and prunes
-    //      when it dies.
+    //      when it dies. (Candidates are the home WRAPPER — the shape-E cycle
+    //      is reached through it.)
     #[test]
     fn register_env_candidate_dedups_and_collects_shape_e() {
         let (env, wrapper, payload, nf) = build_env_nativefn_cycle();
-        assert!(register_env_candidate(&env), "first adoption registers");
-        assert!(!register_env_candidate(&env), "later adoptions dedup");
+        assert!(register_env_candidate(&wrapper), "first adoption registers");
+        assert!(!register_env_candidate(&wrapper), "later adoptions dedup");
 
         let stats_live = collect(&[]);
         assert!(!stats_live.aborted);
         assert_eq!(stats_live.candidates, 1, "deduped to one registration");
         assert_eq!(stats_live.collected, 0, "externally held: kept");
         assert!(
-            !register_env_candidate(&env),
+            !register_env_candidate(&wrapper),
             "seen entry survives a collect while the env lives"
         );
 
@@ -1709,12 +1992,38 @@ mod tests {
         assert_eq!(stats.collected, 4, "nf + payload + wrapper + bindings");
         assert_eq!(weak_bindings.strong_count(), 0, "env cycle reclaimed");
         assert_eq!(
-            ENV_SEEN.with(|s| s.borrow().len()),
+            GC.with(|gc| gc.env_seen.borrow().len()),
             0,
             "seen entry pruned with the registry"
         );
-        let env2 = Env::new();
-        assert!(register_env_candidate(&env2), "fresh env registers anew");
+        let wrapper2 = Rc::new(Env::new());
+        assert!(
+            register_env_candidate(&wrapper2),
+            "fresh env registers anew"
+        );
+    }
+
+    // 15c. register_closure_birth is the fused make_closure path: adopts the
+    //      home wrapper once, registers non-exempt closures, and reports the
+    //      growth threshold. A zero-upvalue-style exempt closure (None) still
+    //      adopts its home, and the resulting shape-E cycle is collected via
+    //      the env candidate alone.
+    #[test]
+    fn register_closure_birth_env_candidate_covers_exempt_closure() {
+        let (env, wrapper, payload, nf) = build_env_nativefn_cycle();
+        register_closure_birth(Some(&wrapper), None);
+        register_closure_birth(Some(&wrapper), None);
+        let weak_nf = Rc::downgrade(&nf);
+        drop((env, wrapper, payload, nf));
+
+        let stats = collect(&[]);
+        assert!(!stats.aborted);
+        assert_eq!(stats.candidates, 1, "home adopted once, closure exempt");
+        assert_eq!(
+            stats.collected, 4,
+            "nf + payload + wrapper + bindings via the env candidate"
+        );
+        assert!(weak_nf.upgrade().is_none(), "exempt closure reclaimed");
     }
 
     // 15b. duplicate raw registrations of one live allocation are pruned to

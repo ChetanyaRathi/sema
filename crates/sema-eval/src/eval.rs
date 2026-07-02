@@ -202,7 +202,7 @@ impl Interpreter {
         // interpreter's global namespace; the scheduler's globals are the same
         // env (init_scheduler above), so the one chain covers both.
         if sema_core::gc_should_collect() {
-            sema_core::gc_collect(&sema_core::gc_env_chain_pins(&self.global_env));
+            sema_core::gc_threshold_collect(&sema_core::gc_env_chain_pins(&self.global_env));
         }
         result
     }

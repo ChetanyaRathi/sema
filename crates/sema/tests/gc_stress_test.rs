@@ -765,13 +765,15 @@ fn interpreter_drop_during_panic_unwind_is_catchable() {
     assert_eq!(v, Value::bool(true));
 }
 
-// ── Known gaps (repros kept runnable via --ignored) ────────────────
+// ── Closure-free data cycles (M5: cold constructors register candidates) ──
+//
+// A cycle needs no closure: it can close entirely through the data cells
+// (channel buffer, thunk `forced`, promise state, multimethod table). The
+// constructors register `GcNode::{Channel,Thunk,Promise,MultiMethod}`
+// candidates, so these cycles are discovered even when no closure candidate
+// (and no live env binding) reaches them.
 
 #[test]
-#[ignore = "M5 (plan §5.2): the cold data-cycle constructors (channel/delay/promise/defmulti) \
-            do not register collector candidates yet, so a closure-free cycle (channel \
-            buffering a list that contains the channel) is never discovered — it leaks \
-            (leak-safe, but uncollected). Un-ignore when M5 registers them."]
 fn data_only_channel_cycle_collected() {
     let v = eval_ok(
         "(begin
@@ -784,4 +786,270 @@ fn data_only_channel_cycle_collected() {
            (> (:collected (gc/collect)) 0))",
     );
     assert_eq!(v, Value::bool(true));
+}
+
+#[test]
+fn data_only_channel_cycle_live_survives_collect() {
+    // Same self-buffering shape, still bound: the collection must keep the
+    // whole cycle, and the buffered list must still yield the channel back.
+    let v = eval_ok(
+        "(begin
+           (define ch (channel/new 2))
+           (channel/send ch (list ch))
+           (gc/collect)
+           (channel? (first (channel/recv ch))))",
+    );
+    assert_eq!(v, Value::bool(true));
+}
+
+#[test]
+fn data_only_delay_cycle_collected() {
+    // The delay body reads a GLOBAL, so its wrapper closure has zero upvalues
+    // (exempt from closure candidacy); forcing memoizes `t.forced = t`. Once
+    // both globals are rebound, the self-cycle through the thunk's forced
+    // cell is reachable only from the constructor-registered Thunk candidate.
+    // Two evals: the first eval's VM pins the thunk through its global-load
+    // inline cache (`(force t)` cached the loaded value — bounded mid-eval
+    // retention that dies with the VM); the collect runs on a fresh VM.
+    let interp = Interpreter::new();
+    interp
+        .eval_str_compiled(
+            "(begin
+               (gc/collect)
+               (define tmp nil)
+               (define t (delay tmp))
+               (set! tmp t)
+               (force t)
+               (set! tmp nil)
+               (set! t nil))",
+        )
+        .expect("build garbage delay cycle");
+    let v = interp
+        .eval_str_compiled("(> (:collected (gc/collect)) 0)")
+        .expect("collect");
+    assert_eq!(v, Value::bool(true));
+}
+
+#[test]
+fn data_only_delay_cycle_live_keeps_forcing_to_itself() {
+    let v = eval_ok(
+        "(begin
+           (define tmp nil)
+           (define t (delay tmp))
+           (set! tmp t)
+           (force t)
+           (gc/collect)
+           (= t (force t)))",
+    );
+    assert_eq!(v, Value::bool(true));
+}
+
+#[test]
+fn data_only_promise_channel_cycle_collected() {
+    // p resolves to ch and ch buffers p: a closure-free cycle through TWO
+    // data cells (promise state + channel buffer). Locals die at return, so
+    // only the Promise/Channel candidates reach it.
+    let v = eval_ok(
+        "(begin
+           (gc/collect)
+           (define (mk)
+             (let ((ch (channel/new 1)))
+               (let ((p (async/resolved ch)))
+                 (channel/send ch p)
+                 nil)))
+           (mk)
+           (> (:collected (gc/collect)) 0))",
+    );
+    assert_eq!(v, Value::bool(true));
+}
+
+#[test]
+fn data_only_promise_channel_cycle_live_round_trips() {
+    let v = eval_ok(
+        "(begin
+           (define ch (channel/new 1))
+           (define p (async/resolved ch))
+           (channel/send ch p)
+           (gc/collect)
+           (define p-back (channel/recv ch))
+           (channel? (await p-back)))",
+    );
+    assert_eq!(v, Value::bool(true));
+}
+
+#[test]
+fn data_only_multimethod_self_cycle_collected() {
+    // mm.methods[:self] = mm with a builtin dispatch fn: no closure anywhere
+    // on the cycle. After the global rebind the MultiMethod candidate is the
+    // only path to it. Two evals for the same inline-cache reason as
+    // `data_only_delay_cycle_collected` (`defmethod` loads the global).
+    let interp = Interpreter::new();
+    interp
+        .eval_str_compiled(
+            "(begin
+               (gc/collect)
+               (defmulti dead first)
+               (defmethod dead :self dead)
+               (set! dead 0))",
+        )
+        .expect("build garbage multimethod cycle");
+    let v = interp
+        .eval_str_compiled("(> (:collected (gc/collect)) 0)")
+        .expect("collect");
+    assert_eq!(v, Value::bool(true));
+}
+
+#[test]
+fn data_only_multimethod_self_cycle_live_still_dispatches() {
+    let v = eval_ok(
+        "(begin
+           (defmulti live first)
+           (defmethod live :self live)
+           (defmethod live :go (fn (xs) 42))
+           (gc/collect)
+           (live (list :go)))",
+    );
+    assert_eq!(v, Value::int(42));
+}
+
+// ── Data-birth registry-growth trigger (mid-eval, no closures) ─────
+//
+// The cold constructors register a candidate per allocation, and each dead
+// candidate's `Weak` pins its allocation's RcBox until a pass prunes the
+// entry. No closure is born inside these loops, so only `register_candidate`'s
+// own threshold trigger can run a pass before the eval returns — without it,
+// a single long eval retains O(total data births), not O(live).
+
+#[test]
+fn acyclic_data_churn_bounds_registry_mid_eval() {
+    // 20k dead channels in one eval; the probe runs INSIDE the same eval,
+    // before any outer safe point. Each threshold crossing takes the
+    // prune-only fast path (the churn is acyclic), holding the registry to
+    // roughly one growth-threshold batch.
+    let v = eval_ok(
+        "(begin
+           (gc/collect)
+           (define (churn n)
+             (if (<= n 0) nil
+                 (begin (channel/new 1) (churn (- n 1)))))
+           (churn 20000)
+           (:registry-size (gc/stats)))",
+    );
+    let n = v.as_int().expect("registry size is an int");
+    assert!(
+        n <= 4096,
+        "registry retained {n} entries after 20k acyclic channel births mid-eval"
+    );
+}
+
+#[test]
+fn cyclic_data_churn_collected_mid_eval() {
+    // Self-buffering channels (closure-free cycles) stay LIVE registry
+    // entries until traced, so pruning alone cannot bound this loop: the
+    // birth-trigger pass must escalate to a full trace once live candidates
+    // exceed half the threshold, severing the garbage cycles mid-eval. The
+    // follow-up explicit collect reclaims only the post-last-pass tail —
+    // far fewer than the total churned.
+    let v = eval_ok(
+        "(begin
+           (gc/collect)
+           (define (churn n)
+             (if (<= n 0) nil
+                 (begin
+                   (let ((ch (channel/new 2)))
+                     (channel/send ch (list ch)))
+                   (churn (- n 1)))))
+           (churn 1500)
+           (list (:registry-size (gc/stats)) (:collected (gc/collect))))",
+    );
+    let items = v.as_seq().expect("result list");
+    let registry = items[0].as_int().expect("registry size");
+    let tail = items[1].as_int().expect("collected");
+    assert!(
+        registry < 1300,
+        "cyclic data churn left {registry} live registry entries mid-eval \
+         (birth trigger never traced)"
+    );
+    assert!(
+        (1..3000).contains(&tail),
+        "explicit collect reclaimed {tail} nodes; expected only the \
+         post-last-pass tail of the 1500 cycles"
+    );
+}
+
+// ── Scheduler-idle safe point ───────────────────────────────────────
+
+#[test]
+fn scheduler_idle_safe_point_runs_pass_after_tasks_finish() {
+    // A task churns 3000 dead channels: the data births cross the registry
+    // threshold inside the task, so birth-trigger passes prune mid-task and
+    // the registry is already bounded when the task finishes. The
+    // scheduler-idle hook (after terminal-task reaping, task list empty)
+    // remains the threshold-gated backstop for garbage released at reap
+    // time and for passes that aborted mid-task. Asserted from the awaiting
+    // eval, before any outer safe point runs — async-born churn must never
+    // survive to the (gc/stats) read at O(total births).
+    let v = eval_ok(
+        "(begin
+           (gc/collect)
+           (define (spam n)
+             (if (<= n 0) :done (begin (channel/new 1) (spam (- n 1)))))
+           (define p (async/spawn (fn () (spam 3000))))
+           (await p)
+           (< (:registry-size (gc/stats)) 1024))",
+    );
+    assert_eq!(v, Value::bool(true));
+}
+
+// ── Zero-upvalue exemption (make_closure skips closure candidates) ─
+
+#[test]
+fn zero_upvalue_env_cycle_collected_via_env_candidate() {
+    // `(define (f x) x)` compiles to a closure with ZERO upvalues, which
+    // `make_closure` exempts from closure-candidate registration — the only
+    // candidate reaching the resulting env⇄closure cycle (bindings → f →
+    // `Closure.globals` → wrapper → same bindings) is the home-env WRAPPER
+    // registered at adoption. Interpreter teardown runs the final unpinned
+    // collection; if the exemption left the cycle without a covering
+    // candidate, the whole global env would leak and this Weak would stay
+    // live.
+    let weak_bindings = {
+        let interp = Interpreter::new();
+        interp
+            .eval_str_compiled("(define (f x) x)")
+            .expect("define zero-upvalue closure");
+        std::rc::Rc::downgrade(&interp.global_env.bindings)
+    };
+    assert_eq!(
+        weak_bindings.strong_count(),
+        0,
+        "zero-upvalue env⇄closure cycle reclaimed via the env-wrapper candidate"
+    );
+}
+
+#[test]
+fn zero_upvalue_module_closure_bound_in_importer_env_collected_at_teardown() {
+    // Cross-env variant: a zero-upvalue closure homed in a MODULE env is
+    // bound into the importing (parent) env, so the cycle closes through the
+    // ANCESTOR's bindings: importer.bindings → closure → module-env wrapper
+    // → parent → importer wrapper → importer.bindings. Neither closure is a
+    // registry candidate (both zero-upvalue); the cycle must be reached
+    // through a registered home WRAPPER's parent chain.
+    let dir = temp_dir("zero-uv-mod");
+    let m = write_file(&dir, "mk.sema", "(define (make) (fn (x) (* x 3)))");
+    let weak_bindings = {
+        let interp = Interpreter::new();
+        interp
+            .eval_str_compiled(&format!(
+                r#"(begin (import "{m}" make) (define g (make)) (g 4))"#
+            ))
+            .expect("import + bind module closure");
+        std::rc::Rc::downgrade(&interp.global_env.bindings)
+    };
+    assert_eq!(
+        weak_bindings.strong_count(),
+        0,
+        "cross-env cycle through the importer's bindings reclaimed at teardown"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }

@@ -139,6 +139,10 @@ impl Scheduler {
             state: RefCell::new(PromiseState::Pending),
             task_id: std::cell::Cell::new(id),
         });
+        // Cold data-cycle constructor (CORE-2): this promise is wrapped via
+        // `async_promise_from_rc` later, which registers nothing — register
+        // the candidate here, at the allocation.
+        sema_core::register_candidate(sema_core::GcNode::Promise(Rc::downgrade(&promise)));
 
         // Use the function table from the thunk's own compilation context,
         // not the scheduler's — each eval_str_compiled produces different functions.
@@ -502,6 +506,9 @@ pub(crate) fn run_closure_as_inline_task(
         state: RefCell::new(PromiseState::Pending),
         task_id: std::cell::Cell::new(id),
     });
+    // Cold data-cycle constructor (CORE-2): raw allocation, wrapped via
+    // `async_promise_from_rc` on resolution paths — register here.
+    sema_core::register_candidate(sema_core::GcNode::Promise(Rc::downgrade(&promise)));
 
     let mut vm = match VM::new_for_task(sched.globals.clone(), functions, &sched.native_spurs) {
         Ok(vm) => vm,
@@ -615,6 +622,16 @@ fn run_scheduler_callback(
     // path and is gated by `in_async_context()` being true, so it is untouched.
     if !sema_core::in_async_context() {
         sched.reap_leftover_tasks();
+        // Scheduler-idle safe point (CORE-2, plan §5.2 point d): every task is
+        // done and reaped, so task VMs/promises just released their refs and
+        // async-born garbage (channels, promises, task-local closures) is at
+        // its most collectable. Deliberately NOT between task polls — a
+        // per-tick collect would re-trace live parked-task graphs constantly.
+        // Threshold-gated; pins computed only when a pass will actually run.
+        if sched.tasks.is_empty() && sema_core::gc_should_collect() {
+            let pins = sema_core::gc_env_chain_pins(&sched.globals);
+            sema_core::gc_threshold_collect(&pins);
+        }
     }
 
     put_scheduler(sched);

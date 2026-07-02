@@ -880,7 +880,13 @@ impl Value {
     }
 
     pub fn thunk(t: Thunk) -> Value {
-        Value::from_rc_ptr(TAG_THUNK, Rc::new(t))
+        let rc = Rc::new(t);
+        // Cold data-cycle constructor (CORE-2, plan §5.2): a thunk can carry a
+        // closure-free cycle through its `forced` cell, so every fresh thunk
+        // is a collector candidate. `from_rc` wrappers are exempt — they wrap
+        // allocations registered at their own creation site.
+        crate::cycle::register_candidate(crate::cycle::GcNode::Thunk(Rc::downgrade(&rc)));
+        Value::from_rc_ptr(TAG_THUNK, rc)
     }
 
     pub fn thunk_from_rc(rc: Rc<Thunk>) -> Value {
@@ -920,7 +926,12 @@ impl Value {
     }
 
     pub fn multimethod(m: MultiMethod) -> Value {
-        Value::from_rc_ptr(TAG_MULTIMETHOD, Rc::new(m))
+        let rc = Rc::new(m);
+        // Cold data-cycle constructor (CORE-2): the method table / default
+        // cells can close a closure-free cycle (e.g. a method value that is
+        // the multimethod itself).
+        crate::cycle::register_candidate(crate::cycle::GcNode::MultiMethod(Rc::downgrade(&rc)));
+        Value::from_rc_ptr(TAG_MULTIMETHOD, rc)
     }
 
     pub fn multimethod_from_rc(rc: Rc<MultiMethod>) -> Value {
@@ -936,13 +947,24 @@ impl Value {
     }
 
     pub fn async_promise(promise: AsyncPromise) -> Value {
-        Value::from_rc_ptr(TAG_ASYNC_PROMISE, Rc::new(promise))
+        let rc = Rc::new(promise);
+        // Cold data-cycle constructor (CORE-2): a resolved promise can close a
+        // closure-free cycle through its state cell (e.g. resolved to a channel
+        // that buffers the promise). The scheduler's raw `Rc::new(AsyncPromise…)`
+        // spawn sites register their own candidates before wrapping via
+        // `async_promise_from_rc`.
+        crate::cycle::register_candidate(crate::cycle::GcNode::Promise(Rc::downgrade(&rc)));
+        Value::from_rc_ptr(TAG_ASYNC_PROMISE, rc)
     }
     pub fn async_promise_from_rc(rc: Rc<AsyncPromise>) -> Value {
         Value::from_rc_ptr(TAG_ASYNC_PROMISE, rc)
     }
     pub fn channel(ch: Channel) -> Value {
-        Value::from_rc_ptr(TAG_CHANNEL, Rc::new(ch))
+        let rc = Rc::new(ch);
+        // Cold data-cycle constructor (CORE-2): the buffer can hold values
+        // that reach back to the channel with no closure on the cycle.
+        crate::cycle::register_candidate(crate::cycle::GcNode::Channel(Rc::downgrade(&rc)));
+        Value::from_rc_ptr(TAG_CHANNEL, rc)
     }
     pub fn channel_from_rc(rc: Rc<Channel>) -> Value {
         Value::from_rc_ptr(TAG_CHANNEL, rc)

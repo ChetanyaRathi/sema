@@ -1,6 +1,6 @@
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 
 use sema_core::{
     bits_to_spur,
@@ -99,8 +99,10 @@ struct VmClosurePayload {
 // pass, so the casts are sound.
 
 thread_local! {
-    /// Once-guard: the payload tracer is registered (per thread) by the
-    /// first `make_closure`, the sole producer of collector candidates.
+    /// Once-guard: the payload tracer is registered (per thread) at VM
+    /// construction — every `make_closure` (the sole producer of collector
+    /// candidates) runs inside a VM, so wiring there keeps this check off
+    /// the closure-creation hot path.
     static CYCLE_GC_WIRED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
@@ -336,6 +338,12 @@ pub struct VM {
     /// temporarily by `run_nested_closure` so a re-entrant in-VM HOF callback
     /// returns to its native caller without unwinding the parent's frames.
     frame_floor: usize,
+    /// One-entry cache of the last home env this VM registered with the
+    /// cycle collector (CORE-2): consecutive `make_closure`s share a home,
+    /// so a pointer-equality hit skips the collector's seen-set probe. The
+    /// `Weak` guards address reuse — a dead entry (strong count 0) never
+    /// matches, even if a fresh env landed on the same address.
+    gc_adopted_home: std::cell::RefCell<Weak<Env>>,
 }
 
 thread_local! {
@@ -705,6 +713,7 @@ impl VM {
             func.cache_offset = total_cache_slots;
             total_cache_slots += func.chunk.n_global_cache_slots as usize;
         }
+        ensure_cycle_gc_wired();
         Ok(VM {
             stack: Vec::with_capacity(256),
             frames: Vec::with_capacity(64),
@@ -715,6 +724,7 @@ impl VM {
             debug_values: HashMap::new(),
             next_debug_value_ref: DEBUG_VALUE_REF_BASE,
             frame_floor: 0,
+            gc_adopted_home: std::cell::RefCell::new(Weak::new()),
         })
     }
 
@@ -756,6 +766,7 @@ impl VM {
             .iter()
             .map(|f| f.chunk.n_global_cache_slots as usize)
             .sum();
+        ensure_cycle_gc_wired();
         VM {
             stack: Vec::with_capacity(256),
             frames: Vec::with_capacity(64),
@@ -766,6 +777,7 @@ impl VM {
             debug_values: HashMap::new(),
             next_debug_value_ref: DEBUG_VALUE_REF_BASE,
             frame_floor: 0,
+            gc_adopted_home: std::cell::RefCell::new(Weak::new()),
         }
     }
 
@@ -780,6 +792,7 @@ impl VM {
             .iter()
             .map(|f| f.chunk.n_global_cache_slots as usize)
             .sum();
+        ensure_cycle_gc_wired();
         Ok(VM {
             stack: Vec::with_capacity(256),
             frames: Vec::with_capacity(64),
@@ -790,6 +803,7 @@ impl VM {
             debug_values: HashMap::new(),
             next_debug_value_ref: DEBUG_VALUE_REF_BASE,
             frame_floor: 0,
+            gc_adopted_home: std::cell::RefCell::new(Weak::new()),
         })
     }
 
@@ -3152,11 +3166,25 @@ impl VM {
             None => self.globals.clone(),
         };
 
-        // Cycle-collector candidates (CORE-2): the home env on first adoption
-        // (deduped inside), the new closure wrapper below. The tracer must be
-        // wired before any collect can see these.
-        ensure_cycle_gc_wired();
-        sema_core::register_env_candidate(&home_globals);
+        // Cycle-collector candidates (CORE-2), registered after construction
+        // below: the home env on first adoption, the new closure wrapper.
+        // Home-adoption 1-entry cache: only clone (and later probe the
+        // collector's seen-set for) the home when it isn't the one this VM
+        // last adopted. The `Weak` guards address reuse — a dead entry
+        // (strong count 0) never matches, even if a fresh env landed on the
+        // same address.
+        let home_for_gc: Option<Rc<Env>> = {
+            let cached = self.gc_adopted_home.borrow();
+            let hit = std::ptr::eq(cached.as_ptr(), Rc::as_ptr(&home_globals))
+                && cached.strong_count() > 0;
+            drop(cached);
+            if hit {
+                None
+            } else {
+                *self.gc_adopted_home.borrow_mut() = Rc::downgrade(&home_globals);
+                Some(home_globals.clone())
+            }
+        };
 
         let closure = Rc::new(Closure {
             func,
@@ -3238,19 +3266,41 @@ impl VM {
         // Mark this wrapper so `type`/`type_name` report `:lambda`, not `:native-fn`.
         native_fn.is_closure = true;
         let native_rc = Rc::new(native_fn);
-        sema_core::register_candidate(sema_core::GcNode::ClosureFn(Rc::downgrade(&native_rc)));
+
+        // Zero-upvalue exemption: a closure that captured NO upvalues is not
+        // registered as a cycle candidate (its home env still is). Sound
+        // because it owns no upvalue cells, so it cannot carry the severable
+        // link of any cycle (invariant I1) — every cycle it sits on closes
+        // through a cell owned by something else that is independently
+        // registered and reaches the whole cycle:
+        //   - env bindings on its home's parent chain (the Env⇄Closure
+        //     shapes): the home WRAPPER candidate registered by this very
+        //     call traces `parent` edges through every ancestor env;
+        //   - upvalue cells: owned by closures WITH upvalues (registered);
+        //   - data cells (thunk/promise/channel/multimethod): their cold
+        //     constructors register their own candidates, so even a data
+        //     cell smuggled into chunk consts by a macro (reachable only
+        //     through the shared function table) carries a covering
+        //     candidate.
+        // This keeps every top-level `(define (f ...))` — the common case —
+        // out of the registry: live ones aren't re-traced each pass, garbage
+        // ones die by plain Rc drop without a registry entry to prune.
+        let candidate = (n_upvalues > 0).then_some(&native_rc);
+        let should_collect = sema_core::register_closure_birth(home_for_gc.as_ref(), candidate);
+        drop(home_for_gc);
         self.stack.push(Value::native_fn_from_rc(native_rc));
 
-        // Threshold-gated safe point: closure creation is the only site where
-        // the candidate registry grows, so churn workloads that never return
+        // Threshold-gated safe point: closure creation is the hot site where
+        // the candidate registry grows (cold data births run the same trigger
+        // inside register_candidate), so churn workloads that never return
         // to a top-level safe point still collect. Mid-VM collection is safe —
         // live objects are protected by external strong counts (VM stack,
         // frames, open-upvalue refs) and any outstanding `RefCell` borrow
         // aborts the pass cleanly. Pins skip descent into the executing VM's
         // live global namespace; computed only when a pass will actually run.
-        if sema_core::gc_should_collect() {
+        if should_collect {
             let pins = sema_core::gc_env_chain_pins(&self.globals);
-            sema_core::gc_collect(&pins);
+            sema_core::gc_threshold_collect(&pins);
         }
         Ok(())
     }
