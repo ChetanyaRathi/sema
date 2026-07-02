@@ -167,13 +167,13 @@
 ;; ── Drag and Drop ───────────────────────────────────────────────────
 
 (define (get-card-id-from-event ev)
-  (if-let ((el (dom/event-target-closest ev "[data-card-id]")))
+  (if-let (el (dom/event-target-closest ev "[data-card-id]"))
     ;; Force to string — WASM bridge may auto-convert "1" to 1
     (->str (dom/get-attribute el "data-card-id"))
     nil))
 
 (define (get-col-id-from-event ev)
-  (if-let ((el (dom/event-target-closest ev "[data-col-id]")))
+  (if-let (el (dom/event-target-closest ev "[data-col-id]"))
     (dom/get-attribute el "data-col-id")
     nil))
 
@@ -184,19 +184,19 @@
   (put! drag-over-col nil))
 
 (define (handle-pointer-down-card ev)
-  (when-let ((card-id-str (get-card-id-from-event ev)))
-    (when-let ((card (find-card-by-id @board card-id-str)))
+  (when-let (card-id-str (get-card-id-from-event ev))
+    (when-let (card (find-card-by-id @board card-id-str))
       (put! drag-card-id card-id-str)
       (put! drag-source-col (get card :column)))))
 
 (define (handle-pointer-move-col ev)
   (when (not (null? @drag-card-id))
-    (when-let ((col-id (get-col-id-from-event ev)))
+    (when-let (col-id (get-col-id-from-event ev))
       (put! drag-over-col col-id))))
 
 (define (handle-pointer-up-col ev)
   (when (not (null? @drag-card-id))
-    (when-let ((target-col (get-col-id-from-event ev)))
+    (when-let (target-col (get-col-id-from-event ev))
       (when (not (equal? target-col @drag-source-col))
         (move-card @drag-card-id target-col))))
   (clear-drag-state))
@@ -210,29 +210,29 @@
   (put! search-text ""))
 
 (define (handle-card-click ev)
-  (when-let ((card-id-str (get-card-id-from-event ev)))
+  (when-let (card-id-str (get-card-id-from-event ev))
     (put! selected-card-id card-id-str)))
 
 (define (handle-move-left ev)
   (dom/stop-propagation! ev)
   (dom/prevent-default! ev)
-  (when-let ((card-id-str (get-card-id-from-event ev)))
-    (when-let ((card (find-card-by-id @board card-id-str)))
-      (when-let ((p (prev-col (get card :column))))
+  (when-let (card-id-str (get-card-id-from-event ev))
+    (when-let (card (find-card-by-id @board card-id-str))
+      (when-let (p (prev-col (get card :column)))
         (move-card card-id-str p)))))
 
 (define (handle-move-right ev)
   (dom/stop-propagation! ev)
   (dom/prevent-default! ev)
-  (when-let ((card-id-str (get-card-id-from-event ev)))
-    (when-let ((card (find-card-by-id @board card-id-str)))
-      (when-let ((n (next-col (get card :column))))
+  (when-let (card-id-str (get-card-id-from-event ev))
+    (when-let (card (find-card-by-id @board card-id-str))
+      (when-let (n (next-col (get card :column)))
         (move-card card-id-str n)))))
 
 (define (handle-delete ev)
   (dom/stop-propagation! ev)
   (dom/prevent-default! ev)
-  (when-let ((card-id-str (get-card-id-from-event ev)))
+  (when-let (card-id-str (get-card-id-from-event ev))
     (delete-card card-id-str)))
 
 ;; Add card flow
@@ -268,24 +268,24 @@
   (put! selected-card-id nil))
 
 (define (handle-modal-desc ev)
-  (when-let ((id @selected-card-id))
+  (when-let (id @selected-card-id)
     (update-card-field id :description (dom/event-value ev))))
 
 (define (handle-modal-move-left ev)
-  (when-let ((id @selected-card-id))
-    (when-let ((card (find-card-by-id @board id)))
-      (when-let ((p (prev-col (get card :column))))
+  (when-let (id @selected-card-id)
+    (when-let (card (find-card-by-id @board id))
+      (when-let (p (prev-col (get card :column)))
         (move-card id p)))))
 
 (define (handle-modal-move-right ev)
-  (when-let ((id @selected-card-id))
-    (when-let ((card (find-card-by-id @board id)))
-      (when-let ((n (next-col (get card :column))))
+  (when-let (id @selected-card-id)
+    (when-let (card (find-card-by-id @board id))
+      (when-let (n (next-col (get card :column)))
         (move-card id n)))))
 
 (define (handle-cycle-priority ev)
-  (when-let ((id @selected-card-id))
-    (when-let ((card (find-card-by-id @board id)))
+  (when-let (id @selected-card-id)
+    (when-let (card (find-card-by-id @board id))
       (let ((prio (get card :priority)))
         (let ((new-prio (cond
                           ((equal? prio "low") "medium")
@@ -305,12 +305,12 @@
          (@search-active (put! search-text ""))
          (#t nil)))
       ((equal? key "/")
-       (when-let ((input (dom/query "#search-input")))
+       (when-let (input (dom/query "#search-input"))
          (dom/prevent-default! ev)
          (dom/focus! input)))
       ((equal? key "n")
        ;; Only trigger if not typing in an input/textarea
-       (when-let ((target (dom/event-target ev)))
+       (when-let (target (dom/event-target ev))
          (let ((tag (dom/get-attribute target "tagName")))
            (when (not (equal? tag "INPUT"))
              (when (not (equal? tag "TEXTAREA"))
@@ -341,7 +341,7 @@
 
 ;; Process completed AI stream — called via js/set-interval polling, NOT during render
 (define (poll-ai-stream)
-  (when-let ((s @ai-stream))
+  (when-let (s @ai-stream)
     (let ((val @s))
       (when (get val :done)
         (let ((text (get val :text)))
@@ -371,7 +371,7 @@
 (js/set-interval "poll-ai-stream" 500)
 
 (define (render-ai-status)
-  (if-let ((s @ai-stream))
+  (if-let (s @ai-stream)
     (let ((val @s))
       (if (get val :done)
         [:span {:class streaming-indicator-style} "Processing..."]
@@ -937,8 +937,8 @@
 ;; ── Modal (detail view, mounted separately) ─────────────────────────
 
 (define (modal-view)
-  (if-let ((id @selected-card-id))
-    (if-let ((card (find-card-by-id @board id)))
+  (if-let (id @selected-card-id)
+    (if-let (card (find-card-by-id @board id))
       [:div {:class overlay-style :on-click "close-modal" :data-testid "card-modal"}
         [:div {:class modal-style :on-click "stop-propagation"}
           [:div {:class modal-title-style :data-testid "modal-title"} (get card :title)]

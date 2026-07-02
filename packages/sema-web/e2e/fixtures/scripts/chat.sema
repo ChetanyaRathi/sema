@@ -24,7 +24,7 @@
     [:span (get msg :content)]])
 
 (define (render-stream-status)
-  (if-let ((s @current-stream))
+  (if-let (s @current-stream)
     (let ((val @s))
       (if (get val :done)
         (begin

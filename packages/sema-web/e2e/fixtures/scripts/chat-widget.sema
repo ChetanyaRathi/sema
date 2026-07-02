@@ -21,7 +21,7 @@
   (store/set! "sema-chat-messages" @messages))
 
 (define (load-messages)
-  (when-let ((saved (store/get "sema-chat-messages")))
+  (when-let (saved (store/get "sema-chat-messages"))
     (put! messages saved)))
 
 (load-messages)
@@ -227,7 +227,7 @@
 ;; ── Stream Rendering ────────────────────────────────────────────────
 
 (define (render-stream)
-  (if-let ((s @current-stream))
+  (if-let (s @current-stream)
     (let ((val @s))
       (if (get val :done)
         (begin
