@@ -369,6 +369,29 @@ impl Scheduler {
         self.cancel_await_tree(target);
     }
 
+    /// On an `async/all`/`async/race` short-circuit, transitively cancel the
+    /// combinator's OWN still-pending siblings. When `async/all` rejects (or
+    /// `async/race` settles) the remaining in-flight members are abandoned: without
+    /// this they run on, and a reachable one survives the terminal-only reap, so its
+    /// span-owning `IoHandle` can strand to teardown and abort the process
+    /// (adversarial #7 — ASYNC-3). Mirrors the timeout path's `cancel_promise_task`
+    /// guard, scoped to the combinator's promise set. No-op for other targets.
+    fn cancel_abandoned_combinator_siblings(&mut self, target: &SchedulerTarget) {
+        let (SchedulerTarget::AllOf(promises) | SchedulerTarget::AnyOf(promises)) = target else {
+            return;
+        };
+        // Snapshot the still-pending members first: `cancel_promise_task` borrows
+        // `self.tasks` mutably and transitions promise state as it goes.
+        let pending: Vec<Rc<AsyncPromise>> = promises
+            .iter()
+            .filter(|p| matches!(&*p.state.borrow(), PromiseState::Pending))
+            .cloned()
+            .collect();
+        for p in &pending {
+            self.cancel_promise_task(p);
+        }
+    }
+
     /// Mark a task (by id) as cancelled and transition its promise into `Cancelled`,
     /// transitively cancelling whatever it awaits. Returns true if this call actually
     /// transitioned the task, false if it was already terminal/cancelled or no task
@@ -902,12 +925,14 @@ fn run_until_reentrant(
         }
 
         if let Some(result) = goal.status() {
+            sched.cancel_abandoned_combinator_siblings(target);
             return Ok(result);
         }
 
         sched.wake_blocked_tasks();
 
         if let Some(result) = goal.status() {
+            sched.cancel_abandoned_combinator_siblings(target);
             return Ok(result);
         }
 

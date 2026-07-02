@@ -18,7 +18,7 @@ where the thunk returned and the flag was reset. Two symptoms:
   against whatever budget frame happens to be installed when it resolves, not the
   frame that was active when it was dispatched.
 
-Decision (locked with owner): **implement both A and B.** ADR #66.
+Decision (locked with owner): **implement both A and B.** ADR #67.
 
 ## Root cause (one sentence)
 
@@ -193,6 +193,6 @@ or `complete_async_test.rs`). **These are the CI regression oracle.**
 
 - Remove the ASYNC-1 entry from `docs/deferred.md` once landed (like the
   LEX-1/VM-1/N7 removals).
-- Add ADR #66 (below) with the decision + the shared-frame rationale.
+- Add ADR #67 (below) with the decision + the shared-frame rationale.
 - Update the `workflow :budget` contract note and any `llm/with-budget` doc that
   currently warns concurrent fan-out is not gated.

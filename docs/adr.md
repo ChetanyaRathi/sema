@@ -743,7 +743,7 @@ The bytecode lowerer is scope-free — it resolves a special form from a call's 
 
 This lands on the **Common Lisp / Clojure** model (special operators are reserved in operator position; their value namespace is irrelevant here since Sema is a Lisp-1), not Scheme's. Regular non-special-form names — including builtin *functions* like `list`/`map`/`filter` — still shadow freely. See `docs/limitations.md` #36; regression tests `reserved_*` / `shadow_builtin_*` in `eval_test.rs`.
 
-### 66. LLM dynamic scope (cache / budget / tags) is captured per async task (PROPOSED)
+### 67. LLM dynamic scope (cache / budget / tags) is captured per async task (PROPOSED)
 
 Status: **proposed 2026-07-02** — closes deferred item **ASYNC-1**. Plan:
 `docs/plans/2026-07-02-async-1-dynamic-scope-per-task.md`.

@@ -735,6 +735,63 @@ fn cancel_completed_task_is_noop() {
     );
 }
 
+// === ASYNC-3: a combinator short-circuit cancels its abandoned in-flight siblings ===
+//
+// When `async/all` short-circuits on the first rejection (or `async/race` on the
+// first settle), any still-pending sibling in that combinator's OWN promise set must
+// be transitively cancelled — structured-concurrency semantics. Before the fix the
+// abandoned sibling was left running (a reachable one survives the terminal-only reap),
+// so its span-owning IoHandle could strand to teardown and abort the process under an
+// active OTel exporter (the adversarial-#7 hazard the timeout path already guards).
+
+#[test]
+fn async_all_reject_cancels_pending_sibling() {
+    assert_eq!(
+        eval(
+            r#"
+            (define slow (async (async/sleep 1000) :done))
+            (define boom (async (error "boom")))
+            (try (async/all (list boom slow)) (catch e nil))
+            (async/cancelled? slow)
+            "#
+        ),
+        Value::bool(true),
+    );
+}
+
+#[test]
+fn async_race_cancels_losing_siblings() {
+    assert_eq!(
+        eval(
+            r#"
+            (define slow (async (async/sleep 1000) :slow))
+            (define fast (async :fast))
+            (async/race (list slow fast))
+            (async/cancelled? slow)
+            "#
+        ),
+        Value::bool(true),
+    );
+}
+
+// Guard against over-cancellation: the cancel is scoped to the combinator's own
+// promise set — an unrelated in-flight task awaited later must survive untouched.
+#[test]
+fn combinator_short_circuit_spares_unrelated_task() {
+    assert_eq!(
+        eval(
+            r#"
+            (define bg (async (async/sleep 50) 99))
+            (define slow (async (async/sleep 1000) :slow))
+            (define fast (async :fast))
+            (async/race (list slow fast))
+            (await bg)
+            "#
+        ),
+        Value::int(99),
+    );
+}
+
 // === Bug regression: yield signal through op::CALL ===
 
 #[test]
