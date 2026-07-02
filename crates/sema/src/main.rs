@@ -1013,7 +1013,7 @@ fn main() {
                 }
             }
             Err(msg) if msg.starts_with("file not found:") => {
-                eprintln!("error: '{file}' not found (not a file or command)\n\nRun 'sema --help' for available commands.");
+                eprintln!("error: file not found: '{file}' (not a file or command)\n\nRun 'sema --help' for available commands.");
                 std::process::exit(1);
             }
             Err(msg) => {

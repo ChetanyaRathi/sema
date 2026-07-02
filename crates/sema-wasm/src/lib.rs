@@ -1676,6 +1676,16 @@ impl Default for WasmInterpreter {
     }
 }
 
+/// Summary of a loaded web archive: entry point, embedded file count, and the
+/// optional `sema-version` / `build-target` / `build-timestamp` metadata.
+type LoadedArchiveInfo = (
+    String,
+    usize,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
+
 #[wasm_bindgen(js_class = SemaInterpreter)]
 impl WasmInterpreter {
     #[wasm_bindgen(constructor)]
@@ -2530,7 +2540,11 @@ impl WasmInterpreter {
 
     /// Invoke a stored callback handle directly with JS arguments.
     #[wasm_bindgen(js_name = invokeCallback)]
-    pub fn invoke_callback(&self, callback_id: u32, args: &js_sys::Array) -> Result<JsValue, JsValue> {
+    pub fn invoke_callback(
+        &self,
+        callback_id: u32,
+        args: &js_sys::Array,
+    ) -> Result<JsValue, JsValue> {
         let func = self
             .callback_handles
             .borrow()
@@ -2628,7 +2642,7 @@ impl WasmInterpreter {
     /// Load a compiled web archive into the interpreter's embedded module table.
     #[wasm_bindgen(js_name = loadArchive)]
     pub fn load_archive(&self, archive_bytes: &[u8]) -> JsValue {
-        let result = (|| -> Result<(String, usize, Option<String>, Option<String>, Option<String>), SemaError> {
+        let result = (|| -> Result<LoadedArchiveInfo, SemaError> {
             let archive = sema_core::archive::deserialize_archive_from_bytes(archive_bytes)
                 .map_err(|e| SemaError::eval(format!("invalid archive: {e}")))?;
 
@@ -2636,7 +2650,8 @@ impl WasmInterpreter {
                 .unwrap_or_else(|| "__main__.semac".to_string());
             let sema_version = Self::archive_metadata_value(&archive.metadata, "sema-version");
             let build_target = Self::archive_metadata_value(&archive.metadata, "build-target");
-            let build_timestamp = Self::archive_metadata_value(&archive.metadata, "build-timestamp");
+            let build_timestamp =
+                Self::archive_metadata_value(&archive.metadata, "build-timestamp");
 
             Self::validate_web_archive_metadata(
                 sema_version.as_deref(),
@@ -3274,9 +3289,7 @@ fn callback_handle_from_js(value: &JsValue) -> Option<u32> {
     }
 }
 
-fn make_callback_handle_object(
-    callback_id: u32,
-) -> JsValue {
+fn make_callback_handle_object(callback_id: u32) -> JsValue {
     let obj = js_sys::Object::new();
     let _ = js_sys::Reflect::set(
         &obj,
@@ -3299,7 +3312,9 @@ fn allocate_callback_handle(
 
     let callback_id = next_callback_id.get();
     next_callback_id.set(callback_id.saturating_add(1));
-    callback_handles.borrow_mut().insert(callback_id, val.clone());
+    callback_handles
+        .borrow_mut()
+        .insert(callback_id, val.clone());
     callback_ids_by_value
         .borrow_mut()
         .insert(raw_bits, callback_id);
@@ -3468,11 +3483,6 @@ mod tests {
         // The dedicated escapes are still preferred over the generic form.
         assert_eq!(escape_json("\t"), "\\t");
     }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::WasmInterpreter;
 
     #[test]
     fn web_archive_metadata_rejects_wrong_build_target() {

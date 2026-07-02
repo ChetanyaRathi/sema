@@ -7,9 +7,9 @@
 
 use std::collections::BTreeMap;
 
-use sema_core::{check_arity, SemaError, Value};
 #[cfg(not(target_arch = "wasm32"))]
 use sema_core::Caps;
+use sema_core::{check_arity, SemaError, Value};
 
 use crate::register_fn;
 

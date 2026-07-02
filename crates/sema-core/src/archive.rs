@@ -59,6 +59,12 @@ pub struct Archive {
     pub files: HashMap<String, Vec<u8>>,
 }
 
+impl Default for Archive {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Archive {
     /// Create a new empty archive with the current format version.
     #[allow(dead_code)]

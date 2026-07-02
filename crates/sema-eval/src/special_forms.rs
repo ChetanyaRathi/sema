@@ -228,7 +228,13 @@ fn import_module_from_bytes(
                 })?;
                 let (exprs, spans) = sema_reader::read_many_with_spans(&content)?;
                 ctx.merge_span_table(spans.clone());
-                eval::eval_module_body_vm(ctx, &module_env, &exprs, &spans, Some(file_path.clone()))?;
+                eval::eval_module_body_vm(
+                    ctx,
+                    &module_env,
+                    &exprs,
+                    &spans,
+                    Some(file_path.clone()),
+                )?;
             }
             Ok(())
         })();

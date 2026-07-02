@@ -424,7 +424,11 @@ impl Parser {
                     depth -= 1;
                 }
                 // Quote-like prefixes at depth 0 could start a new form
-                Token::Quote | Token::Quasiquote | Token::Unquote | Token::UnquoteSplice | Token::Deref => {
+                Token::Quote
+                | Token::Quasiquote
+                | Token::Unquote
+                | Token::UnquoteSplice
+                | Token::Deref => {
                     if depth == 0 {
                         return;
                     }
@@ -1198,11 +1202,7 @@ mod tests {
             result,
             Value::list(vec![
                 Value::symbol("deref"),
-                Value::list(vec![
-                    Value::symbol("+"),
-                    Value::int(1),
-                    Value::int(2),
-                ])
+                Value::list(vec![Value::symbol("+"), Value::int(1), Value::int(2),])
             ])
         );
     }
