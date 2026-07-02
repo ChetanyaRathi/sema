@@ -28,7 +28,7 @@
 
 import { createHandler } from "../handler.js";
 import { extractClientIdFromRequestHeaders } from "../client-id.js";
-import { buildBodyTooLargeResponse, getMaxBodySize, readRequestTextWithLimit } from "../body.js";
+import { getMaxBodySize, parseJsonBody } from "../body.js";
 import type { ProxyConfig, ProxyRequest } from "../types.js";
 
 /**
@@ -55,30 +55,14 @@ export function createNetlifyHandler(config: ProxyConfig): NetlifyHandler {
     let body: unknown = null;
 
     if (req.method === "POST") {
-      try {
-        const bodyResult = await readRequestTextWithLimit(req, maxBodySize);
-        if (!bodyResult.ok) {
-          const tooLarge = buildBodyTooLargeResponse(corsOrigin, maxBodySize, bodyResult.size);
-          return new Response(tooLarge.body, {
-            status: tooLarge.status,
-            headers: tooLarge.headers,
-          });
-        }
-        body = bodyResult.text ? JSON.parse(bodyResult.text) : null;
-      } catch {
-        return new Response(
-          JSON.stringify({ error: "Invalid JSON body", code: "INVALID_REQUEST" }),
-          {
-            status: 400,
-            headers: {
-              "Content-Type": "application/json",
-              "Access-Control-Allow-Origin": corsOrigin,
-              "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-              "Access-Control-Allow-Headers": "Content-Type, Authorization",
-            },
-          },
-        );
+      const parsed = await parseJsonBody(req, corsOrigin, maxBodySize);
+      if (!parsed.ok) {
+        return new Response(parsed.response.body, {
+          status: parsed.response.status,
+          headers: parsed.response.headers,
+        });
       }
+      body = parsed.body;
     }
 
     const proxyReq: ProxyRequest = {

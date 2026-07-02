@@ -72,3 +72,38 @@ export async function readRequestTextWithLimit(
 export function byteLength(value: string): number {
   return textEncoder.encode(value).length;
 }
+
+function buildInvalidJsonResponse(corsOrigin: string): ProxyResponse {
+  return {
+    status: 400,
+    headers: {
+      "Content-Type": "application/json",
+      "Access-Control-Allow-Origin": corsOrigin,
+      "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+      "Access-Control-Allow-Headers": "Content-Type, Authorization",
+    },
+    body: JSON.stringify({ error: "Invalid JSON body", code: "INVALID_REQUEST" }),
+  };
+}
+
+/**
+ * Read and JSON-parse a POST body under a size limit, for adapters built on
+ * the standard Fetch API Request/Response shape (Vercel, Cloudflare,
+ * Netlify). The Node adapter reads from an IncomingMessage stream instead
+ * and doesn't share this helper.
+ */
+export async function parseJsonBody(
+  req: Request,
+  corsOrigin: string,
+  maxBytes: number,
+): Promise<{ ok: true; body: unknown } | { ok: false; response: ProxyResponse }> {
+  try {
+    const bodyResult = await readRequestTextWithLimit(req, maxBytes);
+    if (!bodyResult.ok) {
+      return { ok: false, response: buildBodyTooLargeResponse(corsOrigin, maxBytes, bodyResult.size) };
+    }
+    return { ok: true, body: bodyResult.text ? JSON.parse(bodyResult.text) : null };
+  } catch {
+    return { ok: false, response: buildInvalidJsonResponse(corsOrigin) };
+  }
+}
