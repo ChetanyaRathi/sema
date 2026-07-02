@@ -101,9 +101,23 @@
   streaming, mouse-wheel scrolling, resize handling, and an extensible
   slash-command registry + single-file JSON config (falls back to a plain
   line-based REPL when stdout isn't a TTY).
+- **Conversation inspection, surgery, search & prompt algebra** (issue #12) —
+  15 builtins for working with conversations as data: `conversation/length`,
+  `conversation/turns`, `conversation/models-used`, and `conversation/stats`
+  inspect a conversation; `conversation/remove`, `conversation/insert`,
+  `conversation/replace`, and `conversation/map-role` edit it non-destructively;
+  `conversation/search` / `conversation/find` locate messages; and the prompt
+  algebra `prompt/diff`, `prompt/union`, `prompt/intersection`,
+  `prompt/difference` compare message sets by role+content. `conversation/cost`
+  reports the billed total.
 
 ### Fixed
 
+- **Conversation cost/usage is real, not estimated.** `conversation/say` now
+  folds each turn's actual provider `usage` into the conversation, so
+  `conversation/cost` and `conversation/stats` report the billed token/cost sum.
+  When no turn recorded a priced usage, `conversation/cost` returns `nil` rather
+  than falling back to a character-count estimate (issue #12).
 - **`sort` is type-safe and numerically correct without a comparator.**
   Comparator-free `(sort xs)` previously delegated to an internal tag order, so
   mixed int/float lists sorted every int before every float regardless of value
