@@ -99,9 +99,14 @@ fn async_cache_miss_is_counted() {
     reset_runtime_state();
     register_test_provider(Box::new(fake));
 
+    // `llm/cache-clear` wipes the persistent (on-disk) cache too — `reset_runtime_state`
+    // only clears the in-memory table, so a "hello" entry left by a prior run would make
+    // this dispatch a HIT and the intended first-miss would never be counted (the source
+    // of the earlier "flaky" removal — it was actually a non-hermetic disk cache).
     // Spawn is inside the with-cache thunk; the await is OUTSIDE it, so the task
     // executes after the with-cache extent has ended.
     let program = r#"
+        (llm/cache-clear)
         (define p (llm/with-cache (fn () (async/spawn (fn () (llm/complete "hello"))))))
         (async/await p)
         (:misses (llm/cache-stats))
