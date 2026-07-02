@@ -34,7 +34,6 @@ use serial_test::serial;
 /// (peak in-flight ≥ 2, wall ≈ 3·120 — the single-agent critical path).
 #[test]
 #[serial]
-#[ignore = "RED acceptance gate for non-blocking multi-round agent/run (issue #61 §3a); un-ignored when the yield-per-round implementation lands"]
 fn concurrent_agents_overlap_and_peak_inflight() {
     reset_io_inflight();
 
@@ -86,7 +85,6 @@ fn concurrent_agents_overlap_and_peak_inflight() {
 /// round observes a strictly higher count → the max snapshot is > 0.
 #[test]
 #[serial]
-#[ignore = "RED acceptance gate for non-blocking multi-round agent/run (issue #61 §3a); un-ignored when the yield-per-round implementation lands"]
 fn sibling_ticker_advances_during_agent_rounds() {
     reset_io_inflight();
 
@@ -141,7 +139,6 @@ fn sibling_ticker_advances_during_agent_rounds() {
 /// remaining rounds never dispatch (best-effort for the in-flight round).
 #[test]
 #[serial]
-#[ignore = "RED acceptance gate for non-blocking multi-round agent/run (issue #61 §3a); un-ignored when the yield-per-round implementation lands"]
 fn cancelling_agent_run_cuts_the_loop_short() {
     reset_io_inflight();
 

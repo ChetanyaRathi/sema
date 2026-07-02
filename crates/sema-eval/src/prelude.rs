@@ -505,4 +505,24 @@ pub const PRELUDE: &str = r#"
   `(let ((amap-f# ,f))
      (async/all
        (map (fn (item#) (async/spawn (fn () (amap-f# item#)))) ,items))))
+
+;; ── Non-blocking multi-round agent loop (issue #61 §3a, ADR #68) ──────────────
+;; In an async scheduler task, drive the agent conversation from bytecode: each
+;; provider round is one native (`__agent-step`) that offloads + yields `AwaitIo`,
+;; so sibling tasks overlap during the conversation, and `async/timeout`/`async/cancel`
+;; can cut the loop at an inter-round park. `__agent-drive` loops step→exec-tools until
+;; the handle reports `:done`; loop bounds (max-turns, consecutive-error abort) are
+;; enforced in the Rust handle. The synchronous / wasm path stays the byte-identical
+;; blocking native `__agent-run-blocking`.
+(define (__agent-drive __h)
+  (if (:done (__agent-step __h))
+      (__agent-finish __h)
+      (begin (__agent-exec-tools __h) (__agent-drive __h))))
+
+(define (agent/run __agent __input . __rest)
+  (if (__async-context?)
+      (let ((__h (apply __agent-begin __agent __input __rest)))
+        (try (__agent-drive __h)
+             (catch __e (begin (__agent-finish __h) (throw __e)))))
+      (apply __agent-run-blocking __agent __input __rest)))
 "#;

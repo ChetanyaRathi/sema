@@ -285,6 +285,15 @@ pub fn current_conversation_id() -> Option<String> {
     CONVERSATION_ID.with(|c| c.borrow().clone())
 }
 
+/// Whether this crate's thread-local span/scope storage is still accessible on the
+/// current thread. Returns `false` once the thread-locals have been destroyed (during
+/// thread teardown). A holder of a still-live [`ConversationGuard`] / span whose `Drop`
+/// touches these thread-locals can consult this to avoid a `panic`-on-drop abort when a
+/// leaked handle (e.g. a cancelled agent run) is finally dropped at thread exit.
+pub fn tls_alive() -> bool {
+    STACK.try_with(|_| ()).is_ok() && CONVERSATION_ID.try_with(|_| ()).is_ok()
+}
+
 /// Generate a fresh, cheap conversation id (monotonic counter mixed with wall-clock).
 pub fn new_conversation_id() -> String {
     let nanos = std::time::SystemTime::now()

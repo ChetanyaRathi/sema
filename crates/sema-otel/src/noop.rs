@@ -74,6 +74,12 @@ pub fn current_conversation_id() -> Option<String> {
     None
 }
 
+/// wasm/noop: the guards are zero-sized and their `Drop` touches no thread-local, so
+/// dropping them is always safe.
+pub fn tls_alive() -> bool {
+    true
+}
+
 pub fn new_conversation_id() -> String {
     String::new()
 }

@@ -357,6 +357,7 @@ pub fn reset_runtime_state() {
     LAST_SERVING_PROVIDER.with(|p| *p.borrow_mut() = None);
     RETRY_BASE_MS.with(|c| c.set(500));
     NETWORK_MAX_RETRIES.with(|c| c.set(3));
+    clear_agent_runs();
     pricing::clear_custom_pricing();
 }
 
@@ -2647,7 +2648,10 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
 
     // (agent/run agent "msg") returns string
     // (agent/run agent "msg" {:on-tool-call cb :messages history}) returns {:response "..." :messages [...]}
-    register_fn_ctx(env, "agent/run", |ctx, args| {
+    // Synchronous / wasm agent loop (byte-identical to the historical `agent/run`).
+    // The `agent/run` name is bound in the prelude to a dispatcher that reaches this
+    // native in non-async context and the yield-per-round driver in async context.
+    register_fn_ctx(env, "__agent-run-blocking", |ctx, args| {
         if args.len() < 2 || args.len() > 3 {
             return Err(SemaError::arity("agent/run", "2-3", args.len()));
         }
@@ -2839,6 +2843,28 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
             // 2-arg form: return string (backward compat)
             Ok(Value::string(&result))
         }
+    });
+
+    // ── Non-blocking multi-round agent loop (async-context path) ──────────────
+    // The prelude `agent/run` dispatches here (four internal natives + a Sema
+    // driver loop) when `(__async-context?)`, so each provider round offloads +
+    // yields `AwaitIo` and sibling scheduler tasks overlap during the conversation.
+    // See docs/plans/2026-07-02-nonblocking-agent-run.md (ADR #68).
+    register_fn_ctx(env, "__async-context?", |_ctx, _args| {
+        Ok(Value::bool(sema_core::in_async_context()))
+    });
+    register_fn_ctx(env, "__agent-begin", |_ctx, args| agent_begin(args));
+    register_fn_ctx(env, "__agent-step", |_ctx, args| {
+        let token = agent_token_arg(args, "__agent-step")?;
+        agent_step(token)
+    });
+    register_fn_ctx(env, "__agent-exec-tools", |ctx, args| {
+        let token = agent_token_arg(args, "__agent-exec-tools")?;
+        agent_exec_tools(ctx, token)
+    });
+    register_fn_ctx(env, "__agent-finish", |_ctx, args| {
+        let token = agent_token_arg(args, "__agent-finish")?;
+        agent_finish(token)
     });
 
     // (llm/pmap fn collection {:max-tokens N ...})
@@ -7176,6 +7202,542 @@ fn chat_messages_to_sema_list(messages: &[ChatMessage]) -> Value {
 
 /// The tool execution loop: send -> check for tool_calls -> execute -> send results -> repeat.
 #[allow(clippy::too_many_arguments)]
+/// Bound runaway error loops across the agent conversation (mirrors `run_tool_loop`).
+const MAX_CONSECUTIVE_TOOL_ERRORS: usize = 5;
+
+/// Per-run state for the non-blocking (async-context) agent loop. Lives in the
+/// thread-local `AGENT_RUNS` slab keyed by an integer token handed to Sema, so it
+/// survives every inter-round / inter-tool `AwaitIo` park (the slab is on the VM
+/// thread; nothing here is `Send` and nothing crosses threads). No `__agent-*`
+/// native holds a `RefCell` borrow of the slab across a callback / tool execution /
+/// completion yield — each short-borrows to copy inputs out, drops, does the work,
+/// then short-borrows again to write back.
+struct AgentLoopState {
+    messages: Vec<ChatMessage>,
+    tools: Vec<Value>,
+    tool_schemas: Vec<ToolSchema>,
+    model: String,
+    max_tokens: Option<u32>,
+    temperature: Option<f64>,
+    system: Option<String>,
+    reasoning_effort: Option<String>,
+    on_tool_call: Option<Value>,
+    on_text: Option<Value>,
+    round: usize,
+    max_rounds: usize,
+    consecutive_errors: usize,
+    pending_tool_calls: Vec<ToolCall>,
+    last_content: String,
+    first_input: String,
+    /// Set once the loop should stop (no tool calls, round cap, or consec-error abort).
+    done: bool,
+    /// Non-empty error message when the run aborted (consecutive tool errors); raised
+    /// by `__agent-finish` so the abort surfaces to the caller like the blocking path.
+    abort_error: Option<String>,
+    /// Whether a final plain-assistant message has been appended to `messages`.
+    final_pushed: bool,
+    output_conv_id: String,
+    has_opts: bool,
+    memory_handle: Option<Value>,
+    pre_user_count: usize,
+    agent_model: String,
+    /// The attached agent OTel span (pushed on the thread-local stack in `__agent-begin`,
+    /// popped+ended when this state is removed from the slab). `Option` so the custom
+    /// `Drop` can forget it when the otel thread-locals are already gone (see below).
+    agent_span: Option<sema_otel::AgentSpan>,
+    conv_guard: Option<sema_otel::ConversationGuard>,
+}
+
+impl Drop for AgentLoopState {
+    fn drop(&mut self) {
+        // Normal path (`__agent-finish`, or `reset_runtime_state` during eval): the otel
+        // thread-locals are live, so let the span guard pop+end and the scope guard
+        // restore — dropping the span BEFORE the scope (reverse of begin's install order).
+        if sema_otel::tls_alive() {
+            drop(self.agent_span.take());
+            drop(self.conv_guard.take());
+        } else {
+            // Thread teardown of a leaked (cancelled) run: the otel thread-locals are
+            // already destroyed. Forget the guards rather than let their `Drop` touch
+            // dead TLS and abort the process. The span never flushes, which is
+            // acceptable for a cancelled run at process exit.
+            std::mem::forget(self.agent_span.take());
+            std::mem::forget(self.conv_guard.take());
+        }
+    }
+}
+
+thread_local! {
+    /// Live non-blocking agent runs, keyed by the integer token handed to Sema.
+    static AGENT_RUNS: RefCell<std::collections::HashMap<u64, AgentLoopState>> =
+        RefCell::new(std::collections::HashMap::new());
+    static AGENT_RUN_NEXT_ID: Cell<u64> = const { Cell::new(1) };
+}
+
+/// Clear any live agent-loop state (called from `reset_runtime_state`). Dropping the
+/// entries ends any still-open agent spans; benign when otel is disabled.
+fn clear_agent_runs() {
+    AGENT_RUNS.with(|r| r.borrow_mut().clear());
+    AGENT_RUN_NEXT_ID.with(|c| c.set(1));
+}
+
+/// Extract the integer handle token from a `__agent-*` native's args.
+fn agent_token_arg(args: &[Value], who: &str) -> Result<u64, SemaError> {
+    if args.len() != 1 {
+        return Err(SemaError::arity(who, "1", args.len()));
+    }
+    args[0]
+        .as_int()
+        .filter(|n| *n >= 0)
+        .map(|n| n as u64)
+        .ok_or_else(|| SemaError::type_error("agent-run-handle", args[0].type_name()))
+}
+
+/// `__agent-begin(agent, input, opts-or-absent) → token-int`. Ports `__agent-run-blocking`'s
+/// setup: session/memory seed, conversation-id resolution, message assembly, tool
+/// schemas, system, telemetry, and the attached agent span; stores it in the slab.
+fn agent_begin(args: &[Value]) -> Result<Value, SemaError> {
+    if args.len() < 2 || args.len() > 3 {
+        return Err(SemaError::arity("agent/run", "2-3", args.len()));
+    }
+    let agent = args[0]
+        .as_agent_rc()
+        .ok_or_else(|| SemaError::type_error("agent", args[0].type_name()))?;
+    let user_msg = args[1]
+        .as_str()
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| args[1].to_string());
+
+    let opts = args.get(2).and_then(|v| v.as_map_rc());
+    let has_opts = opts.is_some();
+
+    let on_tool_call = opts
+        .as_ref()
+        .and_then(|o| o.get(&Value::keyword("on-tool-call")).cloned());
+    let on_text = opts
+        .as_ref()
+        .and_then(|o| o.get(&Value::keyword("on-text")).cloned());
+    let reasoning_effort = opts
+        .as_ref()
+        .and_then(|o| get_opt_effort(o, "reasoning-effort"));
+
+    // :session — seed history + conversation-id from a prior Conversation.
+    let (session_messages, session_conv_id): (Vec<ChatMessage>, Option<String>) =
+        if let Some(ref o) = opts {
+            if let Some(sess_val) = o.get(&Value::keyword("session")) {
+                if let Some(conv_rc) = sess_val.as_conversation_rc() {
+                    let msgs: Vec<ChatMessage> = conv_rc
+                        .messages
+                        .iter()
+                        .map(|m| ChatMessage::new(m.role.to_string(), m.content.clone()))
+                        .collect();
+                    let cid = conv_rc.metadata.get("conversation-id").cloned();
+                    (msgs, cid)
+                } else {
+                    (Vec::new(), None)
+                }
+            } else {
+                (Vec::new(), None)
+            }
+        } else {
+            (Vec::new(), None)
+        };
+
+    // :memory — seed from the memory working set.
+    let memory_handle: Option<Value> = opts
+        .as_ref()
+        .and_then(|o| o.get(&Value::keyword("memory")).cloned());
+    let memory_seed: Vec<ChatMessage> = if let Some(ref h) = memory_handle {
+        MEMORY_CALLBACKS.with(|c| {
+            if let Some(ref cbs) = *c.borrow() {
+                (cbs.get_working)(h).unwrap_or_default()
+            } else {
+                Vec::new()
+            }
+        })
+    } else {
+        Vec::new()
+    };
+
+    let output_conv_id: String = session_conv_id
+        .clone()
+        .or_else(|| {
+            opts.as_ref()
+                .and_then(|o| o.get(&Value::keyword("conversation-id")))
+                .and_then(|v| v.as_str().map(|s| s.to_string()))
+        })
+        .unwrap_or_else(sema_otel::new_conversation_id);
+
+    let conv_scope = ConvScope {
+        conversation: Some(output_conv_id.clone()),
+        session: opts
+            .as_ref()
+            .and_then(|o| o.get(&Value::keyword("session-id")))
+            .and_then(|v| v.as_str().map(|s| s.to_string())),
+        user: opts
+            .as_ref()
+            .and_then(|o| o.get(&Value::keyword("user-id")))
+            .and_then(|v| v.as_str().map(|s| s.to_string())),
+    };
+
+    // Build messages: memory working set + session history + :messages history + new user.
+    let mut messages: Vec<ChatMessage> = memory_seed;
+    messages.extend(session_messages);
+    if let Some(ref o) = opts {
+        if let Some(history) = o.get(&Value::keyword("messages")) {
+            let extra = sema_list_to_chat_messages(history)?;
+            messages.extend(extra);
+        }
+    }
+    let pre_user_count = messages.len();
+    messages.push(ChatMessage::new("user", user_msg));
+
+    let tool_schemas = build_tool_schemas(&agent.tools)?;
+    let system = if agent.system.is_empty() {
+        None
+    } else {
+        Some(agent.system.clone())
+    };
+
+    let first_input = messages
+        .iter()
+        .find(|m| m.role == "user")
+        .map(|m| m.content.to_text())
+        .unwrap_or_default();
+
+    // Open conversation scope FIRST so the agent span carries the same ids, then start
+    // the attached agent span (pushed onto the thread-local span stack; the per-task
+    // otel swap preserves it across every park). Both guards live in the slab and are
+    // dropped (balanced pop+end) in `__agent-finish` / `Drop`.
+    let conv_guard = Some(sema_otel::set_conversation_scope(
+        &output_conv_id,
+        conv_scope.session.as_deref(),
+        conv_scope.user.as_deref(),
+    ));
+    let agent_span = sema_otel::agent_span(Some(&agent.name));
+    // User :tags / :metadata attached directly to the agent span (a `CallTelemetry`
+    // guard cannot be held across the loop's yields; the async path attaches to the
+    // agent root rather than threading CALL_TAGS through every round).
+    if let Some(o) = opts.as_ref() {
+        let tags = get_opt_string_list(o, "tags");
+        let meta = get_opt_str_map(o, "metadata");
+        if !tags.is_empty() {
+            agent_span.set_tags(&tags);
+        }
+        if !meta.is_empty() {
+            agent_span.set_metadata(&meta);
+        }
+    }
+
+    let state = AgentLoopState {
+        messages,
+        tools: agent.tools.clone(),
+        tool_schemas,
+        model: agent.model.clone(),
+        max_tokens: Some(4096),
+        temperature: None,
+        system,
+        reasoning_effort,
+        on_tool_call,
+        on_text,
+        round: 0,
+        max_rounds: agent.max_turns,
+        consecutive_errors: 0,
+        pending_tool_calls: Vec::new(),
+        last_content: String::new(),
+        first_input,
+        done: false,
+        abort_error: None,
+        final_pushed: false,
+        output_conv_id,
+        has_opts,
+        memory_handle,
+        pre_user_count,
+        agent_model: agent.model.clone(),
+        agent_span: Some(agent_span),
+        conv_guard,
+    };
+
+    let token = AGENT_RUN_NEXT_ID.with(|c| {
+        let id = c.get();
+        c.set(id + 1);
+        id
+    });
+    AGENT_RUNS.with(|r| r.borrow_mut().insert(token, state));
+    Ok(Value::int(token as i64))
+}
+
+/// Apply one provider round's response to the loop state and return the driver's
+/// `{:done bool :has-tools bool}` map. Runs on the VM thread (either the poller after
+/// an async round, or inline for the synchronous fallback). Short-borrows the slab.
+fn agent_apply_step_response(token: u64, resp: ChatResponse) -> Result<Value, SemaError> {
+    AGENT_RUNS.with(|r| {
+        let mut slab = r.borrow_mut();
+        let st = slab
+            .get_mut(&token)
+            .ok_or_else(|| SemaError::Llm("agent-run handle not found".to_string()))?;
+        st.last_content = resp.content.clone();
+        let has_tools = !resp.tool_calls.is_empty();
+        if has_tools {
+            // Echo the assistant turn carrying tool_calls BEFORE the tool results, so
+            // every provider can correlate them (OpenAI rejects orphan tool results).
+            st.messages.push(ChatMessage::assistant_with_tool_calls(
+                resp.content.clone(),
+                resp.tool_calls.clone(),
+            ));
+            st.pending_tool_calls = resp.tool_calls;
+            st.round += 1;
+            // Round cap: stop without executing this round's tools (the final assistant
+            // is appended in `__agent-finish`).
+            if st.round >= st.max_rounds {
+                st.done = true;
+            }
+        } else {
+            // No tool calls → final turn; `__agent-finish` appends the plain assistant.
+            st.done = true;
+        }
+        let mut map = BTreeMap::new();
+        map.insert(Value::keyword("done"), Value::bool(st.done));
+        map.insert(Value::keyword("has-tools"), Value::bool(has_tools));
+        Ok(Value::map(map))
+    })
+}
+
+/// `__agent-step(token) → {:done bool :has-tools bool}`. One provider round: in async
+/// context it offloads + yields `AwaitIo` (the map is produced by the poller via the
+/// finalize closure and becomes the resolved value of the yield); otherwise it runs
+/// `do_complete` synchronously. If the loop is already done (round cap or consec-error
+/// abort set by `__agent-exec-tools`), returns immediately without a provider call.
+fn agent_step(token: u64) -> Result<Value, SemaError> {
+    // A resumed AwaitIo yield lands here NOT re-invoked (the scheduler resumes the
+    // bytecode after the CALL); but drain any stray resume value defensively, as the
+    // other yielding natives do.
+    if let Some(v) = sema_core::take_resume_value() {
+        return Ok(v);
+    }
+
+    // Short-borrow: bail out if the loop is already done (round cap / consec-error
+    // abort), else build the request + snapshot on_text; then drop the borrow.
+    enum StepPrep {
+        Done,
+        Run(Box<ChatRequest>, Option<Value>),
+    }
+    let prep = AGENT_RUNS.with(|r| {
+        let slab = r.borrow();
+        let st = slab
+            .get(&token)
+            .ok_or_else(|| SemaError::Llm("agent-run handle not found".to_string()))?;
+        if st.done {
+            return Ok(StepPrep::Done);
+        }
+        let mut request = ChatRequest::new(st.model.clone(), st.messages.clone());
+        request.max_tokens = st.max_tokens.or(Some(4096));
+        request.temperature = st.temperature;
+        request.system = st.system.clone();
+        request.reasoning_effort = st.reasoning_effort.clone();
+        request.tools = st.tool_schemas.clone();
+        Ok::<_, SemaError>(StepPrep::Run(Box::new(request), st.on_text.clone()))
+    })?;
+
+    let (request, on_text) = match prep {
+        StepPrep::Done => {
+            let mut map = BTreeMap::new();
+            map.insert(Value::keyword("done"), Value::bool(true));
+            map.insert(Value::keyword("has-tools"), Value::bool(false));
+            return Ok(Value::map(map));
+        }
+        StepPrep::Run(req, on_text) => (*req, on_text),
+    };
+
+    // Streaming rounds (`:on-text`) and non-async context both run synchronously on
+    // the VM thread. Only the plain async path offloads + yields.
+    #[cfg(not(target_arch = "wasm32"))]
+    if on_text.is_none() && sema_core::in_async_context() {
+        return do_complete_async_yield(
+            request,
+            Box::new(move |resp| agent_apply_step_response(token, resp)),
+        );
+    }
+
+    // Synchronous fallback: on-text streaming needs the caller's ctx, which this
+    // native does not thread; on-text is validated synchronous-only elsewhere, but if
+    // it ever reaches here without a ctx we fall back to a plain completion.
+    let response = do_complete(request)?;
+    track_usage(&response.usage)?;
+    agent_apply_step_response(token, response)
+}
+
+/// `__agent-exec-tools(token) → nil`. Runs the pending tool calls in ordinary async
+/// task context (so yielding/async tools suspend correctly), pushing correlated
+/// tool-result messages. Never holds the slab borrow across a callback / tool call.
+fn agent_exec_tools(ctx: &EvalContext, token: u64) -> Result<Value, SemaError> {
+    // Short-borrow: copy out the pending calls + tool set + callback, then drop.
+    let (pending, tools, on_tool_call): (Vec<ToolCall>, Vec<Value>, Option<Value>) =
+        AGENT_RUNS.with(|r| {
+            let mut slab = r.borrow_mut();
+            let st = slab
+                .get_mut(&token)
+                .ok_or_else(|| SemaError::Llm("agent-run handle not found".to_string()))?;
+            let pending = std::mem::take(&mut st.pending_tool_calls);
+            Ok::<_, SemaError>((pending, st.tools.clone(), st.on_tool_call.clone()))
+        })?;
+
+    for tc in &pending {
+        let args_value = sema_core::json_to_value(&tc.arguments);
+
+        if let Some(callback) = on_tool_call.as_ref() {
+            let mut event_map = BTreeMap::new();
+            event_map.insert(Value::keyword("event"), Value::string("start"));
+            event_map.insert(Value::keyword("tool"), Value::string(&tc.name));
+            event_map.insert(Value::keyword("args"), args_value.clone());
+            let _ = sema_core::call_callback(ctx, callback, &[Value::map(event_map)]);
+        }
+
+        let start_time = std::time::Instant::now();
+        let tool_desc = tools.iter().find_map(|t| {
+            let td = t.as_tool_def_rc()?;
+            (td.name == tc.name).then(|| td.description.clone())
+        });
+        let tspan = sema_otel::tool_span(&tc.name, &tc.id, tool_desc.as_deref());
+        let (result, is_error) = match execute_tool_call(ctx, &tools, &tc.name, &tc.arguments) {
+            Ok(r) => (r, false),
+            Err(e) => (format!("Error: {e}"), true),
+        };
+        if is_error {
+            tspan.record_error("tool_error", &result);
+        }
+        if sema_otel::content_capture_enabled() {
+            let args_json = serde_json::to_string(&tc.arguments).unwrap_or_default();
+            tspan.set_tool_io(&args_json, &result);
+        }
+        drop(tspan);
+        let duration_ms = start_time.elapsed().as_millis() as i64;
+
+        if let Some(callback) = on_tool_call.as_ref() {
+            let mut event_map = BTreeMap::new();
+            event_map.insert(Value::keyword("event"), Value::string("end"));
+            event_map.insert(Value::keyword("tool"), Value::string(&tc.name));
+            event_map.insert(Value::keyword("args"), args_value);
+            let result_preview = if result.len() > 200 {
+                format!("{}...", sema_core::truncate_chars(&result, 200))
+            } else {
+                result.clone()
+            };
+            event_map.insert(Value::keyword("result"), Value::string(&result_preview));
+            event_map.insert(Value::keyword("error"), Value::bool(is_error));
+            event_map.insert(Value::keyword("duration-ms"), Value::int(duration_ms));
+            let _ = sema_core::call_callback(ctx, callback, &[Value::map(event_map)]);
+        }
+
+        // Re-borrow to push the correlated result + update the error counter.
+        AGENT_RUNS.with(|r| {
+            let mut slab = r.borrow_mut();
+            let st = match slab.get_mut(&token) {
+                Some(st) => st,
+                None => return,
+            };
+            st.messages
+                .push(ChatMessage::tool_result(tc.id.clone(), tc.name.clone(), result));
+            if is_error {
+                st.consecutive_errors += 1;
+                if st.consecutive_errors >= MAX_CONSECUTIVE_TOOL_ERRORS {
+                    // Stop the loop; `__agent-finish` raises the abort so the caller
+                    // sees the same failure the blocking path returns via `?`.
+                    st.done = true;
+                    st.abort_error = Some(format!(
+                        "aborting agent run after {} consecutive tool errors",
+                        st.consecutive_errors
+                    ));
+                }
+            } else {
+                st.consecutive_errors = 0;
+            }
+        });
+    }
+
+    Ok(Value::nil())
+}
+
+/// `__agent-finish(token) → result`. Idempotent: appends the final assistant turn,
+/// records trace I/O, ends the agent span, writes back to memory, and builds the
+/// return value (`{:response :messages :session}` map with opts, else the string).
+fn agent_finish(token: u64) -> Result<Value, SemaError> {
+    // Take the state OUT of the slab so the span/scope guards drop (balanced pop+end,
+    // agent-task otel installed) once we're done building the result.
+    let mut st = match AGENT_RUNS.with(|r| r.borrow_mut().remove(&token)) {
+        Some(st) => st,
+        // Already finished (idempotent) — the driver's normal exit and the Sema catch
+        // may both call finish.
+        None => return Ok(Value::nil()),
+    };
+
+    // Append the final assistant message (mirrors run_tool_loop's terminal push).
+    if !st.final_pushed && !st.last_content.is_empty() {
+        st.messages
+            .push(ChatMessage::new("assistant", st.last_content.clone()));
+        st.final_pushed = true;
+    }
+    if let Some(span) = st.agent_span.as_ref() {
+        span.set_trace_io(&st.first_input, &st.last_content);
+    }
+
+    // Memory writeback: append new turns (from pre_user_count) into the memory thread.
+    if let Some(ref h) = st.memory_handle {
+        let new_turns = if st.messages.len() > st.pre_user_count {
+            &st.messages[st.pre_user_count..]
+        } else {
+            &[]
+        };
+        MEMORY_CALLBACKS.with(|c| {
+            if let Some(ref cbs) = *c.borrow() {
+                let _ = (cbs.append_back)(h, new_turns);
+            }
+        });
+    }
+
+    // A consecutive-tool-error abort surfaces as an error (matching the blocking path).
+    if let Some(msg) = st.abort_error.take() {
+        if let Some(span) = st.agent_span.as_ref() {
+            span.record_error("tool_error", &msg);
+        }
+        // `st` drops here → agent span ends, conv scope restored.
+        return Err(SemaError::Llm(msg));
+    }
+
+    let result = st.last_content.clone();
+    if st.has_opts {
+        let mut meta = std::collections::BTreeMap::new();
+        meta.insert("conversation-id".to_string(), st.output_conv_id.clone());
+        let session_conv = Conversation {
+            messages: st
+                .messages
+                .iter()
+                .map(|m| Message {
+                    role: match m.role.as_str() {
+                        "assistant" => Role::Assistant,
+                        _ => Role::User,
+                    },
+                    content: m.content.to_text(),
+                    images: Vec::new(),
+                })
+                .collect(),
+            model: st.agent_model.clone(),
+            metadata: meta,
+        };
+        let mut map = BTreeMap::new();
+        map.insert(Value::keyword("response"), Value::string(&result));
+        map.insert(
+            Value::keyword("messages"),
+            chat_messages_to_sema_list(&st.messages),
+        );
+        map.insert(Value::keyword("session"), Value::conversation(session_conv));
+        Ok(Value::map(map))
+    } else {
+        Ok(Value::string(&result))
+    }
+    // `st` drops at the end of scope → agent span ends (balanced), conv scope restored.
+}
+
 fn run_tool_loop(
     ctx: &EvalContext,
     initial_messages: Vec<ChatMessage>,
