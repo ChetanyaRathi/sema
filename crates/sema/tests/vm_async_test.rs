@@ -861,6 +861,24 @@ fn async_all_rejects_on_any_failure() {
     );
 }
 
+// ASYNC-3 companion: an async/all rejection short-circuit cancels the pending
+// siblings — but the surfaced error must name the REJECTION (the cause), not a
+// cancelled sibling (a consequence). A cancelled sibling earlier in list order must
+// not mask the real failure reason.
+#[test]
+fn async_all_reports_rejection_over_cancelled_sibling() {
+    let err = eval_vm_err(
+        r#"
+        (async/all (list (async (async/sleep 1000) :slow)
+                         (async (error "boom"))))
+        "#,
+    );
+    assert!(
+        err.contains("boom"),
+        "async/all should surface the rejection cause, not a cancelled sibling; got: {err}"
+    );
+}
+
 #[test]
 fn async_all_empty_list() {
     assert_eq!(eval("(async/all (list))"), Value::list(vec![]));
