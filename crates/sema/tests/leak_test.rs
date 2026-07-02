@@ -169,17 +169,13 @@ fn interpreter_teardown_frees_global_env() {
     );
 }
 
-/// CORE-2 oracle, builtin-delegate shape: even with NO user code the global
-/// env leaks, because `register_vm_delegates` (and the deftool/defagent
-/// registrars) install `NativeFn`s whose boxed `Fn` strongly captures the very
-/// `Rc<Env>` they are registered into (`crates/sema-eval/src/eval.rs:558` and
-/// ~10 siblings) — `Env → binding → NativeFn → Box<dyn Fn> capture → Env`.
-/// Measured ~166 KB leaked per Interpreter drop. Unlike the closure shapes,
-/// these captures hide inside an opaque `Box<dyn Fn>` a collector cannot
-/// trace; the fix is to make delegate captures weak (or payload-traced), after
-/// which this test goes green independently of the cycle collector.
+/// CORE-2 M1 gate, builtin-delegate shape: the `register_vm_delegates` (and
+/// deftool/defagent) natives capture the env they are registered into as
+/// `Weak<Env>` (invariant I2), so no `Env → binding → NativeFn → Box<dyn Fn>
+/// → Env` cycle exists, and `Interpreter::drop` releases the thread-local
+/// scheduler's `Rc<Env>` clone. A define-free Interpreter therefore tears
+/// down cleanly under plain `Rc` drop — no collector involved.
 #[test]
-#[ignore = "CORE-2 acceptance oracle: fails until delegate env-captures are made traceable/weak (docs/plans/2026-07-02-core2-gc.md)"]
 fn interpreter_teardown_without_defines_is_bounded() {
     let grown = interpreter_teardown_growth(None);
     let per_drop = grown / TEARDOWN_ITERS as isize;

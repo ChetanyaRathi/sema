@@ -421,6 +421,22 @@ pub fn reset_scheduler_tasks() {
     });
 }
 
+/// Drop the thread-local scheduler if it belongs to `globals` — called from
+/// `Interpreter::drop` so a dead interpreter's global env (and any leftover
+/// task VMs holding `Rc<Env>` clones) is not pinned until thread exit. The
+/// `ptr_eq` guard is load-bearing: many interpreters can live on one thread
+/// (test suites, embedders), and dropping interpreter A must not clobber a
+/// live interpreter B's scheduler (mirrors the reuse branch in
+/// `init_scheduler`). No-op when the slot is empty or owned by another env.
+pub fn shutdown_scheduler(globals: &Rc<Env>) {
+    SCHEDULER.with(|s| {
+        let mut slot = s.borrow_mut();
+        if matches!(slot.as_ref(), Some(sched) if Rc::ptr_eq(&sched.globals, globals)) {
+            *slot = None;
+        }
+    });
+}
+
 /// Run `f` against the per-task VM of the task currently paused at a cooperative
 /// breakpoint, if any. Returns `None` when no task is paused (or it can no longer
 /// be found — e.g. it already resumed/completed), in which case the caller should
