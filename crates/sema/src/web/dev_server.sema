@@ -12,6 +12,14 @@
 (define runtime-dir (:runtimeDir config))
 (define app-dir (:appDir config))
 
+;; Watch the app dir; each poll drains pending events and, if any fired, bumps a
+;; generation the browser diffs against to trigger a reload. fs/watch emits
+;; several events per save, but coalescing them into one bump per poll debounces.
+;; The generation also cache-busts the app-source URL (:static sends a 1h
+;; cache-control), so a full reload fetches the changed source instead of a copy.
+(define watcher (fs/watch app-dir))
+(define generation 0)
+
 ;; The synthesized page. An <script type="importmap"> resolves the bare
 ;; @sema-lang/* specifiers to the runtime we serve under /__sema; the app's
 ;; source loads via <script type="text/sema" src="/app/...">; SemaWeb.init()
@@ -34,7 +42,7 @@
     "  }\n}\n"
     "</script>\n</head>\n<body>\n"
     "<div id=\"app\"></div>\n"
-    "<script type=\"text/sema\" src=\"/app/" entry "\"></script>\n"
+    "<script type=\"text/sema\" src=\"/app/" entry "?g=" (number->string generation) "\"></script>\n"
     "<script type=\"module\">\n"
     "  import { SemaWeb } from \"@sema-lang/sema-web\";\n"
     "  try {\n"
@@ -45,17 +53,33 @@
     "    console.error(e);\n"
     "  }\n"
     "</script>\n"
+    ;; Hot reload: short-poll /__dev/poll (each returns instantly, so it never
+    ;; blocks the sequential server) and full-reload when the generation bumps.
+    "<script>\n"
+    "(function(){var g=null;function p(){"
+    "fetch('/__dev/poll').then(function(r){return r.ok?r.json():null;})"
+    ".then(function(d){if(d){if(g===null){g=d.generation;}"
+    "else if(d.generation!==g){location.reload();return;}}setTimeout(p,300);})"
+    ".catch(function(){setTimeout(p,600);});}p();})();\n"
+    "</script>\n"
     "</body>\n</html>\n"))
 
 (define (handle-index req)
   (http/html (shell-html)))
 
-;; /__sema/*  → embedded runtime (WASM + JS bundle), served with real MIME types.
-;; /app/*     → the app's source directory (raw .sema + any assets).
+(define (handle-poll req)
+  (when (> (length (fs/watch-events watcher)) 0)
+    (set! generation (+ generation 1)))
+  (http/ok {:generation generation}))
+
+;; /__sema/*    → embedded runtime (WASM + JS bundle), served with real MIME types.
+;; /app/*       → the app's source directory (raw .sema + any assets).
+;; /__dev/poll  → hot-reload generation (instant response; never blocks).
 (define routes
-  [[:get    "/"       handle-index]
-   [:static "/__sema" runtime-dir]
-   [:static "/app"    app-dir]])
+  [[:get    "/"           handle-index]
+   [:get    "/__dev/poll" handle-poll]
+   [:static "/__sema"     runtime-dir]
+   [:static "/app"        app-dir]])
 
 (define (announce info)
   (println "")

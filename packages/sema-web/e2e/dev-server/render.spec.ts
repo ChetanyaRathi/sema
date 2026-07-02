@@ -44,3 +44,23 @@ test("renders and runs the app in the browser", async ({ page }) => {
   await page.getByRole("button", { name: "+" }).click();
   await expect(page.locator("#app")).toContainText("1");
 });
+
+test("hot-reloads the browser when the app source changes", async ({ page }) => {
+  await page.goto(`http://127.0.0.1:${PORT}/`);
+  await page.waitForFunction(() => (window as any).__semaInitialized === true, null, {
+    timeout: 20_000,
+  });
+  await expect(page.getByRole("heading", { name: "Sema Counter" })).toBeVisible();
+
+  // Edit the served source; the dev server's watcher + poll loop should trigger
+  // a full reload that fetches the (cache-busted) new source.
+  const appPath = path.join(tmpDir, "app.sema");
+  const edited = fs
+    .readFileSync(appPath, "utf8")
+    .replace("Sema Counter", "Reloaded Heading");
+  fs.writeFileSync(appPath, edited);
+
+  await expect(page.getByRole("heading", { name: "Reloaded Heading" })).toBeVisible({
+    timeout: 15_000,
+  });
+});
