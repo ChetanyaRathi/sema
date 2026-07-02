@@ -77,22 +77,33 @@ The model is proven for **single-shot, offloaded leaves**. The open frontier is
 native** — the archetype is `agent/run`, but the shape is general (any native
 that loops over multiple offloadable steps holding state across them).
 
-### 3a. Non-blocking multi-round operations (the "lift the loop" problem)
+### 3a. Non-blocking multi-round `agent/run` — SHIPPED (ADR #68)
 
-`agent/run` drives `run_tool_loop`, a Rust `for` over rounds; each round's
-completion blocks the VM thread, and the loop can't suspend mid-`for`. Two
-mechanisms, not mutually exclusive:
+**Done** (`docs/plans/2026-07-02-nonblocking-agent-run.md`, ADR #68). In an async
+scheduler task, `agent/run` (and `llm/chat`-with-tools) now yields `AwaitIo` per
+provider round, so siblings overlap during the conversation and `async/timeout`
+cuts the loop at an inter-round park. The sync/top-level and `wasm32` paths keep the
+byte-identical blocking `run_tool_loop` (renamed `__agent-run-blocking`).
+
+The "yield-internally in one native" sketch below was **rejected during design**: a
+native cannot loop-yield (a yielded `AwaitIo` is not re-invoked, and a poller cannot
+arm a second yield or run async tools). The shipped design is the **step
+decomposition** — a thin Sema/prelude driver (`__agent-drive`) over four internal
+natives (`__agent-begin/step/exec-tools/finish`) backed by a Rust-owned, task-scoped
+`AgentRunState` slab; each round reuses `do_complete_async_yield`; tools run in
+ordinary task context; the agent OTel span is kept attached on the per-task otel
+stack (carried by the existing `ReinstallGuard` swap, ended idempotently, including a
+`tls_alive`-guarded `Drop` for the cancelled-run leak). Verified by
+`crates/sema/tests/agent_async_test.rs` + `agent_async_breaker_test.rs`.
+
+Original two-mechanism framing (kept for the record):
 
 - **Yield-internally:** convert the native's round loop to offload each step via
-  `do_complete_async_yield`, so the *native* parks on `AwaitIo` between rounds
-  while keeping its RAII state (agent OTel span, usage, error handling, round
-  counters) inside the one Rust frame. Preferred where the state is awkward to
-  hand to Sema (the agent span is an RAII guard that can't span separate native
-  calls). Siblings run during each park.
-- **Decompose to a step primitive:** expose a non-blocking `agent/step` (one
-  offloaded round → returns tool calls or final text) and drive the loop in Sema.
-  More flexible (Sema owns history/cancel), but moves tool execution to the Sema
-  layer and must preserve the invariants below.
+  `do_complete_async_yield`, keeping RAII state inside one Rust frame. *Rejected — a
+  native cannot loop-yield.*
+- **Decompose to a step primitive** (SHIPPED): a non-blocking step native, loop in
+  Sema. More flexible (Sema owns history/cancel); tool execution moves to the task
+  layer; the invariants below are preserved in the Rust-owned handle.
 
 **Invariants either mechanism must keep** (learned the hard way):
 - `track_usage` fires exactly once per round, in the poller/finalize, so the
@@ -150,10 +161,10 @@ path for animation (which needs only `async/spawn` + `async/sleep`).
 
 ## 5. Roadmap (folds the sub-plans' open items)
 
-- **M1 — non-blocking `agent/run`:** yield-internally per round via
-  `do_complete_async_yield`; tools inline on the VM thread; keep span/usage/error
-  in the one native. (Absorbs the parent plan's deferred "multi-round agent" +
-  §8.5 multi-span carry.)
+- **M1 — non-blocking `agent/run`: SHIPPED (ADR #68).** Delivered via step
+  decomposition (Sema driver + `__agent-begin/step/exec-tools/finish` over a
+  Rust-owned handle), not the yield-internally sketch (which is impossible — a
+  native cannot loop-yield). See §3a and `docs/plans/2026-07-02-nonblocking-agent-run.md`.
 - **M2 — async input:** `io/read-key-async` (offload+yield) or the sub-frame
   input-task pattern; quantify residual per-poll block.
 - **M3 — cancellation completeness:** race a spawned turn against interrupt; wire
