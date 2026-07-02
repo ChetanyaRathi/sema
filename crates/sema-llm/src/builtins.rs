@@ -2854,9 +2854,9 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
         Ok(Value::bool(sema_core::in_async_context()))
     });
     register_fn_ctx(env, "__agent-begin", |_ctx, args| agent_begin(args));
-    register_fn_ctx(env, "__agent-step", |_ctx, args| {
+    register_fn_ctx(env, "__agent-step", |ctx, args| {
         let token = agent_token_arg(args, "__agent-step")?;
-        agent_step(token)
+        agent_step(ctx, token)
     });
     register_fn_ctx(env, "__agent-exec-tools", |ctx, args| {
         let token = agent_token_arg(args, "__agent-exec-tools")?;
@@ -7200,8 +7200,6 @@ fn chat_messages_to_sema_list(messages: &[ChatMessage]) -> Value {
     Value::list(items)
 }
 
-/// The tool execution loop: send -> check for tool_calls -> execute -> send results -> repeat.
-#[allow(clippy::too_many_arguments)]
 /// Bound runaway error loops across the agent conversation (mirrors `run_tool_loop`).
 const MAX_CONSECUTIVE_TOOL_ERRORS: usize = 5;
 
@@ -7508,7 +7506,7 @@ fn agent_apply_step_response(token: u64, resp: ChatResponse) -> Result<Value, Se
 /// finalize closure and becomes the resolved value of the yield); otherwise it runs
 /// `do_complete` synchronously. If the loop is already done (round cap or consec-error
 /// abort set by `__agent-exec-tools`), returns immediately without a provider call.
-fn agent_step(token: u64) -> Result<Value, SemaError> {
+fn agent_step(ctx: &EvalContext, token: u64) -> Result<Value, SemaError> {
     // A resumed AwaitIo yield lands here NOT re-invoked (the scheduler resumes the
     // bytecode after the CALL); but drain any stray resume value defensively, as the
     // other yielding natives do.
@@ -7559,10 +7557,14 @@ fn agent_step(token: u64) -> Result<Value, SemaError> {
         );
     }
 
-    // Synchronous fallback: on-text streaming needs the caller's ctx, which this
-    // native does not thread; on-text is validated synchronous-only elsewhere, but if
-    // it ever reaches here without a ctx we fall back to a plain completion.
-    let response = do_complete(request)?;
+    // Synchronous round: an `:on-text` streaming round drives the SSE stream inline on
+    // the VM thread (it does not yield — documented sibling-blocking limit); a plain
+    // round in non-async context is the ordinary blocking completion. Either way the
+    // usage is accounted once and the state updated inline.
+    let response = match on_text.as_ref() {
+        Some(cb) => do_complete_streaming(ctx, request, cb)?,
+        None => do_complete(request)?,
+    };
     track_usage(&response.usage)?;
     agent_apply_step_response(token, response)
 }
@@ -7738,6 +7740,8 @@ fn agent_finish(token: u64) -> Result<Value, SemaError> {
     // `st` drops at the end of scope → agent span ends (balanced), conv scope restored.
 }
 
+/// The tool execution loop: send -> check for tool_calls -> execute -> send results -> repeat.
+#[allow(clippy::too_many_arguments)]
 fn run_tool_loop(
     ctx: &EvalContext,
     initial_messages: Vec<ChatMessage>,
