@@ -50,7 +50,12 @@
 - Avoids `Arc<Mutex>` complexity since the Lisp is single-threaded
 - Provider auto-configures from env vars (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`)
 
-### 8. tokio runtime per provider
+### 8. tokio runtime per provider — SUPERSEDED (by #68 / the cooperative scheduler)
+
+> **Superseded.** The per-provider runtime + `block_on` sync facade is what froze
+> the cooperative scheduler during I/O. Blocking natives (`http/*`, `shell`,
+> `llm/*`) now offload onto a single shared runtime and yield `AwaitIo`, and the
+> multi-round agent loop yields per round (ADR #68). Kept below for the record.
 
 - Each provider creates its own `tokio::runtime::Runtime`
 - Uses `block_on` to present a sync interface
@@ -740,5 +745,52 @@ The bytecode lowerer is scope-free — it resolves a special form from a call's 
 **Alternatives considered:**
 - *Full scope-aware lowering* (the Scheme/hygienic model: a local binding shadows the special form everywhere, including operator position). Rejected: lowering is deliberately scope-free; threading lexical scope through all 35 special-form handlers + resolution is a large, regression-prone change for a payoff (rebinding `if` as a local) that is an anti-pattern anyway.
 - *Document-only, no enforcement.* Rejected: leaves the silently-wrong-result trap in place.
+
+### 68. Non-blocking multi-round `agent/run` — a Sema-driven step loop (supersedes #8)
+
+Full design + plan: `docs/plans/2026-07-02-nonblocking-agent-run.md`. Closes the
+last blocking frontier of issue #61 §3a: `agent/run` and `llm/chat`-with-tools drove
+`run_tool_loop`, a blocking `for` over rounds calling the synchronous `do_complete`,
+so a whole multi-round conversation froze every sibling scheduler task and could not
+be cancelled mid-flight — even though a single `llm/complete` already yields.
+
+**Decision:** decompose the tool loop. A **native cannot loop-yield** (a yielded
+`AwaitIo` is not re-invoked; a poller cannot arm a second yield; and tools cannot run
+inside a poller because the scheduler is out of its thread-local during
+`wake_blocked_tasks`, so an async tool would hard-error or degrade to blocking). So
+the round loop moves to **bytecode**: a thin Sema/prelude driver calls four internal
+natives — `__agent-begin` / `__agent-step` (one offloaded round → `AwaitIo` yield,
+reusing `do_complete_async_yield`) / `__agent-exec-tools` (tools run in ordinary task
+context, so async/sub-agent tools suspend correctly) / `__agent-finish` — over a
+Rust-owned opaque `AgentRun` handle (`Rc<RefCell<AgentRunState>>`, task-id-stamped)
+that owns messages/correlation, counters, and the agent OTel span. Siblings run
+during every inter-round park; `async/timeout` cancels cleanly at the parks.
+
+**Key invariants (adversarially reviewed):**
+- The agent span is **attached** on the per-task otel stack and carried across parks
+  by the existing `ReinstallGuard` swap; `__agent-finish` ends it **balanced** and
+  **idempotently** (also on `Drop`, since a cancelled task never runs a Sema
+  `finally`). No blind off-stack span drop (which `SpanCore::drop` would mis-pop).
+- The **blocking `run_tool_loop` is kept byte-identical** for the synchronous
+  (top-level) and `wasm32` paths; the new driver is additive, gated on
+  `in_async_context()`.
+- Per-round accounting (track_usage-once, cache/cassette, per-leaf usage,
+  serving-provider) is inherited unchanged from `do_complete_async_yield`.
+- No native holds a `borrow_mut` across a callback / tool execution / inline-task
+  spin (copy owned inputs out first).
+
+**Honest limits:** `:on-text` streaming rounds and synchronous CPU-bound tools
+between rounds block siblings (documented); the `spawn_blocking` LLM tier has no
+`AbortHandle`, so a cancelled agent's in-flight round completes on the worker and is
+discarded (best-effort). Per-task budget-across-yield under concurrent spawned agents
+is a pre-existing single-completion ASYNC-1 gap, closed separately (plan Step 7).
+
+**Alternatives considered:**
+- *Poller-chained (loop entirely in one native's poller).* Rejected: memory-safe but
+  a functional dead-end — a poller cannot arm a second yield, and an async tool run
+  from a poller hard-errors "async yield outside of scheduler context".
+- *Reimplement the whole loop in Sema.* Rejected: would re-derive the battle-tested
+  correlation/usage/error invariants (CHANGELOG 1.21.x) in Sema and drift. The handle
+  keeps them in Rust; only trivial loop control is in Sema.
 
 This lands on the **Common Lisp / Clojure** model (special operators are reserved in operator position; their value namespace is irrelevant here since Sema is a Lisp-1), not Scheme's. Regular non-special-form names — including builtin *functions* like `list`/`map`/`filter` — still shadow freely. See `docs/limitations.md` #36; regression tests `reserved_*` / `shadow_builtin_*` in `eval_test.rs`.
