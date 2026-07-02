@@ -1,3 +1,5 @@
+use std::rc::Rc;
+
 use sema_core::{
     intern, resolve, Agent, Env, EvalContext, Record, SemaError, Spur, ToolDefinition, Value,
 };
