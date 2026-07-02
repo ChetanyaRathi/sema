@@ -193,33 +193,57 @@ function destroyMountedComponent(selector: string, component: MountedComponent, 
   }
 
   for (const listenerKey of component.ownedListenerKeys) {
-    cleanupListener(ctx, listenerKey);
+    try {
+      cleanupListener(ctx, listenerKey);
+    } catch (e) {
+      ctx.onerror(e instanceof Error ? e : new Error(String(e)), `component-listener-cleanup:${component.componentFn}`);
+    }
   }
   component.ownedListenerKeys.clear();
 
   for (const signalId of component.ownedSignalIds) {
-    disposeSignal(ctx, signalId);
+    try {
+      disposeSignal(ctx, signalId);
+    } catch (e) {
+      ctx.onerror(e instanceof Error ? e : new Error(String(e)), `component-signal-cleanup:${component.componentFn}`);
+    }
   }
   component.ownedSignalIds.clear();
 
   for (const watchId of component.ownedWatchIds) {
-    cleanupWatch(ctx, watchId);
+    try {
+      cleanupWatch(ctx, watchId);
+    } catch (e) {
+      ctx.onerror(e instanceof Error ? e : new Error(String(e)), `component-watch-cleanup:${component.componentFn}`);
+    }
   }
   component.ownedWatchIds.clear();
 
   for (const intervalId of component.ownedIntervalIds) {
-    cleanupInterval(ctx, intervalId);
+    try {
+      cleanupInterval(ctx, intervalId);
+    } catch (e) {
+      ctx.onerror(e instanceof Error ? e : new Error(String(e)), `component-interval-cleanup:${component.componentFn}`);
+    }
   }
   component.ownedIntervalIds.clear();
 
   for (const signalId of component.ownedStreamIds) {
-    cleanupStream(ctx, signalId);
-    disposeSignal(ctx, signalId);
+    try {
+      cleanupStream(ctx, signalId);
+      disposeSignal(ctx, signalId);
+    } catch (e) {
+      ctx.onerror(e instanceof Error ? e : new Error(String(e)), `component-stream-cleanup:${component.componentFn}`);
+    }
   }
   component.ownedStreamIds.clear();
 
   for (const signalId of component.localState.values()) {
-    disposeSignal(ctx, signalId);
+    try {
+      disposeSignal(ctx, signalId);
+    } catch (e) {
+      ctx.onerror(e instanceof Error ? e : new Error(String(e)), `component-local-state-cleanup:${component.componentFn}`);
+    }
   }
   component.localState.clear();
 
@@ -525,6 +549,10 @@ export function registerComponentBindings(interp: SemaInterpreterLike, ctx: Sema
 
 export function disposeAllComponents(ctx: SemaWebContext): void {
   for (const [selector, component] of Array.from(ctx.mountedComponents.entries())) {
-    destroyMountedComponent(selector, component, ctx);
+    try {
+      destroyMountedComponent(selector, component, ctx);
+    } catch (e) {
+      ctx.onerror(e instanceof Error ? e : new Error(String(e)), `component-dispose-all:${component.componentFn}`);
+    }
   }
 }

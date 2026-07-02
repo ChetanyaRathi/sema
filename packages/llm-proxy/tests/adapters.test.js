@@ -157,6 +157,111 @@ test("preflight reflects requested custom headers", async () => {
   );
 });
 
+// --- Cloudflare / Netlify adapter parity ---
+//
+// Cloudflare and Netlify both wrap the same `createHandler` core and the same
+// `readRequestTextWithLimit` / `buildBodyTooLargeResponse` / `getMaxBodySize`
+// helpers from body.ts as Vercel (see src/adapters/{vercel,cloudflare,netlify}.ts —
+// the request-parsing bodies are effectively identical). These tests mirror the
+// three Vercel-only cases above to confirm that shared logic actually behaves
+// the same across adapters.
+
+test("Cloudflare adapter returns a structured 400 for invalid JSON", async () => {
+  const worker = createCloudflareHandler({ provider: "openai", apiKey: "test-key" });
+  const response = await worker.fetch(new Request("https://example.com/api/llm/chat", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: "{",
+  }));
+
+  assert.equal(response.status, 400);
+  assert.deepEqual(await response.json(), {
+    error: "Invalid JSON body",
+    code: "INVALID_REQUEST",
+  });
+});
+
+test("Cloudflare adapter rejects oversized request bodies before JSON parsing", async () => {
+  const worker = createCloudflareHandler({
+    provider: "openai",
+    apiKey: "test-key",
+    maxBodySize: 10,
+  });
+
+  const response = await worker.fetch(new Request("https://example.com/api/llm/chat", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ messages: [{ role: "user", content: "hello world" }] }),
+  }));
+
+  assert.equal(response.status, 413);
+  assert.equal((await response.json()).code, "BODY_TOO_LARGE");
+});
+
+test("Cloudflare adapter preflight reflects requested custom headers", async () => {
+  const worker = createCloudflareHandler({ provider: "openai", apiKey: "test-key" });
+  const response = await worker.fetch(new Request("https://example.com/api/llm/chat", {
+    method: "OPTIONS",
+    headers: {
+      "Access-Control-Request-Headers": "x-session-id, x-trace-id",
+    },
+  }));
+
+  assert.equal(response.status, 204);
+  assert.equal(
+    response.headers.get("access-control-allow-headers"),
+    "Content-Type, Authorization, x-session-id, x-trace-id",
+  );
+});
+
+test("Netlify adapter returns a structured 400 for invalid JSON", async () => {
+  const handler = createNetlifyHandler({ provider: "openai", apiKey: "test-key" });
+  const response = await handler(new Request("https://example.com/api/llm/chat", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: "{",
+  }));
+
+  assert.equal(response.status, 400);
+  assert.deepEqual(await response.json(), {
+    error: "Invalid JSON body",
+    code: "INVALID_REQUEST",
+  });
+});
+
+test("Netlify adapter rejects oversized request bodies before JSON parsing", async () => {
+  const handler = createNetlifyHandler({
+    provider: "openai",
+    apiKey: "test-key",
+    maxBodySize: 10,
+  });
+
+  const response = await handler(new Request("https://example.com/api/llm/chat", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ messages: [{ role: "user", content: "hello world" }] }),
+  }));
+
+  assert.equal(response.status, 413);
+  assert.equal((await response.json()).code, "BODY_TOO_LARGE");
+});
+
+test("Netlify adapter preflight reflects requested custom headers", async () => {
+  const handler = createNetlifyHandler({ provider: "openai", apiKey: "test-key" });
+  const response = await handler(new Request("https://example.com/api/llm/chat", {
+    method: "OPTIONS",
+    headers: {
+      "Access-Control-Request-Headers": "x-session-id, x-trace-id",
+    },
+  }));
+
+  assert.equal(response.status, 204);
+  assert.equal(
+    response.headers.get("access-control-allow-headers"),
+    "Content-Type, Authorization, x-session-id, x-trace-id",
+  );
+});
+
 test("Node adapter does not trust forwarded IP headers by default", async () => {
   const handler = createNodeHandler({
     provider: "openai",
