@@ -30,6 +30,20 @@ const SVG_NS = "http://www.w3.org/2000/svg";
 const MATHML_NS = "http://www.w3.org/1998/Math/MathML";
 
 /**
+ * Namespace URIs for the reserved XML attribute prefixes SIP recognizes.
+ * `setAttribute("xlink:href", ...)` sets an attribute literally *named*
+ * "xlink:href" without registering it in the XLink namespace — most
+ * browsers resolve it anyway for rendering, but `getAttributeNS` (and
+ * strict SVG processors) will not see it. `setAttributeNS` is the correct,
+ * spec-compliant way to set these.
+ */
+const NS_ATTR_PREFIXES: Record<string, string> = {
+  xlink: "http://www.w3.org/1999/xlink",
+  xml: "http://www.w3.org/XML/1998/namespace",
+  xmlns: "http://www.w3.org/2000/xmlns/",
+};
+
+/**
  * HTML boolean content attributes (WHATWG list, minus `checked`, which is
  * handled separately as a live DOM property rather than an attribute — see
  * `applyAttributes`). For these, presence (not attribute *value*) means
@@ -64,7 +78,16 @@ const BOOLEAN_ATTRS = new Set([
  *
  * `<svg>` (and `<math>`) switch the element namespace for themselves and
  * their descendants, as real HTML parsing does; a nested `<foreignObject>`
- * switches back to the HTML namespace for its own children.
+ * switches back to the HTML namespace for its own children. Attribute names
+ * prefixed `xlink:`, `xml:`, or `xmlns:` are set via `setAttributeNS` in
+ * their proper namespace (needed for `<use xlink:href="...">` and similar).
+ *
+ * A malformed tag name or attribute name (e.g. built from bad dynamic
+ * input) is isolated rather than allowed to crash the whole render: the
+ * offending node renders as empty / the offending attribute is skipped,
+ * and the failure is reported through `ctx.onerror` — never a raw
+ * `console.error` — so host apps can route SIP render failures through
+ * whatever error-reporting hook they've configured.
  */
 export function renderSip(node: any, interp: SemaInterpreterLike, ctx: SemaWebContext): Node {
   return renderSipNode(node, interp, ctx, null);
@@ -115,9 +138,19 @@ function renderSipNode(
     } else if (lowerTag === "math") {
       elNamespace = MATHML_NS;
     }
-    const el = elNamespace
-      ? document.createElementNS(elNamespace, tagName)
-      : document.createElement(tagName);
+    let el: Element;
+    try {
+      el = elNamespace
+        ? document.createElementNS(elNamespace, tagName)
+        : document.createElement(tagName);
+    } catch (e) {
+      // An invalid tag name (e.g. one built from bad user input) would
+      // otherwise throw and abort the ENTIRE render, including unrelated
+      // siblings. Render this node as empty instead — one malformed node
+      // shouldn't take down everything around it.
+      ctx.onerror(e instanceof Error ? e : new Error(String(e)), `sip-render:invalid-tag:${tagName}`);
+      return document.createTextNode("");
+    }
     // <foreignObject> stays in the SVG namespace itself, but re-enters HTML
     // content for its children, matching real HTML/SVG parsing.
     const childNamespace = lowerTag === "foreignobject" ? null : elNamespace;
@@ -181,53 +214,70 @@ function applyAttributes(
       continue;
     }
 
-    if (key.startsWith("on-")) {
-      // Event handler: set data attribute for delegated event handling
-      const eventName = key.slice(3);
-      if (typeof value === "string") {
-        if (!SEMA_IDENT_RE.test(value)) {
-          console.error(`[sema-web] Invalid event handler name: ${value}`);
-          continue;
+    // Each attribute is applied independently: a bad value or an unexpected
+    // DOM exception (e.g. an invalid attribute name) shouldn't prevent the
+    // rest of the attributes — or the element's children — from rendering.
+    try {
+      if (key.startsWith("on-")) {
+        // Event handler: set data attribute for delegated event handling
+        const eventName = key.slice(3);
+        if (typeof value === "string") {
+          if (!SEMA_IDENT_RE.test(value)) {
+            ctx.onerror(new Error(`Invalid event handler name: ${value}`), "sip-render:on-handler");
+            continue;
+          }
+          el.setAttribute(`data-sema-on-${eventName}`, value);
+        } else {
+          ctx.onerror(
+            new Error(`Event handler value for "${key}" must be a string function name, got: ${typeof value}`),
+            "sip-render:on-handler",
+          );
         }
-        el.setAttribute(`data-sema-on-${eventName}`, value);
+      } else if (key === "style") {
+        if (typeof value === "string") {
+          el.setAttribute("style", value);
+        } else if (typeof value === "object") {
+          // Style map: {":color": "red", ":font-size": "14px"}
+          for (let [prop, val] of Object.entries(value)) {
+            if (prop.startsWith(":")) prop = prop.slice(1);
+            if (val === null || val === undefined) continue;
+            (el as HTMLElement).style.setProperty(prop, String(val));
+          }
+        }
+      } else if (key === "class") {
+        if (value === false) {
+          // no-op: a conditional class idiom like {:class (if active "on" false)}
+        } else if (Array.isArray(value)) {
+          const joined = value
+            .filter((v) => v !== null && v !== undefined && v !== false && v !== "")
+            .map(String)
+            .join(" ");
+          if (joined) el.setAttribute("class", joined);
+        } else {
+          el.setAttribute("class", String(value));
+        }
+      } else if (key === "value") {
+        (el as HTMLInputElement).value = String(value);
+      } else if (key === "checked") {
+        (el as HTMLInputElement).checked = Boolean(value);
+      } else if (BOOLEAN_ATTRS.has(key)) {
+        if (value) {
+          el.setAttribute(key, "");
+        } else {
+          el.removeAttribute(key);
+        }
       } else {
-        console.error(`[sema-web] Event handler value for "${key}" must be a string function name, got: ${typeof value}`);
-      }
-    } else if (key === "style") {
-      if (typeof value === "string") {
-        el.setAttribute("style", value);
-      } else if (typeof value === "object") {
-        // Style map: {":color": "red", ":font-size": "14px"}
-        for (let [prop, val] of Object.entries(value)) {
-          if (prop.startsWith(":")) prop = prop.slice(1);
-          if (val === null || val === undefined) continue;
-          (el as HTMLElement).style.setProperty(prop, String(val));
+        const colonIdx = key.indexOf(":");
+        const prefix = colonIdx > 0 ? key.slice(0, colonIdx) : null;
+        const ns = prefix ? NS_ATTR_PREFIXES[prefix] : undefined;
+        if (ns) {
+          el.setAttributeNS(ns, key, String(value));
+        } else {
+          el.setAttribute(key, String(value));
         }
       }
-    } else if (key === "class") {
-      if (value === false) {
-        // no-op: a conditional class idiom like {:class (if active "on" false)}
-      } else if (Array.isArray(value)) {
-        const joined = value
-          .filter((v) => v !== null && v !== undefined && v !== false && v !== "")
-          .map(String)
-          .join(" ");
-        if (joined) el.setAttribute("class", joined);
-      } else {
-        el.setAttribute("class", String(value));
-      }
-    } else if (key === "value") {
-      (el as HTMLInputElement).value = String(value);
-    } else if (key === "checked") {
-      (el as HTMLInputElement).checked = Boolean(value);
-    } else if (BOOLEAN_ATTRS.has(key)) {
-      if (value) {
-        el.setAttribute(key, "");
-      } else {
-        el.removeAttribute(key);
-      }
-    } else {
-      el.setAttribute(key, String(value));
+    } catch (e) {
+      ctx.onerror(e instanceof Error ? e : new Error(String(e)), `sip-render:attribute:${key}`);
     }
   }
 }

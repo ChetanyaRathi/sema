@@ -90,14 +90,14 @@ describe("renderSip", () => {
     expect(node.getAttribute("data-sema-on-click")).toBe("handle-click");
   });
 
-  it("invalid handler name does not set data attribute and logs error", () => {
-    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+  it("invalid handler name does not set data attribute and routes an error through ctx.onerror", () => {
+    const errors: Array<{ message: string; context: string }> = [];
+    ctx.onerror = (e, context) => errors.push({ message: e.message, context });
     const node = renderSip([":button", { ":on-click": "123bad" }], interp, ctx) as HTMLElement;
     expect(node.hasAttribute("data-sema-on-click")).toBe(false);
-    expect(errorSpy).toHaveBeenCalledWith(
-      expect.stringContaining("Invalid event handler name"),
-    );
-    errorSpy.mockRestore();
+    expect(errors).toEqual([
+      { message: "Invalid event handler name: 123bad", context: "sip-render:on-handler" },
+    ]);
   });
 
   // --- Style ---
@@ -618,12 +618,14 @@ describe("renderSip — on-* event handler validation", () => {
     errorSpy.mockRestore();
   });
 
-  it("non-string, non-nullish handler value logs an error instead of silently no-oping", () => {
-    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+  it("non-string, non-nullish handler value routes an error through ctx.onerror instead of silently no-oping", () => {
+    const errors: Array<{ message: string; context: string }> = [];
+    ctx.onerror = (e, context) => errors.push({ message: e.message, context });
     const node = renderSip([":button", { ":on-click": 42 }], interp, ctx) as HTMLElement;
     expect(node.hasAttribute("data-sema-on-click")).toBe(false);
-    expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining("must be a string"));
-    errorSpy.mockRestore();
+    expect(errors).toHaveLength(1);
+    expect(errors[0].message).toContain("must be a string");
+    expect(errors[0].context).toBe("sip-render:on-handler");
   });
 
   it("very long handler name is still accepted (no arbitrary length cap)", () => {
@@ -727,5 +729,109 @@ describe("registerSipBindings — sip/* and hiccup/* functions", () => {
 
     interp.getFunction("hiccup/render-into!")!("#target", [":div", "via-hiccup-alias"]);
     expect(document.querySelector("#target")!.textContent).toBe("via-hiccup-alias");
+  });
+});
+
+describe("renderSip — error isolation (one bad node/attribute shouldn't crash the whole tree)", () => {
+  let interp: ReturnType<typeof createMockInterpreter>;
+  let ctx: SemaWebContext;
+
+  beforeEach(() => {
+    interp = createMockInterpreter();
+    ctx = new SemaWebContext();
+  });
+
+  it("an invalid tag name (regression: used to throw InvalidCharacterError and abort the whole render)", () => {
+    const errors: Array<{ message: string; context: string }> = [];
+    ctx.onerror = (e, context) => errors.push({ message: e.message, context });
+
+    let node: Node;
+    expect(() => {
+      node = renderSip([":bad tag", "x"], interp, ctx);
+    }).not.toThrow();
+    expect(node!).toBeInstanceOf(Text);
+    expect(node!.textContent).toBe("");
+    expect(errors).toHaveLength(1);
+    expect(errors[0].context).toBe("sip-render:invalid-tag:bad tag");
+    expect(errors[0].message).toContain("did not match the Name production");
+  });
+
+  it("a bad tag name in one child doesn't prevent sibling children from rendering", () => {
+    ctx.onerror = () => {}; // silence expected error for this test
+    const node = renderSip(
+      [":div", [":span", "before"], [":bad tag", "x"], [":span", "after"]],
+      interp,
+      ctx,
+    ) as HTMLElement;
+    expect(node.childNodes.length).toBe(3);
+    expect(node.childNodes[0].textContent).toBe("before");
+    expect(node.childNodes[1]).toBeInstanceOf(Text);
+    expect(node.childNodes[1].textContent).toBe("");
+    expect(node.childNodes[2].textContent).toBe("after");
+  });
+
+  it("an invalid attribute name (regression: used to throw InvalidCharacterError and abort the whole element)", () => {
+    const errors: Array<{ message: string; context: string }> = [];
+    ctx.onerror = (e, context) => errors.push({ message: e.message, context });
+
+    expect(() =>
+      renderSip([":div", { "bad attr name": "x" }, [":span", "still renders"]], interp, ctx),
+    ).not.toThrow();
+
+    const node = renderSip(
+      [":div", { "bad attr name": "x" }, [":span", "still renders"]],
+      interp,
+      ctx,
+    ) as HTMLElement;
+    // The element itself and its children still render...
+    expect(node.tagName).toBe("DIV");
+    expect(node.textContent).toBe("still renders");
+    // ...the bad attribute is just skipped, reported via ctx.onerror.
+    expect(errors.some((e) => e.context === "sip-render:attribute:bad attr name")).toBe(true);
+  });
+
+  it("one bad attribute doesn't prevent sibling attributes from being applied", () => {
+    ctx.onerror = () => {};
+    const node = renderSip(
+      [":div", { ":id": "ok-before", "bad name": "x", ":title": "ok-after" }],
+      interp,
+      ctx,
+    ) as HTMLElement;
+    expect(node.getAttribute("id")).toBe("ok-before");
+    expect(node.getAttribute("title")).toBe("ok-after");
+    expect(node.hasAttribute("bad name")).toBe(false);
+  });
+});
+
+describe("renderSip — namespaced attributes (xlink:, xml:, xmlns:)", () => {
+  let interp: ReturnType<typeof createMockInterpreter>;
+  let ctx: SemaWebContext;
+  const XLINK_NS = "http://www.w3.org/1999/xlink";
+  const XML_NS = "http://www.w3.org/XML/1998/namespace";
+
+  beforeEach(() => {
+    interp = createMockInterpreter();
+    ctx = new SemaWebContext();
+  });
+
+  it("xlink:href is set via setAttributeNS, not a plain unnamespaced attribute (regression: getAttributeNS returned null)", () => {
+    const node = renderSip(
+      [":svg", [":use", { ":xlink:href": "#icon" }]],
+      interp,
+      ctx,
+    ) as SVGElement;
+    const use = node.firstChild as Element;
+    expect(use.getAttribute("xlink:href")).toBe("#icon");
+    expect(use.getAttributeNS(XLINK_NS, "href")).toBe("#icon");
+  });
+
+  it("xml:lang is set via setAttributeNS in the XML namespace", () => {
+    const node = renderSip([":div", { ":xml:lang": "en" }], interp, ctx) as HTMLElement;
+    expect(node.getAttributeNS(XML_NS, "lang")).toBe("en");
+  });
+
+  it("an unrecognized colon-containing attribute name falls back to plain setAttribute", () => {
+    const node = renderSip([":div", { ":data:custom": "x" }], interp, ctx) as HTMLElement;
+    expect(node.getAttribute("data:custom")).toBe("x");
   });
 });
