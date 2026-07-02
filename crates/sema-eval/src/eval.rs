@@ -86,7 +86,7 @@ impl Drop for Interpreter {
         // held (e.g. a user-kept `global_env` clone) survives, and the
         // registry reclaims it at a later safe point once released.
         drop(std::mem::replace(&mut self.global_env, Rc::new(Env::new())));
-        sema_core::gc_collect(&[]);
+        sema_core::gc_collect(&[], sema_core::GcTrigger::InterpreterDrop);
     }
 }
 
@@ -202,7 +202,10 @@ impl Interpreter {
         // interpreter's global namespace; the scheduler's globals are the same
         // env (init_scheduler above), so the one chain covers both.
         if sema_core::gc_should_collect() {
-            sema_core::gc_threshold_collect(&sema_core::gc_env_chain_pins(&self.global_env));
+            sema_core::gc_threshold_collect(
+                &sema_core::gc_env_chain_pins(&self.global_env),
+                sema_core::GcTrigger::EvalReturn,
+            );
         }
         result
     }
@@ -1150,7 +1153,10 @@ pub fn register_vm_delegates(env: &Rc<Env>) {
                     None => Vec::new(),
                 },
             };
-            Ok(gc_stats_map(&sema_core::gc_collect(&pins)))
+            Ok(gc_stats_map(&sema_core::gc_collect(
+                &pins,
+                sema_core::GcTrigger::Explicit,
+            )))
         })),
     );
 

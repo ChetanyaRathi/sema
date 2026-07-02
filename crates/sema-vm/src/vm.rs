@@ -3300,7 +3300,7 @@ impl VM {
         // live global namespace; computed only when a pass will actually run.
         if should_collect {
             let pins = sema_core::gc_env_chain_pins(&self.globals);
-            sema_core::gc_threshold_collect(&pins);
+            sema_core::gc_threshold_collect(&pins, sema_core::GcTrigger::Threshold);
         }
         Ok(())
     }

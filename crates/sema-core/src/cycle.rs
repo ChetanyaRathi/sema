@@ -240,6 +240,77 @@ pub type PayloadTracer = fn(&Rc<dyn Any>, &mut dyn FnMut(GcEdge)) -> bool;
 
 // ── Stats ─────────────────────────────────────────────────────────
 
+/// Which safe point requested a collection pass. Purely observational —
+/// recorded on the [`GcPassEvent`] so telemetry can attribute collector work
+/// to the code path that triggered it; the pass itself runs identically for
+/// every trigger.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GcTrigger {
+    /// Registry growth crossed the collection threshold at a candidate birth
+    /// (`make_closure` or a data-cycle constructor).
+    Threshold,
+    /// Top-level eval return (REPL line, script form, embedded eval).
+    EvalReturn,
+    /// Interpreter teardown (`Interpreter::drop`).
+    InterpreterDrop,
+    /// Notebook cell eval return.
+    NotebookCell,
+    /// Notebook kernel reset mop-up.
+    NotebookReset,
+    /// Agent tool-loop turn boundary.
+    AgentTurn,
+    /// Cooperative scheduler went idle (all tasks done and reaped).
+    SchedulerIdle,
+    /// Explicit request: `(gc/collect)`, REPL `,gc`, or a host call.
+    Explicit,
+}
+
+impl GcTrigger {
+    /// Stable lowercase-kebab name, for span/metric attributes.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            GcTrigger::Threshold => "threshold",
+            GcTrigger::EvalReturn => "eval-return",
+            GcTrigger::InterpreterDrop => "interpreter-drop",
+            GcTrigger::NotebookCell => "notebook-cell",
+            GcTrigger::NotebookReset => "notebook-reset",
+            GcTrigger::AgentTurn => "agent-turn",
+            GcTrigger::SchedulerIdle => "scheduler-idle",
+            GcTrigger::Explicit => "explicit",
+        }
+    }
+}
+
+/// One collector pass, as reported to the [`set_gc_observer`] observer. Fires
+/// for every pass that actually ran — including aborted ones (visible via
+/// `stats.aborted`) and prune-only fast passes — but never for a
+/// [`maybe_collect`] that stayed below the threshold.
+#[derive(Debug, Clone, Copy)]
+pub struct GcPassEvent {
+    /// The safe point that requested the pass.
+    pub trigger: GcTrigger,
+    /// The pass's result.
+    pub stats: GcStats,
+    /// Registry length (live + not-yet-pruned dead entries) when the pass
+    /// started.
+    pub registry_len_before: usize,
+    /// Wall-clock duration of the pass. Zero on wasm32 (no monotonic clock).
+    pub duration_ns: u64,
+}
+
+/// Register (or clear, with `None`) the per-pass observer. Thread-local, like
+/// all collector state; registered by the host's telemetry wiring (sema-otel
+/// via sema-llm — sema-core cannot depend on either, the same seam as the
+/// eval callbacks). The observer is a plain `fn` so it cannot capture
+/// `Value`/`Env` state (invariant I2 applies to it as it does to native fns);
+/// it runs after the pass has fully completed — the heap is never touched
+/// mid-callback — and must not call back into the collector. When no observer
+/// is registered a pass pays one thread-local `Option` load and nothing else;
+/// the no-pass path (`maybe_collect` below threshold) pays nothing.
+pub fn set_gc_observer(observer: Option<fn(&GcPassEvent)>) {
+    GC.with(|gc| gc.observer.set(observer));
+}
+
 /// Result of one collection pass.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct GcStats {
@@ -311,6 +382,8 @@ struct GcState {
     threshold: Cell<usize>,
     /// Stats of the last *completed* (non-aborted) pass, for `(gc/stats)`.
     last_stats: Cell<GcStats>,
+    /// Pass observer ([`set_gc_observer`]); `None` = observation disabled.
+    observer: Cell<Option<fn(&GcPassEvent)>>,
     /// Reusable pass buffers (owned by at most one pass at a time — the
     /// `collecting` guard excludes reentry before the scratch is taken).
     scratch: RefCell<Scratch>,
@@ -326,6 +399,7 @@ impl GcState {
             last_survivors: Cell::new(0),
             threshold: Cell::new(GC_FLOOR),
             last_stats: Cell::new(GcStats::new()),
+            observer: Cell::new(None),
             scratch: RefCell::new(Scratch::default()),
         }
     }
@@ -386,7 +460,7 @@ pub fn register_candidate(node: GcNode) {
         gc.past_threshold()
     });
     if past_threshold {
-        threshold_collect(&[]);
+        threshold_collect(&[], GcTrigger::Threshold);
     }
 }
 
@@ -595,9 +669,9 @@ pub fn trace_value(v: &Value, sink: &mut dyn FnMut(GcEdge)) -> bool {
 /// nodes are externally referenced by definition and marked black
 /// immediately). Caller guarantees the safe-point invariant (no outstanding
 /// env/cell borrows); if a borrow is found anyway, the pass aborts cleanly
-/// having mutated nothing.
-pub fn collect(pins: &[NodePtr]) -> GcStats {
-    collect_impl(pins, false)
+/// having mutated nothing. `trigger` is observational only (see [`GcTrigger`]).
+pub fn collect(pins: &[NodePtr], trigger: GcTrigger) -> GcStats {
+    collect_impl(pins, false, trigger)
 }
 
 /// Threshold safe-point collect ([`maybe_collect`] and the `make_closure`
@@ -611,11 +685,38 @@ pub fn collect(pins: &[NodePtr]) -> GcStats {
 /// forces a real trace as soon as it exceeds half the threshold — the same
 /// memory envelope the growth policy already allows. Explicit collects
 /// ([`collect`]: `(gc/collect)`, interpreter teardown) always trace.
-pub fn threshold_collect(pins: &[NodePtr]) -> GcStats {
-    collect_impl(pins, true)
+pub fn threshold_collect(pins: &[NodePtr], trigger: GcTrigger) -> GcStats {
+    collect_impl(pins, true, trigger)
 }
 
-fn collect_impl(pins: &[NodePtr], threshold_pass: bool) -> GcStats {
+/// Observation wrapper around [`run_pass`]: when an observer is registered,
+/// time the pass and report a [`GcPassEvent`] for it (completed, prune-only,
+/// or aborted alike). Unobserved passes skip straight through — one
+/// thread-local `Option` load of overhead.
+fn collect_impl(pins: &[NodePtr], threshold_pass: bool, trigger: GcTrigger) -> GcStats {
+    let Some(observer) = GC.with(|gc| gc.observer.get()) else {
+        return run_pass(pins, threshold_pass);
+    };
+    let registry_len_before = registry_len();
+    // `Instant::now` is unavailable on wasm32-unknown-unknown; an observer
+    // registered there (none is today — sema-otel is a no-op on wasm) sees
+    // duration 0 rather than a panic.
+    #[cfg(not(target_arch = "wasm32"))]
+    let start = Some(std::time::Instant::now());
+    #[cfg(target_arch = "wasm32")]
+    let start: Option<std::time::Instant> = None;
+    let stats = run_pass(pins, threshold_pass);
+    let duration_ns = start.map_or(0, |t| t.elapsed().as_nanos() as u64);
+    observer(&GcPassEvent {
+        trigger,
+        stats,
+        registry_len_before,
+        duration_ns,
+    });
+    stats
+}
+
+fn run_pass(pins: &[NodePtr], threshold_pass: bool) -> GcStats {
     if GC.with(|gc| gc.collecting.get()) {
         // Reentrancy guard: severing cascades `Value::drop`s, which must not
         // re-enter the collector.
@@ -807,8 +908,8 @@ pub fn env_chain_pins(env: &Rc<Env>) -> Vec<NodePtr> {
 /// Threshold-gated [`threshold_collect`] for safe points: runs when the
 /// registry has grown past `max(GC_FLOOR, GC_GROWTH × survivors of the last
 /// collect)` (CPython's generation-0 heuristic flattened to one generation).
-pub fn maybe_collect(pins: &[NodePtr]) -> Option<GcStats> {
-    should_collect().then(|| threshold_collect(pins))
+pub fn maybe_collect(pins: &[NodePtr], trigger: GcTrigger) -> Option<GcStats> {
+    should_collect().then(|| threshold_collect(pins, trigger))
 }
 
 /// RAII guard for the thread-local `collecting` flag: engaged for the whole
@@ -1429,7 +1530,7 @@ mod tests {
             "cycle keeps the graph alive pre-collect"
         );
 
-        let stats = collect(&[]);
+        let stats = collect(&[], GcTrigger::Explicit);
 
         assert!(!stats.aborted);
         assert_eq!(stats.candidates, 2, "closure + env bindings registered");
@@ -1448,7 +1549,7 @@ mod tests {
         let keeper = wrapper.clone();
         drop((env, wrapper, payload, nf));
 
-        let stats = collect(&[]);
+        let stats = collect(&[], GcTrigger::Explicit);
 
         assert!(!stats.aborted);
         assert_eq!(stats.collected, 0, "externally referenced: nothing severed");
@@ -1477,7 +1578,7 @@ mod tests {
         register_candidate(GcNode::ClosureFn(Rc::downgrade(&nf)));
         drop((cell, payload, nf));
 
-        let stats = collect(&[]);
+        let stats = collect(&[], GcTrigger::Explicit);
 
         assert!(!stats.aborted);
         assert_eq!(stats.collected, 4, "nf + payload + cell + list");
@@ -1497,7 +1598,7 @@ mod tests {
         register_candidate(GcNode::Thunk(Rc::downgrade(&t)));
         drop(t);
 
-        let stats = collect(&[]);
+        let stats = collect(&[], GcTrigger::Explicit);
 
         assert!(!stats.aborted);
         assert_eq!(stats.collected, 1);
@@ -1513,7 +1614,7 @@ mod tests {
         });
         register_candidate(GcNode::Thunk(Rc::downgrade(&t)));
 
-        let stats = collect(&[]);
+        let stats = collect(&[], GcTrigger::Explicit);
 
         assert!(!stats.aborted);
         assert_eq!(stats.collected, 0);
@@ -1536,7 +1637,7 @@ mod tests {
         register_candidate(GcNode::Channel(Rc::downgrade(&ch)));
         drop(ch);
 
-        let stats = collect(&[]);
+        let stats = collect(&[], GcTrigger::Explicit);
 
         assert!(!stats.aborted);
         assert_eq!(stats.collected, 1);
@@ -1559,7 +1660,7 @@ mod tests {
         register_candidate(GcNode::MultiMethod(Rc::downgrade(&mm)));
         drop(mm);
 
-        let stats = collect(&[]);
+        let stats = collect(&[], GcTrigger::Explicit);
 
         assert!(!stats.aborted);
         assert_eq!(stats.collected, 1);
@@ -1578,7 +1679,7 @@ mod tests {
         register_candidate(GcNode::Promise(Rc::downgrade(&p)));
         drop(p);
 
-        let stats = collect(&[]);
+        let stats = collect(&[], GcTrigger::Explicit);
 
         assert!(!stats.aborted);
         assert_eq!(stats.collected, 1);
@@ -1608,7 +1709,7 @@ mod tests {
         register_candidate(GcNode::Thunk(Rc::downgrade(&t2)));
         drop((t1, t2));
 
-        let stats = collect(&[]);
+        let stats = collect(&[], GcTrigger::Explicit);
 
         assert!(!stats.aborted);
         assert_eq!(stats.candidates, 2);
@@ -1627,13 +1728,13 @@ mod tests {
         register_candidate(GcNode::ClosureFn(Rc::downgrade(&nf)));
         drop((env, wrapper, payload, nf));
 
-        let stats = collect(&[pin]);
+        let stats = collect(&[pin], GcTrigger::Explicit);
         assert!(!stats.aborted);
         assert_eq!(stats.collected, 0, "pinned root: nothing severed");
         assert!(weak_nf.upgrade().is_some());
 
         // Without the pin the same graph is garbage and is reclaimed.
-        let stats2 = collect(&[]);
+        let stats2 = collect(&[], GcTrigger::Explicit);
         assert!(!stats2.aborted);
         assert!(stats2.collected >= 4);
         assert!(weak_nf.upgrade().is_none());
@@ -1650,7 +1751,7 @@ mod tests {
         drop((env, wrapper, payload, nf));
 
         let guard = bindings.borrow_mut();
-        let stats = collect(&[]);
+        let stats = collect(&[], GcTrigger::Explicit);
         assert!(stats.aborted, "borrowed bindings must abort the pass");
         assert_eq!(stats.collected, 0);
         assert!(weak_nf.upgrade().is_some(), "graph intact after abort");
@@ -1658,7 +1759,7 @@ mod tests {
         drop(guard);
         drop(bindings);
 
-        let stats2 = collect(&[]);
+        let stats2 = collect(&[], GcTrigger::Explicit);
         assert!(!stats2.aborted);
         assert!(stats2.collected >= 4);
         assert!(weak_nf.upgrade().is_none());
@@ -1677,14 +1778,14 @@ mod tests {
         drop(t);
 
         GC.with(|gc| gc.collecting.set(true));
-        let stats = collect(&[]);
+        let stats = collect(&[], GcTrigger::Explicit);
         assert!(stats.aborted);
         assert_eq!(stats.collected, 0);
         assert!(weak.upgrade().is_some(), "no-op left the graph alone");
-        assert!(maybe_collect(&[]).is_none());
+        assert!(maybe_collect(&[], GcTrigger::Threshold).is_none());
         GC.with(|gc| gc.collecting.set(false));
 
-        collect(&[]);
+        collect(&[], GcTrigger::Explicit);
         assert_eq!(weak.strong_count(), 0);
     }
 
@@ -1720,7 +1821,7 @@ mod tests {
         register_candidate(GcNode::ClosureFn(Rc::downgrade(&nf)));
         drop((cell, payload, nf));
 
-        let stats = collect(&[]);
+        let stats = collect(&[], GcTrigger::Explicit);
 
         assert!(!stats.aborted);
         assert_eq!(stats.collected, 4, "nf + payload + cell + list");
@@ -1737,7 +1838,7 @@ mod tests {
         register_candidate(GcNode::Thunk(Rc::downgrade(&t)));
         drop(t); // acyclic: plain Rc drop reclaims it before any collect
 
-        let stats = collect(&[]);
+        let stats = collect(&[], GcTrigger::Explicit);
 
         assert_eq!(stats.pruned, 1);
         assert_eq!(stats.candidates, 0);
@@ -1752,7 +1853,7 @@ mod tests {
     #[test]
     fn maybe_collect_respects_threshold() {
         assert!(
-            maybe_collect(&[]).is_none(),
+            maybe_collect(&[], GcTrigger::Threshold).is_none(),
             "empty registry: no collection"
         );
         for _ in 0..1025 {
@@ -1769,7 +1870,7 @@ mod tests {
         assert_eq!(stats.candidates, 1, "the in-scope thunk was live");
         assert!(registry_len() <= 1, "registry bounded by the trigger");
         assert!(
-            maybe_collect(&[]).is_none(),
+            maybe_collect(&[], GcTrigger::Threshold).is_none(),
             "already pruned below threshold"
         );
     }
@@ -1862,7 +1963,7 @@ mod tests {
         });
         register_candidate(GcNode::Thunk(Rc::downgrade(&t)));
 
-        let stats = collect(&[]);
+        let stats = collect(&[], GcTrigger::Explicit);
 
         assert!(!stats.aborted);
         assert_eq!(stats.traced, DEPTH + 1, "thunk + every level visited");
@@ -1892,7 +1993,7 @@ mod tests {
         register_candidate(GcNode::Thunk(Rc::downgrade(&t)));
         drop(t);
 
-        let stats = collect(&[]);
+        let stats = collect(&[], GcTrigger::Explicit);
 
         assert!(!stats.aborted);
         assert_eq!(stats.collected, 2, "thunk + forced list; held chain kept");
@@ -1925,7 +2026,7 @@ mod tests {
         register_candidate(GcNode::Thunk(Rc::downgrade(&t)));
         drop(t);
 
-        let stats = collect(&[]);
+        let stats = collect(&[], GcTrigger::Explicit);
 
         assert!(!stats.aborted);
         assert_eq!(stats.collected, DEPTH + 2, "chain + wrapper list + thunk");
@@ -1955,7 +2056,7 @@ mod tests {
         register_candidate(GcNode::Thunk(Rc::downgrade(&thunks[0])));
         drop(thunks);
 
-        let stats = collect(&[]);
+        let stats = collect(&[], GcTrigger::Explicit);
 
         assert!(!stats.aborted);
         assert_eq!(stats.traced, DEPTH, "every ring node visited");
@@ -1976,7 +2077,7 @@ mod tests {
         assert!(register_env_candidate(&wrapper), "first adoption registers");
         assert!(!register_env_candidate(&wrapper), "later adoptions dedup");
 
-        let stats_live = collect(&[]);
+        let stats_live = collect(&[], GcTrigger::Explicit);
         assert!(!stats_live.aborted);
         assert_eq!(stats_live.candidates, 1, "deduped to one registration");
         assert_eq!(stats_live.collected, 0, "externally held: kept");
@@ -1987,7 +2088,7 @@ mod tests {
 
         let weak_bindings = Rc::downgrade(&env.bindings);
         drop((env, wrapper, payload, nf));
-        let stats = collect(&[]);
+        let stats = collect(&[], GcTrigger::Explicit);
         assert!(!stats.aborted);
         assert_eq!(stats.collected, 4, "nf + payload + wrapper + bindings");
         assert_eq!(weak_bindings.strong_count(), 0, "env cycle reclaimed");
@@ -2016,7 +2117,7 @@ mod tests {
         let weak_nf = Rc::downgrade(&nf);
         drop((env, wrapper, payload, nf));
 
-        let stats = collect(&[]);
+        let stats = collect(&[], GcTrigger::Explicit);
         assert!(!stats.aborted);
         assert_eq!(stats.candidates, 1, "home adopted once, closure exempt");
         assert_eq!(
@@ -2039,7 +2140,7 @@ mod tests {
             register_candidate(GcNode::Thunk(Rc::downgrade(&t)));
         }
 
-        let stats = collect(&[]);
+        let stats = collect(&[], GcTrigger::Explicit);
         assert!(!stats.aborted);
         assert_eq!(stats.candidates, 1, "one snapshot root per allocation");
         assert_eq!(stats.pruned, 4, "duplicates removed, one entry kept");
@@ -2049,7 +2150,7 @@ mod tests {
         *t.forced.borrow_mut() = Some(Value::thunk_from_rc(t.clone()));
         let weak = Rc::downgrade(&t);
         drop(t);
-        let stats2 = collect(&[]);
+        let stats2 = collect(&[], GcTrigger::Explicit);
         assert_eq!(stats2.candidates, 1);
         assert_eq!(stats2.collected, 1);
         assert_eq!(weak.strong_count(), 0);

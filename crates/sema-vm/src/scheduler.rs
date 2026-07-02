@@ -630,7 +630,7 @@ fn run_scheduler_callback(
         // Threshold-gated; pins computed only when a pass will actually run.
         if sched.tasks.is_empty() && sema_core::gc_should_collect() {
             let pins = sema_core::gc_env_chain_pins(&sched.globals);
-            sema_core::gc_threshold_collect(&pins);
+            sema_core::gc_threshold_collect(&pins, sema_core::GcTrigger::SchedulerIdle);
         }
     }
 

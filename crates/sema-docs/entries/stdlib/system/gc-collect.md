@@ -5,7 +5,7 @@ section: "Memory"
 returns: "map"
 ---
 
-Run a full cycle-collection pass now and return its stats as a map with `:candidates` (registered cycle candidates scanned), `:traced` (heap nodes visited), `:collected` (garbage nodes reclaimed), and `:pruned` (dead registry entries removed). Reference cycles (e.g. a recursive local closure capturing itself) are otherwise reclaimed automatically at safe points; call this to force a collection at a known-quiet moment or to observe reclamation directly.
+Run a full cycle-collection pass now and return its stats as a map with `:candidates` (registered cycle candidates scanned), `:traced` (heap nodes visited), `:collected` (garbage nodes reclaimed), and `:pruned` (dead registry entries removed). Reference cycles (e.g. a recursive local closure capturing itself) are otherwise reclaimed automatically at safe points; call this to force a collection at a known-quiet moment or to observe reclamation directly. With OpenTelemetry tracing enabled, every collector pass (this one included) also emits a `gc.collect` span carrying the trigger and these stats as `gc.*` attributes.
 
 ```sema
 (define (make-loop)

@@ -1257,6 +1257,13 @@ fn guard_provider_url(unrestricted: bool, opts: &BTreeMap<Value, Value>) -> Resu
     Ok(())
 }
 
+/// Cycle-collector pass observer: forwards each pass to sema-otel as a
+/// `gc.collect` span (no-op while telemetry is disabled). A plain `fn`, so it
+/// cannot capture `Value`/`Env` state; it touches no Sema heap.
+fn gc_otel_observer(event: &sema_core::GcPassEvent) {
+    sema_otel::gc_pass_span(event);
+}
+
 pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
     let unrestricted = sandbox.is_unrestricted();
 
@@ -1266,6 +1273,13 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
     // thread-local fn pointers); registering here keeps it in a crate that names
     // both `sema_core` and `sema_otel`.
     sema_otel::register_task_callbacks();
+
+    // Cycle-collector observability: every collector pass that actually runs
+    // (any trigger, aborted included) emits a retroactively-timed `gc.collect`
+    // span, so GC work shows up on the same timeline as LLM/tool spans. Same
+    // seam as above — sema-core can't depend on sema-otel, and the observer is
+    // a plain `fn` (captures nothing; invariant I2). Idempotent.
+    sema_core::set_gc_observer(Some(gc_otel_observer));
 
     // Bridge the LLM cassette to MCP tool calls (sema-mcp consults this via
     // sema-core). Idempotent — just sets two thread-local fn pointers.
@@ -7358,7 +7372,7 @@ fn run_tool_loop(
         // executing VM's env (it depends only on sema-core), and pins are a
         // pure descent-skip optimization — correctness comes from external
         // strong counts. Message history/correlation is untouched.
-        sema_core::gc_maybe_collect(&[]);
+        sema_core::gc_maybe_collect(&[], sema_core::GcTrigger::AgentTurn);
     }
 
     // Push final assistant message if we exhausted rounds

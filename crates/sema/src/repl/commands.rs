@@ -142,7 +142,7 @@ pub fn dispatch(
 /// pinned to skip descent into the live REPL namespace.
 fn run_gc(interpreter: &Interpreter) {
     let pins = sema_core::gc_env_chain_pins(&interpreter.global_env);
-    let stats = sema_core::gc_collect(&pins);
+    let stats = sema_core::gc_collect(&pins, sema_core::GcTrigger::Explicit);
     if stats.aborted {
         println!("gc: pass aborted (cell borrowed or collection already running)");
         return;

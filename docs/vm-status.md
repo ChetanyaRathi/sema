@@ -98,6 +98,18 @@ NaN-boxing or to `Value::drop`; all collection state lives in a transient side m
   eval return, notebook cell eval + kernel reset, agent-loop turn boundary, scheduler
   idle (all tasks done), `Interpreter::drop`, and explicit `(gc/collect)` / REPL
   `,gc`. `(gc/stats)` reports the last pass + registry size.
+- **Observability:** with OpenTelemetry tracing enabled (`(otel/configure …)` or the
+  standard OTLP env init — nothing GC-specific to turn on), every pass that actually
+  runs (prune-only and aborted passes included; threshold-gated no-ops excluded)
+  emits a `gc.collect` span, retroactively timed to the pass's real duration and
+  nested under whatever span was active at the safe point (agent turn, notebook
+  cell, tool call). Attributes: `gc.trigger` (`threshold` | `eval-return` |
+  `interpreter-drop` | `notebook-cell` | `notebook-reset` | `agent-turn` |
+  `scheduler-idle` | `explicit`), `gc.candidates`, `gc.traced`, `gc.collected`,
+  `gc.pruned`, `gc.registry_before`, `gc.aborted`. Wiring: a thread-local observer
+  seam in `cycle.rs` (`set_gc_observer`, a plain `fn` — invariant I2), registered by
+  sema-llm's builtin setup (sema-core cannot depend on sema-otel). Unobserved or
+  telemetry-off passes pay one thread-local check; the no-pass path pays nothing.
 - **Invariants:** I1 — every cycle passes through a severable cell (env bindings,
   upvalue cell, thunk `forced`, promise state, channel buffer, multimethod table);
   I2 — native fns must not strongly capture `Env`/`Value` outside `NativeFn.payload`

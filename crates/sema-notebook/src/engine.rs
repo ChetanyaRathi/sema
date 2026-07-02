@@ -152,7 +152,7 @@ impl Engine {
         // kernel namespace.
         if sema_core::gc_should_collect() {
             let pins = sema_core::gc_env_chain_pins(&self.interpreter.global_env);
-            sema_core::gc_threshold_collect(&pins);
+            sema_core::gc_threshold_collect(&pins, sema_core::GcTrigger::NotebookCell);
         }
 
         // Mark downstream cells as stale
@@ -360,7 +360,10 @@ impl Engine {
         // Mop-up pass for anything the teardown collection could not prove
         // dead at drop time (candidates stay registered, so late-released
         // cycles are still discoverable). Pins: the fresh kernel's namespace.
-        sema_core::gc_collect(&sema_core::gc_env_chain_pins(&self.interpreter.global_env));
+        sema_core::gc_collect(
+            &sema_core::gc_env_chain_pins(&self.interpreter.global_env),
+            sema_core::GcTrigger::NotebookReset,
+        );
         for cell in &mut self.notebook.cells {
             cell.outputs.clear();
             cell.stale = false;
