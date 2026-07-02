@@ -24,21 +24,20 @@
     [:span (get msg :content)]])
 
 (define (render-stream-status)
-  (let ((s @current-stream))
-    (if (null? s)
-      [:span]
-      (let ((val @s))
-        (if (get val :done)
-          (begin
-            ;; Move completed response to messages
-            (when (not (equal? (get val :text) ""))
-              (update! messages
-                (fn (msgs) (append msgs (list {:role "assistant" :content (get val :text)})))))
-            (put! current-stream nil)
-            [:span])
-          [:div {:class "message assistant streaming"}
-            [:strong "assistant: "]
-            [:span (get val :text)]])))))
+  (if-let ((s @current-stream))
+    (let ((val @s))
+      (if (get val :done)
+        (begin
+          ;; Move completed response to messages
+          (when (not (equal? (get val :text) ""))
+            (update! messages
+              (fn (msgs) (append msgs (list {:role "assistant" :content (get val :text)})))))
+          (put! current-stream nil)
+          [:span])
+        [:div {:class "message assistant streaming"}
+          [:strong "assistant: "]
+          [:span (get val :text)]]))
+    [:span]))
 
 (define (chat-view)
   [:div {:class "chat-container"}

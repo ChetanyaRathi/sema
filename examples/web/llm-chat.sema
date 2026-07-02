@@ -1,6 +1,6 @@
 ;; LLM Chat — demonstrates the LLM proxy from the browser
 ;;
-;; This example uses atoms + hiccup + mount! to build a simple
+;; This example uses reactive state + hiccup + mount! to build a simple
 ;; chat interface that sends messages to an LLM via the proxy.
 ;;
 ;; Note: LLM calls use http/post internally, so the page must use
@@ -9,35 +9,35 @@
 
 ;; ── State ──────────────────────────────────────────────
 
-(define messages (atom '()))
-(define user-input (atom ""))
-(define loading (atom #f))
+(define messages (state '()))
+(define user-input (state ""))
+(define loading (state #f))
 
 ;; ── Event handlers ─────────────────────────────────────
 
 (define (update-input ev)
-  (reset! user-input (dom/get-value (dom/query "#chat-input"))))
+  (put! user-input (dom/get-value (dom/query "#chat-input"))))
 
 (define (send-message ev)
-  (let ((text (deref user-input)))
+  (let ((text @user-input))
     (when (> (string-length text) 0)
       ;; Add user message to the list
-      (swap! messages (lambda (msgs)
+      (update! messages (lambda (msgs)
         (append msgs (list {:role "user" :content text}))))
-      (reset! user-input "")
+      (put! user-input "")
       ;; Set the input value in the DOM
       (dom/set-value! (dom/query "#chat-input") "")
       ;; Mark loading
-      (reset! loading #t)
+      (put! loading #t)
       ;; Send to LLM via proxy (uses evalAsync under the hood)
-      (let ((response (llm/chat (deref messages) {:max-tokens 500})))
+      (let ((response (llm/chat @messages {:max-tokens 500})))
         ;; Add assistant reply
-        (swap! messages (lambda (msgs)
+        (update! messages (lambda (msgs)
           (append msgs (list {:role "assistant"
                               :content (if (string? response)
                                          response
                                          (:content response))}))))
-        (reset! loading #f)))))
+        (put! loading #f)))))
 
 ;; ── View component ─────────────────────────────────────
 
@@ -49,8 +49,8 @@
         [:div {:class (string-append "message " (:role msg))}
           [:strong (string-append (:role msg) ": ")]
           (:content msg)])
-        (deref messages))]
-    (if (deref loading)
+        @messages)]
+    (if @loading
       [:div {:class "loading"} "Thinking..."]
       [:span])
     [:div {:class "input-row"}

@@ -21,9 +21,8 @@
   (store/set! "sema-chat-messages" @messages))
 
 (define (load-messages)
-  (let ((saved (store/get "sema-chat-messages")))
-    (when (not (null? saved))
-      (put! messages saved))))
+  (when-let ((saved (store/get "sema-chat-messages")))
+    (put! messages saved)))
 
 (load-messages)
 
@@ -228,26 +227,25 @@
 ;; ── Stream Rendering ────────────────────────────────────────────────
 
 (define (render-stream)
-  (let ((s @current-stream))
-    (if (null? s)
-      [:span]
-      (let ((val @s))
-        (if (get val :done)
-          (begin
-            (when (not (equal? (get val :text) ""))
-              (update! messages
-                (fn (msgs)
-                  (append msgs (list {:role "assistant" :content (get val :text)}))))
-              (save-messages))
-            (put! current-stream nil)
-            [:span])
-          (if (equal? (get val :text) "")
-            [:div {:class msg-streaming-style :data-testid "typing-indicator"}
-              [:span {:class typing-dot-style} ""]
-              [:span {:class typing-dot-style} ""]
-              [:span {:class typing-dot-style} ""]]
-            [:div {:class msg-streaming-style :data-testid "streaming-msg"}
-              [:span (get val :text)]]))))))
+  (if-let ((s @current-stream))
+    (let ((val @s))
+      (if (get val :done)
+        (begin
+          (when (not (equal? (get val :text) ""))
+            (update! messages
+              (fn (msgs)
+                (append msgs (list {:role "assistant" :content (get val :text)}))))
+            (save-messages))
+          (put! current-stream nil)
+          [:span])
+        (if (equal? (get val :text) "")
+          [:div {:class msg-streaming-style :data-testid "typing-indicator"}
+            [:span {:class typing-dot-style} ""]
+            [:span {:class typing-dot-style} ""]
+            [:span {:class typing-dot-style} ""]]
+          [:div {:class msg-streaming-style :data-testid "streaming-msg"}
+            [:span (get val :text)]])))
+    [:span]))
 
 ;; ── Message Rendering ───────────────────────────────────────────────
 

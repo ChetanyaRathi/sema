@@ -295,8 +295,7 @@
 ;; --- Helpers --------------------------------------------------------------
 
 (define (task-id-from-event ev)
-  (string->number
-    (dom/get-attribute (dom/event-target ev) "data-id")))
+  (-> ev dom/event-target (dom/get-attribute "data-id") string->number))
 
 (define (current-page-title)
   (cond
