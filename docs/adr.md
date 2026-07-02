@@ -742,3 +742,56 @@ The bytecode lowerer is scope-free — it resolves a special form from a call's 
 - *Document-only, no enforcement.* Rejected: leaves the silently-wrong-result trap in place.
 
 This lands on the **Common Lisp / Clojure** model (special operators are reserved in operator position; their value namespace is irrelevant here since Sema is a Lisp-1), not Scheme's. Regular non-special-form names — including builtin *functions* like `list`/`map`/`filter` — still shadow freely. See `docs/limitations.md` #36; regression tests `reserved_*` / `shadow_builtin_*` in `eval_test.rs`.
+
+### 66. CORE-2 memory strategy: synchronous Bacon–Rajan cycle collection over the existing `Rc` heap
+
+Self-referential closures form `Rc` cycles that reference counting never reclaims
+(CORE-2). Three confirmed shapes, all measured (`crates/sema/tests/leak_test.rs`):
+a recursive **local** closure's self-capture upvalue cell (260 B leaked per creation —
+the shape long-running agents hit every turn), the `Env ⇄ Closure` cycle through
+`Closure::globals` that every top-level fn `define` creates (~168 KB — the *entire*
+global env — leaked per `Interpreter` teardown), and ~11 `__vm-*`/tool/agent delegate
+builtins whose boxed `Fn` strongly captures the env they are registered into (~166 KB
+per teardown with zero user code).
+
+**Decision:** two-part fix, designed in `docs/plans/2026-07-02-core2-gc.md`:
+
+1. **Delegate captures become `Weak<Env>`** (they are host infrastructure only callable
+   *through* the env that owns them), establishing the invariant that a `NativeFn`'s
+   boxed closure must never strongly capture anything that can hold a `Value`/`Env` —
+   traceable state belongs in `NativeFn.payload`.
+2. **A synchronous Bacon–Rajan cycle collector** (the published algorithm PHP ships; we
+   use a creation-time candidate registry instead of PHP/CPython's decrement buffer —
+   possible because Sema's cycle-birth sites are a small closed set of cold
+   constructors: `MakeClosure`, env adoption, and `delay`/promise/`channel`/`defmulti`
+   for closure-free data cycles) over the **unchanged** `Rc` heap. Candidates are
+   `Weak`-registered at creation; collection trial-deletes candidate subgraphs using
+   `Rc::strong_count` + a transient side map (no headers, no color bits — NaN-boxing
+   untouched), and reclaims garbage cycles by **severing** the mutable cell every cycle
+   must pass through (`Env.bindings`, `UpvalueCell`, `Thunk.forced`, promise/channel/
+   multimethod cells), letting ordinary `Rc` drops cascade. No root enumeration is
+   needed — Rust-stack/VM-stack references surface as unaccounted strong counts, which
+   is what makes a tracing collector *feasible* here at all. Safe points: REPL/notebook/
+   agent-turn boundaries, `Interpreter::drop`, `(gc)`, plus a registry-growth threshold.
+
+**Alternatives rejected** (full analysis in the plan): decrement-buffered trial deletion
+(taxes `Value::drop` — the hottest path — and misses the Env shape, whose teardown never
+drops a `Value`); full tracing mark-sweep with GC handles (root enumeration across
+hundreds of stdlib natives holding `Value`s on the Rust stack is intractable; ~25-type
+handle migration); per-turn region reclamation (unsound without exactly the reachability
+analysis a collector does); `Weak` self-capture revisited (fixes only direct
+self-recursion — mutual recursion, `set!` cycles, data cycles, and the Env shape all
+still leak; the prior attempt already broke `vm_module_test`); off-the-shelf GC crates
+(`gc`, `bacon_rajan_cc` replace `Rc` wholesale and can't round-trip the NaN-box's
+`into_raw >> 3` encoding or trace `Rc<dyn Any>` payloads).
+
+Costs land only where long-running agents live: one `Weak` registration per closure
+creation (~ns, amortized by the four allocations `make_closure` already does), zero
+change to `Value::drop`/call dispatch/`Rc` semantics, collection pauses bounded by
+candidate subgraphs (pinned session roots are not descended into). CLI/script hot paths
+pay nothing they can measure — gated by the `closure` + `numeric` bench suites with a
+≤2% budget and a new `recursive-closure-churn` canary benchmark. The strong-reference
+graph user code sees is unchanged, so the module-exports-fn-calls-private-helper pattern
+(`vm_module_test`, the regression that killed the earlier `Weak`-env attempt) holds by
+construction. Acceptance oracles: three `#[ignore]`d leak-bound tests in
+`crates/sema/tests/leak_test.rs` that flip green as each part lands.

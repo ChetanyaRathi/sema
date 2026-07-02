@@ -4,6 +4,19 @@
 
 ### Added
 
+- **CORE-2 (recursive-closure memory leak): design accepted + acceptance oracles.**
+  ADR #66 and `docs/plans/2026-07-02-core2-gc.md` lay out the fix: a synchronous
+  Bacon–Rajan cycle collector over the existing `Rc` heap (creation-time candidate
+  registry, cycle reclamation by severing the mutable cell every cycle must pass
+  through), plus a `Weak` refactor for the ~11 `__vm-*`/tool/agent delegates whose
+  boxed closures strongly capture their home env. Measured today: a recursive local
+  closure leaks 260 B per creation, and **every `Interpreter` teardown leaks its
+  entire global env (~166 KB) even with zero user code**. New leak-sizing oracle
+  (`crates/sema/tests/leak_test.rs`, counting global allocator: three `#[ignore]`d
+  acceptance tests + an always-on control) and a `recursive-closure-churn` benchmark
+  in the `closure`/`all` suites as the collector-tax canary. No collector code yet —
+  design only.
+
 - **`otel/configure` — turn on tracing from Sema code.** Telemetry no longer
   needs environment variables: `(otel/configure {:endpoint "..." :key "sk_..."})`
   points Sema at an OTLP backend (or a JSONL file via `:file`) from inside a
