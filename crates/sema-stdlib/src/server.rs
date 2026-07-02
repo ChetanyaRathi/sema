@@ -1068,6 +1068,26 @@ fn handle_file_response(
     });
 }
 
+/// Build the `send` native fn handed to an SSE handler. Extracted so a test can
+/// drive it from inside a tokio runtime — the exact condition (a handler
+/// streaming via `llm/stream`, which runs the callback inside the provider's
+/// `block_on`) that panicked when the channel was bounded + `blocking_send`.
+fn make_sse_send_fn(sse_tx: tokio::sync::mpsc::UnboundedSender<String>) -> Value {
+    use sema_core::NativeFn;
+    Value::native_fn(NativeFn::simple("http/stream/send", move |args| {
+        check_arity!(args, "http/stream/send", 1);
+        let msg = args[0]
+            .as_str()
+            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
+        // Err only when the receiver dropped (client disconnected) — preserves
+        // the "SSE stream closed" contract.
+        sse_tx
+            .send(msg.to_string())
+            .map_err(|_| SemaError::eval("SSE stream closed"))?;
+        Ok(Value::nil())
+    }))
+}
+
 /// Handle an SSE stream response: extract the stream handler, create channels,
 /// send the SSE receiver to axum, then call the handler with a `send` function.
 fn handle_sse_response(
@@ -1075,7 +1095,7 @@ fn handle_sse_response(
     response_val: &Value,
     respond: tokio::sync::oneshot::Sender<ServerResponse>,
 ) {
-    use sema_core::{call_callback, NativeFn};
+    use sema_core::call_callback;
 
     let map = response_val.as_map_rc().unwrap();
     let stream_handler = map
@@ -1094,18 +1114,7 @@ fn handle_sse_response(
     let _ = respond.send(ServerResponse::Sse(sse_rx));
 
     // Build the `send` function for the Sema handler
-    let send_fn = Value::native_fn(NativeFn::simple("http/stream/send", move |args| {
-        check_arity!(args, "http/stream/send", 1);
-        let msg = args[0]
-            .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
-        // Err only when the receiver dropped (client disconnected) — preserves
-        // the "SSE stream closed" contract.
-        sse_tx
-            .send(msg.to_string())
-            .map_err(|_| SemaError::eval("SSE stream closed"))?;
-        Ok(Value::nil())
-    }));
+    let send_fn = make_sse_send_fn(sse_tx);
 
     // Call the stream handler with the send function.
     // When it returns (or errors), the sse_tx is dropped, closing the stream.
@@ -1147,6 +1156,13 @@ fn handle_ws_response(
     // task only exits (and the socket only closes) when the *last* `Sender` is
     // dropped, so `ws/close` must release the sole sender — not a throwaway
     // clone. Mirrors the `in_rx` Option pattern below.
+    //
+    // NOTE: `ws/send`/`ws/recv` below use bounded blocking_send/blocking_recv,
+    // which are correct for the typical handler (runs on the evaluator thread,
+    // no nested runtime). But a WS handler that drives `llm/stream` (whose
+    // callback fires inside the provider's block_on) would hit the same "block
+    // within a runtime" panic the SSE path fixed with an unbounded channel. Left
+    // as a known limitation — WS+llm/stream isn't a shipped pattern yet.
     let out_tx = Rc::new(RefCell::new(Some(out_tx)));
     let out_tx_for_send = out_tx.clone();
     let send_fn = Value::native_fn(NativeFn::simple("ws/send", move |args| {
@@ -1426,19 +1442,31 @@ fn http_serve_impl(ctx: &sema_core::EvalContext, args: &[Value]) -> Result<Value
 mod tests {
     use super::*;
 
-    // The SSE producer (`http/stream/send`) runs on the evaluator thread, which
-    // may be inside a provider's `block_on` when the handler streams via
-    // llm/stream. The channel's send must not panic there.
+    // Regression guard for the real production send path: the actual
+    // `http/stream/send` native fn (as built by handle_sse_response) must work
+    // when invoked from inside a tokio runtime — the exact condition that
+    // panicked with the old bounded `blocking_send`. Reverting make_sse_send_fn
+    // to blocking_send makes this test panic.
     #[test]
-    fn unbounded_sse_send_works_inside_runtime() {
+    fn sse_send_fn_works_inside_runtime() {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let send_fn = make_sse_send_fn(tx);
+        let native = send_fn.as_native_fn_ref().expect("native fn");
+        let ctx = sema_core::EvalContext::new();
         let rt = tokio::runtime::Runtime::new().unwrap();
-        rt.block_on(async {
-            tx.send("a".to_string()).unwrap();
-            tx.send("b".to_string()).unwrap();
+        let result = rt.block_on(async {
+            (native.func)(&ctx, &[Value::string("a")])?;
+            (native.func)(&ctx, &[Value::string("b")])
         });
+        assert!(result.is_ok(), "send must not error/panic inside a runtime");
         assert_eq!(rx.try_recv().unwrap(), "a");
         assert_eq!(rx.try_recv().unwrap(), "b");
+
+        // When the receiver is dropped (client disconnect), send reports the
+        // "SSE stream closed" contract rather than panicking.
+        drop(rx);
+        let closed = (native.func)(&ctx, &[Value::string("c")]);
+        assert!(closed.is_err(), "send after receiver drop must Err");
     }
 
     // Documents the exact bug the unbounded channel fixes: a bounded
