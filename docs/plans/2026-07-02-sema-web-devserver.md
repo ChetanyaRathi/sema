@@ -186,8 +186,13 @@ runtime + synthesized import-map shell + app source; short-poll hot reload;
 native LLM proxy speaking the production protocol; browser error overlay;
 auto-open), M4 (`website/docs/web/dev-server.md`). Gates: `make test-web-e2e`
 (Playwright render + hot reload), `crates/sema/tests/web_dev_server_test.rs`
-(serving contract + live proxy). **Deferred:** M2 (concurrency → progressive
-streaming; `/stream` currently single-shot), M3 (state-preserving HMR).
+(serving contract + live proxy). **M2 Tier 1 shipped
+(2026-07-02):** the SSE channel is now unbounded + non-blocking, fixing the
+llm/stream panic and delivering **progressive** token streaming (`/stream` uses
+real `llm/stream`). **Still deferred:** M2 concurrency (head-of-line blocking — a
+live stream holds the single evaluator thread; the worker-pool / LLM-offload
+options both need soundness-sensitive `Send` surface in sema-core, so parked),
+M3 (state-preserving HMR). See the concurrency design workflow judgment.
 
 
 - **M0 — asset-embedding spike:** prove the Rust launcher can embed + serve the

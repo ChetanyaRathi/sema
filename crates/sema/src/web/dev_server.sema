@@ -128,22 +128,22 @@
 (define (handle-models req)
   (http/ok {:models (llm/list-providers)}))
 
-;; Streaming endpoint: emit SSE `data:` events shaped as sema-web's client
-;; expects — {type:"token",text} then {type:"done"}.
+;; Streaming endpoint: emit one SSE `data:` per token as {type:"token",text},
+;; then {type:"done"} — the shape sema-web's SSE client expects. Tokens stream
+;; progressively (the SSE channel is unbounded, so llm/stream's per-chunk
+;; callback can feed it from inside the provider's runtime without blocking).
 ;;
-;; MVP caveat: progressive token-by-token streaming is deferred to the M2
-;; concurrency work. Native llm/stream drives its own tokio runtime and invokes
-;; the chunk callback from inside it, where the SSE channel's blocking send
-;; panics. So we run the non-streaming llm/chat (which returns on the main
-;; thread) and emit the whole reply as a single token. The response still
-;; renders; it just isn't revealed incrementally.
+;; Note: while a stream is live it holds the single evaluator thread, so other
+;; requests queue behind it (head-of-line blocking — the deferred M2 concurrency
+;; work). Fine for a single-user dev loop.
 (define (handle-stream req)
   (let ((b (:json req)))
     (http/stream
       (fn (send)
-        (let ((text (llm/chat (->messages b) b)))
-          (send (json/encode {:type "token" :text text}))
-          (send (json/encode {:type "done"})))))))
+        (llm/stream (->messages b)
+          (fn (chunk) (send (json/encode {:type "token" :text chunk})))
+          b)
+        (send (json/encode {:type "done"}))))))
 
 ;; /__sema/*    → embedded runtime (WASM + JS bundle), served with real MIME types.
 ;; /app/*       → the app's source directory (raw .sema + any assets).

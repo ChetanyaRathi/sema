@@ -32,8 +32,11 @@ struct RawResponse {
 enum ServerResponse {
     /// A normal HTTP response.
     Raw(RawResponse),
-    /// An SSE stream: the receiver yields event data strings.
-    Sse(tokio::sync::mpsc::Receiver<String>),
+    /// An SSE stream: the receiver yields event data strings. Unbounded so the
+    /// producer's `send` never blocks — SSE handlers run on the evaluator thread
+    /// and may be inside a provider's `block_on` (e.g. llm/stream), where a
+    /// bounded `blocking_send` would panic ("block within a runtime").
+    Sse(tokio::sync::mpsc::UnboundedReceiver<String>),
     /// A WebSocket connection: bidirectional channels for message passing.
     WebSocket {
         /// Sends messages from axum (client) to the evaluator (server handler).
@@ -911,9 +914,9 @@ async fn handle_axum_request(
         Ok(ServerResponse::Sse(rx)) => {
             use axum::response::sse::{Event, Sse};
             use futures::stream::StreamExt;
-            use tokio_stream::wrappers::ReceiverStream;
+            use tokio_stream::wrappers::UnboundedReceiverStream;
 
-            let stream = ReceiverStream::new(rx)
+            let stream = UnboundedReceiverStream::new(rx)
                 .map(|data| Ok::<_, std::convert::Infallible>(Event::default().data(data)));
             Sse::new(stream).into_response()
         }
@@ -1080,8 +1083,12 @@ fn handle_sse_response(
         .cloned()
         .unwrap();
 
-    // Create the SSE channel
-    let (sse_tx, sse_rx) = tokio::sync::mpsc::channel::<String>(256);
+    // Create the SSE channel. Unbounded because the handler runs on the
+    // evaluator thread and may `send` from inside a provider's block_on (e.g.
+    // llm/stream feeding tokens): UnboundedSender::send is synchronous and never
+    // asserts "not in a runtime", so it can't panic like blocking_send. Chunks
+    // are small and network-paced; a bounded try_send would silently drop tokens.
+    let (sse_tx, sse_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
 
     // Send the SSE receiver to axum so it can start streaming immediately
     let _ = respond.send(ServerResponse::Sse(sse_rx));
@@ -1092,8 +1099,10 @@ fn handle_sse_response(
         let msg = args[0]
             .as_str()
             .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
+        // Err only when the receiver dropped (client disconnected) — preserves
+        // the "SSE stream closed" contract.
         sse_tx
-            .blocking_send(msg.to_string())
+            .send(msg.to_string())
             .map_err(|_| SemaError::eval("SSE stream closed"))?;
         Ok(Value::nil())
     }));
@@ -1416,6 +1425,34 @@ fn http_serve_impl(ctx: &sema_core::EvalContext, args: &[Value]) -> Result<Value
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // The SSE producer (`http/stream/send`) runs on the evaluator thread, which
+    // may be inside a provider's `block_on` when the handler streams via
+    // llm/stream. The channel's send must not panic there.
+    #[test]
+    fn unbounded_sse_send_works_inside_runtime() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            tx.send("a".to_string()).unwrap();
+            tx.send("b".to_string()).unwrap();
+        });
+        assert_eq!(rx.try_recv().unwrap(), "a");
+        assert_eq!(rx.try_recv().unwrap(), "b");
+    }
+
+    // Documents the exact bug the unbounded channel fixes: a bounded
+    // `blocking_send` panics ("block within a runtime") when called inside a
+    // tokio context — which is what an llm/stream SSE handler did.
+    #[test]
+    #[should_panic]
+    fn bounded_blocking_send_panics_inside_runtime() {
+        let (tx, _rx) = tokio::sync::mpsc::channel::<String>(4);
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let _ = tx.blocking_send("x".to_string());
+        });
+    }
 
     #[test]
     fn test_match_exact_path() {

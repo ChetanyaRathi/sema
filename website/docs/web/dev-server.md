@@ -68,12 +68,14 @@ differs. In dev, it's wired to the dev server automatically.
 Keys come from your environment, exactly as with the `sema` CLI
 (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, …). Disable the proxy with `--no-llm`.
 
-::: warning Streaming
-Progressive token-by-token streaming (`llm/chat-stream`) currently delivers the
-reply in one piece rather than incrementally — the built-in HTTP server is
-single-threaded, so a live stream would monopolize it. The response still
-renders; it just isn't revealed token by token. Non-streaming calls
-(`llm/complete`, `llm/chat`) are unaffected.
+Streaming (`llm/chat-stream`) delivers tokens **progressively** — they render as
+they arrive from the provider.
+
+::: warning One stream at a time
+The built-in HTTP server is single-threaded, so a live stream holds it for its
+duration: other requests (including hot-reload polls and a second stream) queue
+until it finishes. Fine for a single-user dev loop; true concurrency is a
+planned improvement.
 :::
 
 ## Error overlay
