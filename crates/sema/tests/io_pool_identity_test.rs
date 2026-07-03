@@ -57,7 +57,6 @@ fn start_local_server() -> u16 {
 }
 
 #[test]
-#[ignore = "RED acceptance gate for ADR #69 runtime consolidation; un-ignored when the sema-io migration lands"]
 fn one_pool_serves_every_offload_kind() {
     let port = start_local_server();
 

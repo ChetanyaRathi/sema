@@ -119,7 +119,6 @@ fn rs_files_under(dir: &Path, out: &mut Vec<PathBuf>) {
 }
 
 #[test]
-#[ignore = "RED acceptance gate for ADR #69 runtime consolidation; un-ignored when the sema-io migration lands"]
 fn no_adhoc_tokio_runtimes_outside_allowlist() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let crates_dir = root.join("crates");
