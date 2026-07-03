@@ -629,3 +629,115 @@ test.describe('API integration', () => {
     expect(nb2.cells[1].id).toBe(ids[0]);
   });
 });
+
+// ── Regression: UI fixes (July 2026) ───────────────────────────
+// Each test is hermetic — it cleans up any cell it adds and restores the
+// title — so the tracked demo notebook is never mutated on disk.
+test.describe('Regression — notebook UI fixes', () => {
+  test.beforeEach(async ({ page }) => {
+    await waitForLoad(page);
+  });
+
+  test('markdown cell re-renders when it loses focus (blur)', async ({ page }) => {
+    const before = await cells(page).count();
+    await page.getByTestId('btn-add-markdown').click();
+    const newCell = cells(page).nth(before);
+    await newCell.getByTestId('cell-textarea').fill('## Blur render check');
+    await page.keyboard.press('Escape'); // blur → onBlur → render
+
+    await newCell.getByTestId('markdown-rendered').waitFor({ timeout: 3000 });
+    await expect(newCell.getByTestId('markdown-rendered')).toContainText('Blur render check');
+    await expect(newCell.getByTestId('cell-textarea')).toHaveCount(0);
+
+    // cleanup
+    await newCell.hover();
+    await newCell.getByTestId('btn-cell-delete').click();
+    await expect(cells(page)).toHaveCount(before);
+  });
+
+  test('editing a cell syncs its source to the server on blur (save persistence)', async ({ page, request }) => {
+    const before = await cells(page).count();
+    await page.getByTestId('btn-add-code').click();
+    const newCell = cells(page).nth(before);
+    const marker = '; blur-sync-marker-4242';
+    await newCell.getByTestId('cell-textarea').fill(marker);
+    await page.keyboard.press('Escape'); // blur → persistSource
+
+    // Root cause of the "save is broken" report: edits must reach the server,
+    // not just live in the browser. Save then serializes the server's copy.
+    await expect.poll(async () => {
+      const nb = await (await request.get('/api/notebook')).json();
+      return nb.cells.some((c: any) => c.source === marker);
+    }).toBeTruthy();
+
+    // cleanup
+    await newCell.hover();
+    await newCell.getByTestId('btn-cell-delete').click();
+    await expect(cells(page)).toHaveCount(before);
+  });
+
+  test('notebook title edit is persisted to the server', async ({ page, request }) => {
+    const titleInput = page.getByTestId('notebook-title');
+    const original = await titleInput.inputValue();
+    await titleInput.fill('Title Sync Test 4242');
+    await titleInput.blur(); // persistTitle → server
+
+    await expect.poll(async () => (await (await request.get('/api/notebook')).json()).title)
+      .toBe('Title Sync Test 4242');
+
+    // restore original title
+    await titleInput.fill(original);
+    await titleInput.blur();
+  });
+
+  test('insert dropdown stays visible when the pointer moves onto its items', async ({ page }) => {
+    const divider = page.getByTestId('cell-divider').first();
+    await divider.hover();
+    await divider.getByTestId('btn-add-cell').click();
+    const dropdown = divider.getByTestId('add-cell-dropdown');
+    await expect(dropdown).toBeVisible();
+
+    // Moving onto a dropdown item must NOT fade the divider (and its dropdown
+    // child) out — the .visible class keeps opacity at 1 while it is open.
+    await dropdown.getByTestId('btn-insert-code').hover();
+    await expect(divider).toHaveClass(/visible/);
+    await expect.poll(() => divider.evaluate((el) => getComputedStyle(el).opacity)).toBe('1');
+    await expect(dropdown.getByTestId('btn-insert-code')).toBeVisible();
+  });
+
+  test('status bar has symmetric horizontal padding', async ({ page }) => {
+    const pad = await page.getByTestId('status-bar').evaluate((el) => {
+      const cs = getComputedStyle(el);
+      return { left: cs.paddingLeft, right: cs.paddingRight };
+    });
+    expect(pad.left).toBe(pad.right);
+  });
+
+  test('uses the warm brand background palette', async ({ page }) => {
+    // Brand --bg is #131110 (warm), not cold #0c0c0c.
+    const bg = await page.evaluate(() => getComputedStyle(document.body).backgroundColor);
+    expect(bg).toBe('rgb(19, 17, 16)');
+  });
+
+  test('fonts are bundled and served locally (no Google Fonts CDN)', async ({ page, request }) => {
+    const external: string[] = [];
+    page.on('request', (r) => {
+      if (/gstatic|googleapis|fonts\.google/.test(r.url())) external.push(r.url());
+    });
+    await page.goto('/', { waitUntil: 'networkidle' });
+    await page.waitForSelector('[data-testid="cell"]');
+    expect(external, `unexpected CDN font requests: ${external.join(', ')}`).toHaveLength(0);
+
+    const font = await request.get('/ui/fonts/jetbrains-mono-latin.woff2');
+    expect(font.status()).toBe(200);
+    expect(font.headers()['content-type']).toContain('font/woff2');
+
+    await page.evaluate(() => document.fonts.ready);
+    const loaded = await page.evaluate(() => ({
+      jb700: document.fonts.check("700 15px 'JetBrains Mono'"),
+      corm300: document.fonts.check("300 20px 'Cormorant'"),
+    }));
+    expect(loaded.jb700).toBeTruthy();
+    expect(loaded.corm300).toBeTruthy();
+  });
+});

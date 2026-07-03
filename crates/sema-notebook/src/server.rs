@@ -115,6 +115,7 @@ pub async fn serve(notebook_path: Option<PathBuf>, host: &str, port: u16) {
         .route("/api/eval-all", post(eval_all))
         .route("/api/env", get(get_env))
         .route("/api/reset", post(reset))
+        .route("/api/title", post(set_title))
         .route("/api/undo", post(undo_cell))
         .route("/api/save", post(save_notebook))
         // VFS endpoints
@@ -153,6 +154,10 @@ async fn index_handler() -> Html<String> {
 }
 
 async fn ui_asset_handler(Path(path): Path<String>) -> Response {
+    if let Some((bytes, mime)) = ui::font(&path) {
+        let headers = [(axum::http::header::CONTENT_TYPE, mime)];
+        return (headers, bytes).into_response();
+    }
     match ui::asset(&path) {
         Some((content, mime)) => {
             let headers = [(axum::http::header::CONTENT_TYPE, mime)];
@@ -321,6 +326,23 @@ async fn reset(
     state
         .engine
         .reset()
+        .await
+        .map(|_| Json(serde_json::json!({"ok": true})))
+        .map_err(|e| bridge_err(e, StatusCode::INTERNAL_SERVER_ERROR))
+}
+
+#[derive(Deserialize)]
+struct SetTitleRequest {
+    title: String,
+}
+
+async fn set_title(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<SetTitleRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    state
+        .engine
+        .set_title(req.title)
         .await
         .map(|_| Json(serde_json::json!({"ok": true})))
         .map_err(|e| bridge_err(e, StatusCode::INTERNAL_SERVER_ERROR))

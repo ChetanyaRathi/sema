@@ -23,6 +23,25 @@ pub fn asset(path: &str) -> Option<(String, String)> {
     }
 }
 
+/// Serve an embedded binary font asset by path (e.g. `fonts/cormorant-latin.woff2`).
+///
+/// Fonts are bundled into the binary (latin `woff2` subsets of Cormorant and
+/// JetBrains Mono) so the notebook renders correctly offline, with no runtime
+/// dependency on the Google Fonts CDN.
+pub fn font(path: &str) -> Option<(&'static [u8], &'static str)> {
+    match path {
+        "fonts/cormorant-latin.woff2" => Some((
+            include_bytes!("ui/fonts/cormorant-latin.woff2"),
+            "font/woff2",
+        )),
+        "fonts/jetbrains-mono-latin.woff2" => Some((
+            include_bytes!("ui/fonts/jetbrains-mono-latin.woff2"),
+            "font/woff2",
+        )),
+        _ => None,
+    }
+}
+
 fn css() -> &'static str {
     include_str!("ui/style.css")
 }

@@ -162,6 +162,11 @@ document.addEventListener('alpine:init', () => {
     // ── Save / Undo / Reset ──
     async save() {
       try {
+        // Flush every cell's current source to the server first. Edits that were
+        // never evaluated (markdown, un-run code) live only in the browser, and
+        // the server serializes its own copy — so without this, save writes
+        // stale content and the edits appear lost.
+        await Promise.all([this.persistTitle(), ...this.cells.map(c => this.persistSource(c))]);
         await this.api('POST', '/api/save');
         this.saveFeedback = true;
         setTimeout(() => { this.saveFeedback = false; }, 600);
@@ -188,6 +193,30 @@ document.addEventListener('alpine:init', () => {
         await this.load();
       } catch (e) {
         console.error('Reset failed:', e);
+      }
+    },
+
+    // ── Editing / persistence ──
+    // Push a cell's current source to the server. Source edits otherwise reach
+    // the server only when a code cell is evaluated, so markdown edits and
+    // un-run code edits would be dropped on save/reload.
+    persistSource(cell) {
+      return this.api('POST', '/api/cells/' + cell.id, { source: cell.source }).catch(() => {});
+    },
+
+    // Push the notebook title to the server. Like cell source, the title is
+    // client-only state (x-model) until synced, so without this a renamed
+    // notebook would save under its old title.
+    persistTitle() {
+      return this.api('POST', '/api/title', { title: this.title }).catch(() => {});
+    },
+
+    // Editor lost focus: persist the source, and return non-empty markdown cells
+    // to their rendered view (blur is the natural "done editing" signal).
+    onBlur(cell) {
+      this.persistSource(cell);
+      if (cell.cell_type === 'markdown' && cell.source.trim()) {
+        cell._rendered = true;
       }
     },
 
