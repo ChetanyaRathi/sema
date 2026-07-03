@@ -3,8 +3,6 @@
 mod archive;
 mod arithmetic;
 mod async_ops;
-#[cfg(not(target_arch = "wasm32"))]
-mod async_rt;
 mod bitwise;
 mod bytevector;
 mod comparison;
