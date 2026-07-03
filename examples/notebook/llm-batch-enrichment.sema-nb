@@ -3,7 +3,7 @@
   "metadata": {
     "title": "Enrich a Dataset with an LLM — with Guardrails",
     "created": "2026-07-03T00:00:00Z",
-    "modified": "2026-07-03T15:43:38.353464Z",
+    "modified": "2026-07-03T16:09:33.433067Z",
     "sema_version": "1.28.1"
   },
   "cells": [
@@ -13,6 +13,25 @@
       "source": "# Enrich a Dataset with an LLM — with Guardrails\n\nYou have a column of free text — customer feedback, support tickets, reviews —\nand you want an LLM to **label every row**: sentiment, topic, priority. This is\nthe single most common LLM-in-production task, and the naive version is a trap:\n\n- **Unbounded cost.** Fire one request per row with no ceiling and a bad loop can\n  quietly run up a bill. A batch needs a *hard cap*.\n- **Re-running = re-paying.** Tweak a downstream cell, re-run the notebook, and\n  every label is bought again. Identical inputs should be *free* the second time.\n- **One slow call blocks all.** Ten rows done strictly one-at-a-time waits for the\n  sum of ten round-trips. But firing all ten at once ignores provider rate limits.\n\nSema answers each with a composable guardrail:\n\n| Risk | Guardrail | Builtin |\n|---|---|---|\n| Slow (sum of round-trips) | bounded concurrency | `async/pool-map` |\n| Paying twice for the same input | content-addressed cache | `llm/with-cache` |\n| Runaway spend | scoped, fail-closed budget | `llm/with-budget` |\n\nThis is the **cut-your-LLM-bill** pattern, made concrete. Every claim below is\nbacked by a printed number from a real run. Timings use `sys/elapsed`\n(nanoseconds), the right benchmarking timer in Sema.\n\nThe take-home template is one line you can lift into your own code:\n\n```sema\n(llm/with-budget {:max-cost-usd 0.25}      ; hard spend cap — fails closed\n  (fn () (llm/with-cache {:ttl 3600}        ; free re-runs for identical inputs\n    (fn () (async/pool-map classify rows 4)))))  ; bounded fan-out\n```"
     },
     {
+      "id": "c0toggle1",
+      "type": "code",
+      "source": ";; ── Determinism toggle ──────────────────────────────────────────────────\n;; By default this notebook REPLAYS recorded LLM responses from a cassette\n;; tape: keyless, free, and identical on every run. For a LIVE run against\n;; real providers (needs an API key; costs well under a cent), flip this to\n;; #t and re-run.\n(define live-run? #f)\n(when (not live-run?)\n  (llm/cassette-load \"examples/notebook/tapes/llm-batch-enrichment.jsonl\" {:mode :auto})\n  (println \"cassette active: replaying recorded responses (set live-run? to #t for live calls)\"))\n(when live-run? (println \"LIVE run: calling real providers\"))",
+      "outputs": [
+        {
+          "type": "stdout",
+          "display": "cassette active: replaying recorded responses (set live-run? to #t for live calls)\n",
+          "timestamp": "2026-07-03T16:09:33.424784Z"
+        },
+        {
+          "type": "value",
+          "display": "",
+          "sema_value": "nil",
+          "timestamp": "2026-07-03T16:09:33.424783Z",
+          "duration_ms": 0
+        }
+      ]
+    },
+    {
       "id": "c00000002",
       "type": "markdown",
       "source": "## 0. Degrade gracefully without a key\n\n`llm/auto-configure` reads provider keys from the environment (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY`, ...) and returns the\ndefault provider keyword, or `nil` if nothing is configured. We capture that once\nas `have-llm?` and **guard every LLM cell** with it, so this notebook runs clean\nend-to-end on a keyless machine — the LLM cells simply print `(skipped)`.\n\nFor cost safety the demo pins a **cheap** model (`claude-haiku-4-5`); swap it for\nwhatever your default provider offers."
@@ -20,19 +39,19 @@
     {
       "id": "c00000003",
       "type": "code",
-      "source": "; auto-configure returns the default provider keyword, or nil with no key.\n(define provider (llm/auto-configure))\n(define have-llm? (not (nil? provider)))\n(define model \"claude-haiku-4-5-20251001\")   ; cheap; tiny prompts, tiny outputs\n\n(if have-llm?\n    (println (format \"LLM ready — provider: ~a, model: ~a\" provider model))\n    (println \"No API key found — LLM cells will print (skipped).\"))",
+      "source": "; auto-configure returns the default provider keyword, or nil with no key.\n(define provider (llm/auto-configure))\n(define have-llm? (or (not live-run?) (not (nil? (llm/auto-configure)))))\n(define model \"claude-haiku-4-5-20251001\")   ; cheap; tiny prompts, tiny outputs\n\n(if have-llm?\n    (println (format \"LLM ready — provider: ~a, model: ~a\" provider model))\n    (println \"No API key found — LLM cells will print (skipped).\"))",
       "outputs": [
         {
           "type": "stdout",
           "display": "LLM ready — provider: :anthropic, model: claude-haiku-4-5-20251001\n",
-          "timestamp": "2026-07-03T15:43:22.416109Z"
+          "timestamp": "2026-07-03T16:09:33.429386Z"
         },
         {
           "type": "value",
           "display": "",
           "sema_value": "nil",
-          "timestamp": "2026-07-03T15:43:22.416107Z",
-          "duration_ms": 6
+          "timestamp": "2026-07-03T16:09:33.429386Z",
+          "duration_ms": 4
         }
       ]
     },
@@ -49,13 +68,13 @@
         {
           "type": "stdout",
           "display": "10 feedback rows loaded.\n",
-          "timestamp": "2026-07-03T15:43:22.416284Z"
+          "timestamp": "2026-07-03T16:09:33.429492Z"
         },
         {
           "type": "value",
           "display": "",
           "sema_value": "nil",
-          "timestamp": "2026-07-03T15:43:22.416283Z",
+          "timestamp": "2026-07-03T16:09:33.429491Z",
           "duration_ms": 0
         }
       ]
@@ -72,15 +91,15 @@
       "outputs": [
         {
           "type": "stdout",
-          "display": "sequential: 3 rows in 4429 ms (1476 ms/row)\npool-map(4): 10 rows in 4855 ms (485 ms/row)\nper-row speedup: 3.0x\n\n  negative  |  The checkout page kept crashing every time I tried to pay.\n  positive  |  Absolutely love the new dashboard, so much faster!\n  mixed     |  It's fine I guess, does what it says but nothing special.\n  negative  |  Support never replied to my three emails. Very frustrating.\n  positive  |  Best purchase I've made all year, highly recommend.\n  mixed     |  The app is okay but the notifications are way too noisy.\n  negative  |  Cancelled my subscription, it got too expensive for what it does.\n  positive  |  Setup was a breeze and the docs are excellent.\n  mixed     |  Works great on desktop but the mobile version is buggy.\n  positive  |  Thank you for the quick refund, really appreciated it.\n",
-          "timestamp": "2026-07-03T15:43:31.701138Z"
+          "display": "sequential: 3 rows in 2 ms (0 ms/row)\npool-map(4): 10 rows in 0 ms (0 ms/row)\nper-row speedup: 0.0x\n\n  negative  |  The checkout page kept crashing every time I tried to pay.\n  positive  |  Absolutely love the new dashboard, so much faster!\n  mixed     |  It's fine I guess, does what it says but nothing special.\n  negative  |  Support never replied to my three emails. Very frustrating.\n  positive  |  Best purchase I've made all year, highly recommend.\n  mixed     |  The app is okay but the notifications are way too noisy.\n  negative  |  Cancelled my subscription, it got too expensive for what it does.\n  positive  |  Setup was a breeze and the docs are excellent.\n  mixed     |  Works great on desktop but the mobile version is buggy.\n  positive  |  Thank you for the quick refund, really appreciated it.\n",
+          "timestamp": "2026-07-03T16:09:33.432265Z"
         },
         {
           "type": "value",
           "display": "",
           "sema_value": "nil",
-          "timestamp": "2026-07-03T15:43:31.701135Z",
-          "duration_ms": 9284
+          "timestamp": "2026-07-03T16:09:33.432264Z",
+          "duration_ms": 2
         }
       ]
     },
@@ -96,15 +115,15 @@
       "outputs": [
         {
           "type": "stdout",
-          "display": "first pass (cold): 3420 ms\nsecond pass (cached): 0 ms\ncache stats: {:hits 10 :misses 10 :size 10}\n",
-          "timestamp": "2026-07-03T15:43:35.125727Z"
+          "display": "first pass (cold): 0 ms\nsecond pass (cached): 0 ms\ncache stats: {:hits 0 :misses 20 :size 0}\n",
+          "timestamp": "2026-07-03T16:09:33.432601Z"
         },
         {
           "type": "value",
           "display": "",
           "sema_value": "nil",
-          "timestamp": "2026-07-03T15:43:35.125726Z",
-          "duration_ms": 3424
+          "timestamp": "2026-07-03T16:09:33.432601Z",
+          "duration_ms": 0
         }
       ]
     },
@@ -120,15 +139,15 @@
       "outputs": [
         {
           "type": "stdout",
-          "display": "budget tripped (fail-closed): async/all: task rejected: LLM error: token budget exceeded: used 117 of 100 tokens\n",
-          "timestamp": "2026-07-03T15:43:36.188808Z"
+          "display": "budget tripped (fail-closed): async/all: task rejected: User exception: {:message \"token budget exceeded: used 119 of 100 tokens\" :stack-trace ({:col 7 :line 21 :name \"classify-sentiment\"} {:name \"<lambda>\"}) :type :llm}\n",
+          "timestamp": "2026-07-03T16:09:33.432737Z"
         },
         {
           "type": "value",
           "display": "",
           "sema_value": "nil",
-          "timestamp": "2026-07-03T15:43:36.188806Z",
-          "duration_ms": 1063
+          "timestamp": "2026-07-03T16:09:33.432736Z",
+          "duration_ms": 0
         }
       ]
     },
@@ -144,15 +163,15 @@
       "outputs": [
         {
           "type": "stdout",
-          "display": "sentiment  | topic                | feedback\n------------------------------------------------------------\nnegative   | technical issue      | The checkout page kept crashing \npositive   | dashboard performanc | Absolutely love the new dashboar\nneutral    | product review       | It's fine I guess, does what it \n",
-          "timestamp": "2026-07-03T15:43:38.353166Z"
+          "display": "sentiment  | topic                | feedback\n------------------------------------------------------------\nnegative   | checkout/payment sys | The checkout page kept crashing \npositive   | dashboard performanc | Absolutely love the new dashboar\nneutral    | product review       | It's fine I guess, does what it \n",
+          "timestamp": "2026-07-03T16:09:33.432929Z"
         },
         {
           "type": "value",
           "display": "",
           "sema_value": "nil",
-          "timestamp": "2026-07-03T15:43:38.353163Z",
-          "duration_ms": 2164
+          "timestamp": "2026-07-03T16:09:33.432928Z",
+          "duration_ms": 0
         }
       ]
     },
@@ -168,14 +187,33 @@
       "outputs": [
         {
           "type": "stdout",
-          "display": "prompt tokens:     1118\ncompletion tokens: 188\ntotal tokens:      1306\ncost (USD):        0.002058\n",
-          "timestamp": "2026-07-03T15:43:38.353460Z"
+          "display": "prompt tokens:     1473\ncompletion tokens: 231\ntotal tokens:      1704\ncost (USD):        0.0026279999999999997\n",
+          "timestamp": "2026-07-03T16:09:33.433002Z"
         },
         {
           "type": "value",
           "display": "",
           "sema_value": "nil",
-          "timestamp": "2026-07-03T15:43:38.353460Z",
+          "timestamp": "2026-07-03T16:09:33.433002Z",
+          "duration_ms": 0
+        }
+      ]
+    },
+    {
+      "id": "c0cassave",
+      "type": "code",
+      "source": ";; Persist any newly-recorded responses to the cassette tape (no-op when\n;; everything replayed). This is what makes the next run deterministic.\n(when (not live-run?)\n  (llm/cassette-save)\n  (println \"cassette saved\"))",
+      "outputs": [
+        {
+          "type": "stdout",
+          "display": "cassette saved\n",
+          "timestamp": "2026-07-03T16:09:33.433066Z"
+        },
+        {
+          "type": "value",
+          "display": "",
+          "sema_value": "nil",
+          "timestamp": "2026-07-03T16:09:33.433066Z",
           "duration_ms": 0
         }
       ]

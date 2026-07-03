@@ -3,7 +3,7 @@
   "metadata": {
     "title": "Async Concurrency You Can See",
     "created": "2026-07-03T00:00:00Z",
-    "modified": "2026-07-03T15:47:36.017842Z",
+    "modified": "2026-07-03T16:11:57.370546Z",
     "sema_version": "1.28.1"
   },
   "cells": [
@@ -25,13 +25,13 @@
         {
           "type": "stdout",
           "display": "awaited result: 42\n",
-          "timestamp": "2026-07-03T15:47:33.551041Z"
+          "timestamp": "2026-07-03T16:11:54.894920Z"
         },
         {
           "type": "value",
           "display": "",
           "sema_value": "nil",
-          "timestamp": "2026-07-03T15:47:33.551030Z",
+          "timestamp": "2026-07-03T16:11:54.894905Z",
           "duration_ms": 0
         }
       ]
@@ -48,14 +48,14 @@
       "outputs": [
         {
           "type": "stdout",
-          "display": "sequential: 613 ms (sum of waits)\nconcurrent: 202 ms (max of waits)\n",
-          "timestamp": "2026-07-03T15:47:34.367617Z"
+          "display": "sequential: 610 ms (sum of waits)\nconcurrent: 205 ms (max of waits)\n",
+          "timestamp": "2026-07-03T16:11:55.711170Z"
         },
         {
           "type": "value",
           "display": "",
           "sema_value": "nil",
-          "timestamp": "2026-07-03T15:47:34.367615Z",
+          "timestamp": "2026-07-03T16:11:55.711168Z",
           "duration_ms": 816
         }
       ]
@@ -73,13 +73,13 @@
         {
           "type": "stdout",
           "display": "produced 0\nproduced 1\n  consumed 0\n  consumed 1\nproduced 4\nproduced 9\nproduced 16\n  consumed 4\n  consumed 9\n  consumed 16\nsum of squares: 30\n",
-          "timestamp": "2026-07-03T15:47:34.367939Z"
+          "timestamp": "2026-07-03T16:11:55.711425Z"
         },
         {
           "type": "value",
           "display": "",
           "sema_value": "nil",
-          "timestamp": "2026-07-03T15:47:34.367938Z",
+          "timestamp": "2026-07-03T16:11:55.711424Z",
           "duration_ms": 0
         }
       ]
@@ -97,14 +97,14 @@
         {
           "type": "stdout",
           "display": "worker step 0 — ticker is at 11\nworker step 1 — ticker is at 23\nworker step 2 — ticker is at 35\nworker step 3 — ticker is at 47\nticker total while worker ran: 47\n",
-          "timestamp": "2026-07-03T15:47:34.661409Z"
+          "timestamp": "2026-07-03T16:11:56.007426Z"
         },
         {
           "type": "value",
           "display": "",
           "sema_value": "nil",
-          "timestamp": "2026-07-03T15:47:34.661390Z",
-          "duration_ms": 293
+          "timestamp": "2026-07-03T16:11:56.007425Z",
+          "duration_ms": 295
         }
       ]
     },
@@ -120,14 +120,14 @@
       "outputs": [
         {
           "type": "stdout",
-          "display": "race winner: :fast after 60 ms\n",
-          "timestamp": "2026-07-03T15:47:34.722699Z"
+          "display": "race winner: :fast after 61 ms\n",
+          "timestamp": "2026-07-03T16:11:56.068804Z"
         },
         {
           "type": "value",
           "display": "",
           "sema_value": "nil",
-          "timestamp": "2026-07-03T15:47:34.722697Z",
+          "timestamp": "2026-07-03T16:11:56.068799Z",
           "duration_ms": 61
         }
       ]
@@ -144,15 +144,15 @@
       "outputs": [
         {
           "type": "stdout",
-          "display": "outcome: :cancelled after 185 ms (not 10000!)\nruntime healthy: :ok\n",
-          "timestamp": "2026-07-03T15:47:34.908927Z"
+          "display": "outcome: :cancelled after 182 ms (not 10000!)\nruntime healthy: :ok\n",
+          "timestamp": "2026-07-03T16:11:56.252019Z"
         },
         {
           "type": "value",
           "display": "",
           "sema_value": "nil",
-          "timestamp": "2026-07-03T15:47:34.908924Z",
-          "duration_ms": 186
+          "timestamp": "2026-07-03T16:11:56.252017Z",
+          "duration_ms": 183
         }
       ]
     },
@@ -168,15 +168,15 @@
       "outputs": [
         {
           "type": "stdout",
-          "display": "results (input order): (\"item-0\" \"item-1\" \"item-2\" \"item-3\" \"item-4\" \"item-5\")\n6 items, pool of 3: 146 ms\n",
-          "timestamp": "2026-07-03T15:47:35.056060Z"
+          "display": "results (input order): (\"item-0\" \"item-1\" \"item-2\" \"item-3\" \"item-4\" \"item-5\")\n6 items, pool of 3: 150 ms\n",
+          "timestamp": "2026-07-03T16:11:56.402597Z"
         },
         {
           "type": "value",
           "display": "",
           "sema_value": "nil",
-          "timestamp": "2026-07-03T15:47:35.056056Z",
-          "duration_ms": 147
+          "timestamp": "2026-07-03T16:11:56.402595Z",
+          "duration_ms": 150
         }
       ]
     },
@@ -192,15 +192,15 @@
       "outputs": [
         {
           "type": "stdout",
-          "display": "3 x 300ms subprocesses, concurrent: 317 ms\n",
-          "timestamp": "2026-07-03T15:47:35.373946Z"
+          "display": "3 x 300ms subprocesses, concurrent: 318 ms\n",
+          "timestamp": "2026-07-03T16:11:56.721229Z"
         },
         {
           "type": "value",
           "display": "",
           "sema_value": "nil",
-          "timestamp": "2026-07-03T15:47:35.373944Z",
-          "duration_ms": 317
+          "timestamp": "2026-07-03T16:11:56.721227Z",
+          "duration_ms": 318
         }
       ]
     },
@@ -212,14 +212,14 @@
         {
           "type": "stdout",
           "display": "ticks DURING the write+read+delete: 3\n",
-          "timestamp": "2026-07-03T15:47:35.642416Z"
+          "timestamp": "2026-07-03T16:11:56.991875Z"
         },
         {
           "type": "value",
           "display": "",
           "sema_value": "nil",
-          "timestamp": "2026-07-03T15:47:35.642412Z",
-          "duration_ms": 268
+          "timestamp": "2026-07-03T16:11:56.991874Z",
+          "duration_ms": 270
         }
       ]
     },
@@ -236,14 +236,14 @@
         {
           "type": "stdout",
           "display": "ticks DURING CPU-bound work: 0  (vs during file I/O above)\n",
-          "timestamp": "2026-07-03T15:47:36.017827Z"
+          "timestamp": "2026-07-03T16:11:57.370533Z"
         },
         {
           "type": "value",
           "display": "",
           "sema_value": "nil",
-          "timestamp": "2026-07-03T15:47:36.017823Z",
-          "duration_ms": 375
+          "timestamp": "2026-07-03T16:11:57.370531Z",
+          "duration_ms": 378
         }
       ]
     },

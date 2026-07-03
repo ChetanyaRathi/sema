@@ -3,7 +3,7 @@
   "metadata": {
     "title": "A Realtime Monitor: Channels as an Event Bus",
     "created": "2026-07-03T00:00:00Z",
-    "modified": "2026-07-03T15:47:37.775314Z",
+    "modified": "2026-07-03T16:11:59.429007Z",
     "sema_version": "1.28.1"
   },
   "cells": [
@@ -25,13 +25,13 @@
         {
           "type": "stdout",
           "display": "bus ready (capacity 256), alert threshold: 900\n",
-          "timestamp": "2026-07-03T15:47:36.031260Z"
+          "timestamp": "2026-07-03T16:11:57.381860Z"
         },
         {
           "type": "value",
           "display": "",
           "sema_value": "nil",
-          "timestamp": "2026-07-03T15:47:36.031258Z",
+          "timestamp": "2026-07-03T16:11:57.381858Z",
           "duration_ms": 0
         }
       ]
@@ -49,13 +49,13 @@
         {
           "type": "stdout",
           "display": "3 sensor tasks spawned (14 readings each; :pump spikes every 7th)\n",
-          "timestamp": "2026-07-03T15:47:36.031434Z"
+          "timestamp": "2026-07-03T16:11:57.382072Z"
         },
         {
           "type": "value",
           "display": "",
           "sema_value": "nil",
-          "timestamp": "2026-07-03T15:47:36.031434Z",
+          "timestamp": "2026-07-03T16:11:57.382072Z",
           "duration_ms": 0
         }
       ]
@@ -73,13 +73,13 @@
         {
           "type": "stdout",
           "display": "subprocess poller spawned (5 samples of shell RSS)\n",
-          "timestamp": "2026-07-03T15:47:36.031564Z"
+          "timestamp": "2026-07-03T16:11:57.382253Z"
         },
         {
           "type": "value",
           "display": "",
           "sema_value": "nil",
-          "timestamp": "2026-07-03T15:47:36.031564Z",
+          "timestamp": "2026-07-03T16:11:57.382252Z",
           "duration_ms": 0
         }
       ]
@@ -97,13 +97,13 @@
         {
           "type": "stdout",
           "display": "log writer + tailer spawned (10 lines, 8 polls)\n",
-          "timestamp": "2026-07-03T15:47:36.031925Z"
+          "timestamp": "2026-07-03T16:11:57.382575Z"
         },
         {
           "type": "value",
           "display": "",
           "sema_value": "nil",
-          "timestamp": "2026-07-03T15:47:36.031924Z",
+          "timestamp": "2026-07-03T16:11:57.382574Z",
           "duration_ms": 0
         }
       ]
@@ -121,14 +121,14 @@
         {
           "type": "stdout",
           "display": "ALERT  :pump reading 987 exceeds threshold 900\nmonitor running — first alerts fired above\n",
-          "timestamp": "2026-07-03T15:47:36.484624Z"
+          "timestamp": "2026-07-03T16:11:57.840612Z"
         },
         {
           "type": "value",
           "display": "",
           "sema_value": "nil",
-          "timestamp": "2026-07-03T15:47:36.484622Z",
-          "duration_ms": 452
+          "timestamp": "2026-07-03T16:11:57.840611Z",
+          "duration_ms": 458
         }
       ]
     },
@@ -145,14 +145,14 @@
         {
           "type": "stdout",
           "display": "ws echo ok: monitor-echo-check\nws source contributed 1 event(s)\n",
-          "timestamp": "2026-07-03T15:47:37.633446Z"
+          "timestamp": "2026-07-03T16:11:59.282315Z"
         },
         {
           "type": "value",
           "display": "",
           "sema_value": "nil",
-          "timestamp": "2026-07-03T15:47:37.633443Z",
-          "duration_ms": 1148
+          "timestamp": "2026-07-03T16:11:59.282313Z",
+          "duration_ms": 1441
         }
       ]
     },
@@ -169,14 +169,14 @@
         {
           "type": "stdout",
           "display": "ALERT  :pump reading 962 exceeds threshold 900\nbus closed — aggregator drained 54 events from 6 sources\ntemp log file removed\n",
-          "timestamp": "2026-07-03T15:47:37.774750Z"
+          "timestamp": "2026-07-03T16:11:59.428740Z"
         },
         {
           "type": "value",
           "display": "",
           "sema_value": "nil",
-          "timestamp": "2026-07-03T15:47:37.774747Z",
-          "duration_ms": 141
+          "timestamp": "2026-07-03T16:11:59.428739Z",
+          "duration_ms": 146
         }
       ]
     },
@@ -192,14 +192,14 @@
       "outputs": [
         {
           "type": "stdout",
-          "display": "+-----------+--------+-----------+---------+--------+\n| source    | events |      mean |     max | alerts |\n+-----------+--------+-----------+---------+--------+\n| :load     |     14 |      56.5 |      77 |      0 |\n| :logfile  |      6 |       1.7 |       2 |      0 |\n| :proc     |      5 |    1510.4 |    1616 |      0 |\n| :pump     |     14 |     189.5 |     987 |      2 |\n| :temp     |     14 |      55.6 |      74 |      0 |\n| :ws       |      1 |      18.0 |      18 |      0 |\n+-----------+--------+-----------+---------+--------+\ntotal events: 54   total alerts: 2\n",
-          "timestamp": "2026-07-03T15:47:37.775307Z"
+          "display": "+-----------+--------+-----------+---------+--------+\n| source    | events |      mean |     max | alerts |\n+-----------+--------+-----------+---------+--------+\n| :load     |     14 |      56.5 |      77 |      0 |\n| :logfile  |      6 |       1.7 |       2 |      0 |\n| :proc     |      5 |    1440.0 |    1440 |      0 |\n| :pump     |     14 |     189.5 |     987 |      2 |\n| :temp     |     14 |      55.6 |      74 |      0 |\n| :ws       |      1 |      18.0 |      18 |      0 |\n+-----------+--------+-----------+---------+--------+\ntotal events: 54   total alerts: 2\n",
+          "timestamp": "2026-07-03T16:11:59.429004Z"
         },
         {
           "type": "value",
           "display": "",
           "sema_value": "nil",
-          "timestamp": "2026-07-03T15:47:37.775305Z",
+          "timestamp": "2026-07-03T16:11:59.429003Z",
           "duration_ms": 0
         }
       ]
