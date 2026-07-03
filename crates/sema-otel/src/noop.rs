@@ -62,6 +62,11 @@ pub fn activate(_mode: TelemetryMode) -> Option<OtelGuard> {
 
 pub struct ConversationGuard;
 
+impl ConversationGuard {
+    /// Noop mirror of the real guard's non-restoring consume (cancelled-run reap).
+    pub fn defuse(self) {}
+}
+
 pub fn set_conversation_scope(
     _conversation_id: &str,
     _session_id: Option<&str>,
@@ -163,6 +168,8 @@ impl AgentSpan {
     pub fn set_tags(&self, _tags: &[String]) {}
     pub fn set_metadata(&self, _meta: &[(String, String)]) {}
     pub fn record_error(&self, _kind: &str, _msg: &str) {}
+    /// Noop mirror of the real span's stack-free end (cancelled-run reap).
+    pub fn end_unstacked(self) {}
 }
 
 pub struct RetrieverSpan;

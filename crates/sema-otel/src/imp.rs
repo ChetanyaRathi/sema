@@ -251,6 +251,21 @@ impl Drop for ConversationGuard {
     }
 }
 
+impl ConversationGuard {
+    /// Consume the guard WITHOUT restoring the previous ids. For reaping a
+    /// CANCELLED agent run: the saved prev ids belong to the cancelled task's
+    /// per-task context (destroyed with the task), while the ids currently
+    /// installed belong to whoever drove the cancellation — a normal drop would
+    /// overwrite the driver's ids with the dead task's. Leak-free: the saved
+    /// strings are released here; only the restoring `Drop` is skipped.
+    pub fn defuse(mut self) {
+        self.prev_conv = None;
+        self.prev_session = None;
+        self.prev_user = None;
+        std::mem::forget(self);
+    }
+}
+
 /// Open a conversation scope. `session_id` defaults to the conversation id (so a single
 /// run groups in session-aware backends like Langfuse); `user_id` is inherited when
 /// `None`. Every span started while the returned guard is alive carries
@@ -1420,6 +1435,16 @@ impl AgentSpan {
     pub fn record_error(&self, kind: &str, msg: &str) {
         if let Some(c) = &self.inner {
             c.record_error(kind, msg);
+        }
+    }
+    /// End this span WITHOUT popping the thread-local span stack. For reaping a
+    /// CANCELLED agent run: the span's pushed context lives on the cancelled
+    /// task's saved span stack (destroyed with the task), while the stack
+    /// currently installed belongs to whoever drove the cancellation — a normal
+    /// (popping) end would mis-pop an unrelated span and corrupt that trace.
+    pub fn end_unstacked(mut self) {
+        if let Some(mut core) = self.inner.take() {
+            core.detached = true;
         }
     }
 }

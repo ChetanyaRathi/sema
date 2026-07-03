@@ -1393,6 +1393,14 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
     // sema-core). Idempotent — just sets two thread-local fn pointers.
     sema_core::set_mcp_cassette_hook(mcp_cassette_decide, mcp_cassette_record);
 
+    // Reclaim non-blocking agent-run slab entries owned by a CANCELLED task
+    // (whose `__agent-finish` can never run) the moment the scheduler reaps it —
+    // ending the agent span balanced on the VM thread instead of leaking the
+    // entry (and its telemetry) until `reset_runtime_state`. Same type-erased
+    // fn-pointer seam as the callbacks above; idempotent. Invariant I2 holds:
+    // a plain `fn`, captures nothing.
+    sema_core::set_task_reaped_callback(reap_cancelled_agent_runs);
+
     // CI/global cassette: SEMA_LLM_CASSETTE=path [+ SEMA_LLM_CASSETTE_MODE=replay|
     // record|auto] installs a cassette for the whole process, so a suite can be
     // forced into deterministic replay without touching test source. Only honored
@@ -7399,6 +7407,13 @@ struct AgentLoopState {
     /// `Drop` can forget it when the otel thread-locals are already gone (see below).
     agent_span: Option<sema_otel::AgentSpan>,
     conv_guard: Option<sema_otel::ConversationGuard>,
+    /// The scheduler task this run's driver loop executes on (captured in
+    /// `__agent-begin`); `None` for a top-level (non-task) run. When that task is
+    /// CANCELLED its bytecode never resumes, so `__agent-finish` never fires —
+    /// the task-reaped sweep (`reap_cancelled_agent_runs`) matches on this id to
+    /// reclaim the entry (and end its span) instead of leaking it until
+    /// `reset_runtime_state`.
+    owning_task_id: Option<u64>,
 }
 
 impl Drop for AgentLoopState {
@@ -7432,6 +7447,52 @@ thread_local! {
 fn clear_agent_runs() {
     AGENT_RUNS.with(|r| r.borrow_mut().clear());
     AGENT_RUN_NEXT_ID.with(|c| c.set(1));
+}
+
+/// Test instrumentation: the number of live entries in the non-blocking agent-run
+/// slab. A settled scheduler must leave this at 0 — normal exit and Sema errors go
+/// through `__agent-finish`, and a cancelled task's entries are reclaimed by
+/// [`reap_cancelled_agent_runs`].
+pub fn agent_runs_len() -> usize {
+    AGENT_RUNS.with(|r| r.borrow().len())
+}
+
+/// Task-reaped sweep (registered via `sema_core::set_task_reaped_callback`): when
+/// the scheduler cancels a task it will never resume, remove every slab entry that
+/// task owns. `__agent-finish` cannot run for a cancelled task (its bytecode is
+/// gone), so this is the entry's only reclamation point before
+/// `reset_runtime_state`. Runs on the VM thread with OTel TLS alive, but with the
+/// CANCELLER's otel context installed — not the dead task's — so the span/scope
+/// guards must not touch the installed stack/ids:
+/// - the agent span ends via `end_unstacked` (its pushed context lives on the dead
+///   task's saved span stack; a popping end would mis-pop the canceller's stack);
+/// - the conversation guard is `defuse`d (restoring its saved prev ids would
+///   clobber the canceller's).
+///
+/// Idempotent by absence in both directions: after `__agent-finish` removed the
+/// entry this sweep finds nothing, and a late finish after this sweep is the
+/// existing idempotent no-op. Entries with `owning_task_id: None` are untouched.
+fn reap_cancelled_agent_runs(task_id: u64) {
+    let reaped: Vec<AgentLoopState> = AGENT_RUNS.with(|r| {
+        let mut slab = r.borrow_mut();
+        let tokens: Vec<u64> = slab
+            .iter()
+            .filter(|(_, st)| st.owning_task_id == Some(task_id))
+            .map(|(k, _)| *k)
+            .collect();
+        tokens.into_iter().filter_map(|t| slab.remove(&t)).collect()
+    });
+    for mut st in reaped {
+        if let Some(span) = st.agent_span.take() {
+            span.record_error("cancelled", "agent run cancelled");
+            span.end_unstacked();
+        }
+        if let Some(guard) = st.conv_guard.take() {
+            guard.defuse();
+        }
+        // The rest (messages, tool Values, closures) drops here; `Drop` sees both
+        // guards already taken.
+    }
 }
 
 /// Extract the integer handle token from a `__agent-*` native's args.
@@ -7609,6 +7670,7 @@ fn agent_begin(args: &[Value]) -> Result<Value, SemaError> {
         agent_model: agent.model.clone(),
         agent_span: Some(agent_span),
         conv_guard,
+        owning_task_id: sema_core::current_task_id(),
     };
 
     let token = AGENT_RUN_NEXT_ID.with(|c| {
