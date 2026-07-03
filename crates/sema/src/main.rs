@@ -158,7 +158,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Parse source and display the AST
+    /// Parse source and print the AST
     Ast {
         /// File to parse
         file: Option<String>,
@@ -180,7 +180,7 @@ enum Commands {
         #[arg(long)]
         install: bool,
     },
-    /// Compile source to bytecode (.semac) — imports resolve at runtime from the filesystem
+    /// Compile source to bytecode (.semac); imports resolve at runtime
     Compile {
         /// Source file to compile
         file: String,
@@ -193,7 +193,7 @@ enum Commands {
         #[arg(long)]
         check: bool,
     },
-    /// Disassemble a compiled bytecode file
+    /// Disassemble a .semac bytecode file
     Disasm {
         /// Bytecode file to disassemble
         file: String,
@@ -202,7 +202,7 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
-    /// Browse builtin and special-form documentation
+    /// Browse builtin and special-form docs
     #[command(args_conflicts_with_subcommands = true)]
     Doc {
         /// Show docs in a pager even when the output fits on one screen
@@ -219,12 +219,12 @@ enum Commands {
         /// Symbol to show documentation for (implicit `show`)
         symbol: Option<String>,
     },
-    /// Package manager
+    /// Manage packages
     Pkg {
         #[command(subcommand)]
         command: PkgCommands,
     },
-    /// Build a standalone executable with all dependencies bundled
+    /// Build a standalone executable with dependencies bundled
     Build {
         /// Source file to compile and bundle
         #[arg(required_unless_present = "list_targets")]
@@ -284,11 +284,11 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
-    /// Start the Language Server Protocol server
+    /// Start the Language Server Protocol (LSP) server
     Lsp,
-    /// Start the Debug Adapter Protocol server
+    /// Start the Debug Adapter Protocol (DAP) server
     Dap,
-    /// Start the MCP server, or manage MCP client auth (`mcp login`/`logout`)
+    /// Start the Model Context Protocol (MCP) server, or manage client auth (`login`/`logout`)
     #[command(args_conflicts_with_subcommands = true)]
     Mcp {
         /// Client-auth subcommand; when omitted, runs the MCP server
@@ -304,12 +304,12 @@ enum Commands {
         #[arg(long, value_name = "TOOLS")]
         exclude: Option<String>,
     },
-    /// Notebook interface — cell-based evaluation with browser UI
+    /// Cell-based notebook with a browser UI
     Notebook {
         #[command(subcommand)]
         command: NotebookCommands,
     },
-    /// Dev server for a sema-web app — serves it in the browser with a native LLM proxy
+    /// Serve a sema-web app in the browser with a native LLM proxy
     Web {
         /// Path to the app's entry `.sema` file
         file: String,
@@ -327,12 +327,12 @@ enum Commands {
         #[arg(long)]
         no_llm: bool,
     },
-    /// Dynamic workflows — run journaled workflows and view their runs
+    /// Run journaled workflows and view their runs
     Workflow {
         #[command(subcommand)]
         command: WorkflowCommands,
     },
-    /// Evaluate code and return results (designed for machine consumption by editors/LSP)
+    /// Evaluate an expression or program and print the result
     Eval {
         /// Read program from stdin instead of --expr
         #[arg(long)]
