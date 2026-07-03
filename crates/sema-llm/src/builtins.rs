@@ -7336,10 +7336,7 @@ fn chat_messages_to_sema_list(messages: &[ChatMessage]) -> Value {
                         // round-trip too, or a :messages/:session continuation
                         // re-sends the turn without it and Gemini 400s.
                         if let Some(ref sig) = tc.thought_signature {
-                            m.insert(
-                                Value::keyword("thought-signature"),
-                                Value::string(sig),
-                            );
+                            m.insert(Value::keyword("thought-signature"), Value::string(sig));
                         }
                         Value::map(m)
                     })

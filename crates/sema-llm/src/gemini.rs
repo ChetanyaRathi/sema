@@ -240,8 +240,7 @@ impl GeminiProvider {
                     // original functionCall part — Gemini 2.5+ rejects a resent
                     // tool-call turn without it (400 INVALID_ARGUMENT).
                     if let Some(sig) = &tc.thought_signature {
-                        part["thoughtSignature"] =
-                            serde_json::Value::String(sig.clone());
+                        part["thoughtSignature"] = serde_json::Value::String(sig.clone());
                     }
                     parts.push(part);
                 }
@@ -590,11 +589,11 @@ mod tests {
                 },
             ],
         ));
-        let body = provider.build_request_body(&ChatRequest::new(
-            "gemini-2.5-flash".to_string(),
-            messages,
-        ));
-        let parts = body["contents"][1]["parts"].as_array().expect("model parts");
+        let body = provider
+            .build_request_body(&ChatRequest::new("gemini-2.5-flash".to_string(), messages));
+        let parts = body["contents"][1]["parts"]
+            .as_array()
+            .expect("model parts");
         assert_eq!(
             parts[0]["thoughtSignature"], "sig-abc",
             "signature must be echoed as a sibling of functionCall"
