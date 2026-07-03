@@ -8055,6 +8055,19 @@ struct StreamRunState {
     pending_error: Option<String>,
 }
 
+impl Drop for StreamRunState {
+    fn drop(&mut self) {
+        // Normal path (finalize already took the span, or `reset_runtime_state`
+        // during eval): let the detached span end with the otel thread-locals
+        // alive. Thread teardown of a leaked (cancelled) run: forget the span
+        // rather than let its `Drop` touch dead TLS and abort the process
+        // (mirrors `AgentLoopState`).
+        if !sema_otel::tls_alive() {
+            std::mem::forget(self.span.take());
+        }
+    }
+}
+
 thread_local! {
     /// Live non-blocking stream runs, keyed by the integer token handed to Sema.
     static STREAM_RUNS: RefCell<std::collections::HashMap<u64, StreamRunState>> =
@@ -8539,14 +8552,15 @@ fn stream_next(token: u64) -> Result<Value, SemaError> {
 /// the assembled content (usage was already accounted, exactly once, when the
 /// poller finalized the `Done`).
 fn stream_finish(token: u64) -> Result<Value, SemaError> {
-    let st = STREAM_RUNS
+    let mut st = STREAM_RUNS
         .with(|r| r.borrow_mut().remove(&token))
         .ok_or_else(|| SemaError::Llm("stream-run handle not found".to_string()))?;
-    if let Some(msg) = st.pending_error {
+    if let Some(msg) = st.pending_error.take() {
         return Err(SemaError::Llm(msg));
     }
     let resp = st
         .response
+        .take()
         .ok_or_else(|| SemaError::Llm("stream not finished".to_string()))?;
     Ok(Value::string(&resp.content))
 }
@@ -8557,14 +8571,15 @@ fn stream_finish(token: u64) -> Result<Value, SemaError> {
 /// unchanged (tool-call handling identical to a non-streaming round; usage was
 /// accounted by the stream poller).
 fn agent_stream_apply(agent_token: u64, stream_token: u64) -> Result<Value, SemaError> {
-    let st = STREAM_RUNS
+    let mut st = STREAM_RUNS
         .with(|r| r.borrow_mut().remove(&stream_token))
         .ok_or_else(|| SemaError::Llm("stream-run handle not found".to_string()))?;
-    if let Some(msg) = st.pending_error {
+    if let Some(msg) = st.pending_error.take() {
         return Err(SemaError::Llm(msg));
     }
     let resp = st
         .response
+        .take()
         .ok_or_else(|| SemaError::Llm("stream not finished".to_string()))?;
     agent_apply_step_response(agent_token, resp)
 }

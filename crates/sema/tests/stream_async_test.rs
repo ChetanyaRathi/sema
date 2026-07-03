@@ -321,3 +321,44 @@ fn async_stream_mid_stream_error_after_partial_deltas() {
         "no auto-retry on mid-stream failure"
     );
 }
+
+/// Cancelling a task parked mid-stream (via `async/timeout`) abandons the run
+/// (best-effort: the wire worker streams to completion into a dead channel,
+/// discarded) and leaves the runtime healthy — a fresh stream completes.
+#[test]
+fn cancelled_stream_is_cut_short_and_runtime_stays_healthy() {
+    // 40 chunks x 50 ms ≈ 2 s stream against a 150 ms timeout.
+    let chunks: Vec<String> = (0..40).map(|i| format!("s{i}")).collect();
+    let refs: Vec<&str> = chunks.iter().map(|s| s.as_str()).collect();
+    let fake = FakeProvider::builder("fake")
+        .model("fake-model")
+        .stream(&refs)
+        .stream_chunk_delay(50)
+        .stream(&["ok"])
+        .build();
+
+    let program = r#"
+        (define got 0)
+        (try (async/timeout 150
+               (async/spawn (fn ()
+                 (llm/stream "slow" (fn (c) (set! got (+ got 1)))))))
+             (catch e nil))
+        (define out "")
+        (async/await (async/spawn (fn ()
+          (llm/stream "again" (fn (c) (set! out (string-append out c)))))))
+        (list got out)
+    "#;
+    let (result, _) = eval_with_fake(program, fake);
+    let val = result.expect("cancelled stream + follow-up evaluated");
+    let items = val.as_seq().expect("list result");
+    let got = items[0].as_int().unwrap_or(-1);
+    assert!(
+        got < 40,
+        "timeout must cut the stream short (saw {got} of 40 deltas)"
+    );
+    assert_eq!(
+        items[1].as_str(),
+        Some("ok"),
+        "a fresh stream after the cancellation completes normally"
+    );
+}
