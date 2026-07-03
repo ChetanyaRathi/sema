@@ -9,12 +9,12 @@ fn serves_vendored_sema_ui_bundle() {
     assert!(asset.is_some(), "vendored @sema/ui bundle must be served");
     let (body, ct) = asset.unwrap();
     assert!(
-        body.contains("sema-code-editor"),
+        body.contains("sema-editor"),
         "bundle should define the editor element",
     );
     assert!(
-        body.contains("sema-editable-markdown"),
-        "bundle should define the markdown compound element",
+        body.contains("sema-markdown"),
+        "bundle should define the markdown renderer element",
     );
     assert_eq!(ct, "application/javascript");
 }
