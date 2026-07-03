@@ -407,6 +407,10 @@ fn resolve_diamond_conflict(
 /// close to this.
 const MAX_RESOLUTION_STEPS: usize = 10_000;
 
+/// Reads a package's own `[deps]` (name → version/ref spec) by name. Injected
+/// into `resolve_dependency_graph` so the graph walk stays unit-testable.
+type ReadManifestDeps<'a> = dyn Fn(&str) -> Result<BTreeMap<String, String>, String> + 'a;
+
 /// Walk the full transitive dependency graph starting from `direct_deps`,
 /// resolving/installing each package exactly once and reconciling conflicts
 /// per `resolve_diamond_conflict`. All I/O is injected so this is
@@ -418,7 +422,7 @@ fn resolve_dependency_graph(
     existing_lock: &LockFile,
     install_fresh: &mut dyn FnMut(&str, &str) -> Result<LockEntry, String>,
     install_locked: &mut dyn FnMut(&str, &LockEntry) -> Result<(), String>,
-    read_manifest_deps: &dyn Fn(&str) -> Result<BTreeMap<String, String>, String>,
+    read_manifest_deps: &ReadManifestDeps,
 ) -> Result<(LockFile, Vec<String>, Vec<ResolutionNote>), String> {
     let mut resolved: BTreeMap<String, ResolvedPkg> = BTreeMap::new();
     let mut notes = Vec::new();
