@@ -129,6 +129,11 @@ export class SemaCodeEditor extends SemaElement {
     this._undo?.reset();
   }
 
+  /** Focus delegates to the inner textarea (the host itself isn't focusable). */
+  focus() {
+    this._ta?.focus();
+  }
+
   updated(changed: Map<string, unknown>) {
     if (changed.has('value') && this.autosize) this._grow();
   }
@@ -140,7 +145,10 @@ export class SemaCodeEditor extends SemaElement {
     t.style.height = `${t.scrollHeight}px`;
   }
 
-  private _onInput = () => {
+  private _onInput = (e?: Event) => {
+    // Stop the inner textarea's native `input` at the boundary — we re-emit a
+    // typed CustomEvent below, so consumers never see the value-less native one.
+    e?.stopPropagation();
     const t = this._ta;
     if (!t) return;
     this.value = t.value;
@@ -150,7 +158,8 @@ export class SemaCodeEditor extends SemaElement {
     );
   };
 
-  private _onChange = () => {
+  private _onChange = (e?: Event) => {
+    e?.stopPropagation();
     this.dispatchEvent(
       new CustomEvent('change', { detail: { value: this.value }, bubbles: true, composed: true }),
     );
