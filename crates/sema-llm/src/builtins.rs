@@ -328,6 +328,9 @@ struct LispProviderCallbacks {
 /// Reset LLM runtime state used by builtins.
 /// Called by interpreter construction to avoid cross-instance leakage.
 pub fn reset_runtime_state() {
+    // Install THE process-wide I/O pool (ADR #69) so lib tests that reset LLM
+    // state without a full interpreter still offload onto the one pool.
+    sema_io::install();
     PROVIDER_REGISTRY.with(|r| *r.borrow_mut() = ProviderRegistry::new());
     SESSION_USAGE.with(|u| *u.borrow_mut() = Usage::default());
     LAST_USAGE.with(|u| *u.borrow_mut() = None);
@@ -1260,6 +1263,10 @@ fn guard_provider_url(unrestricted: bool, opts: &BTreeMap<Value, Value>) -> Resu
 
 pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
     let unrestricted = sandbox.is_unrestricted();
+
+    // Install THE process-wide I/O pool behind the sema-core executor seam
+    // (ADR #69). Idempotent, first-wins.
+    sema_io::install();
 
     // Wire the per-task otel context-swap callbacks into sema-core so the
     // cooperative scheduler (sema-vm, which can't depend on sema-otel) can swap

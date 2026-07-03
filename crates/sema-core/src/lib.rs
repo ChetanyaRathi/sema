@@ -4,6 +4,7 @@ pub mod async_signal;
 pub mod context;
 pub mod error;
 pub mod home;
+pub mod io_backend;
 pub mod json;
 pub mod mcp_cassette;
 pub mod net;
@@ -34,6 +35,10 @@ pub use context::{
 };
 pub use error::{CallFrame, SemaError, Span, SpanMap, StackTrace};
 pub use home::sema_home;
+pub use io_backend::{
+    io_backend, io_block_on, io_spawn, io_spawn_blocking, set_io_backend, AbortHook, BoxIoFuture,
+    IoBackend,
+};
 pub use json::{json_to_value, key_to_string, value_to_json, value_to_json_lossy};
 pub use lasso::Spur;
 pub use mcp_cassette::{
