@@ -113,6 +113,17 @@ test-notebook-e2e: build
 	@echo "=== Running notebook E2E tests ==="
 	cd crates/sema-notebook/tests/e2e && npx playwright test
 
+# Build @sema/ui and vendor its bundle into the notebook crate, where it is
+# embedded via include_str! (single-binary, offline — like the bundled fonts).
+# Re-run after changing anything under ui/. Naive copy: only the main bundle is
+# vendored; lazily-loaded Shiki grammar chunks aren't served, so non-`sema` code
+# fences in markdown degrade to unhighlighted (the `sema` grammar is bundled).
+notebook-ui-vendor:
+	cd ui && npm run build
+	mkdir -p crates/sema-notebook/src/ui/vendor
+	cp ui/dist/sema-ui.js crates/sema-notebook/src/ui/vendor/sema-ui.js
+	@echo "Vendored ui/dist/sema-ui.js -> crates/sema-notebook/src/ui/vendor/sema-ui.js"
+
 # E2E for the `sema web` dev server: vendor the browser runtime, build the
 # release binary (which embeds it), then drive the real server in a browser.
 test-web-e2e: web-runtime

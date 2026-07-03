@@ -114,9 +114,14 @@ export class SemaMarkdown extends SemaElement {
       if (canHighlight(lang)) {
         const decoded = decodeEntities(body);
         jobs.push(
-          highlightToHtml(decoded, lang).then((code) => {
-            parts[idx] = `<pre><code>${code}</code></pre>`;
-          }),
+          highlightToHtml(decoded, lang)
+            .then((code) => {
+              parts[idx] = `<pre><code>${code}</code></pre>`;
+            })
+            // A lazily-loaded grammar chunk may be absent (e.g. the notebook
+            // vendors only the main bundle). Degrade this one fence to marked's
+            // default output instead of failing the whole document.
+            .catch(() => {}),
         );
       }
     }
