@@ -801,9 +801,15 @@ agent's in-flight round is dropped mid-flight — connection torn down
 (`run_fallback_retry_async` + per-provider `complete_future`; gate:
 `llm_request_is_aborted_on_timeout`). Best-effort remains for sync-only
 providers (the `complete_future` default impl, e.g. FakeProvider) and for the
-STREAMING wire stage (`spawn_blocking(provider.stream)`, no abort hook): a task
-cancelled mid-stream abandons its stream-run slab entry and the wire worker
-streams to completion into a dead channel. Per-task budget-across-yield under
+STREAMING wire stage (`spawn_blocking(provider.stream)`, no abort hook): the
+wire worker streams to completion into a dead channel — but the cancelled
+task's `STREAM_RUNS` slab entry (and the detached chat span it owns) is reaped
+by the same task-reaped sweep that reclaims agent runs (gate:
+`cancelled_stream_slab_entries_are_reaped`). One error-shape asymmetry to know:
+a failing offloaded LEAF (http/shell/file, and a completion round) rejects the
+whole task at its yield point — an in-task `try` around just that call does not
+catch it — whereas a mid-STREAM failure is delivered as an ordinary catchable
+error from the next `__stream-next`. Per-task budget-across-yield under
 concurrent spawned agents
 is a pre-existing single-completion ASYNC-1 gap, closed separately (plan Step 7).
 ~~Cancelled agents leak their slab entry (and never-ended agent span) until

@@ -3369,6 +3369,11 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
             // The provider name + canonical price are needed on the VM thread in
             // the poller; capture them before the Arc is moved into the worker.
             let provider_name = provider.name().to_string();
+            // Capture the dispatch-time budget + leaf-usage frames (ASYNC-1), so the
+            // poller charges the frames active NOW — not whatever scope is installed
+            // when the future lands. Mirrors do_complete_async_yield.
+            let usage_accum_slot = current_usage_accum();
+            let budget_slot = active_budget();
             let (tx, mut rx) = tokio::sync::oneshot::channel::<Result<EmbedResponse, LlmError>>();
             let req2 = request.clone();
             // Spawned pool future (the http/shell abort tier): providers with a
@@ -3433,10 +3438,31 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
                             // session-usage / budget thread-locals and reads static
                             // pricing — it never spawns, yields, or touches the
                             // scheduler — so it is safe to call here inside
-                            // `wake_blocked_tasks`'s `&mut self.tasks` borrow. A budget
+                            // `wake_blocked_tasks`'s `&mut self.tasks` borrow. Fold into
+                            // the CAPTURED leaf-usage frame and charge the CAPTURED
+                            // budget frame (ASYNC-1, mirroring the completion poller):
+                            // the poller runs outside the per-task install boundary, so
+                            // the live thread-locals may belong to a sibling. A budget
                             // overrun fails the task, exactly as the sync path's `?`.
+                            if let Some(slot) = &usage_accum_slot {
+                                let cost = pricing::calculate_cost_for(&provider_name, &resp.usage);
+                                accumulate_into(slot, &resp.usage, cost);
+                            }
                             let value = embed_value_from_response(&resp, single);
-                            match track_usage(&resp.usage) {
+                            let track_result = {
+                                let prev_budget = ACTIVE_BUDGET.with(|b| {
+                                    std::mem::replace(&mut *b.borrow_mut(), budget_slot.clone())
+                                });
+                                let r = USAGE_ACCUM_SUPPRESS.with(|s| {
+                                    s.set(true);
+                                    let r = track_usage(&resp.usage);
+                                    s.set(false);
+                                    r
+                                });
+                                ACTIVE_BUDGET.with(|b| *b.borrow_mut() = prev_budget);
+                                r
+                            };
+                            match track_result {
                                 Ok(()) => sema_core::IoPoll::Ready(Ok(value)),
                                 Err(e) => sema_core::IoPoll::Ready(Err(e.to_string())),
                             }
@@ -6335,9 +6361,20 @@ fn do_complete_async_yield(
     // pay one extra 400+retry on temperature-rejecting models. Correctness
     // holds; documented as a minor async-path divergence.
     // Bump in-flight + peak on spawn so a test can prove simultaneity (mirrors the
-    // io-sleep-once spike instrumentation).
+    // io-sleep-once spike instrumentation). The balancing guard is constructed
+    // HERE and moved into the future: an abort that lands before the future's
+    // first poll still drops the future — and the captured guard with it — so
+    // the gauge cannot strand at +1.
+    struct InflightGuard;
+    impl Drop for InflightGuard {
+        fn drop(&mut self) {
+            let _ = IO_INFLIGHT
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| Some((v - 1).max(0)));
+        }
+    }
     let prev = IO_INFLIGHT.fetch_add(1, Ordering::SeqCst) + 1;
     IO_PEAK.fetch_max(prev, Ordering::SeqCst);
+    let inflight = InflightGuard;
     // Offloaded as a SPAWNED POOL FUTURE (the http/shell abort tier), not
     // spawn_blocking: native-async providers are dropped mid-flight on abort —
     // the in-flight request's connection is torn down, no wasted round-trip.
@@ -6345,14 +6382,7 @@ fn do_complete_async_yield(
     // inside `complete_once_async`, where cancel stays best-effort.
     let abort = sema_io::io_spawn(async move {
         // Balance in-flight on EVERY exit — normal completion or abort-drop.
-        struct InflightGuard;
-        impl Drop for InflightGuard {
-            fn drop(&mut self) {
-                let _ = IO_INFLIGHT
-                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| Some((v - 1).max(0)));
-            }
-        }
-        let _inflight = InflightGuard;
+        let _inflight = inflight;
         let r = run_fallback_retry_async(chain, req2, max_retries, retry_base_ms).await;
         let _ = tx.send(r);
         sema_core::notify_io_complete();
@@ -7628,6 +7658,11 @@ pub fn agent_runs_len() -> usize {
     AGENT_RUNS.with(|r| r.borrow().len())
 }
 
+/// Test instrumentation: number of live stream-run slab entries.
+pub fn stream_runs_len() -> usize {
+    STREAM_RUNS.with(|r| r.borrow().len())
+}
+
 /// Task-reaped sweep (registered via `sema_core::set_task_reaped_callback`): when
 /// the scheduler cancels a task it will never resume, remove every slab entry that
 /// task owns. `__agent-finish` cannot run for a cancelled task (its bytecode is
@@ -7663,6 +7698,28 @@ fn reap_cancelled_agent_runs(task_id: u64) {
         }
         // The rest (messages, tool Values, closures) drops here; `Drop` sees both
         // guards already taken.
+    }
+    // The stream-run slab is owned by the same tasks (an :on-text agent round or a
+    // standalone `llm/stream`) and leaks the same way on cancel — including the
+    // DETACHED chat span each entry holds. The seam is single-slot, so this one
+    // callback sweeps both slabs. Detached spans end without touching the
+    // installed (canceller's) span stack, so a plain end is safe here.
+    let stream_reaped: Vec<StreamRunState> = STREAM_RUNS.with(|r| {
+        let mut slab = r.borrow_mut();
+        let tokens: Vec<u64> = slab
+            .iter()
+            .filter(|(_, st)| st.owning_task_id == Some(task_id))
+            .map(|(k, _)| *k)
+            .collect();
+        tokens.into_iter().filter_map(|t| slab.remove(&t)).collect()
+    });
+    for mut st in stream_reaped {
+        if let Some(span) = st.span.take() {
+            span.record_error("cancelled", "stream cancelled");
+        }
+        // The wire worker (if still running) streams into a dead channel and
+        // releases its admission permit when the provider stream ends —
+        // documented best-effort for the sync stream stage.
     }
 }
 
@@ -8209,6 +8266,10 @@ struct StreamRunState {
     /// The assembled response, set once `Done(Ok)` has been finalized.
     response: Option<ChatResponse>,
     done: bool,
+    /// The scheduler task that opened this run (None outside a task). The
+    /// task-reaped sweep reclaims entries by this id when their task is
+    /// cancelled — `__stream-finish` cannot run for a cancelled task.
+    owning_task_id: Option<u64>,
     /// A failure that arrived in a batch that still carried deltas: stored so the
     /// driver delivers those deltas to the callback first, then raised (and the
     /// entry dropped) on the next `__stream-next`/`__stream-finish`.
@@ -8434,6 +8495,7 @@ fn stream_run_begin(request: ChatRequest, span: sema_otel::LlmSpan) -> Result<Va
         first_token_seen: false,
         response: None,
         done: false,
+        owning_task_id: sema_core::current_task_id(),
         pending_error: None,
     };
     let token = STREAM_RUN_NEXT_ID.with(|c| {

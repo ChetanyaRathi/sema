@@ -560,3 +560,42 @@ fn budget_enforced_across_spawn_and_yield() {
         "a spawned completion must charge the captured budget frame and raise on overrun"
     );
 }
+
+/// Embed parity for the ASYNC-1 captured-frame accounting: an `llm/embed` inside
+/// an `async/spawn`'d task under `llm/with-budget` must charge the DISPATCH-TIME
+/// budget frame in the poller — the same guarantee `llm/complete` has
+/// (`budget_enforced_across_spawn_and_yield`). Previously the embed poller
+/// charged whatever budget scope was live when the future landed.
+#[test]
+#[serial]
+fn embed_budget_enforced_across_spawn_and_yield() {
+    let _cap = sema_otel::testing::install();
+    reset_io_inflight();
+
+    let fake = FakeProvider::builder("fake")
+        .model("fake-embed")
+        .embed_delay(50)
+        .embed_with_tokens(vec![vec![0.1, 0.2, 0.3]], 100)
+        .build();
+    let interp = Interpreter::new();
+    reset_runtime_state();
+    register_test_provider(Box::new(fake));
+
+    let program = r#"
+        (llm/cache-clear)
+        (try
+          (begin
+            (llm/with-budget {:max-tokens 5}
+              (fn () (async/await (async/spawn (fn () (llm/embed "big"))))))
+            "no-error")
+          (catch e "budget-raised"))
+    "#;
+    let val = interp
+        .eval_str_compiled(program)
+        .expect("embed budget program evaluated");
+    assert_eq!(
+        val.as_str(),
+        Some("budget-raised"),
+        "a spawned embed must charge the captured budget frame and raise on overrun"
+    );
+}

@@ -362,3 +362,48 @@ fn cancelled_stream_is_cut_short_and_runtime_stays_healthy() {
         "a fresh stream after the cancellation completes normally"
     );
 }
+
+/// Cross-fix regression (adversarial review finding): a task cancelled while
+/// parked mid-stream must have its `STREAM_RUNS` slab entry reaped by the same
+/// task-reaped sweep that reclaims agent runs — including the detached chat span
+/// it owns. Covers BOTH shapes: a standalone `llm/stream` and an agent `:on-text`
+/// round (where the agent entry was swept but the stream entry used to leak).
+#[test]
+#[serial_test::serial]
+fn cancelled_stream_slab_entries_are_reaped() {
+    use sema_llm::builtins::{agent_runs_len, stream_runs_len};
+
+    let chunks: Vec<String> = (0..40).map(|i| format!("s{i}")).collect();
+    let refs: Vec<&str> = chunks.iter().map(|s| s.as_str()).collect();
+    let fake = FakeProvider::builder("fake")
+        .model("fake-model")
+        .stream(&refs)
+        .stream_chunk_delay(50)
+        .stream(&refs)
+        .stream_chunk_delay(50)
+        .build();
+
+    // Shape 1: standalone stream, cancelled mid-flight.
+    // Shape 2: an :on-text agent round, cancelled mid-stream — the agent slab
+    // entry AND its in-flight stream entry must both be gone.
+    let program = r#"
+        (try (async/timeout 150
+               (async/spawn (fn ()
+                 (llm/stream "slow" (fn (c) nil)))))
+             (catch e nil))
+        (defagent bot {:model "fake-model" :max-turns 4})
+        (try (async/timeout 150
+               (async/spawn (fn ()
+                 (agent/run bot "go" {:on-text (fn (c) nil)}))))
+             (catch e nil))
+        nil
+    "#;
+    let (result, _) = eval_with_fake(program, fake);
+    result.expect("cancelled stream shapes evaluated");
+    assert_eq!(
+        stream_runs_len(),
+        0,
+        "cancelled tasks must not leak STREAM_RUNS entries (detached chat span included)"
+    );
+    assert_eq!(agent_runs_len(), 0, "agent slab also swept");
+}
