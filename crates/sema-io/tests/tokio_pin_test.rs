@@ -3,16 +3,16 @@
 //! workspace-resolved version — so a future tokio upgrade that changes the
 //! rules fails loudly here instead of deadlocking or panicking in production.
 //!
-//! - (i)   `block_on` via the pool from its own `spawn_blocking` thread: OK —
-//!         the literal production shape (VM thread → offload → provider
-//!         `complete()` → `io_block_on(reqwest)`).
-//! - (ii)  `block_on` from an async WORKER thread: panics.
+//! - (i) `block_on` via the pool from its own `spawn_blocking` thread: OK —
+//!   the literal production shape (VM thread → offload → provider
+//!   `complete()` → `io_block_on(reqwest)`).
+//! - (ii) `block_on` from an async WORKER thread: panics.
 //! - (iii) `block_on` from a plain OS thread: OK.
-//! - (iv)  nested `spawn_blocking → block_on → spawn_blocking` fan-out
-//!         deadlocks at blocking-cap == N units and completes at 2N — the
-//!         probe-h regression the admission semaphore exists to prevent.
-//! - (v)   oversubscription (600 offload units through the admission
-//!         semaphore, each driving `block_on`) completes.
+//! - (iv) nested `spawn_blocking → block_on → spawn_blocking` fan-out
+//!   deadlocks at blocking-cap == N units and completes at 2N — the probe-h
+//!   regression the admission semaphore exists to prevent.
+//! - (v) oversubscription (600 offload units through the admission semaphore,
+//!   each driving `block_on`) completes.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
