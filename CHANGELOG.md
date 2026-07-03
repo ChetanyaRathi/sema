@@ -13,7 +13,8 @@
   removes the CORE-2 self-reference cycle (ADR #66) at its hottest source — every
   loop *entry* previously birthed a 3-node cycle for the collector to trace and
   sever — and lets pure counter loops reach zero upvalues (skipping cycle-candidate
-  registration entirely). The optimization is conservative: it does not fire when
+  registration entirely). Measured ~22% faster on `mandelbrot.sema` (named-let per
+  pixel) with identical output. The optimization is conservative: it does not fire when
   the loop name escapes (stored, passed, returned, `set!`, captured by an inner
   lambda, or used in non-tail position) — those keep the real self-capture.
   Verified by resolver/compiler unit tests, end-to-end eval oracles (including the
