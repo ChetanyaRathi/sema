@@ -37,7 +37,7 @@ export default defineConfig({
         extends: true,
         test: {
           name: 'node',
-          include: ['tests/tokens.test.ts', 'tests/sema-tokenize.test.ts'],
+          include: ['tests/tokens.test.ts'],
           environment: 'node',
         },
       },

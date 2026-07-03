@@ -139,6 +139,13 @@ const NOOP_THEME = {
 };
 
 let highlighterPromise: Promise<HighlighterCore> | null = null;
+/**
+ * The resolved highlighter, cached once warmed so a live editor can tokenize
+ * synchronously (Shiki's `codeToTokensBase` is sync once the grammar is loaded;
+ * only the initial `createHighlighterCore`/`loadLanguage` is async). Populated by
+ * `preloadLanguage` / `highlightToHtml`; consumed by `highlightToHtmlSync`.
+ */
+let readyHighlighter: HighlighterCore | null = null;
 
 function getHighlighter(): Promise<HighlighterCore> {
   if (!highlighterPromise) {
@@ -186,31 +193,13 @@ async function ensureLanguage(id: string): Promise<void> {
 }
 
 /**
- * Highlight `code` and return the inner HTML for a `<pre><code>` element:
- * per-token `<span class="tok-*">` (HTML-escaped), lines joined by "\n".
- *
- * For an unsupported `lang` (or if grammar load/tokenize fails), returns the escaped
- * plain text (no spans) so callers can render it verbatim.
+ * Tokenize `code` (grammar must already be loaded) and render `<pre><code>` inner
+ * HTML: per-token `<span class="tok-*">` (HTML-escaped), lines joined by "\n".
+ * Shared by the async (`highlightToHtml`) and sync (`highlightToHtmlSync`) paths so
+ * there is exactly one tokenize→class mapping.
  */
-export async function highlightToHtml(code: string, lang: string): Promise<string> {
-  const id = resolveLang(lang);
-  if (!canHighlight(id)) return escapeHtml(code);
-
-  await ensureLanguage(id);
-  if (!loaded.has(id)) return escapeHtml(code);
-
-  const hl = await getHighlighter();
-  let lines;
-  try {
-    lines = hl.codeToTokensBase(code, {
-      lang: id,
-      theme: 'sema-noop',
-      includeExplanation: true,
-    });
-  } catch {
-    return escapeHtml(code);
-  }
-
+function renderTokensToHtml(hl: HighlighterCore, code: string, id: string): string {
+  const lines = hl.codeToTokensBase(code, { lang: id, theme: 'sema-noop', includeExplanation: true });
   return lines
     .map((line) =>
       line
@@ -229,6 +218,55 @@ export async function highlightToHtml(code: string, lang: string): Promise<strin
         .join(''),
     )
     .join('\n');
+}
+
+/**
+ * Warm the highlighter and load `lang`'s grammar so `highlightToHtmlSync` can run.
+ * Call once (e.g. when an editor connects); subsequent sync highlights are instant.
+ */
+export async function preloadLanguage(lang: string): Promise<void> {
+  const id = resolveLang(lang);
+  readyHighlighter = await getHighlighter();
+  if (canHighlight(id)) await ensureLanguage(id);
+}
+
+/**
+ * Synchronous highlight for live editors — the overlay repaints on every keystroke
+ * and cannot await. Requires the grammar to be loaded already (via `preloadLanguage`);
+ * until then, or for an unsupported/failed lang, returns escaped plain text so the
+ * editor degrades gracefully and upgrades in place once warm.
+ */
+export function highlightToHtmlSync(code: string, lang: string): string {
+  const id = resolveLang(lang);
+  if (!readyHighlighter || !loaded.has(id)) return escapeHtml(code);
+  try {
+    return renderTokensToHtml(readyHighlighter, code, id);
+  } catch {
+    return escapeHtml(code);
+  }
+}
+
+/**
+ * Highlight `code` and return the inner HTML for a `<pre><code>` element:
+ * per-token `<span class="tok-*">` (HTML-escaped), lines joined by "\n".
+ *
+ * For an unsupported `lang` (or if grammar load/tokenize fails), returns the escaped
+ * plain text (no spans) so callers can render it verbatim.
+ */
+export async function highlightToHtml(code: string, lang: string): Promise<string> {
+  const id = resolveLang(lang);
+  if (!canHighlight(id)) return escapeHtml(code);
+
+  await ensureLanguage(id);
+  if (!loaded.has(id)) return escapeHtml(code);
+
+  const hl = await getHighlighter();
+  readyHighlighter = hl;
+  try {
+    return renderTokensToHtml(hl, code, id);
+  } catch {
+    return escapeHtml(code);
+  }
 }
 
 /** A highlighted segment: raw text + its `tok-*` class (empty for unscoped text). */
