@@ -334,10 +334,17 @@ body {
   font-family: var(--mono);
   font-size: 13px;
   line-height: 1.65;
-  white-space: pre-wrap;
   word-break: break-word;
   color: var(--text);
 }
+/* Preserve significant whitespace on the output text itself, never on the
+   container. Alpine's x-if templates leave whitespace-only text nodes (the
+   HTML source indentation between the output spans) as direct children here;
+   a pre-wrap container renders that indentation literally, prefixing every
+   output with a blank line and ~28 leading spaces. Scoping pre-wrap to the
+   spans keeps multi-line output intact while the inter-node indentation
+   collapses under the container's default white-space. */
+.cell-output-content > span { white-space: pre-wrap; }
 .cell-output-content.collapsed { display: none; }
 
 /* Error output */

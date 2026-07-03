@@ -131,6 +131,27 @@ test.describe('Cell evaluation', () => {
     expect(output).toContain('x + y = 50');
   });
 
+  test('stdout output has no spurious leading whitespace', async ({ page }) => {
+    // Regression guard: the .cell-output-content container must not use
+    // `white-space: pre-wrap`. Alpine's x-if templates leave whitespace-only
+    // text nodes (the HTML source indentation between the output spans) inside
+    // the container; a pre-wrap container renders that indentation literally,
+    // prefixing every output with a blank line and ~28 leading spaces. We use
+    // innerText (not textContent) because it reflects the CSS-rendered text.
+    const codeCell = cellsOfType(page, 'code').first();
+    await codeCell.hover();
+    await codeCell.getByTestId('btn-cell-run').click();
+    await codeCell.locator('[data-testid="cell-output-stdout"]').waitFor({ timeout: 15000 });
+
+    const rendered = await codeCell
+      .locator('[data-testid="cell-output-stdout"] .cell-output-content')
+      .first()
+      .innerText();
+    // First rendered character is real output, not leaked indentation.
+    expect(rendered.startsWith('x = 42')).toBe(true);
+    expect(rendered).not.toMatch(/^\s/);
+  });
+
   test('eval via Shift+Enter works', async ({ page }) => {
     const codeCell = cellsOfType(page, 'code').first();
     const textarea = codeCell.getByTestId('cell-textarea');
