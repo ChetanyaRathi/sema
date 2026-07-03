@@ -155,31 +155,27 @@ fn resolve_embedded_file(
     ctx: &EvalContext,
     spec: &str,
 ) -> Option<(std::path::PathBuf, std::path::PathBuf, Vec<u8>)> {
-    // Archive keys are stored relative to the project root (e.g. "util.sema"),
-    // but imports are commonly written "./util.sema". Try the spec as written and
-    // with a leading "./" stripped, both as a direct key and relative to the
-    // importing file's dir.
-    let normalized = spec.strip_prefix("./").unwrap_or(spec);
-    let candidates = if normalized == spec {
-        vec![spec]
-    } else {
-        vec![normalized, spec]
-    };
-
-    for s in &candidates {
-        let direct = std::path::PathBuf::from(s);
-        if let Some(bytes) = ctx.get_embedded_file(&direct) {
-            let file_path = module_file_path(s, &direct, true);
-            return Some((direct, file_path, bytes));
+    // Archive keys are clean, lexically-normalized, root-relative paths (e.g.
+    // "util.sema", "lib/util.sema"). Look the spec up in the same normalized form
+    // — resolving "./", "../", and interior "." — so every spelling that names
+    // the same module hits the one key. Try the spec as a root-relative key
+    // first, then relative to the importing file's directory (for nested
+    // imports). Normalization also becomes the cache/current_file identity, so a
+    // module resolved via different spellings is only evaluated once.
+    if let Some(norm) = sema_core::vfs::normalize_path(std::path::Path::new(spec)) {
+        let key = std::path::PathBuf::from(&norm);
+        if let Some(bytes) = ctx.get_embedded_file(&key) {
+            let file_path = module_file_path(spec, &key, true);
+            return Some((key, file_path, bytes));
         }
     }
 
     let base_dir = ctx.current_file_dir()?;
-    for s in &candidates {
-        let candidate = base_dir.join(s);
-        if let Some(bytes) = ctx.get_embedded_file(&candidate) {
-            let file_path = module_file_path(s, &candidate, false);
-            return Some((candidate, file_path, bytes));
+    if let Some(norm) = sema_core::vfs::normalize_path(&base_dir.join(spec)) {
+        let key = std::path::PathBuf::from(&norm);
+        if let Some(bytes) = ctx.get_embedded_file(&key) {
+            let file_path = module_file_path(spec, &key, false);
+            return Some((key, file_path, bytes));
         }
     }
     None
@@ -319,54 +315,33 @@ pub(crate) fn eval_import(
             .current_file_dir()
             .map(|d| d.to_string_lossy().to_string());
 
-        // Compute the resolved VFS path — this is the actual VFS key that
-        // matched, and becomes the canonical identity for caching and
-        // current_file_dir() resolution.
-        //
-        // Two cases:
-        //   1. Direct hit: vfs_read("github.com/u/repo") or vfs_read("lib.sema")
-        //      → resolved = path_str itself
-        //   2. Base-dir hit: vfs_read("github.com/u/repo/helpers.sema")
-        //      after joining base_dir + "helpers.sema"
-        //      → resolved = base_dir/path_str
-        let resolved_vfs_path = if sema_core::vfs::vfs_exists(path_str) == Some(true) {
-            std::path::PathBuf::from(path_str)
-        } else if let Some(ref base) = base_dir {
-            std::path::Path::new(base.as_str()).join(path_str)
-        } else {
-            std::path::PathBuf::from(path_str)
-        };
+        // The canonical, normalized key that actually matched (resolving
+        // "./"/".."). Using it as the cache identity + current_file means every
+        // spelling of a module (e.g. "shared.sema" vs "sub/../shared.sema")
+        // dedups to one evaluation and roots its own imports correctly.
+        if let Some(key) = sema_core::vfs::vfs_resolve_key(path_str, base_dir.as_deref()) {
+            let resolved_vfs_path = std::path::PathBuf::from(&key);
 
-        // For package entries, the VFS key has no filename component
-        // (e.g., "github.com/u/repo" or "json-utils"). We append a synthetic
-        // filename so current_file_dir() returns the package directory.
-        // This is only needed for direct-hit package entries, not for
-        // files resolved via base_dir (those already have a filename).
-        let is_direct_hit = sema_core::vfs::vfs_exists(path_str) == Some(true);
-        let is_package = is_direct_hit
-            && (sema_core::resolve::is_package_import(path_str)
-                || (!path_str.ends_with(".sema")
-                    && !path_str.starts_with("./")
-                    && !path_str.starts_with("../")
-                    && !path_str.starts_with('/')));
-        let file_path = if is_package {
-            resolved_vfs_path.join("__entry__")
-        } else {
-            resolved_vfs_path.clone()
-        };
+            // Package/dir entries have no ".sema" filename component; append a
+            // synthetic one so current_file_dir() returns the package directory.
+            let is_package = sema_core::resolve::is_package_import(&key) || !key.ends_with(".sema");
+            let file_path = if is_package {
+                resolved_vfs_path.join("__entry__")
+            } else {
+                resolved_vfs_path.clone()
+            };
 
-        if let Some(content_bytes) =
-            sema_core::vfs::vfs_resolve_and_read(path_str, base_dir.as_deref())
-        {
-            return import_module_from_bytes(
-                path_str,
-                resolved_vfs_path,
-                file_path,
-                content_bytes,
-                &selective,
-                env,
-                ctx,
-            );
+            if let Some(content_bytes) = sema_core::vfs::vfs_read(&key) {
+                return import_module_from_bytes(
+                    path_str,
+                    resolved_vfs_path,
+                    file_path,
+                    content_bytes,
+                    &selective,
+                    env,
+                    ctx,
+                );
+            }
         }
     }
 
@@ -486,9 +461,15 @@ pub(crate) fn eval_load(
         std::path::PathBuf::from(path_str)
     };
 
-    if let Some((_, file_path, content_bytes)) = resolve_embedded_file(ctx, path_str) {
-        let result = eval_bytes_in_env("load", path_str, &file_path, &content_bytes, env, ctx)?;
-        return Ok(Trampoline::Value(result));
+    // `begin_module_load` guards against cycles (a loads b loads a…), which would
+    // otherwise recurse until the stack overflows. Keyed on the resolved
+    // identity, so a completed load can still be re-loaded — only an in-progress
+    // cycle errors.
+    if let Some((resolved_key, file_path, content_bytes)) = resolve_embedded_file(ctx, path_str) {
+        ctx.begin_module_load(&resolved_key)?;
+        let result = eval_bytes_in_env("load", path_str, &file_path, &content_bytes, env, ctx);
+        ctx.end_module_load(&resolved_key);
+        return Ok(Trampoline::Value(result?));
     }
 
     // Check VFS before hitting the filesystem
@@ -496,20 +477,15 @@ pub(crate) fn eval_load(
         let base_dir = ctx
             .current_file_dir()
             .map(|d| d.to_string_lossy().to_string());
-        if let Some(content_bytes) =
-            sema_core::vfs::vfs_resolve_and_read(path_str, base_dir.as_deref())
-        {
-            // Push resolved VFS path so nested load/import resolves correctly.
-            // Determine which VFS key matched: direct or base-dir-relative.
-            let vfs_path = if sema_core::vfs::vfs_exists(path_str) == Some(true) {
-                std::path::PathBuf::from(path_str)
-            } else if let Some(base) = &base_dir {
-                std::path::Path::new(base.as_str()).join(path_str)
-            } else {
-                std::path::PathBuf::from(path_str)
-            };
-            let result = eval_bytes_in_env("load", path_str, &vfs_path, &content_bytes, env, ctx)?;
-            return Ok(Trampoline::Value(result));
+        if let Some(key) = sema_core::vfs::vfs_resolve_key(path_str, base_dir.as_deref()) {
+            if let Some(content_bytes) = sema_core::vfs::vfs_read(&key) {
+                let vfs_path = std::path::PathBuf::from(&key);
+                ctx.begin_module_load(&vfs_path)?;
+                let result =
+                    eval_bytes_in_env("load", path_str, &vfs_path, &content_bytes, env, ctx);
+                ctx.end_module_load(&vfs_path);
+                return Ok(Trampoline::Value(result?));
+            }
         }
     }
 
@@ -518,8 +494,10 @@ pub(crate) fn eval_load(
         .map_err(|e| SemaError::Io(format!("load {}: {e}", resolved.display())))?;
     let content_bytes = std::fs::read(&canonical)
         .map_err(|e| SemaError::Io(format!("load {}: {e}", canonical.display())))?;
-    let result = eval_bytes_in_env("load", path_str, &canonical, &content_bytes, env, ctx)?;
-    Ok(Trampoline::Value(result))
+    ctx.begin_module_load(&canonical)?;
+    let result = eval_bytes_in_env("load", path_str, &canonical, &content_bytes, env, ctx);
+    ctx.end_module_load(&canonical);
+    Ok(Trampoline::Value(result?))
 }
 
 #[cfg(test)]
@@ -550,6 +528,109 @@ mod tests {
             .eval_str(r#"(import "lib/util.sema") (double 21)"#)
             .unwrap();
         assert_eq!(result, Value::int(42));
+    }
+
+    /// Set an embedded module (source form) under `key`.
+    fn embed(interp: &Interpreter, key: &str, source: &str) {
+        let bytes = compile_source(interp, source);
+        interp.ctx.set_embedded_file(PathBuf::from(key), bytes);
+    }
+
+    // Embedded imports must resolve regardless of how the spec is spelled — a
+    // leading "./", subdirectories, nested relatives, and "../" parents all name
+    // the same clean archive key. (These broke before the normalization fix.)
+
+    #[test]
+    fn embedded_import_dotslash_prefix() {
+        let interp = Interpreter::new();
+        embed(&interp, "u.sema", "(module u (export v) (define v 7))");
+        assert_eq!(
+            interp.eval_str(r#"(import "./u.sema") v"#).unwrap(),
+            Value::int(7)
+        );
+    }
+
+    #[test]
+    fn embedded_import_subdir_dotslash() {
+        let interp = Interpreter::new();
+        embed(&interp, "lib/u.sema", "(module u (export v) (define v 8))");
+        assert_eq!(
+            interp.eval_str(r#"(import "./lib/u.sema") v"#).unwrap(),
+            Value::int(8)
+        );
+    }
+
+    #[test]
+    fn embedded_import_nested_relative() {
+        // entry → lib/a, a (in lib/) → ./b resolves to lib/b via current_file.
+        let interp = Interpreter::new();
+        embed(
+            &interp,
+            "lib/b.sema",
+            "(module b (export bv) (define bv 5))",
+        );
+        embed(
+            &interp,
+            "lib/a.sema",
+            r#"(module a (export av) (import "./b.sema") (define av bv))"#,
+        );
+        assert_eq!(
+            interp.eval_str(r#"(import "./lib/a.sema") av"#).unwrap(),
+            Value::int(5)
+        );
+    }
+
+    #[test]
+    fn embedded_import_parent_relative() {
+        // a in sub/ imports ../shared → normalizes to the root key "shared.sema".
+        let interp = Interpreter::new();
+        embed(
+            &interp,
+            "shared.sema",
+            "(module s (export sv) (define sv 9))",
+        );
+        embed(
+            &interp,
+            "sub/a.sema",
+            r#"(module a (export av) (import "../shared.sema") (define av sv))"#,
+        );
+        assert_eq!(
+            interp.eval_str(r#"(import "./sub/a.sema") av"#).unwrap(),
+            Value::int(9)
+        );
+    }
+
+    #[test]
+    fn embedded_circular_import_errors_gracefully() {
+        let interp = Interpreter::new();
+        embed(
+            &interp,
+            "a.sema",
+            r#"(module a (export av) (import "./b.sema") (define av 1))"#,
+        );
+        embed(
+            &interp,
+            "b.sema",
+            r#"(module b (export bv) (import "./a.sema") (define bv 2))"#,
+        );
+        let err = interp.eval_str(r#"(import "./a.sema")"#).unwrap_err();
+        assert!(
+            err.to_string().contains("cyclic"),
+            "expected a cyclic-import error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn embedded_circular_load_errors_instead_of_overflowing() {
+        // Before the fix this recursed until the stack overflowed (process abort).
+        let interp = Interpreter::new();
+        embed(&interp, "a.sema", r#"(load "./b.sema")"#);
+        embed(&interp, "b.sema", r#"(load "./a.sema")"#);
+        let err = interp.eval_str(r#"(load "./a.sema")"#).unwrap_err();
+        assert!(
+            err.to_string().contains("cyclic"),
+            "expected a cyclic error, got: {err}"
+        );
     }
 
     #[test]
