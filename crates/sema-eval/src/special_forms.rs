@@ -221,9 +221,10 @@ fn import_module_from_bytes(
         return Ok(Trampoline::Value(Value::nil()));
     }
 
-    ctx.begin_module_load(&resolved_path)?;
-
-    let load_result: Result<std::collections::BTreeMap<String, Value>, SemaError> = (|| {
+    // Scoped so the load-stack guard drops right after evaluation (before we
+    // cache), matching the original end-of-load point.
+    let load_result: Result<std::collections::BTreeMap<String, Value>, SemaError> = {
+        let _guard = ctx.enter_module_load(resolved_path.clone())?;
         let module_env = eval::create_module_env(env);
         ctx.push_file_path(file_path.clone());
         ctx.clear_module_exports();
@@ -251,12 +252,8 @@ fn import_module_from_bytes(
 
         ctx.pop_file_path();
         let declared = ctx.take_module_exports();
-        eval_result?;
-
-        Ok(collect_module_exports(&module_env, declared.as_deref()))
-    })();
-
-    ctx.end_module_load(&resolved_path);
+        eval_result.map(|()| collect_module_exports(&module_env, declared.as_deref()))
+    };
     let exports = load_result?;
 
     ctx.cache_module(resolved_path, exports.clone());
@@ -461,15 +458,14 @@ pub(crate) fn eval_load(
         std::path::PathBuf::from(path_str)
     };
 
-    // `begin_module_load` guards against cycles (a loads b loads a…), which would
+    // `enter_module_load` guards against cycles (a loads b loads a…), which would
     // otherwise recurse until the stack overflows. Keyed on the resolved
     // identity, so a completed load can still be re-loaded — only an in-progress
-    // cycle errors.
+    // cycle errors. The guard pops the stack on any exit path.
     if let Some((resolved_key, file_path, content_bytes)) = resolve_embedded_file(ctx, path_str) {
-        ctx.begin_module_load(&resolved_key)?;
-        let result = eval_bytes_in_env("load", path_str, &file_path, &content_bytes, env, ctx);
-        ctx.end_module_load(&resolved_key);
-        return Ok(Trampoline::Value(result?));
+        let _guard = ctx.enter_module_load(resolved_key)?;
+        let result = eval_bytes_in_env("load", path_str, &file_path, &content_bytes, env, ctx)?;
+        return Ok(Trampoline::Value(result));
     }
 
     // Check VFS before hitting the filesystem
@@ -480,11 +476,10 @@ pub(crate) fn eval_load(
         if let Some(key) = sema_core::vfs::vfs_resolve_key(path_str, base_dir.as_deref()) {
             if let Some(content_bytes) = sema_core::vfs::vfs_read(&key) {
                 let vfs_path = std::path::PathBuf::from(&key);
-                ctx.begin_module_load(&vfs_path)?;
+                let _guard = ctx.enter_module_load(vfs_path.clone())?;
                 let result =
-                    eval_bytes_in_env("load", path_str, &vfs_path, &content_bytes, env, ctx);
-                ctx.end_module_load(&vfs_path);
-                return Ok(Trampoline::Value(result?));
+                    eval_bytes_in_env("load", path_str, &vfs_path, &content_bytes, env, ctx)?;
+                return Ok(Trampoline::Value(result));
             }
         }
     }
@@ -494,10 +489,9 @@ pub(crate) fn eval_load(
         .map_err(|e| SemaError::Io(format!("load {}: {e}", resolved.display())))?;
     let content_bytes = std::fs::read(&canonical)
         .map_err(|e| SemaError::Io(format!("load {}: {e}", canonical.display())))?;
-    ctx.begin_module_load(&canonical)?;
-    let result = eval_bytes_in_env("load", path_str, &canonical, &content_bytes, env, ctx);
-    ctx.end_module_load(&canonical);
-    Ok(Trampoline::Value(result?))
+    let _guard = ctx.enter_module_load(canonical.clone())?;
+    let result = eval_bytes_in_env("load", path_str, &canonical, &content_bytes, env, ctx)?;
+    Ok(Trampoline::Value(result))
 }
 
 #[cfg(test)]
