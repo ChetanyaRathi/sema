@@ -3378,7 +3378,62 @@ fn generate_completions(shell: Shell) -> String {
     let mut buf = Vec::new();
     clap_complete::generate(shell, &mut Cli::command(), "sema", &mut buf);
     let mut out = String::from_utf8(buf).expect("clap completion output is utf-8");
+    if shell == Shell::Zsh {
+        out = fix_zsh_root_completion(out);
+    }
     out.push_str(dynamic_doc_completion_script(shell));
+    out
+}
+
+/// Repair subcommand completion in the generated zsh script.
+///
+/// `clap_complete`'s zsh generator emits the top-level optional positionals
+/// (`FILE`, `SCRIPT_ARGS`) *before* the subcommand slot — even with
+/// `args_conflicts_with_subcommands` set — so zsh consumes `sema notebook` as
+/// the FILE positional: `sema <TAB>` offers only files and
+/// `sema notebook <TAB>` completes script arguments. Subcommand completion
+/// never engages, at any depth.
+///
+/// The repair makes position 1 an alternation of subcommands and script files
+/// (`_sema_root`), and re-indexes the subcommand dispatch from `$line[3]` to
+/// `$line[1]`. Every rewrite is anchored on the exact generator output; if an
+/// anchor is missing (a future clap_complete changed shape), the script is
+/// returned UNMODIFIED — a wrong-but-consistent script beats a broken one —
+/// and the pinning unit test fails loudly so the anchors get refreshed.
+fn fix_zsh_root_completion(script: String) -> String {
+    const POSITIONALS: &str = "'::file -- File to execute:_default' \\\n\
+'::script_args -- Arguments passed to the script (after --):_default' \\\n\
+\":: :_sema_commands\" \\\n";
+    const ROOT_SLOT: &str = "\":: :_sema_root\" \\\n";
+    let anchors_present = script.contains(POSITIONALS)
+        && script.contains("words=($line[3] \"${words[@]}\")")
+        && script.contains("case $line[3] in");
+    if !anchors_present {
+        return script;
+    }
+    let mut out = script.replacen(POSITIONALS, ROOT_SLOT, 1);
+    out = out.replacen(
+        "words=($line[3] \"${words[@]}\")",
+        "words=($line[1] \"${words[@]}\")",
+        1,
+    );
+    out = out.replacen(
+        "curcontext=\"${curcontext%:*:*}:sema-command-$line[3]:\"",
+        "curcontext=\"${curcontext%:*:*}:sema-command-$line[1]:\"",
+        1,
+    );
+    out = out.replacen("case $line[3] in", "case $line[1] in", 1);
+    // The definition must precede clap's self-invoking trailer
+    // (`if [ "$funcstack[1]" = "_sema" ]; then _sema "$@" ...`): on the very
+    // first TAB the file executes top-to-bottom and calls `_sema` right there —
+    // a root fn appended after the trailer is not yet defined at that moment.
+    let root_fn = "\n_sema_root() {\n    _alternative \\\n        'subcommands:sema command:_sema_commands' \\\n        'files:script file:_files'\n}\n\n";
+    const TRAILER: &str = "if [ \"$funcstack[1]\" = \"_sema\" ]; then";
+    if let Some(pos) = out.find(TRAILER) {
+        out.insert_str(pos, root_fn);
+    } else {
+        out.push_str(root_fn);
+    }
     out
 }
 
@@ -3485,6 +3540,36 @@ fn install_completions(shell: Shell) {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    /// Pins the zsh-completion repair (`fix_zsh_root_completion`): position 1
+    /// must dispatch subcommands (clap_complete emits the FILE/SCRIPT_ARGS
+    /// positionals first, which swallows the subcommand word — `sema notebook
+    /// <TAB>` completed files). If this fails after a clap_complete upgrade,
+    /// refresh the anchors in `fix_zsh_root_completion`.
+    #[test]
+    fn zsh_completions_dispatch_subcommands_at_position_one() {
+        let script = generate_completions(clap_complete::Shell::Zsh);
+        assert!(
+            script.contains(":: :_sema_root"),
+            "root slot missing — anchor drift in fix_zsh_root_completion"
+        );
+        assert!(
+            script.contains("_sema_root() {"),
+            "root alternation fn missing"
+        );
+        assert!(
+            script.contains("case $line[1] in") && !script.contains("case $line[3] in"),
+            "top-level dispatch must read the subcommand from position 1"
+        );
+        assert!(
+            !script.contains("File to execute"),
+            "top-level FILE positional must not shadow the subcommand slot"
+        );
+        // The nested groups must still be intact (spot-check one).
+        assert!(script.contains("_sema__notebook_commands"));
+    }
+
     use super::{compile_source_to_bytecode, run_bytecode_bytes};
     use sema_core::{intern, NativeFn, Sandbox, Value};
     use sema_eval::Interpreter;
