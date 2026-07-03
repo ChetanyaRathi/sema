@@ -853,7 +853,13 @@ run so a tokio upgrade that changes the rules fails loudly.
 **Scope kept honest:** sema-mcp (behavioral liveness change — own slice), notebook
 (std::mpsc cleanup, no seam), lsp (already correct Handle reuse), main.rs entry
 points, and otel's isolated export reactor stay as they are, each with recorded
-rationale.
+rationale. File-I/O yielding, previously deferred, now rides the seam:
+`file/read|read-bytes|read-lines|write|append|copy|delete` offload via
+`io_spawn_blocking` in async context (sync path untouched; small-file overhead
+measured at ~2.3x / +13 µs per 1 KB read, release — no size threshold needed);
+`file/exists?` and the stat/list predicates stay synchronous (microsecond ops,
+often in tight loops), and module/import loading reads `std::fs` directly so it
+never routes through the converted builtins.
 
 This lands on the **Common Lisp / Clojure** model (special operators are reserved in operator position; their value namespace is irrelevant here since Sema is a Lisp-1), not Scheme's. Regular non-special-form names — including builtin *functions* like `list`/`map`/`filter` — still shadow freely. See `docs/limitations.md` #36; regression tests `reserved_*` / `shadow_builtin_*` in `eval_test.rs`.
 

@@ -55,7 +55,12 @@ The one primitive everything builds on:
 
 - **`AwaitIo` mechanism** + park/wake, sleeper/timeout liveness during I/O.
 - **Blocking leaves converted**, gated on `in_async_context()` (sync path
-  byte-identical): `http/*`, `shell`/subprocess, `llm/embed`.
+  byte-identical): `http/*`, `shell`/subprocess, `llm/embed`, and the file I/O
+  leaves `file/read`, `file/read-bytes`, `file/read-lines`, `file/write`,
+  `file/append`, `file/copy`, `file/delete` (`fs_offload` in
+  `sema-stdlib/src/io.rs`; `io_spawn_blocking` tier, no abort hook — a file op
+  is bounded, cancellation discards the result; small-file async overhead
+  measured at ~2.3x / +13 µs per 1 KB read, release build).
 - **Bounded fan-out** `async/pool-map` (semaphore = capacity-N channel).
 - **Concurrent `llm/complete` / `classify` / `extract`** via an `io_spawn`ed
   `run_fallback_retry_async` over per-provider `complete_future` hooks — same
