@@ -81,6 +81,10 @@ enum EngineRequest {
     Reset {
         reply: oneshot::Sender<()>,
     },
+    SetTitle {
+        title: String,
+        reply: oneshot::Sender<()>,
+    },
     Save {
         reply: oneshot::Sender<EngineResult<String>>,
     },
@@ -193,9 +197,15 @@ impl EngineHandle {
                                 .cell_mut(&id)
                                 .ok_or_else(|| format!("Cell not found: {id}"))?;
                             if let Some(s) = source {
-                                cell.source = s;
-                                if !cell.outputs.is_empty() {
-                                    cell.stale = true;
+                                // React only to a genuine change. The UI re-syncs
+                                // every cell's source on blur and before save, so
+                                // treating an identical resend as an edit would
+                                // spuriously mark evaluated cells stale.
+                                if cell.source != s {
+                                    cell.source = s;
+                                    if !cell.outputs.is_empty() {
+                                        cell.stale = true;
+                                    }
                                 }
                             }
                             if let Some(ct) = cell_type {
@@ -308,6 +318,10 @@ impl EngineHandle {
                     }
                     EngineRequest::Reset { reply } => {
                         engine.reset();
+                        let _ = reply.send(());
+                    }
+                    EngineRequest::SetTitle { title, reply } => {
+                        engine.notebook.metadata.title = title;
                         let _ = reply.send(());
                     }
                     EngineRequest::Save { reply } => {
@@ -425,6 +439,11 @@ impl EngineHandle {
 
     pub async fn reset(&self) -> Result<(), BridgeError> {
         self.send(|reply| EngineRequest::Reset { reply }).await
+    }
+
+    pub async fn set_title(&self, title: String) -> Result<(), BridgeError> {
+        self.send(|reply| EngineRequest::SetTitle { title, reply })
+            .await
     }
 
     pub async fn save(&self) -> Result<String, BridgeError> {

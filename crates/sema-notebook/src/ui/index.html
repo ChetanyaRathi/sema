@@ -5,7 +5,6 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Sema Notebook</title>
 <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%231a1a1a'/%3E%3Ctext x='16' y='22' text-anchor='middle' font-family='JetBrains Mono,monospace' font-weight='700' font-size='15' fill='%23ffffff'%3E%3Ctspan fill='%23c8a855'%3E(%3C/tspan%3Es%3Ctspan fill='%23c8a855'%3E)%3C/tspan%3E%3C/text%3E%3C/svg%3E">
-<link href="https://fonts.googleapis.com/css2?family=Cormorant:ital,wght@0,300;0,400;0,500;0,600;1,400&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="/ui/style.css">
 <script defer src="/ui/notebook.js"></script>
 <script defer src="/ui/alpine.min.js"></script>
@@ -22,7 +21,7 @@
     <span class="logo-text">Notebook</span>
   </div>
   <div class="toolbar-center">
-    <input type="text" id="notebook-title" data-testid="notebook-title" x-model="title">
+    <input type="text" id="notebook-title" data-testid="notebook-title" x-model="title" @blur="persistTitle()">
     <svg class="edit-icon" width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
       <path d="M11.5 1.5l3 3L5 14H2v-3L11.5 1.5z"/>
     </svg>
@@ -154,6 +153,7 @@
                               data-testid="cell-textarea"
                               x-text="cell.source"
                               @focus="focusedCellId = cell.id"
+                              @blur="onBlur(cell)"
                               @input="cell.source = $el.value; autoResize($el)"
                               @keydown.shift.enter.prevent="handleShiftEnter(cell)"
                               @keydown.meta.enter.prevent="evalCellStay(cell.id)"
