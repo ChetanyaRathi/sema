@@ -1,4 +1,4 @@
-.PHONY: all build release web-runtime test-web-e2e build-pgo pgo-profile install install-pgo uninstall test test-lsp test-embedding-bench test-http test-llm check clippy fmt fmt-check clean run lint lint-links docs docs-check update-pricing examples examples-vm smoke-bytecode rag-demo test-providers fuzz fuzz-reader fuzz-eval fuzz-grammar fuzz-grammar-emit setup docs-search-gate bench-1m bench-10m bench-100m site-dev site-build site-preview site-deploy deploy coverage coverage-html bench bench-vm bench-save bench-suite bench-closure bench-numeric bench-compare bench-baseline profile profile-vm ts-setup ts-generate ts-test ts-playground js-lib-build js-lib-dev sema-web-example sema-web-example-build
+.PHONY: llm-stress all build release web-runtime test-web-e2e build-pgo pgo-profile install install-pgo uninstall test test-lsp test-embedding-bench test-http test-llm check clippy fmt fmt-check clean run lint lint-links docs docs-check update-pricing examples examples-vm smoke-bytecode rag-demo test-providers fuzz fuzz-reader fuzz-eval fuzz-grammar fuzz-grammar-emit setup docs-search-gate bench-1m bench-10m bench-100m site-dev site-build site-preview site-deploy deploy coverage coverage-html bench bench-vm bench-save bench-suite bench-closure bench-numeric bench-compare bench-baseline profile profile-vm ts-setup ts-generate ts-test ts-playground js-lib-build js-lib-dev sema-web-example sema-web-example-build
 
 SEMA_WEB_EXAMPLE_DIR := examples/sema-web-app
 
@@ -104,6 +104,14 @@ examples: release
 # `sema build` and execute it (exercises the whole release/portability path).
 examples-build: release
 	@EXAMPLE_TIMEOUT=30 ./scripts/build-examples.sh
+
+# LIVE async/streaming stress against real provider APIs (real spend -- cents).
+# The manual verification gate for the true-async work (issue #61 / ADR #68/#69):
+# concurrent completions, non-blocking agent/run, cancellation, streaming, mixed
+# I/O storm, cache/budget, provider matrix. Deliberately NOT part of `examples`
+# (skip-listed); needs ANTHROPIC_API_KEY / OPENAI_API_KEY / GEMINI_API_KEY in env.
+llm-stress: release
+	@./target/release/sema examples/llm/async-stress-live.sema
 
 example-notebook: build
 	@echo "=== Running example notebook ==="
