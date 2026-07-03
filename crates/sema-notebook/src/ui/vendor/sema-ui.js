@@ -12736,7 +12736,7 @@ const Eo = class Eo extends C {
     }, this._onFocusout = () => {
       this.value.trim() && this._commit();
     }, this._onKeydown = (e) => {
-      e.key === "Enter" && e.shiftKey && (e.preventDefault(), this._commit());
+      (e.key === "Enter" && e.shiftKey || e.key === "Escape") && (e.preventDefault(), this._commit());
     }, this._onEmptyKeydown = (e) => {
       (e.key === "Enter" || e.key === " ") && (e.preventDefault(), this._edit());
     };

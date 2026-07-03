@@ -80,7 +80,9 @@ export class SemaEditableMarkdown extends SemaElement {
   };
 
   private _onKeydown = (e: KeyboardEvent) => {
-    if (e.key === 'Enter' && e.shiftKey) {
+    // Shift+Enter and Escape both mean "done editing → render" (matches the
+    // notebook's prior blur/Shift+Enter behavior).
+    if ((e.key === 'Enter' && e.shiftKey) || e.key === 'Escape') {
       e.preventDefault();
       this._commit();
     }

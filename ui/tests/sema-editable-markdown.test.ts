@@ -51,4 +51,18 @@ describe('sema-editable-markdown', () => {
     expect(el.value).toBe('# New')
     expect(view(el)).toBeTruthy()
   })
+
+  it('Escape commits and returns to rendered view', async () => {
+    const el = await mount('')
+    const ed = editor(el) as HTMLElement
+    ed.dispatchEvent(
+      new CustomEvent('input', { detail: { value: '## Done' }, bubbles: true, composed: true }),
+    )
+    ed.dispatchEvent(
+      new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, composed: true }),
+    )
+    await el.updateComplete
+    expect(view(el)).toBeTruthy()
+    expect(el.value).toBe('## Done')
+  })
 })
