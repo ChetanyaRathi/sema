@@ -3400,6 +3400,13 @@ fn generate_completions(shell: Shell) -> String {
 /// anchor is missing (a future clap_complete changed shape), the script is
 /// returned UNMODIFIED — a wrong-but-consistent script beats a broken one —
 /// and the pinning unit test fails loudly so the anchors get refreshed.
+///
+/// zsh is the ONLY affected shell: its generator dispatches by positional
+/// index (`$line[N]`), while bash (word-walk), fish
+/// (`__fish_seen_subcommand_from`), elvish and powershell (name-keyed maps)
+/// all match literal subcommand names — verified empirically 2026-07-03
+/// (bash 5.2 in a clean container; fish `complete -C`; pwsh
+/// `CommandCompletion::CompleteInput`; elvish statically).
 fn fix_zsh_root_completion(script: String) -> String {
     const POSITIONALS: &str = "'::file -- File to execute:_default' \\\n\
 '::script_args -- Arguments passed to the script (after --):_default' \\\n\
