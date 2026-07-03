@@ -61,44 +61,11 @@ export class SemaTooltip extends SemaElement {
         transform: translateY(-50%);
       }
 
-      /* ── CSS Anchor Positioning (overrides fallback in supporting browsers) ──
-         inset-area is the pre-rename spelling (Chrome 125-128); position-area
-         comes second so it wins wherever both parse. */
-      @supports (position-area: top) or (inset-area: top) {
-        :host {
-          anchor-name: --sema-tip;
-        }
-        .tooltip {
-          position-anchor: --sema-tip;
-          transform: none;
-        }
-        :host([placement="top"]) .tooltip {
-          inset-area: top;
-          position-area: top;
-          bottom: auto;
-          left: auto;
-        }
-        :host([placement="bottom"]) .tooltip {
-          inset-area: bottom;
-          position-area: bottom;
-          top: auto;
-          left: auto;
-        }
-        :host([placement="left"]) .tooltip {
-          inset-area: left;
-          position-area: left;
-          right: auto;
-          top: auto;
-          transform: none;
-        }
-        :host([placement="right"]) .tooltip {
-          inset-area: right;
-          position-area: right;
-          left: auto;
-          top: auto;
-          transform: none;
-        }
-      }
+      /* NOTE: CSS anchor positioning (position-area) was intentionally removed.
+         An @supports (position-area) query returns true in browsers that only parse
+         the property without implementing the layout, which silently overrode the
+         fallback and left every tooltip stuck at its trigger's origin. The absolute
+         fallback above positions correctly everywhere; z-index keeps it visible. */
 
       .tooltip-arrow {
         position: absolute;
