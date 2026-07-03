@@ -3242,7 +3242,7 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
             // handle has no abort hook (IoHandle::new) — on cancel/timeout the result
             // is discarded but the request runs to completion (LLM tier; the
             // spawn-based http/shell offloads get a real AbortHandle).
-            crate::http::shared_rt().spawn_blocking(move || {
+            sema_io::io_spawn_blocking(move || {
                 let r = provider.embed(req2);
                 let _ = tx.send(r);
                 sema_core::notify_io_complete();
@@ -5307,7 +5307,7 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
     // (llm/io-sleep-once id [ms]) — AwaitIo spike leaf (NOT for production use).
     //
     // Mimics `llm/chat-once` but does a timer instead of an HTTP call: spawns a
-    // `tokio::time::sleep` on the shared runtime and yields `AwaitIo`, so the
+    // `tokio::time::sleep` on the I/O pool and yields `AwaitIo`, so the
     // scheduler parks the task and runs siblings. Proves real overlap across the
     // per-task-VM scheduler before any agent-loop work. Resolves to `id`.
     #[cfg(not(target_arch = "wasm32"))]
@@ -5332,7 +5332,7 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
         let prev = IO_INFLIGHT.fetch_add(1, Ordering::SeqCst) + 1;
         IO_PEAK.fetch_max(prev, Ordering::SeqCst);
 
-        crate::http::shared_rt().spawn(async move {
+        let _abort = sema_io::io_spawn(async move {
             tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
             // Clamp at 0: a stray decrement from an abandoned future (timeout/pool
             // error-path) must not push a later test's live count negative.
@@ -6185,7 +6185,9 @@ fn do_complete_async_yield(
     // io-sleep-once spike instrumentation).
     let prev = IO_INFLIGHT.fetch_add(1, Ordering::SeqCst) + 1;
     IO_PEAK.fetch_max(prev, Ordering::SeqCst);
-    crate::http::shared_rt().spawn_blocking(move || {
+    // Admission-controlled offload onto THE pool: the permit is held for the
+    // whole wire unit, including any retry-backoff sleeps inside it.
+    sema_io::io_spawn_blocking(move || {
         let r = run_fallback_retry(chain, req2, max_retries, retry_base_ms);
         let _ =
             IO_INFLIGHT.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| Some((v - 1).max(0)));
