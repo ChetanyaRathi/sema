@@ -73,15 +73,13 @@
       </div>
     </div>
     <div class="editor-wrap">
-      <div class="editor-gutter" id="editor-gutter"></div>
-      <textarea id="editor" data-testid="editor" spellcheck="false" placeholder=";; Write Sema code here…
+      <sema-editor id="editor" testid="editor" line-numbers style="height:100%;width:100%;" placeholder=";; Write Sema code here…
 ;; Press ⌘+Enter or click Run to evaluate
 
 (define (greet name)
   (format &quot;Hello, ~a!&quot; name))
 
-(greet &quot;world&quot;)"></textarea>
-      <pre class="editor-highlight" id="editor-highlight" aria-hidden="true"></pre>
+(greet &quot;world&quot;)"></sema-editor>
     </div>
   </div>
   <div class="splitter splitter-v" id="splitter-editor" data-testid="splitter-editor"></div>
@@ -160,6 +158,9 @@
 })();
 </script>
 
+<!-- @sema/ui web components (vendored). Loaded before app.js so <sema-editor> is
+     defined when app.js queries it. -->
+<script type="module" src="dist/sema-ui.js"></script>
 <script type="module" src="dist/app.js"></script>
 </body>
 </html>

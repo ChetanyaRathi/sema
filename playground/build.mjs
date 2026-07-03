@@ -1,4 +1,4 @@
-import { readdirSync, readFileSync, writeFileSync, mkdirSync, existsSync } from 'fs';
+import { readdirSync, readFileSync, writeFileSync, mkdirSync, existsSync, cpSync } from 'fs';
 import { join, basename } from 'path';
 import { build } from 'esbuild';
 
@@ -80,3 +80,13 @@ await build({
   external: ['../pkg/*'],
 });
 console.log('Bundled dist/app.js + dist/sema-worker.js');
+
+// 3. Vendor the @sema/ui web-component bundle (provides <sema-editor>). Built by
+//    the ui package (`cd ui && npm run build`); loaded by index.html before app.js.
+const SEMA_UI_SRC = '../ui/dist/sema-ui.js';
+if (existsSync(SEMA_UI_SRC)) {
+  cpSync(SEMA_UI_SRC, join(DIST_DIR, 'sema-ui.js'));
+  console.log('Vendored dist/sema-ui.js from @sema/ui');
+} else {
+  console.warn(`WARNING: ${SEMA_UI_SRC} not found — run \`cd ui && npm run build\` first (<sema-editor> will be missing).`);
+}

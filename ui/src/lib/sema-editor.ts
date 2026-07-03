@@ -221,6 +221,16 @@ export class SemaEditor extends SemaElement {
     this._ta?.focus();
   }
 
+  /** Scroll so 1-based `line` is vertically centered (e.g. a debugger's current line). */
+  scrollToLine(line: number) {
+    const t = this._ta;
+    if (!t) return;
+    const cs = getComputedStyle(t);
+    const lh = parseFloat(cs.lineHeight) || 22;
+    const pad = parseFloat(cs.paddingTop) || 0;
+    t.scrollTop = Math.max(0, pad + (line - 1) * lh - t.clientHeight / 2 + lh);
+  }
+
   private _grow() {
     const t = this._ta;
     if (!t) return;
