@@ -87,11 +87,13 @@ Extract the playground's editor into a reusable Lit component.
 - **Props:** `value` (two-way via events), `lang` (default `sema`), `placeholder`,
   `readonly`, `gutter` (bool), `autosize` (bool — grow to content, needed for notebook
   cells), `tab-size` (default 2), `testid` (forwarded onto the inner textarea for e2e).
-- **Highlighting:** *default* — reuse `@sema/ui`'s Shiki highlighter **synchronously**
-  (grammar/theme preloaded once, then `codeToHtml` is sync) so the editor and `sema-code`
-  share one grammar. *Fallback* — if keystroke latency regresses, port the playground's
-  synchronous `tokenizeSema`/`highlightSema` into `internal/` (see open question). Repaint
-  is rAF-debounced regardless.
+- **Highlighting:** the overlay repaints per keystroke, so it needs a **synchronous**
+  highlighter. `@sema/ui`'s `highlightToHtml` is async-only (Shiki + `@lit/task`) and would
+  invite stale-render races, so the editor uses a ported synchronous Sema tokenizer
+  (`internal/sema-tokenize.ts`, from the playground's `tokenizeSema`/`highlightSema`);
+  non-`sema` langs fall back to escaped plain text. Shiki stays the highlighter for static
+  `sema-code` and markdown fences. Repaint is rAF-debounced. The highlighter is a pluggable
+  static hook so a future sync-Shiki path can replace the port without an API change.
 - **Undo:** port `TextareaUndo` (overlay editors lose native undo once `value` is set
   programmatically — this is exactly why the playground has a custom stack).
 - **Events:** `input` (`detail.value`) per keystroke; `change` on blur/commit; `keydown`
@@ -188,10 +190,10 @@ Alpine cell.source ─(:value)─▶ sema-code-editor / sema-editable-markdown
 - **Slice scope:** ~~both vs. staged~~ **decided: both code + markdown cells** (see §3).
   Staged fallbacks (code-only / markdown-only) retained here in case the e2e adaptation
   proves costlier than expected.
-- **Editor highlighter:** reuse `@sema/ui` Shiki synchronously (grammar unification, one
-  source of truth) vs. port the playground's `tokenizeSema` (proven zero-latency, but a
-  third Sema highlighter to keep in sync with the TextMate grammar). Default: try Shiki-sync,
-  fall back to the port if latency regresses.
+- **Editor highlighter:** ~~Shiki-sync vs. port~~ **decided: port the playground's
+  synchronous `tokenizeSema`** (`@sema/ui`'s Shiki path is async-only). Tradeoff accepted:
+  a second Sema highlighter to keep aligned with the canonical TextMate grammar; the
+  pluggable hook lets a sync-Shiki path replace it later without an API change.
 - **Renderer dep:** `marked` (recommended) vs `markdown-it`+DOMPurify vs hand-rolled.
 - **Component names:** `sema-code-editor` / `sema-markdown` / `sema-editable-markdown` —
   open to alternatives (`sema-editor`, `sema-md`, `sema-markdown-editor`).
