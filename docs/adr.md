@@ -796,4 +796,45 @@ is a pre-existing single-completion ASYNC-1 gap, closed separately (plan Step 7)
   correlation/usage/error invariants (CHANGELOG 1.21.x) in Sema and drift. The handle
   keeps them in Rust; only trivial loop control is in Sema.
 
+### 69. One I/O pool behind one seam — runtime consolidation (completes the supersession of #8)
+
+Full design + empirical probes + plan: `docs/plans/2026-07-03-io-seam-consolidation.md`.
+
+**Problem:** 19 tokio-runtime-creation sites; the core sprawl is two identical offload
+pools split by crate layering (sema-llm `SHARED_RT`, sema-stdlib `STDLIB_SHARED_RT`),
+a full runtime per provider *instance* (`BlockingRuntime`), a thread-local runtime for
+sync http, and an ad-hoc thread+runtime for `http/serve`. Ad-hoc mechanisms have
+already cost features (sema-web streaming deferral) and spawned a parallel
+suspend/resume system (the wasm http replay-with-cache hack).
+
+**Decision:** one executor seam in sema-core (`io_backend.rs` — tokio-free; the sixth
+instance of the type-erased-registration idiom), one process-wide pool behind it in a
+new leaf crate `crates/sema-io` (multi-thread, `enable_all`, named `sema-io-*`
+threads, **admission-control semaphore** reserving depth-1 blocking-slot headroom so
+nested DNS lookups can never deadlock the consolidated pool — an empirically probed
+regression risk, prevented by mechanism). `IoHandle`/`AwaitIo` stay the yield-side
+seam unchanged. A future wasm backend implements the two spawn ops over
+fetch/JS-promises (`block_on` is native-only; all its consumers are wasm-gated) —
+retiring the replay hack becomes a backend implementation, not new architecture.
+
+**Explicitly rejected:** the issue-#61 sketch of a *scheduler-owned current-thread
+runtime*. Empirical grounds: it cannot run the synchronous provider stack (blocking
+the reactor = blocking all siblings), so it would force async-ifying the entire
+provider/retry/fallback/streaming/MCP surface — maximal churn in the most
+invariant-dense code — for no additional user-visible concurrency (verified: no
+benefit for file I/O or wasm either; both are spawn_blocking/fetch-shaped regardless).
+
+**Enforcement:** a source-conformance test (`runtime_conformance_test.rs`) forbids
+runtime creation outside an explicit allowlist (sema-io; sema-otel's isolated OTLP
+reactor; `main.rs` subcommand drivers; out-of-slice sema-mcp/notebook, tracked) and
+forbids bypassing the sanctioned `sema_io::io_*` wrappers — future sprawl fails CI,
+not review. Tokio-assumption pin tests in sema-io re-establish the probed contract
+(block_on-from-spawn_blocking legality, nested-fan-out deadlock bounds) on every CI
+run so a tokio upgrade that changes the rules fails loudly.
+
+**Scope kept honest:** sema-mcp (behavioral liveness change — own slice), notebook
+(std::mpsc cleanup, no seam), lsp (already correct Handle reuse), main.rs entry
+points, and otel's isolated export reactor stay as they are, each with recorded
+rationale.
+
 This lands on the **Common Lisp / Clojure** model (special operators are reserved in operator position; their value namespace is irrelevant here since Sema is a Lisp-1), not Scheme's. Regular non-special-form names — including builtin *functions* like `list`/`map`/`filter` — still shadow freely. See `docs/limitations.md` #36; regression tests `reserved_*` / `shadow_builtin_*` in `eval_test.rs`.
