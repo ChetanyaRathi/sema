@@ -22,7 +22,8 @@
 
 use sema_eval::Interpreter;
 use sema_llm::builtins::{
-    io_peak_inflight, register_test_provider, reset_io_inflight, reset_runtime_state,
+    agent_runs_len, io_peak_inflight, register_test_provider, reset_io_inflight,
+    reset_runtime_state,
 };
 use sema_llm::fake::FakeProvider;
 use serial_test::serial;
@@ -227,4 +228,158 @@ fn round_cap_with_pending_tools_leaves_valid_history() {
         "every assistant tool_calls turn in the returned history must have a \
          correlated tool result (no orphan tool call)"
     );
+}
+
+/// Cancelling an agent mid-loop must not leak its slab entry: the task-reaped
+/// sweep (fired at the cancellation transition, since the cancelled task's
+/// bytecode never reaches `__agent-finish`) removes the `AGENT_RUNS` entry —
+/// messages, tool Values, closures — right then, not at `reset_runtime_state`.
+/// And the runtime stays healthy: a subsequent `agent/run` on the same
+/// interpreter completes normally and also leaves the slab empty.
+#[test]
+#[serial]
+fn cancelled_agent_leaves_no_slab_entry_and_next_run_works() {
+    reset_io_inflight();
+
+    // 8 tool rounds (9 calls) at 100 ms each ⇒ ~900 ms full; cancel at 250 ms.
+    let fake = FakeProvider::builder("fake")
+        .model("fake-model")
+        .chat_delay(100)
+        .tool_loop(8, "ping", serde_json::json!({ "n": 1 }), "done")
+        .build();
+
+    let interp = Interpreter::new();
+    reset_runtime_state();
+    register_test_provider(Box::new(fake));
+
+    let cancel_program = r#"
+        (deftool ping "ping" {:n {:type :number}} (fn (n) "pong"))
+        (defagent bot {:model "fake-model" :tools [ping] :max-turns 12})
+        (let ((p (async/spawn (fn () (agent/run bot "go")))))
+          (try (async/timeout 250 p) (catch e nil)))
+    "#;
+    let _ = interp.eval_str_compiled(cancel_program);
+
+    assert_eq!(
+        agent_runs_len(),
+        0,
+        "cancelled agent's slab entry must be reaped at the cancellation \
+         transition, not leak until reset_runtime_state"
+    );
+
+    // A fresh run on the SAME interpreter (same provider script, request-keyed
+    // so the new conversation replays from round 1) completes normally.
+    let next_program = r#"
+        (async/await (async/spawn (fn () (agent/run bot "go"))))
+    "#;
+    let val = interp
+        .eval_str_compiled(next_program)
+        .expect("agent/run after a cancelled run must still work");
+    assert_eq!(val.as_str(), Some("done"));
+    assert_eq!(
+        agent_runs_len(),
+        0,
+        "normal completion after the cancelled run must leave the slab empty"
+    );
+}
+
+/// The cancelled agent's `invoke_agent` span must be ENDED (exported) by the
+/// task-reaped sweep — balanced, on the VM thread — rather than leaking open
+/// until teardown (where it was only defused, losing the telemetry entirely).
+#[test]
+#[serial]
+fn cancelled_agent_span_is_exported() {
+    let cap = sema_otel::testing::install();
+    reset_io_inflight();
+
+    let fake = FakeProvider::builder("fake")
+        .model("fake-model")
+        .chat_delay(100)
+        .tool_loop(8, "ping", serde_json::json!({ "n": 1 }), "done")
+        .build();
+
+    let interp = Interpreter::new();
+    reset_runtime_state();
+    register_test_provider(Box::new(fake));
+
+    let program = r#"
+        (deftool ping "ping" {:n {:type :number}} (fn (n) "pong"))
+        (defagent bot {:model "fake-model" :tools [ping] :max-turns 12})
+        (let ((p (async/spawn (fn () (agent/run bot "go")))))
+          (try (async/timeout 250 p) (catch e nil)))
+    "#;
+    let _ = interp.eval_str_compiled(program);
+    assert_eq!(agent_runs_len(), 0, "slab reaped on cancel");
+
+    let spans = cap.spans_json();
+    let agent_spans: Vec<&serde_json::Value> = spans
+        .iter()
+        .filter(|s| s["attributes"]["gen_ai.operation.name"] == "invoke_agent")
+        .collect();
+    assert_eq!(
+        agent_spans.len(),
+        1,
+        "the cancelled agent's invoke_agent span must be exported (ended by the \
+         reap sweep), got {} agent spans",
+        agent_spans.len()
+    );
+    let status = agent_spans[0]["status"].as_str().unwrap_or_default();
+    assert!(
+        status.starts_with("error"),
+        "the reaped span must carry the cancellation error status, got {status:?}"
+    );
+}
+
+/// No-regression: the slab is empty after BOTH ordinary exits — a normal
+/// completion (driver reaches `__agent-finish`) and an error completion (the
+/// consecutive-tool-error abort raised through `__agent-finish`). Neither path
+/// depends on the cancel sweep.
+#[test]
+#[serial]
+fn normal_and_error_completion_leave_slab_empty() {
+    reset_io_inflight();
+
+    // Normal completion.
+    let fake = FakeProvider::builder("fake")
+        .model("fake-model")
+        .tool_loop(2, "ping", serde_json::json!({ "n": 1 }), "done")
+        .build();
+    let interp = Interpreter::new();
+    reset_runtime_state();
+    register_test_provider(Box::new(fake));
+    let program = r#"
+        (deftool ping "ping" {:n {:type :number}} (fn (n) "pong"))
+        (defagent bot {:model "fake-model" :tools [ping] :max-turns 6})
+        (async/await (async/spawn (fn () (agent/run bot "go"))))
+    "#;
+    let val = interp
+        .eval_str_compiled(program)
+        .expect("normal async agent run");
+    assert_eq!(val.as_str(), Some("done"));
+    assert_eq!(agent_runs_len(), 0, "normal completion must empty the slab");
+
+    // Error completion: 6 queued failing tool rounds trip the consecutive-error
+    // abort, raised from `__agent-finish` and propagated through the await.
+    let mut b = FakeProvider::builder("fake").model("fake-model");
+    for i in 0..6 {
+        b = b.tool_call(&format!("c{i}"), "flaky", serde_json::json!({ "x": "bad" }));
+    }
+    let fake = b.build();
+    let interp = Interpreter::new();
+    reset_runtime_state();
+    register_test_provider(Box::new(fake));
+    let program = r#"
+        (deftool flaky "Always fails" {:x {:type :string}}
+          (lambda (x) (throw "boom")))
+        (defagent bot {:model "fake-model" :tools [flaky] :max-turns 10})
+        (async/await (async/spawn (fn () (agent/run bot "go"))))
+    "#;
+    let err = interp
+        .eval_str_compiled(program)
+        .expect_err("runaway tool errors must abort the async run too");
+    assert!(
+        err.to_string().contains("consecutive tool errors"),
+        "expected a consecutive-tool-errors abort, got: {err}"
+    );
+    assert_eq!(agent_runs_len(), 0, "error completion must empty the slab");
 }
