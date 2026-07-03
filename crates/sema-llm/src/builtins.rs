@@ -6989,25 +6989,20 @@ fn do_complete_with_provider(
     })
 }
 
-/// Stream-open budget pre-gate. When `:on-stream :pre-gate` is active, refuse to OPEN a
-/// stream if the scope's spend is already at/over the cost or token limit. (A stream's own
-/// cost is unknown until it ends, so this is the only honest gate — a single in-flight
-/// stream can still push past the cap, but the next call is blocked.)
+/// Parsed `llm/stream`-shaped args: the request, the optional callback, and the
+/// optional opts map.
+type StreamArgs = (
+    ChatRequest,
+    Option<Value>,
+    Option<Rc<BTreeMap<Value, Value>>>,
+);
+
 /// Parse `llm/stream`-shaped args — prompt/messages, then an optional callback
 /// (any procedure) and an optional opts map in either order — into the
 /// `ChatRequest` plus the raw callback/opts. Shared by the blocking native
 /// (`__llm-stream-blocking`) and the non-blocking `__stream-begin`, so both
 /// paths accept byte-identical calls.
-fn parse_stream_args(
-    args: &[Value],
-) -> Result<
-    (
-        ChatRequest,
-        Option<Value>,
-        Option<Rc<BTreeMap<Value, Value>>>,
-    ),
-    SemaError,
-> {
+fn parse_stream_args(args: &[Value]) -> Result<StreamArgs, SemaError> {
     if args.is_empty() || args.len() > 3 {
         return Err(SemaError::arity("llm/stream", "1-3", args.len()));
     }
@@ -7056,6 +7051,10 @@ fn parse_stream_args(
     Ok((request, callback, opts_map))
 }
 
+/// Stream-open budget pre-gate. When `:on-stream :pre-gate` is active, refuse to OPEN a
+/// stream if the scope's spend is already at/over the cost or token limit. (A stream's own
+/// cost is unknown until it ends, so this is the only honest gate — a single in-flight
+/// stream can still push past the cap, but the next call is blocked.)
 fn stream_budget_pregate() -> Result<(), SemaError> {
     if !STREAM_BUDGET_PREGATE.with(|c| c.get()) {
         return Ok(());
@@ -8133,8 +8132,12 @@ fn stream_wire_walk(
             }
         }
     }
-    let (e, name) = last
-        .unwrap_or_else(|| (LlmError::Config("all providers failed".to_string()), String::new()));
+    let (e, name) = last.unwrap_or_else(|| {
+        (
+            LlmError::Config("all providers failed".to_string()),
+            String::new(),
+        )
+    });
     emit(StreamEvent::Done(Box::new(StreamDone {
         result: Err(e),
         provider: name,
@@ -8521,13 +8524,13 @@ fn stream_next(token: u64) -> Result<Value, SemaError> {
         }
     }
 
-    let handle = Rc::new(sema_core::IoHandle::new(
-        move || match stream_poll_batch(token, false) {
+    let handle = Rc::new(sema_core::IoHandle::new(move || {
+        match stream_poll_batch(token, false) {
             Ok(Some(v)) => sema_core::IoPoll::Ready(Ok(v)),
             Ok(None) => sema_core::IoPoll::Pending,
             Err(e) => sema_core::IoPoll::Ready(Err(e.to_string())),
-        },
-    ));
+        }
+    }));
     sema_core::set_yield_signal(sema_core::YieldReason::AwaitIo(handle));
     Ok(Value::nil())
 }

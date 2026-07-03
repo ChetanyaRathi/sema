@@ -315,5 +315,9 @@ fn async_stream_mid_stream_error_after_partial_deltas() {
         err.contains("dropped mid-stream"),
         "mid-stream error surfaces (got: {err})"
     );
-    assert_eq!(recorder.call_count(), 1, "no auto-retry on mid-stream failure");
+    assert_eq!(
+        recorder.call_count(),
+        1,
+        "no auto-retry on mid-stream failure"
+    );
 }
