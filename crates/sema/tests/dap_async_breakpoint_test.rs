@@ -4,8 +4,8 @@
 //! `VM::run_inner(ctx, Some(debug))`, but the cooperative scheduler steps every
 //! async task via the NON-debug `execute_async`/`run_async` path, so a breakpoint
 //! on a line that executes only inside `(async/spawn (fn () …))` is silently
-//! skipped. See `docs/bugs/async-breakpoints.md` /
-//! `docs/plans/2026-06-23-async-debugger.md`.
+//! skipped. Fixed; see `docs/plans/archive/2026-06-23-async-debugger.md` (the
+//! residual cross-task stepping gap is tracked as ASYNC-2 in `docs/deferred.md`).
 //!
 //! This is a fast MECHANISM-level test (it drives `VM::execute_debug` directly,
 //! NOT the slow binary-protocol DAP harness). It mirrors the DAP run setup in

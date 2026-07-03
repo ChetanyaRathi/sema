@@ -71,7 +71,7 @@
       "examples": [
         "(defagent weather-bot\n  {:system \"You report the weather concisely.\"\n   :model \"claude-haiku-4-5-20251001\"\n   :tools [get-weather]\n   :max-turns 5})\n\n;; simple: just the final answer\n(agent/run weather-bot \"What's the weather in Oslo?\")\n; => \"Oslo is 4°C and cloudy.\"\n\n;; resumable: keep the full transcript and log each tool call\n(define out\n  (agent/run weather-bot \"And tomorrow?\"\n    {:messages prior-history\n     :on-tool-call (fn (ev) (println (:event ev) \" \" (:tool ev)))}))\n(:response out)   ; the reply string\n(:messages out)   ; the conversation, ready to pass back in as :messages"
       ],
-      "body": "Run an agent on a user message, driving the full tool-execution loop up to the agent's `:max-turns`, and return the model's final reply.\n\nThe agent (built with `defagent`) carries a system prompt, a model, a tool set, and a turn cap. `agent/run` sends the message, lets the model call the agent's tools, feeds each tool result back, and repeats until the model answers without a tool call or `:max-turns` is hit. Tool-result correlation is handled for you — you never hand-wire the round-trip.\n\n**Two shapes:**\n\n- `(agent/run agent message)` — returns just the final reply **string**.\n- `(agent/run agent message opts)` — returns a map `{:response ... :messages ...}`, where `:messages` is the full conversation (so you can continue it). `opts` accepts `:messages` (prior history to resume from) and `:on-tool-call` (a callback fired for each tool call). The callback receives an event map: `{:event \"start\" :tool name :args …}` before the tool runs and `{:event \"end\" :tool name :args … :result … :error bool :duration-ms n}` after.\n\nEach turn is generated with a fixed `max-tokens` of 4096. A turn that hits `:max-turns` returns whatever the model last produced — it does not error, so check the reply if the task may not have completed.\n\n```sema\n(defagent weather-bot\n  {:system \"You report the weather concisely.\"\n   :model \"claude-haiku-4-5-20251001\"\n   :tools [get-weather]\n   :max-turns 5})\n\n;; simple: just the final answer\n(agent/run weather-bot \"What's the weather in Oslo?\")\n; => \"Oslo is 4°C and cloudy.\"\n\n;; resumable: keep the full transcript and log each tool call\n(define out\n  (agent/run weather-bot \"And tomorrow?\"\n    {:messages prior-history\n     :on-tool-call (fn (ev) (println (:event ev) \" \" (:tool ev)))}))\n(:response out)   ; the reply string\n(:messages out)   ; the conversation, ready to pass back in as :messages\n```\n\nSee also: `defagent`, `deftool`, `agent/tools`, `agent/max-turns`."
+      "body": "Run an agent on a user message, driving the full tool-execution loop up to the agent's `:max-turns`, and return the model's final reply.\n\nThe agent (built with `defagent`) carries a system prompt, a model, a tool set, and a turn cap. `agent/run` sends the message, lets the model call the agent's tools, feeds each tool result back, and repeats until the model answers without a tool call or `:max-turns` is hit. Tool-result correlation is handled for you — you never hand-wire the round-trip.\n\n**Two shapes:**\n\n- `(agent/run agent message)` — returns just the final reply **string**.\n- `(agent/run agent message opts)` — returns a map `{:response ... :messages ...}`, where `:messages` is the full conversation (so you can continue it). `opts` accepts `:messages` (prior history to resume from), `:on-tool-call` (a callback fired for each tool call), and `:on-text` (a callback fired with each streamed assistant text delta). The tool callback receives an event map: `{:event \"start\" :tool name :args …}` before the tool runs and `{:event \"end\" :tool name :args … :result … :error bool :duration-ms n}` after. `:on-text` is called with each text chunk as the reply is generated, so a front-end can render the answer live; the streamed chunks concatenate to `:response`. Without `:on-text` the reply is returned whole (non-streaming). Tool calls work under streaming too.\n\nEach turn is generated with a fixed `max-tokens` of 4096. A turn that hits `:max-turns` returns whatever the model last produced — it does not error, so check the reply if the task may not have completed.\n\n```sema\n(defagent weather-bot\n  {:system \"You report the weather concisely.\"\n   :model \"claude-haiku-4-5-20251001\"\n   :tools [get-weather]\n   :max-turns 5})\n\n;; simple: just the final answer\n(agent/run weather-bot \"What's the weather in Oslo?\")\n; => \"Oslo is 4°C and cloudy.\"\n\n;; resumable: keep the full transcript and log each tool call\n(define out\n  (agent/run weather-bot \"And tomorrow?\"\n    {:messages prior-history\n     :on-tool-call (fn (ev) (println (:event ev) \" \" (:tool ev)))}))\n(:response out)   ; the reply string\n(:messages out)   ; the conversation, ready to pass back in as :messages\n```\n\nSee also: `defagent`, `deftool`, `agent/tools`, `agent/max-turns`."
     },
     {
       "name": "agent/system",
@@ -104,6 +104,76 @@
         "(deftool get-weather \"Get weather for a city\"\n  {:city :string}\n  (fn (args) (str \"sunny in \" (:city args))))\n\n(defagent weather-bot\n  {:system \"Report the weather.\"\n   :model \"claude-haiku-4-5-20251001\"\n   :tools [get-weather]})\n\n(count (agent/tools weather-bot))   ; => 1\n(agent/tools weather-bot)           ; => (<tool get-weather>)"
       ],
       "body": "Return the agent's tools as a list of tool values (the `deftool` values passed in `:tools`). An agent with no tools returns `()`.\n\n```sema\n(deftool get-weather \"Get weather for a city\"\n  {:city :string}\n  (fn (args) (str \"sunny in \" (:city args))))\n\n(defagent weather-bot\n  {:system \"Report the weather.\"\n   :model \"claude-haiku-4-5-20251001\"\n   :tools [get-weather]})\n\n(count (agent/tools weather-bot))   ; => 1\n(agent/tools weather-bot)           ; => (<tool get-weather>)\n```\n\nSee also: `defagent`, `deftool`, `agent/run`."
+    },
+    {
+      "name": "gzip/compress",
+      "module": "archive",
+      "section": "Compression & Archives",
+      "summary": "Compress bytes with gzip, returning a gzip-compressed bytevector. Accepts either a bytevector or a string (its UTF-8 bytes are compressed). Pairs with `gzip/decompress` for a lossless round-trip.",
+      "examples": [
+        "(gzip/decompress (gzip/compress (string->utf8 \"hello\")))"
+      ],
+      "body": "Compress bytes with gzip, returning a gzip-compressed bytevector. Accepts either a bytevector or a string (its UTF-8 bytes are compressed). Pairs with `gzip/decompress` for a lossless round-trip.\n\n```sema\n(gzip/decompress (gzip/compress (string->utf8 \"hello\")))\n```"
+    },
+    {
+      "name": "gzip/decompress",
+      "module": "archive",
+      "section": "Compression & Archives",
+      "summary": "Decompress a gzip-compressed bytevector, returning the original bytes as a bytevector. Errors if the input is not valid gzip data. Inverse of `gzip/compress`.",
+      "examples": [
+        "(utf8->string (gzip/decompress (gzip/compress (string->utf8 \"hello\"))))"
+      ],
+      "body": "Decompress a gzip-compressed bytevector, returning the original bytes as a bytevector. Errors if the input is not valid gzip data. Inverse of `gzip/compress`.\n\n```sema\n(utf8->string (gzip/decompress (gzip/compress (string->utf8 \"hello\"))))\n```"
+    },
+    {
+      "name": "tar/create",
+      "module": "archive",
+      "section": "Compression & Archives",
+      "summary": "Create a tar archive at `out-path` containing the given list of files, each added under its basename. The archive is gzip-compressed when `out-path` ends in `.tar.gz` or `.tgz`, otherwise it is an uncompressed tar. Returns the number of entries written. Requires the `fs-write` capability.",
+      "examples": [
+        "(tar/create \"bundle.tar.gz\" (list \"a.txt\" \"b.txt\"))"
+      ],
+      "body": "Create a tar archive at `out-path` containing the given list of files, each added under its basename. The archive is gzip-compressed when `out-path` ends in `.tar.gz` or `.tgz`, otherwise it is an uncompressed tar. Returns the number of entries written. Requires the `fs-write` capability.\n\n```sema\n(tar/create \"bundle.tar.gz\" (list \"a.txt\" \"b.txt\"))\n```"
+    },
+    {
+      "name": "tar/extract",
+      "module": "archive",
+      "section": "Compression & Archives",
+      "summary": "Extract every entry of the tar archive at `tar-path` into `dest-dir`, creating directories as needed. Gzip compression is auto-detected by file extension or magic bytes. Entries whose paths would escape the destination are skipped to guard against path traversal. Returns the number of entries extracted. Requires the `fs-write` capability.",
+      "examples": [
+        "(tar/extract \"bundle.tar.gz\" \"out-dir\")"
+      ],
+      "body": "Extract every entry of the tar archive at `tar-path` into `dest-dir`, creating directories as needed. Gzip compression is auto-detected by file extension or magic bytes. Entries whose paths would escape the destination are skipped to guard against path traversal. Returns the number of entries extracted. Requires the `fs-write` capability.\n\n```sema\n(tar/extract \"bundle.tar.gz\" \"out-dir\")\n```"
+    },
+    {
+      "name": "zip/create",
+      "module": "archive",
+      "section": "Compression & Archives",
+      "summary": "Create a ZIP archive at `out-path` containing the given list of files. Each file is added under its basename using deflate compression. Returns the number of entries written. Requires the `fs-write` capability.",
+      "examples": [
+        "(zip/create \"bundle.zip\" (list \"a.txt\" \"b.txt\"))"
+      ],
+      "body": "Create a ZIP archive at `out-path` containing the given list of files. Each file is added under its basename using deflate compression. Returns the number of entries written. Requires the `fs-write` capability.\n\n```sema\n(zip/create \"bundle.zip\" (list \"a.txt\" \"b.txt\"))\n```"
+    },
+    {
+      "name": "zip/extract",
+      "module": "archive",
+      "section": "Compression & Archives",
+      "summary": "Extract every entry of the ZIP archive at `zip-path` into `dest-dir`, creating directories as needed. Entries whose paths would escape the destination (zip-slip via `..` or absolute roots) are skipped for safety. Returns the number of entries extracted. Requires the `fs-write` capability.",
+      "examples": [
+        "(zip/extract \"bundle.zip\" \"out-dir\")"
+      ],
+      "body": "Extract every entry of the ZIP archive at `zip-path` into `dest-dir`, creating directories as needed. Entries whose paths would escape the destination (zip-slip via `..` or absolute roots) are skipped for safety. Returns the number of entries extracted. Requires the `fs-write` capability.\n\n```sema\n(zip/extract \"bundle.zip\" \"out-dir\")\n```"
+    },
+    {
+      "name": "zip/list",
+      "module": "archive",
+      "section": "Compression & Archives",
+      "summary": "List the entry names contained in the ZIP archive at `zip-path`, returning a list of strings without extracting anything. Requires the `fs-read` capability.",
+      "examples": [
+        "(zip/list \"bundle.zip\")"
+      ],
+      "body": "List the entry names contained in the ZIP archive at `zip-path`, returning a list of strings without extracting anything. Requires the `fs-read` capability.\n\n```sema\n(zip/list \"bundle.zip\")\n```"
     },
     {
       "name": "bytevector",
@@ -450,29 +520,31 @@
     {
       "name": "string/to-utf8",
       "aliases": [
-        "string->utf8"
+        "string->utf8",
+        "string->bytevector"
       ],
       "module": "bytevectors",
       "section": "String Conversion",
-      "summary": "Encode a string as a UTF-8 bytevector — the raw bytes you'd write to a file or send over the network. ASCII characters map to one byte each; non-ASCII characters take two or more.",
+      "summary": "Encode a string as a UTF-8 bytevector — the raw bytes you'd write to a file or send over the network. ASCII characters map to one byte each; non-ASCII characters take two or more. Also available as `string->bytevector` (a Sema string encodes to its UTF-8 bytes).",
       "examples": [
         "(string/to-utf8 \"hi\")     ; => #u8(104 105)\n(string/to-utf8 \"é\")      ; => #u8(195 169)  (one char, two bytes)",
         "(utf8/to-string (string/to-utf8 \"héllo\"))   ; => \"héllo\""
       ],
-      "body": "Encode a string as a UTF-8 bytevector — the raw bytes you'd write to a file or send over the network. ASCII characters map to one byte each; non-ASCII characters take two or more.\n\n```sema\n(string/to-utf8 \"hi\")     ; => #u8(104 105)\n(string/to-utf8 \"é\")      ; => #u8(195 169)  (one char, two bytes)\n```\n\n`utf8/to-string` is the inverse, so the round-trip is lossless:\n\n```sema\n(utf8/to-string (string/to-utf8 \"héllo\"))   ; => \"héllo\"\n```"
+      "body": "Encode a string as a UTF-8 bytevector — the raw bytes you'd write to a file or send over the network. ASCII characters map to one byte each; non-ASCII characters take two or more. Also available as `string->bytevector` (a Sema string encodes to its UTF-8 bytes).\n\n```sema\n(string/to-utf8 \"hi\")     ; => #u8(104 105)\n(string/to-utf8 \"é\")      ; => #u8(195 169)  (one char, two bytes)\n```\n\n`utf8/to-string` is the inverse, so the round-trip is lossless:\n\n```sema\n(utf8/to-string (string/to-utf8 \"héllo\"))   ; => \"héllo\"\n```"
     },
     {
       "name": "utf8/to-string",
       "aliases": [
-        "utf8->string"
+        "utf8->string",
+        "bytevector->string"
       ],
       "module": "bytevectors",
       "section": "String Conversion",
-      "summary": "Decode a bytevector of UTF-8 bytes back into a string. This is the inverse of `string/to-utf8` — use it to turn bytes read from a file or socket into text.",
+      "summary": "Decode a bytevector of UTF-8 bytes back into a string. This is the inverse of `string/to-utf8` — use it to turn bytes read from a file or socket into text. Also available as `bytevector->string`.",
       "examples": [
         "(utf8/to-string #u8(104 105))       ; => \"hi\"\n(utf8/to-string #u8(195 169))       ; => \"é\"  (two bytes, one char)"
       ],
-      "body": "Decode a bytevector of UTF-8 bytes back into a string. This is the inverse of `string/to-utf8` — use it to turn bytes read from a file or socket into text.\n\n```sema\n(utf8/to-string #u8(104 105))       ; => \"hi\"\n(utf8/to-string #u8(195 169))       ; => \"é\"  (two bytes, one char)\n```"
+      "body": "Decode a bytevector of UTF-8 bytes back into a string. This is the inverse of `string/to-utf8` — use it to turn bytes read from a file or socket into text. Also available as `bytevector->string`.\n\n```sema\n(utf8/to-string #u8(104 105))       ; => \"hi\"\n(utf8/to-string #u8(195 169))       ; => \"é\"  (two bytes, one char)\n```"
     },
     {
       "name": "async/all",
@@ -1170,18 +1242,18 @@
     {
       "name": "conversation/cost",
       "module": "conversation",
-      "summary": "Estimate the cost in USD of the conversation, treating its estimated tokens (~4 chars per token, the same heuristic as `conversation/token-count`) as input tokens for the conversation's model. This is a rough planning aid, not a billing figure: it ignores output-token pricing and the provider's real tokenizer. Returns `nil` if pricing for the model is unknown.",
+      "summary": "Cumulative cost in USD, summed from each turn's actual token usage as it was sent (`conversation/say` folds the billed usage into the conversation). Returns `nil` when no priced turn has been recorded: an empty or hand-built conversation, or a model whose pricing is unknown.",
       "params": [
         {
           "name": "conv",
           "type": "conversation"
         }
       ],
-      "returns": "float",
+      "returns": "float or nil",
       "examples": [
-        "(conversation/cost conv)   ; => 0.0014"
+        "(conversation/cost conv)   ; => 0.00028 (or nil)"
       ],
-      "body": "Estimate the cost in USD of the conversation, treating its estimated tokens (~4 chars per token, the same heuristic as `conversation/token-count`) as input tokens for the conversation's model. This is a rough planning aid, not a billing figure: it ignores output-token pricing and the provider's real tokenizer. Returns `nil` if pricing for the model is unknown.\n\n```sema\n(conversation/cost conv)   ; => 0.0014\n```"
+      "body": "Cumulative cost in USD, summed from each turn's actual token usage as it was sent (`conversation/say` folds the billed usage into the conversation). Returns `nil` when no priced turn has been recorded: an empty or hand-built conversation, or a model whose pricing is unknown.\n\n```sema\n(conversation/cost conv)   ; => 0.00028 (or nil)\n```"
     },
     {
       "name": "conversation/filter",
@@ -1203,6 +1275,25 @@
       "body": "Return a new conversation keeping only messages for which `(pred msg)` is truthy. The predicate receives each message value. The result is still a conversation (so you can keep talking to it) — unlike `conversation/map`, which returns a plain list of per-message results. Combine with `message/role` to drop or isolate roles, e.g. strip tool chatter before re-sending.\n\n```sema\n;; Keep only the user turns.\n(conversation/filter conv (fn [m] (= (message/role m) :user)))\n```"
     },
     {
+      "name": "conversation/find",
+      "module": "conversation",
+      "summary": "Returns the first message for which `(pred msg)` is truthy, or `nil` if none match. Like `conversation/filter`, but returns just the first hit rather than a filtered conversation.",
+      "params": [
+        {
+          "name": "conv",
+          "type": "conversation"
+        },
+        {
+          "name": "pred"
+        }
+      ],
+      "returns": "message or nil",
+      "examples": [
+        "(conversation/find conv (fn (m) (= (message/role m) :assistant)))"
+      ],
+      "body": "Returns the first message for which `(pred msg)` is truthy, or `nil` if none match. Like `conversation/filter`, but returns just the first hit rather than a filtered conversation.\n\n```sema\n(conversation/find conv (fn (m) (= (message/role m) :assistant)))\n```"
+    },
+    {
       "name": "conversation/fork",
       "module": "conversation",
       "summary": "Return an independent copy of the conversation, sharing its history up to this point but diverging from here on. Use it to explore alternative continuations — ask the same context two different follow-ups, A/B different system prompts, or speculatively branch — without disturbing the original thread.",
@@ -1219,6 +1310,29 @@
       "body": "Return an independent copy of the conversation, sharing its history up to this point but diverging from here on. Use it to explore alternative continuations — ask the same context two different follow-ups, A/B different system prompts, or speculatively branch — without disturbing the original thread.\n\nBecause conversations are already immutable, `conversation/say` on the original would *also* leave it untouched; `fork` mainly signals intent and gives each branch its own name to thread forward. Each branch is a separate value you continue independently.\n\n```sema\n;; Explore two follow-ups from the same shared context:\n(let* ((a (conversation/say conv \"Summarize it formally.\"))\n       (b (conversation/say (conversation/fork conv) \"Summarize it casually.\")))\n  (list (conversation/last-reply a) (conversation/last-reply b)))\n```"
     },
     {
+      "name": "conversation/insert",
+      "module": "conversation",
+      "summary": "Returns a new conversation with a message inserted before index `idx`; passing `idx` equal to the length appends. The message is given either as a message value or as a `:role` keyword plus a content string. Errors if `idx` is out of bounds.",
+      "params": [
+        {
+          "name": "conv",
+          "type": "conversation"
+        },
+        {
+          "name": "idx",
+          "type": "int"
+        },
+        {
+          "name": "message"
+        }
+      ],
+      "returns": "conversation",
+      "examples": [
+        "(conversation/insert conv 1 :system \"Additional context.\")\n(conversation/insert conv 1 (message :system \"Additional context.\"))"
+      ],
+      "body": "Returns a new conversation with a message inserted before index `idx`; passing `idx` equal to the length appends. The message is given either as a message value or as a `:role` keyword plus a content string. Errors if `idx` is out of bounds.\n\n```sema\n(conversation/insert conv 1 :system \"Additional context.\")\n(conversation/insert conv 1 (message :system \"Additional context.\"))\n```"
+    },
+    {
       "name": "conversation/last-reply",
       "module": "conversation",
       "summary": "Return the content of the most recent assistant message as a string. Errors if the conversation has no assistant reply.",
@@ -1233,6 +1347,22 @@
         "(conversation/last-reply conv)"
       ],
       "body": "Return the content of the most recent assistant message as a string. Errors if the conversation has no assistant reply.\n\n```sema\n(conversation/last-reply conv)\n```"
+    },
+    {
+      "name": "conversation/length",
+      "module": "conversation",
+      "summary": "Number of messages in the conversation — system, user, and assistant messages are all counted. Contrast with `conversation/turns`, which counts only assistant replies.",
+      "params": [
+        {
+          "name": "conv",
+          "type": "conversation"
+        }
+      ],
+      "returns": "int",
+      "examples": [
+        "(conversation/length conv)   ; => 4"
+      ],
+      "body": "Number of messages in the conversation — system, user, and assistant messages are all counted. Contrast with `conversation/turns`, which counts only assistant replies.\n\n```sema\n(conversation/length conv)   ; => 4\n```"
     },
     {
       "name": "conversation/map",
@@ -1252,6 +1382,29 @@
         "(conversation/map conv message/content)"
       ],
       "body": "Apply `f` to each message in the conversation and return the list of results. Unlike `conversation/filter`, this returns a plain list rather than a conversation.\n\n```sema\n(conversation/map conv message/content)\n```"
+    },
+    {
+      "name": "conversation/map-role",
+      "module": "conversation",
+      "summary": "Returns a new conversation where every message whose role is `role` is replaced by `(f msg)` — `f` receives a message and must return a message. Messages of other roles pass through unchanged. Contrast with `conversation/map`, which applies `f` to every message and returns a plain list of results.",
+      "params": [
+        {
+          "name": "conv",
+          "type": "conversation"
+        },
+        {
+          "name": "role",
+          "type": "keyword"
+        },
+        {
+          "name": "f"
+        }
+      ],
+      "returns": "conversation",
+      "examples": [
+        "(conversation/map-role conv :assistant\n  (fn (m) (message :assistant (string/trim (message/content m)))))"
+      ],
+      "body": "Returns a new conversation where every message whose role is `role` is replaced by `(f msg)` — `f` receives a message and must return a message. Messages of other roles pass through unchanged. Contrast with `conversation/map`, which applies `f` to every message and returns a plain list of results.\n\n```sema\n(conversation/map-role conv :assistant\n  (fn (m) (message :assistant (string/trim (message/content m)))))\n```"
     },
     {
       "name": "conversation/messages",
@@ -1286,6 +1439,22 @@
       "body": "Return the model name associated with the conversation.\n\n```sema\n(conversation/model conv)   ; => \"claude-sonnet-4\"\n```"
     },
     {
+      "name": "conversation/models-used",
+      "module": "conversation",
+      "summary": "The models that produced replies in the conversation. A conversation carries a single configured model, so this is a one-element list of that model name — or an empty list when no model is set.",
+      "params": [
+        {
+          "name": "conv",
+          "type": "conversation"
+        }
+      ],
+      "returns": "list",
+      "examples": [
+        "(conversation/models-used conv)   ; => (\"gpt-4\")"
+      ],
+      "body": "The models that produced replies in the conversation. A conversation carries a single configured model, so this is a one-element list of that model name — or an empty list when no model is set.\n\n```sema\n(conversation/models-used conv)   ; => (\"gpt-4\")\n```"
+    },
+    {
       "name": "conversation/new",
       "module": "conversation",
       "summary": "Create a new, empty conversation — a value that bundles a model, an optional system prompt, and an ordered list of messages. The optional map sets the `:model`; any other keys are stored as string metadata.",
@@ -1300,6 +1469,49 @@
         "(conversation/new {:model \"claude-sonnet-4\" :user \"alice\"})\n\n;; Build up a conversation by threading the returned value (no LLM call here):\n(let* ((c  (conversation/new {:model \"claude-sonnet-4\"}))\n       (c1 (conversation/set-system c \"You are concise.\"))\n       (c2 (conversation/add-message c1 :user \"Hello\"))\n       (c3 (conversation/add-message c2 :assistant \"Hi.\")))\n  (conversation/map c3 message/role))  ; => (:system :user :assistant)"
       ],
       "body": "Create a new, empty conversation — a value that bundles a model, an optional system prompt, and an ordered list of messages. The optional map sets the `:model`; any other keys are stored as string metadata.\n\nConversations are **immutable**. Every operation (`conversation/say`, `conversation/add-message`, `conversation/set-system`, …) returns a *new* conversation rather than mutating in place, so you must thread the returned value forward — `let*` or a pipeline is the idiomatic way to chain turns. This immutability is what makes `conversation/fork` cheap and safe for branching.\n\n```sema\n(conversation/new {:model \"claude-sonnet-4\" :user \"alice\"})\n\n;; Build up a conversation by threading the returned value (no LLM call here):\n(let* ((c  (conversation/new {:model \"claude-sonnet-4\"}))\n       (c1 (conversation/set-system c \"You are concise.\"))\n       (c2 (conversation/add-message c1 :user \"Hello\"))\n       (c3 (conversation/add-message c2 :assistant \"Hi.\")))\n  (conversation/map c3 message/role))  ; => (:system :user :assistant)\n```"
+    },
+    {
+      "name": "conversation/remove",
+      "module": "conversation",
+      "summary": "Returns a new conversation with the message at index `idx` removed — conversations are immutable, so the original is unchanged. Errors if `idx` is out of bounds.",
+      "params": [
+        {
+          "name": "conv",
+          "type": "conversation"
+        },
+        {
+          "name": "idx",
+          "type": "int"
+        }
+      ],
+      "returns": "conversation",
+      "examples": [
+        "(conversation/remove conv 2)   ; drop the message at index 2"
+      ],
+      "body": "Returns a new conversation with the message at index `idx` removed — conversations are immutable, so the original is unchanged. Errors if `idx` is out of bounds.\n\n```sema\n(conversation/remove conv 2)   ; drop the message at index 2\n```"
+    },
+    {
+      "name": "conversation/replace",
+      "module": "conversation",
+      "summary": "Returns a new conversation with the message at index `idx` replaced. The replacement is given either as a message value or as a `:role` keyword plus a content string. Errors if `idx` is out of bounds.",
+      "params": [
+        {
+          "name": "conv",
+          "type": "conversation"
+        },
+        {
+          "name": "idx",
+          "type": "int"
+        },
+        {
+          "name": "message"
+        }
+      ],
+      "returns": "conversation",
+      "examples": [
+        "(conversation/replace conv 1 :user \"What is Scheme?\")"
+      ],
+      "body": "Returns a new conversation with the message at index `idx` replaced. The replacement is given either as a message value or as a `:role` keyword plus a content string. Errors if `idx` is out of bounds.\n\n```sema\n(conversation/replace conv 1 :user \"What is Scheme?\")\n```"
     },
     {
       "name": "conversation/say",
@@ -1353,6 +1565,26 @@
       "body": "Like `conversation/say` but overrides the system prompt (a string or prompt value) for **this turn only** — the conversation's own system message is left unchanged in the returned conversation, so the next plain `conversation/say` reverts to it. The optional opts map accepts `:temperature` and `:max-tokens`.\n\nContrast with `conversation/set-system`, which *persistently* replaces the system message for all future turns. Reach for `say-as` to adopt a persona or instruction for a single exchange.\n\n```sema\n(conversation/say-as conv \"You are a terse pirate.\" \"Describe the weather.\")\n```"
     },
     {
+      "name": "conversation/search",
+      "module": "conversation",
+      "summary": "Case-insensitive substring search over message content. Returns a list of `{:index :role :content}` maps, one per matching message.",
+      "params": [
+        {
+          "name": "conv",
+          "type": "conversation"
+        },
+        {
+          "name": "query",
+          "type": "string"
+        }
+      ],
+      "returns": "list",
+      "examples": [
+        "(conversation/search conv \"lisp\")\n;; => [{:index 1 :role :user :content \"What is Lisp?\"} ...]"
+      ],
+      "body": "Case-insensitive substring search over message content. Returns a list of `{:index :role :content}` maps, one per matching message.\n\n```sema\n(conversation/search conv \"lisp\")\n;; => [{:index 1 :role :user :content \"What is Lisp?\"} ...]\n```"
+    },
+    {
       "name": "conversation/set-system",
       "module": "conversation",
       "summary": "Return a new conversation with its system message set to (or replaced by) the given string, placed first among the messages. This **persists** for every future turn — contrast with `conversation/say-as`, which overrides the system prompt for one turn only. Read it back with `conversation/system`.",
@@ -1371,6 +1603,22 @@
         "(conversation/system\n  (conversation/set-system conv \"You are a concise expert.\"))  ; => \"You are a concise expert.\""
       ],
       "body": "Return a new conversation with its system message set to (or replaced by) the given string, placed first among the messages. This **persists** for every future turn — contrast with `conversation/say-as`, which overrides the system prompt for one turn only. Read it back with `conversation/system`.\n\n```sema\n(conversation/system\n  (conversation/set-system conv \"You are a concise expert.\"))  ; => \"You are a concise expert.\"\n```"
+    },
+    {
+      "name": "conversation/stats",
+      "module": "conversation",
+      "summary": "Aggregate report over the conversation: `{:messages :turns :tokens {:prompt :completion :total} :cost :models}`. The token and cost figures come from the real usage `conversation/say` accumulates as each turn is sent; they are `0` / `nil` when no priced turn has been recorded, and `:cost` is `nil` for a model with no known pricing.",
+      "params": [
+        {
+          "name": "conv",
+          "type": "conversation"
+        }
+      ],
+      "returns": "map",
+      "examples": [
+        "(conversation/stats conv)\n;; => {:messages 4 :turns 2 :tokens {:prompt 200 :completion 40 :total 240} :cost 0.00028 :models (\"gpt-4\")}"
+      ],
+      "body": "Aggregate report over the conversation: `{:messages :turns :tokens {:prompt :completion :total} :cost :models}`. The token and cost figures come from the real usage `conversation/say` accumulates as each turn is sent; they are `0` / `nil` when no priced turn has been recorded, and `:cost` is `nil` for a model with no known pricing.\n\n```sema\n(conversation/stats conv)\n;; => {:messages 4 :turns 2 :tokens {:prompt 200 :completion 40 :total 240} :cost 0.00028 :models (\"gpt-4\")}\n```"
     },
     {
       "name": "conversation/system",
@@ -1403,6 +1651,22 @@
         "(conversation/token-count conv)   ; => 312"
       ],
       "body": "Estimate the total number of tokens across all message contents in the conversation, using a ~4-characters-per-token heuristic.\n\n```sema\n(conversation/token-count conv)   ; => 312\n```"
+    },
+    {
+      "name": "conversation/turns",
+      "module": "conversation",
+      "summary": "Number of assistant replies in the conversation — the count of completed user/assistant exchanges. Contrast with `conversation/length`, which counts every message.",
+      "params": [
+        {
+          "name": "conv",
+          "type": "conversation"
+        }
+      ],
+      "returns": "int",
+      "examples": [
+        "(conversation/turns conv)   ; => 2"
+      ],
+      "body": "Number of assistant replies in the conversation — the count of completed user/assistant exchanges. Contrast with `conversation/length`, which counts every message.\n\n```sema\n(conversation/turns conv)   ; => 2\n```"
     },
     {
       "name": "base64/decode",
@@ -1633,6 +1897,78 @@
       "body": "Parse a date string into a UTC Unix timestamp using a [strftime](#strftime-format-directives)-style format string. The input is treated as a **UTC naive datetime** — no timezone information is expected or applied.\n\n```sema\n(time/parse date-string format-string) ; => float (UTC timestamp)\n```\n\n```sema\n(time/parse \"2025-01-15 12:10:00\" \"%Y-%m-%d %H:%M:%S\")    ; => 1736943000.0\n(time/parse \"2025-01-15 00:00:00\" \"%Y-%m-%d %H:%M:%S\")    ; => 1736899200.0\n(time/parse \"15/01/2025 14:30:00\" \"%d/%m/%Y %H:%M:%S\")    ; => 1736951400.0\n```\n\nThe format string must provide enough directives to fully specify a date and time. Parsing a date-only string like `\"%Y-%m-%d\"` without time components will fail — always include time directives (e.g., `%H:%M:%S`).\n\nThe wall-clock time in the string is **always interpreted as UTC**, regardless of any offset present. `time/parse` does not apply timezone offsets. To work with another timezone, convert the value to UTC yourself (subtract the offset) before parsing, then format/compute in UTC.\n\n**Roundtrip** — formatting a timestamp and parsing it back yields the original value:\n\n```sema\n(define ts 1700000000.0)\n(define formatted (time/format ts \"%Y-%m-%d %H:%M:%S\"))\n(define parsed (time/parse formatted \"%Y-%m-%d %H:%M:%S\"))\n(= parsed ts)  ; => #t\n```\n\n`time/parse` returns whole seconds — sub-second precision from the original timestamp is lost when roundtripping through format/parse."
     },
     {
+      "name": "diff/apply",
+      "module": "diff",
+      "section": "Diff & Patch",
+      "summary": "Apply a unified-diff `patch` to the `content` string and return the patched result. Each hunk is located by its recorded line number and surrounding context; if the context or deleted lines do not match the content, an error is raised. Round-trips with `diff/unified`: applying `(diff/unified old new)` to `old` reconstructs `new`.",
+      "returns": "string",
+      "examples": [
+        "(diff/apply \"a\\nb\\nc\\n\" (diff/unified \"a\\nb\\nc\\n\" \"a\\nB\\nc\\n\"))"
+      ],
+      "body": "Apply a unified-diff `patch` to the `content` string and return the patched result. Each hunk is located by its recorded line number and surrounding context; if the context or deleted lines do not match the content, an error is raised. Round-trips with `diff/unified`: applying `(diff/unified old new)` to `old` reconstructs `new`.\n\n```sema\n(diff/apply \"a\\nb\\nc\\n\" (diff/unified \"a\\nb\\nc\\n\" \"a\\nB\\nc\\n\"))\n```",
+      "syntax": "(diff/apply content patch)"
+    },
+    {
+      "name": "diff/hunks",
+      "module": "diff",
+      "section": "Diff & Patch",
+      "summary": "Parse a unified-diff string into a list of hunk maps. Each map has `{:header \"@@ ... @@\" :old-start <int> :old-count <int> :new-start <int> :new-count <int> :lines [...]}`, where `:lines` holds the hunk body lines including their leading marker (`\" \"`, `\"+\"`, or `\"-\"`). Counts default to 1 when omitted from the header.",
+      "returns": "list",
+      "examples": [
+        "(diff/hunks (diff/unified \"a\\nb\\nc\\n\" \"a\\nB\\nc\\n\"))"
+      ],
+      "body": "Parse a unified-diff string into a list of hunk maps. Each map has `{:header \"@@ ... @@\" :old-start <int> :old-count <int> :new-start <int> :new-count <int> :lines [...]}`, where `:lines` holds the hunk body lines including their leading marker (`\" \"`, `\"+\"`, or `\"-\"`). Counts default to 1 when omitted from the header.\n\n```sema\n(diff/hunks (diff/unified \"a\\nb\\nc\\n\" \"a\\nB\\nc\\n\"))\n```",
+      "syntax": "(diff/hunks patch)"
+    },
+    {
+      "name": "diff/parse",
+      "module": "diff",
+      "section": "Diff & Patch",
+      "summary": "Parse a (possibly multi-file) unified-diff string into a structured map `{:files [ {:old-path :new-path :hunks [...]} ... ]}`. File paths come from the `--- a/path` and `+++ b/path` headers (nil if absent), and each file's `:hunks` use the same shape as `diff/hunks`. A bare hunk-only patch yields a single file with nil paths.",
+      "returns": "map",
+      "examples": [
+        "(diff/parse \"--- a/x.txt\\n+++ b/x.txt\\n@@ -1 +1 @@\\n-old\\n+new\\n\")"
+      ],
+      "body": "Parse a (possibly multi-file) unified-diff string into a structured map `{:files [ {:old-path :new-path :hunks [...]} ... ]}`. File paths come from the `--- a/path` and `+++ b/path` headers (nil if absent), and each file's `:hunks` use the same shape as `diff/hunks`. A bare hunk-only patch yields a single file with nil paths.\n\n```sema\n(diff/parse \"--- a/x.txt\\n+++ b/x.txt\\n@@ -1 +1 @@\\n-old\\n+new\\n\")\n```",
+      "syntax": "(diff/parse patch)"
+    },
+    {
+      "name": "diff/stat",
+      "module": "diff",
+      "section": "Diff & Patch",
+      "summary": "Summarize a unified-diff string, returning a map `{:added <int> :removed <int> :hunks <int>}`. Added and removed counts are the number of `+` and `-` body lines (the `+++`/`---` file headers are excluded), and `:hunks` counts the `@@` markers. Useful for reporting the size of a change without applying it.",
+      "returns": "map",
+      "examples": [
+        "(diff/stat (diff/unified \"a\\nb\\nc\\n\" \"a\\nB\\nc\\n\"))"
+      ],
+      "body": "Summarize a unified-diff string, returning a map `{:added <int> :removed <int> :hunks <int>}`. Added and removed counts are the number of `+` and `-` body lines (the `+++`/`---` file headers are excluded), and `:hunks` counts the `@@` markers. Useful for reporting the size of a change without applying it.\n\n```sema\n(diff/stat (diff/unified \"a\\nb\\nc\\n\" \"a\\nB\\nc\\n\"))\n```",
+      "syntax": "(diff/stat patch)"
+    },
+    {
+      "name": "diff/unified",
+      "module": "diff",
+      "section": "Diff & Patch",
+      "summary": "Produce a unified-diff string describing how to turn the `old` string into the `new` string, comparing line by line. The optional third argument sets the number of unchanged context lines kept around each change (default 3). The result uses `old`/`new` file labels and the standard `@@ -l,s +l,s @@` hunk headers, and is the canonical format consumed by `diff/apply`, `diff/stat`, `diff/hunks`, and `diff/parse`.",
+      "returns": "string",
+      "examples": [
+        "(diff/unified \"a\\nb\\nc\\n\" \"a\\nc\\nd\\n\")"
+      ],
+      "body": "Produce a unified-diff string describing how to turn the `old` string into the `new` string, comparing line by line. The optional third argument sets the number of unchanged context lines kept around each change (default 3). The result uses `old`/`new` file labels and the standard `@@ -l,s +l,s @@` hunk headers, and is the canonical format consumed by `diff/apply`, `diff/stat`, `diff/hunks`, and `diff/parse`.\n\n```sema\n(diff/unified \"a\\nb\\nc\\n\" \"a\\nc\\nd\\n\")\n```",
+      "syntax": "(diff/unified old new [context])"
+    },
+    {
+      "name": "patch/apply-file",
+      "module": "diff",
+      "section": "Diff & Patch",
+      "summary": "Read the file at `path`, apply the unified-diff `patch` to its contents (using the same logic as `diff/apply`), write the patched text back to the file, and return the number of hunks applied. Raises an error if any hunk fails to apply, in which case the file is left unmodified. Requires the `fs-write` capability.",
+      "returns": "int",
+      "examples": [
+        "(patch/apply-file \"notes.txt\" my-patch)"
+      ],
+      "body": "Read the file at `path`, apply the unified-diff `patch` to its contents (using the same logic as `diff/apply`), write the patched text back to the file, and return the number of hunks applied. Raises an error if any hunk fails to apply, in which case the file is left unmodified. Requires the `fs-write` capability.\n\n```sema\n(patch/apply-file \"notes.txt\" my-patch)\n```",
+      "syntax": "(patch/apply-file path patch)"
+    },
+    {
       "name": "embedding/->list",
       "module": "embedding",
       "summary": "Convert an embedding bytevector into a list of float values, one per dimension.",
@@ -1698,6 +2034,20 @@
         "(embedding/ref emb 0)   ; => 0.0123"
       ],
       "body": "Return the embedding value at the given dimension index as a float. Errors if the index is out of bounds.\n\n```sema\n(embedding/ref emb 0)   ; => 0.0123\n```"
+    },
+    {
+      "name": "event/select",
+      "module": "events",
+      "section": "Events",
+      "summary": "Poll a list of event sources and return the first that becomes ready, or `nil` on timeout. Sources are maps: `{:type :key}`, `{:type :proc :handle h}`, `{:type :timer :ms n}`. Optional second arg is a timeout in ms. The unified wait for a TUI loop.",
+      "body": "Poll a list of event sources and return the first that becomes ready, or `nil` on timeout. Sources are maps: `{:type :key}`, `{:type :proc :handle h}`, `{:type :timer :ms n}`. Optional second arg is a timeout in ms. The unified wait for a TUI loop."
+    },
+    {
+      "name": "time/tick",
+      "module": "events",
+      "section": "Events",
+      "summary": "Build a reusable timer source for `event/select`: `(time/tick 16)` fires every ~16ms. Returns `{:type :timer :ms 16}`.",
+      "body": "Build a reusable timer source for `event/select`: `(time/tick 16)` fires every ~16ms. Returns `{:type :timer :ms 16}`."
     },
     {
       "name": "display",
@@ -2052,6 +2402,18 @@
       "body": "Test if a path is absolute.\n\n```sema\n(path/absolute? \"/usr/bin\")   ; => #t\n(path/absolute? \"relative\")  ; => #f\n```"
     },
     {
+      "name": "path/canonicalize",
+      "module": "file-io",
+      "section": "Path Manipulation",
+      "summary": "Resolve `path` to an absolute real path, following symlinks and collapsing `.`/`..`. Errors if the path does not exist — that requirement is what makes it the trustworthy form for deciding where a path *actually* points (e.g. before a security check).",
+      "returns": "string",
+      "examples": [
+        "(path/canonicalize \"./src/../Cargo.toml\")  ; => \"/abs/repo/Cargo.toml\""
+      ],
+      "body": "Resolve `path` to an absolute real path, following symlinks and collapsing `.`/`..`. Errors if the path does not exist — that requirement is what makes it the trustworthy form for deciding where a path *actually* points (e.g. before a security check).\n\n```sema\n(path/canonicalize \"./src/../Cargo.toml\")  ; => \"/abs/repo/Cargo.toml\"\n```\n\nFor not-yet-created paths, or pure path math that must not touch the filesystem, use `path/relative-to` / `path/within?`.",
+      "syntax": "(path/canonicalize path)"
+    },
+    {
       "name": "path/dir",
       "aliases": [
         "path/dirname"
@@ -2103,6 +2465,18 @@
       "syntax": "(path/join part ...)"
     },
     {
+      "name": "path/relative-to",
+      "module": "file-io",
+      "section": "Path Manipulation",
+      "summary": "Express `path` relative to `base` using pure path math (no filesystem access, so it works for paths that do not exist). Inserts `..` segments when `path` is outside `base`.",
+      "returns": "string",
+      "examples": [
+        "(path/relative-to \"/a/b\" \"/a/b/c/d\")  ; => \"c/d\"\n(path/relative-to \"/a/b/c\" \"/a/x\")    ; => \"../../x\"\n(path/relative-to \"/a/b\" \"/a/b\")      ; => \".\""
+      ],
+      "body": "Express `path` relative to `base` using pure path math (no filesystem access, so it works for paths that do not exist). Inserts `..` segments when `path` is outside `base`.\n\n```sema\n(path/relative-to \"/a/b\" \"/a/b/c/d\")  ; => \"c/d\"\n(path/relative-to \"/a/b/c\" \"/a/x\")    ; => \"../../x\"\n(path/relative-to \"/a/b\" \"/a/b\")      ; => \".\"\n```",
+      "syntax": "(path/relative-to base path)"
+    },
+    {
       "name": "path/stem",
       "module": "file-io",
       "section": "Path Manipulation",
@@ -2111,6 +2485,18 @@
         "(path/stem \"file.rs\")          ; => \"file\"\n(path/stem \"archive.tar.gz\")   ; => \"archive.tar\"   (only \".gz\" stripped)\n(path/stem \"/a/b/notes.md\")    ; => \"notes\"          (dir dropped too)"
       ],
       "body": "Return the filename without its final extension. Only the last extension is removed, so `stem` and `extension` complement each other: `\"archive.tar.gz\"` splits into stem `\"archive.tar\"` and extension `\"gz\"`. Operates on the filename only — any directory prefix is dropped first.\n\n```sema\n(path/stem \"file.rs\")          ; => \"file\"\n(path/stem \"archive.tar.gz\")   ; => \"archive.tar\"   (only \".gz\" stripped)\n(path/stem \"/a/b/notes.md\")    ; => \"notes\"          (dir dropped too)\n```"
+    },
+    {
+      "name": "path/within?",
+      "module": "file-io",
+      "section": "Path Manipulation",
+      "summary": "Return `#t` if `child` is contained inside (or equal to) `base`. Resolves `.`/`..` and, for paths that exist, follows symlinks via canonicalization — so it catches both traversal (`../`) and symlink escapes that a substring check would miss. The cornerstone of sandboxing agent file access to a workspace.",
+      "returns": "boolean",
+      "examples": [
+        "(path/within? \"/repo\" \"/repo/src/main.rs\")  ; => #t\n(path/within? \"/repo\" \"/repo/../etc\")       ; => #f"
+      ],
+      "body": "Return `#t` if `child` is contained inside (or equal to) `base`. Resolves `.`/`..` and, for paths that exist, follows symlinks via canonicalization — so it catches both traversal (`../`) and symlink escapes that a substring check would miss. The cornerstone of sandboxing agent file access to a workspace.\n\n```sema\n(path/within? \"/repo\" \"/repo/src/main.rs\")  ; => #t\n(path/within? \"/repo\" \"/repo/../etc\")       ; => #f\n```",
+      "syntax": "(path/within? base child)"
     },
     {
       "name": "pprint",
@@ -2229,6 +2615,115 @@
         "(read-stdin)   ; => entire piped stdin contents as a string"
       ],
       "body": "Read all of standard input to end-of-file and return it as a single string. Alias: `io/read-stdin`.\n\n```sema\n(read-stdin)   ; => entire piped stdin contents as a string\n```"
+    },
+    {
+      "name": "fs/unwatch",
+      "module": "fs",
+      "section": "File Watching",
+      "summary": "Stop watching and free a watcher handle created by `fs/watch`.",
+      "body": "Stop watching and free a watcher handle created by `fs/watch`."
+    },
+    {
+      "name": "fs/watch",
+      "module": "fs",
+      "section": "File Watching",
+      "summary": "Watch a path for changes and return a watcher handle. `(fs/watch \"src\" {:recursive true})`. The OS delivers events on a background thread; drain them with `fs/watch-events`.",
+      "body": "Watch a path for changes and return a watcher handle. `(fs/watch \"src\" {:recursive true})`. The OS delivers events on a background thread; drain them with `fs/watch-events`."
+    },
+    {
+      "name": "fs/watch-events",
+      "module": "fs",
+      "section": "File Watching",
+      "summary": "Drain pending filesystem events for a watcher (non-blocking): a list of `{:kind :paths}` maps where `:kind` is `:create`/`:modify`/`:remove`/`:access`/`:other`.",
+      "body": "Drain pending filesystem events for a watcher (non-blocking): a list of `{:kind :paths}` maps where `:kind` is `:create`/`:modify`/`:remove`/`:access`/`:other`."
+    },
+    {
+      "name": "git/changed-files",
+      "module": "git",
+      "section": "Git",
+      "summary": "Return a list of path strings for every file that differs from the index or working tree (staged, modified, or untracked). Rename entries report the destination path. Read-only — parses `git status --porcelain=v1`.",
+      "returns": "list",
+      "examples": [
+        "(git/changed-files)  ; => [\"src/main.sema\" \"README.md\"]"
+      ],
+      "body": "Return a list of path strings for every file that differs from the index or working tree (staged, modified, or untracked). Rename entries report the destination path. Read-only — parses `git status --porcelain=v1`.\n\n```sema\n(git/changed-files)  ; => [\"src/main.sema\" \"README.md\"]\n```"
+    },
+    {
+      "name": "git/current-branch",
+      "module": "git",
+      "section": "Git",
+      "summary": "Return the name of the currently checked-out branch (for example `\"main\"`). On a detached HEAD this returns `\"HEAD\"`. Read-only — runs `git rev-parse --abbrev-ref HEAD`.",
+      "returns": "string",
+      "examples": [
+        "(git/current-branch)  ; => \"main\""
+      ],
+      "body": "Return the name of the currently checked-out branch (for example `\"main\"`). On a detached HEAD this returns `\"HEAD\"`. Read-only — runs `git rev-parse --abbrev-ref HEAD`.\n\n```sema\n(git/current-branch)  ; => \"main\"\n```"
+    },
+    {
+      "name": "git/diff",
+      "module": "git",
+      "section": "Git",
+      "summary": "Return the unified diff of unstaged changes as a string. With no argument it diffs the whole working tree; with one path argument it limits the diff to that path. Read-only — runs `git diff` or `git diff -- <path>`.",
+      "returns": "string",
+      "examples": [
+        "(git/diff)              ; whole-tree diff\n(git/diff \"src/main.sema\")  ; diff for one path"
+      ],
+      "body": "Return the unified diff of unstaged changes as a string. With no argument it diffs the whole working tree; with one path argument it limits the diff to that path. Read-only — runs `git diff` or `git diff -- <path>`.\n\n```sema\n(git/diff)              ; whole-tree diff\n(git/diff \"src/main.sema\")  ; diff for one path\n```"
+    },
+    {
+      "name": "git/diff-files",
+      "module": "git",
+      "section": "Git",
+      "summary": "Return a list of path strings for files that have unstaged changes relative to the index. Read-only — runs `git diff --name-only`.",
+      "returns": "list",
+      "examples": [
+        "(git/diff-files)  ; => [\"src/main.sema\"]"
+      ],
+      "body": "Return a list of path strings for files that have unstaged changes relative to the index. Read-only — runs `git diff --name-only`.\n\n```sema\n(git/diff-files)  ; => [\"src/main.sema\"]\n```"
+    },
+    {
+      "name": "git/ignore-matches?",
+      "module": "git",
+      "section": "Git",
+      "summary": "Return true when `path` is excluded by the repository's gitignore rules, false otherwise. Read-only — runs `git check-ignore -q <path>` and inspects its exit code (0 = ignored, 1 = not ignored).",
+      "returns": "bool",
+      "examples": [
+        "(git/ignore-matches? \"target/debug\")  ; => true\n(git/ignore-matches? \"Cargo.toml\")    ; => false"
+      ],
+      "body": "Return true when `path` is excluded by the repository's gitignore rules, false otherwise. Read-only — runs `git check-ignore -q <path>` and inspects its exit code (0 = ignored, 1 = not ignored).\n\n```sema\n(git/ignore-matches? \"target/debug\")  ; => true\n(git/ignore-matches? \"Cargo.toml\")    ; => false\n```"
+    },
+    {
+      "name": "git/recent-files",
+      "module": "git",
+      "section": "Git",
+      "summary": "Return a deduplicated list of file paths touched by the last `n` commits, preserving first-seen order. `n` defaults to 20 when omitted. Read-only — runs `git log --name-only --pretty=format: -n <n>`.",
+      "returns": "list",
+      "examples": [
+        "(git/recent-files)    ; files from the last 20 commits\n(git/recent-files 5)  ; files from the last 5 commits"
+      ],
+      "body": "Return a deduplicated list of file paths touched by the last `n` commits, preserving first-seen order. `n` defaults to 20 when omitted. Read-only — runs `git log --name-only --pretty=format: -n <n>`.\n\n```sema\n(git/recent-files)    ; files from the last 20 commits\n(git/recent-files 5)  ; files from the last 5 commits\n```"
+    },
+    {
+      "name": "git/root",
+      "module": "git",
+      "section": "Git",
+      "summary": "Return the absolute path to the root of the current Git repository (the working tree's top level). Errors if the current directory is not inside a Git repository. Read-only — runs `git rev-parse --show-toplevel`.",
+      "returns": "string",
+      "examples": [
+        "(git/root)  ; => \"/Users/you/projects/sema\""
+      ],
+      "body": "Return the absolute path to the root of the current Git repository (the working tree's top level). Errors if the current directory is not inside a Git repository. Read-only — runs `git rev-parse --show-toplevel`.\n\n```sema\n(git/root)  ; => \"/Users/you/projects/sema\"\n```"
+    },
+    {
+      "name": "git/status",
+      "module": "git",
+      "section": "Git",
+      "summary": "Return a list of maps describing the working-tree status, one per changed file. Each map has `:path` (the file path), `:status` (the two-character porcelain code), `:staged` (true when the index column carries a change), and `:untracked` (true for `\"??\"` entries). Read-only — runs `git status --porcelain=v1`.",
+      "returns": "list",
+      "examples": [
+        "(git/status)\n; => [{:path \"src/main.sema\" :status \" M\" :staged false :untracked false}]"
+      ],
+      "body": "Return a list of maps describing the working-tree status, one per changed file. Each map has `:path` (the file path), `:status` (the two-character porcelain code), `:staged` (true when the index column carries a change), and `:untracked` (true for `\"??\"` entries). Read-only — runs `git status --porcelain=v1`.\n\n```sema\n(git/status)\n; => [{:path \"src/main.sema\" :status \" M\" :staged false :untracked false}]\n```"
     },
     {
       "name": "http/delete",
@@ -2475,27 +2970,6 @@
       ],
       "body": "Call a function with the elements of a list spread out as its arguments. `(apply f xs)` is `(f x1 x2 ...)` — the bridge between \"I have a list of values\" and \"this function takes separate arguments\".\n\nAny leading arguments before the final list are passed first, then the list is spliced on the end; the last argument must be a list.\n\n```sema\n(apply + '(1 2 3))     ; => 6\n(apply max '(3 1 4))   ; => 4\n\n;; Leading fixed args, then the list:\n(apply + 1 2 '(3 4))   ; => 10\n\n;; Common use: forward a collected arg list to a variadic builtin\n(define nums '(5 9 2))\n(apply min nums)       ; => 2\n```",
       "syntax": "(apply f arg ... lst)"
-    },
-    {
-      "name": "assoc",
-      "module": "lists",
-      "section": "Association Lists",
-      "summary": "Look up a key in an association list (a list of `(key value)` pairs), using `equal?` (structural) comparison. Returns the **whole matching pair**, not just the value — so reach for the value with `cadr`. Returns `#f` when no key matches.",
-      "params": [
-        {
-          "name": "key",
-          "type": "any"
-        },
-        {
-          "name": "alist",
-          "type": "list"
-        }
-      ],
-      "returns": "any",
-      "examples": [
-        "(define alist '((\"a\" 1) (\"b\" 2) (\"c\" 3)))\n(assoc \"b\" alist)         ; => (\"b\" 2)\n(assoc \"z\" alist)         ; => #f\n\n;; Get the value, not the pair:\n(cadr (assoc \"b\" alist))  ; => 2"
-      ],
-      "body": "Look up a key in an association list (a list of `(key value)` pairs), using `equal?` (structural) comparison. Returns the **whole matching pair**, not just the value — so reach for the value with `cadr`. Returns `#f` when no key matches.\n\n```sema\n(define alist '((\"a\" 1) (\"b\" 2) (\"c\" 3)))\n(assoc \"b\" alist)         ; => (\"b\" 2)\n(assoc \"z\" alist)         ; => #f\n\n;; Get the value, not the pair:\n(cadr (assoc \"b\" alist))  ; => 2\n```\n\nBecause `#f` doubles as \"not found\", check membership before destructuring an unknown key. For larger or mutable lookups, a hash map (`{...}` / `get`) is faster than scanning an alist. See also `assq`/`assv` (other comparison flavors — in Sema all three compare by value)."
     },
     {
       "name": "assq",
@@ -2748,9 +3222,9 @@
       ],
       "returns": "list",
       "examples": [
-        "(cons 0 '(1 2 3))  ; => (0 1 2 3)\n(cons 1 '())       ; => (1)"
+        "(cons 0 '(1 2 3))  ; => (0 1 2 3)\n(cons 1 '())       ; => (1)\n(cons 0 \"a\")       ; => (0 \"a\")      ; not a dotted pair\n(cdr (cons 0 \"a\")) ; => (\"a\")        ; a list, not \"a\""
       ],
-      "body": "Prepend an element to a list.\n\n```sema\n(cons 0 '(1 2 3))  ; => (0 1 2 3)\n(cons 1 '())       ; => (1)\n```"
+      "body": "Prepend an element to a list.\n\nSema has **no dotted pairs / improper lists** — `cons` always yields a proper\nlist. If the second argument isn't a list it's treated as a one-element list, so\n`(cons a b)` becomes the two-element list `(a b)`, and `cdr` returns a list, not a\nbare value. To build a pair, use `(list a b)` and read it back with `car`/`nth`\n(not `car`/`cdr`), e.g. `(nth p 0)` / `(nth p 1)`.\n\n```sema\n(cons 0 '(1 2 3))  ; => (0 1 2 3)\n(cons 1 '())       ; => (1)\n(cons 0 \"a\")       ; => (0 \"a\")      ; not a dotted pair\n(cdr (cons 0 \"a\")) ; => (\"a\")        ; a list, not \"a\"\n```"
     },
     {
       "name": "drop",
@@ -2861,7 +3335,7 @@
       "name": "first",
       "module": "lists",
       "section": "Construction & Access",
-      "summary": "Alias for `car`. Return the first element.",
+      "summary": "Alias for `car`. Return the first element of a list or vector. Returns `nil` for empty sequences (making it a safe \"index 0\" accessor — unlike `nth`, which errors out of bounds).",
       "params": [
         {
           "name": "lst",
@@ -2871,9 +3345,9 @@
       ],
       "returns": "any",
       "examples": [
-        "(first '(1 2 3))   ; => 1"
+        "(first '(1 2 3))   ; => 1\n(first [1 2 3])    ; => 1\n(first [])         ; => nil"
       ],
-      "body": "Alias for `car`. Return the first element.\n\n```sema\n(first '(1 2 3))   ; => 1\n```"
+      "body": "Alias for `car`. Return the first element of a list or vector. Returns `nil` for empty sequences (making it a safe \"index 0\" accessor — unlike `nth`, which errors out of bounds).\n\n```sema\n(first '(1 2 3))   ; => 1\n(first [1 2 3])    ; => 1\n(first [])         ; => nil\n```"
     },
     {
       "name": "flat-map",
@@ -3073,7 +3547,7 @@
       "name": "length",
       "module": "lists",
       "section": "Basic Operations",
-      "summary": "Return the number of elements in a list.",
+      "summary": "Return the number of elements in a collection. Works on lists, vectors, strings, maps, bytevectors, and typed arrays. See also `count`, which additionally treats `nil` as `0`.",
       "params": [
         {
           "name": "list",
@@ -3082,9 +3556,9 @@
       ],
       "returns": "int",
       "examples": [
-        "(length '(1 2 3))  ; => 3\n(length '())       ; => 0"
+        "(length '(1 2 3))  ; => 3\n(length '())       ; => 0\n(length [10 20 30]); => 3\n(length \"abc\")     ; => 3"
       ],
-      "body": "Return the number of elements in a list.\n\n```sema\n(length '(1 2 3))  ; => 3\n(length '())       ; => 0\n```"
+      "body": "Return the number of elements in a collection. Works on lists, vectors, strings, maps, bytevectors, and typed arrays. See also `count`, which additionally treats `nil` as `0`.\n\n```sema\n(length '(1 2 3))  ; => 3\n(length '())       ; => 0\n(length [10 20 30]); => 3\n(length \"abc\")     ; => 3\n```"
     },
     {
       "name": "list",
@@ -3515,7 +3989,7 @@
       "name": "nth",
       "module": "lists",
       "section": "Construction & Access",
-      "summary": "Return the element at index N (zero-based).",
+      "summary": "Return the element at index N (zero-based). Works on both lists and vectors.",
       "params": [
         {
           "name": "lst",
@@ -3530,9 +4004,10 @@
       ],
       "returns": "any",
       "examples": [
-        "(nth '(10 20 30) 1)   ; => 20\n(nth '(10 20 30) 0)   ; => 10"
+        "(nth '(10 20 30) 1)   ; => 20\n(nth '(10 20 30) 0)   ; => 10\n(nth [10 20 30] 2)    ; => 30",
+        "(nth [10 20 30] 3)\n; => error: index 3 out of bounds (length 3)"
       ],
-      "body": "Return the element at index N (zero-based).\n\n```sema\n(nth '(10 20 30) 1)   ; => 20\n(nth '(10 20 30) 0)   ; => 10\n```"
+      "body": "Return the element at index N (zero-based). Works on both lists and vectors.\n\n```sema\n(nth '(10 20 30) 1)   ; => 20\n(nth '(10 20 30) 0)   ; => 10\n(nth [10 20 30] 2)    ; => 30\n```\n\nOut of bounds is an error:\n\n```sema\n(nth [10 20 30] 3)\n; => error: index 3 out of bounds (length 3)\n```\n\nUse `first` for safe \"index 0\" access — it returns `nil` on empty sequences."
     },
     {
       "name": "partition",
@@ -3570,7 +4045,7 @@
       "name": "rest",
       "module": "lists",
       "section": "Construction & Access",
-      "summary": "Alias for `cdr`. Return the rest of the list.",
+      "summary": "Alias for `cdr`. Return everything after the first element. **Preserves type** — list in, list out; vector in, vector out.",
       "params": [
         {
           "name": "lst",
@@ -3579,9 +4054,9 @@
       ],
       "returns": "list",
       "examples": [
-        "(rest '(1 2 3))    ; => (2 3)"
+        "(rest '(1 2 3))    ; => (2 3)\n(rest [1 2 3])     ; => [2 3]\n(rest [])          ; => []\n(rest [1])         ; => []"
       ],
-      "body": "Alias for `cdr`. Return the rest of the list.\n\n```sema\n(rest '(1 2 3))    ; => (2 3)\n```"
+      "body": "Alias for `cdr`. Return everything after the first element. **Preserves type** — list in, list out; vector in, vector out.\n\n```sema\n(rest '(1 2 3))    ; => (2 3)\n(rest [1 2 3])     ; => [2 3]\n(rest [])          ; => []\n(rest [1])         ; => []\n```"
     },
     {
       "name": "reverse",
@@ -3639,9 +4114,9 @@
       ],
       "returns": "list",
       "examples": [
-        "(sort '(3 1 4 1 5))                ; => (1 1 3 4 5)\n(sort '(3 1 4 1 5) >)              ; => (5 4 3 1 1)   ; custom comparator\n(sort '(\"banana\" \"apple\" \"cherry\")) ; => (\"apple\" \"banana\" \"cherry\")"
+        "(sort '(3 1 4 1 5))                ; => (1 1 3 4 5)\n(sort '(3 1.5 2))                  ; => (1.5 2 3)     ; ints and floats compare numerically\n(sort '(3 1 4 1 5) >)              ; => (5 4 3 1 1)   ; custom comparator\n(sort '(\"banana\" \"apple\" \"cherry\")) ; => (\"apple\" \"banana\" \"cherry\")\n(sort (list 1 \"a\"))               ; error: sort orders one type at a time"
       ],
-      "body": "Return a new list sorted in ascending order. The input is left unchanged. Pass an optional two-argument comparator to control the order (e.g. `>` for descending).\n\n```sema\n(sort '(3 1 4 1 5))                ; => (1 1 3 4 5)\n(sort '(3 1 4 1 5) >)              ; => (5 4 3 1 1)   ; custom comparator\n(sort '(\"banana\" \"apple\" \"cherry\")) ; => (\"apple\" \"banana\" \"cherry\")\n```\n\nSee also: `sort-by` (sort by a derived key rather than a comparator)."
+      "body": "Return a new list sorted in ascending order. The input is left unchanged. Pass an optional two-argument comparator to control the order (e.g. `>` for descending).\n\nWithout a comparator, `sort` orders one type at a time. Numbers (ints and floats) sort together by numeric value; strings, symbols, keywords, chars, and booleans each sort within their own kind. Mixing unrelated types (e.g. a number and a string) is a type error rather than a silent, arbitrary order — pass an explicit comparator or use `sort-by` to order mixed types deliberately.\n\n```sema\n(sort '(3 1 4 1 5))                ; => (1 1 3 4 5)\n(sort '(3 1.5 2))                  ; => (1.5 2 3)     ; ints and floats compare numerically\n(sort '(3 1 4 1 5) >)              ; => (5 4 3 1 1)   ; custom comparator\n(sort '(\"banana\" \"apple\" \"cherry\")) ; => (\"apple\" \"banana\" \"cherry\")\n(sort (list 1 \"a\"))               ; error: sort orders one type at a time\n```\n\nSee also: `sort-by` (sort by a derived key rather than a comparator)."
     },
     {
       "name": "sort-by",
@@ -4511,9 +4986,10 @@
       "summary": "Add or update key-value pairs, returning a **new** map; the original is never mutated.",
       "returns": "map",
       "examples": [
-        "(assoc {:a 1} :b 2)          ; => {:a 1 :b 2}\n(assoc {:a 1} :a 99)         ; => {:a 99}  (existing key replaced)\n(assoc {} :a 1 :b 2 :c 3)    ; => {:a 1 :b 2 :c 3}  (multiple pairs)\n\n;; The input is unchanged — assoc returns a fresh map.\n(let ((m {:a 1}))\n  (assoc m :b 2)\n  m)                         ; => {:a 1}"
+        "(assoc {:a 1} :b 2)          ; => {:a 1 :b 2}\n(assoc {:a 1} :a 99)         ; => {:a 99}  (existing key replaced)\n(assoc {} :a 1 :b 2 :c 3)    ; => {:a 1 :b 2 :c 3}  (multiple pairs)\n\n;; The input is unchanged — assoc returns a fresh map.\n(let ((m {:a 1}))\n  (assoc m :b 2)\n  m)                         ; => {:a 1}",
+        "(define alist '((\"a\" 1) (\"b\" 2) (\"c\" 3)))\n(assoc \"b\" alist)         ; => (\"b\" 2)\n(assoc \"z\" alist)         ; => #f\n(cadr (assoc \"b\" alist))  ; => 2   (get the value, not the pair)"
       ],
-      "body": "Add or update key-value pairs, returning a **new** map; the original is never mutated.\n\nAccepts any number of trailing key/value pairs, applied left to right. `assoc` only touches the top level — to reach into a nested map use `assoc-in`/`map/assoc-in`. To remove a key instead, use `dissoc`.\n\n```sema\n(assoc {:a 1} :b 2)          ; => {:a 1 :b 2}\n(assoc {:a 1} :a 99)         ; => {:a 99}  (existing key replaced)\n(assoc {} :a 1 :b 2 :c 3)    ; => {:a 1 :b 2 :c 3}  (multiple pairs)\n\n;; The input is unchanged — assoc returns a fresh map.\n(let ((m {:a 1}))\n  (assoc m :b 2)\n  m)                         ; => {:a 1}\n```",
+      "body": "Add or update key-value pairs, returning a **new** map; the original is never mutated.\n\nAccepts any number of trailing key/value pairs, applied left to right. `assoc` only touches the top level — to reach into a nested map use `assoc-in`/`map/assoc-in`. To remove a key instead, use `dissoc`.\n\n```sema\n(assoc {:a 1} :b 2)          ; => {:a 1 :b 2}\n(assoc {:a 1} :a 99)         ; => {:a 99}  (existing key replaced)\n(assoc {} :a 1 :b 2 :c 3)    ; => {:a 1 :b 2 :c 3}  (multiple pairs)\n\n;; The input is unchanged — assoc returns a fresh map.\n(let ((m {:a 1}))\n  (assoc m :b 2)\n  m)                         ; => {:a 1}\n```\n\n## Association-list form\n\nCalled as `(assoc key alist)` — two arguments where the second is a list — `assoc`\ninstead does a classic Scheme association-list lookup: it scans a list of\n`(key value)` pairs using `equal?` (structural) comparison and returns the **whole\nmatching pair** (reach for the value with `cadr`), or `#f` when no key matches.\n\n```sema\n(define alist '((\"a\" 1) (\"b\" 2) (\"c\" 3)))\n(assoc \"b\" alist)         ; => (\"b\" 2)\n(assoc \"z\" alist)         ; => #f\n(cadr (assoc \"b\" alist))  ; => 2   (get the value, not the pair)\n```\n\nBecause `#f` doubles as \"not found\", check membership before destructuring an\nunknown key. For larger or mutable lookups, a hash map (`{...}` / `get`) is faster\nthan scanning an alist. See also `assq`/`assv` (other comparison flavors — in Sema\nall three compare by value).",
       "syntax": "(assoc map key val ...)"
     },
     {
@@ -4978,6 +5454,83 @@
       "body": "Return the values of a map as a list, in the same order as `keys` returns the corresponding keys (sorted by key for an ordered map).\n\n```sema\n(vals {:a 1 :b 2})        ; => (1 2)\n(vals {:c 3 :a 1 :b 2})   ; => (1 2 3)  (ordered by key)\n(vals {})                 ; => ()\n```"
     },
     {
+      "name": "html/parse",
+      "module": "markup",
+      "section": "Markdown & HTML",
+      "summary": "Parse and normalize an HTML document, returning the normalized HTML as a string. The returned string is the handle accepted by `html/select`, `html/text`, and `html/select-text`, which re-parse it internally. Parsing is lenient (html5ever), so malformed markup is repaired rather than rejected.",
+      "examples": [
+        "(html/parse \"<p>hello<p>world\")",
+        ";; The result feeds the other html functions\n(html/text (html/parse \"<h1>Title</h1>\"))\n;; => \"Title\""
+      ],
+      "body": "Parse and normalize an HTML document, returning the normalized HTML as a string. The returned string is the handle accepted by `html/select`, `html/text`, and `html/select-text`, which re-parse it internally. Parsing is lenient (html5ever), so malformed markup is repaired rather than rejected.\n\n```sema\n(html/parse \"<p>hello<p>world\")\n```\n\n```sema\n;; The result feeds the other html functions\n(html/text (html/parse \"<h1>Title</h1>\"))\n;; => \"Title\"\n```"
+    },
+    {
+      "name": "html/select",
+      "module": "markup",
+      "section": "Markdown & HTML",
+      "summary": "Run a CSS selector against an HTML string and return a list of the matched elements as their outer HTML strings. Supports the full CSS selector syntax (tags, classes, ids, attributes, combinators). An invalid selector raises an error.",
+      "examples": [
+        "(html/select \"<p class=x>a</p><p>b</p>\" \"p.x\")\n;; => (\"<p class=\\\"x\\\">a</p>\")",
+        ";; Pull every link element out of a page\n(html/select \"<a href=/1>one</a><a href=/2>two</a>\" \"a\")"
+      ],
+      "body": "Run a CSS selector against an HTML string and return a list of the matched elements as their outer HTML strings. Supports the full CSS selector syntax (tags, classes, ids, attributes, combinators). An invalid selector raises an error.\n\n```sema\n(html/select \"<p class=x>a</p><p>b</p>\" \"p.x\")\n;; => (\"<p class=\\\"x\\\">a</p>\")\n```\n\n```sema\n;; Pull every link element out of a page\n(html/select \"<a href=/1>one</a><a href=/2>two</a>\" \"a\")\n```"
+    },
+    {
+      "name": "html/select-text",
+      "module": "markup",
+      "section": "Markdown & HTML",
+      "summary": "Run a CSS selector against an HTML string and return a list of the matched elements' text content (one whitespace-collapsed string per match), with tags stripped. Like `html/select` but yields text rather than outer HTML. An invalid selector raises an error.",
+      "examples": [
+        "(html/select-text \"<p class=x>alpha</p><p class=x>beta</p>\" \"p.x\")\n;; => (\"alpha\" \"beta\")",
+        ";; Scrape the text of every list item\n(html/select-text \"<ul><li>one</li><li>two</li></ul>\" \"li\")\n;; => (\"one\" \"two\")"
+      ],
+      "body": "Run a CSS selector against an HTML string and return a list of the matched elements' text content (one whitespace-collapsed string per match), with tags stripped. Like `html/select` but yields text rather than outer HTML. An invalid selector raises an error.\n\n```sema\n(html/select-text \"<p class=x>alpha</p><p class=x>beta</p>\" \"p.x\")\n;; => (\"alpha\" \"beta\")\n```\n\n```sema\n;; Scrape the text of every list item\n(html/select-text \"<ul><li>one</li><li>two</li></ul>\" \"li\")\n;; => (\"one\" \"two\")\n```"
+    },
+    {
+      "name": "html/text",
+      "module": "markup",
+      "section": "Markdown & HTML",
+      "summary": "Extract the visible text content from an HTML string, stripping all tags. Text from every node is concatenated and whitespace-collapsed into a single trimmed string.",
+      "examples": [
+        "(html/text \"<div><p>hello</p> <p>world</p></div>\")\n;; => \"hello world\"",
+        ";; Strip markup to get plain text for indexing or display\n(html/text \"<h1>Title</h1><p>Some <b>bold</b> body.</p>\")\n;; => \"Title Some bold body.\""
+      ],
+      "body": "Extract the visible text content from an HTML string, stripping all tags. Text from every node is concatenated and whitespace-collapsed into a single trimmed string.\n\n```sema\n(html/text \"<div><p>hello</p> <p>world</p></div>\")\n;; => \"hello world\"\n```\n\n```sema\n;; Strip markup to get plain text for indexing or display\n(html/text \"<h1>Title</h1><p>Some <b>bold</b> body.</p>\")\n;; => \"Title Some bold body.\"\n```"
+    },
+    {
+      "name": "markdown/frontmatter",
+      "module": "markup",
+      "section": "Markdown & HTML",
+      "summary": "Split a leading `---` fenced frontmatter block from a Markdown document. Returns a map with `:frontmatter` (the raw block text, or `nil` when no frontmatter is present) and `:body` (the remaining document). The frontmatter block is returned verbatim; it is not parsed as YAML or TOML.",
+      "examples": [
+        "(markdown/frontmatter \"---\\ntitle: Hello\\n---\\nBody text\")\n;; => {:frontmatter \"title: Hello\\n\" :body \"Body text\"}",
+        ";; No frontmatter -> :frontmatter is nil, :body is the original\n(markdown/frontmatter \"Just a plain document\")\n;; => {:frontmatter nil :body \"Just a plain document\"}"
+      ],
+      "body": "Split a leading `---` fenced frontmatter block from a Markdown document. Returns a map with `:frontmatter` (the raw block text, or `nil` when no frontmatter is present) and `:body` (the remaining document). The frontmatter block is returned verbatim; it is not parsed as YAML or TOML.\n\n```sema\n(markdown/frontmatter \"---\\ntitle: Hello\\n---\\nBody text\")\n;; => {:frontmatter \"title: Hello\\n\" :body \"Body text\"}\n```\n\n```sema\n;; No frontmatter -> :frontmatter is nil, :body is the original\n(markdown/frontmatter \"Just a plain document\")\n;; => {:frontmatter nil :body \"Just a plain document\"}\n```"
+    },
+    {
+      "name": "markdown/headings",
+      "module": "markup",
+      "section": "Markdown & HTML",
+      "summary": "Extract the headings from a Markdown document in document order. Returns a list of maps, each with a `:level` integer (1 through 6) and a `:text` string holding the heading's plain text content.",
+      "examples": [
+        "(markdown/headings \"# Intro\\n\\n## Setup\\n\\n## Usage\")\n;; => ({:level 1 :text \"Intro\"} {:level 2 :text \"Setup\"} {:level 2 :text \"Usage\"})",
+        ";; Build a table of contents from a document\n(map (lambda (h) (:text h))\n     (markdown/headings \"# A\\n\\n## B\\n\\n### C\"))"
+      ],
+      "body": "Extract the headings from a Markdown document in document order. Returns a list of maps, each with a `:level` integer (1 through 6) and a `:text` string holding the heading's plain text content.\n\n```sema\n(markdown/headings \"# Intro\\n\\n## Setup\\n\\n## Usage\")\n;; => ({:level 1 :text \"Intro\"} {:level 2 :text \"Setup\"} {:level 2 :text \"Usage\"})\n```\n\n```sema\n;; Build a table of contents from a document\n(map (lambda (h) (:text h))\n     (markdown/headings \"# A\\n\\n## B\\n\\n### C\"))\n```"
+    },
+    {
+      "name": "markdown/to-html",
+      "module": "markup",
+      "section": "Markdown & HTML",
+      "summary": "Render a CommonMark Markdown string to an HTML string. Uses `pulldown-cmark` for standards-compliant parsing, covering headings, emphasis, lists, links, code spans, and fenced code blocks.",
+      "examples": [
+        "(markdown/to-html \"# Title\\n\\nHello **world**.\")",
+        ";; Lists and inline code render too\n(markdown/to-html \"- one\\n- two\\n\\nRun `make build`.\")"
+      ],
+      "body": "Render a CommonMark Markdown string to an HTML string. Uses `pulldown-cmark` for standards-compliant parsing, covering headings, emphasis, lists, links, code spans, and fenced code blocks.\n\n```sema\n(markdown/to-html \"# Title\\n\\nHello **world**.\")\n```\n\n```sema\n;; Lists and inline code render too\n(markdown/to-html \"- one\\n- two\\n\\nRun `make build`.\")\n```"
+    },
+    {
       "name": "*",
       "module": "math",
       "section": "Basic Arithmetic",
@@ -5048,18 +5601,6 @@
       ],
       "body": "Less than or equal. Variadic: `(<= a b c)` is true when arguments are in non-decreasing order.\n\n```sema\n(<= 1 2)      ; => #t\n(<= 2 2)      ; => #t\n(<= 1 2 2)    ; => #t   (non-decreasing chain)\n```",
       "syntax": "(<= num ...)"
-    },
-    {
-      "name": "=",
-      "module": "math",
-      "section": "Comparison",
-      "summary": "Equality. For numbers this is **numeric** equality, so `(= 1 1.0)` is `#t` even though the int and float differ in representation. For non-numbers it falls back to **structural** equality (recursing into lists, maps, vectors).",
-      "returns": "bool",
-      "examples": [
-        "(= 1 1)             ; => #t\n(= 1 1.0)           ; => #t   (numeric: int = float)\n(= 1 2)             ; => #f\n(= \"abc\" \"abc\")     ; => #t   (structural)\n(= '(1 2) '(1 2))   ; => #t   (recurses into the list)\n\n(eq? 1 1.0)         ; => #f   (no numeric coercion)"
-      ],
-      "body": "Equality. For numbers this is **numeric** equality, so `(= 1 1.0)` is `#t`\neven though the int and float differ in representation. For non-numbers it falls\nback to **structural** equality (recursing into lists, maps, vectors).\n\n`=` never errors on type mismatches — it just answers `#f` (or `#t`). That makes\nit the safe general-purpose equality. Contrast with `eq?`, which is stricter\nidentity/value equality: `(eq? 1 1.0)` is `#f` because the values are not the\nsame kind. Reach for `=` when comparing numbers or whole data structures; reach\nfor `eq?` when you want \"is this the exact same value\" (no int/float coercion).\n\n```sema\n(= 1 1)             ; => #t\n(= 1 1.0)           ; => #t   (numeric: int = float)\n(= 1 2)             ; => #f\n(= \"abc\" \"abc\")     ; => #t   (structural)\n(= '(1 2) '(1 2))   ; => #t   (recurses into the list)\n\n(eq? 1 1.0)         ; => #f   (no numeric coercion)\n```\n\nSee also: `eq?` (value identity), `<` / `>` (ordering — these *do* error on mixed\nor unorderable types, where `=` does not).",
-      "syntax": "(= a b ...)"
     },
     {
       "name": ">",
@@ -5246,23 +5787,6 @@
         "e              ; => 2.718281828459045"
       ],
       "body": "Euler's number (2.71828...).\n\n```sema\ne              ; => 2.718281828459045\n```"
-    },
-    {
-      "name": "even?",
-      "module": "math",
-      "section": "Numeric Predicates",
-      "summary": "Test whether an integer is even. Requires an integer — passing a float errors rather than coercing. See `odd?` for the complement.",
-      "params": [
-        {
-          "name": "n",
-          "type": "int"
-        }
-      ],
-      "returns": "bool",
-      "examples": [
-        "(even? 4)      ; => #t\n(even? 0)      ; => #t\n(even? -2)     ; => #t\n(even? 3)      ; => #f"
-      ],
-      "body": "Test whether an integer is even. Requires an integer — passing a float errors rather than coercing. See `odd?` for the complement.\n\n```sema\n(even? 4)      ; => #t\n(even? 0)      ; => #t\n(even? -2)     ; => #t\n(even? 3)      ; => #f\n```"
     },
     {
       "name": "expt",
@@ -5774,33 +6298,6 @@
       "body": "Alias for [`mod`](#mod): truncated remainder whose sign follows the dividend.\n\n```sema\n(modulo 10 3)  ; => 1\n(modulo -7 2)  ; => -1\n```"
     },
     {
-      "name": "negative?",
-      "module": "math",
-      "section": "Numeric Predicates",
-      "summary": "Test if a number is negative.",
-      "examples": [
-        "(negative? -1) ; => #t\n(negative? 1)  ; => #f"
-      ],
-      "body": "Test if a number is negative.\n\n```sema\n(negative? -1) ; => #t\n(negative? 1)  ; => #f\n```"
-    },
-    {
-      "name": "odd?",
-      "module": "math",
-      "section": "Numeric Predicates",
-      "summary": "Test if an integer is odd.",
-      "params": [
-        {
-          "name": "n",
-          "type": "int"
-        }
-      ],
-      "returns": "bool",
-      "examples": [
-        "(odd? 3)       ; => #t\n(odd? 4)       ; => #f"
-      ],
-      "body": "Test if an integer is odd.\n\n```sema\n(odd? 3)       ; => #t\n(odd? 4)       ; => #f\n```"
-    },
-    {
       "name": "pi",
       "module": "math",
       "section": "Constants",
@@ -5809,23 +6306,6 @@
         "pi             ; => 3.141592653589793"
       ],
       "body": "The mathematical constant π (3.14159...).\n\n```sema\npi             ; => 3.141592653589793\n```"
-    },
-    {
-      "name": "positive?",
-      "module": "math",
-      "section": "Numeric Predicates",
-      "summary": "Test if a number is positive.",
-      "params": [
-        {
-          "name": "n",
-          "type": "number"
-        }
-      ],
-      "returns": "bool",
-      "examples": [
-        "(positive? 1)  ; => #t\n(positive? -1) ; => #f\n(positive? 0)  ; => #f"
-      ],
-      "body": "Test if a number is positive.\n\n```sema\n(positive? 1)  ; => #t\n(positive? -1) ; => #f\n(positive? 0)  ; => #f\n```"
     },
     {
       "name": "pow",
@@ -5892,21 +6372,103 @@
       "body": "Drop the fractional part, rounding toward zero (so negatives round *up*). Unlike [`round`](#round), it never inspects the fraction — `3.9` truncates to `3`.\n\n```sema\n(truncate 3.7)  ; => 3\n(truncate -3.7) ; => -3   ; toward zero, not floor (-4)\n(truncate 3.9)  ; => 3\n```"
     },
     {
-      "name": "zero?",
-      "module": "math",
-      "section": "Numeric Predicates",
-      "summary": "Test if a number is zero.",
+      "name": "mcp/call",
+      "module": "mcp",
+      "section": "MCP Client",
+      "summary": "Invoke a tool on an MCP server (`tools/call`) and return its result normalized to a Sema value: a plain text result collapses to a string; a richer result (images, resources, `structuredContent`) is returned as the full map. A tool that reports `isError` surfaces as a `SemaError`.",
       "params": [
         {
-          "name": "n",
-          "type": "number"
+          "name": "handle",
+          "type": "string"
+        },
+        {
+          "name": "tool",
+          "type": "string",
+          "doc": "tool name"
+        },
+        {
+          "name": "args",
+          "type": "map",
+          "doc": "arguments object"
         }
       ],
-      "returns": "bool",
+      "returns": "any",
       "examples": [
-        "(zero? 0)      ; => #t\n(zero? 1)      ; => #f"
+        "(define fs (mcp/connect {:command \"npx\"\n                         :args [\"-y\" \"@modelcontextprotocol/server-filesystem\" \"/tmp\"]}))\n\n(mcp/call fs \"read_file\" {:path \"/tmp/notes.txt\"})\n; => \"…file contents…\""
       ],
-      "body": "Test if a number is zero.\n\n```sema\n(zero? 0)      ; => #t\n(zero? 1)      ; => #f\n```"
+      "body": "```\n(mcp/call handle tool args)\n```\n\nInvoke a tool on an MCP server (`tools/call`) and return its result normalized to\na Sema value: a plain text result collapses to a string; a richer result (images,\nresources, `structuredContent`) is returned as the full map. A tool that reports\n`isError` surfaces as a `SemaError`.\n\n```sema\n(define fs (mcp/connect {:command \"npx\"\n                         :args [\"-y\" \"@modelcontextprotocol/server-filesystem\" \"/tmp\"]}))\n\n(mcp/call fs \"read_file\" {:path \"/tmp/notes.txt\"})\n; => \"…file contents…\"\n```\n\nFor agent use, prefer `mcp/tools->sema` so the model drives the calls; use\n`mcp/call` directly for scripted, non-agent access."
+    },
+    {
+      "name": "mcp/close",
+      "module": "mcp",
+      "section": "MCP Client",
+      "summary": "Close an MCP connection. For a stdio server this terminates the child process; for an HTTP server it best-effort ends the session (`DELETE`). After closing, the handle is no longer valid.",
+      "params": [
+        {
+          "name": "handle",
+          "type": "string",
+          "doc": "connection handle from mcp/connect"
+        }
+      ],
+      "returns": "nil",
+      "examples": [
+        "(define fs (mcp/connect {:command \"npx\" :args [\"-y\" \"server-filesystem\" \"/tmp\"]}))\n;; … use it …\n(mcp/close fs)"
+      ],
+      "body": "```\n(mcp/close handle)\n```\n\nClose an MCP connection. For a stdio server this terminates the child process;\nfor an HTTP server it best-effort ends the session (`DELETE`). After closing, the\nhandle is no longer valid.\n\nAlways call `mcp/close` when you're done: a connection stays alive (and a stdio\nchild keeps running) until you close it or the Sema process exits — the handle is\njust an opaque string, so letting it go out of scope does **not** disconnect.\n\n```sema\n(define fs (mcp/connect {:command \"npx\" :args [\"-y\" \"server-filesystem\" \"/tmp\"]}))\n;; … use it …\n(mcp/close fs)\n```"
+    },
+    {
+      "name": "mcp/connect",
+      "module": "mcp",
+      "section": "MCP Client",
+      "summary": "Connect to an external MCP (Model Context Protocol) server and return an opaque connection **handle** (a string) for use with `mcp/tools`, `mcp/call`, `mcp/tools->sema`, and `mcp/close`. The handshake (`initialize`) runs eagerly, so a returned handle is ready to use. The transport is chosen from the config map:",
+      "params": [
+        {
+          "name": "config",
+          "type": "map",
+          "doc": "connection spec: :command (stdio) or :url (http)"
+        }
+      ],
+      "returns": "string",
+      "examples": [
+        ";; Local stdio server\n(define fs (mcp/connect {:command \"npx\"\n                         :args [\"-y\" \"@modelcontextprotocol/server-filesystem\" \"/tmp\"]}))\n\n;; Remote server (OAuth handled automatically on first use)\n(define asana (mcp/connect {:url \"https://mcp.asana.com/mcp\"}))\n\n;; Remote server with a bring-your-own bearer token\n(define gh (mcp/connect {:url \"https://mcp.example.com/mcp\"\n                         :headers {\"Authorization\" \"Bearer ghp_…\"}}))"
+      ],
+      "body": "```\n(mcp/connect {:command \"…\" :args […] :env {…} :cwd \"…\"})\n(mcp/connect {:url \"https://…/mcp\" :headers {…} :auth {:client-id \"…\"}})\n```\n\nConnect to an external MCP (Model Context Protocol) server and return an opaque\nconnection **handle** (a string) for use with `mcp/tools`, `mcp/call`,\n`mcp/tools->sema`, and `mcp/close`. The handshake (`initialize`) runs eagerly, so\na returned handle is ready to use. The transport is chosen from the config map:\n\n- **`:command`** — spawn a local server as a child process and speak JSON-RPC\n  over stdio. Optional `:args` (list of strings), `:env` (map of extra\n  environment variables — the place to pass a token a server reads from its\n  environment), and `:cwd`. Requires the `process` sandbox capability.\n- **`:url`** — connect to a remote server over **Streamable HTTP** (falls back\n  automatically to the deprecated 2024-11-05 HTTP+SSE transport when a server\n  only speaks that). Requires the `network` capability. Optional `:headers`\n  attaches a static bearer token (`{\"Authorization\" \"Bearer …\"}`); `:auth\n  {:client-id \"…\"}` supplies a pre-registered OAuth client id.\n\nA remote server that requires OAuth is handled automatically: the first `401`\ntriggers the browser login flow (or a cached/refreshed token), then the handshake\nretries. See `sema mcp login` to authenticate ahead of time.\n\nConnecting to an MCP server runs its tools with the **server's** authority, not\nSema's sandbox — treat an untrusted server like untrusted code.\n\n```sema\n;; Local stdio server\n(define fs (mcp/connect {:command \"npx\"\n                         :args [\"-y\" \"@modelcontextprotocol/server-filesystem\" \"/tmp\"]}))\n\n;; Remote server (OAuth handled automatically on first use)\n(define asana (mcp/connect {:url \"https://mcp.asana.com/mcp\"}))\n\n;; Remote server with a bring-your-own bearer token\n(define gh (mcp/connect {:url \"https://mcp.example.com/mcp\"\n                         :headers {\"Authorization\" \"Bearer ghp_…\"}}))\n```"
+    },
+    {
+      "name": "mcp/tools",
+      "module": "mcp",
+      "section": "MCP Client",
+      "summary": "List the tools an MCP server exposes (`tools/list`). Returns a list of maps, one per tool, each with `:name`, `:description`, and `:input-schema` (the tool's raw JSON-Schema for its arguments).",
+      "params": [
+        {
+          "name": "handle",
+          "type": "string",
+          "doc": "connection handle from mcp/connect"
+        }
+      ],
+      "returns": "list",
+      "examples": [
+        "(define fs (mcp/connect {:command \"npx\"\n                         :args [\"-y\" \"@modelcontextprotocol/server-filesystem\" \"/tmp\"]}))\n\n(mcp/tools fs)\n; => ({:name \"read_file\" :description \"Read a file\" :input-schema {…}} …)\n\n;; Just the names:\n(map (fn (t) (:name t)) (mcp/tools fs))"
+      ],
+      "body": "```\n(mcp/tools handle)\n```\n\nList the tools an MCP server exposes (`tools/list`). Returns a list of maps, one\nper tool, each with `:name`, `:description`, and `:input-schema` (the tool's raw\nJSON-Schema for its arguments).\n\nTo feed these tools to an agent, use `mcp/tools->sema` instead — it produces the\nvalue shape `deftool`/`defagent` expect.\n\n```sema\n(define fs (mcp/connect {:command \"npx\"\n                         :args [\"-y\" \"@modelcontextprotocol/server-filesystem\" \"/tmp\"]}))\n\n(mcp/tools fs)\n; => ({:name \"read_file\" :description \"Read a file\" :input-schema {…}} …)\n\n;; Just the names:\n(map (fn (t) (:name t)) (mcp/tools fs))\n```"
+    },
+    {
+      "name": "mcp/tools->sema",
+      "module": "mcp",
+      "section": "MCP Client",
+      "summary": "Convert an MCP server's tools into the exact value shape `deftool` produces (name, description, params map, handler), so `defagent` can consume external MCP tools as first-class agent tools with no agent-loop changes. Each returned tool's handler calls back into the server via the connection; a tool that reports `isError` surfaces to the agent loop as an error it can react to.",
+      "params": [
+        {
+          "name": "handle",
+          "type": "string",
+          "doc": "connection handle from mcp/connect"
+        }
+      ],
+      "returns": "list",
+      "examples": [
+        "(define fs (mcp/connect {:command \"npx\"\n                         :args [\"-y\" \"@modelcontextprotocol/server-filesystem\" \"/tmp\"]}))\n\n(defagent librarian\n  {:model \"claude-sonnet-5\"\n   :system \"You manage files.\"\n   :tools (mcp/tools->sema fs)})     ; MCP tools become agent tools\n\n(agent/run librarian \"Summarize /tmp/notes.txt\")"
+      ],
+      "body": "```\n(mcp/tools->sema handle)\n```\n\nConvert an MCP server's tools into the exact value shape `deftool` produces\n(name, description, params map, handler), so `defagent` can consume external MCP\ntools as first-class agent tools with no agent-loop changes. Each returned tool's\nhandler calls back into the server via the connection; a tool that reports\n`isError` surfaces to the agent loop as an error it can react to.\n\nThe MCP `inputSchema` (JSON Schema) is inverted into the `{param-name -> spec}`\nmap the agent loop expects (type, description, enum, and `:optional` for\nparameters not in the schema's `required` list).\n\n```sema\n(define fs (mcp/connect {:command \"npx\"\n                         :args [\"-y\" \"@modelcontextprotocol/server-filesystem\" \"/tmp\"]}))\n\n(defagent librarian\n  {:model \"claude-sonnet-5\"\n   :system \"You manage files.\"\n   :tools (mcp/tools->sema fs)})     ; MCP tools become agent tools\n\n(agent/run librarian \"Summarize /tmp/notes.txt\")\n```"
     },
     {
       "name": "memory/append",
@@ -6022,6 +6584,16 @@
         "(message/with-image :user \"Describe this picture\" png-bytes {:media-type \"image/png\"})"
       ],
       "body": "Build a multimodal message with text plus an attached image. Role is `:system`, `:user`, `:assistant`, or `:tool`; the image is a bytevector that is base64-encoded. The media type is auto-detected unless overridden via opts `:media-type`.\n\n```sema\n(message/with-image :user \"Describe this picture\" png-bytes {:media-type \"image/png\"})\n```"
+    },
+    {
+      "name": "otel/configure",
+      "module": "otel",
+      "section": "Observability",
+      "summary": "Point Sema at a tracing backend **from code**, so environment variables aren't the only way to turn telemetry on. Installs an OpenTelemetry provider on the first call and returns `#t` when this call turned tracing on, or `#f` when nothing was configured or telemetry was already active (from the environment at startup, or an earlier `otel/configure`). Only the first call installs a provider — one per process. Call it once, early, before any `llm/*`/`agent/*` work. A no-op on wasm.",
+      "examples": [
+        ";; Hosted backend with an API key (key → Authorization: Bearer …)\n(otel/configure {:endpoint \"https://cloud.langfuse.com/api/public/otel\"\n                 :key \"sk_prod_123\"\n                 :service-name \"my-agent\"})\n\n;; Extra headers as a map\n(otel/configure {:endpoint \"https://otlp.example.com\"\n                 :headers {:x-project \"checkout\" :x-tenant \"acme\"}})\n\n;; No backend — capture spans to a local JSONL file\n(otel/configure {:file \"/tmp/sema-trace.jsonl\"})"
+      ],
+      "body": "Point Sema at a tracing backend **from code**, so environment variables aren't the only way to turn telemetry on. Installs an OpenTelemetry provider on the first call and returns `#t` when this call turned tracing on, or `#f` when nothing was configured or telemetry was already active (from the environment at startup, or an earlier `otel/configure`). Only the first call installs a provider — one per process. Call it once, early, before any `llm/*`/`agent/*` work. A no-op on wasm.\n\nConfig keys (all optional): `:endpoint` (OTLP url — setting it turns tracing on) · `:file` (write JSONL spans to a path instead of the network — also turns tracing on) · `:protocol` (`\"http/protobuf\"` default · `\"http/json\"` · `\"grpc\"`) · `:key` (an API key, sent as `Authorization: Bearer <key>`) · `:headers` (a map of extra HTTP headers, or a pre-formatted `\"name=value,...\"` string) · `:service-name` · `:environment` · `:release` · `:capture-content` (bool — record prompt/response text, off by default).\n\n**Signature:** `(otel/configure config-map) → bool`\n\n```sema\n;; Hosted backend with an API key (key → Authorization: Bearer …)\n(otel/configure {:endpoint \"https://cloud.langfuse.com/api/public/otel\"\n                 :key \"sk_prod_123\"\n                 :service-name \"my-agent\"})\n\n;; Extra headers as a map\n(otel/configure {:endpoint \"https://otlp.example.com\"\n                 :headers {:x-project \"checkout\" :x-tenant \"acme\"}})\n\n;; No backend — capture spans to a local JSONL file\n(otel/configure {:file \"/tmp/sema-trace.jsonl\"})\n```\n\nEach key maps to the environment variable of the same role (`:endpoint` → `OTEL_EXPORTER_OTLP_ENDPOINT`, `:file` → `SEMA_OTEL_FILE`, `:key`/`:headers` → `OTEL_EXPORTER_OTLP_HEADERS`, …), so a script that configures itself and one driven by env vars behave identically.\n\nSee the [Observability guide](https://sema-lang.com/docs/llm/observability)."
     },
     {
       "name": "otel/event",
@@ -6478,12 +7050,12 @@
       "name": "=",
       "module": "predicates",
       "section": "Equality",
-      "summary": "Equality. For numbers this is numeric equality (so `(= 1 1.0)` is `#t`); for non-numbers it falls back to structural equality. Unlike `<` / `>`, comparing non-numbers does not error — it reports whether the values are equal.",
+      "summary": "Equality. For numbers this is **numeric** equality, so `(= 1 1.0)` is `#t` even though the int and float differ in representation. For non-numbers it falls back to **structural** equality (recursing into lists, maps, vectors).",
       "returns": "bool",
       "examples": [
-        "(= 1 1)           ; => #t\n(= 1 1.0)         ; => #t\n(= 1 2)           ; => #f\n(= \"abc\" \"abc\")   ; => #t   (structural, not an error)\n(= 1 \"a\")         ; => #f"
+        "(= 1 1)             ; => #t\n(= 1 1.0)           ; => #t   (numeric: int = float)\n(= 1 2)             ; => #f\n(= \"abc\" \"abc\")     ; => #t   (structural)\n(= '(1 2) '(1 2))   ; => #t   (recurses into the list)\n\n(eq? 1 1.0)         ; => #f   (no numeric coercion)"
       ],
-      "body": "Equality. For numbers this is numeric equality (so `(= 1 1.0)` is `#t`); for\nnon-numbers it falls back to structural equality. Unlike `<` / `>`, comparing\nnon-numbers does not error — it reports whether the values are equal.\n\n```sema\n(= 1 1)           ; => #t\n(= 1 1.0)         ; => #t\n(= 1 2)           ; => #f\n(= \"abc\" \"abc\")   ; => #t   (structural, not an error)\n(= 1 \"a\")         ; => #f\n```",
+      "body": "Equality. For numbers this is **numeric** equality, so `(= 1 1.0)` is `#t`\neven though the int and float differ in representation. For non-numbers it falls\nback to **structural** equality (recursing into lists, maps, vectors).\n\n`=` never errors on type mismatches — it just answers `#f` (or `#t`). That makes\nit the safe general-purpose equality. Contrast with `eq?`, which is stricter\nidentity/value equality: `(eq? 1 1.0)` is `#f` because the values are not the\nsame kind. Reach for `=` when comparing numbers or whole data structures; reach\nfor `eq?` when you want \"is this the exact same value\" (no int/float coercion).\n\n```sema\n(= 1 1)             ; => #t\n(= 1 1.0)           ; => #t   (numeric: int = float)\n(= 1 2)             ; => #f\n(= \"abc\" \"abc\")     ; => #t   (structural)\n(= '(1 2) '(1 2))   ; => #t   (recurses into the list)\n\n(eq? 1 1.0)         ; => #f   (no numeric coercion)\n```\n\nSee also: `eq?` (value identity), `<` / `>` (ordering — these *do* error on mixed\nor unorderable types, where `=` does not).",
       "syntax": "(= a b ...)"
     },
     {
@@ -6609,7 +7181,7 @@
       "name": "even?",
       "module": "predicates",
       "section": "Numeric Predicates",
-      "summary": "Test if an integer is even. Requires an integer — passing a float raises a type error.",
+      "summary": "Test if an integer is even. Requires an integer — passing a float raises a type error. See `odd?` for the complement.",
       "params": [
         {
           "name": "n",
@@ -6620,7 +7192,7 @@
       "examples": [
         "(even? 4)    ; => #t\n(even? 3)    ; => #f\n(even? -2)   ; => #t   (sign doesn't matter)\n(even? 0)    ; => #t"
       ],
-      "body": "Test if an integer is even. Requires an integer — passing a float raises a type error.\n\n```sema\n(even? 4)    ; => #t\n(even? 3)    ; => #f\n(even? -2)   ; => #t   (sign doesn't matter)\n(even? 0)    ; => #t\n```"
+      "body": "Test if an integer is even. Requires an integer — passing a float raises a type error. See `odd?` for the complement.\n\n```sema\n(even? 4)    ; => #t\n(even? 3)    ; => #f\n(even? -2)   ; => #t   (sign doesn't matter)\n(even? 0)    ; => #t\n```"
     },
     {
       "name": "float?",
@@ -6980,9 +7552,9 @@
       ],
       "returns": "bool",
       "examples": [
-        "(vector? [1])   ; => #t\n(vector? '(1))  ; => #f"
+        "(vector? [1 2 3])   ; => #t\n(vector? '(1 2 3))  ; => #f\n(vector? 42)        ; => #f"
       ],
-      "body": "Test if a value is a vector.\n\n```sema\n(vector? [1])   ; => #t\n(vector? '(1))  ; => #f\n```"
+      "body": "Test if a value is a vector.\n\n```sema\n(vector? [1 2 3])   ; => #t\n(vector? '(1 2 3))  ; => #f\n(vector? 42)        ; => #f\n```"
     },
     {
       "name": "zero?",
@@ -7000,6 +7572,76 @@
         "(zero? 0)   ; => #t\n(zero? 1)   ; => #f"
       ],
       "body": "Test if a number is zero.\n\n```sema\n(zero? 0)   ; => #t\n(zero? 1)   ; => #f\n```"
+    },
+    {
+      "name": "proc/close",
+      "module": "process",
+      "section": "Processes",
+      "summary": "Kill the process if needed, reap it, and free its handle from the registry.",
+      "body": "Kill the process if needed, reap it, and free its handle from the registry."
+    },
+    {
+      "name": "proc/close-stdin",
+      "module": "process",
+      "section": "Processes",
+      "summary": "Close the process's stdin (sends EOF), so commands that read until EOF (e.g. `cat`) can finish.",
+      "body": "Close the process's stdin (sends EOF), so commands that read until EOF (e.g. `cat`) can finish."
+    },
+    {
+      "name": "proc/exit-code",
+      "module": "process",
+      "section": "Processes",
+      "summary": "Return the process's exit code if it has exited, or `nil` if it is still running (non-blocking).",
+      "body": "Return the process's exit code if it has exited, or `nil` if it is still running (non-blocking)."
+    },
+    {
+      "name": "proc/kill",
+      "module": "process",
+      "section": "Processes",
+      "summary": "Kill the process (SIGKILL). Safe to call if it has already exited.",
+      "body": "Kill the process (SIGKILL). Safe to call if it has already exited."
+    },
+    {
+      "name": "proc/read-stderr",
+      "module": "process",
+      "section": "Processes",
+      "summary": "Drain and return everything written to the process's stderr since the last call (non-blocking).",
+      "body": "Drain and return everything written to the process's stderr since the last call (non-blocking)."
+    },
+    {
+      "name": "proc/read-stdout",
+      "module": "process",
+      "section": "Processes",
+      "summary": "Drain and return everything written to the process's stdout since the last call (non-blocking; `\"\"` if nothing new). Lets a TUI show output as it streams.",
+      "body": "Drain and return everything written to the process's stdout since the last call (non-blocking; `\"\"` if nothing new). Lets a TUI show output as it streams."
+    },
+    {
+      "name": "proc/running?",
+      "module": "process",
+      "section": "Processes",
+      "summary": "Return `#t` if the process is still running, `#f` if it has exited.",
+      "body": "Return `#t` if the process is still running, `#f` if it has exited."
+    },
+    {
+      "name": "proc/spawn",
+      "module": "process",
+      "section": "Processes",
+      "summary": "Spawn a subprocess and return an integer handle. `(proc/spawn [\"cargo\" \"test\"])` or `(proc/spawn argv {:cwd \"path\" :env {\"KEY\" \"val\"}})`. Unlike `shell`, stdout/stderr stream live into buffers you poll with `proc/read-stdout`/`proc/read-stderr`.",
+      "body": "Spawn a subprocess and return an integer handle. `(proc/spawn [\"cargo\" \"test\"])` or `(proc/spawn argv {:cwd \"path\" :env {\"KEY\" \"val\"}})`. Unlike `shell`, stdout/stderr stream live into buffers you poll with `proc/read-stdout`/`proc/read-stderr`."
+    },
+    {
+      "name": "proc/wait",
+      "module": "process",
+      "section": "Processes",
+      "summary": "Block until the process exits and return its exit code (`-1` if killed by a signal). Reader threads finish flushing first, so a subsequent `proc/read-stdout` returns the tail.",
+      "body": "Block until the process exits and return its exit code (`-1` if killed by a signal). Reader threads finish flushing first, so a subsequent `proc/read-stdout` returns the tail."
+    },
+    {
+      "name": "proc/write-stdin",
+      "module": "process",
+      "section": "Processes",
+      "summary": "Write a string to the process's stdin. Use `proc/close-stdin` to send EOF when done.",
+      "body": "Write a string to the process's stdin. Use `proc/close-stdin` to send EOF when done."
     },
     {
       "name": "prompt/append",
@@ -7034,6 +7676,46 @@
       "body": "Alias for `prompt/append`: concatenate one or more prompts into a single prompt, preserving message order. See `prompt/append` for the full behavior (system messages are *not* merged).\n\n```sema\n(prompt/messages\n  (prompt/concat (prompt (user \"a\")) (prompt (user \"b\"))))\n; => (<message user \"a\"> <message user \"b\">)\n```"
     },
     {
+      "name": "prompt/diff",
+      "module": "prompt",
+      "summary": "Structurally compares two prompts by `(role, content)`. Returns `{:added :removed}`: `:added` holds the messages present in `b` but not `a`, `:removed` those in `a` but not `b`. Useful for prompt versioning and review.",
+      "params": [
+        {
+          "name": "a",
+          "type": "prompt"
+        },
+        {
+          "name": "b",
+          "type": "prompt"
+        }
+      ],
+      "returns": "map",
+      "examples": [
+        "(prompt/diff prompt-v1 prompt-v2)\n;; => {:added [...] :removed [...]}"
+      ],
+      "body": "Structurally compares two prompts by `(role, content)`. Returns `{:added :removed}`: `:added` holds the messages present in `b` but not `a`, `:removed` those in `a` but not `b`. Useful for prompt versioning and review.\n\n```sema\n(prompt/diff prompt-v1 prompt-v2)\n;; => {:added [...] :removed [...]}\n```"
+    },
+    {
+      "name": "prompt/difference",
+      "module": "prompt",
+      "summary": "Returns a prompt of the messages in `a` that are not in `b`, matched by `(role, content)`, in `a`'s order and de-duplicated.",
+      "params": [
+        {
+          "name": "a",
+          "type": "prompt"
+        },
+        {
+          "name": "b",
+          "type": "prompt"
+        }
+      ],
+      "returns": "prompt",
+      "examples": [
+        "(prompt/difference prompt-a prompt-b)"
+      ],
+      "body": "Returns a prompt of the messages in `a` that are not in `b`, matched by `(role, content)`, in `a`'s order and de-duplicated.\n\n```sema\n(prompt/difference prompt-a prompt-b)\n```"
+    },
+    {
       "name": "prompt/fill",
       "module": "prompt",
       "summary": "Substitute `{{key}}` placeholders in every message of the prompt using the vars map (keys looked up as keywords). Slots with no matching key are left unchanged, so a partial fill is safe and re-fillable.",
@@ -7053,6 +7735,26 @@
         "(prompt/messages (prompt/fill template {:name \"Ada\"}))\n; => (<message user \"Hi Ada, let's do {{topic}}\">)"
       ],
       "body": "Substitute `{{key}}` placeholders in every message of the prompt using the vars map (keys looked up as keywords). Slots with no matching key are left unchanged, so a partial fill is safe and re-fillable.\n\nThe template stays reusable: `fill` returns a new prompt and never mutates the original, so one template can be filled many times with different vars.\n\n```sema\n(define template (prompt (user \"Hi {{name}}, let's do {{topic}}\")))\n(prompt/messages (prompt/fill template {:name \"Ada\" :topic \"loops\"}))\n; => (<message user \"Hi Ada, let's do loops\">)\n```\n\nA slot with no matching key is left verbatim — handy for filling in stages:\n\n```sema\n(prompt/messages (prompt/fill template {:name \"Ada\"}))\n; => (<message user \"Hi Ada, let's do {{topic}}\">)\n```\n\nUse `prompt/slots` to discover which placeholder keys a template expects before filling."
+    },
+    {
+      "name": "prompt/intersection",
+      "module": "prompt",
+      "summary": "Returns a prompt of the messages present in both prompts, matched by `(role, content)`, in `a`'s order and de-duplicated.",
+      "params": [
+        {
+          "name": "a",
+          "type": "prompt"
+        },
+        {
+          "name": "b",
+          "type": "prompt"
+        }
+      ],
+      "returns": "prompt",
+      "examples": [
+        "(prompt/intersection prompt-a prompt-b)"
+      ],
+      "body": "Returns a prompt of the messages present in both prompts, matched by `(role, content)`, in `a`'s order and de-duplicated.\n\n```sema\n(prompt/intersection prompt-a prompt-b)\n```"
     },
     {
       "name": "prompt/messages",
@@ -7107,6 +7809,89 @@
       "body": "Return the list of distinct `{{slot}}` placeholder names found across the prompt's messages, as keywords.\n\n```sema\n(prompt/slots template)   ; => (:name :topic)\n```"
     },
     {
+      "name": "prompt/union",
+      "module": "prompt",
+      "summary": "Returns a prompt containing the messages of `a` followed by those of `b`, de-duplicated by `(role, content)` with the first occurrence kept and order preserved. Matching is exact — it does not merge semantically similar instructions.",
+      "params": [
+        {
+          "name": "a",
+          "type": "prompt"
+        },
+        {
+          "name": "b",
+          "type": "prompt"
+        }
+      ],
+      "returns": "prompt",
+      "examples": [
+        "(prompt/union base-prompt safety-prompt)"
+      ],
+      "body": "Returns a prompt containing the messages of `a` followed by those of `b`, de-duplicated by `(role, content)` with the first occurrence kept and order preserved. Matching is exact — it does not merge semantically similar instructions.\n\n```sema\n(prompt/union base-prompt safety-prompt)\n```"
+    },
+    {
+      "name": "pty/close",
+      "module": "pty",
+      "section": "Pseudo-Terminals",
+      "summary": "Kill the child if needed and free the pty handle from the registry.",
+      "body": "Kill the child if needed and free the pty handle from the registry."
+    },
+    {
+      "name": "pty/exit-code",
+      "module": "pty",
+      "section": "Pseudo-Terminals",
+      "summary": "Return the child's exit code if it has exited, or `nil` if it is still running (non-blocking).",
+      "body": "Return the child's exit code if it has exited, or `nil` if it is still running (non-blocking)."
+    },
+    {
+      "name": "pty/kill",
+      "module": "pty",
+      "section": "Pseudo-Terminals",
+      "summary": "Kill the pty's child process. Safe to call if it has already exited.",
+      "body": "Kill the pty's child process. Safe to call if it has already exited."
+    },
+    {
+      "name": "pty/read",
+      "module": "pty",
+      "section": "Pseudo-Terminals",
+      "summary": "Drain and return everything the pty has emitted since the last call (non-blocking). Output may include terminal control sequences and CR/LF translation.",
+      "body": "Drain and return everything the pty has emitted since the last call (non-blocking). Output may include terminal control sequences and CR/LF translation."
+    },
+    {
+      "name": "pty/resize",
+      "module": "pty",
+      "section": "Pseudo-Terminals",
+      "summary": "Resize the pty window to `rows`×`cols`, delivering SIGWINCH to the child so full-screen apps redraw. `(pty/resize h 50 200)`.",
+      "body": "Resize the pty window to `rows`×`cols`, delivering SIGWINCH to the child so full-screen apps redraw. `(pty/resize h 50 200)`."
+    },
+    {
+      "name": "pty/running?",
+      "module": "pty",
+      "section": "Pseudo-Terminals",
+      "summary": "Return `#t` if the pty's child is still running, `#f` if it has exited.",
+      "body": "Return `#t` if the pty's child is still running, `#f` if it has exited."
+    },
+    {
+      "name": "pty/spawn",
+      "module": "pty",
+      "section": "Pseudo-Terminals",
+      "summary": "Spawn a command under a pseudo-terminal and return an integer handle. `(pty/spawn [\"bash\"] {:rows 40 :cols 120 :cwd \"path\" :env {...}})`. The child sees a real TTY (isatty is true), so REPLs, editors, and color-aware tools behave normally. Output (stdout+stderr merged) streams into a buffer you drain with `pty/read`.",
+      "body": "Spawn a command under a pseudo-terminal and return an integer handle. `(pty/spawn [\"bash\"] {:rows 40 :cols 120 :cwd \"path\" :env {...}})`. The child sees a real TTY (isatty is true), so REPLs, editors, and color-aware tools behave normally. Output (stdout+stderr merged) streams into a buffer you drain with `pty/read`."
+    },
+    {
+      "name": "pty/wait",
+      "module": "pty",
+      "section": "Pseudo-Terminals",
+      "summary": "Block until the child exits and return its exit code. All output is buffered first, so a following `pty/read` returns the tail.",
+      "body": "Block until the child exits and return its exit code. All output is buffered first, so a following `pty/read` returns the tail."
+    },
+    {
+      "name": "pty/write",
+      "module": "pty",
+      "section": "Pseudo-Terminals",
+      "summary": "Write a string to the pty (as if typed at the terminal). Include a trailing newline to submit a line.",
+      "body": "Write a string to the pty (as if typed at the terminal). Include a trailing newline to submit a line."
+    },
+    {
       "name": "define-record-type",
       "module": "records",
       "section": "Defining Record Types",
@@ -7118,16 +7903,6 @@
       ],
       "body": "Define a new record type, generating a constructor, predicate, and one accessor per field.\n\n```sema\n(define-record-type point\n  (make-point x y)       ; constructor (positional args)\n  point?                  ; predicate\n  (x point-x)            ; (field-name accessor-name)\n  (y point-y))\n```\n\nEach of the three generated names is a normal binding you can call:\n\n```sema\n(define-record-type point\n  (make-point x y) point?\n  (x point-x) (y point-y))\n\n(define p (make-point 3 4))\n(point-x p)      ; => 3\n(point? p)       ; => #t\n(point? 42)      ; => #f\n(type p)         ; => :point\n```\n\nRecords are **immutable** — there are no generated field setters, so \"updating\" means constructing a new record (`(make-point (point-x p) 10)`). Unlike a plain map, the predicate gives you a real nominal type: two records with the same fields but different type names are distinguishable, and `point?` only answers `#t` for points.\n\nGeneral syntax:\n\n```sema\n(define-record-type <type-name>\n  (<constructor> <field-name> ...)\n  <predicate>\n  (<field-name> <accessor>) ...)\n```",
       "syntax": "(define-record-type type (constructor field ...) predicate (field accessor) ...)"
-    },
-    {
-      "name": "record?",
-      "module": "records",
-      "section": "Introspection",
-      "summary": "Test if a value is any record instance (of any record type).",
-      "examples": [
-        "(record? (make-point 3 4))   ; => #t\n(record? {:x 3 :y 4})        ; => #f\n(record? 42)                 ; => #f"
-      ],
-      "body": "Test if a value is any record instance (of any record type).\n\n```sema\n(record? (make-point 3 4))   ; => #t\n(record? {:x 3 :y 4})        ; => #f\n(record? 42)                 ; => #f\n```"
     },
     {
       "name": "type",
@@ -7145,6 +7920,41 @@
         "(type (make-point 3 4))   ; => :point\n(type [1 2 3])            ; => :vector\n(type {:a 1})             ; => :map"
       ],
       "body": "Return the type of a value as a keyword. For records, returns the record's type name:\n\n```sema\n(type (make-point 3 4))   ; => :point\n(type [1 2 3])            ; => :vector\n(type {:a 1})             ; => :map\n```"
+    },
+    {
+      "name": "format/form",
+      "module": "reflect",
+      "section": "Reflection",
+      "summary": "Pretty-print a form to canonical Sema source using the formatter. `(format/form (read/string \"(define  x  1)\"))` => `\"(define x 1)\"`.",
+      "body": "Pretty-print a form to canonical Sema source using the formatter. `(format/form (read/string \"(define  x  1)\"))` => `\"(define x 1)\"`."
+    },
+    {
+      "name": "read/all",
+      "module": "reflect",
+      "section": "Reflection",
+      "summary": "Parse every top-level form in a string and return them as a list. `(read/all \"(a) (b)\")` => `((a) (b))`.",
+      "body": "Parse every top-level form in a string and return them as a list. `(read/all \"(a) (b)\")` => `((a) (b))`."
+    },
+    {
+      "name": "read/string",
+      "module": "reflect",
+      "section": "Reflection",
+      "summary": "Parse exactly one Sema form from a string and return it as data (a quoted form). `(read/string \"(+ 1 2)\")` => the list `(+ 1 2)`.",
+      "body": "Parse exactly one Sema form from a string and return it as data (a quoted form). `(read/string \"(+ 1 2)\")` => the list `(+ 1 2)`."
+    },
+    {
+      "name": "sema/check-file",
+      "module": "reflect",
+      "section": "Reflection",
+      "summary": "Like `sema/check-string` but reads a file first. Returns `{:ok bool :diagnostics [...]}`.",
+      "body": "Like `sema/check-string` but reads a file first. Returns `{:ok bool :diagnostics [...]}`."
+    },
+    {
+      "name": "sema/check-string",
+      "module": "reflect",
+      "section": "Reflection",
+      "summary": "Check a Sema source string and return diagnostics as data: `{:ok bool :diagnostics [{:level :code :message :span?} ...]}`. Catches syntax and compile errors — built for agent repair loops.",
+      "body": "Check a Sema source string and return diagnostics as data: `{:ok bool :diagnostics [{:level :code :message :span?} ...]}`. Catches syntax and compile errors — built for agent repair loops."
     },
     {
       "name": "\"",
@@ -7289,6 +8099,56 @@
         "(route/prefix \"/api\"\n  [[:get \"/users\" list-users]\n   [:post \"/users\" create-user]])"
       ],
       "body": "Prepend a path prefix to every route's pattern in the given list, returning a new list of routes. Each route is a `[method pattern handler ...]` vector; a trailing slash on the prefix is trimmed.\n\n```sema\n(route/prefix \"/api\"\n  [[:get \"/users\" list-users]\n   [:post \"/users\" create-user]])\n```"
+    },
+    {
+      "name": "hash/digest",
+      "module": "security",
+      "section": "Secrets & Redaction",
+      "summary": "Return the lowercase hex SHA-256 digest of a string. Handy for fingerprinting redacted values so equal secrets can be correlated across records without storing the secret itself.",
+      "examples": [
+        "(hash/digest \"correct horse battery staple\")"
+      ],
+      "body": "Return the lowercase hex SHA-256 digest of a string. Handy for fingerprinting redacted values so equal secrets can be correlated across records without storing the secret itself.\n\n```sema\n(hash/digest \"correct horse battery staple\")\n```"
+    },
+    {
+      "name": "pii/detect",
+      "module": "security",
+      "section": "Secrets & Redaction",
+      "summary": "Scan text for personally-identifying data and return a list of maps, one per match, each with `:type`, `:match`, `:start`, and `:end`. Detects email addresses (`:type \"email\"`), IPv4 addresses (`:type \"ipv4\"`), and US-style phone numbers (`:type \"phone\"`). Pair the returned spans with `redact/spans` to scrub the original text.",
+      "examples": [
+        "(pii/detect \"email me@example.com or call (415) 555-2671\")"
+      ],
+      "body": "Scan text for personally-identifying data and return a list of maps, one per match, each with `:type`, `:match`, `:start`, and `:end`. Detects email addresses (`:type \"email\"`), IPv4 addresses (`:type \"ipv4\"`), and US-style phone numbers (`:type \"phone\"`). Pair the returned spans with `redact/spans` to scrub the original text.\n\n```sema\n(pii/detect \"email me@example.com or call (415) 555-2671\")\n```"
+    },
+    {
+      "name": "redact/spans",
+      "module": "security",
+      "section": "Secrets & Redaction",
+      "summary": "Replace explicit byte-offset spans in a string with redaction markers. Takes the text and a list of maps `{:start <int> :end <int>}`, each optionally carrying a `:label`. A labeled span becomes `«redacted:<label>»`, an unlabeled one becomes `«redacted»`. Offsets are clamped to the string and validated against char boundaries; inverted, empty, out-of-range, or non-map entries are skipped. Edits apply right-to-left so earlier offsets remain valid.",
+      "examples": [
+        "(redact/spans \"hello world\"\n  (list {:start 6 :end 11 :label \"name\"}))"
+      ],
+      "body": "Replace explicit byte-offset spans in a string with redaction markers. Takes the text and a list of maps `{:start <int> :end <int>}`, each optionally carrying a `:label`. A labeled span becomes `«redacted:<label>»`, an unlabeled one becomes `«redacted»`. Offsets are clamped to the string and validated against char boundaries; inverted, empty, out-of-range, or non-map entries are skipped. Edits apply right-to-left so earlier offsets remain valid.\n\n```sema\n(redact/spans \"hello world\"\n  (list {:start 6 :end 11 :label \"name\"}))\n```"
+    },
+    {
+      "name": "secret/detect",
+      "module": "security",
+      "section": "Secrets & Redaction",
+      "summary": "Scan text for embedded credentials and return a list of maps, one per match, each with `:type`, `:match`, `:start`, and `:end` (byte offsets). Detects AWS access key ids, JWTs, Slack and GitHub tokens, PEM private-key blocks, generic `key = value` assignments, and bare high-entropy blobs. The generic and high-entropy matchers are gated on Shannon entropy (~3.5 bits/char) to suppress false positives on ordinary identifiers.",
+      "examples": [
+        "(secret/detect \"AWS key AKIAIOSFODNN7EXAMPLE here\")"
+      ],
+      "body": "Scan text for embedded credentials and return a list of maps, one per match, each with `:type`, `:match`, `:start`, and `:end` (byte offsets). Detects AWS access key ids, JWTs, Slack and GitHub tokens, PEM private-key blocks, generic `key = value` assignments, and bare high-entropy blobs. The generic and high-entropy matchers are gated on Shannon entropy (~3.5 bits/char) to suppress false positives on ordinary identifiers.\n\n```sema\n(secret/detect \"AWS key AKIAIOSFODNN7EXAMPLE here\")\n```"
+    },
+    {
+      "name": "secret/redact",
+      "module": "security",
+      "section": "Secrets & Redaction",
+      "summary": "Return a copy of the text with every secret found by `secret/detect` replaced by a `«redacted:<type>»` marker. Replacement is applied from the rightmost match to the leftmost so byte offsets stay valid as edits are made. Useful for sanitizing logs, prompts, or LLM context before they leave the process.",
+      "examples": [
+        "(secret/redact \"deploy key AKIAIOSFODNN7EXAMPLE to prod\")"
+      ],
+      "body": "Return a copy of the text with every secret found by `secret/detect` replaced by a `«redacted:<type>»` marker. Replacement is applied from the rightmost match to the leftmost so byte offsets stay valid as edits are made. Useful for sanitizing logs, prompts, or LLM context before they leave the process.\n\n```sema\n(secret/redact \"deploy key AKIAIOSFODNN7EXAMPLE to prod\")\n```"
     },
     {
       "name": "serial/close",
@@ -9638,6 +10498,45 @@
       "body": "Convert a string to uppercase (Unicode-aware). Some characters expand when uppercased — the German sharp s `ß` becomes `SS` — so the result can be longer than the input.\n\n```sema\n(string/upper \"hello\")   ; => \"HELLO\"\n(string/upper \"ß\")       ; => \"SS\"\n```"
     },
     {
+      "name": "string/width",
+      "module": "strings",
+      "section": "Core String Operations",
+      "summary": "Terminal **display width** of a string, in columns. Unlike `string-length` (which counts Unicode scalar values), this counts how many columns the string occupies when printed: wide characters (CJK, most emoji) count as 2, combining marks as 0, and ANSI escape sequences (colors, cursor moves) as 0. Use it for TUI layout, padding, and alignment, where character count is wrong for non-ASCII or styled text.",
+      "params": [
+        {
+          "name": "s",
+          "type": "string"
+        }
+      ],
+      "returns": "int",
+      "examples": [
+        "(string/width \"hello\")     ; => 5\n(string/width \"日本語\")     ; => 6   (string-length is 3)\n(string/width \"👋\")         ; => 2\n(string/width \"é\")          ; => 1   (base + combining mark)"
+      ],
+      "body": "Terminal **display width** of a string, in columns. Unlike `string-length` (which counts Unicode scalar values), this counts how many columns the string occupies when printed: wide characters (CJK, most emoji) count as 2, combining marks as 0, and ANSI escape sequences (colors, cursor moves) as 0. Use it for TUI layout, padding, and alignment, where character count is wrong for non-ASCII or styled text.\n\n```sema\n(string/width \"hello\")     ; => 5\n(string/width \"日本語\")     ; => 6   (string-length is 3)\n(string/width \"👋\")         ; => 2\n(string/width \"é\")          ; => 1   (base + combining mark)\n```"
+    },
+    {
+      "name": "string/word-wrap",
+      "module": "strings",
+      "section": "Core String Operations",
+      "summary": "Word-wrap `text` to lines of at most `width` display columns, returning a list of line strings. Wraps on spaces (collapsing runs), hard-breaks any word longer than `width` on grapheme-cluster boundaries, and preserves explicit newlines as line breaks. Widths are measured with `string/width`, so wrapping is correct for non-ASCII text. (Distinct from `string/wrap`, which wraps a string in left/right delimiters.)",
+      "params": [
+        {
+          "name": "text",
+          "type": "string"
+        },
+        {
+          "name": "width",
+          "type": "int",
+          "doc": "max display columns per line"
+        }
+      ],
+      "returns": "list",
+      "examples": [
+        "(string/word-wrap \"the quick brown fox\" 10)\n; => (\"the quick\" \"brown fox\")\n\n(string/word-wrap \"日本語 の テスト\" 8)\n; => (\"日本語\" \"の\" \"テスト\")"
+      ],
+      "body": "Word-wrap `text` to lines of at most `width` display columns, returning a list of line strings. Wraps on spaces (collapsing runs), hard-breaks any word longer than `width` on grapheme-cluster boundaries, and preserves explicit newlines as line breaks. Widths are measured with `string/width`, so wrapping is correct for non-ASCII text. (Distinct from `string/wrap`, which wraps a string in left/right delimiters.)\n\n```sema\n(string/word-wrap \"the quick brown fox\" 10)\n; => (\"the quick\" \"brown fox\")\n\n(string/word-wrap \"日本語 の テスト\" 8)\n; => (\"日本語\" \"の\" \"テスト\")\n```"
+    },
+    {
       "name": "string/words",
       "module": "strings",
       "section": "Case Conversion",
@@ -9756,6 +10655,28 @@
       "syntax": "(exit [code])"
     },
     {
+      "name": "gc/collect",
+      "module": "system",
+      "section": "Memory",
+      "summary": "Run a full cycle-collection pass now and return its stats as a map with `:candidates` (registered cycle candidates scanned), `:traced` (heap nodes visited), `:collected` (garbage nodes reclaimed), and `:pruned` (dead registry entries removed). Reference cycles (e.g. a recursive local closure capturing itself) are otherwise reclaimed automatically at safe points; call this to force a collection at a known-quiet moment or to observe reclamation directly. With OpenTelemetry tracing enabled, every collector pass (this one included) also emits a `gc.collect` span carrying the trigger and these stats as `gc.*` attributes.",
+      "returns": "map",
+      "examples": [
+        "(define (make-loop)\n  (define (loop n) (if (<= n 0) 0 (loop (- n 1))))\n  (loop 3))\n(make-loop)\n(gc/collect)   ; => {:candidates 3 :collected 4 :pruned 1 :traced 9}"
+      ],
+      "body": "Run a full cycle-collection pass now and return its stats as a map with `:candidates` (registered cycle candidates scanned), `:traced` (heap nodes visited), `:collected` (garbage nodes reclaimed), and `:pruned` (dead registry entries removed). Reference cycles (e.g. a recursive local closure capturing itself) are otherwise reclaimed automatically at safe points; call this to force a collection at a known-quiet moment or to observe reclamation directly. With OpenTelemetry tracing enabled, every collector pass (this one included) also emits a `gc.collect` span carrying the trigger and these stats as `gc.*` attributes.\n\n```sema\n(define (make-loop)\n  (define (loop n) (if (<= n 0) 0 (loop (- n 1))))\n  (loop 3))\n(make-loop)\n(gc/collect)   ; => {:candidates 3 :collected 4 :pruned 1 :traced 9}\n```"
+    },
+    {
+      "name": "gc/stats",
+      "module": "system",
+      "section": "Memory",
+      "summary": "Return the cycle collector's stats without collecting: the last completed collection's `:candidates`, `:traced`, `:collected`, and `:pruned` counts (all zero before the first collection), plus `:registry-size` — the current number of registered cycle candidates awaiting the next collection. Useful for diagnosing memory growth in long-running sessions.",
+      "returns": "map",
+      "examples": [
+        "(gc/stats)   ; => {:candidates 3 :collected 4 :pruned 1 :registry-size 2 :traced 9}"
+      ],
+      "body": "Return the cycle collector's stats without collecting: the last completed collection's `:candidates`, `:traced`, `:collected`, and `:pruned` counts (all zero before the first collection), plus `:registry-size` — the current number of registered cycle candidates awaiting the next collection. Useful for diagnosing memory growth in long-running sessions.\n\n```sema\n(gc/stats)   ; => {:candidates 3 :collected 4 :pruned 1 :registry-size 2 :traced 9}\n```"
+    },
+    {
       "name": "gensym",
       "module": "system",
       "section": "Metaprogramming",
@@ -9855,6 +10776,18 @@
       "body": "Dispatch any pending signal callbacks. Call this from your event loop (typically right after `io/read-key` / `io/read-key-timeout` returns) so handlers run in a predictable place rather than asynchronously interrupting Sema code.\n\n```sema\n(let loop ()\n  (sys/check-signals)\n  (let ((key (io/read-key-timeout 50)))\n    (when key (handle-key key))\n    (loop)))\n```\n\nIf no signals are pending, this is essentially free — it just checks three atomic booleans."
     },
     {
+      "name": "sys/config-dir",
+      "module": "system",
+      "section": "System Information",
+      "summary": "Return the platform-appropriate base directory for user configuration, so apps can locate their config without branching on the operating system.",
+      "returns": "string",
+      "examples": [
+        "(path/join (sys/config-dir) \"sema\" \"sema-code\" \"config.json\")"
+      ],
+      "body": "Return the platform-appropriate base directory for user configuration, so apps can locate their config without branching on the operating system.\n\n| Platform | Location |\n|----------|----------|\n| Linux    | `$XDG_CONFIG_HOME` or `~/.config` |\n| macOS    | `~/Library/Application Support` |\n| Windows  | `%APPDATA%` |\n\n```sema\n(path/join (sys/config-dir) \"sema\" \"sema-code\" \"config.json\")\n```",
+      "syntax": "(sys/config-dir)"
+    },
+    {
       "name": "sys/cwd",
       "module": "system",
       "section": "System Information",
@@ -9939,11 +10872,11 @@
       "name": "sys/os",
       "module": "system",
       "section": "System Information",
-      "summary": "Return the operating system name.",
+      "summary": "Return the raw operating system name from the Rust target (`std::env::consts::OS`). This is an **open set** — besides `\"macos\"`, `\"linux\"`, and `\"windows\"` it can also report `\"ios\"`, `\"android\"`, `\"freebsd\"`, `\"dragonfly\"`, and others.",
       "examples": [
         "(sys/os)   ; => \"macos\""
       ],
-      "body": "Return the operating system name.\n\n```sema\n(sys/os)   ; => \"macos\"\n```"
+      "body": "Return the raw operating system name from the Rust target (`std::env::consts::OS`).\nThis is an **open set** — besides `\"macos\"`, `\"linux\"`, and `\"windows\"` it can also\nreport `\"ios\"`, `\"android\"`, `\"freebsd\"`, `\"dragonfly\"`, and others.\n\n```sema\n(sys/os)   ; => \"macos\"\n```\n\nUse `sys/platform` instead when you want a **closed, normalized set**\n(`\"macos\"` / `\"linux\"` / `\"windows\"` / `\"unknown\"`) that is safe to `match`/`cond`\non exhaustively."
     },
     {
       "name": "sys/pid",
@@ -9959,11 +10892,11 @@
       "name": "sys/platform",
       "module": "system",
       "section": "System Information",
-      "summary": "Return the platform name.",
+      "summary": "Return a normalized platform name, always one of the **closed set** `\"macos\"`, `\"linux\"`, `\"windows\"`, or `\"unknown\"`. Anything the build doesn't recognize collapses to `\"unknown\"`, so this is safe to branch on exhaustively.",
       "examples": [
         "(sys/platform)   ; => \"macos\" / \"linux\" / \"windows\""
       ],
-      "body": "Return the platform name.\n\n```sema\n(sys/platform)   ; => \"macos\" / \"linux\" / \"windows\"\n```"
+      "body": "Return a normalized platform name, always one of the **closed set**\n`\"macos\"`, `\"linux\"`, `\"windows\"`, or `\"unknown\"`. Anything the build doesn't\nrecognize collapses to `\"unknown\"`, so this is safe to branch on exhaustively.\n\n```sema\n(sys/platform)   ; => \"macos\" / \"linux\" / \"windows\"\n```\n\nFor the raw, open-ended OS name (e.g. `\"ios\"`, `\"android\"`, `\"freebsd\"`), use\n`sys/os`."
     },
     {
       "name": "sys/sema-home",
@@ -10061,7 +10994,7 @@
       "examples": [
         "(io/read-key)\n;; => {:kind :char :char \"a\"}"
       ],
-      "body": "Block until a single keypress arrives, then return a map describing it. Returns `nil` on EOF (after which `io/eof?` returns `#t`).\n\n```sema\n(io/read-key)\n;; => {:kind :char :char \"a\"}\n```\n\nThe map's `:kind` field is one of:\n\n| `:kind`   | Other keys              | Meaning                                         |\n|-----------|-------------------------|-------------------------------------------------|\n| `:char`   | `:char` (string)        | A printable character (UTF-8 multi-byte handled) |\n| `:ctrl`   | `:char` (string)        | Ctrl + letter (e.g., Ctrl-C → `{:kind :ctrl :char \"c\"}`) |\n| `:alt`    | `:char` (string)        | Alt/Meta + character (ESC + char sequence)      |\n| `:key`    | `:name` (keyword)       | Named key — see table below                     |\n\nNamed keys (`:kind :key`) currently emitted:\n\n`:enter` `:tab` `:backspace` `:esc` `:up` `:down` `:left` `:right` `:home` `:end` `:delete` `:page-up` `:page-down` `:f1` `:f2` `:f3` `:f4`\n\nCSI/SS3 escape sequences (arrow keys, F1–F4, Page Up/Down, Delete) and UTF-8 continuation bytes are decoded for you with a 20 ms continuation-byte window. F5–F12 and Insert use longer escape sequences that aren't decoded yet — they fall through as raw characters."
+      "body": "Block until a single keypress arrives, then return a map describing it. Returns `nil` on EOF (after which `io/eof?` returns `#t`).\n\n```sema\n(io/read-key)\n;; => {:kind :char :char \"a\"}\n```\n\nThe map's `:kind` field is one of:\n\n| `:kind`   | Other keys              | Meaning                                         |\n|-----------|-------------------------|-------------------------------------------------|\n| `:char`   | `:char` (string)        | A printable character (UTF-8 multi-byte handled) |\n| `:ctrl`   | `:char` (string)        | Ctrl + letter (e.g., Ctrl-C → `{:kind :ctrl :char \"c\"}`) |\n| `:alt`    | `:char` (string)        | Alt/Meta + character (ESC + char sequence)      |\n| `:key`    | `:name` (keyword)       | Named key — see table below                     |\n| `:mouse`  | `:action` `:x` `:y` `:button` `:mods` | A mouse event (only after `term/enable-mouse`)  |\n\nNamed keys (`:kind :key`) currently emitted:\n\n`:enter` `:tab` `:backspace` `:esc` `:up` `:down` `:left` `:right` `:home` `:end` `:delete` `:page-up` `:page-down` `:f1` `:f2` `:f3` `:f4`\n\nCSI/SS3 escape sequences (arrow keys, F1–F4, Page Up/Down, Delete) and UTF-8 continuation bytes are decoded for you. F5–F12 and Insert use longer escape sequences that aren't decoded yet — they fall through as raw characters.\n\n**Mouse** (after `term/enable-mouse`): SGR mouse reports decode to\n`{:kind :mouse :action A :x col :y row :button N :mods (…)}`, where `A` is one of\n`:press` `:release` `:move` `:wheel-up` `:wheel-down` `:wheel-left` `:wheel-right`,\ncoordinates are 1-based, and `:mods` (omitted when empty) lists `:shift`/`:alt`/`:ctrl`.\n\n**Kitty keyboard** (after `term/enable-kitty-keys!`): richer key events decode to\nthe *same* `:char`/`:ctrl`/`:alt`/`:key` shapes above — so existing code is\nunaffected — plus an optional `:mods` list (e.g. Shift+A →\n`{:kind :char :char \"A\" :mods (:shift)}`). Terminals without kitty support keep\nthe legacy encoding. Both mouse and kitty decoding are opt-in; plain keys are\nbyte-identical whether or not they're enabled."
     },
     {
       "name": "io/read-key-timeout",
@@ -10093,6 +11026,23 @@
         "(io/tty-restore! tok)"
       ],
       "body": "Restore the TTY to cooked mode using the token returned by `io/tty-raw!`.\n\n```sema\n(io/tty-restore! tok)\n```"
+    },
+    {
+      "name": "io/with-raw-mode",
+      "module": "terminal",
+      "section": "Screen Control",
+      "summary": "Guard macro: put the controlling TTY into raw mode (via `io/tty-raw!`), run `body`, and **always** restore cooked mode on exit — even if `body` throws (the error is re-raised after restoring). Returns `body`'s value. This guard matters most: an unrestored raw TTY leaves the shell unusable (no echo, no line editing). The restore token is handled internally, so `body` binds nothing.",
+      "examples": [
+        "(io/with-raw-mode\n  (let loop ()\n    (let ((k (io/read-key)))\n      (unless (ctrl-c? k) (handle k) (loop)))))"
+      ],
+      "body": "Guard macro: put the controlling TTY into raw mode (via `io/tty-raw!`), run\n`body`, and **always** restore cooked mode on exit — even if `body` throws (the\nerror is re-raised after restoring). Returns `body`'s value. This guard matters\nmost: an unrestored raw TTY leaves the shell unusable (no echo, no line editing).\nThe restore token is handled internally, so `body` binds nothing.\n\n```sema\n(io/with-raw-mode\n  (let loop ()\n    (let ((k (io/read-key)))\n      (unless (ctrl-c? k) (handle k) (loop)))))\n```"
+    },
+    {
+      "name": "term/bell",
+      "module": "terminal",
+      "section": "Screen Control",
+      "summary": "Emit the terminal bell (BEL) — an audible or visible alert depending on terminal settings. Takes no arguments.",
+      "body": "Emit the terminal bell (BEL) — an audible or visible alert depending on terminal settings. Takes no arguments."
     },
     {
       "name": "term/black",
@@ -10139,6 +11089,34 @@
       "body": "Render text in **bold** (increased intensity).\n\n```sema\n(term/bold \"important\")\n(println (term/bold \"Warning: check your input\"))\n```"
     },
     {
+      "name": "term/clear",
+      "module": "terminal",
+      "section": "Screen Control",
+      "summary": "Clear the entire screen and move the cursor to the top-left (home) position. Takes no arguments.",
+      "body": "Clear the entire screen and move the cursor to the top-left (home) position. Takes no arguments."
+    },
+    {
+      "name": "term/clear-below",
+      "module": "terminal",
+      "section": "Screen Control",
+      "summary": "Clear from the cursor to the end of the screen. Takes no arguments.",
+      "body": "Clear from the cursor to the end of the screen. Takes no arguments."
+    },
+    {
+      "name": "term/clear-line",
+      "module": "terminal",
+      "section": "Screen Control",
+      "summary": "Clear the line the cursor is on, without moving the cursor. Useful for redrawing a status line or spinner in place. Takes no arguments.",
+      "body": "Clear the line the cursor is on, without moving the cursor. Useful for redrawing a status line or spinner in place. Takes no arguments."
+    },
+    {
+      "name": "term/cursor-home",
+      "module": "terminal",
+      "section": "Screen Control",
+      "summary": "Move the cursor to the top-left corner (row 1, column 1) without clearing. Takes no arguments.",
+      "body": "Move the cursor to the top-left corner (row 1, column 1) without clearing. Takes no arguments."
+    },
+    {
       "name": "term/cyan",
       "module": "terminal",
       "section": "Colors",
@@ -10171,6 +11149,48 @@
         "(term/dim \"less important\")"
       ],
       "body": "Render text with decreased intensity.\n\n```sema\n(term/dim \"less important\")\n```"
+    },
+    {
+      "name": "term/disable-kitty-keys!",
+      "module": "terminal",
+      "section": "Screen Control",
+      "summary": "Pop the kitty keyboard protocol flags pushed by `term/enable-kitty-keys!`, restoring the terminal's previous keyboard mode. Call before `io/tty-restore!` on exit. Takes no arguments.",
+      "body": "Pop the kitty keyboard protocol flags pushed by `term/enable-kitty-keys!`, restoring the terminal's previous keyboard mode. Call before `io/tty-restore!` on exit. Takes no arguments."
+    },
+    {
+      "name": "term/disable-mouse",
+      "module": "terminal",
+      "section": "Screen Control",
+      "summary": "Disable mouse event reporting previously turned on with `term/enable-mouse`. Takes no arguments.",
+      "body": "Disable mouse event reporting previously turned on with `term/enable-mouse`. Takes no arguments."
+    },
+    {
+      "name": "term/enable-kitty-keys!",
+      "module": "terminal",
+      "section": "Screen Control",
+      "summary": "Opt into the kitty keyboard protocol (progressive-enhancement flags: disambiguate + report-associated-text). While enabled, `io/read-key` decodes richer key events — reliable modifier reporting (an optional `:mods` list of `:shift`/`:alt`/`:ctrl`/`:super`) and unambiguous key identification — normalized to the same `{:kind :char/:ctrl/:alt/:key}` shapes as the legacy path, so existing consumers keep working. Terminals without kitty support silently ignore this and keys keep arriving via the legacy encoding. Restore with `term/disable-kitty-keys!` before leaving raw mode. Takes no arguments.",
+      "body": "Opt into the kitty keyboard protocol (progressive-enhancement flags: disambiguate + report-associated-text). While enabled, `io/read-key` decodes richer key events — reliable modifier reporting (an optional `:mods` list of `:shift`/`:alt`/`:ctrl`/`:super`) and unambiguous key identification — normalized to the same `{:kind :char/:ctrl/:alt/:key}` shapes as the legacy path, so existing consumers keep working. Terminals without kitty support silently ignore this and keys keep arriving via the legacy encoding. Restore with `term/disable-kitty-keys!` before leaving raw mode. Takes no arguments."
+    },
+    {
+      "name": "term/enable-mouse",
+      "module": "terminal",
+      "section": "Screen Control",
+      "summary": "Enable mouse reporting — button events, button-motion (drag), and SGR extended coordinates — so the terminal sends click/drag/wheel events on stdin. `io/read-key` decodes them into `{:kind :mouse :action … :x :y :button :mods}` (see `io/read-key`). Pair with `term/disable-mouse`, or use the `term/with-mouse` guard to disable automatically on exit. Takes no arguments.",
+      "body": "Enable mouse reporting — button events, button-motion (drag), and SGR extended\ncoordinates — so the terminal sends click/drag/wheel events on stdin. `io/read-key`\ndecodes them into `{:kind :mouse :action … :x :y :button :mods}` (see `io/read-key`).\nPair with `term/disable-mouse`, or use the `term/with-mouse` guard to disable\nautomatically on exit. Takes no arguments."
+    },
+    {
+      "name": "term/enter-alt-screen",
+      "module": "terminal",
+      "section": "Screen Control",
+      "summary": "Switch to the terminal's alternate screen buffer. Use at app start so the TUI gets a clean canvas; pair with `term/leave-alt-screen` on exit to restore the user's scrollback exactly as it was. Takes no arguments.",
+      "body": "Switch to the terminal's alternate screen buffer. Use at app start so the TUI gets a clean canvas; pair with `term/leave-alt-screen` on exit to restore the user's scrollback exactly as it was. Takes no arguments."
+    },
+    {
+      "name": "term/flush",
+      "module": "terminal",
+      "section": "Screen Control",
+      "summary": "Flush buffered stdout. The other `term/*` control functions self-flush; use this when you batch styled `io/print` writes and want to present a frame all at once. Takes no arguments.",
+      "body": "Flush buffered stdout. The other `term/*` control functions self-flush; use this when you batch styled `io/print` writes and want to present a frame all at once. Takes no arguments."
     },
     {
       "name": "term/gray",
@@ -10207,6 +11227,13 @@
       "body": "Wrap `text` in ANSI escape codes so it renders in green in a terminal that supports color.\n\n```sema\n(term/green \"hello\")\n```"
     },
     {
+      "name": "term/hide-cursor",
+      "module": "terminal",
+      "section": "Screen Control",
+      "summary": "Hide the text cursor — reduces flicker while a TUI redraws. Pair with `term/show-cursor`. Takes no arguments.",
+      "body": "Hide the text cursor — reduces flicker while a TUI redraws. Pair with `term/show-cursor`. Takes no arguments."
+    },
+    {
       "name": "term/inverse",
       "module": "terminal",
       "section": "Modifiers",
@@ -10227,6 +11254,13 @@
       "body": "Render text in *italic*.\n\n```sema\n(term/italic \"emphasis\")\n```"
     },
     {
+      "name": "term/leave-alt-screen",
+      "module": "terminal",
+      "section": "Screen Control",
+      "summary": "Leave the alternate screen buffer and restore the primary screen and its scrollback. The inverse of `term/enter-alt-screen`. Takes no arguments.",
+      "body": "Leave the alternate screen buffer and restore the primary screen and its scrollback. The inverse of `term/enter-alt-screen`. Takes no arguments."
+    },
+    {
       "name": "term/magenta",
       "module": "terminal",
       "section": "Colors",
@@ -10242,6 +11276,18 @@
         "(term/magenta \"hello\")"
       ],
       "body": "Wrap `text` in ANSI escape codes so it renders in magenta in a terminal that supports color.\n\n```sema\n(term/magenta \"hello\")\n```"
+    },
+    {
+      "name": "term/move-to",
+      "module": "terminal",
+      "section": "Screen Control",
+      "summary": "Move the cursor to a 1-based `row` and `col`. Coordinates below 1 are clamped to 1.",
+      "returns": "nil",
+      "examples": [
+        "(term/move-to 1 1)      ; top-left\n(term/move-to 10 20)    ; row 10, column 20"
+      ],
+      "body": "Move the cursor to a 1-based `row` and `col`. Coordinates below 1 are clamped to 1.\n\n```sema\n(term/move-to 1 1)      ; top-left\n(term/move-to 10 20)    ; row 10, column 20\n```",
+      "syntax": "(term/move-to row col)"
     },
     {
       "name": "term/red",
@@ -10261,6 +11307,13 @@
       "body": "Wrap `text` in ANSI escape codes so it renders in red in a terminal that supports color.\n\n```sema\n(term/red \"hello\")\n```"
     },
     {
+      "name": "term/restore-cursor",
+      "module": "terminal",
+      "section": "Screen Control",
+      "summary": "Restore the cursor to the position saved by `term/save-cursor`. Takes no arguments.",
+      "body": "Restore the cursor to the position saved by `term/save-cursor`. Takes no arguments."
+    },
+    {
       "name": "term/rgb",
       "module": "terminal",
       "section": "True Color",
@@ -10270,6 +11323,32 @@
         ";; Build a gradient\n(for-each\n  (lambda (i)\n    (display (term/rgb \"█\" (* i 25) 50 (- 255 (* i 25)))))\n  (range 11))\n(println)"
       ],
       "body": "Apply 24-bit true color to text. Takes the text followed by red, green, and blue values (integers 0–255).\n\n```sema\n(term/rgb \"orange\" 255 165 0)\n(term/rgb \"coral\" 255 127 80)\n(term/rgb \"teal\" 0 128 128)\n(term/rgb \"hot pink\" 255 105 180)\n```\n\nUses the `ESC[38;2;r;g;bm` escape sequence format, which is supported by most modern terminals.\n\n```sema\n;; Build a gradient\n(for-each\n  (lambda (i)\n    (display (term/rgb \"█\" (* i 25) 50 (- 255 (* i 25)))))\n  (range 11))\n(println)\n```"
+    },
+    {
+      "name": "term/save-cursor",
+      "module": "terminal",
+      "section": "Screen Control",
+      "summary": "Save the current cursor position, to be restored later with `term/restore-cursor`. Takes no arguments.",
+      "body": "Save the current cursor position, to be restored later with `term/restore-cursor`. Takes no arguments."
+    },
+    {
+      "name": "term/set-title",
+      "module": "terminal",
+      "section": "Screen Control",
+      "summary": "Set the terminal window/tab title (OSC 0).",
+      "returns": "nil",
+      "examples": [
+        "(term/set-title \"Sema Coder\")"
+      ],
+      "body": "Set the terminal window/tab title (OSC 0).\n\n```sema\n(term/set-title \"Sema Coder\")\n```",
+      "syntax": "(term/set-title title)"
+    },
+    {
+      "name": "term/show-cursor",
+      "module": "terminal",
+      "section": "Screen Control",
+      "summary": "Show the text cursor again after `term/hide-cursor`. Takes no arguments.",
+      "body": "Show the text cursor again after `term/hide-cursor`. Takes no arguments."
     },
     {
       "name": "term/spinner-start",
@@ -10363,6 +11442,35 @@
         "(term/white \"hello\")"
       ],
       "body": "Wrap `text` in ANSI escape codes so it renders in white in a terminal that supports color.\n\n```sema\n(term/white \"hello\")\n```"
+    },
+    {
+      "name": "term/with-alt-screen",
+      "module": "terminal",
+      "section": "Screen Control",
+      "summary": "Guard macro: enter the alternate screen and hide the cursor, run `body`, and **always** restore both (show cursor, leave alt screen) on exit — even if `body` throws (the error is re-raised after restoring). Returns `body`'s value. Prevents a crash from leaving the terminal stuck in the alt buffer with a hidden cursor. Compose with `io/with-raw-mode` / `term/with-mouse` (outermost restores last).",
+      "examples": [
+        "(io/with-raw-mode\n  (term/with-alt-screen\n    (term/with-mouse\n      (run-tui))))   ; terminal is fully restored however this exits"
+      ],
+      "body": "Guard macro: enter the alternate screen and hide the cursor, run `body`, and\n**always** restore both (show cursor, leave alt screen) on exit — even if `body`\nthrows (the error is re-raised after restoring). Returns `body`'s value. Prevents\na crash from leaving the terminal stuck in the alt buffer with a hidden cursor.\nCompose with `io/with-raw-mode` / `term/with-mouse` (outermost restores last).\n\n```sema\n(io/with-raw-mode\n  (term/with-alt-screen\n    (term/with-mouse\n      (run-tui))))   ; terminal is fully restored however this exits\n```"
+    },
+    {
+      "name": "term/with-mouse",
+      "module": "terminal",
+      "section": "Screen Control",
+      "summary": "Guard macro: enable mouse reporting (`term/enable-mouse`), run `body`, and **always** disable it on exit — even if `body` throws (the error is re-raised after disabling). Returns `body`'s value. Without the guard, a crash leaves mouse reporting on and escape reports spew into the shell as garbage. `io/read-key` decodes reports as `{:kind :mouse …}` while enabled.",
+      "body": "Guard macro: enable mouse reporting (`term/enable-mouse`), run `body`, and\n**always** disable it on exit — even if `body` throws (the error is re-raised\nafter disabling). Returns `body`'s value. Without the guard, a crash leaves mouse\nreporting on and escape reports spew into the shell as garbage. `io/read-key`\ndecodes reports as `{:kind :mouse …}` while enabled."
+    },
+    {
+      "name": "term/write-at",
+      "module": "terminal",
+      "section": "Screen Control",
+      "summary": "Move the cursor to a 1-based `row`/`col` and write `text` there in one operation. Combine with `term/style`/`term/rgb` for colored output.",
+      "returns": "nil",
+      "examples": [
+        "(term/write-at 3 5 (term/rgb \"status: ok\" 200 168 85))"
+      ],
+      "body": "Move the cursor to a 1-based `row`/`col` and write `text` there in one operation. Combine with `term/style`/`term/rgb` for colored output.\n\n```sema\n(term/write-at 3 5 (term/rgb \"status: ok\" 200 168 85))\n```",
+      "syntax": "(term/write-at row col text)"
     },
     {
       "name": "term/yellow",
@@ -10974,45 +12082,6 @@
       "body": "```sema\n(let (([head second & tail] [1 2 3 4 5]))\n  [head second tail])\n; => [1 2 (3 4 5)]\n```\n\nNote: `tail` is a **list**, not a vector."
     },
     {
-      "name": "first",
-      "module": "vectors",
-      "section": "Indexed Access",
-      "summary": "Return the first element of a vector (or list). Returns `nil` for empty vectors.",
-      "params": [
-        {
-          "name": "vec",
-          "type": "vector",
-          "doc": "vector or list; nil if empty"
-        }
-      ],
-      "returns": "any",
-      "examples": [
-        "(first [1 2 3])   ; => 1\n(first [])        ; => nil"
-      ],
-      "body": "Return the first element of a vector (or list). Returns `nil` for empty vectors.\n\n```sema\n(first [1 2 3])   ; => 1\n(first [])        ; => nil\n```"
-    },
-    {
-      "name": "length",
-      "aliases": [
-        "count",
-        "empty?"
-      ],
-      "module": "vectors",
-      "section": "Predicates & Introspection",
-      "summary": "Vectors participate in Sema's generic collection functions:",
-      "params": [
-        {
-          "name": "vec",
-          "type": "vector"
-        }
-      ],
-      "returns": "int",
-      "examples": [
-        "(length [10 20 30])   ; => 3\n(count [10 20 30])    ; => 3\n(empty? [])           ; => #t\n(empty? [1])          ; => #f"
-      ],
-      "body": "Vectors participate in Sema's generic collection functions:\n\n```sema\n(length [10 20 30])   ; => 3\n(count [10 20 30])    ; => 3\n(empty? [])           ; => #t\n(empty? [1])          ; => #f\n```"
-    },
-    {
       "name": "list->vector",
       "module": "vectors",
       "section": "Conversion",
@@ -11021,47 +12090,6 @@
         "(list->vector '(1 2 3))   ; => [1 2 3]\n(list->vector '())         ; => []"
       ],
       "body": "Convert a list to a vector.\n\n```sema\n(list->vector '(1 2 3))   ; => [1 2 3]\n(list->vector '())         ; => []\n```"
-    },
-    {
-      "name": "nth",
-      "module": "vectors",
-      "section": "Indexed Access",
-      "summary": "Return the element at index `n` (zero-based). Works on both lists and vectors.",
-      "params": [
-        {
-          "name": "coll",
-          "type": "any",
-          "doc": "list or vector"
-        },
-        {
-          "name": "n",
-          "type": "int",
-          "doc": "zero-based index"
-        }
-      ],
-      "returns": "any",
-      "examples": [
-        "(nth [10 20 30] 0)    ; => 10\n(nth [10 20 30] 2)    ; => 30",
-        "(nth [10 20 30] 3)\n; => error: index 3 out of bounds (length 3)"
-      ],
-      "body": "Return the element at index `n` (zero-based). Works on both lists and vectors.\n\n```sema\n(nth [10 20 30] 0)    ; => 10\n(nth [10 20 30] 2)    ; => 30\n```\n\nOut of bounds is an error:\n\n```sema\n(nth [10 20 30] 3)\n; => error: index 3 out of bounds (length 3)\n```\n\nUse `first` for safe \"index 0\" access — it returns `nil` on empty sequences."
-    },
-    {
-      "name": "rest",
-      "module": "vectors",
-      "section": "Indexed Access",
-      "summary": "Return everything after the first element. **Preserves type** — vector in, vector out.",
-      "params": [
-        {
-          "name": "vec",
-          "type": "vector"
-        }
-      ],
-      "returns": "vector",
-      "examples": [
-        "(rest [1 2 3])    ; => [2 3]\n(rest [])         ; => []\n(rest [1])        ; => []"
-      ],
-      "body": "Return everything after the first element. **Preserves type** — vector in, vector out.\n\n```sema\n(rest [1 2 3])    ; => [2 3]\n(rest [])         ; => []\n(rest [1])        ; => []\n```"
     },
     {
       "name": "vector",
@@ -11160,23 +12188,6 @@
         ";; (3.0 4.0) has magnitude 5, so it normalizes to (0.6 0.8)\n(embedding/->list (vector/normalize (embedding/list->embedding '(3.0 4.0))))\n; => (0.6 0.8)"
       ],
       "body": "Return a unit-length copy of an embedding vector (each component divided by the vector's magnitude). The argument is a bytevector of packed little-endian f64 values (as produced by `embedding/list->embedding`), non-empty with a length that is a multiple of 8 bytes. A zero vector is returned unchanged (all zeros).\n\n```sema\n;; (3.0 4.0) has magnitude 5, so it normalizes to (0.6 0.8)\n(embedding/->list (vector/normalize (embedding/list->embedding '(3.0 4.0))))\n; => (0.6 0.8)\n```"
-    },
-    {
-      "name": "vector?",
-      "module": "vectors",
-      "section": "Predicates & Introspection",
-      "summary": "Test whether a value is a vector.",
-      "params": [
-        {
-          "name": "x",
-          "type": "any"
-        }
-      ],
-      "returns": "bool",
-      "examples": [
-        "(vector? [1 2 3])          ; => #t\n(vector? '(1 2 3))         ; => #f\n(vector? 42)               ; => #f"
-      ],
-      "body": "Test whether a value is a vector.\n\n```sema\n(vector? [1 2 3])          ; => #t\n(vector? '(1 2 3))         ; => #f\n(vector? 42)               ; => #f\n```"
     },
     {
       "name": ":static",
@@ -11293,9 +12304,10 @@
       "section": "Serving",
       "summary": "Start an HTTP server. Takes a handler function and an optional options map. The handler receives a request map and returns a response map. This function blocks — it becomes the server's run loop.",
       "examples": [
-        "(http/serve handler)\n(http/serve handler {:port 3000})\n(http/serve handler {:port 8080 :host \"127.0.0.1\"})"
+        "(http/serve handler)\n(http/serve handler {:port 3000})\n(http/serve handler {:port 8080 :host \"127.0.0.1\"})",
+        "(http/serve handler\n  {:port 3000\n   :port-fallback true\n   :on-listen (fn (info)\n     (println (string-append \"Ready at \" (:url info))))})"
       ],
-      "body": "Start an HTTP server. Takes a handler function and an optional options map. The handler receives a request map and returns a response map. This function blocks — it becomes the server's run loop.\n\n```sema\n(http/serve handler)\n(http/serve handler {:port 3000})\n(http/serve handler {:port 8080 :host \"127.0.0.1\"})\n```\n\n| Option  | Default     | Description        |\n| ------- | ----------- | ------------------ |\n| `:port` | `3000`      | TCP port to bind   |\n| `:host` | `\"0.0.0.0\"` | Address to bind to |\n\nThe handler is any function `(request-map -> response-map)`. This can be a plain function, a router, or a middleware-wrapped stack."
+      "body": "Start an HTTP server. Takes a handler function and an optional options map. The handler receives a request map and returns a response map. This function blocks — it becomes the server's run loop.\n\n```sema\n(http/serve handler)\n(http/serve handler {:port 3000})\n(http/serve handler {:port 8080 :host \"127.0.0.1\"})\n```\n\n| Option           | Default     | Description                                                         |\n| ---------------- | ----------- | ------------------------------------------------------------------- |\n| `:port`          | `3000`      | TCP port to bind                                                    |\n| `:host`          | `\"0.0.0.0\"` | Address to bind to                                                  |\n| `:port-fallback` | `false`     | If the port is taken, bind the next free port instead of failing    |\n| `:on-listen`     | —           | Function called once bound with `{:host :port :url}`                |\n\nThe handler is any function `(request-map -> response-map)`. This can be a plain function, a router, or a middleware-wrapped stack.\n\n### Automatic port fallback\n\nBy default `http/serve` fails fast when the port is already in use. Pass\n`:port-fallback true` to walk to the next free port instead — handy for dev\nservers and multiple instances. Because the actual port may then differ from the\none requested, use `:on-listen` to learn where the server ended up:\n\n```sema\n(http/serve handler\n  {:port 3000\n   :port-fallback true\n   :on-listen (fn (info)\n     (println (string-append \"Ready at \" (:url info))))})\n```\n\n`:on-listen` runs once, on the main thread, right after the socket binds and\nbefore the request loop starts."
     },
     {
       "name": "http/stream",

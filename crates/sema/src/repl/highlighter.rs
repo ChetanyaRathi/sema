@@ -4,8 +4,6 @@ use sema_core::SemaError;
 use sema_eval::SPECIAL_FORM_NAMES;
 use sema_reader::lexer::{tokenize, SpannedToken, Token};
 
-use crate::colors::enabled_stdout;
-
 // Sema brand palette from `crates/sema/src/colors.rs` / `website/.vitepress/theme/BrandGuide.vue`.
 const GOLD: Color = Color::Rgb(200, 168, 85);
 const SAGE: Color = Color::Rgb(168, 196, 122);
@@ -24,7 +22,7 @@ const SECONDARY: Color = Color::Rgb(150, 140, 121);
 ///
 /// When the cursor sits on a bracket (or just past one), the matching
 /// partner is bolded. A lonely bracket with no partner is coloured red.
-pub struct SemaHighlighter;
+pub(crate) struct SemaHighlighter;
 
 impl SemaHighlighter {
     pub fn new() -> Self {
@@ -113,9 +111,12 @@ fn style_for(
                 Style::default()
             }
         }
-        Token::Quote | Token::Quasiquote | Token::Unquote | Token::UnquoteSplice | Token::Dot => {
-            Style::new().fg(TERTIARY)
-        }
+        Token::Quote
+        | Token::Quasiquote
+        | Token::Unquote
+        | Token::UnquoteSplice
+        | Token::Deref
+        | Token::Dot => Style::new().fg(TERTIARY),
         Token::ShortLambdaStart | Token::BytevectorStart => Style::new().fg(GOLD),
         Token::LParen
         | Token::RParen
@@ -133,49 +134,24 @@ fn style_for(
     }
 }
 
-/// Highlight Sema code blocks inside a Markdown doc string.
-///
-/// Fenced blocks tagged `sema` get inline syntax highlighting; the fence
-/// lines themselves are dimmed so they recede. Everything else is passed
-/// through unchanged. Returns the original string when ANSI colors are
-/// disabled (`NO_COLOR` set or stdout is not a terminal).
-pub fn highlight_doc_markdown(md: &str) -> String {
-    highlight_doc_markdown_inner(md, enabled_stdout())
-}
-
-fn highlight_doc_markdown_inner(md: &str, color: bool) -> String {
-    if !color {
-        return md.to_string();
-    }
-
+pub(crate) fn highlight_sema_ansi(line: &str) -> String {
     let fence_style = Style::new().fg(TERTIARY);
     let highlighter = SemaHighlighter::new();
-    let mut out = String::with_capacity(md.len() * 2);
-    let mut in_sema_block = false;
-
-    for line in md.lines() {
-        let trimmed = line.trim_start();
-        if trimmed.starts_with("```sema") {
-            in_sema_block = true;
-            out.push_str(&fence_style.paint(line).to_string());
-            out.push('\n');
-        } else if in_sema_block && trimmed.starts_with("```") {
-            in_sema_block = false;
-            out.push_str(&fence_style.paint(line).to_string());
-            out.push('\n');
-        } else if in_sema_block {
-            let styled = highlighter.highlight(line, 0);
-            for (style, text) in &styled.buffer {
-                out.push_str(&style.paint(text).to_string());
-            }
-            out.push('\n');
-        } else {
-            out.push_str(line);
-            out.push('\n');
-        }
+    let mut out = String::with_capacity(line.len() * 2);
+    if line.trim_start().starts_with("```") {
+        return fence_style.paint(line).to_string();
     }
-
+    let styled = highlighter.highlight(line, 0);
+    for (style, text) in &styled.buffer {
+        out.push_str(&style.paint(text).to_string());
+    }
     out
+}
+
+/// Highlight Sema code blocks inside a Markdown doc string.
+#[cfg(test)]
+pub(crate) fn highlight_doc_markdown(md: &str) -> String {
+    md.to_string()
 }
 
 /// Given the tokens of the buffer and the cursor position, return the
@@ -478,7 +454,7 @@ mod tests {
     #[test]
     fn doc_markdown_dims_all_sema_fences() {
         let md = "Example:\n\n```sema\n(a 1)\n```\n\nMore:\n\n```sema\n(b 2)\n```\n";
-        let out = highlight_doc_markdown_inner(md, true);
+        let out = crate::docs::render_terminal_markdown_inner(md, true);
 
         // Every fence line should start with the tertiary foreground escape.
         // (Lines begin with ANSI escapes after dimming, so we look for the
@@ -507,7 +483,7 @@ mod tests {
         // regression where the final closing fence of a multi-block doc was
         // not styled.
         let md = "Define an LLM agent. The `name` must be a symbol.\n\n```sema\n(defagent greeter\n  {:system \"You are a friendly greeter.\"})\n```\n\nInspecting an agent:\n\n```sema\n(agent/name greeter)       ; => \"greeter\"\n(agent? greeter)           ; => #t\n```";
-        let out = highlight_doc_markdown_inner(md, true);
+        let out = crate::docs::render_terminal_markdown_inner(md, true);
 
         let tertiary = "\x1b[38;2;107;99;84m";
         let mut fence_count = 0;
@@ -525,7 +501,7 @@ mod tests {
         // Regression: code in the final ```sema block of defagent was not
         // getting function-position syntax highlighting.
         let md = "Inspecting an agent:\n\n```sema\n(agent/name greeter)       ; => \"greeter\"\n(agent/system greeter)     ; => \"You are a friendly greeter...\"\n(agent/max-turns greeter)  ; => 5\n(agent? greeter)           ; => #t\n```";
-        let out = highlight_doc_markdown_inner(md, true);
+        let out = crate::docs::render_terminal_markdown_inner(md, true);
 
         let gold = "\x1b[38;2;200;168;85m";
         for line in out.lines() {

@@ -5,7 +5,7 @@ use std::rc::Rc;
 use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::Shell;
 
-use sema_core::{pretty_print, SemaError, Value, ValueView};
+use sema_core::{archive, pretty_print, SemaError, Value, ValueView};
 use sema_eval::Interpreter;
 use serde::Deserialize;
 
@@ -57,12 +57,13 @@ fn find_config() -> Option<SemaConfig> {
     }
 }
 
-mod archive;
 mod colors;
 mod cross_compile;
+mod docs;
 mod import_tracer;
 mod pkg;
 mod repl;
+mod web;
 mod workflow_check;
 mod workflow_view;
 
@@ -201,6 +202,23 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Browse builtin and special-form documentation
+    #[command(args_conflicts_with_subcommands = true)]
+    Doc {
+        /// Show docs in a pager even when the output fits on one screen
+        #[arg(long, conflicts_with = "no_pager")]
+        pager: bool,
+
+        /// Print directly without invoking a pager
+        #[arg(long, conflicts_with = "pager")]
+        no_pager: bool,
+
+        #[command(subcommand)]
+        command: Option<DocCommands>,
+
+        /// Symbol to show documentation for (implicit `show`)
+        symbol: Option<String>,
+    },
     /// Package manager
     Pkg {
         #[command(subcommand)]
@@ -224,7 +242,7 @@ enum Commands {
         #[arg(long, conflicts_with = "target")]
         runtime: Option<String>,
 
-        /// Target platform triple or alias (e.g. linux, macos, windows, or a full triple).
+        /// Target platform triple or alias (e.g. linux, macos, windows, web, or a full triple).
         /// Use "all" to build for all supported targets.
         #[arg(long)]
         target: Option<String>,
@@ -270,9 +288,13 @@ enum Commands {
     Lsp,
     /// Start the Debug Adapter Protocol server
     Dap,
-    /// Start the Model Context Protocol (MCP) server
+    /// Start the MCP server, or manage MCP client auth (`mcp login`/`logout`)
+    #[command(args_conflicts_with_subcommands = true)]
     Mcp {
-        /// Optional source files to run/load tools from
+        /// Client-auth subcommand; when omitted, runs the MCP server
+        #[command(subcommand)]
+        auth: Option<McpAuthCommands>,
+        /// Optional source files to run/load tools from (server mode)
         #[arg(value_name = "FILES")]
         files: Vec<String>,
         /// Comma-separated list of tool names to explicitly include
@@ -286,6 +308,24 @@ enum Commands {
     Notebook {
         #[command(subcommand)]
         command: NotebookCommands,
+    },
+    /// Dev server for a sema-web app — serves it in the browser with a native LLM proxy
+    Web {
+        /// Path to the app's entry `.sema` file
+        file: String,
+        /// Host to bind. Loopback by default; a non-loopback host exposes the
+        /// unauthenticated LLM proxy to the network.
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
+        /// Port to listen on (advances to the next free port if taken)
+        #[arg(short, long, default_value = "3000")]
+        port: u16,
+        /// Don't open a browser automatically
+        #[arg(long)]
+        no_open: bool,
+        /// Disable the built-in LLM proxy
+        #[arg(long)]
+        no_llm: bool,
     },
     /// Dynamic workflows — run journaled workflows and view their runs
     Workflow {
@@ -321,6 +361,50 @@ enum Commands {
         /// Disable LLM features
         #[arg(long)]
         no_llm: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum DocCommands {
+    /// Show documentation for a symbol
+    Show {
+        /// Symbol to show documentation for
+        symbol: String,
+    },
+    /// Search documentation by natural-language query
+    Search {
+        /// Query to search for
+        #[arg(required = true, num_args = 1..)]
+        query: Vec<String>,
+
+        /// Maximum number of results to show
+        #[arg(short = 'n', long, default_value_t = sema_mcp::docs_search::DEFAULT_LIMIT)]
+        limit: usize,
+    },
+    /// Search symbol names by prefix, substring, and fuzzy match
+    Apropos {
+        /// Pattern to search for
+        pattern: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum McpAuthCommands {
+    /// Log in to a remote (HTTP) MCP server and cache the OAuth token
+    Login {
+        /// The MCP server URL (e.g. https://mcp.example.com/mcp)
+        url: String,
+        /// Use the device-authorization flow instead of opening a browser
+        #[arg(long)]
+        device: bool,
+        /// A pre-registered OAuth client id (when the server has no dynamic registration)
+        #[arg(long = "client-id", value_name = "ID")]
+        client_id: Option<String>,
+    },
+    /// Remove cached credentials for a remote MCP server
+    Logout {
+        /// The MCP server URL whose cached credentials to clear
+        url: String,
     },
 }
 
@@ -532,10 +616,36 @@ enum NotebookCommands {
     },
 }
 
+/// Build the standard CLI interpreter: stdlib + LLM (registered inside sema-eval)
+/// plus the MCP *client* builtins (`mcp/connect`, `mcp/tools`, `mcp/tools->sema`,
+/// …). The MCP builtins live in `sema-mcp`, which depends on `sema-eval`, so they
+/// can't be registered inside `sema-eval` itself — the binary wires them in here.
+fn build_interpreter(sandbox: &sema_core::Sandbox) -> Interpreter {
+    let interpreter = Interpreter::new_with_sandbox(sandbox);
+    sema_mcp::register_mcp_builtins(&interpreter.global_env, sandbox);
+    interpreter
+}
+
 fn main() {
     // Check for embedded archive before parsing CLI args
     if let Some(exit_code) = try_run_embedded() {
         std::process::exit(exit_code);
+    }
+
+    // Shell-completion helper for `sema doc` symbols, handled before clap parses.
+    // It is intentionally NOT a clap subcommand: a hidden subcommand makes
+    // `clap_complete`'s bash generator panic (find_subcommand_with_path), which
+    // would break `sema completions bash`. The generated completion scripts still
+    // invoke `sema __complete-doc-symbols <prefix>`.
+    {
+        let mut args = std::env::args().skip(1);
+        if args.next().as_deref() == Some("__complete-doc-symbols") {
+            let prefix = args.next().unwrap_or_default();
+            for name in docs::completion_candidates(&prefix) {
+                println!("{name}");
+            }
+            return;
+        }
     }
 
     let cli = Cli::parse();
@@ -571,12 +681,7 @@ fn main() {
                 if install {
                     install_completions(shell);
                 } else {
-                    clap_complete::generate(
-                        shell,
-                        &mut Cli::command(),
-                        "sema",
-                        &mut std::io::stdout(),
-                    );
+                    print!("{}", generate_completions(shell));
                 }
             }
             Commands::Compile {
@@ -592,6 +697,24 @@ fn main() {
             }
             Commands::Disasm { file, json } => {
                 run_disasm(&file, json);
+            }
+            Commands::Doc {
+                pager,
+                no_pager,
+                command,
+                symbol,
+            } => {
+                let pager = if no_pager {
+                    docs::PagerMode::Never
+                } else if pager {
+                    docs::PagerMode::Always
+                } else {
+                    docs::PagerMode::Auto
+                };
+                if let Err(msg) = run_doc(command, symbol, pager) {
+                    eprintln!("Error: {msg}");
+                    std::process::exit(1);
+                }
             }
             Commands::Pkg { command } => {
                 let result = match command {
@@ -683,10 +806,26 @@ fn main() {
                     .block_on(sema_dap::run_server());
             }
             Commands::Mcp {
+                auth,
                 files,
                 include,
                 exclude,
             } => {
+                if let Some(auth) = auth {
+                    let result = match auth {
+                        McpAuthCommands::Login {
+                            url,
+                            device,
+                            client_id,
+                        } => sema_mcp::mcp_login(&url, device, client_id.as_deref()),
+                        McpAuthCommands::Logout { url } => sema_mcp::mcp_logout(&url),
+                    };
+                    if let Err(e) = result {
+                        eprintln!("mcp: {e}");
+                        std::process::exit(1);
+                    }
+                    return;
+                }
                 let inc_tools = include.map(|s| {
                     s.split(',')
                         .map(|x| x.trim().to_string())
@@ -699,7 +838,7 @@ fn main() {
                 });
 
                 let sandbox = sema_core::Sandbox::allow_all();
-                let interpreter = Interpreter::new_with_sandbox(&sandbox);
+                let interpreter = build_interpreter(&sandbox);
 
                 let _ = interpreter.eval_str("(llm/auto-configure)");
 
@@ -734,6 +873,18 @@ fn main() {
             Commands::Notebook { command } => {
                 run_notebook_command(command);
             }
+            Commands::Web {
+                file,
+                host,
+                port,
+                no_open,
+                no_llm,
+            } => {
+                if let Err(e) = web::run(&file, &host, port, !no_open, !no_llm) {
+                    eprintln!("sema web: {e}");
+                    std::process::exit(1);
+                }
+            }
             Commands::Workflow { command } => {
                 run_workflow_command(command, &sandbox);
             }
@@ -752,7 +903,7 @@ fn main() {
         return;
     }
 
-    let interpreter = Interpreter::new_with_sandbox(&sandbox);
+    let interpreter = build_interpreter(&sandbox);
 
     // Set LLM env vars before auto-configure
     if let Some(model) = cli.chat_model.as_ref() {
@@ -891,6 +1042,10 @@ fn main() {
                         std::process::exit(1);
                     }
                 }
+            }
+            Err(msg) if msg.starts_with("file not found:") => {
+                eprintln!("error: file not found: '{file}' (not a file or command)\n\nRun 'sema --help' for available commands.");
+                std::process::exit(1);
             }
             Err(msg) => {
                 eprintln!("error: {msg}");
@@ -1048,7 +1203,7 @@ fn run_workflow_command(command: WorkflowCommands, sandbox: &sema_core::Sandbox)
         std::thread::sleep(std::time::Duration::from_millis(250));
     }
 
-    let interpreter = Interpreter::new_with_sandbox(&effective_sandbox);
+    let interpreter = build_interpreter(&effective_sandbox);
 
     // Auto-configure an LLM provider from the environment (mirrors the default run
     // path), so a workflow whose leaves call `llm/*` works without self-configuring.
@@ -1363,7 +1518,7 @@ fn run_eval(
         None => sema_core::Sandbox::allow_all(),
     };
 
-    let interpreter = Interpreter::new_with_sandbox(&sandbox);
+    let interpreter = build_interpreter(&sandbox);
 
     // Auto-configure LLM unless --no-llm
     if !no_llm {
@@ -1572,7 +1727,7 @@ fn run_compile(file: &str, output: Option<&str>) {
 
     // Use Interpreter for macro expansion before compilation
     let sandbox = sema_core::Sandbox::allow_all();
-    let interpreter = Interpreter::new_with_sandbox(&sandbox);
+    let interpreter = build_interpreter(&sandbox);
 
     let result = match interpreter.compile_to_bytecode(&source) {
         Ok(r) => r,
@@ -1649,7 +1804,7 @@ fn try_run_embedded() -> Option<i32> {
     sema_core::vfs::init_vfs(arch.files);
 
     let sandbox = sema_core::Sandbox::allow_all();
-    let interpreter = Interpreter::new_with_sandbox(&sandbox);
+    let interpreter = build_interpreter(&sandbox);
 
     let _ = interpreter.eval_str("(llm/auto-configure)");
 
@@ -1760,6 +1915,10 @@ fn run_build(
         return Ok(());
     }
 
+    if target == Some("web") {
+        return run_build_web(file, output, includes);
+    }
+
     let path = std::path::Path::new(file);
 
     let source = read_source_file(path)?;
@@ -1790,7 +1949,7 @@ fn run_build(
     // Compute source hash and compile to bytecode
     let source_hash = crc32fast::hash(source.as_bytes());
     let sandbox = sema_core::Sandbox::allow_all();
-    let interpreter = Interpreter::new_with_sandbox(&sandbox);
+    let interpreter = build_interpreter(&sandbox);
 
     let result = match interpreter.compile_to_bytecode(&source) {
         Ok(r) => r,
@@ -1976,6 +2135,174 @@ fn run_build(
             );
         }
     }
+
+    Ok(())
+}
+
+fn compile_source_to_bytecode(source: &str) -> Result<Vec<u8>, String> {
+    let source_hash = crc32fast::hash(source.as_bytes());
+    let sandbox = sema_core::Sandbox::allow_all();
+    let interpreter = Interpreter::new_with_sandbox(&sandbox);
+    interpreter
+        .eval_str_in_global(include_str!("web_prelude.sema"))
+        .map_err(|e| format!("web prelude error: {}", e.inner()))?;
+    let result = interpreter
+        .compile_to_bytecode(source)
+        .map_err(|e| format!("compile error: {}", e.inner()))?;
+    sema_vm::serialize_to_bytes(&result, source_hash)
+        .map_err(|e| format!("serialization error: {}", e.inner()))
+}
+
+fn should_compile_traced_import(rel_path: &str) -> bool {
+    rel_path.ends_with(".sema") || sema_core::resolve::is_package_import(rel_path)
+}
+
+fn web_output_path(input: &std::path::Path, output: Option<&str>) -> std::path::PathBuf {
+    let default_name = format!(
+        "{}.vfs",
+        input
+            .file_stem()
+            .unwrap_or(input.as_os_str())
+            .to_string_lossy()
+    );
+
+    match output {
+        Some(raw) => {
+            let path = std::path::PathBuf::from(raw);
+            if path.is_dir() || raw.ends_with(std::path::MAIN_SEPARATOR) {
+                path.join(default_name)
+            } else if path.extension().is_none() {
+                path.with_extension("vfs")
+            } else {
+                path
+            }
+        }
+        None => std::path::PathBuf::from(default_name),
+    }
+}
+
+/// Compile an entry `.sema` plus its traced imports (and any `includes`) into a
+/// web `.vfs` archive. Returns the archive bytes and the number of traced
+/// imports (0 = single-file). Shared by `sema build --target web` and the
+/// `sema web` dev server, which builds an archive on the fly for multi-file apps.
+pub(crate) fn build_web_archive(
+    path: &std::path::Path,
+    includes: &[String],
+) -> Result<(Vec<u8>, usize), String> {
+    let source =
+        std::fs::read_to_string(path).map_err(|e| format!("reading {}: {e}", path.display()))?;
+    let entry_bytecode = compile_source_to_bytecode(&source)?;
+
+    let imports =
+        import_tracer::trace_imports(path).map_err(|e| format!("tracing imports: {e}"))?;
+    let import_count = imports.len();
+
+    let mut files = std::collections::HashMap::new();
+    files.insert("__main__.semac".to_string(), entry_bytecode);
+
+    for (rel_path, contents) in &imports {
+        if let Err(e) = sema_core::vfs::validate_vfs_path(rel_path) {
+            eprintln!("Warning: skipping import with invalid VFS path: {e}");
+            continue;
+        }
+
+        let bundled = if should_compile_traced_import(rel_path) {
+            let import_source = String::from_utf8(contents.clone()).map_err(|e| {
+                format!("compile error in {rel_path}: import is not valid UTF-8: {e}")
+            })?;
+            compile_source_to_bytecode(&import_source).map_err(|e| format!("{e} in {rel_path}"))?
+        } else {
+            contents.clone()
+        };
+
+        files.insert(rel_path.clone(), bundled);
+    }
+
+    for include in includes {
+        let inc_path = std::path::Path::new(include);
+        if inc_path.is_dir() {
+            let base = inc_path
+                .file_name()
+                .unwrap_or(inc_path.as_os_str())
+                .to_string_lossy()
+                .to_string();
+            collect_directory_files(inc_path, &base, &mut files);
+        } else if inc_path.is_file() {
+            let rel = inc_path
+                .file_name()
+                .unwrap_or(inc_path.as_os_str())
+                .to_string_lossy()
+                .to_string();
+            if let Err(e) = sema_core::vfs::validate_vfs_path(&rel) {
+                eprintln!("Warning: skipping {include}: {e}");
+                continue;
+            }
+            match std::fs::read(inc_path) {
+                Ok(data) => {
+                    files.insert(rel, data);
+                }
+                Err(e) => {
+                    eprintln!("Warning: cannot read {include}: {e}");
+                }
+            }
+        } else {
+            eprintln!("Warning: --include path not found: {include}");
+        }
+    }
+
+    let mut metadata = std::collections::HashMap::new();
+    metadata.insert(
+        "sema-version".to_string(),
+        env!("CARGO_PKG_VERSION").as_bytes().to_vec(),
+    );
+    metadata.insert(
+        "build-timestamp".to_string(),
+        build_timestamp().into_bytes(),
+    );
+    metadata.insert("entry-point".to_string(), b"__main__.semac".to_vec());
+    metadata.insert("build-target".to_string(), b"web".to_vec());
+
+    let canonical_root = path
+        .parent()
+        .and_then(|p| p.canonicalize().ok())
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+    metadata.insert(
+        "build-root".to_string(),
+        canonical_root.to_string_lossy().into_owned().into_bytes(),
+    );
+
+    Ok((archive::serialize_archive(&metadata, &files), import_count))
+}
+
+fn run_build_web(file: &str, output: Option<&str>, includes: &[String]) -> Result<(), String> {
+    let path = std::path::Path::new(file);
+    if !path.exists() {
+        return Err(format!("source file not found: {file}"));
+    }
+
+    eprintln!("Compiling {file} for web...");
+    let (archive_bytes, import_count) = build_web_archive(path, includes)?;
+
+    let output_path = web_output_path(path, output);
+    if let Some(parent) = output_path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("creating output directory {}: {e}", parent.display()))?;
+        }
+    }
+    std::fs::write(&output_path, &archive_bytes)
+        .map_err(|e| format!("writing {}: {e}", output_path.display()))?;
+
+    eprintln!(
+        "Built web archive: {} ({} bytes, {} imports bundled)",
+        output_path.display(),
+        archive_bytes.len(),
+        import_count
+    );
+    eprintln!(
+        "  Load with <script type=\"text/sema\" src=\"{}\"></script>",
+        output_path.display()
+    );
 
     Ok(())
 }
@@ -3009,6 +3336,107 @@ pub(crate) fn print_error(e: &SemaError) {
     }
 }
 
+fn run_doc(
+    command: Option<DocCommands>,
+    symbol: Option<String>,
+    pager: docs::PagerMode,
+) -> Result<(), String> {
+    match command {
+        Some(DocCommands::Show { symbol }) => show_doc(&symbol, pager),
+        Some(DocCommands::Search { query, limit }) => {
+            let query = query.join(" ");
+            let query = query.trim().to_string();
+            if query.is_empty() {
+                return Err("usage: sema doc search <query>".to_string());
+            }
+            let rendered =
+                docs::render_search_results(&query, &docs::doc_search_results(&query, limit));
+            docs::print_rendered(&rendered, pager).map_err(|e| format!("writing docs: {e}"))
+        }
+        Some(DocCommands::Apropos { pattern }) => {
+            let hits = docs::builtin_apropos_hits(&pattern);
+            let rendered = docs::render_apropos_hits(&pattern, &hits);
+            docs::print_rendered(&rendered, pager).map_err(|e| format!("writing docs: {e}"))
+        }
+        None => {
+            let Some(symbol) = symbol else {
+                return Err("usage: sema doc <symbol> | sema doc search <query> | sema doc apropos <pattern>".to_string());
+            };
+            show_doc(&symbol, pager)
+        }
+    }
+}
+
+fn show_doc(symbol: &str, pager: docs::PagerMode) -> Result<(), String> {
+    let Some(rendered) = docs::rendered_doc(symbol) else {
+        return Err(format!("documentation not found: {symbol}"));
+    };
+    docs::print_rendered(&rendered, pager).map_err(|e| format!("writing docs: {e}"))
+}
+
+fn generate_completions(shell: Shell) -> String {
+    let mut buf = Vec::new();
+    clap_complete::generate(shell, &mut Cli::command(), "sema", &mut buf);
+    let mut out = String::from_utf8(buf).expect("clap completion output is utf-8");
+    out.push_str(dynamic_doc_completion_script(shell));
+    out
+}
+
+fn dynamic_doc_completion_script(shell: Shell) -> &'static str {
+    match shell {
+        Shell::Bash => {
+            r#"
+
+# Dynamic Sema doc symbol completion.
+_sema_doc_complete() {
+    local cur="${COMP_WORDS[COMP_CWORD]}"
+    if [[ ${COMP_WORDS[1]} == doc && ${COMP_CWORD} -eq 2 ]]; then
+        COMPREPLY=( $(compgen -W "$(sema __complete-doc-symbols "$cur")" -- "$cur") )
+        return
+    fi
+    if [[ ${COMP_WORDS[1]} == doc && ${COMP_WORDS[2]} == show && ${COMP_CWORD} -eq 3 ]]; then
+        COMPREPLY=( $(compgen -W "$(sema __complete-doc-symbols "$cur")" -- "$cur") )
+        return
+    fi
+    _sema "$@"
+}
+complete -o nosort -o bashdefault -o default -F _sema_doc_complete sema
+"#
+        }
+        Shell::Zsh => {
+            r#"
+
+# Dynamic Sema doc symbol completion.
+_sema_doc_complete() {
+  if (( CURRENT == 3 )) && [[ "${words[2]}" == "doc" ]]; then
+    local -a matches
+    matches=("${(@f)$(sema __complete-doc-symbols "${words[CURRENT]}")}")
+    _describe 'Sema doc symbol' matches
+    return
+  fi
+  if (( CURRENT == 4 )) && [[ "${words[2]}" == "doc" && "${words[3]}" == "show" ]]; then
+    local -a matches
+    matches=("${(@f)$(sema __complete-doc-symbols "${words[CURRENT]}")}")
+    _describe 'Sema doc symbol' matches
+    return
+  fi
+  _sema "$@"
+}
+compdef _sema_doc_complete sema
+"#
+        }
+        Shell::Fish => {
+            r#"
+
+# Dynamic Sema doc symbol completion.
+complete -c sema -n '__fish_seen_subcommand_from doc; and not __fish_seen_subcommand_from show search apropos' -a '(sema __complete-doc-symbols (commandline -ct))'
+complete -c sema -n '__fish_seen_subcommand_from doc show' -a '(sema __complete-doc-symbols (commandline -ct))'
+"#
+        }
+        _ => "",
+    }
+}
+
 fn install_completions(shell: Shell) {
     let home = match std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")) {
         Ok(h) => PathBuf::from(h),
@@ -3043,9 +3471,8 @@ fn install_completions(shell: Shell) {
         });
     }
 
-    let mut buf = Vec::new();
-    clap_complete::generate(shell, &mut Cli::command(), "sema", &mut buf);
-    std::fs::write(&path, &buf).unwrap_or_else(|e| {
+    let completions = generate_completions(shell);
+    std::fs::write(&path, completions).unwrap_or_else(|e| {
         eprintln!("Error writing {}: {e}", path.display());
         std::process::exit(1);
     });
@@ -3053,5 +3480,80 @@ fn install_completions(shell: Shell) {
     println!("✓ Installed {shell} completions to {}", path.display());
     if shell == Shell::Zsh {
         println!("  Add to ~/.zshrc (before compinit): fpath=(~/.zsh/completions $fpath)");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{compile_source_to_bytecode, run_bytecode_bytes};
+    use sema_core::{intern, NativeFn, Sandbox, Value};
+    use sema_eval::Interpreter;
+
+    #[test]
+    fn web_build_prelude_expands_defcomponent_into_callable_global() {
+        let source = r##"
+            (defcomponent counter-view ()
+              [:div "ok"])
+            (mount! "#app" counter-view)
+        "##;
+
+        let bytes = compile_source_to_bytecode(source).expect("compile should succeed");
+
+        let interp = Interpreter::new_with_sandbox(&Sandbox::allow_all());
+        interp.global_env.set(
+            intern("component/mount!"),
+            Value::native_fn(NativeFn::simple("component/mount!", |_args| {
+                Ok(Value::nil())
+            })),
+        );
+
+        run_bytecode_bytes(&interp, &bytes).expect("compiled program should execute");
+
+        let counter_view = interp
+            .global_env
+            .get(intern("counter-view"))
+            .expect("defcomponent should define counter-view");
+        let rendered = sema_eval::call_value(&interp.ctx, &counter_view, &[])
+            .expect("counter-view should be callable");
+
+        assert!(!rendered.is_nil(), "component should return SIP markup");
+    }
+
+    #[test]
+    fn web_build_prelude_expands_reactive_macros() {
+        let source = r#"
+            (def doubled (computed 42))
+            (def batched (batch 1 2 3))
+        "#;
+
+        let bytes = compile_source_to_bytecode(source).expect("compile should succeed");
+
+        let interp = Interpreter::new_with_sandbox(&Sandbox::allow_all());
+        interp.global_env.set(
+            intern("__state/computed-create"),
+            Value::native_fn(NativeFn::simple("__state/computed-create", |args| {
+                Ok(Value::string("computed-ok"))
+            })),
+        );
+        interp.global_env.set(
+            intern("__state/batch-run"),
+            Value::native_fn(NativeFn::simple("__state/batch-run", |args| {
+                Ok(Value::string("batch-ok"))
+            })),
+        );
+
+        run_bytecode_bytes(&interp, &bytes).expect("compiled program should execute");
+
+        let doubled = interp
+            .global_env
+            .get(intern("doubled"))
+            .expect("computed should define doubled");
+        let batched = interp
+            .global_env
+            .get(intern("batched"))
+            .expect("batch should define batched");
+
+        assert_eq!(doubled, Value::string("computed-ok"));
+        assert_eq!(batched, Value::string("batch-ok"));
     }
 }

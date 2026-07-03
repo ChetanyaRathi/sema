@@ -292,6 +292,85 @@ eval_tests! {
 }
 
 // ============================================================
+// Host/app primitives — path safety, config dir, terminal control
+// (the missing pieces for self-hosted TUI apps like Sema Coder)
+// ============================================================
+
+eval_tests! {
+    // path/relative-to is pure path math (no fs).
+    path_relative_to_descendant: r#"(path/relative-to "/a/b" "/a/b/c/d")"# => Value::string("c/d"),
+    path_relative_to_sibling: r#"(path/relative-to "/a/b/c" "/a/x")"# => Value::string("../../x"),
+    path_relative_to_same: r#"(path/relative-to "/a/b" "/a/b")"# => Value::string("."),
+    // path/within? — containment after resolving `.`/`..` (lexical for non-existent paths).
+    path_within_descendant: r#"(path/within? "/a/b" "/a/b/c")"# => Value::bool(true),
+    path_within_self: r#"(path/within? "/a/b" "/a/b")"# => Value::bool(true),
+    path_within_escape: r#"(path/within? "/a/b" "/a/x")"# => Value::bool(false),
+    path_within_traversal_escape: r#"(path/within? "/a/b" "/a/b/../x")"# => Value::bool(false),
+    // sys/config-dir always yields a non-empty path string.
+    config_dir_is_string: "(string? (sys/config-dir))" => Value::bool(true),
+    // Terminal control sequences return nil (their effect is the bytes on stdout).
+    term_move_to_returns_nil: "(term/move-to 1 1)" => Value::nil(),
+    term_flush_returns_nil: "(term/flush)" => Value::nil(),
+    term_set_title_returns_nil: r#"(term/set-title "x")"# => Value::nil(),
+    // term/strip removes full CSI/OSC sequences, not just SGR (`…m`). A cursor
+    // move or OSC title must not swallow the visible text that follows it.
+    term_strip_sgr: r#"(term/strip "\x1b;[31mred\x1b;[0m")"# => Value::string("red"),
+    term_strip_cursor_move: r#"(term/strip "x\x1b;[10;5Hy")"# => Value::string("xy"),
+    term_strip_osc_title: r#"(term/strip "\x1b;]0;title\x07;after")"# => Value::string("after"),
+    term_strip_plain: r#"(term/strip "plain")"# => Value::string("plain"),
+    // string/width — terminal display columns (wide chars = 2, ANSI = 0).
+    string_width_ascii: r#"(string/width "hello")"# => Value::int(5),
+    string_width_cjk: r#"(string/width "日本語")"# => Value::int(6),
+    string_width_emoji: r#"(string/width "👋")"# => Value::int(2),
+    string_width_ignores_ansi: r#"(string/width (term/rgb "hi" 1 2 3))"# => Value::int(2),
+    // string/wrap — width-aware word wrapping to a list of lines.
+    string_wrap_words: r#"(string/word-wrap "the quick brown fox" 10)"# => common::eval(r#"'("the quick" "brown fox")"#),
+    string_wrap_hard_break: r#"(string/word-wrap "abcdefghij k" 5)"# => common::eval(r#"'("abcde" "fghij" "k")"#),
+    string_wrap_keeps_newlines: r#"(string/word-wrap "a\nb" 10)"# => common::eval(r#"'("a" "b")"#),
+    // Terminal setup/teardown guard macros return the body value and re-raise
+    // after restoring (teardown always runs — the emitted escapes go to stdout).
+    guard_alt_screen_returns_body: "(term/with-alt-screen 1 2 3)" => Value::int(3),
+    guard_raw_mode_returns_body: "(io/with-raw-mode 42)" => Value::int(42),
+    guard_mouse_returns_body: "(term/with-mouse 7)" => Value::int(7),
+    guard_reraises_after_teardown: r#"(try (term/with-alt-screen (error "x")) (catch e "caught"))"# => Value::string("caught"),
+    // string->bytevector: intuitive alias for string->utf8 (UTF-8 encode).
+    string_to_bytevector_alias: r#"(bytevector->string (string->bytevector "héllo"))"# => Value::string("héllo"),
+    // sema/check-string classifies a wrapped reader error as :syntax with a :span
+    // (regression: the error was being wrapped, dropping the code + span).
+    check_string_syntax_code: r#"(:code (car (:diagnostics (sema/check-string "(+ 1 2"))))"# => Value::string("syntax"),
+    check_string_has_span: r#"(map? (:span (car (:diagnostics (sema/check-string "(+ 1 2")))))"# => Value::bool(true),
+}
+
+// ============================================================
+// Agent/TUI host primitives — wave 2 (diff, secret, reflect,
+// archive, markup). Process/event/git/fs need a live OS handle and
+// are covered by the modules' own unit tests.
+// ============================================================
+
+eval_tests! {
+    // diff round-trips: applying the unified diff reconstructs `new`.
+    diff_apply_roundtrip: "(diff/apply \"a\\nb\\n\" (diff/unified \"a\\nb\\n\" \"a\\nc\\n\"))" => Value::string("a\nc\n"),
+    diff_stat_added: "(:added (diff/stat (diff/unified \"a\\n\" \"a\\nb\\n\")))" => Value::int(1),
+    // reflection
+    read_all_count: r#"(length (read/all "(a) (b) (c)"))"# => Value::int(3),
+    format_form_tidies: r#"(format/form (read/string "(define  x   1)"))"# => Value::string("(define x 1)"),
+    check_string_ok: r#"(:ok (sema/check-string "(+ 1 2)"))"# => Value::bool(true),
+    check_string_bad: r#"(:ok (sema/check-string "(+ 1 2"))"# => Value::bool(false),
+    // secrets
+    secret_redact_hides: r#"(string/contains? (secret/redact "k AKIAIOSFODNN7EXAMPLE") "redacted")"# => Value::bool(true),
+    // archive: gzip is a lossless round-trip
+    gzip_roundtrip_len: r#"(bytevector-length (gzip/decompress (gzip/compress "hello")))"# => Value::int(5),
+    // markup
+    markdown_h1: r##"(string/contains? (markdown/to-html "# Hi") "<h1>")"## => Value::bool(true),
+    html_text_strips_tags: r#"(html/text "<p>Hello <b>world</b></p>")"# => Value::string("Hello world"),
+    // Regressions from the wave-2 quality pass:
+    // overlapping redact spans must not panic (drops the overlapping one).
+    redact_spans_overlap_safe: r#"(redact/spans "0123456789" (list {:start 3 :end 6} {:start 0 :end 4}))"# => Value::string("\u{ab}redacted\u{bb}456789"),
+    // diff/stat counts a removed content line that renders as "---", not as a header.
+    diff_stat_content_dashes: r#"(:removed (diff/stat (diff/unified "keep\n--\n" "keep\n")))"# => Value::int(1),
+}
+
+// ============================================================
 // Debug helpers
 // ============================================================
 
@@ -1574,4 +1653,153 @@ eval_tests! {
     math_format_fixed: r#"(math/format-fixed 1.2 3)"# => Value::string("1.200"),
     string_lines_count: r#"(length (string/lines "a\nb\r\nc\n"))"# => Value::int(3),
     string_lines_first: r#"(first (string/lines "x\ny"))"# => Value::string("x"),
+}
+
+// ============================================================
+// Cycle collector (CORE-2, ADR #66): gc/collect + gc/stats and the
+// plan §6-M3 adversarial shapes. Exact reclaim COUNTS are the trace
+// model's business (unit-tested in sema-core::cycle and sized by
+// leak_test.rs); these pin the semantic contract — garbage cycles
+// are reclaimed, live closures are never severed by a collection.
+// ============================================================
+
+eval_tests! {
+    gc_collect_returns_stats_map: "(map? (gc/collect))" => Value::bool(true),
+    gc_stats_has_registry_size: "(integer? (:registry-size (gc/stats)))" => Value::bool(true),
+    // Direct self-recursion (shape U): the churned closure's cell⇄closure
+    // cycle is unreachable after the call and must be reclaimed.
+    gc_self_recursive_local_collected: "(begin
+        (define (churn)
+          (define (loop n) (if (<= n 0) 0 (loop (- n 1))))
+          (loop 3))
+        (churn)
+        (> (:collected (gc/collect)) 0))" => Value::bool(true),
+    // Mutual local recursion: two cells, neither a self-capture — the shape
+    // that defeats any weak-self-edge scheme (plan §4 option E).
+    gc_mutual_local_recursion_collected: "(begin
+        (define (churn)
+          (define (ev? n) (if (<= n 0) true (od? (- n 1))))
+          (define (od? n) (if (<= n 0) false (ev? (- n 1))))
+          (ev? 4))
+        (churn)
+        (> (:collected (gc/collect)) 0))" => Value::bool(true),
+    // set!-through-cell cycle: the back-edge is written after creation.
+    gc_set_cell_cycle_collected: "(begin
+        (define (churn)
+          (define box nil)
+          (define (grab) box)
+          (set! box grab)
+          nil)
+        (churn)
+        (> (:collected (gc/collect)) 0))" => Value::bool(true),
+    // Live-closure guard: collecting mid-workload in a loop must never sever
+    // a reachable closure's cells — the recursive local closure keeps working
+    // across every pass (external strong counts protect it by construction).
+    gc_live_closure_never_severed: "(begin
+        (define (check n)
+          (define (fact k) (if (<= k 1) 1 (* k (fact (- k 1)))))
+          (if (<= n 0)
+              (fact 10)
+              (begin (gc/collect)
+                     (assert (= (fact 5) 120) \"live closure severed\")
+                     (check (- n 1)))))
+        (check 20))" => Value::int(3628800),
+    // A live mutual pair also survives collection (cells stay intact).
+    gc_live_mutual_pair_survives: "(begin
+        (define (make)
+          (define (ev? n) (if (<= n 0) true (od? (- n 1))))
+          (define (od? n) (if (<= n 0) false (ev? (- n 1))))
+          ev?)
+        (define keep (make))
+        (gc/collect)
+        (keep 7))" => Value::bool(false),
+}
+
+// ============================================================
+// Prelude macro-name collisions
+// (docs/bugs/prelude-macro-names-collide-with-user-defines.md)
+// ============================================================
+// Macro expansion rewrites ANY list whose head names a macro — define-sugar
+// heads included — and local defines cannot shadow a macro at call sites.
+// These pin (a) that the nested define-with-`let` shapes compile fine with a
+// non-colliding name (no lowering/resolution bug hides here), and (b) the
+// collision itself, so the write-up stays honest until the expander gains
+// binding-position awareness or scope-aware shadowing.
+
+eval_tests! {
+    nested_define_with_let_body_in_lambda: "(begin
+        (define (outer a) (fn () (define (stp n) (let ((v 1)) v)) (stp 3)))
+        ((outer 1)))" => Value::int(1),
+    nested_define_with_let_body_direct: "(begin
+        (define (outer a) (define (stp n) (let ((v 1)) v)) (stp 3))
+        (outer 1))" => Value::int(1),
+}
+
+eval_error_tests! {
+    // `step` is the prelude workflow macro; its expansion (a `let` template)
+    // lands in the define head, so define sugar sees no symbol.
+    prelude_macro_name_in_define_sugar_head_errors:
+        "(define (step n) n)" => "define: expected a symbol",
+}
+
+// ============================================================
+// Self-tail-call optimization (issue #62)
+//
+// Self-recursive named-let / letrec loops whose name is referenced only in
+// tail-call position compile to SelfTailCall with the self upvalue elided.
+// These pin end-to-end correctness — especially the upvalue-index remap when
+// the self upvalue is dropped from a lambda that also captures outer variables.
+// ============================================================
+
+eval_tests! {
+    // Pure counter — loop captures nothing (0 upvalues after the opt).
+    stc_counter: "(let loop ((n 5)) (if (= n 0) n (loop (- n 1))))" => Value::int(0),
+    // Accumulator — still self-only.
+    stc_accumulator: "(let loop ((n 5) (acc 0)) (if (= n 0) acc (loop (- n 1) (+ acc n))))" => Value::int(15),
+    // Deep recursion proves the SelfTailCall reuses the frame (no stack growth).
+    stc_deep_tco: "(let loop ((n 1000000) (acc 0)) (if (= n 0) acc (loop (- n 1) (+ acc 1))))" => Value::int(1000000),
+
+    // Captures an outer var referenced AFTER the self-call → self upvalue is the
+    // high index, so dropping it needs no remap. c is captured (uv0), self (uv1).
+    stc_capture_no_shift:
+        "(let ((c 100)) (let loop ((n 5) (acc 0)) (if (= n 0) (+ acc c) (loop (- n 1) (+ acc c)))))" => Value::int(600),
+    // Captures an outer var referenced BEFORE the self-call → self upvalue is
+    // index 0, so dropping it shifts c from uv1 down to uv0. THE KEY REMAP CASE.
+    stc_capture_remap_one:
+        "(let ((c 100)) (let loop ((n 5)) (if (> n 0) (loop (- n 1)) c)))" => Value::int(100),
+    // Self before TWO captured vars → dropping self shifts both a and b down.
+    stc_capture_remap_two:
+        "(let ((a 10) (b 20)) (let loop ((n 2)) (if (> n 0) (loop (- n 1)) (+ a b))))" => Value::int(30),
+
+    // Self-recursion coexisting with a cross-reference (g) in the same lambda:
+    // only the self upvalue is elided; g stays a real upvalue. Self after g.
+    stc_self_and_crossref_no_shift:
+        "(letrec ((f (lambda (n acc) (if (= n 0) (g acc) (f (- n 1) (+ acc 1))))) (g (lambda (x) (* x 2)))) (f 5 0))" => Value::int(10),
+    // Same, but self is captured before g → g's upvalue index shifts on removal.
+    stc_self_and_crossref_shift:
+        "(letrec ((f (lambda (n acc) (if (> n 0) (f (- n 1) (+ acc 1)) (g acc)))) (g (lambda (x) (* x 2)))) (f 5 0))" => Value::int(10),
+
+    // Rest-param self-tail-call exercises the has_rest path in self_tail_call.
+    stc_rest_param:
+        "(letrec ((f (lambda (n . acc) (if (= n 0) acc (f (- n 1) n))))) (f 3))" => Value::list(vec![Value::int(1)]),
+
+    // Nested named-lets — both loops optimize independently.
+    stc_nested_named_lets:
+        "(let loop ((i 3) (sum 0)) (if (= i 0) sum (loop (- i 1) (+ sum (let inner ((j i) (p 0)) (if (= j 0) p (inner (- j 1) (+ p 1))))))))" => Value::int(6),
+
+    // Shadowing: an inner `let` rebinds `loop`; the outer self-call still
+    // optimizes because the shadow resolves to a local, not the self upvalue.
+    stc_shadowed_loop_name:
+        "(let loop ((n 2)) (if (= n 0) (let ((loop 99)) loop) (loop (- n 1))))" => Value::int(99),
+
+    // Escape: the loop name is consed into a list (used as a value), so the opt
+    // is disabled and the real self-capture is retained — result must be right.
+    stc_escape_as_value:
+        "(let loop ((n 3) (acc '())) (if (= n 0) (length acc) (loop (- n 1) (cons loop acc))))" => Value::int(3),
+}
+
+eval_error_tests! {
+    // A self-call with the wrong argument count still reports an arity error
+    // (the SelfTailCall opcode arity-checks against the loop lambda).
+    stc_wrong_arity: "(let loop ((a 1) (b 2)) (loop 1))" => "loop",
 }

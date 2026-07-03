@@ -4704,6 +4704,51 @@ fn sema_cmd() -> std::process::Command {
     std::process::Command::new(env!("CARGO_BIN_EXE_sema"))
 }
 
+/// End-to-end: `otel/configure` from Sema code (no env vars) turns tracing on and a
+/// user span is written to the configured JSONL file. Runs in a fresh subprocess so the
+/// global-provider guard is clean.
+#[test]
+fn test_otel_configure_from_sema_writes_spans() {
+    let path = std::env::temp_dir().join(format!(
+        "sema-otel-configure-e2e-{}.jsonl",
+        std::process::id()
+    ));
+    let path_str = path.to_str().unwrap().to_string();
+    let _ = std::fs::remove_file(&path);
+
+    let script = format!(
+        r#"(let ((on (otel/configure {{:file "{}" :service-name "e2e"}})))
+             (otel/span "from-sema" (fn () 42))
+             (println on))"#,
+        path_str.replace('\\', "\\\\")
+    );
+
+    let output = sema_cmd()
+        .env_remove("SEMA_OTEL_FILE")
+        .env_remove("OTEL_EXPORTER_OTLP_ENDPOINT")
+        .args(["-e", &script])
+        .output()
+        .expect("failed to run sema");
+
+    assert!(
+        output.status.success(),
+        "sema exited non-zero: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("#t"),
+        "otel/configure should return true when it installs a provider, got: {stdout}"
+    );
+
+    let contents = std::fs::read_to_string(&path).expect("jsonl trace file should exist");
+    let _ = std::fs::remove_file(&path);
+    assert!(
+        contents.contains("\"from-sema\""),
+        "expected the user span in the trace file, got:\n{contents}"
+    );
+}
+
 #[test]
 fn test_cli_provider_flag_sets_default_provider() {
     let output = sema_cmd()
@@ -12537,6 +12582,128 @@ fn test_sema_build_with_imports() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// `sema build` must embed + resolve imports written with weird path spellings
+/// (`./x/../x`, climbing subdirs then back to root) AND unicode module names —
+/// once the source is gone, only the embedded archive can satisfy them.
+#[test]
+fn test_sema_build_weird_and_unicode_imports_embedded() {
+    let dir = build_test_dir("weird-unicode");
+    std::fs::create_dir_all(dir.join("a/b/c")).unwrap();
+    std::fs::create_dir_all(dir.join("lïb-café")).unwrap();
+
+    // A deep chain where every hop uses a weird relative spelling.
+    std::fs::write(
+        dir.join("top.sema"),
+        "(module top (export tv) (define tv 100))",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("a/b/c/m3.sema"),
+        r#"(module m3 (export tv) (import "../../../top.sema"))"#,
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("a/b/m2.sema"),
+        r#"(module m2 (export tv) (import "./c/../c/m3.sema"))"#,
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("a/m1.sema"),
+        r#"(module m1 (export tv) (import "../a/./b/m2.sema"))"#,
+    )
+    .unwrap();
+    // A unicode module dir + a weird spelling of it.
+    std::fs::write(
+        dir.join("lïb-café/µtil.sema"),
+        "(module u (export uv) (define uv 42))",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("app.sema"),
+        "(import \"././a/m1.sema\")\n\
+         (import \"./lïb-café/../lïb-café/µtil.sema\")\n\
+         (println (+ tv uv))\n",
+    )
+    .unwrap();
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_sema"))
+        .args([
+            "build",
+            dir.join("app.sema").to_str().unwrap(),
+            "-o",
+            dir.join("app").to_str().unwrap(),
+        ])
+        .output()
+        .expect("failed to run sema build");
+    assert!(
+        output.status.success(),
+        "sema build failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Remove every source so resolution can only come from the embedded archive.
+    std::fs::remove_dir_all(dir.join("a")).unwrap();
+    std::fs::remove_dir_all(dir.join("lïb-café")).unwrap();
+    std::fs::remove_file(dir.join("top.sema")).unwrap();
+    std::fs::remove_file(dir.join("app.sema")).unwrap();
+
+    let run = std::process::Command::new(dir.join("app"))
+        .output()
+        .expect("failed to run bundled executable");
+    assert!(
+        run.status.success(),
+        "bundled executable failed: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&run.stdout).trim(), "142");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `sema compile` produces a `.semac` whose imports resolve from the filesystem
+/// at runtime. Weird spellings + unicode paths must resolve there too.
+#[test]
+fn test_compile_multifile_imports_resolve_from_fs() {
+    let dir = build_test_dir("compile-mf");
+    std::fs::create_dir_all(dir.join("lïb")).unwrap();
+    std::fs::write(
+        dir.join("lïb/µtil.sema"),
+        "(module u (export answer) (define answer 42))",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("app.sema"),
+        "(import \"./lïb/../lïb/µtil.sema\")\n(println answer)\n",
+    )
+    .unwrap();
+
+    let compiled = std::process::Command::new(env!("CARGO_BIN_EXE_sema"))
+        .args(["compile", dir.join("app.sema").to_str().unwrap()])
+        .output()
+        .expect("failed to run sema compile");
+    assert!(
+        compiled.status.success(),
+        "sema compile failed: {}",
+        String::from_utf8_lossy(&compiled.stderr)
+    );
+
+    // Run the .semac from its directory; the (still-present) source imports
+    // resolve from the filesystem.
+    let run = std::process::Command::new(env!("CARGO_BIN_EXE_sema"))
+        .current_dir(&dir)
+        .arg("app.semac")
+        .output()
+        .expect("failed to run .semac");
+    assert!(
+        run.status.success(),
+        "running .semac failed: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&run.stdout).trim(), "42");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn test_sema_build_with_include() {
     let dir = build_test_dir("include");
@@ -13494,7 +13661,122 @@ fn test_package_imports() {
     .unwrap();
 }
 
+// ── sema completions (shell completion generation) ────────────────
+
+#[test]
+fn test_completions_all_shells_generate_without_panic() {
+    // Regression guard: a hidden `__complete-doc-symbols` clap subcommand once
+    // made clap_complete's bash generator panic. Every shell must generate a
+    // non-empty script and exit 0.
+    for shell in ["bash", "zsh", "fish", "powershell", "elvish"] {
+        let output = sema_cmd()
+            .args(["completions", shell])
+            .output()
+            .expect("failed to run sema completions");
+        assert!(
+            output.status.success(),
+            "sema completions {shell} did not exit 0; stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            !output.stdout.is_empty(),
+            "sema completions {shell} produced no script"
+        );
+    }
+}
+
+#[test]
+fn test_completions_bash_zsh_fish_wire_dynamic_doc_hook() {
+    // The interactive shells must include the dynamic doc-symbol hook that calls
+    // back into `sema __complete-doc-symbols`; bash must also define the wrapper.
+    for shell in ["bash", "zsh", "fish"] {
+        let output = sema_cmd()
+            .args(["completions", shell])
+            .output()
+            .expect("failed to run sema completions");
+        let script = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            script.contains("__complete-doc-symbols"),
+            "{shell} completion missing dynamic doc-symbol hook"
+        );
+    }
+    let bash = sema_cmd().args(["completions", "bash"]).output().unwrap();
+    let bash = String::from_utf8_lossy(&bash.stdout);
+    assert!(
+        bash.contains("_sema_doc_complete"),
+        "bash completion missing the doc-completion wrapper function"
+    );
+}
+
 // ── sema eval subcommand ──────────────────────────────────────────
+
+#[test]
+fn test_doc_show_builtin() {
+    let output = sema_cmd()
+        .args(["doc", "string/split"])
+        .output()
+        .expect("failed to run sema doc");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("string/split"), "stdout: {stdout}");
+    assert!(
+        stdout.contains("Split a string by a literal delimiter"),
+        "stdout: {stdout}"
+    );
+}
+
+#[test]
+fn test_doc_search_finds_builtin() {
+    let output = sema_cmd()
+        .args(["doc", "search", "split", "a", "string"])
+        .output()
+        .expect("failed to run sema doc search");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("string/split"), "stdout: {stdout}");
+}
+
+#[test]
+fn test_doc_apropos_finds_name_matches() {
+    let output = sema_cmd()
+        .args(["doc", "apropos", "string/spl"])
+        .output()
+        .expect("failed to run sema doc apropos");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("string/split") || stdout.contains("string-split"),
+        "stdout: {stdout}"
+    );
+}
+
+#[test]
+fn test_complete_doc_symbols_filters_prefix() {
+    let output = sema_cmd()
+        .args(["__complete-doc-symbols", "string/spl"])
+        .output()
+        .expect("failed to run sema __complete-doc-symbols");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.lines().any(|line| line == "string/split"));
+    assert!(!stdout.lines().any(|line| line == "map"));
+}
 
 #[test]
 fn test_eval_expr_json() {

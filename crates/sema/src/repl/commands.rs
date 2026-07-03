@@ -3,9 +3,7 @@ use std::collections::HashSet;
 use sema_core::{pretty_print, Env, Spur, ValueView};
 use sema_eval::{Interpreter, SPECIAL_FORM_NAMES};
 
-use crate::{colors, print_error, LAST_FILE, LAST_SOURCE};
-
-use super::highlighter::highlight_doc_markdown;
+use crate::{colors, docs, print_error, LAST_FILE, LAST_SOURCE};
 
 pub const REPL_COMMANDS: &[&str] = &[
     ",quit",
@@ -15,6 +13,7 @@ pub const REPL_COMMANDS: &[&str] = &[
     ",h",
     ",env",
     ",builtins",
+    ",gc",
     ",type",
     ",time",
     ",doc",
@@ -54,6 +53,10 @@ pub fn dispatch(
         }
         ",builtins" => {
             print_builtins(interpreter);
+            return CommandOutcome::Handled;
+        }
+        ",gc" => {
+            run_gc(interpreter);
             return CommandOutcome::Handled;
         }
         _ => {}
@@ -134,19 +137,36 @@ pub fn dispatch(
     CommandOutcome::Passthrough
 }
 
+/// `,gc` — run a full cycle collection (CORE-2) and print its stats plus the
+/// remaining candidate-registry size. Same pass as the `(gc/collect)` builtin,
+/// pinned to skip descent into the live REPL namespace.
+fn run_gc(interpreter: &Interpreter) {
+    let pins = sema_core::gc_env_chain_pins(&interpreter.global_env);
+    let stats = sema_core::gc_collect(&pins, sema_core::GcTrigger::Explicit);
+    if stats.aborted {
+        println!("gc: pass aborted (cell borrowed or collection already running)");
+        return;
+    }
+    println!(
+        "gc: collected {} of {} traced ({} candidates, {} registry entries pruned)",
+        stats.collected, stats.traced, stats.candidates, stats.pruned
+    );
+    println!(
+        "{}",
+        colors::dim(&format!(
+            "    registry: {} live candidates",
+            sema_core::gc_registry_len()
+        ))
+    );
+}
+
 fn record_source(expr: &str) {
     LAST_SOURCE.with(|s| *s.borrow_mut() = Some(expr.to_string()));
     LAST_FILE.with(|f| *f.borrow_mut() = None);
 }
 
-fn print_doc_entry(e: &sema_docs::DocEntry) {
-    let md = sema_lsp::builtin_docs::render_markdown(e);
-    println!("{}", highlight_doc_markdown(&md));
-}
-
 fn doc(env: &Env, name: &str) {
     let spur = sema_core::intern(name);
-    let builtin_docs = sema_lsp::builtin_docs::BuiltinDocs::load();
     match env.get(spur) {
         Some(val) => {
             // VM closures arrive wrapped as NativeFn — peel that first so we
@@ -165,9 +185,10 @@ fn doc(env: &Env, name: &str) {
             } else {
                 match val.view() {
                     ValueView::NativeFn(_f) => {
-                        println!("  {} {} native-fn", colors::cyan(name), colors::dim(":"),);
-                        if let Some(e) = builtin_docs.get(name) {
-                            print_doc_entry(e);
+                        if let Some(rendered) = docs::rendered_doc(name) {
+                            print!("{rendered}");
+                        } else {
+                            println!("  {} {} native-fn", colors::cyan(name), colors::dim(":"));
                         }
                     }
                     ValueView::Lambda(l) => {
@@ -198,14 +219,14 @@ fn doc(env: &Env, name: &str) {
             }
         }
         None => {
-            if SPECIAL_FORM_NAMES.contains(&name) {
-                println!("  {} {} special form", colors::cyan(name), colors::dim(":"));
-                if let Some(e) = builtin_docs.get(name) {
-                    print_doc_entry(e);
+            if let Some(entry) = docs::lookup(name) {
+                print!("{}", docs::rendered_doc_entry(name, entry));
+            } else if SPECIAL_FORM_NAMES.contains(&name) {
+                if let Some(rendered) = docs::rendered_doc(name) {
+                    print!("{rendered}");
+                } else {
+                    eprintln!("  {} {name}", colors::red_bold("not found:"));
                 }
-            } else if let Some(e) = builtin_docs.get(name) {
-                println!("  {} {} builtin", colors::cyan(name), colors::dim(":"));
-                print_doc_entry(e);
             } else {
                 eprintln!("  {} {name}", colors::red_bold("not found:"));
             }
@@ -219,6 +240,7 @@ fn print_help() {
     println!("  ,help / ,h       Show this help");
     println!("  ,env             Show defined variables");
     println!("  ,builtins        List all builtin functions");
+    println!("  ,gc              Run a cycle collection and show its stats");
     println!("  ,type EXPR       Show the type of a value");
     println!("  ,time EXPR       Evaluate and show elapsed time");
     println!("  ,doc NAME        Show info about a binding");

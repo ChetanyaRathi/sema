@@ -109,6 +109,26 @@ eval_tests! {
 }
 
 // ============================================================
+// Prompt introspection + algebra (issue #12)
+// ============================================================
+
+eval_tests! {
+    // diff: added/removed by (role, content)
+    prompt_diff_added_len: r#"(length (:added (prompt/diff (prompt (user "a")) (prompt (user "a") (user "b")))))"# => Value::int(1),
+    prompt_diff_removed_len: r#"(length (:removed (prompt/diff (prompt (user "a") (user "b")) (prompt (user "a")))))"# => Value::int(1),
+    prompt_diff_added_content: r#"(message/content (car (:added (prompt/diff (prompt (user "a")) (prompt (user "b"))))))"# => Value::string("b"),
+    prompt_diff_identical: r#"(length (:added (prompt/diff (prompt (user "a")) (prompt (user "a")))))"# => Value::int(0),
+    // union: concat + dedup
+    prompt_union_count: r#"(length (prompt/messages (prompt/union (prompt (system "s") (user "a")) (prompt (system "s") (user "b")))))"# => Value::int(3),
+    // intersection: present in both
+    prompt_intersection_len: r#"(length (prompt/messages (prompt/intersection (prompt (system "s") (user "a")) (prompt (system "s") (user "b")))))"# => Value::int(1),
+    prompt_intersection_content: r#"(message/content (car (prompt/messages (prompt/intersection (prompt (system "s") (user "a")) (prompt (system "s") (user "b"))))))"# => Value::string("s"),
+    // difference: in a but not b
+    prompt_difference_len: r#"(length (prompt/messages (prompt/difference (prompt (system "s") (user "a")) (prompt (system "s")))))"# => Value::int(1),
+    prompt_difference_content: r#"(message/content (car (prompt/messages (prompt/difference (prompt (system "s") (user "a")) (prompt (system "s"))))))"# => Value::string("a"),
+}
+
+// ============================================================
 // Conversation
 // ============================================================
 
@@ -131,6 +151,40 @@ eval_tests! {
     conv_map_content: r#"(car (conversation/map (conversation/add-message (conversation/new) :user "hello") message/content))"# => Value::string("hello"),
     conv_token_count: r#"(> (conversation/token-count (conversation/add-message (conversation/new {:model "test"}) :user "hello world this is a test")) 0)"# => Value::bool(true),
     conv_token_count_empty: r#"(conversation/token-count (conversation/new))"# => Value::int(0),
+    // ---- inspection (issue #12, Part 3) ----
+    conv_length: r#"(conversation/length (-> (conversation/new) (conversation/add-message :user "a") (conversation/add-message :assistant "b")))"# => Value::int(2),
+    conv_turns: r#"(conversation/turns (-> (conversation/new) (conversation/add-message :user "a") (conversation/add-message :assistant "b")))"# => Value::int(1),
+    conv_turns_zero: r#"(conversation/turns (conversation/new))"# => Value::int(0),
+    conv_models_used: r#"(car (conversation/models-used (conversation/new {:model "gpt-4"})))"# => Value::string("gpt-4"),
+    conv_models_used_empty: r#"(length (conversation/models-used (conversation/new)))"# => Value::int(0),
+    conv_stats_messages: r#"(:messages (conversation/stats (conversation/add-message (conversation/new) :user "hi")))"# => Value::int(1),
+    conv_stats_turns: r#"(:turns (conversation/stats (-> (conversation/new) (conversation/add-message :user "a") (conversation/add-message :assistant "b"))))"# => Value::int(1),
+    conv_stats_cost_nil: r#"(nil? (:cost (conversation/stats (conversation/new {:model "gpt-4"}))))"# => Value::bool(true),
+    conv_stats_tokens_total: r#"(:total (:tokens (conversation/stats (conversation/new))))"# => Value::int(0),
+    // cost reports real billed usage only — nil when nothing has been sent (no estimation)
+    conv_cost_nil: r#"(nil? (conversation/cost (conversation/new {:model "gpt-4"})))"# => Value::bool(true),
+    // ---- surgery (issue #12, Part 3) ----
+    conv_remove_count: r#"(conversation/length (conversation/remove (-> (conversation/new) (conversation/add-message :user "a") (conversation/add-message :assistant "b")) 0))"# => Value::int(1),
+    conv_remove_content: r#"(message/content (car (conversation/messages (conversation/remove (-> (conversation/new) (conversation/add-message :user "a") (conversation/add-message :assistant "b")) 0))))"# => Value::string("b"),
+    conv_insert_count: r#"(conversation/length (conversation/insert (conversation/add-message (conversation/new) :user "a") 0 :system "s"))"# => Value::int(2),
+    conv_insert_append: r#"(message/content (car (conversation/messages (conversation/insert (conversation/new) 0 :user "hi"))))"# => Value::string("hi"),
+    conv_insert_msg_value: r#"(message/role (car (conversation/messages (conversation/insert (conversation/new) 0 (message :system "s")))))"# => Value::keyword("system"),
+    conv_replace_content: r#"(message/content (car (conversation/messages (conversation/replace (conversation/add-message (conversation/new) :user "a") 0 :user "A"))))"# => Value::string("A"),
+    conv_map_role_applied: r#"(car (conversation/map (conversation/map-role (conversation/add-message (conversation/new) :assistant "  y  ") :assistant (fn (m) (message :assistant (string/trim (message/content m))))) message/content))"# => Value::string("y"),
+    conv_map_role_untouched: r#"(car (conversation/map (conversation/map-role (conversation/add-message (conversation/new) :user "keep") :assistant (fn (m) (message :assistant "X"))) message/content))"# => Value::string("keep"),
+    // ---- search (issue #12, Part 3) ----
+    conv_search_count: r#"(length (conversation/search (-> (conversation/new) (conversation/add-message :user "About Lisp") (conversation/add-message :assistant "Lisp rocks")) "lisp"))"# => Value::int(2),
+    conv_search_index: r#"(:index (car (conversation/search (conversation/add-message (conversation/new) :user "hello") "hello")))"# => Value::int(0),
+    conv_search_none: r#"(length (conversation/search (conversation/add-message (conversation/new) :user "hello") "zzz"))"# => Value::int(0),
+    conv_find: r#"(message/content (conversation/find (-> (conversation/new) (conversation/add-message :user "u") (conversation/add-message :assistant "a")) (fn (m) (= (message/role m) :assistant))))"# => Value::string("a"),
+    conv_find_none: r#"(nil? (conversation/find (conversation/new) (fn (m) #t)))"# => Value::bool(true),
+}
+
+eval_error_tests! {
+    conv_remove_oob: r#"(conversation/remove (conversation/new) 0)"#,
+    conv_replace_oob: r#"(conversation/replace (conversation/new) 5 :user "x")"#,
+    conv_insert_oob: r#"(conversation/insert (conversation/new) 5 :user "x")"#,
+    conv_map_role_bad_role: r#"(conversation/map-role (conversation/new) :nope (fn (m) m))"#,
 }
 
 // ============================================================

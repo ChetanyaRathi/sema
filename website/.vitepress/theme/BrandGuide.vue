@@ -213,6 +213,16 @@ const copyIcon = (key) => {
                 operations, active lines, and key indicators.</p>
             </div>
           </div>
+
+          <div class="name-origin" style="margin-top: 3rem; padding-top: 2.5rem; border-top: 1px solid var(--border); max-width: 760px;">
+            <span class="section-num" style="margin-bottom: 1.25rem;">The Name</span>
+            <p style="font-family: 'Cormorant', Georgia, serif; font-size: 2rem; font-weight: 300; color: var(--text-primary); line-height: 1.3; margin: 0 0 1.15rem 0;">
+              Sema takes its name from Ancient Greek <em style="color: var(--gold); font-style: italic;">sêma</em> <span style="color: var(--text-tertiary);">(σῆμα)</span> — a sign, signal, or token of meaning.
+            </p>
+            <p style="font-family: 'Inter', system-ui, sans-serif; font-size: 1rem; color: var(--text-secondary); line-height: 1.65; max-width: 42rem; margin: 0;">
+              The same root runs through <em>semantics</em>, <em>semaphore</em>, and <em>semiotics</em> — fitting for a language built to carry meaning legibly between humans, machines, and the models that read both.
+            </p>
+          </div>
         </section>
 
         <!-- Logotype Section -->

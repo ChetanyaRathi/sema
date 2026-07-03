@@ -62,7 +62,7 @@ export default defineConfig({
     ['link', { rel: 'icon', type: 'image/svg+xml', href: '/favicon.svg' }],
     ['link', { rel: 'alternate', type: 'text/plain', href: '/llms.txt', title: 'LLM-friendly documentation index' }],
     ['meta', { property: 'og:type', content: 'website' }],
-    ['meta', { property: 'og:title', content: 'Sema — A Lisp with LLM Primitives' }],
+    ['meta', { property: 'og:title', content: 'Sema — Agent-native Lisp for LLM Workflows' }],
     ['meta', { property: 'og:description', content: 'A Scheme-like Lisp where prompts are s-expressions, conversations are persistent data structures, and LLM calls are just another form of evaluation. Implemented in Rust.' }],
     ['meta', { property: 'og:url', content: 'https://sema-lang.com' }],
     ['meta', { property: 'og:image', content: `${SITE}/og/home.${OG_EXT}` }],
@@ -72,7 +72,7 @@ export default defineConfig({
     ['meta', { property: 'og:site_name', content: 'Sema' }],
     ['meta', { name: 'twitter:card', content: 'summary_large_image' }],
     ['meta', { name: 'twitter:image', content: `${SITE}/og/home.${OG_EXT}` }],
-    ['meta', { name: 'twitter:title', content: 'Sema — A Lisp with LLM Primitives' }],
+    ['meta', { name: 'twitter:title', content: 'Sema — Agent-native Lisp for LLM Workflows' }],
     ['meta', { name: 'twitter:description', content: 'A Scheme-like Lisp where prompts are s-expressions, conversations are persistent data structures, and LLM calls are just another form of evaluation.' }],
     ['meta', { name: 'theme-color', content: '#c8a855' }],
     ['link', { rel: 'preconnect', href: 'https://fonts.googleapis.com' }],
@@ -129,7 +129,10 @@ export default defineConfig({
             { text: 'File I/O & Paths', link: '/docs/stdlib/file-io' },
             { text: 'PDF Processing', link: '/docs/stdlib/pdf' },
             { text: 'CSV Parsing', link: '/docs/stdlib/csv' },
-            { text: 'TOML Parsing', link: '/docs/stdlib/toml' }
+            { text: 'TOML Parsing', link: '/docs/stdlib/toml' },
+            { text: 'Archives', link: '/docs/stdlib/archive' },
+            { text: 'Diff & Patch', link: '/docs/stdlib/diff' },
+            { text: 'Markdown & HTML', link: '/docs/stdlib/markup' }
           ]
         },
         {
@@ -145,14 +148,18 @@ export default defineConfig({
           collapsed: true,
           items: [
             { text: 'System', link: '/docs/stdlib/system' },
+            { text: 'Processes & PTYs', link: '/docs/stdlib/process' },
+            { text: 'Git', link: '/docs/stdlib/git' },
             { text: 'SQLite Database', link: '/docs/stdlib/sqlite' },
             { text: 'Key-Value Store', link: '/docs/stdlib/kv-store' },
             { text: 'Serial Ports', link: '/docs/stdlib/serial' },
             { text: 'Regex Engine', link: '/docs/stdlib/regex' },
             { text: 'Crypto & Encoding', link: '/docs/stdlib/crypto' },
+            { text: 'Secrets & Redaction', link: '/docs/stdlib/secret' },
+            { text: 'Reflection & Diagnostics', link: '/docs/stdlib/reflect' },
             { text: 'Date & Time', link: '/docs/stdlib/datetime' },
             { text: 'Context Manager', link: '/docs/stdlib/context' },
-            { text: 'Terminal Styling', link: '/docs/stdlib/terminal' },
+            { text: 'Terminal', link: '/docs/stdlib/terminal' },
             { text: 'Playground & WASM', link: '/docs/stdlib/playground' }
           ]
         },
@@ -230,6 +237,27 @@ export default defineConfig({
             { text: 'Feature Comparison', link: '/docs/internals/feature-comparison' },
             { text: 'Glossary', link: '/docs/internals/glossary' }
           ]
+        },
+        {
+          text: 'Sema Web',
+          items: [
+            { text: 'Overview', link: '/docs/web/' },
+            { text: 'Getting Started', link: '/docs/web/getting-started' },
+            { text: 'Dev Server', link: '/docs/web/dev-server' },
+            { text: 'Building an App', link: '/docs/web/building-apps' },
+            { text: 'Reactive State', link: '/docs/web/reactive-state' },
+            { text: 'Components', link: '/docs/web/components' },
+            { text: 'SIP Markup', link: '/docs/web/sip-markup' },
+            { text: 'DOM API', link: '/docs/web/dom-api' },
+            { text: 'Store', link: '/docs/web/store' },
+            { text: 'Routing', link: '/docs/web/routing' },
+            { text: 'Scoped CSS', link: '/docs/web/css' },
+            { text: 'HTTP & Streams', link: '/docs/web/http' },
+            { text: 'LLM Integration', link: '/docs/web/llm' },
+            { text: 'LLM Proxy', link: '/docs/web/llm-proxy' },
+            { text: 'Deployment', link: '/docs/web/deployment' },
+            { text: 'Examples', link: '/docs/web/examples' },
+          ],
         }
       ],
 

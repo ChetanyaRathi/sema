@@ -371,6 +371,115 @@ fn tool_handler_runs_full_evaluator_with_side_effects() {
     assert_eq!(recorder.call_count(), 2, "tool call round + final answer");
 }
 
+/// CORE-2 mid-agent-loop reclamation (`docs/plans/2026-07-02-core2-gc.md`
+/// §5.2): a long agent run must reclaim BETWEEN tool turns, not only when
+/// the whole eval returns. Turn 1's handler builds 700 garbage
+/// recursive-closure cycles and then churns 3000 dead channels; the channel
+/// births cross the registry-growth threshold inside the handler, so the
+/// data-birth trigger (`register_candidate`) severs the cycles and prunes
+/// the dead entries mid-turn. The turn-boundary `maybe_collect` stays a
+/// threshold-gated backstop that the growth policy keeps quiescent here
+/// (registry-at-rest never exceeds the threshold once births self-collect).
+/// Turn 2's handler observes the outcome as its FIRST action: bounded
+/// registry, a real prune, and an explicit collect that finds no garbage
+/// cycle left. Message correlation must be unchanged by passes running
+/// inside a tool handler. Deterministic — no timing; the fake scripts
+/// every round.
+#[test]
+fn agent_turn_boundary_collects_between_tool_turns() {
+    let fake = FakeProvider::builder("fake")
+        .model("fake-model")
+        .tool_call("call_1", "churn", serde_json::json!({"x": "one"}))
+        .tool_call("call_2", "churn", serde_json::json!({"x": "two"}))
+        .reply("all done")
+        .build();
+
+    let src = r#"
+        (define turn 0)
+        (define probe nil)
+        (define leftover nil)
+        (define (mk-cycle k)
+          (define (r n) (if (<= n 0) k (r (- n 1))))
+          r)
+        (define (spin i)
+          (if (<= i 0) nil (begin (mk-cycle i) (spin (- i 1)))))
+        (define (spam-channels i)
+          (if (<= i 0) nil (begin (channel/new 1) (spam-channels (- i 1)))))
+        (deftool churn "Churn the heap" {:x {:type :string}}
+          (lambda (x)
+            (set! turn (+ turn 1))
+            (if (= turn 1)
+                (begin (spin 700) (spam-channels 3000) "turn-1 done")
+                (begin (set! probe (gc/stats))
+                       (set! leftover (gc/collect))
+                       "turn-2 done"))))
+        (defagent bot {:model "fake-model" :tools [churn] :max-turns 5})
+        (define answer (agent/run bot "go"))
+        (list answer
+              (< (:registry-size probe) 1024)
+              (>= (:pruned probe) 900)
+              (:collected leftover))
+    "#;
+
+    let (result, recorder) = eval_with_fake(src, fake);
+    let val = result.expect("agent run with a churning tool handler should complete");
+    let items = val.as_seq().expect("result list");
+    // The loop completed correctly across the collections...
+    assert_eq!(items[0].as_str(), Some("all done"));
+    // ...and turn 2 observed the mid-turn passes: registry bounded well
+    // under the spam count, the last pass really pruned a dead batch, and
+    // the 700 garbage cycles were already severed before turn 2 started
+    // (the explicit collect has nothing left to reclaim).
+    assert_eq!(
+        items[1],
+        Value::bool(true),
+        "registry must be pruned before turn 2 (probe below 1024)"
+    );
+    assert_eq!(
+        items[2],
+        Value::bool(true),
+        "the last mid-turn pass must have pruned a dead-entry batch"
+    );
+    assert_eq!(
+        items[3],
+        Value::int(0),
+        "all garbage cycles must be reclaimed before turn 2's explicit collect"
+    );
+
+    // Zero behavior change to messages/correlation: 3 provider rounds, each
+    // tool round echoed the assistant tool_calls turn and fed back a
+    // correlated tool result.
+    let reqs = recorder.requests();
+    assert_eq!(reqs.len(), 3, "two tool rounds + the final answer");
+    let round2 = &reqs[1];
+    assert!(
+        round2
+            .messages
+            .iter()
+            .any(|m| m.role == "assistant" && !m.tool_calls.is_empty()),
+        "round 2 must echo the assistant's tool_calls"
+    );
+    assert!(
+        round2
+            .messages
+            .iter()
+            .any(|m| m.tool_call_id.as_deref() == Some("call_1")),
+        "round 2 must include the tool result correlated to call_1"
+    );
+    let round3 = &reqs[2];
+    assert!(
+        round3
+            .messages
+            .iter()
+            .any(|m| m.tool_call_id.as_deref() == Some("call_2")),
+        "round 3 must include the tool result correlated to call_2"
+    );
+    assert!(
+        round3.messages.len() > round2.messages.len(),
+        "history must keep growing across turns"
+    );
+}
+
 #[test]
 fn rerank_reorders_documents_by_relevance() {
     // Three candidates; the fake scripts a reordering: doc index 2 most relevant,
@@ -606,5 +715,180 @@ fn stream_does_not_fail_over_mid_stream() {
         items[1],
         Value::bool(true),
         "mid-stream error surfaces (no silent failover)"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Conversation usage accounting (issue #12 correctness fix): conversation/say
+// folds each turn's real usage into the conversation, and conversation/cost
+// reports the billed sum.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn conversation_say_accumulates_real_usage_and_cost() {
+    // Two turns, explicit token usage; a custom price for the fake's model so cost
+    // is a known figure: per turn 100*$1/M + 20*$2/M = 0.00014, doubled = 0.00028.
+    let fake = FakeProvider::builder("fake-priced")
+        .model("fake-priced")
+        .reply_with_usage("first", 100, 20)
+        .reply_with_usage("second", 100, 20)
+        .build();
+    let src = r#"
+        (llm/set-pricing "fake-priced" 1.0 2.0)
+        (let* ((c0 (conversation/new {:model "fake-priced"}))
+               (c1 (conversation/say c0 "hi"))
+               (c2 (conversation/say c1 "again"))
+               (stats (conversation/stats c2)))
+          (and (= (:prompt (:tokens stats)) 200)
+               (= (:completion (:tokens stats)) 40)
+               (= (:total (:tokens stats)) 240)
+               (> (conversation/cost c2) 0.00027)
+               (< (conversation/cost c2) 0.00029)))"#;
+    let (result, _rec) = eval_with_fake(src, fake);
+    let val = result.expect("conversation/say should accumulate usage");
+    assert_eq!(
+        val,
+        Value::bool(true),
+        "tokens accumulate across turns and cost equals the billed sum"
+    );
+}
+
+#[test]
+fn conversation_cost_is_nil_without_known_pricing() {
+    // A model with no price: usage still accumulates (tokens), but cost stays nil —
+    // conversation/cost must NOT fall back to estimation.
+    let fake = FakeProvider::builder("unpriced")
+        .model("unpriced-model")
+        .reply_with_usage("hello", 10, 5)
+        .build();
+    let src = r#"
+        (let* ((c0 (conversation/new {:model "unpriced-model"}))
+               (c1 (conversation/say c0 "hi")))
+          (and (nil? (conversation/cost c1))
+               (= (:total (:tokens (conversation/stats c1))) 15)))"#;
+    let (result, _rec) = eval_with_fake(src, fake);
+    let val = result.expect("conversation/say should still run without pricing");
+    assert_eq!(
+        val,
+        Value::bool(true),
+        "cost is nil (no estimation) while tokens still accumulate"
+    );
+}
+
+// ── agent/run :on-text streaming (the Sema Coder TUI needs live token deltas) ──
+
+/// `agent/run` with `:on-text` streams the assistant reply as deltas, in order,
+/// and the final `:response` equals their concatenation.
+#[test]
+fn agent_run_on_text_streams_deltas_in_order() {
+    let fake = FakeProvider::builder("fake")
+        .model("fake-model")
+        .stream(&["Hel", "lo, ", "world"])
+        .build();
+
+    let src = r#"
+        (defagent bot {:model "fake-model"})
+        (define trace "")
+        (let ((r (agent/run bot "hi"
+                   {:on-text (lambda (c) (set! trace (string-append trace c "|")))})))
+          (list (:response r) trace))
+    "#;
+    let (result, recorder) = eval_with_fake(src, fake);
+    let val = result.expect("agent/run with :on-text should complete");
+    let items = val.as_seq().expect("list result");
+    assert_eq!(items[0].as_str(), Some("Hello, world"), "final response");
+    assert_eq!(
+        items[1].as_str(),
+        Some("Hel|lo, |world|"),
+        "deltas must arrive in order, as separate chunks"
+    );
+    assert_eq!(recorder.call_count(), 1);
+}
+
+/// Streaming must survive a tool round: round 1 issues a tool call (no visible
+/// text), round 2 streams the final answer. Tool-result correlation is unchanged
+/// — the second request carries the tool result — and only round 2's text streams.
+#[test]
+fn agent_run_on_text_streams_after_a_tool_round() {
+    let fake = FakeProvider::builder("fake")
+        .model("fake-model")
+        .tool_call("call_1", "calc", serde_json::json!({"x": 2}))
+        .stream(&["The ", "answer ", "is 4"])
+        .build();
+
+    let src = r#"
+        (deftool calc "double a number" {:x {:type :number :description "n"}}
+          (lambda (x) "4"))
+        (defagent bot {:model "fake-model" :tools [calc] :max-turns 5})
+        (define trace "")
+        (let ((r (agent/run bot "double 2"
+                   {:on-text (lambda (c)
+                               (when (> (string/length c) 0)
+                                 (set! trace (string-append trace c "|"))))})))
+          (list (:response r) trace))
+    "#;
+    let (result, recorder) = eval_with_fake(src, fake);
+    let val = result.expect("agent/run streaming through a tool round should complete");
+    let items = val.as_seq().expect("list result");
+    assert_eq!(items[0].as_str(), Some("The answer is 4"), "final response");
+    assert_eq!(
+        items[1].as_str(),
+        Some("The |answer |is 4|"),
+        "only round 2's text streams, in order"
+    );
+    assert_eq!(
+        recorder.call_count(),
+        2,
+        "two provider calls: tool round + reply"
+    );
+}
+
+/// Regression: multi-turn tool history must round-trip. Turn 1 calls a tool; we
+/// feed its `:messages` back into turn 2. The re-sent history has to keep the
+/// assistant `tool_calls` turn AND the tool-result's `tool_call_id`, or providers
+/// reject it (e.g. Anthropic 400: `tool_use_id` empty). This once broke every
+/// multi-turn agent conversation that used a tool.
+#[test]
+fn agent_run_preserves_tool_correlation_across_turns() {
+    let fake = FakeProvider::builder("fake")
+        .model("fake-model")
+        .tool_call("call_abc", "calc", serde_json::json!({"x": 2})) // turn 1, round 1
+        .reply("four") // turn 1, round 2 (final)
+        .reply("done") // turn 2, round 1 (final)
+        .build();
+
+    let src = r#"
+        (deftool calc "double a number" {:x {:type :number :description "n"}}
+          (lambda (x) "4"))
+        (defagent bot {:model "fake-model" :tools [calc] :max-turns 5})
+        (define hist (:messages (agent/run bot "double 2" {:messages '()})))
+        (:response (agent/run bot "and again" {:messages hist}))
+    "#;
+    let (result, recorder) = eval_with_fake(src, fake);
+    result.expect("two turns with a tool round should complete");
+
+    // Turn 2's request is the last one recorded; it carries turn 1's history.
+    let reqs = recorder.requests();
+    let last = reqs.last().expect("a turn-2 request");
+    assert!(
+        last.messages
+            .iter()
+            .any(|m| m.role == "assistant" && !m.tool_calls.is_empty()),
+        "re-sent history must keep the assistant tool_calls turn"
+    );
+    let tool_msg = last
+        .messages
+        .iter()
+        .find(|m| m.role == "tool")
+        .expect("re-sent history must contain the tool-result message");
+    assert_eq!(
+        tool_msg.tool_call_id.as_deref(),
+        Some("call_abc"),
+        "the re-sent tool result must keep its tool_call_id"
+    );
+    assert_eq!(
+        tool_msg.tool_name.as_deref(),
+        Some("calc"),
+        "the re-sent tool result must keep its tool name"
     );
 }

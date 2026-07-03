@@ -5,22 +5,280 @@
 ### Added
 
 - **WebSocket client (`ws/*`).** Connect to `ws://`/`wss://` servers with
-  `ws/connect`, then `ws/send`, `ws/recv`, `ws/close`, and `ws/connected?`. A
-  connection is a closeable stream, so the new `with-open` macro (a RAII alias of
-  `with-stream`) closes it on both the normal and error paths. `ws/send` accepts a
-  string (text frame), a bytevector (binary frame), or a map (sent as JSON text);
-  `ws/recv` returns a tagged map (`{:text …}`, `{:binary …}`, `{:close …}`, or
-  `nil` once drained) for `match`. Top-level calls block; inside an `async/spawn`
-  task they yield cooperatively, mirroring the HTTP client's offload model. Gated
-  on the `network` capability; native-only (not in the WASM playground). The
-  server side (`:ws` routes / `http/websocket`) already shipped. (#49)
-- **WebSocket client, comprehensive surface.** `ws/connect` takes an options map
-  (`:headers`, `:subprotocols`, `:timeout`, `:retries`, `:retry-backoff-ms` with
-  exponential backoff). `ws/send` adds explicit framing (`{:text …}`, `{:binary …}`,
-  `{:json …}`) alongside the value-typed shorthands. New `ws/recv-timeout` (returns
-  `:timeout` distinct from `nil`), `ws/ping`, and the `ws/listen` macro — an evented
-  receive loop dispatching to `:on-open`/`:on-message`/`:on-close`/`:on-error`,
-  returning a promise to await. (#49)
+  `ws/connect` (options map: `:headers`, `:subprotocols`, `:timeout`, `:retries`,
+  `:retry-backoff-ms` with exponential backoff), then `ws/send`, `ws/recv`,
+  `ws/recv-timeout`, `ws/ping`, `ws/close`, and `ws/connected?`. A connection is a
+  closeable stream, so the new `with-open` macro (a RAII alias of `with-stream`)
+  closes it on both the normal and error paths. `ws/send` accepts a string (text),
+  a bytevector (binary), a map (JSON text), or explicit framing (`{:text …}`,
+  `{:binary …}`, `{:json …}`); `ws/recv` returns a tagged map (`{:text …}`,
+  `{:binary …}`, `{:close …}`, or `nil` once drained) for `match`, and
+  `ws/recv-timeout` returns `:timeout` distinct from `nil`. The `ws/listen` macro
+  drives an evented receive loop dispatching to
+  `:on-open`/`:on-message`/`:on-close`/`:on-error` and returns a promise to await.
+  Top-level calls block; inside an `async/spawn` task they yield cooperatively,
+  mirroring the HTTP client's offload model. Gated on the `network` capability;
+  native-only (not in the WASM playground). The server side (`:ws` routes /
+  `http/websocket`) already shipped. (#49)
+- **Self-tail-call optimization: named-let loops no longer birth a self-reference
+  cycle (issue #62).** A self-recursive named-let / `letrec` loop whose name is
+  referenced only in tail-call position no longer captures itself as an upvalue.
+  The resolver detects the pattern and elides the self upvalue
+  (`VarResolution::SelfFn`); the compiler emits a new `SelfTailCall` opcode that
+  reuses the running frame's own closure instead of `LoadUpvalue`+`TailCall`. This
+  removes the CORE-2 self-reference cycle (ADR #66) at its hottest source — every
+  loop *entry* previously birthed a 3-node cycle for the collector to trace and
+  sever — and lets pure counter loops reach zero upvalues (skipping cycle-candidate
+  registration entirely). Measured ~22% faster on `mandelbrot.sema` (named-let per
+  pixel) with identical output. The optimization is conservative: it does not fire when
+  the loop name escapes (stored, passed, returned, `set!`, captured by an inner
+  lambda, or used in non-tail position) — those keep the real self-capture.
+  Verified by resolver/compiler unit tests, end-to-end eval oracles (including the
+  upvalue-index remap when a loop also captures outer variables), a `.semac`
+  round-trip + verifier test, and `gc_stress_test` no-cycle assertions.
+- **Sema Web — run Sema apps in the browser.** The new `@sema-lang/sema-web`
+  package embeds the WASM VM in the browser with reactive state
+  (`state`/`computed`/`watch`), SIP markup (hiccup-style vectors), a component
+  system (`defcomponent`/`mount!`), and `dom/*`, `store/*`, `router/*`, `css/*`,
+  and browser `llm/*` namespaces. `@sema-lang/llm-proxy` ships drop-in Vercel /
+  Netlify / Cloudflare / Node adapters so browser `llm/*` calls reach real
+  providers with server-side keys. See the
+  [Sema Web guide](https://sema-lang.com/docs/web/).
+- **`sema web` — zero-config dev server.** `sema web app.sema` serves an app in
+  the browser with no bundler and no `npm install`: it embeds the browser runtime
+  (WASM VM + JS bundle) in the binary, serves your app, hot-reloads on file
+  change, and proxies `llm/*` to real providers using your environment keys.
+  Multi-file apps (that `import` other modules) are compiled to a `.vfs` on the
+  fly and resolve automatically, and a browser error overlay surfaces Sema errors
+  on the page. Options: `--port`, `--host`, `--no-open`, `--no-llm`. See the
+  [Dev Server guide](https://sema-lang.com/docs/web/dev-server).
+- **Automatic port fallback for `http/serve`.** Pass `{:port-fallback true}` and
+  a taken port advances to the next free one instead of failing;
+  `{:on-listen (fn (info) …)}` reports the bound `{:host :port :url}` (handy for
+  printing a URL or opening a browser). Off by default (backward-compatible); the
+  notebook server opts in. See the
+  [Web Server docs](https://sema-lang.com/docs/stdlib/web-server).
+- **Transitive dependency resolution for `sema pkg`.** `sema pkg install` (and
+  `add`/`update`/`remove`) now walks each dependency's own `[deps]` and installs
+  the whole graph, instead of only the project's top-level manifest — no more
+  hand-flattening a dependency tree into your own `sema.toml`. Diamond conflicts
+  resolve deterministically: direct deps always win over transitive requests,
+  semver-compatible transitive versions pick the higher one, and incompatible
+  majors / conflicting git refs hard-error asking for an explicit override.
+  `sema.lock` records a per-entry `direct` flag (additive; defaults to `true`
+  when absent, so existing lock files are unaffected) so `--locked` and
+  `sema pkg list` can distinguish direct from transitive packages.
+- **CORE-2 fixed: cycle-collecting garbage collector.** Sema now reclaims reference
+  cycles — a synchronous Bacon–Rajan cycle collector (ADR #66; design + measurements
+  in `docs/plans/2026-07-02-core2-gc.md`) runs over the existing `Rc` heap with a
+  creation-time candidate registry, reclaiming garbage cycles by severing the one
+  mutable cell every Sema cycle must pass through (env bindings, upvalue cell, thunk
+  `forced`, promise state, channel buffer, multimethod table) and letting ordinary
+  `Rc` drops cascade. What users get: **long-lived sessions stop leaking** — REPL,
+  notebook server, HTTP/MCP servers, and long-running agents that define recursive
+  local helpers every turn (previously 260 B leaked per recursive closure, forever)
+  now stay memory-bounded, and **interpreter teardown frees everything** (previously
+  every `Interpreter` drop leaked its entire global env, ~168 KB, even with zero
+  user code — fatal for embedders and notebook kernel resets). Measured by the
+  counting-allocator oracles in `crates/sema/tests/leak_test.rs` (all seven green):
+  recursive-closure churn 260 B/iter → ~0 (bounded); teardown ~168 KB/drop → 0 B/drop
+  (no defines, macro-injected consts, module imports) and bounded with user defines;
+  1M-iteration churn RSS 303.7 MB → 16.0 MB. Collection runs at safe points (closure/
+  data-birth registry threshold, top-level eval return, notebook cell + kernel reset,
+  agent-turn boundary, scheduler idle, `Interpreter::drop`) plus on demand via the new
+  **`gc/collect` and `gc/stats` builtins** and the REPL `,gc` command. Perf gate
+  (interleaved hyperfine A/B vs the pre-collector baseline): closure bookkeeping
+  ≤1.6% on storm/upvalue-counter/fold; numeric within noise (tak's +0.9% shows
+  all-zero `gc/stats` — layout noise); reclamation costs ~326 ns per collected cycle
+  at 1.73× the *leaking* baseline's wall time on the churn canary; mandelbrot pays
+  +12% because its named-`let` loops birth a real cycle per entry — the baseline
+  leaks on it, and issue #62 (self-tail-call optimization) is the planned
+  elimination. Load-bearing invariant established in M1 (AGENTS.md, I2): a
+  `NativeFn`'s boxed closure must never strongly capture anything that can
+  transitively hold a `Value`/`Env` — traceable state belongs in `NativeFn.payload`;
+  the ~11 `__vm-*`/tool/agent delegates now capture their home env `Weak`. No object
+  headers, no color bits, no change to `Value`'s NaN-boxing, `Value::drop`, or the
+  strong-reference graph user code sees.
+
+- **`otel/configure` — turn on tracing from Sema code.** Telemetry no longer
+  needs environment variables: `(otel/configure {:endpoint "..." :key "sk_..."})`
+  points Sema at an OTLP backend (or a JSONL file via `:file`) from inside a
+  script. `:key` becomes an `Authorization: Bearer` header; `:headers` takes a
+  map or a pre-formatted string; `:service-name`, `:environment`, `:release`, and
+  `:capture-content` mirror their env vars. Installs one provider per process and
+  returns `#t` when it turned tracing on (env config, if present, still wins).
+  See the [Observability guide](https://sema-lang.com/docs/llm/observability#configuring-from-sema-code).
+- **MCP client.** Sema can now act as an MCP *client*, not just a server, over
+  every standard transport. `mcp/connect` picks the transport from its config:
+  `:command` spawns a **stdio** server (gated on the `process` capability;
+  credentials via the `:env` map), `:url` connects to a remote server over
+  **Streamable HTTP** (gated on `network`; MCP spec `2025-11-25`, with
+  `Mcp-Session-Id` / `MCP-Protocol-Version` handling and JSON-or-SSE responses),
+  and it auto-falls-back to the deprecated 2024-11-05 HTTP+SSE transport when a
+  server only speaks that. `mcp/tools` lists tools, `mcp/call` invokes one,
+  `mcp/close` disconnects, and `mcp/tools->sema` converts a server's tools into
+  the exact value shape `deftool` produces so `defagent` consumes external MCP
+  tools with no agent-loop changes (`isError` surfaces as an error).
+- **MCP client OAuth 2.1 login.** Remote servers that require authorization are
+  handled natively per the MCP authorization spec: on a `401`, Sema discovers the
+  authorization server (RFC 9728 protected-resource metadata → RFC 8414/OIDC
+  metadata), registers a client (RFC 7591 dynamic registration, a pre-registered
+  `:auth {:client-id …}`, or a cached one), and runs the Authorization-Code +
+  PKCE-S256 flow over an RFC 8252 loopback redirect — opening the system browser,
+  binding `resource=` (RFC 8707), then exchanging the code for tokens. Tokens are
+  cached in the OS keychain (with a `0600`-file fallback), so later connects are
+  silent; expired tokens are refreshed automatically. A headless RFC 8628
+  device-authorization flow and a bring-your-own-token option (`:headers`) are
+  also supported. `sema mcp login <url>` (with `--device` / `--client-id`) and
+  `sema mcp logout <url>` manage credentials from the CLI. A mid-session `401`
+  (expired token) or `403 insufficient_scope` re-authorizes and retries the call
+  transparently — refreshing, or stepping up to the union of scopes — on both the
+  Streamable-HTTP and legacy HTTP+SSE transports. Set `SEMA_MCP_TOKEN_STORE=file`
+  to force the `0600`-file store instead of the OS keychain (handy on headless
+  boxes or to avoid repeated keychain prompts while developing).
+- **MCP tool-call cassettes.** MCP `tools/call` results record and replay through
+  the same cassette tape as LLM calls (`llm/cassette-load`/`llm/cassette-save`,
+  or the `SEMA_LLM_CASSETTE` env var), keyed by a hash of the server identity,
+  tool, and arguments — so an agent-over-MCP flow can be captured once and
+  replayed offline/deterministically in CI, with no network or live server.
+
+- **Agent & TUI host primitives** (issue #53) — the building blocks for
+  self-hosted terminal apps written in Sema (see the
+  [Sema Coder](https://github.com/HelgeSverre/sema/tree/main/examples/sema-coder)
+  reference app; the primitives are documented per module under the
+  [standard library reference](https://sema-lang.com/docs/stdlib/)):
+  - **Terminal screen control** — `term/enter-alt-screen`, `term/leave-alt-screen`,
+    `term/clear`, `term/clear-line`, `term/clear-below`, `term/move-to`,
+    `term/write-at`, `term/cursor-home`, `term/hide-cursor`, `term/show-cursor`,
+    `term/save-cursor`, `term/restore-cursor`, `term/enable-mouse`,
+    `term/disable-mouse`, `term/set-title`, `term/bell`, `term/flush`.
+  - **Streaming subprocesses** — `proc/spawn`, `proc/read-stdout`,
+    `proc/read-stderr`, `proc/write-stdin`, `proc/close-stdin`, `proc/wait`,
+    `proc/exit-code`, `proc/running?`, `proc/kill`, `proc/close`.
+  - **Pseudo-terminals** — `pty/spawn`, `pty/read`, `pty/write`, `pty/resize`,
+    `pty/wait`, `pty/exit-code`, `pty/running?`, `pty/kill`, `pty/close`.
+  - **Event loop** — `event/select` (over `:key`/`:proc`/`:timer` sources) and
+    `time/tick`.
+  - **File watching** — `fs/watch`, `fs/watch-events`, `fs/unwatch`.
+  - **Diff & patch** — `diff/unified`, `diff/parse`, `diff/apply`, `diff/hunks`,
+    `diff/stat`, `patch/apply-file`.
+  - **Read-only git** — `git/root`, `git/current-branch`, `git/status`,
+    `git/changed-files`, `git/diff`, `git/diff-files`, `git/recent-files`,
+    `git/ignore-matches?`.
+  - **Sema reflection & diagnostics** — `read/string`, `read/all`,
+    `format/form`, `sema/check-string`, `sema/check-file` (diagnostics as data).
+  - **Secrets & redaction** — `secret/detect`, `secret/redact`, `pii/detect`,
+    `redact/spans`, `hash/digest`.
+  - **Archives** — `gzip/compress`, `gzip/decompress`, `zip/create`,
+    `zip/extract`, `zip/list`, `tar/create`, `tar/extract`.
+  - **Markdown & HTML** — `markdown/to-html`, `markdown/headings`,
+    `markdown/frontmatter`, `html/parse`, `html/select`, `html/select-text`,
+    `html/text`.
+  - **Path safety & config** — `path/canonicalize`, `path/relative-to`,
+    `path/within?`, `sys/config-dir`.
+  - **Display-aware text** — `string/width` (terminal display columns; wide-char
+    and ANSI aware) and `string/word-wrap` (width-aware word wrapping).
+  - **Rich terminal input** — `io/read-key` now decodes the kitty keyboard
+    protocol (modifier reporting as an optional `:mods` list) and SGR mouse
+    reports (`{:kind :mouse …}`), both backward compatible; opt in with
+    `term/enable-kitty-keys!` / `term/disable-kitty-keys!` (mouse via the
+    existing `term/enable-mouse`, which now also reports drag).
+  - **Terminal setup guards** — `term/with-alt-screen`, `io/with-raw-mode`, and
+    `term/with-mouse` run a body and *always* restore the terminal on exit (even
+    if the body throws), so a crash can't leave the shell in raw mode / the alt
+    buffer / with mouse reporting on. Compose them outermost-restores-last.
+- **Streaming agent turns** — `agent/run` accepts an `:on-text` callback that
+  streams the assistant reply token-by-token (in addition to `:on-tool-call`),
+  so front-ends can render a reply as it arrives.
+- **`string->bytevector` / `bytevector->string`** — intuitive aliases for
+  `string->utf8` / `utf8->string` (a Sema string encodes to its UTF-8 bytes).
+- **Sema Coder** (`examples/sema-coder/`) — a terminal coding agent written in
+  Sema: a full-screen, frame-diffed TUI with a fuzzy `/` command palette, live
+  streaming, mouse-wheel scrolling, resize handling, and an extensible
+  slash-command registry + single-file JSON config (falls back to a plain
+  line-based REPL when stdout isn't a TTY).
+- **Conversation inspection, surgery, search & prompt algebra** (issue #12) —
+  15 builtins for working with conversations as data: `conversation/length`,
+  `conversation/turns`, `conversation/models-used`, and `conversation/stats`
+  inspect a conversation; `conversation/remove`, `conversation/insert`,
+  `conversation/replace`, and `conversation/map-role` edit it non-destructively;
+  `conversation/search` / `conversation/find` locate messages; and the prompt
+  algebra `prompt/diff`, `prompt/union`, `prompt/intersection`,
+  `prompt/difference` compare message sets by role+content. `conversation/cost`
+  reports the billed total.
+
+### Fixed
+
+- **`llm/stream` over `http/stream` streams progressively without panicking.**
+  The SSE channel was bounded and used a blocking send, which panicked ("cannot
+  block the current thread from within a runtime") when a handler fed tokens from
+  inside a provider's async runtime. It is now an unbounded, non-blocking channel,
+  so LLM tokens flow to the client as they arrive. WebSocket/file/raw responses
+  are unchanged.
+- **Robust module/import resolution in embedded and `.vfs` contexts.** Imports
+  written `./x`, `../x`, subdirectory, and nested-relative paths now resolve
+  correctly from a `sema build` standalone binary or a browser `.vfs` archive —
+  previously only an exact plain relative key matched, so multi-file apps broke
+  once bundled. Every spelling of a module normalizes to one key (so diamonds
+  dedup to a single evaluation), and a circular `(load ...)` now errors gracefully
+  instead of overflowing the stack.
+- **Conversation cost/usage is real, not estimated.** `conversation/say` now
+  folds each turn's actual provider `usage` into the conversation, so
+  `conversation/cost` and `conversation/stats` report the billed token/cost sum.
+  When no turn recorded a priced usage, `conversation/cost` returns `nil` rather
+  than falling back to a character-count estimate (issue #12).
+- **`sort` is type-safe and numerically correct without a comparator.**
+  Comparator-free `(sort xs)` previously delegated to an internal tag order, so
+  mixed int/float lists sorted every int before every float regardless of value
+  (`(sort (list 3 1.5))` → `(3 1.5)`) and heterogeneous lists
+  (`(sort (list 3 "a" 1))`) returned a silent, non-portable ordering. Now ints
+  and floats compare as one numeric family by value, every other element must
+  share its kind, and mixing unrelated types raises a type error pointing at
+  `sort-by` / a 2-arg comparator. Deliberate cross-type ordering via an explicit
+  comparator is unchanged.
+- **`str` is now a real alias of `string-append`.** The two builtins had
+  byte-identical but separately copy-pasted implementations; `str` is now
+  registered as an alias of `string-append` (matching how `string/append`
+  already works). Behavior is unchanged — `str`, `string-append`, and
+  `string/append` remain interchangeable.
+- **`path/within?` could be fooled by a symlink.** For a path that doesn't exist
+  yet (the "agent about to write a new file" case) it now resolves the deepest
+  existing ancestor — so a symlink inside the sandbox can't escape it — and no
+  longer rejects legitimate paths under a symlinked prefix (e.g. macOS
+  `/var`→`/private/var`).
+- **`term/strip` swallowed text after non-SGR sequences.** It now parses full CSI
+  and OSC sequences (cursor moves, clears, titles), not just colors.
+- **Arrow/navigation keys could leak as literal characters.** `io/read-key` reads
+  unbuffered from the raw fd so escape-sequence continuation bytes stay visible to
+  `select()`, fixing intermittent `^[[C`-style leakage under fast terminals.
+- **Streamed tool calls were dropped (Anthropic).** `stream_complete` now
+  assembles `tool_use` blocks into `tool_calls`, so a streaming `agent/run` turn
+  can call tools.
+- **Multi-turn tool history failed on re-send.** `agent/run`'s `:messages`
+  round-trip now preserves assistant `tool_calls` and the tool-result
+  `tool_call_id`/name, so a conversation that used a tool no longer errors on the
+  next turn (e.g. Anthropic `tool_use_id` validation).
+- **Archive extraction could silently overwrite.** `zip/extract` / `tar/extract`
+  reject two entries that map to the same target; `diff/apply` folds hunk drift
+  into its offset; `sys/which` honors `PATHEXT` on Windows.
+- **`sema/check-string` / `sema/check-file` dropped diagnostic detail.** A reader
+  error carrying a hint was wrapped, so the result reported a generic `:code
+  "error"` with no `:span`; it now classifies the root error and returns `:code
+  "syntax"` with the `:span` — important for agent repair loops.
+
+### Docs and Website
+
+- **Consolidated duplicate builtin doc entries.** Thirteen builtins
+  (`odd?`, `even?`, `zero?`, `positive?`, `negative?`, `=`, `vector?`,
+  `record?`, `first`, `rest`, `nth`, `length`, `assoc`) each had two doc files
+  filed under different modules. Because LSP hover and REPL apropos index by
+  name, only one of each pair was ever surfaced while the other silently drifted;
+  each is now a single entry with the richer content merged in. The merged
+  `assoc` entry documents both its map-update and association-list forms.
+- **Clarified `sys/os` vs `sys/platform`.** Docs (builtin index and website)
+  now explain that `sys/os` returns the raw, open-ended OS name
+  (`"ios"`/`"android"`/`"freebsd"`/…) while `sys/platform` normalizes to the
+  closed set `"macos"`/`"linux"`/`"windows"`/`"unknown"`.
 
 ## 1.28.1
 

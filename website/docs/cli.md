@@ -405,6 +405,25 @@ sema lsp
 
 Provides diagnostics, completion, hover, go-to-definition, and code lenses. See the [LSP documentation](/docs/lsp) for full feature details and editor setup instructions.
 
+### `sema mcp`
+
+Start the [Model Context Protocol](/docs/mcp) server (exposes Sema's tools to LLM clients), or manage **MCP client** authentication.
+
+```
+sema mcp [FILES]...                 # run the MCP server (optionally loading tool files)
+sema mcp login  <url> [--device] [--client-id ID]
+sema mcp logout <url>
+```
+
+- `sema mcp` (no subcommand) starts the stdio MCP **server** — see the [MCP documentation](/docs/mcp).
+- `sema mcp login <url>` authenticates to a remote MCP **server** you want to *consume* and caches the OAuth token so later `mcp/connect` calls are silent. `--device` uses the headless device-code flow; `--client-id` supplies a pre-registered OAuth client.
+- `sema mcp logout <url>` clears the cached credentials for a server.
+
+```bash
+sema mcp login https://mcp.asana.com/mcp
+sema mcp logout https://mcp.asana.com/mcp
+```
+
 ## Examples
 
 ```bash
@@ -548,6 +567,7 @@ sema --sandbox=no-shell,no-network --allowed-paths=./data script.sema
 | `SEMA_EMBEDDING_PROVIDER` | Preferred embedding provider                    |
 | `SEMA_REGISTRY_URL`  | Override default package registry URL                 |
 | `SEMA_RUNTIME_BASE_URL` | Override base URL for cross-compilation runtime downloads |
+| `SEMA_MCP_TOKEN_STORE` | MCP client token backend: `file` (0600 file) or `keychain` (OS keychain). Default: keychain when available, else file. |
 | `NO_COLOR`           | Disable colored output when set                       |
 
 
