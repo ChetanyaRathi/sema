@@ -54,6 +54,11 @@ export class SemaEditableMarkdown extends SemaElement {
     });
   };
 
+  /** Enter edit mode and focus the source editor (e.g. a freshly inserted cell). */
+  focus() {
+    this._edit();
+  }
+
   private _commit() {
     if (!this._editing) return;
     this._editing = false;

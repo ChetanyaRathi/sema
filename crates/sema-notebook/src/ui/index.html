@@ -6,6 +6,10 @@
 <title>Sema Notebook</title>
 <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%231a1a1a'/%3E%3Ctext x='16' y='22' text-anchor='middle' font-family='JetBrains Mono,monospace' font-weight='700' font-size='15' fill='%23ffffff'%3E%3Ctspan fill='%23c8a855'%3E(%3C/tspan%3Es%3Ctspan fill='%23c8a855'%3E)%3C/tspan%3E%3C/text%3E%3C/svg%3E">
 <link rel="stylesheet" href="/ui/style.css">
+<!-- @sema/ui web components (vendored, offline). Registers <sema-code-editor>,
+     <sema-markdown>, <sema-editable-markdown>. Lit applies any properties Alpine
+     sets before upgrade, so load order relative to Alpine is safe. -->
+<script type="module" src="/ui/vendor/sema-ui.js"></script>
 <script defer src="/ui/notebook.js"></script>
 <script defer src="/ui/alpine.min.js"></script>
 </head>
@@ -139,29 +143,36 @@
                   </button>
                 </div>
 
-                <!-- Markdown rendered view -->
-                <template x-if="cell.cell_type === 'markdown' && cell._rendered">
-                  <div class="markdown-rendered" data-testid="markdown-rendered" @click="editMarkdown(cell.id)" x-html="renderMarkdown(cell.source)"></div>
+                <!-- Markdown cell: edit-in-place (rendered <-> source) is owned by the
+                     component; it forwards the `markdown-rendered` testid onto its view. -->
+                <template x-if="cell.cell_type === 'markdown'">
+                  <sema-editable-markdown
+                    :data-id="cell.id"
+                    x-effect="if ($el.value !== cell.source) $el.value = cell.source"
+                    @input="cell.source = $event.detail.value"
+                    @change="onMarkdownChange(cell, $event)"
+                  ></sema-editable-markdown>
                 </template>
 
-                <!-- Editor (code cells + markdown in edit mode) -->
-                <template x-if="cell.cell_type === 'code' || !cell._rendered">
+                <!-- Code cell: syntax-highlighting editor. Native keydown bubbles
+                     (composed) from the shadow textarea, so Alpine's @keydown.* still
+                     fire on the host; Tab/undo are handled inside the component. -->
+                <template x-if="cell.cell_type === 'code'">
                   <div class="cell-editor" data-testid="cell-editor">
-                    <textarea :rows="Math.max(cell.source.split('\n').length, 1)"
-                              spellcheck="false"
-                              :data-id="cell.id"
-                              data-testid="cell-textarea"
-                              x-text="cell.source"
-                              @focus="focusedCellId = cell.id"
-                              @blur="onBlur(cell)"
-                              @input="cell.source = $el.value; autoResize($el)"
-                              @keydown.shift.enter.prevent="handleShiftEnter(cell)"
-                              @keydown.meta.enter.prevent="evalCellStay(cell.id)"
-                              @keydown.ctrl.enter.prevent="evalCellStay(cell.id)"
-                              @keydown.tab.prevent="insertTab($el, cell)"
-                              @keydown.escape="$el.blur(); focusedCellId = null"
-                              x-init="$nextTick(() => autoResize($el))"
-                    ></textarea>
+                    <sema-code-editor
+                      lang="sema"
+                      autosize
+                      testid="cell-textarea"
+                      :data-id="cell.id"
+                      x-effect="if ($el.value !== cell.source) $el.value = cell.source"
+                      @focusin="focusedCellId = cell.id"
+                      @input="cell.source = $event.detail.value"
+                      @change="persistSource(cell)"
+                      @keydown.shift.enter.prevent="handleShiftEnter(cell)"
+                      @keydown.meta.enter.prevent="evalCellStay(cell.id)"
+                      @keydown.ctrl.enter.prevent="evalCellStay(cell.id)"
+                      @keydown.escape="focusedCellId = null"
+                    ></sema-code-editor>
                     <span x-show="!shiftEnterUsed && focusedCellId === cell.id" class="shift-enter-hint" data-testid="shift-enter-hint">Shift+Enter</span>
                   </div>
                 </template>

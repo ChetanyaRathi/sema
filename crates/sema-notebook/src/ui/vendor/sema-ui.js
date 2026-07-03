@@ -12744,6 +12744,10 @@ const Eo = class Eo extends C {
   willUpdate() {
     this._initialized || (this._initialized = !0, this._editing = this.value.trim() === "" && !this.readonly);
   }
+  /** Enter edit mode and focus the source editor (e.g. a freshly inserted cell). */
+  focus() {
+    this._edit();
+  }
   _commit() {
     this._editing && (this._editing = !1, this.dispatchEvent(
       new CustomEvent("change", { detail: { value: this.value }, bubbles: !0, composed: !0 })
