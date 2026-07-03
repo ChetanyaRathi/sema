@@ -17,9 +17,13 @@
   drives an evented receive loop dispatching to
   `:on-open`/`:on-message`/`:on-close`/`:on-error` and returns a promise to await.
   Top-level calls block; inside an `async/spawn` task they yield cooperatively,
-  mirroring the HTTP client's offload model. Gated on the `network` capability;
-  native-only (not in the WASM playground). The server side (`:ws` routes /
-  `http/websocket`) already shipped. (#49)
+  mirroring the HTTP client's offload model. Gated on the `network` capability.
+  Also runs in the **browser** (Sema Web / WASM) over the native `WebSocket`:
+  `ws/connect`, `ws/send`, `ws/close`, `ws/connected?`, and `ws/listen` all work
+  there; the pull-based `ws/recv`/`ws/recv-timeout` stay native-only (the browser
+  main thread can't block — receive via the evented `ws/listen`), and only
+  `:subprotocols` of the connect options apply in the browser. The server side
+  (`:ws` routes / `http/websocket`) already shipped. (#49)
 - **Self-tail-call optimization: named-let loops no longer birth a self-reference
   cycle (issue #62).** A self-recursive named-let / `letrec` loop whose name is
   referenced only in tail-call position no longer captures itself as an upvalue.

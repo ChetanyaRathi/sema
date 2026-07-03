@@ -551,8 +551,17 @@ it (or run the scheduler) to drive the loop. All handlers are optional:
        :on-close   (fn (conn info) (println "closed"))})))
 ```
 
-> WebSocket support is native-only — it is not available in the browser
-> playground (WASM) build.
+> **Browser support.** The `ws/*` client also runs in the browser (Sema Web /
+> WASM), backed by the browser's native `WebSocket`: `ws/connect`, `ws/send`
+> (text/binary/JSON + `{:text}`/`{:binary}`/`{:json}` framing), `ws/close`,
+> `ws/connected?`, and `ws/listen` all work there. Because the browser main
+> thread cannot block, the pull-based `ws/recv` and `ws/recv-timeout` are
+> **native-only** — in the browser, receive with the evented `ws/listen`
+> (`:on-message` / `:on-open` / `:on-close` / `:on-error`), which mirrors how
+> browser SSE and `llm/chat-stream` deliver data. Connection `:headers`,
+> `:timeout`, and retry options are native-only too (the browser `WebSocket` API
+> only supports `:subprotocols`). See the
+> [Sema Web WebSocket guide](https://sema-lang.com/docs/web/websocket).
 
 ## Complete Examples
 
