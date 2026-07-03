@@ -24,6 +24,7 @@ import { toInvokableCallback, releaseCallback, type SemaCallback } from "./callb
 interface SemaInterpreterLike {
   registerFunction(name: string, fn: (...args: any[]) => any): void;
   invokeGlobal(name: string, ...args: any[]): any;
+  evalStr(code: string): { value: string | null; output: string[]; error: string | null };
 }
 
 /** Strip leading `:` from Sema keyword-style map keys (recursively). */
@@ -127,17 +128,29 @@ export function registerWsBindings(interp: SemaInterpreterLike, ctx: SemaWebCont
     return !!reg && reg.socket.readyState === WebSocket.OPEN;
   });
 
-  // ws/close: close the socket and release its handle + listener callbacks.
+  // ws/close: close the socket. Stops inbound delivery but preserves onclose so
+  // a wired ws/listen :on-close still fires — matching the native client, where
+  // a client-initiated close surfaces to the listen loop (recv → nil →
+  // on-close). If nothing wired onclose, a cleanup-only handler releases the
+  // handle when the close event lands.
   interp.registerFunction("ws/close", (handle: unknown, code?: number, reason?: string) => {
     const reg = typeof handle === "number" ? ctx.sockets.get(handle) : undefined;
     if (!reg) return null;
+    const { socket } = reg;
+    socket.onopen = null;
+    socket.onmessage = null;
+    socket.onerror = null;
+    if (!socket.onclose) {
+      socket.onclose = () => {
+        if (typeof handle === "number") ctx.sockets.delete(handle);
+        for (const cb of reg.callbacks) releaseCallback(cb);
+      };
+    }
     try {
-      reg.socket.onopen = reg.socket.onmessage = reg.socket.onclose = reg.socket.onerror = null;
-      if (typeof code === "number") reg.socket.close(code, reason);
-      else reg.socket.close();
-    } finally {
-      for (const cb of reg.callbacks) releaseCallback(cb);
-      ctx.sockets.delete(handle as number);
+      if (typeof code === "number") socket.close(code, reason);
+      else socket.close();
+    } catch (e) {
+      ctx.onerror(e instanceof Error ? e : new Error(String(e)), "ws/close");
     }
     return null;
   });
@@ -148,22 +161,29 @@ export function registerWsBindings(interp: SemaInterpreterLike, ctx: SemaWebCont
   //   :on-message (fn (conn msg) …)   msg = text string or binary bytevector
   //   :on-close   (fn (conn info) …)  info = {:code … :reason …}
   //   :on-error   (fn (conn err) …)
-  // Returns the connection handle (the native client returns a promise to
-  // await; the browser is evented, so there is nothing to await).
-  interp.registerFunction("ws/listen", (handle: unknown, handlers: any) => {
-    const reg = getReg(ctx, handle);
-    const wire = (key: string): SemaCallback | null => {
-      const v = mapGet(handlers, key);
-      if (v === undefined || v === null) return null;
-      const cb = toInvokableCallback(v, interp, `ws/listen ${key}`);
-      reg.callbacks.push(cb);
-      return cb;
-    };
-    const onOpen = wire("on-open");
-    const onMessage = wire("on-message");
-    const onClose = wire("on-close");
-    const onError = wire("on-error");
-    const { socket } = reg;
+  //
+  // Registered as `__ws/listen` taking the handlers *positionally*, with a Sema
+  // wrapper (below) that destructures the map. This is load-bearing: the WASM
+  // boundary only converts top-level lambda args into invokable callbacks — a
+  // lambda nested inside a map arg is serialized through JSON and lost, so
+  // callbacks MUST cross as separate arguments. Returns the connection handle
+  // (the native client returns a promise to await; the browser is evented, so
+  // there is nothing to await).
+  interp.registerFunction(
+    "__ws/listen",
+    (handle: unknown, onOpenV: any, onMessageV: any, onCloseV: any, onErrorV: any) => {
+      const reg = getReg(ctx, handle);
+      const wire = (v: any, label: string): SemaCallback | null => {
+        if (v === undefined || v === null) return null;
+        const cb = toInvokableCallback(v, interp, `ws/listen ${label}`);
+        reg.callbacks.push(cb);
+        return cb;
+      };
+      const onOpen = wire(onOpenV, "on-open");
+      const onMessage = wire(onMessageV, "on-message");
+      const onClose = wire(onCloseV, "on-close");
+      const onError = wire(onErrorV, "on-error");
+      const { socket } = reg;
 
     if (onOpen) {
       // If already open (connect resolved before listen), fire immediately.
@@ -197,4 +217,22 @@ export function registerWsBindings(interp: SemaInterpreterLike, ctx: SemaWebCont
     }
     return handle;
   });
+
+  // Sema wrapper for ws/listen: pulls the handlers out of the map (where they
+  // are still real Sema lambdas) and hands them to __ws/listen as top-level
+  // args so each crosses the WASM boundary as an invokable callback. Defining
+  // it as a function overwrites the prelude's native-only ws/listen *macro*
+  // binding (macros and functions share one env slot), so browser code calling
+  // `(ws/listen conn {:on-message …})` reaches this instead of the recv-loop
+  // macro.
+  const wrapper = interp.evalStr(`
+    (define (ws/listen conn handlers)
+      (__ws/listen conn
+        (get handlers :on-open)
+        (get handlers :on-message)
+        (get handlers :on-close)
+        (get handlers :on-error)))`);
+  if (wrapper.error) {
+    throw new Error(`ws/listen wrapper failed to install: ${wrapper.error}`);
+  }
 }

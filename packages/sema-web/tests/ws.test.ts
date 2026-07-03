@@ -36,6 +36,8 @@ class MockWebSocket {
     this.closed = true;
     this.closeArgs = [code, reason];
     this.readyState = MockWebSocket.CLOSED;
+    // Real browsers fire a CloseEvent after close() completes.
+    this.onclose?.({ code: code ?? 1000, reason: reason ?? "" });
   }
   // test drivers
   fireMessage(data: any) {
@@ -135,21 +137,34 @@ describe("registerWsBindings", () => {
     expect(ctx.sockets.has(h)).toBe(false);
   });
 
-  it("ws/listen dispatches incoming text frames to :on-message with the handle", () => {
+  // ws/listen crosses the WASM boundary as __ws/listen with POSITIONAL callback
+  // args (on-open, on-message, on-close, on-error) — a Sema wrapper destructures
+  // the handlers map. These test the native binding directly.
+  const listen = (
+    h: number,
+    cbs: { open?: any; message?: any; close?: any; error?: any },
+  ) =>
+    interp.getFunction("__ws/listen")!(
+      h,
+      cbs.open ?? null,
+      cbs.message ?? null,
+      cbs.close ?? null,
+      cbs.error ?? null,
+    );
+
+  it("__ws/listen dispatches incoming text frames to on-message with the handle", () => {
     const h = connect();
     const received: any[] = [];
-    interp.getFunction("ws/listen")!(h, {
-      ":on-message": (conn: number, msg: any) => received.push([conn, msg]),
-    });
+    listen(h, { message: (conn: number, msg: any) => received.push([conn, msg]) });
     sock().fireMessage("frame-1");
     expect(received).toEqual([[h, "frame-1"]]);
   });
 
-  it("ws/listen delivers binary frames as a Uint8Array", () => {
+  it("__ws/listen delivers binary frames as a Uint8Array", () => {
     const h = connect();
     let got: any = null;
-    interp.getFunction("ws/listen")!(h, {
-      ":on-message": (_c: number, msg: any) => {
+    listen(h, {
+      message: (_c: number, msg: any) => {
         got = msg;
       },
     });
@@ -158,26 +173,40 @@ describe("registerWsBindings", () => {
     expect(Array.from(got)).toEqual([1, 2, 3]);
   });
 
-  it("ws/listen fires :on-open immediately when already open", () => {
+  it("__ws/listen fires on-open immediately when already open", () => {
     const h = connect();
     const opened: number[] = [];
-    interp.getFunction("ws/listen")!(h, {
-      ":on-open": (conn: number) => opened.push(conn),
-    });
+    listen(h, { open: (conn: number) => opened.push(conn) });
     expect(opened).toEqual([h]);
   });
 
-  it("ws/listen delivers :on-close with {:code :reason} and drops the socket", () => {
+  it("__ws/listen delivers on-close with {:code :reason} and drops the socket", () => {
     const h = connect();
     let info: any = null;
-    interp.getFunction("ws/listen")!(h, {
-      ":on-close": (_c: number, i: any) => {
+    listen(h, {
+      close: (_c: number, i: any) => {
         info = i;
       },
     });
     sock().fireClose(1006, "gone");
     expect(info).toEqual({ ":code": 1006, ":reason": "gone" });
     expect(ctx.sockets.has(h)).toBe(false);
+  });
+
+  it("client ws/close still fires a wired on-close (native parity)", () => {
+    const h = connect();
+    let closedInfo: any = null;
+    listen(h, { close: (_c: number, i: any) => { closedInfo = i; } });
+    interp.getFunction("ws/close")!(h, 1000, "bye");
+    expect(closedInfo).toEqual({ ":code": 1000, ":reason": "bye" });
+    expect(ctx.sockets.has(h)).toBe(false);
+  });
+
+  it("__ws/listen ignores null (absent) handlers without wiring them", () => {
+    const h = connect();
+    listen(h, {}); // all null
+    // No throw; a message with no on-message handler is simply dropped.
+    expect(() => sock().fireMessage("x")).not.toThrow();
   });
 
   it("disposeContextResources closes open sockets", () => {
