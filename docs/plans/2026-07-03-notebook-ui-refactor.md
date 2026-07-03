@@ -1,4 +1,4 @@
-# Notebook UI refactor — `sema-markdown` + `sema-editable-markdown` (first slice of #69)
+# Notebook UI refactor — editor + markdown components (first slice of #69)
 
 **Status:** design / awaiting approval
 **Branch:** `feature/notebook-ui-refactor`
@@ -8,164 +8,188 @@
 ## 1. Context
 
 The notebook browser UI (`crates/sema-notebook/src/ui/`) is Alpine.js + hand-rolled
-primitives: a raw `<textarea>` editor and a ~12-line **regex** markdown renderer
-(`renderMarkdown` in `notebook.js`). Markdown cells toggle between a rendered
-`<div x-html="renderMarkdown(...)">` and the textarea via a `_rendered` flag —
-`@click` on the rendered div enters edit mode; `@blur` and Shift+Enter re-render.
+primitives: a raw `<textarea>` editor (no syntax highlighting) and a ~12-line **regex**
+markdown renderer (`renderMarkdown` in `notebook.js`). Markdown cells toggle between a
+rendered `<div x-html="renderMarkdown(...)">` and the textarea via a `_rendered` flag —
+`@click` enters edit mode; `@blur` and Shift+Enter re-render.
 
-The repo ships a first-party Lit web-component library, **`@sema/ui`** (`ui/`), with
-design-token-driven components. Issue #69 wants the notebook to consume `@sema/ui`
-instead of re-implementing (and re-bugging) primitives by hand, on an **incremental**
-path (leaf primitives → editor → menus/dialogs).
+The repo ships a first-party Lit web-component library, **`@sema/ui`** (`ui/`). Issue #69
+wants the notebook to consume `@sema/ui` on an **incremental** path (leaf primitives →
+editor → menus/dialogs) so it stops re-implementing (and re-bugging) primitives by hand.
 
-**This spec covers the first vertical slice:** build the two components the markdown
-cell needs, resolve the bundling prerequisite, and wire *only* the notebook's markdown
-cell to them. Everything else in #69 (buttons, tooltip, menu, dialog, toast, the code
-editor) is deferred to follow-up slices.
+**This spec covers the first vertical slice:** build the editor + markdown components the
+notebook needs, resolve the bundling prerequisite, and rewire the notebook's cells to use
+them. Toolbar buttons, tooltips, menus, dialogs, and toasts are deferred to follow-ups.
 
-### What already exists in `@sema/ui`
+### What already exists
 
-- `sema-textarea` — themed, form-associated multi-line input (plain; no live highlight).
-- `sema-code` — **display-only** syntax-highlighted `<pre>` from slotted text (not an editor).
-- Shiki highlighter (`internal/syntax-highlight.ts`) with the bundled `sema` grammar +
-  lazy-loaded language chunks.
-- **No markdown renderer exists.** (There is a Shiki `markdown` *grammar* for highlighting
-  markdown *source*, but nothing that renders markdown → HTML.)
+- `@sema/ui` `sema-textarea` — themed multi-line input (plain; **no live highlighting**).
+- `@sema/ui` `sema-code` — **display-only** Shiki-highlighted `<pre>` (not an editor).
+- `@sema/ui` Shiki highlighter (`internal/syntax-highlight.ts`) + bundled `sema` grammar.
+- **Playground editor** (`playground/src/`) — a proven, dependency-free code editor using
+  the transparent-textarea + highlight-overlay technique:
+  - `<textarea>` (real caret/selection/input) layered over a `<div>` painted by a
+    **synchronous** hand-written highlighter (`highlight.js` → `tokenizeSema`/`highlightSema`).
+  - rAF-debounced repaint (`scheduleHighlight`), scroll sync (`syncScroll`), a line-number
+    gutter (`updateGutter`), and a custom undo/redo stack (`undo.js` → `TextareaUndo`).
+- **No markdown renderer exists** anywhere (only a Shiki *grammar* for highlighting md source).
 
 ## 2. Prerequisites (must be resolved for this slice)
 
 1. **Bundling / single-binary.** `@sema/ui` builds via Vite to `ui/dist/sema-ui.js`
-   (~424 KB) + lazy language chunks. The notebook embeds assets with `include_str!`
-   from *inside its own crate dir*. → A `make` target builds `ui/` and vendors the built
-   bundle (+ the `sema` grammar chunk) into `crates/sema-notebook/src/ui/vendor/`, served
-   and `include_str!`-embedded exactly like the offline fonts. Single-binary/offline holds.
-2. **e2e coupling.** `notebook.spec.ts` drives `[data-testid="cell-textarea"]` and
-   `[data-testid="markdown-rendered"]`. This slice keeps **code** cells on the current
-   `<textarea>`, so those selectors are untouched; the markdown-rendered testid is
-   preserved on the new component's rendered surface.
+   (~424 KB) + lazy language chunks. The notebook embeds assets with `include_str!` from
+   *inside its own crate dir*. → A `make` target builds `ui/` and vendors the built bundle
+   (+ needed grammar chunks) into `crates/sema-notebook/src/ui/vendor/`, served and
+   `include_str!`-embedded exactly like the offline fonts. Single-binary/offline holds.
+2. **e2e coupling (shadow DOM).** `notebook.spec.ts` drives `[data-testid="cell-textarea"]`
+   with `.fill()`/`.type()`/`.focus()` and `[data-testid="markdown-rendered"]`. Moving the
+   editable control into a web component's shadow root breaks `.fill()` unless the testid is
+   **forwarded onto the inner `<textarea>`**. `sema-code-editor` reflects a `testid` prop
+   onto its internal textarea; Playwright pierces open shadow roots for testid locators, so
+   `getByTestId('cell-textarea').fill(...)` keeps working. (Validate early — this is the
+   single biggest migration risk.)
 3. **Alpine ↔ web-component binding.** `x-model` relies on `input` on the bound element.
-   The compound component owns its edit state and emits a `change` event carrying the
-   current source; Alpine binds `.value` and persists on `@change` (no `x-model` on a
-   shadow-DOM control).
+   The components own their internal state and emit `input`/`change` with `detail.value`;
+   Alpine binds `.value` and persists on those events (no `x-model` on a shadow control).
 
 ## 3. Scope
 
 **In scope (this slice):**
-- `sema-markdown` — pure markdown → styled-HTML renderer.
-- `sema-editable-markdown` — compound edit-in-place (textarea ↔ rendered), the reusable
-  foundation the notebook markdown cell needs.
-- Vendor/build wiring so the notebook can embed `@sema/ui` offline.
-- Rewire the notebook markdown cell to `sema-editable-markdown`; delete the regex
-  renderer and the markdown branches of the Alpine helpers.
+- **`sema-code-editor`** — editable, syntax-highlighting code editor extracted from the
+  playground editor. The keystone.
+- **`sema-markdown`** — pure markdown → styled-HTML renderer.
+- **`sema-editable-markdown`** — compound edit-in-place composing the two above.
+- Vendor/build wiring so the notebook embeds `@sema/ui` offline.
+- Rewire notebook **code cells** → `sema-code-editor lang="sema"`, and **markdown cells** →
+  `sema-editable-markdown`. Delete the regex renderer + the markdown Alpine helpers.
 
 **Non-goals (deferred):**
-- Migrating code-cell editor, toolbar buttons, tooltips, menus, dialogs, toasts.
-- A true live-syntax-highlighting **code editor** (neither `sema-code` nor `sema-textarea`
-  edits with highlighting today — separate effort).
+- Toolbar buttons, tooltips, menus, dialogs, toasts → later #69 slices.
+- Migrating the **playground** to consume `sema-code-editor` (dogfood) → follow-up once the
+  component proves out in the notebook.
 - Removing Alpine.js (state/reactivity stays on Alpine during incremental migration).
-- Sanitization hardening beyond a light allowlist (local, single-user authoring context).
+- Sanitization hardening beyond a light allowlist (local single-user authoring context).
 
 ## 4. Design
 
-### 4.1 `sema-markdown` (renderer)
+### 4.1 `sema-code-editor` (keystone — editable code editor)
 
-A Lit component that renders a markdown string as token-styled HTML in its shadow root.
+Extract the playground's editor into a reusable Lit component.
 
-- **Input:** `value` property (string) **or** slotted text (slot → `value`, like `sema-code`).
-- **Parse:** [`marked`](https://marked.js.org) (no deps). Fenced code blocks are routed to
-  `@sema/ui`'s existing `highlightToHtml(code, lang)` so notebook code fences match
-  `sema-code`. Unknown/unloaded fence languages fall back to escaped plain text.
-- **Sanitize:** render via `unsafeHTML`, but pass parser output through a small tag/attr
-  allowlist first (strip `<script>`, event-handler attrs, `javascript:` URLs). Local
-  authoring → light touch, but never inject raw event handlers.
-- **Styling:** shadow-DOM styles built from design tokens (`--text-primary`, `--mono`,
-  headings, lists, `code`, `pre`, tables, links). Exposes `part`s (`h1`…`h4`, `p`, `code`,
-  `pre`, `a`, `ul`, `table`) for consumer theming.
-- **Testids/parts:** root surface carries `part="content"` and forwards a `data-testid`
-  so the notebook can keep `markdown-rendered`.
-- **A11y:** rendered region is a normal document flow; links get `rel="noopener"`.
+- **Structure (shadow DOM):** `.wrap` containing an `aria-hidden` `<div class="highlight">`
+  overlay + a transparent `<textarea>` on top; optional `<div class="gutter">` for line
+  numbers. Overlay and gutter scroll-sync to the textarea.
+- **Props:** `value` (two-way via events), `lang` (default `sema`), `placeholder`,
+  `readonly`, `gutter` (bool), `autosize` (bool — grow to content, needed for notebook
+  cells), `tab-size` (default 2), `testid` (forwarded onto the inner textarea for e2e).
+- **Highlighting:** *default* — reuse `@sema/ui`'s Shiki highlighter **synchronously**
+  (grammar/theme preloaded once, then `codeToHtml` is sync) so the editor and `sema-code`
+  share one grammar. *Fallback* — if keystroke latency regresses, port the playground's
+  synchronous `tokenizeSema`/`highlightSema` into `internal/` (see open question). Repaint
+  is rAF-debounced regardless.
+- **Undo:** port `TextareaUndo` (overlay editors lose native undo once `value` is set
+  programmatically — this is exactly why the playground has a custom stack).
+- **Events:** `input` (`detail.value`) per keystroke; `change` on blur/commit; `keydown`
+  bubbles `composed` so the host handles Shift+Enter (notebook: eval) / other shortcuts.
+- **Tab/indent:** Tab inserts `tab-size` spaces (matches notebook `insertTab`).
+- **Parts:** `textarea`, `highlight`, `gutter` for consumer theming.
 
-### 4.2 `sema-editable-markdown` (compound edit-in-place)
+### 4.2 `sema-markdown` (renderer)
 
-Composes `sema-textarea` (edit) + `sema-markdown` (view) and owns the view↔edit toggle.
+- **Input:** `value` property **or** slotted text (slot → `value`, like `sema-code`).
+- **Parse:** [`marked`](https://marked.js.org) (no deps). Fenced code blocks route to
+  `@sema/ui`'s `highlightToHtml(code, lang)` so md code fences match `sema-code`; unknown/
+  unloaded fence languages fall back to escaped plain text.
+- **Sanitize:** render via `unsafeHTML` but pass parser output through a small tag/attr
+  allowlist first (strip `<script>`, event-handler attrs, `javascript:` URLs).
+- **Styling:** shadow-DOM styles from design tokens (headings, lists, `code`, `pre`,
+  tables, links); links get `rel="noopener"`. Exposes `part`s for theming.
+- **Testid:** root surface forwards a `data-testid` so the notebook keeps `markdown-rendered`.
 
-- **Props:** `value` (string, two-way via events), `placeholder`, `readonly`.
-- **State:** internal `editing` boolean. **Not** `editing` → render `sema-markdown`;
-  `editing` → render `sema-textarea` (autosize).
-- **Interactions (mirror the notebook today):**
-  - Click the rendered view → enter edit mode, focus the textarea.
-  - Blur the textarea → if source non-empty, return to rendered view.
-  - Shift+Enter → commit to rendered view.
-  - Empty content in view mode → show a muted "Empty markdown — click to edit" affordance
-    (so an empty cell is still clickable), matching current empty-cell behavior.
-- **Events:** emits `change` (bubbles, composed) with `detail: { value }` on every commit
-  (blur / Shift+Enter) and an `input` event on keystroke for live persistence parity.
-- **Parts/testids:** forwards `markdown-rendered` (view) and `cell-textarea` (edit) testids
-  so e2e can drive it; exposes `part="editor"` / `part="viewer"`.
+### 4.3 `sema-editable-markdown` (compound edit-in-place)
 
-### 4.3 Bundling
+Composes `sema-code-editor lang="markdown"` (edit) + `sema-markdown` (view); owns the toggle.
 
-- New `make` target (e.g. `notebook-ui-vendor`): `cd ui && npm run build`, then copy
-  `dist/sema-ui.js` + required grammar chunk(s) into
-  `crates/sema-notebook/src/ui/vendor/`.
-- `crates/sema-notebook/src/ui.rs`: add a `vendor/sema-ui.js` asset route + `include_str!`.
-- `index.html`: `<script type="module" src="vendor/sema-ui.js">` and use `<sema-editable-markdown>`
-  in the markdown-cell branch.
+- **Props:** `value` (two-way), `placeholder`, `readonly`.
+- **State:** internal `editing` boolean. Not editing → `sema-markdown`; editing →
+  `sema-code-editor` (autosize, `lang="markdown"` for highlighted source).
+- **Interactions (mirror the notebook today):** click rendered → edit + focus; blur →
+  render if non-empty; Shift+Enter → render; empty content → muted "click to edit" affordance.
+- **Events:** `change` (`detail.value`) on commit; `input` on keystroke for live persist parity.
+- **Parts/testids:** forwards `markdown-rendered` (view) + `cell-textarea` (edit) testids.
+
+### 4.4 Bundling
+
+- New `make` target (`notebook-ui-vendor`): `cd ui && npm run build`, then copy
+  `dist/sema-ui.js` (+ required grammar chunks) into `crates/sema-notebook/src/ui/vendor/`.
+- `ui.rs`: add a `vendor/sema-ui.js` asset route + `include_str!`.
+- `index.html`: `<script type="module" src="vendor/sema-ui.js">`, then use the new elements.
 - Document that `@sema/ui` changes require re-running the vendor target (like fonts).
 - **Follow-up optimization (out of scope):** a slim notebook-only entry that tree-shakes to
-  just the components the notebook uses, shrinking the embedded bundle below the full 424 KB.
+  just the used components, shrinking the embed below the full 424 KB.
 
-### 4.4 Notebook wiring (`notebook.js` / `index.html`)
+### 4.5 Notebook wiring (`notebook.js` / `index.html`)
 
-- Replace the markdown-cell `x-if` pair (rendered div + textarea) with a single
+- **Code cells:** replace `<textarea>` with
+  `<sema-code-editor lang="sema" testid="cell-textarea" :value="cell.source"
+  @input="cell.source = $event.detail.value" @keydown.shift.enter.prevent="handleShiftEnter(cell)"
+  @change="persistSource(cell)">`.
+- **Markdown cells:** replace the `x-if` pair with a single
   `<sema-editable-markdown :value="cell.source" @change="onMarkdownChange(cell, $event)">`.
-- Delete `renderMarkdown`, `editMarkdown`, and the markdown branches of `onBlur` /
-  `handleShiftEnter` (the component owns them now).
-- `onMarkdownChange(cell, e)` sets `cell.source = e.detail.value` and calls
-  `persistSource(cell)` — same persistence path as today.
-- Code cells are untouched this slice.
+- Delete `renderMarkdown`, `editMarkdown`, `insertTab`, `autoResize`, and the markdown
+  branches of `onBlur`/`handleShiftEnter` (the components own them now).
 
 ## 5. Data flow
 
 ```
-Alpine cell.source ──(:value)──▶ sema-editable-markdown
-                                     │  edit/blur/shift-enter (internal state)
-                                     ▼
-                          sema-textarea ⇄ sema-markdown ──▶ marked + Shiki fences
-                                     │
-        onMarkdownChange ◀─(@change detail.value)─┘ ──▶ persistSource → POST /api/cells/:id
+Alpine cell.source ─(:value)─▶ sema-code-editor / sema-editable-markdown
+                                   │  keystroke (@input detail.value) ─▶ cell.source
+                                   │  Shift+Enter (@keydown, code) ─▶ evalCell
+                                   ▼
+     sema-code-editor: textarea ⇄ highlight overlay (Shiki-sync) + gutter + undo
+     sema-editable-markdown: sema-code-editor(md) ⇄ sema-markdown (marked + Shiki fences)
+                                   │
+      persist ◀─(@change detail.value)─┘ ─▶ POST /api/cells/:id
 ```
 
 ## 6. Error handling / edge cases
 
-- **Malformed markdown:** `marked` is tolerant; on any parser throw, fall back to escaped
-  raw text (never render broken/unsafe HTML).
-- **Empty source:** view mode shows the clickable empty affordance; `change` with empty
-  value persists an empty cell (current behavior).
-- **Fence language not loaded:** render the fence as escaped plain text (no dynamic-import
-  failure in the offline binary).
-- **Focus race:** entering edit mode focuses the textarea on the next frame (mirrors the
-  current `$nextTick` focus).
+- **Malformed markdown:** `marked` is tolerant; on any throw, fall back to escaped raw text.
+- **Empty source:** markdown view shows a clickable empty affordance; empty `change` persists.
+- **Fence / editor language not loaded:** render escaped plain text (no dynamic-import
+  failure in the offline binary; the `sema` + `markdown` grammars are vendored).
+- **Undo after programmatic `value` set:** covered by the ported `TextareaUndo`.
+- **Autosize + overlay height:** overlay height tracks the textarea so no clipping/misalign.
+- **Focus race entering edit mode:** focus on next frame (mirrors current `$nextTick`).
 
 ## 7. Testing
 
-- **`@sema/ui` vitest (browser):** `sema-markdown` (headings/lists/links/tables/fences,
-  sanitization strips `<script>`/handlers, slot vs `value`); `sema-editable-markdown`
-  (click→edit, blur→render, Shift+Enter→render, empty affordance, `change`/`input` events,
-  two-way `value`).
-- **Notebook e2e (`notebook.spec.ts`):** markdown add → type → blur renders → click re-edits;
-  assert `markdown-rendered` still resolves and code-cell selectors are unaffected. Add a
-  round-trip (edit → save → reload → still rendered) guarding the persistence path.
+- **`@sema/ui` vitest (browser):**
+  - `sema-code-editor`: typing updates `value` + overlay; Tab inserts spaces; undo/redo;
+    `input`/`change`/`keydown` events; `testid` reaches the inner textarea; readonly.
+  - `sema-markdown`: headings/lists/links/tables/fences; sanitization strips `<script>` +
+    handlers; slot vs `value`.
+  - `sema-editable-markdown`: click→edit, blur→render, Shift+Enter→render, empty affordance,
+    two-way `value`, `change`/`input`.
+- **Notebook e2e (`notebook.spec.ts`):** code cell type → run → output (proves
+  `cell-textarea` testid still `.fill()`s through the shadow root); markdown add → type →
+  blur renders → click re-edits (`markdown-rendered` resolves); edit → save → reload
+  round-trip (persistence path).
 - **Rust:** `cargo test -p sema-notebook` for the new asset route.
-- **Full local gate before PR:** `make lint`, notebook e2e, and a manual
-  `make example-notebook` smoke.
+- **Full local gate before PR:** `make lint`, notebook e2e, manual `make example-notebook`.
 
 ## 8. Open questions
 
-- **Renderer dep:** confirm `marked` (recommended) vs `markdown-it`+DOMPurify vs
-  hand-rolled. Spec assumes `marked` + light allowlist.
-- **Bundle size:** accept the full `sema-ui.js` embed for the slice, or build the slim
-  notebook entry now? Spec defers slim entry to a follow-up.
-- **Component names:** `sema-markdown` / `sema-editable-markdown` — open to `sema-md` /
-  `sema-markdown-editor` if preferred.
+- **Slice scope:** does slice 1 rewire **both** code + markdown cells (requires the
+  shadow-DOM testid-forwarding e2e adaptation), or build all three components but wire only
+  markdown this slice and defer code-cell rewiring? *(the one decision to confirm — see below)*
+- **Editor highlighter:** reuse `@sema/ui` Shiki synchronously (grammar unification, one
+  source of truth) vs. port the playground's `tokenizeSema` (proven zero-latency, but a
+  third Sema highlighter to keep in sync with the TextMate grammar). Default: try Shiki-sync,
+  fall back to the port if latency regresses.
+- **Renderer dep:** `marked` (recommended) vs `markdown-it`+DOMPurify vs hand-rolled.
+- **Component names:** `sema-code-editor` / `sema-markdown` / `sema-editable-markdown` —
+  open to alternatives (`sema-editor`, `sema-md`, `sema-markdown-editor`).
+- **Playground dogfood:** rewire the playground onto `sema-code-editor` now or as a follow-up?
+  Default: follow-up (prove it in the notebook first).
 ```
