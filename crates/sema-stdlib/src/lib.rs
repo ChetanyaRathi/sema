@@ -61,6 +61,8 @@ mod typed_array;
 mod workflow;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod workflow_check;
+#[cfg(not(target_arch = "wasm32"))]
+mod ws;
 
 #[cfg(not(target_arch = "wasm32"))]
 use sema_core::Caps;
@@ -137,6 +139,8 @@ pub fn register_stdlib(env: &Env, sandbox: &Sandbox) {
     http::register(env, sandbox);
     #[cfg(not(target_arch = "wasm32"))]
     server::register(env, sandbox);
+    #[cfg(not(target_arch = "wasm32"))]
+    ws::register(env, sandbox);
     bitwise::register(env);
     crypto::register(env);
     datetime::register(env);
