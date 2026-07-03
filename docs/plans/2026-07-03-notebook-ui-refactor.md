@@ -21,6 +21,11 @@ editor → menus/dialogs) so it stops re-implementing (and re-bugging) primitive
 notebook needs, resolve the bundling prerequisite, and rewire the notebook's cells to use
 them. Toolbar buttons, tooltips, menus, dialogs, and toasts are deferred to follow-ups.
 
+> **Scope decision (2026-07-03):** slice 1 rewires **both code and markdown cells** — the
+> full keystone payoff and the direct reading of "replace the textarea for editing." This
+> makes the shadow-DOM testid-forwarding e2e adaptation (§2.2) a required, validate-early
+> task. The narrower staged options (code-only / markdown-only) remain in §8 as fallbacks.
+
 ### What already exists
 
 - `@sema/ui` `sema-textarea` — themed multi-line input (plain; **no live highlighting**).
@@ -180,9 +185,9 @@ Alpine cell.source ─(:value)─▶ sema-code-editor / sema-editable-markdown
 
 ## 8. Open questions
 
-- **Slice scope:** does slice 1 rewire **both** code + markdown cells (requires the
-  shadow-DOM testid-forwarding e2e adaptation), or build all three components but wire only
-  markdown this slice and defer code-cell rewiring? *(the one decision to confirm — see below)*
+- **Slice scope:** ~~both vs. staged~~ **decided: both code + markdown cells** (see §3).
+  Staged fallbacks (code-only / markdown-only) retained here in case the e2e adaptation
+  proves costlier than expected.
 - **Editor highlighter:** reuse `@sema/ui` Shiki synchronously (grammar unification, one
   source of truth) vs. port the playground's `tokenizeSema` (proven zero-latency, but a
   third Sema highlighter to keep in sync with the TextMate grammar). Default: try Shiki-sync,
