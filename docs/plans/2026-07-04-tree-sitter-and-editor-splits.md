@@ -74,11 +74,11 @@ The reference repo does exactly what we want; replicate it for `sema-lisp/zed-se
 | VS Code | `sema-lisp/vscode-sema` | Node/vsce | Marketplace + OpenVSX on `vscode-ext-v*` | none (owns tmLanguage) | `publish-vscode-extension.yml` |
 | IntelliJ | `sema-lisp/intellij-sema` | Gradle/Kotlin | JetBrains Marketplace (manual dispatch) | none | `intellij-build.yml` + `intellij-release.yml` |
 | Emacs | `sema-lisp/emacs-sema` | elisp | MELPA (recipe `:repo`) | none | `editors/emacs/melpa-recipe` |
-| Vim | `sema-lisp/vim-sema` | vimscript | plugin managers (git), optional vim.org | none | — |
-| Neovim | `sema-lisp/nvim-sema` | lua | plugin managers; upstream nvim-treesitter | git url + files | — |
+| Vim | `sema-lisp/sema.vim` | vimscript | plugin managers (git), optional vim.org | none | — |
+| Neovim | `sema-lisp/sema.nvim` | lua | plugin managers; upstream nvim-treesitter | git url + files | — |
 | Helix | upstream PR (+doc) | toml/scm | `helix-editor/helix` PR | git + rev pin | — |
 
-**Naming scheme is a decision (see below):** the reference uses editor-first `zed-applescript`; Vim/Neovim ecosystems conventionally use `sema.vim` / `sema.nvim` (dot form, so plugin managers install cleanly). Table uses `<editor>-sema` as a placeholder — pick per-ecosystem convention before executing.
+**Naming (resolved):** per-ecosystem convention — `<editor>-sema` for Zed/VS Code/IntelliJ/Emacs, and the dot-form `sema.vim` / `sema.nvim` for Vim/Neovim so plugin managers install cleanly.
 
 ## tmLanguage sourcing (fix the live drift)
 
@@ -99,7 +99,7 @@ Recommendation: **(1)** now (kills the drift immediately, no new package), revis
 - **Marketplace publisher identity** — vscode `publisher: "helgesverre"`, JetBrains vendor, Zed author. **Decision:** keep the personal publisher, or create an org publisher? (Org publisher is cleaner long-term but re-publishing under a new publisher ID orphans install stats/reviews — usually keep the existing publisher and just change the repo links.)
 - **README / docs links** across `website/` and each plugin.
 
-**Order:** transfer `HelgeSverre/sema` → `sema-lisp/sema` first (GitHub 301-redirects cover old URLs during the transition, so nothing hard-breaks), then run the reference-update pass, then split editors out. Star-preservation holds for the **transfer** of the main repo; the editor *splits* are new repos (no stars today anyway).
+**Order (resolved):** split the editor/grammar repos out **first**, then transfer `HelgeSverre/sema` → `sema-lisp/sema` **last**, then run the remaining `HelgeSverre → sema-lisp` reference-update pass. GitHub 301-redirects cover old URLs through the transition, so nothing hard-breaks; star-preservation holds for the **transfer** of the main repo (the editor *splits* are new repos with no stars today anyway).
 
 ## Sequencing (each phase separately approved)
 
@@ -111,13 +111,18 @@ Recommendation: **(1)** now (kills the drift immediately, no new package), revis
 6. **Transfer main repo → org**; global `HelgeSverre → sema-lisp` reference pass; update npm Trusted Publisher paths; update marketplace repo links.
 7. **Helix:** keep the standalone `languages.toml` doc; pursue `helix-editor/helix` upstream PR when adoption supports it.
 
-## Open decisions
+## Resolved decisions (2026-07-04)
 
-- **Repo naming scheme:** editor-first (`zed-sema`, `vscode-sema`) vs ecosystem convention (`sema.vim`, `sema.nvim`). Likely mixed: `zed-sema`/`vscode-sema`/`intellij-sema` but `sema.vim`/`sema.nvim`.
-- **`tree-sitter-sema` on npm:** unscoped `tree-sitter-sema` (tree-sitter ecosystem convention, what nvim-treesitter/tooling expect) vs `@sema-lang/tree-sitter-sema` (org-consistent). Editors consume via git either way, so this only affects `npm install` users. Leaning **unscoped** for convention.
-- **tmLanguage sourcing:** CI-fetch (1) vs npm package (2) vs vendored+drift-check (3).
-- **Marketplace publisher identity:** keep personal (`helgesverre`) publisher IDs vs create org publishers (weigh loss of install stats/reviews).
-- **Grammar contribution model:** does the mono stay the place to edit `grammar.js` (and re-sync), or does the standalone repo become the true edit home? (This plan assumes the **standalone repo is the edit home** post-split.)
+- **Repo naming:** per-ecosystem convention — `tree-sitter-sema`, `zed-sema`, `vscode-sema`, `intellij-sema`, `emacs-sema`, **`sema.vim`**, **`sema.nvim`** (dot-form for vim/nvim so plugin managers install cleanly).
+- **`tree-sitter-sema` on npm:** publish **unscoped** (`tree-sitter-sema`) — tree-sitter ecosystem convention (nvim-treesitter/tooling expect the unscoped name). Editors consume via git+commit regardless; npm is only for node-binding users. (The other JS packages stay `@sema-lang/*`.)
+- **tmLanguage sourcing:** **CI-fetch at a pinned tag** — the website prebuild pulls `sema.tmLanguage.json` from `sema-lisp/vscode-sema` at a pinned release tag; no vendored file, no new package. **Reconcile the two already-drifted files first**, then pin.
+- **Grammar edit home:** the **standalone repo (`sema-lisp/tree-sitter-sema`) is the canonical edit home** post-split; the monorepo copy is removed. Contributors PR `grammar.js`/queries there.
+- **Main-repo transfer:** transfer `HelgeSverre/sema` → `sema-lisp/sema` **last**, after the editor/grammar splits (GitHub 301-redirects cover old URLs; stars preserved).
+- **Execution start:** **grammar repo only, as the pilot** — stand up `sema-lisp/tree-sitter-sema` (CI, tags, `v0.1.0`) and repoint the 3 consumers; nothing else moves until reviewed.
+
+## Deferred decisions
+
+- **Marketplace publisher identity:** deferred. Nothing is published yet (a personal JetBrains publisher account exists). Leaning toward a **Sema-branded org publisher**, and — importantly — tying any such publisher (VS Code / JetBrains / OpenVSX) to a **`sema-lang.com` role email** (e.g. `publisher@sema-lang.com`), not a personal address, so the listings can be handed off later. Prerequisite: set up that role email before creating org publishers.
 
 ## Guardrails
 
