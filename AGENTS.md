@@ -97,7 +97,7 @@ The bytecode VM (`sema-vm`) is the **sole evaluator**. All tests run on the VM. 
 
 ## LLM & Agentic Features (sema-llm)
 
-Hard-won conventions — follow these or you will reintroduce shipped bugs (see `docs/llm-agentic-audit.md` and CHANGELOG 1.21.x):
+Hard-won conventions — follow these or you will reintroduce shipped bugs (see `docs/plans/archive/2026-06-21-llm-agentic-audit.md` and CHANGELOG 1.21.x):
 
 - **One canonical request, per-provider translation.** `ChatRequest` (in `sema-llm/src/types.rs`) is the single source of truth that Sema code produces; each provider's `build_request_body` (anthropic/openai/gemini/ollama) translates it to that provider's wire format. **Never branch on provider in Sema code or in builtins** — add the field to `ChatRequest` and map it in each serializer. Example: `:reasoning-effort` → OpenAI `reasoning_effort`, Anthropic extended thinking (`budget_tokens` + max-tokens/temperature adjustments), Gemini `thinkingConfig`.
 - **Tool-result correlation is mandatory.** The agent loop (`run_tool_loop`) must echo the assistant `tool_calls` turn and send results as correlated `ChatMessage::tool_result(id, name, content)`; each serializer maps that to its native shape (OpenAI `role:"tool"`+`tool_call_id`, Anthropic `tool_use`/`tool_result` blocks, Gemini `functionCall`/`functionResponse`). Plain user-text results silently break OpenAI-family providers.
