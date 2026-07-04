@@ -97,4 +97,23 @@ describe('SemaTreeItem', () => {
     row.click()
     expect(selected).toBe(true)
   })
+
+  it('reflects depth and renders top-level parents as uppercase section headers', async () => {
+    document.body.innerHTML = `
+      <sema-tree>
+        <sema-tree-item label="Getting Started" has-children>
+          <sema-tree-item label="hello.sema"></sema-tree-item>
+        </sema-tree-item>
+      </sema-tree>`
+    const [top, leaf] = document.querySelectorAll('sema-tree-item')
+    await top.updateComplete
+    await leaf.updateComplete
+    expect(top.getAttribute('depth')).toBe('0')
+    expect(leaf.getAttribute('depth')).toBe('1')
+    const row = (el: Element) => el.shadowRoot!.querySelector('.row') as HTMLElement
+    expect(getComputedStyle(row(top)).textTransform).toBe('uppercase')
+    expect(getComputedStyle(row(leaf)).textTransform).toBe('none')
+    // parts exposed for consumer styling
+    expect(top.shadowRoot!.querySelector('[part="label"]')).toBeTruthy()
+  })
 })

@@ -69,6 +69,16 @@ export class SemaTreeItem extends SemaElement {
         background: var(--gold-glow, rgba(200, 168, 85, 0.08));
       }
 
+      /* Top-level parent items read as section headers (uppercased, dimmed, sans),
+         distinct from leaves. Gated to depth 0 so nested dirs stay normal. */
+      :host([depth='0'][has-children]) .row {
+        text-transform: uppercase;
+        letter-spacing: 0.06em;
+        font-size: 0.65rem;
+        color: var(--text-tertiary, #5a5448);
+        font-family: inherit;
+      }
+
       .chevron {
         font-size: 0.6rem;
         width: 0.8rem;
@@ -104,7 +114,7 @@ export class SemaTreeItem extends SemaElement {
   @property({ type: Boolean, reflect: true }) expanded = false;
   @property({ type: Boolean, reflect: true }) selected = false;
   @property({ type: Boolean, reflect: true, attribute: 'has-children' }) hasChildren = false;
-  @property({ type: Number }) depth = 0;
+  @property({ type: Number, reflect: true }) depth = 0;
   /** Roving tab stop within the tree (managed by SemaTree / arrow navigation). */
   @property({ type: Boolean, reflect: true }) tabbable = false;
 
@@ -113,7 +123,7 @@ export class SemaTreeItem extends SemaElement {
   render() {
     const padLeft = 0.75 + this.depth * 0.875;
     return html`
-      <div class="row" role="treeitem" tabindex=${this.tabbable ? '0' : '-1'}
+      <div class="row" part="row" role="treeitem" tabindex=${this.tabbable ? '0' : '-1'}
            style="padding-left:${padLeft}rem;"
         aria-label=${this.label || nothing}
         aria-expanded=${this.hasChildren || this._hasSlotChildren ? String(this.expanded) : nothing}
@@ -122,7 +132,7 @@ export class SemaTreeItem extends SemaElement {
            @click=${this._onClick}
            @keydown=${this._onKeydown}>
         <span class="chevron">&#x25BE;</span>
-        <span class="label">${this.label}<slot name="label"></slot></span>
+        <span class="label" part="label">${this.label}<slot name="label"></slot></span>
       </div>
       <div class="children"><slot @slotchange=${this._onSlotChange}></slot></div>
     `;
