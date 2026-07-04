@@ -124,7 +124,11 @@ export class SemaPage extends SemaElement {
     body.style.padding = '0';
     body.style.background = 'var(--bg, #0c0c0c)';
     body.style.color = 'var(--text-secondary, #a09888)';
-    body.style.fontFamily = 'var(--serif)';
+    // The token vars live on this element's :host, which is a child of <body>,
+    // so body can't see them — every body var() needs a literal fallback (as
+    // --bg/--text-secondary above do). Without it, font-family resolved to the
+    // UA default serif (Times) instead of the brand Cormorant.
+    body.style.fontFamily = "var(--serif, 'Cormorant', Georgia, serif)";
     body.style.fontSize = '18px';
     body.style.lineHeight = '1.7';
     body.style.setProperty('-webkit-font-smoothing', 'antialiased');
