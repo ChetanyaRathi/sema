@@ -113,6 +113,12 @@ describe('SemaTreeItem', () => {
     const row = (el: Element) => el.shadowRoot!.querySelector('.row') as HTMLElement
     expect(getComputedStyle(row(top)).textTransform).toBe('uppercase')
     expect(getComputedStyle(row(leaf)).textTransform).toBe('none')
+    // The category header keeps the mono family — it must NOT inherit the
+    // consumer's ambient font (regression: a serif page body, e.g. sema-page's
+    // Cormorant, made top-level folders render in serif).
+    const topFont = getComputedStyle(row(top)).fontFamily
+    expect(topFont.toLowerCase()).toContain('mono')
+    expect(topFont).toBe(getComputedStyle(row(leaf)).fontFamily)
     // parts exposed for consumer styling
     expect(top.shadowRoot!.querySelector('[part="label"]')).toBeTruthy()
   })
