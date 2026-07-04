@@ -129,4 +129,17 @@ describe('SemaTooltip', () => {
     expect(document.activeElement).not.toBe(btn)
     expect(el.matches(':focus-within')).toBe(false)
   })
+
+  it('wraps long content instead of truncating it', async () => {
+    document.body.innerHTML =
+      '<sema-tooltip content="Upload files into the virtual filesystem"><button>U</button></sema-tooltip>'
+    const el = document.querySelector('sema-tooltip')!
+    await el.updateComplete
+    const tip = el.shadowRoot!.querySelector('.tooltip') as HTMLElement
+    const cs = getComputedStyle(tip)
+    expect(cs.whiteSpace).toBe('normal') // not nowrap
+    expect(cs.textOverflow).not.toBe('ellipsis')
+    // full text present (not clipped to a shorter string)
+    expect(tip.textContent).toContain('virtual filesystem')
+  })
 })

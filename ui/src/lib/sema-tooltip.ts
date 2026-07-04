@@ -24,13 +24,15 @@ export class SemaTooltip extends SemaElement {
         color: var(--text-primary, #d8d0c0);
         border: 1px solid var(--border, #1e1e1e);
         border-radius: var(--radius-md, 4px);
-        white-space: nowrap;
+        /* Short tips stay one line; longer ones WRAP within max-width rather than
+           truncating with an ellipsis (a tooltip must show its full text). */
+        white-space: normal;
+        overflow-wrap: break-word;
+        width: max-content;
         pointer-events: none;
         opacity: 0;
         transition: opacity 0.15s;
         max-width: 20em;
-        overflow: hidden;
-        text-overflow: ellipsis;
       }
 
       :host(:hover) .tooltip,

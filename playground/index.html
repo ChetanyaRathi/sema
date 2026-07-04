@@ -91,8 +91,8 @@
     <div class="pane output-pane">
       <div class="pane-header">
         <span class="pane-title">Output</span>
-        <sema-tooltip content="Clear output" placement="right">
-          <sema-button variant="ghost" id="clear-btn" data-testid="clear-btn">Clear</sema-button>
+        <sema-tooltip content="Clear output" placement="left">
+          <sema-button variant="ghost" size="sm" id="clear-btn" data-testid="clear-btn">Clear</sema-button>
         </sema-tooltip>
       </div>
       <div id="output" data-testid="output">
@@ -111,8 +111,8 @@
             <label data-tooltip="sessionStorage, cleared when tab closes"><input type="radio" name="backend" value="session">Session</label>
             <label data-tooltip="IndexedDB, persistent with larger storage" data-tooltip-pos="right"><input type="radio" name="backend" value="indexeddb">IDB</label>
           </div>
-          <sema-tooltip content="Upload files into the virtual filesystem" placement="bottom"><sema-button variant="ghost" id="upload-btn">Upload</sema-button></sema-tooltip>
-          <sema-tooltip content="Delete all files from the virtual filesystem" placement="right"><sema-button variant="ghost" id="clear-vfs-btn">Clear</sema-button></sema-tooltip>
+          <sema-tooltip content="Upload files into the virtual filesystem" placement="bottom"><sema-button variant="ghost" size="sm" id="upload-btn">Upload</sema-button></sema-tooltip>
+          <sema-tooltip content="Delete all files from the virtual filesystem" placement="left"><sema-button variant="ghost" size="sm" id="clear-vfs-btn">Clear</sema-button></sema-tooltip>
           <sema-tooltip content="Collapse files panel" placement="right"><sema-button variant="icon" id="files-collapse-btn" aria-label="Collapse files panel">▾</sema-button></sema-tooltip>
         </div>
       </div>
