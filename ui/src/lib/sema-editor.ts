@@ -65,6 +65,7 @@ export class SemaEditor extends SemaElement {
         line-height: 1.7;
         padding: var(--space-sm, 8px) 0;
         text-align: right;
+        border-right: 1px solid var(--border, #1e1e1e);
       }
       .gl {
         position: relative;
@@ -76,6 +77,7 @@ export class SemaEditor extends SemaElement {
       }
       .gl.cur {
         color: var(--gold, #d4a537);
+        background: var(--gold-glow, rgba(200, 168, 85, 0.15));
       }
       .gl.bp::before {
         content: '';
@@ -123,9 +125,21 @@ export class SemaEditor extends SemaElement {
       }
       .ln {
         display: block;
+        position: relative;
       }
       .ln.cur {
-        background: var(--bg-line-highlight, rgba(212, 165, 55, 0.09));
+        background: var(--bg-line-highlight, rgba(200, 168, 85, 0.1));
+      }
+      /* Gold accent bar at the gutter/code boundary for the current/debug line.
+         .ln sits inside .hl's left padding, so reach back to the code-area edge. */
+      .ln.cur::before {
+        content: '';
+        position: absolute;
+        top: 0;
+        bottom: 0;
+        left: calc(-1 * var(--space-md, 12px));
+        width: 2px;
+        background: var(--gold, #d4a537);
       }
       textarea {
         position: relative;

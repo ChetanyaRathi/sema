@@ -153,4 +153,15 @@ describe('sema-editor', () => {
     await el.updateComplete
     expect(gutterLines(el).length).toBe(0)
   })
+
+  it('gutter has a divider border and the current line renders an accented .ln.cur', async () => {
+    const el = await mount('line-numbers current-line="2"')
+    el.value = 'a\nb\nc'
+    await el.updateComplete
+    const gutter = el.shadowRoot!.querySelector('.gutter') as HTMLElement
+    expect(parseFloat(getComputedStyle(gutter).borderRightWidth)).toBeGreaterThan(0)
+    // current code line (line 2) is marked
+    const cur = [...el.shadowRoot!.querySelectorAll('.ln')][1]
+    expect(cur.classList.contains('cur')).toBe(true)
+  })
 })
