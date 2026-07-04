@@ -1,4 +1,4 @@
-.PHONY: example-notebooks-async llm-stress all build release web-runtime test-web-e2e build-pgo pgo-profile install install-pgo uninstall test test-lsp test-embedding-bench test-http test-llm check clippy fmt fmt-check clean run lint lint-links docs docs-check update-pricing examples examples-vm smoke-bytecode rag-demo test-providers fuzz fuzz-reader fuzz-eval fuzz-grammar fuzz-grammar-emit setup docs-search-gate bench-1m bench-10m bench-100m site-dev site-build site-preview site-deploy deploy coverage coverage-html bench bench-vm bench-save bench-suite bench-closure bench-numeric bench-compare bench-baseline profile profile-vm ts-setup ts-generate ts-test ts-playground js-lib-build js-lib-dev sema-web-example sema-web-example-build
+.PHONY: example-notebooks-async llm-stress all build release web-runtime test-web-e2e build-pgo pgo-profile install install-pgo uninstall test test-lsp test-embedding-bench test-http test-llm check clippy fmt fmt-check clean run lint lint-links docs docs-check update-pricing examples examples-vm smoke-bytecode icons-assets icons-flatten icons-check rag-demo test-providers fuzz fuzz-reader fuzz-eval fuzz-grammar fuzz-grammar-emit setup docs-search-gate bench-1m bench-10m bench-100m site-dev site-build site-preview site-deploy deploy coverage coverage-html bench bench-vm bench-save bench-suite bench-closure bench-numeric bench-compare bench-baseline profile profile-vm ts-setup ts-generate ts-test ts-playground js-lib-build js-lib-dev sema-web-example sema-web-example-build
 
 SEMA_WEB_EXAMPLE_DIR := examples/sema-web-app
 
@@ -153,6 +153,27 @@ example-notebook-serve: build
 
 smoke-bytecode: build
 	@./scripts/smoke-bytecode.sh ./target/debug/sema
+
+# assets/icons/svg/ is the canonical source of truth for every brand/editor icon.
+# `icons-assets` renders the png/ rasters and syncs every consumer copy (favicons,
+# VS Code marketplace icon, IntelliJ plugin + file icons, website showcase).
+# Needs librsvg (rsvg-convert). See assets/icons/README.md.
+icons-assets:
+	@python3 scripts/gen-icon-assets.py
+	@python3 scripts/gen-brand-assets.py
+
+# Icons draw their glyphs with <text font-family="JetBrains Mono"/Georgia>, which
+# only renders where the font is installed AND applied — broken as a distributable
+# icon. `icons-flatten` bakes the text into self-contained <path> outlines (needs
+# JetBrains Mono Bold+ExtraBold + Georgia installed + `pip install fonttools brotli`).
+ICON_SVGS := $(wildcard assets/icons/svg/*.svg)
+
+icons-flatten:
+	@python3 scripts/flatten-svg-text.py $(ICON_SVGS)
+
+# CI-safe guard: fails if any canonical icon still carries an un-flattened <text>.
+icons-check:
+	@python3 scripts/flatten-svg-text.py --check $(ICON_SVGS)
 
 # Hermetic gate: docs_search must work from the binary alone in a FROM-scratch
 # container (no source, no uncompiled docs, --network none). Requires docker + jq.
