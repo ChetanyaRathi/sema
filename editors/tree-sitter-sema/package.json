@@ -5,10 +5,10 @@
   "main": "bindings/node",
   "repository": {
     "type": "git",
-    "url": "https://github.com/helgesverre/tree-sitter-sema.git"
+    "url": "https://github.com/HelgeSverre/tree-sitter-sema.git"
   },
   "keywords": ["sema", "tree-sitter", "parser", "lisp"],
-  "author": "Helge Sverre",
+  "author": "Helge Sverre <helge.sverre@gmail.com>",
   "license": "MIT",
   "dependencies": {
     "nan": "^2.18.0"

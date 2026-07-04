@@ -55,7 +55,9 @@ export default defineConfig({
   },
 
   sitemap: {
-    hostname: 'https://sema-lang.com'
+    hostname: 'https://sema-lang.com',
+    // /icons is an internal, unlinked manifest — keep it out of the sitemap.
+    transformItems: (items) => items.filter((i) => !/(^|\/)icons(\.html)?$/.test(i.url))
   },
 
   head: [

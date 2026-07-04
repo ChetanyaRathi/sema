@@ -20,7 +20,7 @@
       }
     ],
     "links": {
-      "repository": "https://github.com/helgesverre/tree-sitter-sema"
+      "repository": "https://github.com/HelgeSverre/tree-sitter-sema"
     }
   },
   "bindings": {

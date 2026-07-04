@@ -1,7 +1,7 @@
 <idea-plugin>
     <id>com.sema.language</id>
     <name>Sema</name>
-    <vendor url="https://sema-lang.com">Helge Sverre</vendor>
+    <vendor email="helge.sverre@gmail.com" url="https://sema-lang.com">Helge Sverre</vendor>
     <description><![CDATA[
         <p>Language support for <a href="https://sema-lang.com">Sema</a>, a Lisp dialect with first-class LLM primitives.</p>
         <ul>

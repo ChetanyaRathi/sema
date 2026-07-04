@@ -753,7 +753,7 @@ Mistral fallback, caching, and budgets).
 
 ## 1.21.0
 
-LLM/agentic bulletproofing. A multi-agent audit (see `docs/llm-agentic-audit.md`)
+LLM/agentic bulletproofing. A multi-agent audit (see `docs/plans/archive/2026-06-21-llm-agentic-audit.md`)
 found the headline agent loop broken on OpenAI-family providers and several
 robustness gaps; this release fixes them, hardens resilience, and adds
 cross-provider reasoning control — all verified live against OpenAI, Anthropic,
