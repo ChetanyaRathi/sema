@@ -1,4 +1,4 @@
-.PHONY: example-notebooks-async llm-stress all build release web-runtime test-web-e2e build-pgo pgo-profile install install-pgo uninstall test test-lsp test-embedding-bench test-http test-llm check clippy fmt fmt-check clean run lint lint-links docs docs-check update-pricing examples examples-vm smoke-bytecode icons-assets icons-flatten icons-check rag-demo test-providers fuzz fuzz-reader fuzz-eval fuzz-grammar fuzz-grammar-emit setup docs-search-gate bench-1m bench-10m bench-100m site-dev site-build site-preview site-deploy deploy coverage coverage-html bench bench-vm bench-save bench-suite bench-closure bench-numeric bench-compare bench-baseline profile profile-vm ts-setup ts-generate ts-test ts-playground js-lib-build js-lib-dev sema-web-example sema-web-example-build
+.PHONY: example-notebooks-async llm-stress all build release web-runtime test-web-e2e build-pgo pgo-profile install install-pgo uninstall test test-lsp test-embedding-bench test-http test-llm check clippy fmt fmt-check clean run lint lint-links docs docs-check update-pricing examples examples-vm smoke-bytecode icons-assets icons-flatten icons-check rag-demo test-providers fuzz fuzz-reader fuzz-eval fuzz-grammar fuzz-grammar-emit setup docs-search-gate bench-1m bench-10m bench-100m site-dev site-build site-preview site-deploy deploy coverage coverage-html bench bench-vm bench-save bench-suite bench-closure bench-numeric bench-compare bench-baseline profile profile-vm js-lib-build js-lib-dev sema-web-example sema-web-example-build
 
 SEMA_WEB_EXAMPLE_DIR := examples/sema-web-app
 
@@ -394,21 +394,3 @@ profile:
 
 profile-vm:
 	@$(MAKE) profile PROFILE_MODE=vm PROFILE_BENCH=$(PROFILE_BENCH)
-
-# Tree-sitter grammar
-TS_DIR := editors/tree-sitter-sema
-
-ts-setup:
-	cd $(TS_DIR) && npm install
-
-ts-generate: $(TS_DIR)/node_modules
-	cd $(TS_DIR) && npx tree-sitter generate
-
-$(TS_DIR)/node_modules:
-	cd $(TS_DIR) && npm install
-
-ts-test: ts-generate
-	cd $(TS_DIR) && npx tree-sitter test
-
-ts-playground: ts-generate
-	cd $(TS_DIR) && npx tree-sitter build --wasm && npx tree-sitter playground

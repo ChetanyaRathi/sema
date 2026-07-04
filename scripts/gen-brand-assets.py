@@ -2,7 +2,7 @@
 """Generate website/.vitepress/theme/brandAssets.js from the canonical icon SVGs.
 
 The /icons showcase page must inline every icon as a string (the Vercel build
-only uploads website/, so it can't import from assets/ or editors/). This copies
+only uploads website/, so it can't import from assets/ at the repo root). This copies
 the canonical flattened SVGs from assets/icons/svg/ into a JS module so the
 showcase always matches what actually ships. Run after changing any source icon.
 """

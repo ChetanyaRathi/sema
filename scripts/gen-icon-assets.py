@@ -8,7 +8,11 @@ This script:
   1. verifies each source is flattened,
   2. renders PNGs at every needed size into `assets/icons/png/`,
   3. syncs SVG + PNG copies out to the places that actually consume them
-     (favicons, VS Code marketplace icon, IntelliJ plugin + file icons, etc.).
+     (favicons, brand logos, avatars for the website/playground/pkg).
+
+Editor plugins live in their own repos (`sema-lisp/<editor>-sema`) and carry
+their own icon copies; they pull from the canonical SVGs in `assets/icons/svg/`
+out-of-band, so this script no longer writes into any editor tree.
 
 Edit the SVGs in assets/icons/svg/, then re-run: `make icons-assets`. Consumers
 are always overwritten from canonical, so this folder is authoritative.
@@ -43,36 +47,16 @@ SVG_CONSUMERS = {
         "website/public/favicon.svg",
         "pkg/static/favicon.svg",
         "playground/favicon.svg",
-        "editors/intellij/src/main/resources/META-INF/pluginIcon.svg",
-        "editors/intellij/src/main/resources/META-INF/pluginIcon_dark.svg",
     ],
     "sema-mark-square": ["website/public/avatar.svg"],
     "sema-logotype": [
         "website/public/logo.svg",   # VitePress themeConfig.logo
         "playground/logo.svg",
     ],
-    "sema-file-light": [
-        "editors/vscode/sema/icons/sema-file-light.svg",
-        "editors/intellij/src/main/resources/icons/sema.svg",
-    ],
-    "sema-file-dark": [
-        "editors/vscode/sema/icons/sema-file-dark.svg",
-        "editors/intellij/src/main/resources/icons/sema_dark.svg",
-    ],
-    "semac-file": ["editors/intellij/src/main/resources/icons/semac.svg"],
-    "sema-notebook-file-light": [
-        "editors/intellij/src/main/resources/icons/sema-notebook.svg",
-        "editors/vscode/sema/icons/sema-notebook-light.svg",
-    ],
-    "sema-notebook-file-dark": [
-        "editors/intellij/src/main/resources/icons/sema-notebook_dark.svg",
-        "editors/vscode/sema/icons/sema-notebook-dark.svg",
-    ],
 }
 
 # rendered PNG (name-SIZE) -> consumer path.
 PNG_CONSUMERS = {
-    "sema-mark-rounded-512": "editors/vscode/sema/icon.png",  # VS Code / Open VSX marketplace icon
     "sema-mark-square-512": "website/public/avatar.png",
 }
 

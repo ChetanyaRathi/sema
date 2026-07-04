@@ -1,7 +1,7 @@
 # tree-sitter-sema + Editor Plugin Splits — Research & Plan
 
 **Date:** 2026-07-04
-**Status:** Draft — research/planning only, **no repo moves, no file changes executed**
+**Status:** **DONE (2026-07-05)** — all editor/grammar repos live under `sema-lisp` with green CI; `editors/` removed from the mono; old `HelgeSverre/tree-sitter-sema` mirror retired. See the "Status update" in `docs/plans/2026-07-04-repo-split-org.md`. This doc is kept as the executed record.
 **Related:** `docs/plans/2026-07-04-repo-split-org.md` (org strategy), `docs/plans/2026-02-16-editor-plugin-publishing.md` (per-registry publish targets)
 
 Reference model for the Zed pattern: **`HelgeSverre/zed-applescript`** + **`HelgeSverre/tree-sitter-applescript`** (a working editor-plugin/grammar split by the same author). This plan mirrors that proven structure.

@@ -1,9 +1,15 @@
 # Repo Split & GitHub Org Migration Plan
 
-**Date:** 2026-07-04
-**Status:** Draft — planning/research only, **no repo moves executed yet**
-**Implementation:** Not started
+**Date:** 2026-07-04 (status updated 2026-07-05)
+**Status:** **Tier B (editors + grammar) DONE**; Tier C decided (below), not executed; main-repo transfer pending.
 **Related:** `docs/plans/2026-02-16-editor-plugin-publishing.md` (per-editor publishing targets — this plan is the *repo-structure* prerequisite for those workflows)
+
+## Status update (2026-07-05)
+
+- **Tier B complete.** The `sema-lisp` org exists and hosts nine live repos, each with its own green CI/publishing: `tree-sitter-sema`, `vscode-sema`, `zed-sema`, `intellij-sema`, `emacs-sema`, `helix-sema`, `sema.nvim`, `sema.vim`, `sublime-sema` (Sublime added post-plan). The three tree-sitter consumers (Zed/Helix/nvim) point at `sema-lisp/tree-sitter-sema` with pinned commits/tags.
+- **`editors/` removed from the mono** in this pass, along with the editor CI workflows (`subtree-split.yml`, `publish-vscode-extension.yml`, `intellij-build.yml`, `intellij-release.yml`), the Makefile `ts-*` targets, and the `codecov.yml` `editors/**` ignore. Editor docs (`website/docs/editors.md`, root `README.md`) now point at the org repos.
+- **Old `HelgeSverre/tree-sitter-sema` mirror** retired/deleted (0 stars, mirror-only; superseded by `sema-lisp/tree-sitter-sema`).
+- **Still pending:** Tier C execution (below), the main-repo transfer `HelgeSverre/sema` → `sema-lisp/sema` (last), and the outside-contributor PR (skipped for now).
 
 ## Goal
 
@@ -68,11 +74,19 @@ Each plugin's publishing target (Marketplace/OpenVSX, JetBrains, MELPA, etc.) is
 - [ ] Confirm the registry publish workflow can run from a repo rooted at the plugin (this is exactly what the split provides).
 - [ ] Decide grammar consumption: pinned npm version (default) vs submodule (only if forced).
 
-## Tier C — web & UI
+## Tier C — web, UI & registry (decided 2026-07-05)
 
-- **`ui` → own repo + npm package** (`@sema/ui` or org-scoped). This is the real fix for the current *temporary* workaround where `ui/dist` is copied/vendored into `website/`, `playground/`, etc. (AGENTS.md documents that the brand-page `<sema-code-typer>` showcase is currently commented out precisely because it reaches outside `website/` to the repo-root `@sema/ui` bundle, which breaks Vercel's `website/`-only upload). Publishing `ui` to npm lets `website`/`playground` add it as a normal dependency — no out-of-folder imports, re-enabling the commented-out showcase.
-- **`website` + `playground`** stay **coupled** — either kept together in the mono, or moved together to one repo later. Low priority; do only after Tier B proves the flow. Preserve the Vercel `website/`-only-upload constraint: once `ui` is an npm dep, the monorepo-import gotcha for the UI bundle disappears.
-- **`pkg`, `packages`** — inventory before deciding; likely stay in the mono unless a clear consumer benefits from separation.
+Decision reached after inventorying the folders. Coupling, not folder count, drives each call. **Nothing here is executed yet — this section records the target, per the "no moves until I say so" guardrail.**
+
+### `ui` → **SPLIT** (own repo + npm package), medium priority
+`ui` is `@sema/ui` (v0.1.0, `private: true`, a web-components/Shiki bundle). Today it's **vendored by copy** into four places (`website/.vitepress/`, `pkg/static/`, `pkg/prototypes/`, and its own `ui/src/grammars/` tmLanguage copy) — the same drift hazard the grammar had. Publishing it as `@sema-lang/ui` and consuming it as a normal npm dep is the real fix: it kills the out-of-folder imports, lets `website`/`playground` depend on it cleanly, and re-enables the `<sema-code-typer>` brand showcase currently commented out in `BrandGuide.vue` (it breaks Vercel's `website/`-only upload by reaching up to the repo-root bundle). **Target repo:** `sema-lisp/ui`; **npm:** `@sema-lang/ui`. Do after the main-repo transfer settles; it's the highest-value Tier C item.
+
+### `website` + `playground` → **KEEP coupled, KEEP in mono** (for now)
+Both are Vercel-deployed and share brand assets, the tmLanguage grammar, and (soon) the `@sema/ui` bundle. `playground` is the sema.run WASM playground built from `crates/sema-wasm`, so it is genuinely coupled to the Rust workspace (rebuilt when the language changes) — a point *for* keeping it near the crates. `website` has the `website/`-only Vercel upload constraint. Recommendation: **leave both in the mono.** Their only cross-folder couplings (tmLanguage, `@sema/ui`) become version pins once `ui` is on npm; at that point moving `website`+`playground` *together* to one repo is possible but low-value. Revisit only if web contributors need an independent surface.
+
+### `pkg` (package registry) → **SPLIT-ELIGIBLE, LOW priority — keep in mono until it needs its own surface**
+New finding: `pkg` (`sema-pkg`) is a **self-contained Rust application with its own `Cargo.lock`** — it is *not* a member of the root cargo workspace. It ships as a single binary with SQLite, has its own `Dockerfile`/`docker-compose`, `fly.toml` (independent fly.io deploy), and `e2e/` suite. Coupling to `crates/*` is **low**: it talks to Sema over HTTP/CLI, not via path deps, so splitting it would *not* incur the cross-repo version-juggling that keeps the crates together (contrast Tier A). That makes it a clean Tier-B-style split candidate **mechanically**. But there's no pressure yet — no external contributors, and its release cadence (a fly.io deploy) is already decoupled from the crates release. **Recommendation:** keep it in the mono for now; split to `sema-lisp/sema-pkg` only when it wants an independent contribution/issue surface or a separate release pipeline. It carries one of the vendored tmLanguage copies (`pkg/static`, `pkg/prototypes`) — fold those into the `@sema/ui`/pinned-grammar story when `ui` splits.
+  - `packages/` (if present): inventory at split time; JS packages already publish under `@sema-lang/*`, so only repo paths change.
 
 ## Phasing (execution order — each step separately approved)
 

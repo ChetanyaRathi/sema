@@ -1,5 +1,5 @@
 import { defineConfig } from 'vitepress'
-// Canonical source: editors/vscode/sema/syntaxes/sema.tmLanguage.json
+// Vendored copy of the canonical grammar in sema-lisp/vscode-sema (syntaxes/sema.tmLanguage.json)
 import semaLang from './sema.tmLanguage.json'
 // Brand syntax theme — matches the hand-coded snippets + playground palette
 // (gold keywords, green strings, orange numbers, cyan :keywords, dim parens).

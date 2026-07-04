@@ -28,8 +28,9 @@ make icons-assets     # render png/ + sync every consumer copy
 ```
 
 This runs `scripts/gen-icon-assets.py`: it verifies each SVG is flattened,
-renders `png/` at all sizes, and overwrites the consumer copies (favicons,
-`editors/vscode/sema/icon.png`, IntelliJ `pluginIcon.svg`, file icons, …).
+renders `png/` at all sizes, and overwrites the consumer copies (website /
+playground / pkg favicons, logos, and avatars). Editor plugins live in their own
+repos and carry their own icon copies, pulling from the canonical SVGs here.
 
 The website `/icons` showcase inlines these via
 `scripts/gen-brand-assets.py` → `website/.vitepress/theme/brandAssets.js`.
