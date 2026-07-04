@@ -2,7 +2,7 @@
 
 Tree-sitter grammar for [Sema](https://sema-lang.com), a Lisp with LLM primitives.
 
-> **Note:** This package is auto-published as a read-only mirror from the main [Sema monorepo](https://github.com/helgesverre/sema).
+> **Note:** This package is auto-published as a read-only mirror from the main [Sema monorepo](https://github.com/HelgeSverre/sema).
 
 ## Usage
 
@@ -34,7 +34,7 @@ The grammar produces the following node types:
 ## Links
 
 - [Sema Language](https://sema-lang.com)
-- [Sema Repository](https://github.com/helgesverre/sema)
+- [Sema Repository](https://github.com/HelgeSverre/sema)
 
 ## License
 

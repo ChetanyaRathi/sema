@@ -2,10 +2,10 @@ id = "sema"
 name = "Sema"
 version = "0.1.0"
 schema_version = 1
-description = "Sema programming language support — a Lisp dialect with LLM primitives."
-repository = "https://github.com/helgesverre/sema"
+description = "Language support for Sema, a Lisp dialect with first-class LLM primitives."
+repository = "https://github.com/HelgeSverre/sema"
 authors = ["Helge Sverre <helge.sverre@gmail.com>"]
 
 [grammars.sema]
-repository = "https://github.com/helgesverre/tree-sitter-sema"
+repository = "https://github.com/HelgeSverre/tree-sitter-sema"
 rev = "main"

@@ -3,7 +3,7 @@
 Syntax highlighting and language support for [Sema](https://sema-lang.com) (`.sema` files) in the [Zed](https://zed.dev) editor.
 
 - **Homepage**: [sema-lang.com](https://sema-lang.com)
-- **Source**: [github.com/helgesverre/sema](https://github.com/helgesverre/sema)
+- **Source**: [github.com/HelgeSverre/sema](https://github.com/HelgeSverre/sema)
 - **Author**: Helge Sverre
 
 ## Features
@@ -32,7 +32,7 @@ Syntax highlighting and language support for [Sema](https://sema-lang.com) (`.se
 Clone the Sema repository and point Zed at the extension directory:
 
 ```sh
-git clone https://github.com/helgesverre/sema.git
+git clone https://github.com/HelgeSverre/sema.git
 # Then install as dev extension pointing to sema/editors/zed/
 ```
 
@@ -84,4 +84,4 @@ This requires the `sema` CLI to be installed and available on your `PATH` (see [
 
 ## How It Works
 
-This extension uses the dedicated **[tree-sitter-sema](https://github.com/helgesverre/tree-sitter-sema)** grammar for parsing `.sema` files. The grammar provides native support for Sema-specific syntax — keyword literals (`:name`), hash maps, vectors, and more. The query files layer Sema-specific captures on top — highlighting LLM primitives, slash-namespaced builtins (`string/trim`, `llm/chat`), and special forms like `defagent` and `deftool`.
+This extension uses the dedicated **[tree-sitter-sema](https://github.com/HelgeSverre/tree-sitter-sema)** grammar for parsing `.sema` files. The grammar provides native support for Sema-specific syntax — keyword literals (`:name`), hash maps, vectors, and more. The query files layer Sema-specific captures on top — highlighting LLM primitives, slash-namespaced builtins (`string/trim`, `llm/chat`), and special forms like `defagent` and `deftool`.

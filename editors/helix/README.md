@@ -3,10 +3,10 @@
 Syntax highlighting and language configuration for [Sema](https://sema-lang.com) (`.sema` files) in the [Helix](https://helix-editor.com) editor.
 
 - **Homepage**: [sema-lang.com](https://sema-lang.com)
-- **Source**: [github.com/helgesverre/sema](https://github.com/helgesverre/sema)
+- **Source**: [github.com/HelgeSverre/sema](https://github.com/HelgeSverre/sema)
 - **Author**: Helge Sverre
 
-This configuration uses the dedicated **[tree-sitter-sema](https://github.com/helgesverre/tree-sitter-sema)** grammar for parsing `.sema` files, with Sema-specific highlight queries for proper keyword, builtin, and LLM primitive highlighting.
+This configuration uses the dedicated **[tree-sitter-sema](https://github.com/HelgeSverre/tree-sitter-sema)** grammar for parsing `.sema` files, with Sema-specific highlight queries for proper keyword, builtin, and LLM primitive highlighting.
 
 ## Features
 
@@ -57,7 +57,7 @@ hx examples/hello.sema
 
 ## How It Works
 
-Helix's `grammar = "sema"` setting tells Helix to parse `.sema` files using the [tree-sitter-sema](https://github.com/helgesverre/tree-sitter-sema) grammar, which provides native support for Sema-specific syntax like keyword literals (`:name`), hash maps, and vectors. The custom query files in `queries/sema/` provide Sema-specific captures — adding highlighting for LLM primitives, slash-namespaced builtins, keyword literals, and special forms like `defagent` and `deftool`.
+Helix's `grammar = "sema"` setting tells Helix to parse `.sema` files using the [tree-sitter-sema](https://github.com/HelgeSverre/tree-sitter-sema) grammar, which provides native support for Sema-specific syntax like keyword literals (`:name`), hash maps, and vectors. The custom query files in `queries/sema/` provide Sema-specific captures — adding highlighting for LLM primitives, slash-namespaced builtins, keyword literals, and special forms like `defagent` and `deftool`.
 
 ## Troubleshooting
 
