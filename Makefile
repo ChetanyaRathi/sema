@@ -31,7 +31,7 @@ uninstall:
 	cargo uninstall sema-lang
 
 test:
-	cargo test
+	cargo nextest run
 
 test-lsp: release
 	cargo test -p sema-lsp
@@ -41,7 +41,7 @@ test-embedding-bench:
 	cargo test -p sema-lang --test embedding_bench -- --ignored --nocapture
 
 test-http:
-	cargo test -p sema-lang --test http_test -- --ignored --nocapture
+	cargo nextest run -p sema-lang --test http_test --run-ignored only --no-capture
 
 test-llm:
 	cargo test -p sema-lang --test llm_test -- --ignored --nocapture
