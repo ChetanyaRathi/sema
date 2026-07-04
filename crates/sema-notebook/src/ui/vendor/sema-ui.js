@@ -885,18 +885,20 @@ gs.shadowRootOptions = {
       /* size=sm — compact toolbar metrics; placed last so it overrides the
          form-scale text variants (secondary/ghost/primary) on equal specificity. */
       :host([size="sm"]) .button {
-        padding: 0.3rem 0.9rem;
+        height: var(--control-height-sm, 22px);
+        box-sizing: border-box;
+        padding: 0 0.9rem;
         font-size: 0.7rem;
         border-radius: var(--radius-sm, 3px);
       }
-      /* icon is a fixed square — sm shrinks the box (not the text padding). */
+      /* icon is a fixed square — sm shrinks the box to the shared control height. */
       :host([size="sm"][variant="icon"]) {
-        width: 22px;
-        height: 22px;
+        width: var(--control-height-sm, 22px);
+        height: var(--control-height-sm, 22px);
       }
       :host([size="sm"][variant="icon"]) .button {
-        width: 22px;
-        height: 22px;
+        width: var(--control-height-sm, 22px);
+        height: var(--control-height-sm, 22px);
         padding: 0;
       }
     `
@@ -1184,10 +1186,14 @@ _o.styles = [
         display: inline-block;
       }
       .toggle {
+        display: flex;
+        align-items: center;
+        height: var(--control-height-sm, 22px);
+        box-sizing: border-box;
         font-family: var(--mono, 'JetBrains Mono', monospace);
         font-size: 0.65rem;
         letter-spacing: 0.04em;
-        padding: 0.2rem 0.45rem;
+        padding: 0 0.55rem;
         border-radius: 3px;
         cursor: pointer;
         color: var(--text-tertiary, #5a5448);

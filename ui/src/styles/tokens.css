@@ -61,6 +61,10 @@
   --radius-pill: 20px;
   --radius-full: 50%;
 
+  /* ── Control sizing ── shared height for compact toolbar controls
+     (sm buttons, toggles) so they line up on one row. */
+  --control-height-sm: 22px;
+
   /* ── Focus ring ── shared :focus-visible treatment (gold outline) */
   --focus-ring-color: var(--gold);
   --focus-ring-color-subtle: var(--gold-dim);

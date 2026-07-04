@@ -86,5 +86,17 @@ describe('SemaButton', () => {
       parseFloat(getComputedStyle(el.shadowRoot!.querySelector('button')!).fontSize)
     // 0.7rem (~11px) is smaller than secondary's default 0.85rem (~13.6px)
     expect(fs(sm)).toBeLessThan(fs(md))
+    // normalized compact height (--control-height-sm, 22px fallback)
+    const smH = Math.round(sm.shadowRoot!.querySelector('button')!.getBoundingClientRect().height)
+    expect(smH).toBe(22)
+  })
+
+  it('size="sm" icon variant is a 22px square', async () => {
+    document.body.innerHTML = '<sema-button variant="icon" size="sm" aria-label="x">▾</sema-button>'
+    const el = document.querySelector('sema-button')!
+    await el.updateComplete
+    const rect = el.shadowRoot!.querySelector('button')!.getBoundingClientRect()
+    expect(Math.round(rect.height)).toBe(22)
+    expect(Math.round(rect.width)).toBe(22)
   })
 })

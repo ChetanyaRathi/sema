@@ -10,10 +10,14 @@ export class SemaToggle extends SemaElement {
         display: inline-block;
       }
       .toggle {
+        display: flex;
+        align-items: center;
+        height: var(--control-height-sm, 22px);
+        box-sizing: border-box;
         font-family: var(--mono, 'JetBrains Mono', monospace);
         font-size: 0.65rem;
         letter-spacing: 0.04em;
-        padding: 0.2rem 0.45rem;
+        padding: 0 0.55rem;
         border-radius: 3px;
         cursor: pointer;
         color: var(--text-tertiary, #5a5448);
