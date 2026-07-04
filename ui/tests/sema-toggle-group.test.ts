@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it } from 'vitest'
 import '../src/lib/sema-toggle.js'
 import '../src/lib/sema-toggle-group.js'
+import '../src/lib/sema-tooltip.js'
 import type { SemaToggle } from '../src/lib/sema-toggle.js'
 
 beforeEach(() => {
@@ -162,6 +163,24 @@ describe('SemaToggleGroup', () => {
     // programmatic set (e.g. restoring a saved preference)
     group.value = 'vm'
     await group.updateComplete
+    expect(toggles[1].selected).toBe(true)
+    expect(toggles[0].selected).toBe(false)
+  })
+
+  it('finds and drives toggles even when each is wrapped (e.g. in a tooltip)', async () => {
+    document.body.innerHTML = `
+      <sema-toggle-group value="a">
+        <sema-tooltip content="Option A"><sema-toggle value="a">A</sema-toggle></sema-tooltip>
+        <sema-tooltip content="Option B"><sema-toggle value="b">B</sema-toggle></sema-tooltip>
+      </sema-toggle-group>`
+    const group = document.querySelector('sema-toggle-group')!
+    await group.updateComplete
+    const toggles = document.querySelectorAll('sema-toggle')
+    for (const t of toggles) await t.updateComplete
+    expect(toggles[0].selected).toBe(true) // value=a selected via slotchange despite wrapping
+    ;(toggles[1].shadowRoot!.querySelector('.toggle') as HTMLElement).click()
+    await group.updateComplete
+    expect(group.value).toBe('b')
     expect(toggles[1].selected).toBe(true)
     expect(toggles[0].selected).toBe(false)
   })

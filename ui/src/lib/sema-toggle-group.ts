@@ -1,5 +1,5 @@
 import { html, css } from 'lit';
-import { property, queryAssignedElements } from 'lit/decorators.js';
+import { property } from 'lit/decorators.js';
 import { SemaElement } from '../internal/sema-element.js';
 import type { SemaToggle } from './sema-toggle.js';
 import type { SemaChangeEventDetail } from './events.js';
@@ -37,7 +37,12 @@ export class SemaToggleGroup extends SemaElement {
   ];
 
   @property({ reflect: true }) value: string = '';
-  @queryAssignedElements({ selector: 'sema-toggle' }) _toggles!: SemaToggle[];
+
+  /** All descendant toggles. A getter (not queryAssignedElements) so each toggle may
+   *  be wrapped — e.g. in a `<sema-tooltip>` to explain the option — and still count. */
+  private get _toggles(): SemaToggle[] {
+    return [...this.querySelectorAll('sema-toggle')] as SemaToggle[];
+  }
 
   render() {
     return html`

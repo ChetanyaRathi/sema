@@ -219,6 +219,16 @@ export class SemaButton extends SemaElement {
         font-size: 0.7rem;
         border-radius: var(--radius-sm, 3px);
       }
+      /* icon is a fixed square — sm shrinks the box (not the text padding). */
+      :host([size="sm"][variant="icon"]) {
+        width: 22px;
+        height: 22px;
+      }
+      :host([size="sm"][variant="icon"]) .button {
+        width: 22px;
+        height: 22px;
+        padding: 0;
+      }
     `,
   ];
 
