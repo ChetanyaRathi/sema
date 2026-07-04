@@ -108,6 +108,22 @@ The Makefile→Jake migration (PR #71, branch `feature/jakefile-migration`) is a
 
 Net: with (1)–(3) in place, the tree-sitter and `ui` extractions each reduce to *move one module, swap one variable*. Jake itself gained the enablers during the spike — incremental `file` recipes, recipe-scoped `@require`, `@dotenv` (jake v0.9.1) — so each split-out repo can carry a tiny standalone Jakefile with the same ergonomics.
 
+## Local workspace meta-repo (cross-repo dev)
+
+For working across the split repos locally — the "one folder with everything" flow — a **private `workspace` repo** holds each real repo as a **git submodule** plus one root Jakefile. `git clone --recurse-submodules` gives an agent the whole org at a pinned, known-good SHA set; the submodule pointers *are* the reproducible "this combination builds together" snapshot.
+
+The root Jakefile composes each member's own Jakefile rather than re-encoding paths. This is now clean because jake gained the **`@rooted` directive** (jake#20, on branch `feat/module-basedir`): a sub-repo's Jakefile declares `@rooted` at the top, so **its** recipes' relative paths (`@cd`, `file` targets) resolve against **its own** directory even when imported from the workspace root. So the root does:
+
+```
+@import "tree-sitter-sema/Jakefile" as ts     # each sub-Jakefile declares @rooted
+@import "vscode-sema/Jakefile"      as vscode
+@import "sema/Jakefile"             as sema    # the crates monorepo is just another member
+```
+
+`jake -l` at the workspace root then shows every member's recipes namespaced (`ts.test`, `vscode.package`, `sema.build`), each running correctly in its own dir. A missing/uninitialized submodule makes `@import` **fail fast naming the file** (jake#18) → "run `git submodule update --init`" — the feature-not-a-bug property. Root-level `bootstrap` (`git submodule update --init`), `dev-setup` (`git submodule foreach 'git checkout main'`, since submodules clone detached), `test-all`, and `update-all` recipes cover the aggregate "monorepo workspace stuff"; a root `.env` loaded via `@dotenv` centralizes keys.
+
+Prior to `@rooted` the fallback was **delegation** (`@cd vscode-sema && jake package`), which still works and needs no jake change — but `@rooted` + `@import` is the cleaner target now that it's implemented (pending a jake release cut with it). Same-repo module imports (`@import "jake/rust.jake"`) are unaffected: `@rooted` is opt-in, default stays root-relative.
+
 ## Open questions
 - Org name final pick: `sema-lisp` (recommended) vs `sema-run` (domain match) vs `sema-org`.
 - Does the current `HelgeSverre/sema-lisp` repo get *renamed/transferred into* the org as the crates monorepo, or stay under the personal account with only the split-out repos in the org? (Recommendation: transfer the mono into the org too, so everything lives under one org; GitHub sets up redirects.)
