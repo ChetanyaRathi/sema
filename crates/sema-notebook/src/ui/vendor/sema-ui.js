@@ -2098,7 +2098,7 @@ var Lc = Object.defineProperty, ya = (n, e, t, s) => {
     (i = n[o]) && (r = i(e, t, r) || r);
   return r && Lc(e, t, r), r;
 };
-const ai = "https://fonts.googleapis.com/css2?family=Cormorant:ital,wght@0,300;0,400;0,500;0,600;1,400&family=JetBrains+Mono:wght@400;500&display=swap";
+const ai = "https://fonts.googleapis.com/css2?family=Cormorant:ital,wght@0,300;0,400;0,500;0,600;1,400&family=Inter:wght@300;400;500;600&family=JetBrains+Mono:wght@400;500&display=swap";
 let Gs = !1;
 const Nc = [
   "margin",
@@ -2150,7 +2150,7 @@ const So = class So extends C {
   }
   _applyBody() {
     const e = document.body;
-    e.style.margin = "0", e.style.padding = "0", e.style.background = "var(--bg, #0c0c0c)", e.style.color = "var(--text-secondary, #a09888)", e.style.fontFamily = "var(--serif, 'Cormorant', Georgia, serif)", e.style.fontSize = "18px", e.style.lineHeight = "1.7", e.style.setProperty("-webkit-font-smoothing", "antialiased"), this.fullHeight ? (e.style.height = "100vh", e.style.minHeight = "", e.style.overflow = "hidden") : (e.style.height = "", e.style.minHeight = "100vh", e.style.overflow = ""), this.flex ? (e.style.display = "flex", e.style.flexDirection = "column") : (e.style.display = "", e.style.flexDirection = "");
+    e.style.margin = "0", e.style.padding = "0", e.style.background = "var(--bg, #0c0c0c)", e.style.color = "var(--text-secondary, #a09888)", e.style.fontFamily = "var(--sans, 'Inter', system-ui, -apple-system, sans-serif)", e.style.fontSize = "18px", e.style.lineHeight = "1.7", e.style.setProperty("-webkit-font-smoothing", "antialiased"), this.fullHeight ? (e.style.height = "100vh", e.style.minHeight = "", e.style.overflow = "hidden") : (e.style.height = "", e.style.minHeight = "100vh", e.style.overflow = ""), this.flex ? (e.style.display = "flex", e.style.flexDirection = "column") : (e.style.display = "", e.style.flexDirection = "");
   }
   render() {
     return x`<slot></slot>`;
@@ -2180,6 +2180,7 @@ So.styles = [
         --border-focus: #333;
         --tooltip-bg: #1a1a1a;
         --serif: 'Cormorant', Georgia, serif;
+        --sans: 'Inter', system-ui, -apple-system, sans-serif;
         --mono: 'JetBrains Mono', monospace;
       }
     `

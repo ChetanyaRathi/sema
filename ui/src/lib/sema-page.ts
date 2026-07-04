@@ -2,7 +2,7 @@ import { html, css } from 'lit';
 import { property } from 'lit/decorators.js';
 import { SemaElement } from '../internal/sema-element.js';
 
-const FONT_URL = 'https://fonts.googleapis.com/css2?family=Cormorant:ital,wght@0,300;0,400;0,500;0,600;1,400&family=JetBrains+Mono:wght@400;500&display=swap';
+const FONT_URL = 'https://fonts.googleapis.com/css2?family=Cormorant:ital,wght@0,300;0,400;0,500;0,600;1,400&family=Inter:wght@300;400;500;600&family=JetBrains+Mono:wght@400;500&display=swap';
 
 let _fontsLoaded = false;
 
@@ -67,6 +67,7 @@ export class SemaPage extends SemaElement {
         --border-focus: #333;
         --tooltip-bg: #1a1a1a;
         --serif: 'Cormorant', Georgia, serif;
+        --sans: 'Inter', system-ui, -apple-system, sans-serif;
         --mono: 'JetBrains Mono', monospace;
       }
     `,
@@ -124,11 +125,13 @@ export class SemaPage extends SemaElement {
     body.style.padding = '0';
     body.style.background = 'var(--bg, #0c0c0c)';
     body.style.color = 'var(--text-secondary, #a09888)';
+    // Body/prose is sans (Inter); Cormorant is reserved for editorial headings,
+    // JetBrains Mono for code — the same three-font split as the website.
     // The token vars live on this element's :host, which is a child of <body>,
     // so body can't see them — every body var() needs a literal fallback (as
     // --bg/--text-secondary above do). Without it, font-family resolved to the
-    // UA default serif (Times) instead of the brand Cormorant.
-    body.style.fontFamily = "var(--serif, 'Cormorant', Georgia, serif)";
+    // UA default instead of Inter.
+    body.style.fontFamily = "var(--sans, 'Inter', system-ui, -apple-system, sans-serif)";
     body.style.fontSize = '18px';
     body.style.lineHeight = '1.7';
     body.style.setProperty('-webkit-font-smoothing', 'antialiased');
