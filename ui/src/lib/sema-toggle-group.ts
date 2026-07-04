@@ -47,6 +47,12 @@ export class SemaToggleGroup extends SemaElement {
     `;
   }
 
+  // Keep the toggles in sync when `value` is set programmatically (controlled use,
+  // e.g. restoring a saved selection) — not just on user interaction / slotchange.
+  updated(changed: Map<string, unknown>) {
+    if (changed.has('value')) this._updateSelection();
+  }
+
   private _onSlotChange() {
     this._updateSelection();
   }

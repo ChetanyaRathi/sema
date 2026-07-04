@@ -105,12 +105,12 @@
         <span class="pane-title">Files</span>
         <div style="display:flex;align-items:center;gap:0.5rem;">
           <span class="vfs-stats" id="vfs-stats" data-testid="vfs-stats"></span>
-          <div class="engine-toggle" id="backend-toggle" data-testid="backend-toggle">
-            <label class="active" data-tooltip="In-memory only, lost on refresh"><input type="radio" name="backend" value="memory" checked>Memory</label>
-            <label data-tooltip="localStorage, persists across sessions"><input type="radio" name="backend" value="local">Local</label>
-            <label data-tooltip="sessionStorage, cleared when tab closes"><input type="radio" name="backend" value="session">Session</label>
-            <label data-tooltip="IndexedDB, persistent with larger storage" data-tooltip-pos="right"><input type="radio" name="backend" value="indexeddb">IDB</label>
-          </div>
+          <sema-toggle-group id="backend-toggle" data-testid="backend-toggle" value="memory">
+            <sema-toggle value="memory" title="In-memory only, lost on refresh">Memory</sema-toggle>
+            <sema-toggle value="local" title="localStorage, persists across sessions">Local</sema-toggle>
+            <sema-toggle value="session" title="sessionStorage, cleared when tab closes">Session</sema-toggle>
+            <sema-toggle value="indexeddb" title="IndexedDB, persistent with larger storage">IDB</sema-toggle>
+          </sema-toggle-group>
           <sema-tooltip content="Upload files into the virtual filesystem" placement="bottom"><sema-button variant="ghost" size="sm" id="upload-btn">Upload</sema-button></sema-tooltip>
           <sema-tooltip content="Delete all files from the virtual filesystem" placement="left"><sema-button variant="ghost" size="sm" id="clear-vfs-btn">Clear</sema-button></sema-tooltip>
           <sema-tooltip content="Collapse files panel" placement="right"><sema-button variant="icon" id="files-collapse-btn" aria-label="Collapse files panel">▾</sema-button></sema-tooltip>

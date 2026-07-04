@@ -1226,6 +1226,11 @@ const wo = class wo extends C {
       </div>
     `;
   }
+  // Keep the toggles in sync when `value` is set programmatically (controlled use,
+  // e.g. restoring a saved selection) — not just on user interaction / slotchange.
+  updated(e) {
+    e.has("value") && this._updateSelection();
+  }
   _onSlotChange() {
     this._updateSelection();
   }

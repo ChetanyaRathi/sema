@@ -332,8 +332,8 @@ clearVfsBtn.addEventListener('click', async () => {
 
 const backendToggle = document.getElementById('backend-toggle');
 
-backendToggle.addEventListener('change', async (e) => {
-  const newName = e.target.value;
+backendToggle.addEventListener('sema-change', async (e) => {
+  const newName = e.detail.value;
   if (newName === backendName || !interp) return;
 
   const newBackend = BACKENDS[newName]();
@@ -344,10 +344,7 @@ backendToggle.addEventListener('change', async (e) => {
   vfsBackend = newBackend;
   backendName = newName;
   saveState({ backend: newName });
-
-  backendToggle.querySelectorAll('label').forEach(l => {
-    l.classList.toggle('active', l.querySelector('input').value === newName);
-  });
+  // <sema-toggle-group> owns the selected/active state.
 
   activeFilePath = null;
   fileViewerEl.innerHTML = '<div class="viewer-placeholder">Click a file to preview</div>';
@@ -388,13 +385,7 @@ async function main() {
   const storedBackend = saved.backend ?? 'memory';
   if (BACKENDS[storedBackend]) {
     backendName = storedBackend;
-    const radio = backendToggle.querySelector(`input[value="${storedBackend}"]`);
-    if (radio) {
-      radio.checked = true;
-      backendToggle.querySelectorAll('label').forEach(l => {
-        l.classList.toggle('active', l.querySelector('input').value === storedBackend);
-      });
-    }
+    backendToggle.value = storedBackend; // group reflects the selected toggle
   }
 
   vfsBackend = BACKENDS[backendName]();

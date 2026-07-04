@@ -149,4 +149,20 @@ describe('SemaToggleGroup', () => {
     expect(toggles[1].selected).toBe(false)
     expect(values).toEqual(['vm', 'tw'])
   })
+
+  it('syncs the selected toggle when value is set programmatically (controlled)', async () => {
+    document.body.innerHTML = `
+      <sema-toggle-group value="tw">
+        <sema-toggle value="tw">Tree-walker</sema-toggle>
+        <sema-toggle value="vm">Bytecode VM</sema-toggle>
+      </sema-toggle-group>`
+    const group = document.querySelector('sema-toggle-group')!
+    await group.updateComplete
+    const toggles = document.querySelectorAll('sema-toggle')
+    // programmatic set (e.g. restoring a saved preference)
+    group.value = 'vm'
+    await group.updateComplete
+    expect(toggles[1].selected).toBe(true)
+    expect(toggles[0].selected).toBe(false)
+  })
 })
