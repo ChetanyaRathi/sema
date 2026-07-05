@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+### Security
+
+- **Package registry (`pkg/`) auth hardening ahead of live deploy.** Logout now
+  deletes the session row server-side, so a captured session cookie can no
+  longer be replayed after the user logs out (previously the cookie stayed
+  valid in the DB for its full 7-day lifetime). The GitHub OAuth `return_to`
+  parameter is restricted to same-site paths (`auth::sanitize_return_to`),
+  closing an open redirect where `/auth/github?return_to=https://evil.com`
+  would bounce a logged-in user off-site. The webhook handler now refuses a
+  push when the linked package has an empty/missing webhook secret, instead of
+  validating the signature against an attacker-computable empty-key HMAC.
+  Session cookies gain the `Secure` attribute automatically when `BASE_URL` is
+  `https://` (kept off for local `http://` dev). Added regression tests for
+  each, alongside the existing admin-authorization coverage.
+
 ### Fixed
 
 - **Package registry (`pkg/`) pre-deploy hardening** (per
