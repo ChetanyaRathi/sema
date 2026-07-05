@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+### Fixed
+
+- **Package registry (`pkg/`) pre-deploy hardening** (per
+  `docs/plans/2026-06-09-pkg-registry-predeploy-hardening.md`): publish is now
+  atomic — package, owner, version, and dependency rows are written in a single
+  transaction, and dependency-insert errors propagate instead of being silently
+  swallowed (previously a version row could commit with missing dependency
+  rows). Uploads are validated up front: gzip magic bytes required, dependency
+  count capped (`MAX_DEPENDENCIES`, default 64), `version_req` strings parsed
+  with `semver`, and malformed metadata JSON rejected with 400 instead of
+  silently dropping dependencies/description. `blob::store` returns IO errors
+  as 500s instead of panicking the handler. Also fixed axum's 2 MB default
+  body cap silently overriding `MAX_TARBALL_BYTES` on the publish route, and
+  consolidated API error responses into a shared `ApiError` type.
+
 ### Added
 
 - **WebSocket client (`ws/*`).** Connect to `ws://`/`wss://` servers with
