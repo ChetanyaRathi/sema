@@ -1,7 +1,7 @@
 # Repo Split & GitHub Org Migration Plan
 
 **Date:** 2026-07-04 (status updated 2026-07-05)
-**Status:** **Tier B (editors + grammar) DONE**; **Tier C: `ui` DONE** — split, published (`@sema-lang/ui`, OIDC+provenance), and removed from the mono (website consumes the npm dep); `website`+`playground` kept in mono, `pkg` split deferred; main-repo transfer pending.
+**Status:** **Tier B (editors + grammar) DONE**; **Tier C: `ui` + `pkg` DONE** — `ui` split/published (`@sema-lang/ui`, OIDC+provenance) and removed from the mono; `pkg` split to `sema-lisp/pkg` and removed from the mono; `website`+`playground` kept in mono. **Main-repo transfer DONE** (now `sema-lisp/sema`). A private `sema-lisp/workspace` meta-repo composes all members.
 **Related:** `docs/plans/2026-02-16-editor-plugin-publishing.md` (per-editor publishing targets — this plan is the *repo-structure* prerequisite for those workflows)
 
 ## Status update (2026-07-05)
@@ -92,7 +92,11 @@ Decision reached after inventorying the folders. Coupling, not folder count, dri
 ### `website` + `playground` → **KEEP coupled, KEEP in mono** (for now)
 Both are Vercel-deployed and share brand assets, the tmLanguage grammar, and (soon) the `@sema/ui` bundle. `playground` is the sema.run WASM playground built from `crates/sema-wasm`, so it is genuinely coupled to the Rust workspace (rebuilt when the language changes) — a point *for* keeping it near the crates. `website` has the `website/`-only Vercel upload constraint. Recommendation: **leave both in the mono.** Their only cross-folder couplings (tmLanguage, `@sema/ui`) become version pins once `ui` is on npm; at that point moving `website`+`playground` *together* to one repo is possible but low-value. Revisit only if web contributors need an independent surface.
 
-### `pkg` (package registry) → **SPLIT-ELIGIBLE, LOW priority — keep in mono until it needs its own surface**
+### `pkg` (package registry) → **✅ SPLIT (2026-07-06) → `sema-lisp/pkg`**
+
+> Extracted via history-preserving `git filter-repo` and removed from the mono (the stale `exclude = ["pkg"]` dropped from `Cargo.toml`). It was self-contained (own `Cargo.lock`/`Dockerfile`/`fly.toml`, no path-deps, no live references from the mono), so the split was clean. Added CI (fmt/clippy/build/test) + a `@rooted` Jakefile; it's a `workspace` member. The prototype HTML footers were repointed to `sema-lisp/sema`. Original rationale below.
+
+_Original (pre-split) analysis:_
 New finding: `pkg` (`sema-pkg`) is a **self-contained Rust application with its own `Cargo.lock`** — it is *not* a member of the root cargo workspace. It ships as a single binary with SQLite, has its own `Dockerfile`/`docker-compose`, `fly.toml` (independent fly.io deploy), and `e2e/` suite. Coupling to `crates/*` is **low**: it talks to Sema over HTTP/CLI, not via path deps, so splitting it would *not* incur the cross-repo version-juggling that keeps the crates together (contrast Tier A). That makes it a clean Tier-B-style split candidate **mechanically**. But there's no pressure yet — no external contributors, and its release cadence (a fly.io deploy) is already decoupled from the crates release. **Recommendation:** keep it in the mono for now; split to `sema-lisp/sema-pkg` only when it wants an independent contribution/issue surface or a separate release pipeline. It carries one of the vendored tmLanguage copies (`pkg/static`, `pkg/prototypes`) — fold those into the `@sema/ui`/pinned-grammar story when `ui` splits.
   - `packages/` (if present): inventory at split time; JS packages already publish under `@sema-lang/*`, so only repo paths change.
 
