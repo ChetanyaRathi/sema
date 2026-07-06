@@ -28,6 +28,15 @@ jobs:
       - name: Cache cargo + target
         uses: Swatinem/rust-cache@v2
 
+      - name: Install jake
+        run: |
+          mkdir -p "$HOME/.local/bin"
+          curl -fsSL https://github.com/HelgeSverre/jake/releases/latest/download/jake-linux-x86_64 -o "$HOME/.local/bin/jake"
+          chmod +x "$HOME/.local/bin/jake"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: Verify jake
+        run: jake --version
+
       # Gate the publish on a complete crate list: every publishable workspace
       # crate must be in publish.yml's order, so a release can't half-publish on a
       # newly-added crate (as happened with sema-otel in 1.22.0).
@@ -41,7 +50,7 @@ jobs:
         run: cargo clippy --workspace -- -D warnings
 
       - name: Check builtin docs
-        run: make docs-check
+        run: jake docs-check
 
       - name: Install cargo-nextest
         uses: taiki-e/install-action@nextest
@@ -50,7 +59,7 @@ jobs:
         run: cargo nextest run --workspace --profile ci
 
       - name: Smoke test examples
-        run: make examples
+        run: jake examples
 
       - name: Smoke test bytecode
-        run: make smoke-bytecode
+        run: jake smoke-bytecode
