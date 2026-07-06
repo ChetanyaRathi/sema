@@ -55,42 +55,10 @@ task llm-stress: [release]
     ./target/release/sema examples/llm/async-stress-live.sema
 
 @group llm
-@desc "Exercise every configured LLM provider"
-task test-providers: [build]
-    echo "=== Testing all LLM providers ==="
-    cargo run --quiet -- examples/providers/test-all.sema
-
-# Run a single provider smoke: `jake test-provider anthropic`
-@group llm
-@desc "Test a single provider by name (arg 1)"
-task test-provider: [build]
-    cargo run --quiet -- examples/providers/test-{{$1}}.sema
-
-@group llm
 @desc "LIVE RAG smoke over Sema docs (needs embed+rerank+chat keys)"
 task rag-demo: [build]
     echo "=== RAG over Sema docs (embed -> search -> rerank -> answer) ==="
     cargo run --quiet -- examples/llm/rag-docs-search.sema
 
-# ── Browser E2E ──────────────────────────────────────────────────────
-# The editor plugins now live in their own repos; these E2E suites exercise
-# the mono's own browser surfaces (notebook crate + sema-web dev server).
-
-@group e2e
-@desc "Notebook browser E2E (Playwright)"
-task test-notebook-e2e: [build]
-    @needs npx
-    echo "=== Running notebook E2E tests ==="
-    @cd crates/sema-notebook/tests/e2e
-    npx playwright test
-
-# Vendor the browser runtime, build the release binary (embeds it), then drive
-# the real `sema web` dev server in a browser.
-@group e2e
-@desc "sema web dev-server browser E2E (Playwright)"
-task test-web-e2e: [wasm.web-runtime]
-    @needs npx
-    cargo build --release -p sema-lang
-    echo "=== Running sema web dev-server E2E tests ==="
-    @cd packages/sema-web
-    npx playwright test --config playwright.dev-server.config.ts
+# Provider smokes and browser E2E (test.providers, test.notebook-e2e,
+# test.web-e2e) live in jake/test.jake, namespaced as `test.*`.

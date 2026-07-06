@@ -10,6 +10,7 @@
 #
 # Module layout (each file owns one area; imported below, some namespaced):
 #   jake/rust.jake     — cargo build/test/lint/install/pgo  (UNnamespaced: the daily drivers)
+#   jake/test.jake     — test variants (workspace/lsp/http/llm/e2e/providers), namespaced `test.*`
 #   jake/docs.jake     — builtin-doc index, pricing, link check
 #   jake/examples.jake — headless example + notebook + bytecode smoke runners + browser E2E
 #   jake/wasm.jake     — WASM VM build + browser-runtime vendoring (file recipes = incremental)
@@ -25,6 +26,7 @@
 @rooted
 
 @import "jake/rust.jake"
+@import "jake/test.jake" as test
 @import "jake/docs.jake"
 @import "jake/examples.jake"
 @import "jake/wasm.jake" as wasm
@@ -50,7 +52,7 @@ task all: [lint, test, build]
 # in listed order (run serial, i.e. without -j, so the gate reads top-to-bottom).
 @group ci
 @desc "Full local CI gate: workspace tests + examples + bytecode smoke + lint + docs"
-task ci: [test-workspace, examples, smoke-bytecode, lint, docs-check]
+task ci: [test.workspace, examples, smoke-bytecode, lint, docs-check]
     echo "CI gate green"
 
 # Runs the full CI gate, then prints the manual release steps from AGENTS.md.
@@ -76,7 +78,7 @@ task release-preflight: [ci]
 task deploy-all: [pg.build]
     @confirm "Deploy site AND playground to production?"
     cd playground && npx playwright test
-    jake test-notebook-e2e
+    jake test.notebook-e2e
     jake site.deploy
     jake pg.deploy
     echo "site + playground deployed"

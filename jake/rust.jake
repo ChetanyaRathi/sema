@@ -75,33 +75,8 @@ task test:
     @watch crates/**/*.rs Cargo.toml
     cargo test
 
-@group test
-@desc "Run the full workspace test suite"
-task test-workspace:
-    cargo test --workspace
-
-@group test
-@desc "LSP unit + e2e (pytest) tests"
-task test-lsp: [release]
-    @needs uv
-    cargo test -p sema-lsp
-    cd crates/sema-lsp/tests/e2e && uv run pytest -v
-
-@group test
-@desc "Embedding benchmark (ignored) test"
-task test-embedding-bench:
-    cargo test -p sema-lang --test embedding_bench -- --ignored --nocapture
-
-@group test
-@desc "HTTP integration tests (requires network)"
-task test-http:
-    cargo test -p sema-lang --test http_test -- --ignored --nocapture
-
-@group test
-@desc "LLM integration tests (requires API keys)"
-@require ANTHROPIC_API_KEY OPENAI_API_KEY
-task test-llm:
-    cargo test -p sema-lang --test llm_test -- --ignored --nocapture
+# Test variants (workspace, lsp, http, llm, e2e, providers) live in
+# jake/test.jake, namespaced as `test.*` (jake test.http, jake test.lsp, …).
 
 # ── Lint / format ────────────────────────────────────────────────────
 
