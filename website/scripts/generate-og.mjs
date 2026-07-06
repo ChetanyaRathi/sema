@@ -12,7 +12,8 @@
 // version, then commit the regenerated public/og/*.jpg before deploying.
 
 import { chromium } from 'playwright'
-import { readFileSync, readdirSync, mkdirSync, statSync } from 'node:fs'
+import { readFileSync, writeFileSync, readdirSync, mkdirSync, statSync, existsSync } from 'node:fs'
+import { createHash } from 'node:crypto'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { dirname, join, relative } from 'node:path'
 import { OG_WIDTH, OG_HEIGHT, OG_EXT, ogSlug, categoryFor, isHomepage } from '../.vitepress/og.shared.mjs'
@@ -21,7 +22,14 @@ const __dirname = dirname(fileURLToPath(import.meta.url))
 const WEBSITE = join(__dirname, '..')
 const TEMPLATE = join(WEBSITE, 'og-template.html')
 const OUT_DIR = join(WEBSITE, 'public', 'og')
-const filters = process.argv.slice(2)
+// Records the input hash each card was last rendered from, so an unchanged page
+// is skipped (never re-encoded) — a fresh JPEG would differ byte-for-byte across
+// Chromium versions and churn git even when the card looks identical. Lives
+// outside public/ so it isn't deployed; commit it alongside the images.
+const MANIFEST = join(WEBSITE, 'og-manifest.json')
+const args = process.argv.slice(2)
+const force = args.includes('--force') || args.includes('-f')
+const filters = args.filter((a) => a !== '--force' && a !== '-f')
 
 // Current Sema version, shown as the badge on docs cards.
 function semaVersion() {
@@ -151,6 +159,30 @@ const SPECIAL = [
 
 mkdirSync(OUT_DIR, { recursive: true })
 
+const QUALITY = 92
+
+// Hash of everything shared across cards: the template markup (which carries the
+// inline logo SVG + all CSS) and the vendored fonts. Rendering also depends on
+// the Chromium version, but that's deliberately excluded — a renderer bump that
+// doesn't change the design shouldn't rewrite every card. Use --force for that.
+function baseInputHash() {
+  const h = createHash('sha256')
+  h.update(readFileSync(TEMPLATE))
+  for (const f of ['cormorant-normal.woff2', 'inter-normal.woff2', 'jetbrains-mono-normal.woff2', 'jetbrains-mono-italic.woff2']) {
+    const p = join(WEBSITE, 'public', 'fonts', f)
+    if (existsSync(p)) h.update(readFileSync(p))
+  }
+  return h.digest('hex')
+}
+
+// Stable per-job hash: base inputs + this card's params + output geometry.
+function jobInputHash(base, params) {
+  const stable = JSON.stringify(Object.keys(params).sort().reduce((a, k) => ((a[k] = params[k]), a), {}))
+  return createHash('sha256').update(base).update(stable).update(`${OG_WIDTH}x${OG_HEIGHT}q${QUALITY}`).digest('hex')
+}
+
+const BASE = baseInputHash()
+
 const jobs = [
   ...pages.map((p) => ({
     slug: p.slug,
@@ -159,44 +191,66 @@ const jobs = [
     match: `${p.slug} ${p.relPath}`,
   })),
   ...SPECIAL.map((s) => ({ slug: s.slug, out: s.out, params: s.params, match: s.slug })),
-]
+].map((j) => ({ ...j, hash: jobInputHash(BASE, j.params) }))
 
 const selected = filters.length ? jobs.filter((j) => filters.some((f) => j.match.includes(f))) : jobs
 
-console.log(`Generating ${selected.length} OG image(s)  [badge ${BADGE}]`)
+// Skip any card whose inputs are unchanged since it was last rendered (and whose
+// image still exists), unless --force. This is what makes regeneration
+// idempotent: unchanged pages are never re-encoded, so they can't churn git.
+let manifest = {}
+try {
+  manifest = JSON.parse(readFileSync(MANIFEST, 'utf8'))
+} catch {}
 
-const browser = await chromium.launch()
-const page = await browser.newPage({
-  viewport: { width: OG_WIDTH, height: OG_HEIGHT },
-  deviceScaleFactor: 1,
-})
+const stale = force ? selected : selected.filter((j) => manifest[j.slug] !== j.hash || !existsSync(j.out))
+const skipped = selected.length - stale.length
 
-const externalRequests = []
-await page.route(/^https?:\/\//, (route) => {
-  externalRequests.push(route.request().url())
-  return route.abort('blockedbyclient')
-})
+console.log(`Generating ${stale.length} OG image(s)  [badge ${BADGE}]${skipped ? `, ${skipped} unchanged` : ''}`)
 
 let ok = 0
-for (const j of selected) {
-  const externalRequestStart = externalRequests.length
-  await page.goto(templateUrl(j.params), { waitUntil: 'load' })
-  await page.waitForSelector('html[data-og-ready="1"]', { timeout: 10000 })
-  const jobExternalRequests = externalRequests.slice(externalRequestStart)
-  if (jobExternalRequests.length) {
-    throw new Error(`OG template made external request(s): ${jobExternalRequests.join(', ')}`)
-  }
-  mkdirSync(dirname(j.out), { recursive: true })
-  await page.screenshot({
-    path: j.out,
-    type: 'jpeg',
-    quality: 92,
-    clip: { x: 0, y: 0, width: OG_WIDTH, height: OG_HEIGHT },
+if (stale.length) {
+  const browser = await chromium.launch()
+  const page = await browser.newPage({
+    viewport: { width: OG_WIDTH, height: OG_HEIGHT },
+    deviceScaleFactor: 1,
   })
-  ok++
-  const label = j.params.title || j.params.titleHtml?.replace(/<[^>]+>/g, '') || ''
-  console.log(`  ✓ ${relative(join(WEBSITE, '..'), j.out)}  (${j.params.variant}${label ? ` — ${label}` : ''})`)
+
+  const externalRequests = []
+  await page.route(/^https?:\/\//, (route) => {
+    externalRequests.push(route.request().url())
+    return route.abort('blockedbyclient')
+  })
+
+  for (const j of stale) {
+    const externalRequestStart = externalRequests.length
+    await page.goto(templateUrl(j.params), { waitUntil: 'load' })
+    await page.waitForSelector('html[data-og-ready="1"]', { timeout: 10000 })
+    const jobExternalRequests = externalRequests.slice(externalRequestStart)
+    if (jobExternalRequests.length) {
+      throw new Error(`OG template made external request(s): ${jobExternalRequests.join(', ')}`)
+    }
+    mkdirSync(dirname(j.out), { recursive: true })
+    await page.screenshot({
+      path: j.out,
+      type: 'jpeg',
+      quality: QUALITY,
+      clip: { x: 0, y: 0, width: OG_WIDTH, height: OG_HEIGHT },
+    })
+    manifest[j.slug] = j.hash
+    ok++
+    const label = j.params.title || j.params.titleHtml?.replace(/<[^>]+>/g, '') || ''
+    console.log(`  ✓ ${relative(join(WEBSITE, '..'), j.out)}  (${j.params.variant}${label ? ` — ${label}` : ''})`)
+  }
+
+  await browser.close()
 }
 
-await browser.close()
-console.log(`Done: ${ok}/${selected.length} images written.`)
+// Rewrite the manifest (sorted keys) only when it actually changed, so a no-op
+// run leaves it byte-identical and git stays clean.
+const serialized = JSON.stringify(Object.keys(manifest).sort().reduce((a, k) => ((a[k] = manifest[k]), a), {}), null, 2) + '\n'
+if (!existsSync(MANIFEST) || readFileSync(MANIFEST, 'utf8') !== serialized) {
+  writeFileSync(MANIFEST, serialized)
+}
+
+console.log(`Done: ${ok} written, ${skipped} unchanged.`)
