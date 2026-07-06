@@ -4,15 +4,10 @@ use axum::{
     response::{AppendHeaders, IntoResponse, Redirect},
 };
 use rand::RngCore;
-use sea_orm::*;
 use serde::Deserialize;
 use std::sync::Arc;
 
-use crate::{
-    auth::create_session,
-    entity::{oauth_connection, user},
-    AppState,
-};
+use crate::{auth::create_session, AppState};
 
 fn generate_state() -> String {
     let mut bytes = [0u8; 16];
@@ -28,8 +23,12 @@ pub struct StartParams {
     pub return_to: String,
 }
 
-fn default_login() -> String { "login".into() }
-fn default_account() -> String { "/account".into() }
+fn default_login() -> String {
+    "login".into()
+}
+fn default_account() -> String {
+    "/account".into()
+}
 
 /// GET /auth/github — redirect to GitHub authorize URL
 pub async fn start(
@@ -51,8 +50,11 @@ pub async fn start(
         client_id, state.config.base_url, scopes, oauth_state,
     );
 
-    // Encode mode and return_to in the cookie alongside the CSRF state
-    let cookie_value = format!("{}|{}|{}", oauth_state, params.mode, params.return_to);
+    // Encode mode and return_to in the cookie alongside the CSRF state.
+    // Sanitize return_to to a same-site path so it can't become an open
+    // redirect when the callback consumes it.
+    let return_to = crate::auth::sanitize_return_to(&params.return_to);
+    let cookie_value = format!("{}|{}|{}", oauth_state, params.mode, return_to);
     let cookie = format!(
         "github_oauth_state={}; Path=/; HttpOnly; SameSite=Lax; Max-Age=600",
         cookie_value
@@ -112,10 +114,17 @@ pub async fn callback(
     let parts: Vec<&str> = stored_cookie.splitn(3, '|').collect();
     let stored_state = parts.first().copied().unwrap_or("");
     let mode = parts.get(1).copied().unwrap_or("login");
-    let return_to = parts.get(2).copied().unwrap_or("/account");
+    // Re-sanitize on the way out (defense in depth): never Redirect::to an
+    // attacker-controlled absolute/external URL.
+    let return_to = crate::auth::sanitize_return_to(parts.get(2).copied().unwrap_or("/account"));
+    let return_to = return_to.as_str();
 
     if stored_state.is_empty() || stored_state != params.state {
-        tracing::error!("OAuth state mismatch: stored={:?} vs param={:?}", stored_state, params.state);
+        tracing::error!(
+            "OAuth state mismatch: stored={:?} vs param={:?}",
+            stored_state,
+            params.state
+        );
         return (StatusCode::BAD_REQUEST, "Invalid OAuth state").into_response();
     }
 
@@ -149,7 +158,10 @@ pub async fn callback(
     // Fetch GitHub user info
     let user_res = client
         .get("https://api.github.com/user")
-        .header("Authorization", format!("Bearer {}", token_body.access_token))
+        .header(
+            "Authorization",
+            format!("Bearer {}", token_body.access_token),
+        )
         .header("User-Agent", "sema-pkg")
         .send()
         .await;
@@ -182,66 +194,62 @@ pub async fn callback(
         let current_user = crate::auth::get_session_user(&state.db, session_id).await;
         let current_user = match current_user {
             Some(u) => u,
-            None => return (StatusCode::UNAUTHORIZED, "Must be logged in to connect GitHub").into_response(),
+            None => {
+                return (
+                    StatusCode::UNAUTHORIZED,
+                    "Must be logged in to connect GitHub",
+                )
+                    .into_response()
+            }
         };
 
         // Check if this github_id is already linked to a different user
-        let existing = oauth_connection::Entity::find()
-            .filter(oauth_connection::Column::Provider.eq("github"))
-            .filter(oauth_connection::Column::ProviderUserId.eq(gh_user.id.to_string()))
-            .one(&state.db)
-            .await
-            .ok()
-            .flatten();
+        let existing =
+            crate::dal::oauth::find_by_provider_user_id(&state.db, &gh_user.id.to_string())
+                .await
+                .ok()
+                .flatten();
 
         if let Some(row) = existing {
             if row.user_id != current_user.id {
-                return (StatusCode::CONFLICT, "This GitHub account is linked to another user").into_response();
+                return (
+                    StatusCode::CONFLICT,
+                    "This GitHub account is linked to another user",
+                )
+                    .into_response();
             }
         }
 
-        // Upsert oauth_connections (raw SQL for datetime('now') expression)
-        state.db.execute(Statement::from_sql_and_values(
-            state.db.get_database_backend(),
-            r#"INSERT INTO oauth_connections (user_id, provider, provider_user_id, provider_login, access_token_enc, scopes, updated_at)
-               VALUES (?, 'github', ?, ?, ?, ?, datetime('now'))
-               ON CONFLICT(user_id, provider) DO UPDATE SET
-                 provider_user_id = excluded.provider_user_id,
-                 provider_login = excluded.provider_login,
-                 access_token_enc = excluded.access_token_enc,
-                 scopes = excluded.scopes,
-                 revoked_at = NULL,
-                 updated_at = datetime('now')"#,
-            [
-                current_user.id.into(),
-                gh_user.id.to_string().into(),
-                gh_user.login.clone().into(),
-                token_enc.clone().into(),
-                scopes_str.into(),
-            ],
-        ))
-        .await
-        .ok();
+        // Upsert the GitHub connection (engine-portable via the DAL).
+        let _ = crate::dal::oauth::upsert_connection(
+            &state.db,
+            current_user.id,
+            &gh_user.id.to_string(),
+            &gh_user.login,
+            token_enc.clone(),
+            scopes_str,
+        )
+        .await;
 
         // Also set github_id on users table if not set
-        let user_model = user::Entity::find_by_id(current_user.id)
-            .one(&state.db)
+        let user_model = crate::dal::users::find_by_id(&state.db, current_user.id)
             .await
             .ok()
             .flatten();
         if let Some(u) = user_model {
             if u.github_id.is_none() {
-                let mut active: user::ActiveModel = u.into();
-                active.github_id = Set(Some(gh_user.id));
-                let _ = active.update(&state.db).await;
+                let _ =
+                    crate::dal::users::set_github_id(&state.db, current_user.id, gh_user.id).await;
             }
         }
 
-        let clear_state = "github_oauth_state=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0".to_string();
+        let clear_state =
+            "github_oauth_state=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0".to_string();
         return (
             AppendHeaders([(header::SET_COOKIE, clear_state)]),
             Redirect::to(return_to),
-        ).into_response();
+        )
+            .into_response();
     }
 
     // ── Login mode (default): find/create user, create session ──
@@ -256,41 +264,43 @@ pub async fn callback(
         Ok(id) => id,
         Err(e) => {
             tracing::error!("Failed to find/create GitHub user: {e}");
-            return (StatusCode::INTERNAL_SERVER_ERROR, "Failed to create account")
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to create account",
+            )
                 .into_response();
         }
     };
 
-    // Store token for GitHub-linked packages (raw SQL for datetime('now') expression)
-    state.db.execute(Statement::from_sql_and_values(
-        state.db.get_database_backend(),
-        r#"INSERT INTO oauth_connections (user_id, provider, provider_user_id, provider_login, access_token_enc, scopes, updated_at)
-           VALUES (?, 'github', ?, ?, ?, ?, datetime('now'))
-           ON CONFLICT(user_id, provider) DO UPDATE SET
-             provider_user_id = excluded.provider_user_id,
-             provider_login = excluded.provider_login,
-             access_token_enc = excluded.access_token_enc,
-             scopes = excluded.scopes,
-             revoked_at = NULL,
-             updated_at = datetime('now')"#,
-        [
-            user_id.into(),
-            gh_user.id.to_string().into(),
-            gh_user.login.clone().into(),
-            token_enc.into(),
-            scopes_str.into(),
-        ],
-    ))
-    .await
-    .ok();
+    // Store the token for GitHub-linked packages (engine-portable via the DAL).
+    let _ = crate::dal::oauth::upsert_connection(
+        &state.db,
+        user_id,
+        &gh_user.id.to_string(),
+        &gh_user.login,
+        token_enc,
+        scopes_str,
+    )
+    .await;
 
-    let session_id = create_session(&state.db, user_id).await;
-    tracing::info!("GitHub OAuth: created session for user_id={}, redirecting to {}", user_id, return_to);
-
-    let session_cookie = format!(
-        "session={}; Path=/; HttpOnly; SameSite=Lax; Max-Age=604800",
-        session_id
+    let session_id = match create_session(&state.db, user_id).await {
+        Ok(s) => s,
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to create session",
+            )
+                .into_response();
+        }
+    };
+    tracing::info!(
+        "GitHub OAuth: created session for user_id={}, redirecting to {}",
+        user_id,
+        return_to
     );
+
+    let secure = crate::auth::cookie_secure(&state.config.base_url);
+    let session_cookie = crate::auth::session_cookie(&session_id, secure);
     let clear_state = "github_oauth_state=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0".to_string();
 
     (
@@ -329,9 +339,7 @@ async fn find_or_create_user(
     email: &str,
 ) -> Result<i64, String> {
     // Check for existing user by github_id
-    let existing = user::Entity::find()
-        .filter(user::Column::GithubId.eq(github_id))
-        .one(db)
+    let existing = crate::dal::users::find_by_github_id(db, github_id)
         .await
         .map_err(|e| e.to_string())?;
 
@@ -340,9 +348,7 @@ async fn find_or_create_user(
     }
 
     // Check if username is taken
-    let username_taken = user::Entity::find()
-        .filter(user::Column::Username.eq(login))
-        .one(db)
+    let username_taken = crate::dal::users::find_by_username(db, login)
         .await
         .map_err(|e| e.to_string())?;
 
@@ -353,9 +359,7 @@ async fn find_or_create_user(
     };
 
     // Check if email is taken
-    let email_taken = user::Entity::find()
-        .filter(user::Column::Email.eq(email))
-        .one(db)
+    let email_taken = crate::dal::users::find_by_email(db, email)
         .await
         .map_err(|e| e.to_string())?;
 
@@ -365,14 +369,9 @@ async fn find_or_create_user(
         email.to_string()
     };
 
-    let new_user = user::ActiveModel {
-        username: Set(username),
-        email: Set(user_email),
-        github_id: Set(Some(github_id)),
-        ..Default::default()
-    };
-
-    let result = new_user.insert(db).await.map_err(|e| e.to_string())?;
+    let result = crate::dal::users::create_github_user(db, &username, &user_email, github_id)
+        .await
+        .map_err(|e| e.to_string())?;
     Ok(result.id)
 }
 

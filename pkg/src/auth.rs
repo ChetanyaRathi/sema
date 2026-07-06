@@ -7,15 +7,10 @@ use axum::{
     http::{header, request::Parts, StatusCode},
 };
 use rand::RngCore;
-use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set};
 use std::sync::Arc;
 use time::{Duration, OffsetDateTime};
 
-use crate::{
-    db::Db,
-    entity::{api_token, session, user},
-    AppState,
-};
+use crate::{db::Db, AppState};
 
 #[derive(Debug, Clone)]
 pub struct User {
@@ -62,44 +57,89 @@ pub fn hash_token(token: &str) -> String {
     hex::encode(hash)
 }
 
-pub async fn create_session(db: &Db, user_id: i64) -> String {
+pub async fn create_session(db: &Db, user_id: i64) -> Result<String, sea_orm::DbErr> {
     let session_id = generate_session_id();
     // Note: 7 days must match session cookie Max-Age=604800 in api/auth.rs and github.rs
     let expires_at = {
         let t = OffsetDateTime::now_utc() + Duration::days(7);
         format!(
             "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
-            t.year(), t.month() as u8, t.day(), t.hour(), t.minute(), t.second()
+            t.year(),
+            t.month() as u8,
+            t.day(),
+            t.hour(),
+            t.minute(),
+            t.second()
         )
     };
 
-    let model = session::ActiveModel {
-        id: Set(session_id.clone()),
-        user_id: Set(user_id),
-        expires_at: Set(expires_at),
-        ..Default::default()
-    };
+    crate::dal::sessions::create(db, &session_id, user_id, expires_at).await?;
+    Ok(session_id)
+}
 
-    model.insert(db).await.expect("Failed to create session");
-    session_id
+/// Delete a session row so it can no longer authenticate (used on logout).
+/// Best-effort: a DB error here must not block returning a cleared cookie.
+pub async fn delete_session(db: &Db, session_id: &str) {
+    let _ = crate::dal::sessions::delete(db, session_id).await;
+}
+
+/// Whether session cookies should carry the `Secure` attribute, derived from
+/// the deployment's public URL. Enabled on HTTPS so the cookie is never sent
+/// over plaintext; disabled for `http://` (localhost dev) where `Secure`
+/// would prevent the browser from ever storing it.
+pub fn cookie_secure(base_url: &str) -> bool {
+    base_url.starts_with("https://")
+}
+
+/// Build the `Set-Cookie` value for a session, 7-day lifetime.
+/// Must keep Max-Age in sync with the session `expires_at` in [`create_session`].
+pub fn session_cookie(session_id: &str, secure: bool) -> String {
+    let mut c = format!("session={session_id}; Path=/; HttpOnly; SameSite=Lax; Max-Age=604800");
+    if secure {
+        c.push_str("; Secure");
+    }
+    c
+}
+
+/// Build the `Set-Cookie` value that clears the session cookie.
+pub fn clear_session_cookie(secure: bool) -> String {
+    let mut c = "session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0".to_string();
+    if secure {
+        c.push_str("; Secure");
+    }
+    c
+}
+
+/// Restrict an OAuth `return_to` to a same-site absolute path, preventing an
+/// open redirect. Anything that isn't a single-slash-rooted path (external
+/// URLs, protocol-relative `//host`, `/\host`, backslash tricks) falls back to
+/// the account page.
+pub fn sanitize_return_to(return_to: &str) -> String {
+    let ok = return_to.starts_with('/')
+        && !return_to.starts_with("//")
+        && !return_to.starts_with("/\\")
+        && !return_to.contains('\\');
+    if ok {
+        return_to.to_string()
+    } else {
+        "/account".to_string()
+    }
 }
 
 pub async fn get_session_user(db: &Db, session_id: &str) -> Option<User> {
     // Find the session and its related user in one query
-    let result = session::Entity::find_by_id(session_id.to_string())
-        .find_also_related(user::Entity)
-        .one(db)
-        .await
-        .ok()??;
-
-    let (session_model, user_model) = result;
-    let user_model = user_model?;
+    let (session_model, user_model) = crate::dal::sessions::find_with_user(db, session_id).await?;
 
     // Check session expiry: compare expires_at against current time
     let t = OffsetDateTime::now_utc();
     let now = format!(
         "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
-        t.year(), t.month() as u8, t.day(), t.hour(), t.minute(), t.second()
+        t.year(),
+        t.month() as u8,
+        t.day(),
+        t.hour(),
+        t.minute(),
+        t.second()
     );
     if session_model.expires_at <= now {
         return None;
@@ -177,10 +217,7 @@ impl FromRequestParts<Arc<AppState>> for TokenUser {
         let token_hash = hash_token(token);
 
         // Find the token by hash, excluding revoked tokens
-        let token_model = api_token::Entity::find()
-            .filter(api_token::Column::TokenHash.eq(&token_hash))
-            .filter(api_token::Column::RevokedAt.is_null())
-            .one(&state.db)
+        let token_model = crate::dal::tokens::find_active_by_hash(&state.db, &token_hash)
             .await
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
             .ok_or(StatusCode::UNAUTHORIZED)?;
@@ -189,19 +226,10 @@ impl FromRequestParts<Arc<AppState>> for TokenUser {
         let user_id = token_model.user_id;
 
         // Update last_used_at
-        let t = OffsetDateTime::now_utc();
-        let now = format!(
-            "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
-            t.year(), t.month() as u8, t.day(), t.hour(), t.minute(), t.second()
-        );
-        let mut active_token: api_token::ActiveModel = token_model.into();
-        active_token.last_used_at = Set(Some(now));
-        let _ = active_token.update(&state.db).await;
+        let _ = crate::dal::tokens::touch_last_used(&state.db, token_model).await;
 
         // Find the user, excluding banned users
-        let user_model = user::Entity::find_by_id(user_id)
-            .filter(user::Column::BannedAt.is_null())
-            .one(&state.db)
+        let user_model = crate::dal::users::find_active_by_id(&state.db, user_id)
             .await
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
             .ok_or(StatusCode::UNAUTHORIZED)?;

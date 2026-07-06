@@ -2,6 +2,69 @@
 
 ## Unreleased
 
+### Changed
+
+- **Package registry (`pkg/`) now runs on SQLite, PostgreSQL, and MySQL from one
+  binary**, with a clean Data Access Layer (per
+  `docs/plans/2026-07-05-pkg-dal-multi-engine.md`). The engine is inferred from
+  the `DATABASE_URL` scheme; `db::connect()` applies SQLite-only tuning where
+  relevant and runs SeaORM programmatic migrations (`src/migration/`) that emit
+  correct DDL per engine, replacing the SQLite-dialect `migrations/*.sql`. All
+  database access moved out of handlers into per-aggregate modules under
+  `src/dal/` (`packages`, `versions`, `owners`, `deps`, `users`, `sessions`,
+  `tokens`, `reports`, `audit_log`, `oauth`, `downloads`, `admin`, `sync_log`,
+  `time`); handlers are now parse/authorize → call DAL → shape response and
+  contain no SQL. Portability is by construction: timestamps are generated in
+  Rust (no `datetime('now')`/`CURRENT_TIMESTAMP`), upserts use SeaORM
+  `on_conflict`, and any raw SQL is standard and parameterized. `make
+  test-all-drivers` runs the suite against all three engines. Removed the unused
+  `SESSION_SECRET` config. HTTP behavior is unchanged.
+
+### Security
+
+- **Package registry (`pkg/`) — stored-XSS-to-admin-takeover and secret-default
+  fixes (from an adversarial review).** Published package names are now
+  validated against a strict allowlist (`[A-Za-z0-9._-]`, alnum-bounded, no
+  `..`) on both CLI publish and GitHub link; previously a name taken verbatim
+  from the URL was interpolated into the package page's Alpine `x-init`/`@click`
+  JavaScript, so a crafted name (e.g. `');fetch('/api/v1/admin/users/…/role',
+  {method:'PUT',body:'{"is_admin":true}'})//`) could run in an admin's browser
+  and self-promote to admin. `repository_url` is now required to be `http(s)`
+  (blocks a `javascript:` link on the package page). The server refuses to boot
+  when GitHub OAuth is enabled but `OAUTH_TOKEN_KEY` is left at the insecure
+  compiled-in default (stored GitHub tokens are AES-encrypted with it). The
+  webhook handler returns a uniform `403` for an unknown repo so the status code
+  can't be used to enumerate linked repositories. Removed the unused
+  `SESSION_SECRET` config (sessions use opaque random DB-backed ids; the key was
+  never referenced).
+- **Package registry (`pkg/`) auth hardening ahead of live deploy.** Logout now
+  deletes the session row server-side, so a captured session cookie can no
+  longer be replayed after the user logs out (previously the cookie stayed
+  valid in the DB for its full 7-day lifetime). The GitHub OAuth `return_to`
+  parameter is restricted to same-site paths (`auth::sanitize_return_to`),
+  closing an open redirect where `/auth/github?return_to=https://evil.com`
+  would bounce a logged-in user off-site. The webhook handler now refuses a
+  push when the linked package has an empty/missing webhook secret, instead of
+  validating the signature against an attacker-computable empty-key HMAC.
+  Session cookies gain the `Secure` attribute automatically when `BASE_URL` is
+  `https://` (kept off for local `http://` dev). Added regression tests for
+  each, alongside the existing admin-authorization coverage.
+
+### Fixed
+
+- **Package registry (`pkg/`) pre-deploy hardening** (per
+  `docs/plans/2026-06-09-pkg-registry-predeploy-hardening.md`): publish is now
+  atomic — package, owner, version, and dependency rows are written in a single
+  transaction, and dependency-insert errors propagate instead of being silently
+  swallowed (previously a version row could commit with missing dependency
+  rows). Uploads are validated up front: gzip magic bytes required, dependency
+  count capped (`MAX_DEPENDENCIES`, default 64), `version_req` strings parsed
+  with `semver`, and malformed metadata JSON rejected with 400 instead of
+  silently dropping dependencies/description. `blob::store` returns IO errors
+  as 500s instead of panicking the handler. Also fixed axum's 2 MB default
+  body cap silently overriding `MAX_TARBALL_BYTES` on the publish route, and
+  consolidated API error responses into a shared `ApiError` type.
+
 ### Added
 
 - **WebSocket client (`ws/*`).** Connect to `ws://`/`wss://` servers with
