@@ -1,21 +1,21 @@
 # VitePress docs site (sema-lang.com). Namespaced as `site`.
 # Vercel CLI is intentionally not a repo dep; install globally or via npx.
 
-@group web
+@group site
 @desc "Start the docs site dev server"
 task dev:
     @needs npm
     @cd website
     npm run dev
 
-@group web
+@group site
 @desc "Build the docs site for production"
 task build:
     @needs npm
     @cd website
     npm run build
 
-@group web
+@group site
 @desc "Build + preview the production site locally"
 task preview: [build]
     @cd website
@@ -23,14 +23,14 @@ task preview: [build]
 
 # Check vendored OG assets and regenerate per-page cards. Run after editing the
 # template, logo, page titles, or version; commit the images before deploying.
-@group web
+@group site
 @desc "Regenerate per-page OpenGraph cards (public/og/*.jpg)"
 task og:
     @cd website
     npm run og:check
     npm run og
 
-@group web
+@group site
 @desc "Build + deploy the docs site to production (Vercel)"
 @needs npx
 task deploy: [build]

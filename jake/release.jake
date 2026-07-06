@@ -8,13 +8,13 @@ task check-publish-list:
 
 # ── Coverage ─────────────────────────────────────────────────────────
 
-@group coverage
+@group release
 @desc "Workspace coverage -> lcov.info"
 @needs cargo-llvm-cov "cargo install cargo-llvm-cov"
 task coverage:
     cargo llvm-cov --workspace --lcov --output-path lcov.info
 
-@group coverage
+@group release
 @desc "Workspace coverage -> HTML report"
 @needs cargo-llvm-cov "cargo install cargo-llvm-cov"
 task coverage-html:
@@ -23,26 +23,26 @@ task coverage-html:
 
 # ── Mutation testing ─────────────────────────────────────────────────
 
-@group mutants
+@group release
 @desc "Mutation testing (high-value stdlib crate)"
 @needs cargo-mutants "cargo install cargo-mutants"
 task mutants:
     echo "=== Mutation testing (sema-stdlib) ==="
     cargo mutants -p sema-stdlib --timeout 30 -- --test-threads=1
 
-@group mutants
+@group release
 @desc "Mutation testing (sema-core)"
 @needs cargo-mutants
 task mutants-core:
     cargo mutants -p sema-core --timeout 30
 
-@group mutants
+@group release
 @desc "Mutation testing (sema-notebook)"
 @needs cargo-mutants
 task mutants-notebook:
     cargo mutants -p sema-notebook --timeout 30
 
-@group mutants
+@group release
 @desc "Full-workspace mutation testing (slow)"
 @needs cargo-mutants
 task mutants-all:

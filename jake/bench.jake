@@ -42,7 +42,7 @@ task brc rows="1m": [release]
 # ── Profiling (samply) ───────────────────────────────────────────────
 
 # Record a CPU profile of one benchmark: `jake bench.profile bench=tak`
-@group profile
+@group bench
 @desc "Record a samply CPU profile (params: bench)"
 @needs samply "cargo install samply"
 task profile bench="tak":
