@@ -69,6 +69,7 @@ const VAL_VECTOR: u8 = 0x09;
 const VAL_MAP: u8 = 0x0A;
 const VAL_HASHMAP: u8 = 0x0B;
 const VAL_BYTEVECTOR: u8 = 0x0C;
+const VAL_BIGINT: u8 = 0x0D;
 
 const MAX_VALUE_DEPTH: usize = 128;
 
@@ -161,6 +162,13 @@ pub fn serialize_value(
             buf.push(VAL_BYTEVECTOR);
             buf.extend_from_slice(&len.to_le_bytes());
             buf.extend_from_slice(&bv);
+        }
+        ValueView::BigInt(n) => {
+            buf.push(VAL_BIGINT);
+            let bytes = n.to_signed_bytes_le();
+            let len = checked_u32(bytes.len(), "bigint byte length")?;
+            buf.extend_from_slice(&len.to_le_bytes());
+            buf.extend_from_slice(&bytes);
         }
         // Runtime-only types cannot appear in bytecode constant pools
         _ => {
@@ -362,6 +370,13 @@ fn deserialize_value_inner(
             let len = read_u32_le(buf, cursor)? as usize;
             let data = read_bytes(buf, cursor, len)?;
             Ok(Value::bytevector(data))
+        }
+        VAL_BIGINT => {
+            let len = read_u32_le(buf, cursor)? as usize;
+            let bytes = read_bytes(buf, cursor, len)?;
+            Ok(Value::from_bigint(
+                num_bigint::BigInt::from_signed_bytes_le(&bytes),
+            ))
         }
         _ => Err(SemaError::eval(format!(
             "unknown value tag in bytecode: 0x{tag:02x}"
@@ -1419,6 +1434,23 @@ mod tests {
         assert!(idx > 0);
         let idx2 = builder.intern_spur(spur);
         assert_eq!(idx, idx2);
+    }
+
+    #[test]
+    fn bigint_constant_roundtrips() {
+        use num_bigint::BigInt;
+        use std::str::FromStr;
+        let n = BigInt::from_str("170141183460469231731687303715884105728").unwrap();
+        let val = sema_core::Value::from_bigint(n);
+        let mut stb = StringTableBuilder::default();
+        let mut buf = Vec::new();
+        serialize_value(&val, &mut buf, &mut stb).unwrap();
+        let table = stb.finish();
+        let remap = build_remap_table(&table);
+        let mut cursor = 0;
+        let back = deserialize_value(&buf, &mut cursor, &table, &remap).unwrap();
+        assert_eq!(back, val);
+        assert_eq!(cursor, buf.len());
     }
 
     #[test]

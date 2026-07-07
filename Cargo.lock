@@ -3987,6 +3987,7 @@ version = "1.28.1"
 dependencies = [
  "hashbrown 0.17.1",
  "lasso",
+ "num-bigint",
  "sema-core",
  "sema-reader",
 ]

@@ -269,6 +269,7 @@ Each constant is serialized as a **type tag** (1 byte) followed by type-specific
 | `0x0A` | Map | 2 bytes: n_pairs (u16), then `n_pairs × 2` recursive SerializedValues (key, value alternating) |
 | `0x0B` | HashMap | Same as Map (`0x0A`) — tag distinguishes sorted vs hash map |
 | `0x0C` | Bytevector | 4 bytes: length (u32), then `length` raw bytes |
+| `0x0D` | BigInt | 4 bytes: byte-length (u32), then that many bytes of two's-complement little-endian magnitude (`num-bigint`'s `to_signed_bytes_le`) |
 
 ### Values That Cannot Appear in Bytecode
 

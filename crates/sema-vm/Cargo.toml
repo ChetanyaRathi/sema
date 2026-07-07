@@ -13,3 +13,4 @@ sema-core.workspace = true
 sema-reader.workspace = true
 hashbrown.workspace = true
 lasso.workspace = true
+num-bigint = "0.4"
