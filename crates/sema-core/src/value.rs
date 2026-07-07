@@ -8,6 +8,7 @@ use std::rc::Rc;
 use hashbrown::HashMap as SpurMap;
 use lasso::{Key, Rodeo, Spur};
 use num_bigint::BigInt;
+use num_rational::BigRational;
 use num_traits::ToPrimitive;
 
 use crate::error::SemaError;
@@ -548,6 +549,7 @@ const TAG_I64_ARRAY: u64 = 27;
 const TAG_ASYNC_PROMISE: u64 = 28;
 const TAG_CHANNEL: u64 = 29;
 const TAG_BIGINT: u64 = 30;
+const TAG_RATIONAL: u64 = 31;
 
 /// Small-int range: [-2^44, 2^44 - 1] = [-17_592_186_044_416, +17_592_186_044_415]
 const SMALL_INT_MIN: i64 = -(1i64 << 44);
@@ -618,6 +620,7 @@ pub enum ValueView {
     Bool(bool),
     Int(i64),
     BigInt(Rc<BigInt>),
+    Rational(Rc<BigRational>),
     Float(f64),
     String(Rc<String>),
     Symbol(Spur),
@@ -654,6 +657,7 @@ pub enum ValueViewRef<'a> {
     Bool(bool),
     Int(i64),
     BigInt(&'a BigInt),
+    Rational(&'a BigRational),
     Float(f64),
     String(&'a str),
     Symbol(Spur),
@@ -787,6 +791,16 @@ impl Value {
         match n.to_i64() {
             Some(i) => Value::int(i),
             None => Value::from_rc_ptr(TAG_BIGINT, Rc::new(n)),
+        }
+    }
+
+    /// Construct an exact rational, normalizing integer-valued rationals
+    /// (e.g. `6/3`) down to the tightest integer representation.
+    pub fn rational(r: BigRational) -> Value {
+        if r.is_integer() {
+            Value::from_bigint(r.to_integer())
+        } else {
+            Value::from_rc_ptr(TAG_RATIONAL, Rc::new(r))
         }
     }
 
@@ -1098,6 +1112,7 @@ impl Value {
                 ValueView::Int(val)
             }
             TAG_BIGINT => ValueView::BigInt(unsafe { self.get_rc::<BigInt>() }),
+            TAG_RATIONAL => ValueView::Rational(unsafe { self.get_rc::<BigRational>() }),
             // SAFETY: every TAG_X arm below calls `get_rc::<T>()` where T matches the
             // type stored by the corresponding Value::<x>() constructor. The Clone and
             // Drop impls elsewhere in this file mirror this dispatch table — when adding
@@ -1170,6 +1185,7 @@ impl Value {
                 ValueViewRef::Int(val)
             }
             TAG_BIGINT => ValueViewRef::BigInt(unsafe { self.borrow_ref::<BigInt>() }),
+            TAG_RATIONAL => ValueViewRef::Rational(unsafe { self.borrow_ref::<BigRational>() }),
             // SAFETY: same tag/type correspondence as view() — see the
             // comment in view().  borrow_ref returns &T without touching
             // the refcount.
@@ -1240,6 +1256,7 @@ impl Value {
             match get_tag(self.0) {
                 TAG_INT_BIG => count_at::<i64>(ptr),
                 TAG_BIGINT => count_at::<BigInt>(ptr),
+                TAG_RATIONAL => count_at::<BigRational>(ptr),
                 TAG_STRING => count_at::<String>(ptr),
                 TAG_LIST | TAG_VECTOR => count_at::<Vec<Value>>(ptr),
                 TAG_MAP => count_at::<BTreeMap<Value, Value>>(ptr),
@@ -1278,6 +1295,7 @@ impl Value {
             TAG_NIL => "nil",
             TAG_FALSE | TAG_TRUE => "bool",
             TAG_INT_SMALL | TAG_INT_BIG | TAG_BIGINT => "int",
+            TAG_RATIONAL => "rational",
             TAG_CHAR => "char",
             TAG_SYMBOL => "symbol",
             TAG_KEYWORD => "keyword",
@@ -1335,6 +1353,11 @@ impl Value {
     #[inline(always)]
     pub fn is_bigint(&self) -> bool {
         is_boxed(self.0) && get_tag(self.0) == TAG_BIGINT
+    }
+
+    #[inline(always)]
+    pub fn is_rational(&self) -> bool {
+        is_boxed(self.0) && get_tag(self.0) == TAG_RATIONAL
     }
 
     #[inline(always)]
@@ -1435,25 +1458,38 @@ impl Value {
         }
     }
 
+    /// Lift any exact Value (fixnum, bignum, or rational) to `BigRational`.
+    /// `None` for non-exact-numeric Values (including floats).
+    pub fn as_rational(&self) -> Option<BigRational> {
+        match self.view_ref() {
+            ValueViewRef::Int(n) => Some(BigRational::from(BigInt::from(n))),
+            ValueViewRef::BigInt(n) => Some(BigRational::from(n.clone())),
+            ValueViewRef::Rational(r) => Some(r.clone()),
+            _ => None,
+        }
+    }
+
     /// Lift any numeric Value into the tower type for arithmetic. `None` for
-    /// non-numbers. (Extended with Rational/Complex arms in Phases 2–3.)
+    /// non-numbers. (Extended with Complex arm in Phase 3.)
     pub fn as_number(&self) -> Option<SemaNumber> {
         match self.view_ref() {
             ValueViewRef::Int(n) => Some(SemaNumber::from_i64(n)),
             ValueViewRef::BigInt(n) => Some(SemaNumber::Integer(n.clone())),
+            ValueViewRef::Rational(r) => Some(SemaNumber::Rational(r.clone())),
             ValueViewRef::Float(f) => Some(SemaNumber::Real(f)),
             _ => None,
         }
     }
 
-    /// Lower a tower number to the tightest Value. (Extended with Rational/
-    /// Complex arms in Phases 2–3.)
+    /// Lower a tower number to the tightest Value. (Extended with Complex arm
+    /// in Phase 3.)
     pub fn from_number(n: SemaNumber) -> Value {
         match n.normalize() {
             SemaNumber::Integer(big) => Value::from_bigint(big),
+            SemaNumber::Rational(r) => Value::rational(r),
             SemaNumber::Real(f) => Value::float(f),
-            SemaNumber::Rational(_) | SemaNumber::Complex(_) => {
-                unreachable!("rational/complex Values are introduced in Phases 2–3")
+            SemaNumber::Complex(_) => {
+                unreachable!("complex Values are introduced in Phase 3")
             }
         }
     }
@@ -1886,6 +1922,7 @@ impl Clone for Value {
                     match tag {
                         TAG_INT_BIG => Rc::increment_strong_count(ptr as *const i64),
                         TAG_BIGINT => Rc::increment_strong_count(ptr as *const BigInt),
+                        TAG_RATIONAL => Rc::increment_strong_count(ptr as *const BigRational),
                         TAG_STRING => Rc::increment_strong_count(ptr as *const String),
                         TAG_LIST | TAG_VECTOR => {
                             Rc::increment_strong_count(ptr as *const Vec<Value>)
@@ -1941,6 +1978,7 @@ impl Drop for Value {
                     match tag {
                         TAG_INT_BIG => drop(Rc::from_raw(ptr as *const i64)),
                         TAG_BIGINT => drop(Rc::from_raw(ptr as *const BigInt)),
+                        TAG_RATIONAL => drop(Rc::from_raw(ptr as *const BigRational)),
                         TAG_STRING => drop(Rc::from_raw(ptr as *const String)),
                         TAG_LIST | TAG_VECTOR => drop(Rc::from_raw(ptr as *const Vec<Value>)),
                         TAG_MAP => drop(Rc::from_raw(ptr as *const BTreeMap<Value, Value>)),
@@ -1997,6 +2035,7 @@ impl PartialEq for Value {
             (ValueViewRef::Bool(a), ValueViewRef::Bool(b)) => a == b,
             (ValueViewRef::Int(a), ValueViewRef::Int(b)) => a == b,
             (ValueViewRef::BigInt(a), ValueViewRef::BigInt(b)) => a == b,
+            (ValueViewRef::Rational(a), ValueViewRef::Rational(b)) => a == b,
             (ValueViewRef::Float(a), ValueViewRef::Float(b)) => a == b,
             (ValueViewRef::String(a), ValueViewRef::String(b)) => a == b,
             (ValueViewRef::Symbol(a), ValueViewRef::Symbol(b)) => a == b,
@@ -2044,6 +2083,10 @@ impl Hash for Value {
             ValueViewRef::BigInt(n) => {
                 30u8.hash(state);
                 n.hash(state);
+            }
+            ValueViewRef::Rational(r) => {
+                31u8.hash(state);
+                r.hash(state);
             }
             ValueViewRef::Float(f) => {
                 3u8.hash(state);
@@ -2140,6 +2183,7 @@ impl Ord for Value {
                 ValueViewRef::F64Array(_) => 14,
                 ValueViewRef::I64Array(_) => 15,
                 ValueViewRef::Stream(_) => 16,
+                ValueViewRef::Rational(_) => 18,
                 _ => 17,
             }
         }
@@ -2150,6 +2194,7 @@ impl Ord for Value {
             (ValueViewRef::BigInt(a), ValueViewRef::BigInt(b)) => a.cmp(b),
             (ValueViewRef::Int(a), ValueViewRef::BigInt(b)) => BigInt::from(a).cmp(b),
             (ValueViewRef::BigInt(a), ValueViewRef::Int(b)) => a.cmp(&BigInt::from(b)),
+            (ValueViewRef::Rational(a), ValueViewRef::Rational(b)) => a.cmp(b),
             (ValueViewRef::Float(a), ValueViewRef::Float(b)) => {
                 // Normalize signed zeros so -0.0 and +0.0 are the same map key:
                 // Hash already collapses them and `=` treats them equal, but
@@ -2202,6 +2247,7 @@ impl fmt::Display for Value {
             ValueViewRef::Bool(false) => write!(f, "#f"),
             ValueViewRef::Int(n) => write!(f, "{n}"),
             ValueViewRef::BigInt(n) => write!(f, "{n}"),
+            ValueViewRef::Rational(r) => write!(f, "{}/{}", r.numer(), r.denom()),
             ValueViewRef::Float(n) => {
                 if n.fract() == 0.0 {
                     write!(f, "{n:.1}")
@@ -2490,6 +2536,7 @@ impl fmt::Debug for Value {
             ValueView::Bool(b) => write!(f, "Bool({b})"),
             ValueView::Int(n) => write!(f, "Int({n})"),
             ValueView::BigInt(n) => write!(f, "Int({n})"),
+            ValueView::Rational(r) => write!(f, "Rational({}/{})", r.numer(), r.denom()),
             ValueView::Float(n) => write!(f, "Float({n})"),
             ValueView::String(s) => write!(f, "String({:?})", &**s),
             ValueView::Symbol(s) => write!(f, "Symbol({})", resolve(s)),
@@ -3164,5 +3211,21 @@ mod tests {
         // Clone/Drop refcount safety.
         let v2 = v.clone();
         assert_eq!(v, v2);
+    }
+
+    #[test]
+    fn rational_roundtrip_and_normalize() {
+        use num_bigint::BigInt;
+        use num_rational::BigRational;
+        use num_traits::One;
+        let third = Value::rational(BigRational::new(BigInt::one(), BigInt::from(3)));
+        assert!(third.is_rational());
+        assert_eq!(third.to_string(), "1/3");
+        assert_eq!(third.type_name(), "rational");
+        // 6/3 normalizes to the integer 2
+        let two = Value::rational(BigRational::new(BigInt::from(6), BigInt::from(3)));
+        assert!(!two.is_rational());
+        assert_eq!(two.as_int(), Some(2));
+        assert_eq!(third.clone(), third);
     }
 }
