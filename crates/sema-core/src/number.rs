@@ -190,6 +190,49 @@ impl SemaNumber {
     }
 }
 
+/// Returned by `SemaNumber::div` when dividing by an *exact* zero. An inexact
+/// zero divisor follows IEEE-754 (→ ±inf / NaN), matching Scheme.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DivByZero;
+
+impl SemaNumber {
+    pub fn div(self, other: SemaNumber) -> Result<SemaNumber, DivByZero> {
+        use num_traits::Zero;
+        // Guard exact-zero divisor up front (before promotion, so `1/0` and
+        // `(1/2)/0` both signal, but `1/0.0` falls through to IEEE).
+        if matches!(&other, SemaNumber::Integer(n) if n.is_zero())
+            || matches!(&other, SemaNumber::Rational(r) if r.numer().is_zero())
+        {
+            return Err(DivByZero);
+        }
+        let (a, b) = SemaNumber::promote(self, other);
+        let out = match (a, b) {
+            // Integer/Integer → exact rational (reduces; normalize collapses to Integer if whole).
+            (SemaNumber::Integer(x), SemaNumber::Integer(y)) => SemaNumber::Rational(BigRational::new(x, y)),
+            (SemaNumber::Rational(x), SemaNumber::Rational(y)) => SemaNumber::Rational(x / y),
+            (SemaNumber::Real(x), SemaNumber::Real(y)) => SemaNumber::Real(x / y),
+            (SemaNumber::Complex(x), SemaNumber::Complex(y)) => {
+                // (a+bi)/(c+di) = ((a+bi)(c-di)) / (c²+d²)
+                let denom = y.re.clone().mul(y.re.clone()).add(y.im.clone().mul(y.im.clone()));
+                let num = SemaNumber::Complex(x).mul(SemaNumber::Complex(Box::new(Complex {
+                    re: y.re,
+                    im: y.im.neg(),
+                })));
+                match num {
+                    SemaNumber::Complex(nc) => SemaNumber::Complex(Box::new(Complex {
+                        re: nc.re.div(denom.clone())?,
+                        im: nc.im.div(denom)?,
+                    })),
+                    // num collapsed to real (imaginary cancelled): divide directly.
+                    real => real.div(denom)?,
+                }
+            }
+            _ => unreachable!("promote guarantees equal levels"),
+        };
+        Ok(out.normalize())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -272,5 +315,22 @@ mod tests {
         assert_eq!(half().neg().to_f64(), -0.5);
         // contagion: 2 + 0.5 = 2.5 as Real
         assert!(matches!(two().add(SemaNumber::Real(0.5)), SemaNumber::Real(_)));
+    }
+
+    #[test]
+    fn division_is_exact_when_possible() {
+        let n = |v: i64| SemaNumber::Integer(BigInt::from(v));
+        // 1 / 3 = 1/3 exact (NOT 0.333…)
+        let third = n(1).div(n(3)).unwrap();
+        assert!(matches!(&third, SemaNumber::Rational(r)
+            if *r == BigRational::new(BigInt::one(), BigInt::from(3))));
+        // 6 / 3 = 2 (normalizes to Integer)
+        assert!(matches!(n(6).div(n(3)).unwrap(), SemaNumber::Integer(k) if k == BigInt::from(2)));
+        // 1 / 2.0 = 0.5 (inexact contagion)
+        assert!(matches!(n(1).div(SemaNumber::Real(2.0)).unwrap(), SemaNumber::Real(_)));
+        // divide by exact zero → error
+        assert!(n(1).div(n(0)).is_err());
+        // divide by inexact zero → real infinity (IEEE), NOT an error
+        assert!(matches!(n(1).div(SemaNumber::Real(0.0)).unwrap(), SemaNumber::Real(f) if f.is_infinite()));
     }
 }
