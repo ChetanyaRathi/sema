@@ -346,6 +346,40 @@ impl std::fmt::Display for SemaNumber {
     }
 }
 
+impl SemaNumber {
+    pub fn from_i64(v: i64) -> SemaNumber {
+        SemaNumber::Integer(BigInt::from(v))
+    }
+    pub fn from_f64(v: f64) -> SemaNumber {
+        SemaNumber::Real(v)
+    }
+
+    pub fn to_inexact(self) -> SemaNumber {
+        match self {
+            SemaNumber::Complex(c) => SemaNumber::Complex(Box::new(Complex {
+                re: c.re.to_inexact(),
+                im: c.im.to_inexact(),
+            })),
+            other => SemaNumber::Real(other.to_f64()),
+        }
+    }
+
+    /// Convert inexact components to their exact rational value. Non-finite
+    /// reals have no exact value and are left as-is (callers that require
+    /// exactness should error; R7RS `inexact->exact` on ±inf/NaN is undefined).
+    pub fn to_exact(self) -> SemaNumber {
+        match self {
+            SemaNumber::Real(f) => SemaNumber::real_to_exact(f).map(|n| n.normalize()).unwrap_or(SemaNumber::Real(f)),
+            SemaNumber::Complex(c) => SemaNumber::Complex(Box::new(Complex {
+                re: c.re.to_exact(),
+                im: c.im.to_exact(),
+            }))
+            .normalize(),
+            exact => exact,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -482,5 +516,20 @@ mod tests {
         assert_eq!(c.to_string(), "3+4i");
         let c2 = SemaNumber::Complex(Box::new(Complex { re: n(0), im: n(-1) }));
         assert_eq!(c2.to_string(), "0-1i");
+    }
+
+    #[test]
+    fn exactness_conversions() {
+        let n = |v: i64| SemaNumber::Integer(BigInt::from(v));
+        // exact → inexact
+        assert!(matches!(n(3).to_inexact(), SemaNumber::Real(f) if f == 3.0));
+        // inexact 0.5 → exact 1/2
+        assert!(matches!(SemaNumber::Real(0.5).to_exact(),
+            SemaNumber::Rational(r) if r == BigRational::new(BigInt::one(), BigInt::from(2))));
+        // inexact 2.0 → exact 2 (normalizes to Integer)
+        assert!(matches!(SemaNumber::Real(2.0).to_exact(), SemaNumber::Integer(k) if k == BigInt::from(2)));
+        // bridges
+        assert!(matches!(SemaNumber::from_i64(5), SemaNumber::Integer(k) if k == BigInt::from(5)));
+        assert!(matches!(SemaNumber::from_f64(1.5), SemaNumber::Real(f) if f == 1.5));
     }
 }
