@@ -891,8 +891,11 @@ mod tests {
 
     #[test]
     fn test_read_int_overflow() {
-        // i64::MAX + 1 should error, not silently wrap
-        assert!(read("9999999999999999999999").is_err());
+        // i64::MAX + 1 lexes as a bignum rather than erroring or silently
+        // wrapping.
+        let v = read("9999999999999999999999").unwrap();
+        assert!(v.is_bigint());
+        assert_eq!(v.to_string(), "9999999999999999999999");
     }
 
     #[test]
