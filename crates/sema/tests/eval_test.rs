@@ -1406,6 +1406,15 @@ eval_tests! {
     vm_eq_bignum: "(= 9223372036854775808 9223372036854775808)" => common::eval("#t"),
 }
 
+// Task 1.6: `integer?`/`number?` recognize bignums; `integer?` is true for
+// integer-valued floats (R7RS sense) and false for non-integer floats.
+eval_tests! {
+    integer_pred_bignum: "(integer? 170141183460469231731687303715884105728)" => common::eval("#t"),
+    number_pred_bignum: "(number? 170141183460469231731687303715884105728)" => common::eval("#t"),
+    integer_pred_whole_float: "(integer? 2.0)" => common::eval("#t"),
+    integer_pred_fractional_float: "(integer? 2.5)" => common::eval("#f"),
+}
+
 // Regression tests for the runtime bug-hunt fixes (2026-07-07).
 eval_tests! {
     // Int↔float comparison is exact above 2^53 (was lossy: `as f64` collapsed

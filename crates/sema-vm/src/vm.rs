@@ -2597,7 +2597,9 @@ impl VM {
                     }
                     op::IS_NUMBER => {
                         let val = unsafe { pop_unchecked(&mut self.stack) };
-                        self.stack.push(Value::bool(val.is_int() || val.is_float()));
+                        // Matches stdlib `number?`: any tower number (fixnum,
+                        // bignum, float, and later rational/complex).
+                        self.stack.push(Value::bool(val.as_number().is_some()));
                     }
                     op::IS_STRING => {
                         let val = unsafe { pop_unchecked(&mut self.stack) };

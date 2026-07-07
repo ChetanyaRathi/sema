@@ -36,12 +36,17 @@ pub fn register(env: &sema_core::Env) {
 
     register_fn(env, "number?", |args| {
         check_arity!(args, "number?", 1);
-        Ok(Value::bool(args[0].is_int() || args[0].is_float()))
+        Ok(Value::bool(args[0].as_number().is_some()))
     });
 
     register_fn(env, "integer?", |args| {
         check_arity!(args, "integer?", 1);
-        Ok(Value::bool(args[0].is_int()))
+        // Exact integers (fixnum or bignum) plus integer-valued floats (`2.0`),
+        // per R7RS `integer?`.
+        let is_int = args[0].is_int()
+            || args[0].is_bigint()
+            || matches!(args[0].as_float(), Some(f) if f.is_finite() && f.fract() == 0.0 && args[0].is_float());
+        Ok(Value::bool(is_int))
     });
 
     register_fn(env, "float?", |args| {

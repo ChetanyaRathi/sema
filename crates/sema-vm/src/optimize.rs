@@ -349,8 +349,8 @@ fn fold_binary_op(name: &str, a: &Value, b: &Value) -> Option<Value> {
     let ai = a.as_int()?;
     let bi = b.as_int()?;
     match name {
-        // On overflow, don't fold: leave the call for the runtime, which raises
-        // an "integer overflow" error rather than silently wrapping.
+        // On overflow, don't fold: leave the call for the runtime, which
+        // promotes the result to a bignum rather than silently wrapping.
         "+" => ai.checked_add(bi).map(Value::int),
         "-" => ai.checked_sub(bi).map(Value::int),
         "*" => ai.checked_mul(bi).map(Value::int),
