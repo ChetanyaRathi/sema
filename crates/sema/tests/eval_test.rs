@@ -1622,6 +1622,18 @@ eval_tests! {
     rationalize_inexact_pi: "(rationalize 3.14159 1/100)" => common::eval("3.142857142857143"),
 }
 
+// Task 5.8: bitwise ops are bignum-aware (two's-complement semantics via
+// `BigInt`) — shifts and bitwise combinators operate correctly on operands
+// beyond i64 range instead of erroring or truncating.
+eval_tests! {
+    bit_shift_left_bignum: "(bit/shift-left 1 100)" => common::eval("1267650600228229401496703205376"),
+    bit_and_bignum: "(bit/and 170141183460469231731687303715884105727 255)" => common::eval("255"),
+    bit_or_bignum: "(bit/or 1152921504606846976 1)" => common::eval("1152921504606846977"),
+    bit_xor_bignum: "(bit/xor 170141183460469231731687303715884105728 1)" => common::eval("170141183460469231731687303715884105729"),
+    bit_not_bignum: "(bit/not 170141183460469231731687303715884105728)" => common::eval("-170141183460469231731687303715884105729"),
+    bit_shift_right_bignum: "(bit/shift-right 1267650600228229401496703205376 100)" => Value::int(1),
+}
+
 // Regression tests for the runtime bug-hunt fixes (2026-07-07).
 eval_tests! {
     // Int↔float comparison is exact above 2^53 (was lossy: `as f64` collapsed
@@ -1736,10 +1748,10 @@ fn vm_type_of_lambda_is_lambda() {
 // cleanly on both backends.
 // ---------------------------------------------------------------------------
 eval_error_tests! {
-    // STD-1
-    bit_shift_left_overflow: "(bit/shift-left 1 64)" => "shift",
+    // STD-1: negative shift counts still error. A shift count >= 64 is no
+    // longer an error (Task 5.8) — it now promotes to a bignum result, see
+    // `bit_shift_left_bignum`/`bit_shift_right_bignum` above.
     bit_shift_left_negative: "(bit/shift-left 1 -1)" => "shift",
-    bit_shift_right_overflow: "(bit/shift-right 1 64)" => "shift",
     bit_shift_right_negative: "(bit/shift-right 1 -1)" => "shift",
     // STD-2
     random_int_reversed_bounds: "(math/random-int 10 5)" => "math/random-int",
