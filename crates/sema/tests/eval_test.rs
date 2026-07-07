@@ -1435,6 +1435,24 @@ eval_error_tests! {
     div_by_zero_still_errors: "(/ 1 0)" => "division by zero",
 }
 
+// Task 2.4: rational?/exact?/inexact?/exact-integer?/numerator/denominator.
+eval_tests! {
+    rational_pred_rational: "(rational? 1/3)" => common::eval("#t"),
+    rational_pred_integer: "(rational? 5)" => common::eval("#t"),
+    rational_pred_float: "(rational? 2.5)" => common::eval("#f"),
+    exact_pred_rational: "(exact? 1/3)" => common::eval("#t"),
+    exact_pred_integer: "(exact? 5)" => common::eval("#t"),
+    exact_pred_float: "(exact? 2.5)" => common::eval("#f"),
+    inexact_pred_float: "(inexact? 2.5)" => common::eval("#t"),
+    exact_integer_pred_int: "(exact-integer? 5)" => common::eval("#t"),
+    exact_integer_pred_rational: "(exact-integer? 1/3)" => common::eval("#f"),
+    exact_integer_pred_float: "(exact-integer? 2.0)" => common::eval("#f"),
+    numerator_reduces: "(numerator 6/4)" => common::eval("3"),
+    denominator_reduces: "(denominator 6/4)" => common::eval("2"),
+    numerator_integer: "(numerator 5)" => common::eval("5"),
+    denominator_integer: "(denominator 5)" => common::eval("1"),
+}
+
 // Regression tests for the runtime bug-hunt fixes (2026-07-07).
 eval_tests! {
     // Int↔float comparison is exact above 2^53 (was lossy: `as f64` collapsed

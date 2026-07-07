@@ -1,3 +1,4 @@
+use sema_core::number::SemaNumber;
 use sema_core::{check_arity, SemaError, Value, ValueViewRef};
 
 use crate::register_fn;
@@ -52,6 +53,36 @@ pub fn register(env: &sema_core::Env) {
     register_fn(env, "float?", |args| {
         check_arity!(args, "float?", 1);
         Ok(Value::bool(args[0].is_float()))
+    });
+
+    register_fn(env, "rational?", |args| {
+        check_arity!(args, "rational?", 1);
+        // Exact integers and exact rationals are rational; inexact reals and
+        // complex numbers are not (`exact?`/`real?` cover those distinctions).
+        let ok = match args[0].as_number() {
+            Some(SemaNumber::Complex(_)) | None => false,
+            Some(n) => n.is_exact(),
+        };
+        Ok(Value::bool(ok))
+    });
+
+    register_fn(env, "exact?", |args| {
+        check_arity!(args, "exact?", 1);
+        Ok(Value::bool(
+            args[0].as_number().is_some_and(|n| n.is_exact()),
+        ))
+    });
+
+    register_fn(env, "inexact?", |args| {
+        check_arity!(args, "inexact?", 1);
+        Ok(Value::bool(
+            args[0].as_number().is_some_and(|n| !n.is_exact()),
+        ))
+    });
+
+    register_fn(env, "exact-integer?", |args| {
+        check_arity!(args, "exact-integer?", 1);
+        Ok(Value::bool(args[0].is_int() || args[0].is_bigint()))
     });
 
     register_fn(env, "string?", |args| {

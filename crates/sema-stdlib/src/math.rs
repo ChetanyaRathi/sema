@@ -527,6 +527,22 @@ pub fn register(env: &sema_core::Env) {
         }
     });
 
+    register_fn(env, "numerator", |args| {
+        check_arity!(args, "numerator", 1);
+        match args[0].as_rational() {
+            Some(r) => Ok(Value::from_bigint(r.numer().clone())),
+            None => Err(SemaError::type_error("rational", args[0].type_name())),
+        }
+    });
+
+    register_fn(env, "denominator", |args| {
+        check_arity!(args, "denominator", 1);
+        match args[0].as_rational() {
+            Some(r) => Ok(Value::from_bigint(r.denom().clone())),
+            None => Err(SemaError::type_error("rational", args[0].type_name())),
+        }
+    });
+
     env.set_str("math/infinity", Value::float(f64::INFINITY));
     env.set_str("math/nan", Value::float(f64::NAN));
 }
