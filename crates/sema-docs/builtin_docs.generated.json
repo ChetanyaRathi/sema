@@ -5931,6 +5931,23 @@
       "body": "Round down toward negative infinity. For negatives this rounds *away* from zero (`-2.3` → `-3`), unlike `int`, which truncates toward zero (`-2.3` → `-2`).\n\n```sema\n(floor 3.7)   ; => 3\n(floor -2.3)  ; => -3   (down, not -2)\n(int -2.3)    ; => -2   (contrast: toward zero)\n```"
     },
     {
+      "name": "gcd",
+      "module": "math",
+      "section": "Integer Math",
+      "summary": "Greatest common divisor: the largest non-negative integer that divides all arguments. Variadic and bignum-aware; `(gcd)` with no arguments is `0` (the identity of the fold), per R7RS. Pairs with [`lcm`](#lcm).",
+      "params": [
+        {
+          "name": "ns",
+          "type": "integer"
+        }
+      ],
+      "returns": "integer",
+      "examples": [
+        "(gcd 12 8)     ; => 4\n(gcd 15 10 25) ; => 5\n(gcd 7 13)     ; => 1   ; coprime\n(gcd)          ; => 0"
+      ],
+      "body": "Greatest common divisor: the largest non-negative integer that divides all arguments. Variadic and bignum-aware; `(gcd)` with no arguments is `0` (the identity of the fold), per R7RS. Pairs with [`lcm`](#lcm).\n\n```sema\n(gcd 12 8)     ; => 4\n(gcd 15 10 25) ; => 5\n(gcd 7 13)     ; => 1   ; coprime\n(gcd)          ; => 0\n```"
+    },
+    {
       "name": "imag-part",
       "module": "math",
       "section": "Complex Accessors",
@@ -5948,6 +5965,23 @@
       "body": "Return the imaginary part of a complex number. For real numbers, returns exact 0.\n\n```sema\n(imag-part 3+4i)       ; => 4\n(imag-part 2.5)        ; => 0\n(imag-part 1/3)        ; => 0\n(imag-part 5i)         ; => 5\n```"
     },
     {
+      "name": "inexact->exact",
+      "module": "math",
+      "section": "Exactness Conversion",
+      "summary": "Convert a number to its exact form. Finite floats are converted to their exact rational representation; inexact components of complex numbers are converted. Already-exact numbers are returned unchanged. `exact` is the shorter R7RS spelling of the same operation.",
+      "params": [
+        {
+          "name": "x",
+          "type": "number"
+        }
+      ],
+      "returns": "number",
+      "examples": [
+        "(inexact->exact 0.5)           ; => 1/2\n(inexact->exact 2.0)           ; => 2 (normalizes to integer)\n(inexact->exact 3.0+4.0i)      ; => 3+4i"
+      ],
+      "body": "Convert a number to its exact form. Finite floats are converted to their exact rational representation; inexact components of complex numbers are converted. Already-exact numbers are returned unchanged. `exact` is the shorter R7RS spelling of the same operation.\n\n```sema\n(inexact->exact 0.5)           ; => 1/2\n(inexact->exact 2.0)           ; => 2 (normalizes to integer)\n(inexact->exact 3.0+4.0i)      ; => 3+4i\n```"
+    },
+    {
       "name": "int",
       "module": "math",
       "summary": "Convert a number or numeric string to an integer. Floats are truncated **toward zero** (the fractional part is dropped, not rounded). Signals an error if a string cannot be parsed as an integer.",
@@ -5962,6 +5996,23 @@
         "(int 3.9)     ; => 3\n(int -3.9)    ; => -3   (toward zero, not -4)\n(int \"42\")    ; => 42\n(floor -3.9)  ; => -4   (contrast: rounds down)"
       ],
       "body": "Convert a number or numeric string to an integer. Floats are truncated **toward zero** (the fractional part is dropped, not rounded). Signals an error if a string cannot be parsed as an integer.\n\nTruncation differs from `floor` on negatives: `int` chops toward zero while `floor` always rounds down. `(int -3.9)` is `-3`, but `(floor -3.9)` is `-4`. Use `int` for \"drop the decimals\", `floor`/`ceil` when you need a specific rounding direction.\n\n```sema\n(int 3.9)     ; => 3\n(int -3.9)    ; => -3   (toward zero, not -4)\n(int \"42\")    ; => 42\n(floor -3.9)  ; => -4   (contrast: rounds down)\n```"
+    },
+    {
+      "name": "lcm",
+      "module": "math",
+      "section": "Integer Math",
+      "summary": "Least common multiple: the smallest non-negative integer that every argument divides. Variadic and bignum-aware; `(lcm)` with no arguments is `1` (the identity of the fold), per R7RS. Pairs with [`gcd`](#gcd).",
+      "params": [
+        {
+          "name": "ns",
+          "type": "integer"
+        }
+      ],
+      "returns": "integer",
+      "examples": [
+        "(lcm 4 6)      ; => 12\n(lcm 2 3 4)    ; => 12\n(lcm 7 13)     ; => 91  ; coprime\n(lcm)          ; => 1"
+      ],
+      "body": "Least common multiple: the smallest non-negative integer that every argument divides. Variadic and bignum-aware; `(lcm)` with no arguments is `1` (the identity of the fold), per R7RS. Pairs with [`gcd`](#gcd).\n\n```sema\n(lcm 4 6)      ; => 12\n(lcm 2 3 4)    ; => 12\n(lcm 7 13)     ; => 91  ; coprime\n(lcm)          ; => 1\n```"
     },
     {
       "name": "log",
@@ -6521,6 +6572,27 @@
       "body": "Raise a number to a power. Two non-negative integers give an integer result; a fractional or negative exponent (or float operands) yields a float. Same as [`math/pow`](#math-pow); `expt` is a Scheme-style alias.\n\n```sema\n(pow 2 10)    ; => 1024\n(pow 3 3)     ; => 27\n(pow 2 -1)    ; => 0.5   ; negative exponent -> float\n(pow 9 0.5)   ; => 3.0   ; fractional exponent -> square root\n```"
     },
     {
+      "name": "quotient",
+      "module": "math",
+      "section": "Integer Math",
+      "summary": "Truncated integer division: the result takes the sign of the dividend (truncates toward zero), per R7RS. Bignum-aware; both arguments must be exact integers. Pairs with [`remainder`](#remainder) so that `(+ (* (quotient n d) d) (remainder n d))` reconstructs `n`. Errors on a zero divisor.",
+      "params": [
+        {
+          "name": "n",
+          "type": "integer"
+        },
+        {
+          "name": "d",
+          "type": "integer"
+        }
+      ],
+      "returns": "integer",
+      "examples": [
+        "(quotient 10 3)   ; => 3\n(quotient -7 2)   ; => -3   ; truncates toward zero (not floored to -4)\n(quotient 100000000000000000000 7) ; => 14285714285714285714"
+      ],
+      "body": "Truncated integer division: the result takes the sign of the dividend (truncates toward zero), per R7RS. Bignum-aware; both arguments must be exact integers. Pairs with [`remainder`](#remainder) so that `(+ (* (quotient n d) d) (remainder n d))` reconstructs `n`. Errors on a zero divisor.\n\n```sema\n(quotient 10 3)   ; => 3\n(quotient -7 2)   ; => -3   ; truncates toward zero (not floored to -4)\n(quotient 100000000000000000000 7) ; => 14285714285714285714\n```"
+    },
+    {
       "name": "rationalize",
       "module": "math",
       "section": "Rational Approximation",
@@ -6557,6 +6629,27 @@
         "(real-part 3+4i)       ; => 3\n(real-part 2.5)        ; => 2.5\n(real-part 1/3)        ; => 1/3\n(real-part 5i)         ; => 0"
       ],
       "body": "Return the real part of a complex number. For real numbers, returns the number itself.\n\n```sema\n(real-part 3+4i)       ; => 3\n(real-part 2.5)        ; => 2.5\n(real-part 1/3)        ; => 1/3\n(real-part 5i)         ; => 0\n```"
+    },
+    {
+      "name": "remainder",
+      "module": "math",
+      "section": "Integer Math",
+      "summary": "Remainder of truncated integer division: the result takes the sign of the dividend, per R7RS. Bignum-aware; both arguments must be exact integers. Pairs with [`quotient`](#quotient) so that `(+ (* (quotient n d) d) (remainder n d))` reconstructs `n`. Unlike [`modulo`](#modulo), the sign follows the dividend rather than the divisor. Errors on a zero divisor.",
+      "params": [
+        {
+          "name": "n",
+          "type": "integer"
+        },
+        {
+          "name": "d",
+          "type": "integer"
+        }
+      ],
+      "returns": "integer",
+      "examples": [
+        "(remainder 10 3)   ; => 1\n(remainder -7 2)   ; => -1   ; sign of the dividend\n(remainder 7 -2)   ; => 1"
+      ],
+      "body": "Remainder of truncated integer division: the result takes the sign of the dividend, per R7RS. Bignum-aware; both arguments must be exact integers. Pairs with [`quotient`](#quotient) so that `(+ (* (quotient n d) d) (remainder n d))` reconstructs `n`. Unlike [`modulo`](#modulo), the sign follows the dividend rather than the divisor. Errors on a zero divisor.\n\n```sema\n(remainder 10 3)   ; => 1\n(remainder -7 2)   ; => -1   ; sign of the dividend\n(remainder 7 -2)   ; => 1\n```"
     },
     {
       "name": "round",

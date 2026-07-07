@@ -4,10 +4,9 @@ module: "math"
 section: "Exactness Conversion"
 params: [{ name: x, type: number }]
 returns: "number"
-aliases: ["exact"]
 ---
 
-Convert a number to its exact form. Finite floats are converted to their exact rational representation; inexact components of complex numbers are converted. Already-exact numbers are returned unchanged. This is an alias for `exact`; use either name.
+Convert a number to its exact form. Finite floats are converted to their exact rational representation; inexact components of complex numbers are converted. Already-exact numbers are returned unchanged. `exact` is the shorter R7RS spelling of the same operation.
 
 ```sema
 (inexact->exact 0.5)           ; => 1/2
