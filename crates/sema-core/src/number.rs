@@ -134,6 +134,60 @@ impl SemaNumber {
         let target = a.level().max(b.level());
         (a.lift_to(target), b.lift_to(target))
     }
+
+    pub fn neg(self) -> SemaNumber {
+        match self {
+            SemaNumber::Integer(n) => SemaNumber::Integer(-n),
+            SemaNumber::Rational(r) => SemaNumber::Rational(-r),
+            SemaNumber::Real(f) => SemaNumber::Real(-f),
+            SemaNumber::Complex(c) => SemaNumber::Complex(Box::new(Complex {
+                re: c.re.neg(),
+                im: c.im.neg(),
+            })),
+        }
+        .normalize()
+    }
+
+    pub fn add(self, other: SemaNumber) -> SemaNumber {
+        let (a, b) = SemaNumber::promote(self, other);
+        match (a, b) {
+            (SemaNumber::Integer(x), SemaNumber::Integer(y)) => SemaNumber::Integer(x + y),
+            (SemaNumber::Rational(x), SemaNumber::Rational(y)) => SemaNumber::Rational(x + y),
+            (SemaNumber::Real(x), SemaNumber::Real(y)) => SemaNumber::Real(x + y),
+            (SemaNumber::Complex(x), SemaNumber::Complex(y)) => SemaNumber::Complex(Box::new(Complex {
+                re: x.re.add(y.re),
+                im: x.im.add(y.im),
+            })),
+            _ => unreachable!("promote guarantees equal levels"),
+        }
+        .normalize()
+    }
+
+    pub fn sub(self, other: SemaNumber) -> SemaNumber {
+        self.add(other.neg())
+    }
+
+    pub fn mul(self, other: SemaNumber) -> SemaNumber {
+        let (a, b) = SemaNumber::promote(self, other);
+        match (a, b) {
+            (SemaNumber::Integer(x), SemaNumber::Integer(y)) => SemaNumber::Integer(x * y),
+            (SemaNumber::Rational(x), SemaNumber::Rational(y)) => SemaNumber::Rational(x * y),
+            (SemaNumber::Real(x), SemaNumber::Real(y)) => SemaNumber::Real(x * y),
+            (SemaNumber::Complex(x), SemaNumber::Complex(y)) => {
+                // (a+bi)(c+di) = (ac - bd) + (ad + bc)i
+                let ac = x.re.clone().mul(y.re.clone());
+                let bd = x.im.clone().mul(y.im.clone());
+                let ad = x.re.mul(y.im.clone());
+                let bc = x.im.mul(y.re);
+                SemaNumber::Complex(Box::new(Complex {
+                    re: ac.sub(bd),
+                    im: ad.add(bc),
+                }))
+            }
+            _ => unreachable!("promote guarantees equal levels"),
+        }
+        .normalize()
+    }
 }
 
 #[cfg(test)]
@@ -197,5 +251,26 @@ mod tests {
         let (a, b) = SemaNumber::promote(SemaNumber::Integer(BigInt::from(2)), SemaNumber::Real(0.5));
         assert!(matches!(a, SemaNumber::Real(_)));
         assert!(matches!(b, SemaNumber::Real(_)));
+    }
+
+    #[test]
+    fn add_sub_mul_neg() {
+        use num_traits::Zero;
+        let two = || SemaNumber::Integer(BigInt::from(2));
+        let half = || SemaNumber::Rational(BigRational::new(BigInt::one(), BigInt::from(2)));
+        // 2 + 1/2 = 5/2
+        assert_eq!(two().add(half()).to_f64(), 2.5);
+        // exact: result is Rational, not Real
+        assert!(matches!(two().add(half()), SemaNumber::Rational(_)));
+        // 1/2 + 1/2 = 1 (normalizes to Integer)
+        assert!(matches!(half().add(half()), SemaNumber::Integer(n) if n == BigInt::one()));
+        // 2 - 2 = 0
+        assert!(matches!(two().sub(two()), SemaNumber::Integer(n) if n == BigInt::zero()));
+        // 2 * 1/2 = 1
+        assert!(matches!(two().mul(half()), SemaNumber::Integer(n) if n == BigInt::one()));
+        // -(1/2) = -1/2
+        assert_eq!(half().neg().to_f64(), -0.5);
+        // contagion: 2 + 0.5 = 2.5 as Real
+        assert!(matches!(two().add(SemaNumber::Real(0.5)), SemaNumber::Real(_)));
     }
 }
