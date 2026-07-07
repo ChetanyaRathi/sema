@@ -1491,6 +1491,21 @@ eval_tests! {
     radix_hex_in_arithmetic: "(+ #x10 #x10)" => common::eval("32"),
 }
 
+// Task 4.2: #e/#i exactness prefixes (combinable with radix) and the
+// exact/inexact/exact->inexact/inexact->exact builtins.
+eval_tests! {
+    exact_to_inexact: "(exact->inexact 1/2)" => common::eval("0.5"),
+    inexact_to_exact: "(inexact->exact 0.5)" => common::eval("1/2"),
+    exact_of_float: "(exact 2.0)" => common::eval("2"),
+    inexact_of_int: "(inexact 3)" => common::eval("3.0"),
+    exact_prefix_float: "#e1.5" => common::eval("3/2"),
+    inexact_prefix_rational: "#i1/2" => common::eval("0.5"),
+    // combinable radix + exactness prefixes, in either order
+    exact_prefix_with_radix: "#e#xFF" => common::eval("255"),
+    radix_then_exact_prefix: "#x#e1F" => common::eval("31"),
+    inexact_prefix_with_radix: "#i#xFF" => common::eval("255.0"),
+}
+
 // Task 2.4: rational?/exact?/inexact?/exact-integer?/numerator/denominator.
 eval_tests! {
     rational_pred_rational: "(rational? 1/3)" => common::eval("#t"),

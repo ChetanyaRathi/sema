@@ -397,53 +397,15 @@ pub fn tokenize(input: &str) -> Result<Vec<SpannedToken>, SemaError> {
                                 i += 1;
                             }
                         }
-                        'x' | 'X' | 'o' | 'O' | 'b' | 'B' | 'd' | 'D' => {
-                            // Radix-prefixed integer literal: #xFF, #o17, #b101,
-                            // #d10. Sign-aware (#x-1F) and bignum-capable — the
-                            // digit run is parsed via `SemaNumber::parse_int_radix`
-                            // and lowered to the tightest token (Int or BigInt).
-                            let radix = match chars[i + 1] {
-                                'x' | 'X' => 16,
-                                'o' | 'O' => 8,
-                                'b' | 'B' => 2,
-                                'd' | 'D' => 10,
-                                _ => unreachable!(),
-                            };
-                            let digits_start = i + 2;
-                            let mut j = digits_start;
-                            if j < chars.len() && (chars[j] == '+' || chars[j] == '-') {
-                                j += 1;
-                            }
-                            let digits_body_start = j;
-                            while j < chars.len() && chars[j].is_ascii_alphanumeric() {
-                                j += 1;
-                            }
-                            if j == digits_body_start {
-                                return Err(SemaError::Reader {
-                                    message: format!(
-                                        "expected digits after #{} radix prefix",
-                                        chars[i + 1]
-                                    ),
-                                    span,
-                                });
-                            }
-                            let digits: String = chars[digits_start..j].iter().collect();
-                            let n =
-                                SemaNumber::parse_int_radix(&digits, radix).ok_or_else(|| {
-                                    SemaError::Reader {
-                                        message: format!("invalid radix-{radix} literal: {digits}"),
-                                        span,
-                                    }
-                                })?;
-                            let token = match n {
-                                SemaNumber::Integer(big) => match i64::try_from(&big) {
-                                    Ok(v) => Token::Int(v),
-                                    Err(_) => Token::BigInt(big),
-                                },
-                                _ => unreachable!("parse_int_radix only produces Integer"),
-                            };
-                            col += j - i;
-                            i = j;
+                        'x' | 'X' | 'o' | 'O' | 'b' | 'B' | 'd' | 'D' | 'e' | 'E' | 'i' | 'I' => {
+                            // Numeric prefix literal: any combination of a radix
+                            // prefix (`#x/#o/#b/#d`) and an exactness prefix
+                            // (`#e/#i`), in either order (`#e#xFF`, `#x#e1F`),
+                            // followed by the number body. Bignum-capable; the
+                            // result is lowered to the tightest token.
+                            let (token, len) = read_hash_number(&chars[i..], &span)?;
+                            col += len;
+                            i += len;
                             tokens.push(SpannedToken {
                                 token,
                                 span: span.with_end(line, col),
@@ -808,6 +770,138 @@ fn read_string_escape(
         }
     }
     Ok(())
+}
+
+/// Read a `#`-prefixed numeric literal. `chars[0]` is the leading `#`. Consumes
+/// any chain of radix (`#x/#o/#b/#d`) and exactness (`#e/#i`) prefixes in either
+/// order, then the number body, applies the exactness override, and lowers the
+/// result to the tightest `Token`. Returns the token and the chars consumed.
+fn read_hash_number(chars: &[char], span: &Span) -> Result<(Token, usize), SemaError> {
+    let mut radix: Option<u32> = None;
+    let mut exact: Option<bool> = None;
+    let mut i = 0;
+    // Consume the prefix chain: each prefix is `#` followed by a letter.
+    while i + 1 < chars.len() && chars[i] == '#' {
+        match chars[i + 1] {
+            c @ ('x' | 'X' | 'o' | 'O' | 'b' | 'B' | 'd' | 'D') => {
+                if radix.is_some() {
+                    return Err(SemaError::Reader {
+                        message: "duplicate radix prefix".into(),
+                        span: *span,
+                    });
+                }
+                radix = Some(match c {
+                    'x' | 'X' => 16,
+                    'o' | 'O' => 8,
+                    'b' | 'B' => 2,
+                    _ => 10,
+                });
+            }
+            'e' | 'E' => {
+                if exact.is_some() {
+                    return Err(SemaError::Reader {
+                        message: "duplicate exactness prefix".into(),
+                        span: *span,
+                    });
+                }
+                exact = Some(true);
+            }
+            'i' | 'I' => {
+                if exact.is_some() {
+                    return Err(SemaError::Reader {
+                        message: "duplicate exactness prefix".into(),
+                        span: *span,
+                    });
+                }
+                exact = Some(false);
+            }
+            other => {
+                return Err(SemaError::Reader {
+                    message: format!("unexpected character after #: '{other}'"),
+                    span: *span,
+                });
+            }
+        }
+        i += 2;
+    }
+    // Parse the number body. A non-decimal radix admits only integers; a decimal
+    // body (`#d`, or no radix at all) uses the full number grammar.
+    let (num, body_len) = match radix {
+        Some(r) if r != 10 => read_radix_integer(&chars[i..], r, span)?,
+        _ => {
+            let (tok, len) = read_number(&chars[i..], span)?;
+            (token_to_number(tok, span)?, len)
+        }
+    };
+    // Apply the exactness override, then lower to the tightest token.
+    let num = match exact {
+        Some(true) => num.to_exact(),
+        Some(false) => num.to_inexact(),
+        None => num,
+    };
+    Ok((number_to_token(num), i + body_len))
+}
+
+/// Read a sign-optional, arbitrary-precision integer in `radix` (2/8/16) from the
+/// start of `chars`. Returns the number and the chars consumed.
+fn read_radix_integer(
+    chars: &[char],
+    radix: u32,
+    span: &Span,
+) -> Result<(SemaNumber, usize), SemaError> {
+    let mut j = 0;
+    if j < chars.len() && (chars[j] == '+' || chars[j] == '-') {
+        j += 1;
+    }
+    let body_start = j;
+    while j < chars.len() && chars[j].is_ascii_alphanumeric() {
+        j += 1;
+    }
+    if j == body_start {
+        return Err(SemaError::Reader {
+            message: format!("expected digits after radix-{radix} prefix"),
+            span: *span,
+        });
+    }
+    let digits: String = chars[..j].iter().collect();
+    let n = SemaNumber::parse_int_radix(&digits, radix).ok_or_else(|| SemaError::Reader {
+        message: format!("invalid radix-{radix} literal: {digits}"),
+        span: *span,
+    })?;
+    Ok((n, j))
+}
+
+/// Lift a numeric `Token` into a `SemaNumber` (for applying an exactness prefix).
+/// A non-numeric token is a reader error.
+fn token_to_number(tok: Token, span: &Span) -> Result<SemaNumber, SemaError> {
+    match tok {
+        Token::Int(v) => Ok(SemaNumber::from_i64(v)),
+        Token::BigInt(b) => Ok(SemaNumber::Integer(b)),
+        Token::Rational(r) => Ok(SemaNumber::Rational(r)),
+        Token::Float(f) => Ok(SemaNumber::from_f64(f)),
+        Token::Complex(re, im) => Ok(SemaNumber::Complex(Box::new(sema_core::number::Complex {
+            re,
+            im,
+        }))),
+        _ => Err(SemaError::Reader {
+            message: "expected a number after exactness/radix prefix".into(),
+            span: *span,
+        }),
+    }
+}
+
+/// Lower a `SemaNumber` to the tightest numeric `Token` (i64-range integers →
+/// `Int`, larger → `BigInt`, rationals → `Rational`, reals → `Float`).
+fn number_to_token(n: SemaNumber) -> Token {
+    match n {
+        SemaNumber::Integer(big) => match i64::try_from(&big) {
+            Ok(v) => Token::Int(v),
+            Err(_) => Token::BigInt(big),
+        },
+        SemaNumber::Rational(r) => Token::Rational(r),
+        SemaNumber::Real(f) => Token::Float(f),
+        SemaNumber::Complex(c) => Token::Complex(c.re, c.im),
+    }
 }
 
 fn read_number(chars: &[char], span: &Span) -> Result<(Token, usize), SemaError> {
@@ -1342,5 +1436,26 @@ mod tests {
             first("#xFFFFFFFFFFFFFFFFF"),
             Token::BigInt(BigInt::from_str("295147905179352825855").unwrap())
         );
+    }
+
+    #[test]
+    fn exactness_prefixes() {
+        use num_bigint::BigInt;
+        use num_rational::BigRational;
+        let first = |src: &str| tokenize(src).unwrap().into_iter().next().unwrap().token;
+        // #i makes an exact literal inexact
+        assert_eq!(first("#i1/2"), Token::Float(0.5));
+        assert_eq!(first("#i3"), Token::Float(3.0));
+        // #e makes an inexact literal exact
+        assert_eq!(
+            first("#e1.5"),
+            Token::Rational(BigRational::new(BigInt::from(3), BigInt::from(2)))
+        );
+        // #e on a whole float collapses to an integer
+        assert_eq!(first("#e2.0"), Token::Int(2));
+        // combinable with radix, in either order
+        assert_eq!(first("#e#xFF"), Token::Int(255));
+        assert_eq!(first("#x#e1F"), Token::Int(31));
+        assert_eq!(first("#i#xFF"), Token::Float(255.0));
     }
 }

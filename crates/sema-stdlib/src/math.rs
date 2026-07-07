@@ -51,6 +51,22 @@ fn float_to_int(f: f64, op: &str) -> Result<Value, SemaError> {
     Ok(Value::int(f as i64))
 }
 
+fn to_inexact_impl(args: &[Value]) -> Result<Value, SemaError> {
+    check_arity!(args, "inexact", 1);
+    let n = args[0]
+        .as_number()
+        .ok_or_else(|| SemaError::type_error("number", args[0].type_name()))?;
+    Ok(Value::from_number(n.to_inexact()))
+}
+
+fn to_exact_impl(args: &[Value]) -> Result<Value, SemaError> {
+    check_arity!(args, "exact", 1);
+    let n = args[0]
+        .as_number()
+        .ok_or_else(|| SemaError::type_error("number", args[0].type_name()))?;
+    Ok(Value::from_number(n.to_exact()))
+}
+
 fn ceil_impl(args: &[Value]) -> Result<Value, SemaError> {
     check_arity!(args, "ceil", 1);
     match args[0].view_ref() {
@@ -272,6 +288,14 @@ pub fn register(env: &sema_core::Env) {
             None => Err(SemaError::type_error("number", args[0].type_name())),
         }
     });
+
+    // Exactness conversions (R7RS). `exact`/`inexact->exact` snap a finite real
+    // to its exact rational value; `inexact`/`exact->inexact` project every
+    // component to a float. Both lower back to the tightest representation.
+    register_fn(env, "inexact", to_inexact_impl);
+    register_fn(env, "exact->inexact", to_inexact_impl);
+    register_fn(env, "exact", to_exact_impl);
+    register_fn(env, "inexact->exact", to_exact_impl);
 
     register_fn(env, "pow", pow_impl);
     register_fn(env, "expt", pow_impl);
