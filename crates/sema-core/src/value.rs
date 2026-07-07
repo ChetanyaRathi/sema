@@ -7,8 +7,11 @@ use std::rc::Rc;
 
 use hashbrown::HashMap as SpurMap;
 use lasso::{Key, Rodeo, Spur};
+use num_bigint::BigInt;
+use num_traits::ToPrimitive;
 
 use crate::error::SemaError;
+use crate::number::SemaNumber;
 use crate::EvalContext;
 
 // Compile-time check: NaN-boxing requires 64-bit pointers that fit in 48-bit VA space.
@@ -544,6 +547,7 @@ const TAG_F64_ARRAY: u64 = 26;
 const TAG_I64_ARRAY: u64 = 27;
 const TAG_ASYNC_PROMISE: u64 = 28;
 const TAG_CHANNEL: u64 = 29;
+const TAG_BIGINT: u64 = 30;
 
 /// Small-int range: [-2^44, 2^44 - 1] = [-17_592_186_044_416, +17_592_186_044_415]
 const SMALL_INT_MIN: i64 = -(1i64 << 44);
@@ -613,6 +617,7 @@ pub enum ValueView {
     Nil,
     Bool(bool),
     Int(i64),
+    BigInt(Rc<BigInt>),
     Float(f64),
     String(Rc<String>),
     Symbol(Spur),
@@ -648,6 +653,7 @@ pub enum ValueViewRef<'a> {
     Nil,
     Bool(bool),
     Int(i64),
+    BigInt(&'a BigInt),
     Float(f64),
     String(&'a str),
     Symbol(Spur),
@@ -772,6 +778,16 @@ impl Value {
     fn from_rc_ptr<T>(tag: u64, rc: Rc<T>) -> Value {
         let ptr = Rc::into_raw(rc) as *const u8;
         Value(make_boxed(tag, ptr_to_payload(ptr)))
+    }
+
+    /// Construct an integer of any magnitude, normalizing to the tightest
+    /// representation: values in i64 range become a fixnum/int-big, larger
+    /// values are heap-boxed under `TAG_BIGINT`.
+    pub fn from_bigint(n: BigInt) -> Value {
+        match n.to_i64() {
+            Some(i) => Value::int(i),
+            None => Value::from_rc_ptr(TAG_BIGINT, Rc::new(n)),
+        }
     }
 
     pub fn string(s: &str) -> Value {
@@ -1081,6 +1097,7 @@ impl Value {
                 let val = unsafe { *self.borrow_ref::<i64>() };
                 ValueView::Int(val)
             }
+            TAG_BIGINT => ValueView::BigInt(unsafe { self.get_rc::<BigInt>() }),
             // SAFETY: every TAG_X arm below calls `get_rc::<T>()` where T matches the
             // type stored by the corresponding Value::<x>() constructor. The Clone and
             // Drop impls elsewhere in this file mirror this dispatch table — when adding
@@ -1152,6 +1169,7 @@ impl Value {
                 let val = unsafe { *self.borrow_ref::<i64>() };
                 ValueViewRef::Int(val)
             }
+            TAG_BIGINT => ValueViewRef::BigInt(unsafe { self.borrow_ref::<BigInt>() }),
             // SAFETY: same tag/type correspondence as view() — see the
             // comment in view().  borrow_ref returns &T without touching
             // the refcount.
@@ -1221,6 +1239,7 @@ impl Value {
         let n = unsafe {
             match get_tag(self.0) {
                 TAG_INT_BIG => count_at::<i64>(ptr),
+                TAG_BIGINT => count_at::<BigInt>(ptr),
                 TAG_STRING => count_at::<String>(ptr),
                 TAG_LIST | TAG_VECTOR => count_at::<Vec<Value>>(ptr),
                 TAG_MAP => count_at::<BTreeMap<Value, Value>>(ptr),
@@ -1258,7 +1277,7 @@ impl Value {
         match get_tag(self.0) {
             TAG_NIL => "nil",
             TAG_FALSE | TAG_TRUE => "bool",
-            TAG_INT_SMALL | TAG_INT_BIG => "int",
+            TAG_INT_SMALL | TAG_INT_BIG | TAG_BIGINT => "int",
             TAG_CHAR => "char",
             TAG_SYMBOL => "symbol",
             TAG_KEYWORD => "keyword",
@@ -1311,6 +1330,11 @@ impl Value {
     #[inline(always)]
     pub fn is_int(&self) -> bool {
         is_boxed(self.0) && matches!(get_tag(self.0), TAG_INT_SMALL | TAG_INT_BIG)
+    }
+
+    #[inline(always)]
+    pub fn is_bigint(&self) -> bool {
+        is_boxed(self.0) && get_tag(self.0) == TAG_BIGINT
     }
 
     #[inline(always)]
@@ -1398,6 +1422,39 @@ impl Value {
             }
             TAG_INT_BIG => Some(unsafe { *self.borrow_ref::<i64>() }),
             _ => None,
+        }
+    }
+
+    /// Lift any integer Value (fixnum, int-big, or bignum) to `BigInt`.
+    /// `None` for non-integers.
+    pub fn as_bigint(&self) -> Option<BigInt> {
+        match self.view_ref() {
+            ValueViewRef::Int(n) => Some(BigInt::from(n)),
+            ValueViewRef::BigInt(n) => Some(n.clone()),
+            _ => None,
+        }
+    }
+
+    /// Lift any numeric Value into the tower type for arithmetic. `None` for
+    /// non-numbers. (Extended with Rational/Complex arms in Phases 2–3.)
+    pub fn as_number(&self) -> Option<SemaNumber> {
+        match self.view_ref() {
+            ValueViewRef::Int(n) => Some(SemaNumber::from_i64(n)),
+            ValueViewRef::BigInt(n) => Some(SemaNumber::Integer(n.clone())),
+            ValueViewRef::Float(f) => Some(SemaNumber::Real(f)),
+            _ => None,
+        }
+    }
+
+    /// Lower a tower number to the tightest Value. (Extended with Rational/
+    /// Complex arms in Phases 2–3.)
+    pub fn from_number(n: SemaNumber) -> Value {
+        match n.normalize() {
+            SemaNumber::Integer(big) => Value::from_bigint(big),
+            SemaNumber::Real(f) => Value::float(f),
+            SemaNumber::Rational(_) | SemaNumber::Complex(_) => {
+                unreachable!("rational/complex Values are introduced in Phases 2–3")
+            }
         }
     }
 
@@ -1828,6 +1885,7 @@ impl Clone for Value {
                 unsafe {
                     match tag {
                         TAG_INT_BIG => Rc::increment_strong_count(ptr as *const i64),
+                        TAG_BIGINT => Rc::increment_strong_count(ptr as *const BigInt),
                         TAG_STRING => Rc::increment_strong_count(ptr as *const String),
                         TAG_LIST | TAG_VECTOR => {
                             Rc::increment_strong_count(ptr as *const Vec<Value>)
@@ -1882,6 +1940,7 @@ impl Drop for Value {
                 unsafe {
                     match tag {
                         TAG_INT_BIG => drop(Rc::from_raw(ptr as *const i64)),
+                        TAG_BIGINT => drop(Rc::from_raw(ptr as *const BigInt)),
                         TAG_STRING => drop(Rc::from_raw(ptr as *const String)),
                         TAG_LIST | TAG_VECTOR => drop(Rc::from_raw(ptr as *const Vec<Value>)),
                         TAG_MAP => drop(Rc::from_raw(ptr as *const BTreeMap<Value, Value>)),
@@ -1937,6 +1996,7 @@ impl PartialEq for Value {
             (ValueViewRef::Nil, ValueViewRef::Nil) => true,
             (ValueViewRef::Bool(a), ValueViewRef::Bool(b)) => a == b,
             (ValueViewRef::Int(a), ValueViewRef::Int(b)) => a == b,
+            (ValueViewRef::BigInt(a), ValueViewRef::BigInt(b)) => a == b,
             (ValueViewRef::Float(a), ValueViewRef::Float(b)) => a == b,
             (ValueViewRef::String(a), ValueViewRef::String(b)) => a == b,
             (ValueViewRef::Symbol(a), ValueViewRef::Symbol(b)) => a == b,
@@ -1979,6 +2039,10 @@ impl Hash for Value {
             }
             ValueViewRef::Int(n) => {
                 2u8.hash(state);
+                n.hash(state);
+            }
+            ValueViewRef::BigInt(n) => {
+                30u8.hash(state);
                 n.hash(state);
             }
             ValueViewRef::Float(f) => {
@@ -2061,7 +2125,7 @@ impl Ord for Value {
             match v.view_ref() {
                 ValueViewRef::Nil => 0,
                 ValueViewRef::Bool(_) => 1,
-                ValueViewRef::Int(_) => 2,
+                ValueViewRef::Int(_) | ValueViewRef::BigInt(_) => 2,
                 ValueViewRef::Float(_) => 3,
                 ValueViewRef::Char(_) => 4,
                 ValueViewRef::String(_) => 5,
@@ -2083,6 +2147,9 @@ impl Ord for Value {
             (ValueViewRef::Nil, ValueViewRef::Nil) => Ordering::Equal,
             (ValueViewRef::Bool(a), ValueViewRef::Bool(b)) => a.cmp(&b),
             (ValueViewRef::Int(a), ValueViewRef::Int(b)) => a.cmp(&b),
+            (ValueViewRef::BigInt(a), ValueViewRef::BigInt(b)) => a.cmp(b),
+            (ValueViewRef::Int(a), ValueViewRef::BigInt(b)) => BigInt::from(a).cmp(b),
+            (ValueViewRef::BigInt(a), ValueViewRef::Int(b)) => a.cmp(&BigInt::from(b)),
             (ValueViewRef::Float(a), ValueViewRef::Float(b)) => {
                 // Normalize signed zeros so -0.0 and +0.0 are the same map key:
                 // Hash already collapses them and `=` treats them equal, but
@@ -2134,6 +2201,7 @@ impl fmt::Display for Value {
             ValueViewRef::Bool(true) => write!(f, "#t"),
             ValueViewRef::Bool(false) => write!(f, "#f"),
             ValueViewRef::Int(n) => write!(f, "{n}"),
+            ValueViewRef::BigInt(n) => write!(f, "{n}"),
             ValueViewRef::Float(n) => {
                 if n.fract() == 0.0 {
                     write!(f, "{n:.1}")
@@ -2421,6 +2489,7 @@ impl fmt::Debug for Value {
             ValueView::Nil => write!(f, "Nil"),
             ValueView::Bool(b) => write!(f, "Bool({b})"),
             ValueView::Int(n) => write!(f, "Int({n})"),
+            ValueView::BigInt(n) => write!(f, "Int({n})"),
             ValueView::Float(n) => write!(f, "Float({n})"),
             ValueView::String(s) => write!(f, "String({:?})", &**s),
             ValueView::Symbol(s) => write!(f, "Symbol({})", resolve(s)),
@@ -3074,5 +3143,26 @@ mod tests {
     fn streambox_stream_type() {
         let sb = StreamBox::new(TestStream::new(true, true));
         assert_eq!(sb.stream_type(), "test");
+    }
+
+    #[test]
+    fn bigint_roundtrip_and_normalize() {
+        use num_bigint::BigInt;
+        use std::str::FromStr;
+        // A value beyond i64 stays a bignum and prints exactly.
+        let big = BigInt::from_str("170141183460469231731687303715884105728").unwrap();
+        let v = Value::from_bigint(big.clone());
+        assert!(v.is_bigint());
+        assert_eq!(v.to_string(), "170141183460469231731687303715884105728");
+        assert_eq!(v.type_name(), "int");
+        assert_eq!(v.as_int(), None); // does not fit i64
+        assert_eq!(v.as_bigint(), Some(big));
+        // A bignum that fits i64 normalizes back to a fixnum.
+        let small = Value::from_bigint(BigInt::from(42));
+        assert!(!small.is_bigint());
+        assert_eq!(small.as_int(), Some(42));
+        // Clone/Drop refcount safety.
+        let v2 = v.clone();
+        assert_eq!(v, v2);
     }
 }
