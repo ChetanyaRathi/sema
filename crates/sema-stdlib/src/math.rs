@@ -1,3 +1,4 @@
+use sema_core::number::SemaNumber;
 use sema_core::{check_arity, SemaError, Value, ValueViewRef};
 
 use crate::register_fn;
@@ -54,6 +55,8 @@ fn ceil_impl(args: &[Value]) -> Result<Value, SemaError> {
     check_arity!(args, "ceil", 1);
     match args[0].view_ref() {
         ValueViewRef::Int(n) => Ok(Value::int(n)),
+        // An exact rational rounds up to an exact integer.
+        ValueViewRef::Rational(r) => Ok(Value::from_bigint(r.ceil().to_integer())),
         ValueViewRef::Float(f) => float_to_int(f.ceil(), "ceil"),
         _ => Err(SemaError::type_error("number", args[0].type_name())),
     }
@@ -68,6 +71,21 @@ pub fn register(env: &sema_core::Env) {
                     .with_hint("convert to a float first, e.g. (abs (* 1.0 n))")
             }),
             ValueViewRef::Float(f) => Ok(Value::float(f.abs())),
+            // Exact rationals (and any other tower number): negate iff negative,
+            // preserving exactness. `as_number` lifts to the tower and
+            // `from_number` lowers back to the tightest representation.
+            ValueViewRef::Rational(_) => {
+                let n = args[0]
+                    .as_number()
+                    .ok_or_else(|| SemaError::type_error("number", args[0].type_name()))?;
+                let out = if n.cmp_real(&SemaNumber::from_i64(0)) == Some(std::cmp::Ordering::Less)
+                {
+                    n.neg()
+                } else {
+                    n
+                };
+                Ok(Value::from_number(out))
+            }
             _ => Err(SemaError::type_error("number", args[0].type_name())),
         }
     });
@@ -100,6 +118,8 @@ pub fn register(env: &sema_core::Env) {
         check_arity!(args, "floor", 1);
         match args[0].view_ref() {
             ValueViewRef::Int(n) => Ok(Value::int(n)),
+            // An exact rational rounds down to an exact integer.
+            ValueViewRef::Rational(r) => Ok(Value::from_bigint(r.floor().to_integer())),
             ValueViewRef::Float(f) => float_to_int(f.floor(), "floor"),
             _ => Err(SemaError::type_error("number", args[0].type_name())),
         }
@@ -112,6 +132,8 @@ pub fn register(env: &sema_core::Env) {
         check_arity!(args, "round", 1);
         match args[0].view_ref() {
             ValueViewRef::Int(n) => Ok(Value::int(n)),
+            // An exact rational rounds to the nearest exact integer.
+            ValueViewRef::Rational(r) => Ok(Value::from_bigint(r.round().to_integer())),
             ValueViewRef::Float(f) => float_to_int(f.round(), "round"),
             _ => Err(SemaError::type_error("number", args[0].type_name())),
         }
@@ -187,6 +209,8 @@ pub fn register(env: &sema_core::Env) {
         check_arity!(args, "int", 1);
         match args[0].view_ref() {
             ValueViewRef::Int(n) => Ok(Value::int(n)),
+            // An exact rational truncates toward zero to an exact integer.
+            ValueViewRef::Rational(r) => Ok(Value::from_bigint(r.trunc().to_integer())),
             // Truncate toward zero, but reject NaN/inf/out-of-range like every
             // other rounding builtin (floor/ceil/round/truncate) — a raw cast
             // would saturate and silently return garbage.
@@ -430,6 +454,8 @@ pub fn register(env: &sema_core::Env) {
         check_arity!(args, "truncate", 1);
         match args[0].view_ref() {
             ValueViewRef::Int(n) => Ok(Value::int(n)),
+            // An exact rational truncates toward zero to an exact integer.
+            ValueViewRef::Rational(r) => Ok(Value::from_bigint(r.trunc().to_integer())),
             ValueViewRef::Float(f) => float_to_int(f.trunc(), "truncate"),
             _ => Err(SemaError::type_error("number", args[0].type_name())),
         }

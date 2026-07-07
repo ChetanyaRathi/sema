@@ -6,6 +6,8 @@
 
 use std::collections::BTreeMap;
 
+use num_traits::ToPrimitive;
+
 use crate::{resolve, SemaError, Value, ValueView};
 
 /// Convert a Sema Value to a JSON value, erroring on NaN/Infinity and unsupported types.
@@ -17,6 +19,10 @@ pub fn value_to_json(val: &Value) -> Result<serde_json::Value, SemaError> {
         ValueView::Bool(b) => Ok(serde_json::Value::Bool(b)),
         ValueView::Int(n) => Ok(serde_json::Value::Number(n.into())),
         ValueView::Float(f) => serde_json::Number::from_f64(f)
+            .map(serde_json::Value::Number)
+            .ok_or_else(|| SemaError::eval("cannot encode NaN/Infinity as JSON")),
+        // JSON has no rational type; encode the rational's inexact value.
+        ValueView::Rational(r) => serde_json::Number::from_f64(r.to_f64().unwrap_or(f64::NAN))
             .map(serde_json::Value::Number)
             .ok_or_else(|| SemaError::eval("cannot encode NaN/Infinity as JSON")),
         ValueView::String(s) => Ok(serde_json::Value::String(s.to_string())),
@@ -55,6 +61,10 @@ pub fn value_to_json_lossy(val: &Value) -> serde_json::Value {
         ValueView::Bool(b) => serde_json::Value::Bool(b),
         ValueView::Int(n) => serde_json::Value::Number(n.into()),
         ValueView::Float(f) => serde_json::Number::from_f64(f)
+            .map(serde_json::Value::Number)
+            .unwrap_or(serde_json::Value::Null),
+        // JSON has no rational type; encode the rational's inexact value.
+        ValueView::Rational(r) => serde_json::Number::from_f64(r.to_f64().unwrap_or(f64::NAN))
             .map(serde_json::Value::Number)
             .unwrap_or(serde_json::Value::Null),
         ValueView::String(s) => serde_json::Value::String(s.to_string()),
