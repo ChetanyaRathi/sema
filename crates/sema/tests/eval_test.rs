@@ -1358,12 +1358,40 @@ eval_error_tests! {
 
 // Integer arithmetic raises on i64 overflow rather than silently wrapping
 // (there is no bignum type to promote to). Consistent with `abs` on i64::MIN.
+//
+// These exercise exactly 2 operands, which the compiler always compiles to
+// the inline `AddInt`/`SubInt`/`MulInt` VM opcodes (`try_compile_intrinsic` in
+// sema-vm/src/compiler.rs matches on `(name, argc)` alone, regardless of
+// operand type) — a separate overflow-raising code path from the stdlib
+// `+`/`-`/`*` native functions in `arithmetic.rs`. That VM fast path still
+// raises until Task 1.5 (`vm: fast-path opcodes and helpers promote on
+// overflow`) lands, so these stay accurate for now.
 eval_error_tests! {
     add_overflow_errors: "(+ 9223372036854775807 1)" => "integer overflow",
     sub_underflow_errors: "(- -9223372036854775808 1)" => "integer overflow",
     mul_overflow_errors: "(* 9223372036854775807 9223372036854775807)" => "integer overflow",
     expt_result_overflow_errors: "(expt 2 64)" => "integer overflow",
     expt_exponent_overflow_errors: "(expt 2 4294967296)" => "integer overflow",
+}
+
+// Stdlib `+ - *` promote to bignum on i64 overflow instead of raising.
+//
+// These all use 3+ operands so the compiler emits a plain call to the
+// registered `+`/`-`/`*` native functions rather than the 2-operand-only
+// `AddInt`/`SubInt`/`MulInt` VM intrinsics (see the note above) — the VM
+// fast path itself is promoted separately in Task 1.5.
+eval_tests! {
+    bignum_mul_overflow_promotes: "(* 1000000000000 1000000000000 1)" => common::eval("1000000000000000000000000"),
+    bignum_add_overflow_promotes: "(+ 9223372036854775807 1 0)" => common::eval("9223372036854775808"),
+    bignum_sub_underflow_promotes: "(- -9223372036854775808 1 0)" => common::eval("-9223372036854775809"),
+    // factorial-style product stays exact
+    bignum_factorial_25: "(let loop ((i 1) (acc 1)) (if (> i 25) acc (loop (+ i 1 0) (* acc i 1))))"
+        => common::eval("15511210043330985984000000"),
+    // mixing bignum with float is inexact contagion
+    bignum_plus_float_is_inexact: "(+ 1000000000000000000000000 0.0 0)" => common::eval("1e24"),
+    // in-range arithmetic is byte-identical to before
+    bignum_add_in_range: "(+ 2 3)" => common::eval("5"),
+    bignum_mul_in_range: "(* 6 7)" => common::eval("42"),
 }
 
 // Regression tests for the runtime bug-hunt fixes (2026-07-07).
