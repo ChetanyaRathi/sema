@@ -2083,7 +2083,14 @@ impl Ord for Value {
             (ValueViewRef::Nil, ValueViewRef::Nil) => Ordering::Equal,
             (ValueViewRef::Bool(a), ValueViewRef::Bool(b)) => a.cmp(&b),
             (ValueViewRef::Int(a), ValueViewRef::Int(b)) => a.cmp(&b),
-            (ValueViewRef::Float(a), ValueViewRef::Float(b)) => a.total_cmp(&b),
+            (ValueViewRef::Float(a), ValueViewRef::Float(b)) => {
+                // Normalize signed zeros so -0.0 and +0.0 are the same map key:
+                // Hash already collapses them and `=` treats them equal, but
+                // total_cmp otherwise orders -0.0 < +0.0, silently splitting a
+                // BTreeMap key. (NaN handling is unaffected.)
+                let norm = |f: f64| if f == 0.0 { 0.0 } else { f };
+                norm(a).total_cmp(&norm(b))
+            }
             (ValueViewRef::String(a), ValueViewRef::String(b)) => a.cmp(b),
             (ValueViewRef::Symbol(a), ValueViewRef::Symbol(b)) => compare_spurs(a, b),
             (ValueViewRef::Keyword(a), ValueViewRef::Keyword(b)) => compare_spurs(a, b),
@@ -2120,7 +2127,9 @@ fn truncate(s: &str, max: usize) -> String {
 
 impl fmt::Display for Value {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self.view_ref() {
+        // Grow the stack on demand so printing a deeply nested value can't
+        // overflow the OS thread stack and abort the process.
+        crate::stack::maybe_grow(|| match self.view_ref() {
             ValueViewRef::Nil => write!(f, "nil"),
             ValueViewRef::Bool(true) => write!(f, "#t"),
             ValueViewRef::Bool(false) => write!(f, "#f"),
@@ -2278,7 +2287,7 @@ impl fmt::Display for Value {
                     write!(f, "<channel {len}/{}>", c.capacity)
                 }
             }
-        }
+        })
     }
 }
 
@@ -2304,7 +2313,9 @@ fn pp_value(value: &Value, indent: usize, max_width: usize, buf: &mut String) {
         return;
     }
 
-    match value.view_ref() {
+    // Grow the stack on demand so pretty-printing a deeply nested value can't
+    // overflow the OS thread stack and abort the process.
+    crate::stack::maybe_grow(|| match value.view_ref() {
         ValueViewRef::List(items) => {
             pp_seq(items.iter(), '(', ')', indent, max_width, buf);
         }
@@ -2325,7 +2336,7 @@ fn pp_value(value: &Value, indent: usize, max_width: usize, buf: &mut String) {
             pp_map(entries.into_iter(), indent, max_width, buf);
         }
         _ => buf.push_str(&compact),
-    }
+    })
 }
 
 /// Pretty-print a list or vector.

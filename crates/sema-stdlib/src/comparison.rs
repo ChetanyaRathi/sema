@@ -1,20 +1,35 @@
+use std::cmp::Ordering;
+
+use sema_core::num::cmp_int_float;
 use sema_core::{check_arity, SemaError, Value, ValueViewRef};
 
 use crate::register_fn;
 
-fn num_cmp(args: &[Value], op: &str, f: impl Fn(f64, f64) -> bool) -> Result<Value, SemaError> {
-    check_arity!(args, op, 2..);
-    let to_f64 = |v: &Value| -> Result<f64, SemaError> {
-        match v.view_ref() {
-            ValueViewRef::Int(n) => Ok(n as f64),
-            ValueViewRef::Float(f) => Ok(f),
-            _ => Err(SemaError::type_error("number", v.type_name())),
+/// Exact numeric ordering across int/float, or `None` for NaN. Errors if either
+/// argument is not a number.
+fn num_partial_cmp(a: &Value, b: &Value) -> Result<Option<Ordering>, SemaError> {
+    match (a.view_ref(), b.view_ref()) {
+        (ValueViewRef::Int(x), ValueViewRef::Int(y)) => Ok(Some(x.cmp(&y))),
+        (ValueViewRef::Float(x), ValueViewRef::Float(y)) => Ok(x.partial_cmp(&y)),
+        (ValueViewRef::Int(x), ValueViewRef::Float(y)) => Ok(cmp_int_float(x, y)),
+        (ValueViewRef::Float(x), ValueViewRef::Int(y)) => {
+            Ok(cmp_int_float(y, x).map(Ordering::reverse))
         }
-    };
+        (ValueViewRef::Int(_) | ValueViewRef::Float(_), _) => {
+            Err(SemaError::type_error("number", b.type_name()))
+        }
+        _ => Err(SemaError::type_error("number", a.type_name())),
+    }
+}
+
+fn num_cmp(
+    args: &[Value],
+    op: &str,
+    want: impl Fn(Option<Ordering>) -> bool,
+) -> Result<Value, SemaError> {
+    check_arity!(args, op, 2..);
     for pair in args.windows(2) {
-        let a = to_f64(&pair[0])?;
-        let b = to_f64(&pair[1])?;
-        if !f(a, b) {
+        if !want(num_partial_cmp(&pair[0], &pair[1])?) {
             return Ok(Value::bool(false));
         }
     }
@@ -22,10 +37,22 @@ fn num_cmp(args: &[Value], op: &str, f: impl Fn(f64, f64) -> bool) -> Result<Val
 }
 
 pub fn register(env: &sema_core::Env) {
-    register_fn(env, "<", |args| num_cmp(args, "<", |a, b| a < b));
-    register_fn(env, ">", |args| num_cmp(args, ">", |a, b| a > b));
-    register_fn(env, "<=", |args| num_cmp(args, "<=", |a, b| a <= b));
-    register_fn(env, ">=", |args| num_cmp(args, ">=", |a, b| a >= b));
+    register_fn(env, "<", |args| {
+        num_cmp(args, "<", |o| o == Some(Ordering::Less))
+    });
+    register_fn(env, ">", |args| {
+        num_cmp(args, ">", |o| o == Some(Ordering::Greater))
+    });
+    register_fn(env, "<=", |args| {
+        num_cmp(args, "<=", |o| {
+            matches!(o, Some(Ordering::Less | Ordering::Equal))
+        })
+    });
+    register_fn(env, ">=", |args| {
+        num_cmp(args, ">=", |o| {
+            matches!(o, Some(Ordering::Greater | Ordering::Equal))
+        })
+    });
 
     register_fn(env, "=", |args| {
         check_arity!(args, "=", 2..);
@@ -38,7 +65,7 @@ pub fn register(env: &sema_core::Env) {
                 }
                 (ValueViewRef::Int(a), ValueViewRef::Float(b))
                 | (ValueViewRef::Float(b), ValueViewRef::Int(a)) => {
-                    if (a as f64) != b {
+                    if cmp_int_float(a, b) != Some(Ordering::Equal) {
                         return Ok(Value::bool(false));
                     }
                 }

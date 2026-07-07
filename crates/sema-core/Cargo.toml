@@ -15,3 +15,9 @@ lasso.workspace = true
 hashbrown.workspace = true
 toml.workspace = true
 crc32fast = "1"
+
+# Stack-growth for deep recursive value walks + native→VM re-entry (see
+# `stack::maybe_grow`). Not available on wasm (no stack growth), so gate it off
+# that target; `maybe_grow` is a plain call there.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+stacker = "0.1"

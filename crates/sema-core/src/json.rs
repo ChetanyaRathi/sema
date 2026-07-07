@@ -10,7 +10,9 @@ use crate::{resolve, SemaError, Value, ValueView};
 
 /// Convert a Sema Value to a JSON value, erroring on NaN/Infinity and unsupported types.
 pub fn value_to_json(val: &Value) -> Result<serde_json::Value, SemaError> {
-    match val.view() {
+    // Grow the stack on demand: a deeply nested value would otherwise overflow
+    // the OS thread stack here and abort the process.
+    crate::stack::maybe_grow(|| match val.view() {
         ValueView::Nil => Ok(serde_json::Value::Null),
         ValueView::Bool(b) => Ok(serde_json::Value::Bool(b)),
         ValueView::Int(n) => Ok(serde_json::Value::Number(n.into())),
@@ -42,13 +44,13 @@ pub fn value_to_json(val: &Value) -> Result<serde_json::Value, SemaError> {
             "cannot encode {} as JSON",
             val.type_name()
         ))),
-    }
+    })
 }
 
 /// Convert a Sema Value to JSON without erroring. NaN/Infinity become null,
 /// unsupported types become their string representation.
 pub fn value_to_json_lossy(val: &Value) -> serde_json::Value {
-    match val.view() {
+    crate::stack::maybe_grow(|| match val.view() {
         ValueView::Nil => serde_json::Value::Null,
         ValueView::Bool(b) => serde_json::Value::Bool(b),
         ValueView::Int(n) => serde_json::Value::Number(n.into()),
@@ -76,7 +78,7 @@ pub fn value_to_json_lossy(val: &Value) -> serde_json::Value {
             serde_json::Value::Object(obj)
         }
         _ => serde_json::Value::String(val.to_string()),
-    }
+    })
 }
 
 /// Convert a JSON value to a Sema Value.

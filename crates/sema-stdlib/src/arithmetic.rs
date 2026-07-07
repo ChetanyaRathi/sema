@@ -2,6 +2,14 @@ use sema_core::{check_arity, SemaError, Value, ValueViewRef};
 
 use crate::register_fn;
 
+/// Error for an i64 arithmetic overflow. Integer ops raise this rather than
+/// silently wrapping (there is no bignum type to promote to); use floats for
+/// values beyond ±2^63.
+fn overflow(op: &str) -> SemaError {
+    SemaError::eval(format!("{op}: integer overflow (result exceeds i64 range)"))
+        .with_hint("use floats for values beyond ±2^63")
+}
+
 fn mod_impl(args: &[Value]) -> Result<Value, SemaError> {
     check_arity!(args, "mod", 2);
     match (args[0].view_ref(), args[1].view_ref()) {
@@ -34,7 +42,7 @@ pub fn register(env: &sema_core::Env) {
                     if has_float {
                         float_sum += n as f64;
                     } else {
-                        int_sum = int_sum.wrapping_add(n);
+                        int_sum = int_sum.checked_add(n).ok_or_else(|| overflow("+"))?;
                     }
                 }
                 ValueViewRef::Float(f) => {
@@ -59,7 +67,9 @@ pub fn register(env: &sema_core::Env) {
 
         if args.len() == 1 {
             return match args[0].view_ref() {
-                ValueViewRef::Int(n) => Ok(Value::int(n.wrapping_neg())),
+                ValueViewRef::Int(n) => {
+                    n.checked_neg().map(Value::int).ok_or_else(|| overflow("-"))
+                }
                 ValueViewRef::Float(f) => Ok(Value::float(-f)),
                 _ => Err(SemaError::type_error("number", args[0].type_name())),
             };
@@ -79,7 +89,7 @@ pub fn register(env: &sema_core::Env) {
                     } else if has_float {
                         result_float -= n as f64;
                     } else {
-                        result_int = result_int.wrapping_sub(n);
+                        result_int = result_int.checked_sub(n).ok_or_else(|| overflow("-"))?;
                     }
                 }
                 ValueViewRef::Float(f) => {
@@ -116,7 +126,7 @@ pub fn register(env: &sema_core::Env) {
                     if has_float {
                         float_prod *= n as f64;
                     } else {
-                        int_prod = int_prod.wrapping_mul(n);
+                        int_prod = int_prod.checked_mul(n).ok_or_else(|| overflow("*"))?;
                     }
                 }
                 ValueViewRef::Float(f) => {

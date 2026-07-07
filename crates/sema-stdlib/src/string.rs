@@ -5,7 +5,7 @@ use std::rc::Rc;
 use sema_core::{check_arity, SemaError, Value, ValueView};
 use unicode_normalization::UnicodeNormalization;
 use unicode_segmentation::UnicodeSegmentation;
-use unicode_width::UnicodeWidthStr;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::register_fn;
 
@@ -13,6 +13,27 @@ use crate::register_fn;
 /// combining marks as 0. Shared by `string/width` and `string/word-wrap`.
 fn display_width(s: &str) -> usize {
     UnicodeWidthStr::width(crate::strip_ansi(s).as_str())
+}
+
+/// Pad `s` to a target *display width* (not codepoint count) with `pad_char`,
+/// on the left or right. Strings already at/over the target are returned
+/// unchanged. With a wide pad char an odd column deficit rounds down (floor),
+/// since it can't be filled exactly.
+fn pad_to_width(s: &str, target: usize, pad_char: char, left: bool) -> String {
+    let cur = display_width(s);
+    if cur >= target {
+        return s.to_string();
+    }
+    let pad_w = UnicodeWidthChar::width(pad_char)
+        .filter(|&w| w > 0)
+        .unwrap_or(1);
+    let count = (target - cur) / pad_w;
+    let padding: String = std::iter::repeat_n(pad_char, count).collect();
+    if left {
+        format!("{padding}{s}")
+    } else {
+        format!("{s}{padding}")
+    }
 }
 
 /// Hard-break a single word (no spaces) into chunks each ≤ `width` display
@@ -492,13 +513,7 @@ pub fn register(env: &sema_core::Env) {
         } else {
             ' '
         };
-        let char_len = s.chars().count();
-        if char_len >= width {
-            Ok(Value::string(s))
-        } else {
-            let padding: String = std::iter::repeat_n(pad_char, width - char_len).collect();
-            Ok(Value::string(&format!("{}{}", padding, s)))
-        }
+        Ok(Value::string(&pad_to_width(s, width, pad_char, true)))
     });
 
     register_fn(env, "string/pad-right", |args| {
@@ -515,13 +530,7 @@ pub fn register(env: &sema_core::Env) {
         } else {
             ' '
         };
-        let char_len = s.chars().count();
-        if char_len >= width {
-            Ok(Value::string(s))
-        } else {
-            let padding: String = std::iter::repeat_n(pad_char, width - char_len).collect();
-            Ok(Value::string(&format!("{}{}", s, padding)))
-        }
+        Ok(Value::string(&pad_to_width(s, width, pad_char, false)))
     });
 
     register_fn(env, "string/last-index-of", |args| {

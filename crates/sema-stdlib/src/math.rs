@@ -6,7 +6,19 @@ fn pow_impl(args: &[Value]) -> Result<Value, SemaError> {
     check_arity!(args, "pow", 2);
     match (args[0].view_ref(), args[1].view_ref()) {
         (ValueViewRef::Int(base), ValueViewRef::Int(exp)) if exp >= 0 => {
-            Ok(Value::int(base.wrapping_pow(exp as u32)))
+            // 0/1/-1 have bounded powers for any exponent; everything else must
+            // fit u32 and not overflow i64. The old `wrapping_pow(exp as u32)`
+            // truncated the exponent (e.g. 2^32 → 0) *and* wrapped the result.
+            let result = match base {
+                0 => Some(if exp == 0 { 1 } else { 0 }),
+                1 => Some(1),
+                -1 => Some(if exp % 2 == 0 { 1 } else { -1 }),
+                _ => u32::try_from(exp).ok().and_then(|e| base.checked_pow(e)),
+            };
+            result.map(Value::int).ok_or_else(|| {
+                SemaError::eval("expt: integer overflow (result exceeds i64 range)")
+                    .with_hint("use floats (e.g. (pow 2.0 64.0)) for large powers")
+            })
         }
         _ => {
             let base = args[0]

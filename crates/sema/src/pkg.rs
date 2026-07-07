@@ -1504,10 +1504,7 @@ fn jittered(d: std::time::Duration) -> std::time::Duration {
 /// body can be replayed (reqwest bodies are single-use). On 429 the server's
 /// `Retry-After` is honored (clamped); otherwise the delay grows exponentially
 /// with jitter. Success and non-retryable 4xx (404, 401, …) return immediately.
-fn send_with_retry<F>(
-    what: &str,
-    mut build: F,
-) -> Result<reqwest::blocking::Response, String>
+fn send_with_retry<F>(what: &str, mut build: F) -> Result<reqwest::blocking::Response, String>
 where
     F: FnMut() -> reqwest::Result<reqwest::blocking::Response>,
 {
@@ -4340,8 +4337,10 @@ name = "myproject"
         // Always 429: after HTTP_MAX_ATTEMPTS the last 429 response is returned
         // (not an error), so the caller renders the server's message. Uses a
         // Retry-After of 1s, which the loop clamps and honors.
-        let responses =
-            vec!["HTTP/1.1 429 Too Many Requests\r\nRetry-After: 1\r\nContent-Length: 2\r\n\r\n{}"; HTTP_MAX_ATTEMPTS as usize];
+        let responses = vec![
+                "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 1\r\nContent-Length: 2\r\n\r\n{}";
+                HTTP_MAX_ATTEMPTS as usize
+            ];
         let addr = mock_server(responses);
         let client = http_client().unwrap();
         let url = format!("http://{addr}/");

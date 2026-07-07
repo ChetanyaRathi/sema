@@ -349,9 +349,11 @@ fn fold_binary_op(name: &str, a: &Value, b: &Value) -> Option<Value> {
     let ai = a.as_int()?;
     let bi = b.as_int()?;
     match name {
-        "+" => Some(Value::int(ai.wrapping_add(bi))),
-        "-" => Some(Value::int(ai.wrapping_sub(bi))),
-        "*" => Some(Value::int(ai.wrapping_mul(bi))),
+        // On overflow, don't fold: leave the call for the runtime, which raises
+        // an "integer overflow" error rather than silently wrapping.
+        "+" => ai.checked_add(bi).map(Value::int),
+        "-" => ai.checked_sub(bi).map(Value::int),
+        "*" => ai.checked_mul(bi).map(Value::int),
         "/" => {
             if bi == 0 {
                 None
@@ -373,10 +375,7 @@ fn fold_binary_op(name: &str, a: &Value, b: &Value) -> Option<Value> {
 fn fold_unary_op(name: &str, a: &Value) -> Option<Value> {
     match name {
         "not" => Some(Value::bool(!a.is_truthy())),
-        "-" => {
-            let i = a.as_int()?;
-            Some(Value::int(i.wrapping_neg()))
-        }
+        "-" => a.as_int()?.checked_neg().map(Value::int),
         _ => None,
     }
 }

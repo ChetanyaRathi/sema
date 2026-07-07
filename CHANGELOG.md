@@ -52,6 +52,29 @@
 
 ### Fixed
 
+- **Deep recursion no longer aborts the process.** Re-entrant native→VM calls
+  (a Sema function that maps over its children) and printing/serializing deeply
+  nested values (`str`, `json/encode`, `pprint`) consumed the OS thread stack
+  per level and hit an uncatchable SIGABRT. Those recursion points now grow the
+  stack on demand (`sema_core::stack::maybe_grow`, via `stacker`; a plain call
+  on wasm), so deep-but-finite work completes and true runaways still hit the
+  catchable frame guard.
+- **Integer overflow raises instead of silently wrapping.** `+`, `-`, `*`, and
+  `expt` on i64 now return a catchable "integer overflow" error (checked
+  arithmetic in the stdlib, VM, and constant folder) rather than wrapping to a
+  wrong number — consistent with `abs` on `i64::MIN`. `expt` also no longer
+  truncates its exponent (`(expt 2 4294967296)` was computing 2^0).
+- **Int↔float comparison is exact above 2^53.** `=`/`<`/`>`/`<=`/`>=` between an
+  int and a float compared via a lossy `as f64` cast, so e.g.
+  `(= 9007199254740993 9007199254740992.0)` was `#t`. They now compare exactly.
+- **A computed `-0.0` is the same map key as `+0.0`.** Map ordering distinguished
+  signed zeros (via `total_cmp`) while `=` and hashing treated them equal, so a
+  value stored under `-0.0` silently vanished from lookups. `Ord` now normalizes
+  signed zeros to match.
+- **`string/pad-left`/`string/pad-right` pad by display width.** They counted
+  codepoints, so a CJK/emoji cell (`日本語`) ended up wider than an ASCII cell
+  padded to the same target, misaligning every column layout. They now use the
+  same display-width measure as `string/width`.
 - **`sema pkg` now retries transient registry failures instead of aborting the
   install.** All registry HTTP calls (install/download, package info, publish,
   search, yank) go through a shared client with connect/request timeouts and a

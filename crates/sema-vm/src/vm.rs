@@ -1268,7 +1268,10 @@ impl VM {
         self.setup_for_call(closure, args)?;
         let saved_floor = self.frame_floor;
         self.frame_floor = floor;
-        let result = self.run_inner(ctx, None);
+        // Each native→VM re-entry nests a fresh dispatch loop on the *Rust*
+        // stack; grow it on demand so deep re-entrant recursion hits the VM's
+        // catchable frame guard instead of overflowing the OS stack (SIGABRT).
+        let result = sema_core::stack::maybe_grow(|| self.run_inner(ctx, None));
         self.frame_floor = saved_floor;
         self.globals = saved_globals;
         self.functions = saved_functions;
@@ -2327,13 +2330,22 @@ impl VM {
                                 (((a_bits & NAN_PAYLOAD_MASK) << SIGN_SHIFT) as i64) >> SIGN_SHIFT;
                             let bx =
                                 (((b_bits & NAN_PAYLOAD_MASK) << SIGN_SHIFT) as i64) >> SIGN_SHIFT;
-                            // Use Value::int for multiplication — result may overflow 45 bits
-                            unsafe {
-                                std::ptr::write(
-                                    self.stack.as_mut_ptr().add(len - 2),
-                                    Value::int(ax.wrapping_mul(bx)),
-                                );
-                                self.stack.set_len(len - 1);
+                            // Two 45-bit smalls can multiply past i64 (up to ~2^88);
+                            // check and raise rather than wrap. Value::int boxes the
+                            // in-range result when it overflows the 45-bit small range.
+                            match ax.checked_mul(bx) {
+                                Some(p) => unsafe {
+                                    std::ptr::write(
+                                        self.stack.as_mut_ptr().add(len - 2),
+                                        Value::int(p),
+                                    );
+                                    self.stack.set_len(len - 1);
+                                },
+                                None => {
+                                    unsafe { self.stack.set_len(len - 2) };
+                                    let err = int_overflow("*");
+                                    handle_err!(self, fi, pc, err, pc - op::SIZE_OP, 'dispatch);
+                                }
                             }
                         } else {
                             let b = unsafe { pop_unchecked(&mut self.stack) };
@@ -4310,9 +4322,19 @@ fn map_access_hint(func: &str, coll: &Value) -> String {
     }
 }
 
+/// Error for an i64 arithmetic overflow. Integer ops raise this rather than
+/// silently wrapping (there is no bignum type to promote to).
+fn int_overflow(op: &str) -> SemaError {
+    SemaError::eval(format!("{op}: integer overflow (result exceeds i64 range)"))
+        .with_hint("use floats for values beyond ±2^63")
+}
+
 fn vm_add(a: &Value, b: &Value) -> Result<Value, SemaError> {
     match (a.view_ref(), b.view_ref()) {
-        (ValueViewRef::Int(x), ValueViewRef::Int(y)) => Ok(Value::int(x.wrapping_add(y))),
+        (ValueViewRef::Int(x), ValueViewRef::Int(y)) => x
+            .checked_add(y)
+            .map(Value::int)
+            .ok_or_else(|| int_overflow("+")),
         (ValueViewRef::Float(x), ValueViewRef::Float(y)) => Ok(Value::float(x + y)),
         (ValueViewRef::Int(x), ValueViewRef::Float(y)) => Ok(Value::float(x as f64 + y)),
         (ValueViewRef::Float(x), ValueViewRef::Int(y)) => Ok(Value::float(x + y as f64)),
@@ -4342,7 +4364,10 @@ fn vm_add(a: &Value, b: &Value) -> Result<Value, SemaError> {
 #[inline(always)]
 fn vm_sub(a: &Value, b: &Value) -> Result<Value, SemaError> {
     match (a.view_ref(), b.view_ref()) {
-        (ValueViewRef::Int(x), ValueViewRef::Int(y)) => Ok(Value::int(x.wrapping_sub(y))),
+        (ValueViewRef::Int(x), ValueViewRef::Int(y)) => x
+            .checked_sub(y)
+            .map(Value::int)
+            .ok_or_else(|| int_overflow("-")),
         (ValueViewRef::Float(x), ValueViewRef::Float(y)) => Ok(Value::float(x - y)),
         (ValueViewRef::Int(x), ValueViewRef::Float(y)) => Ok(Value::float(x as f64 - y)),
         (ValueViewRef::Float(x), ValueViewRef::Int(y)) => Ok(Value::float(x - y as f64)),
@@ -4356,7 +4381,10 @@ fn vm_sub(a: &Value, b: &Value) -> Result<Value, SemaError> {
 #[inline(always)]
 fn vm_mul(a: &Value, b: &Value) -> Result<Value, SemaError> {
     match (a.view_ref(), b.view_ref()) {
-        (ValueViewRef::Int(x), ValueViewRef::Int(y)) => Ok(Value::int(x.wrapping_mul(y))),
+        (ValueViewRef::Int(x), ValueViewRef::Int(y)) => x
+            .checked_mul(y)
+            .map(Value::int)
+            .ok_or_else(|| int_overflow("*")),
         (ValueViewRef::Float(x), ValueViewRef::Float(y)) => Ok(Value::float(x * y)),
         (ValueViewRef::Int(x), ValueViewRef::Float(y)) => Ok(Value::float(x as f64 * y)),
         (ValueViewRef::Float(x), ValueViewRef::Int(y)) => Ok(Value::float(x * y as f64)),
@@ -4388,14 +4416,18 @@ fn vm_div(a: &Value, b: &Value) -> Result<Value, SemaError> {
     }
 }
 
-/// Numeric-coercing equality: matches stdlib `=` semantics.
+/// Numeric-coercing equality: matches stdlib `=` semantics. Mixed int/float
+/// compares exactly (no lossy `as f64` cast that would collapse integers above
+/// 2^53 onto the same float).
 #[inline(always)]
 fn vm_eq(a: &Value, b: &Value) -> bool {
     match (a.view_ref(), b.view_ref()) {
         (ValueViewRef::Int(x), ValueViewRef::Int(y)) => x == y,
         (ValueViewRef::Float(x), ValueViewRef::Float(y)) => x == y,
         (ValueViewRef::Int(x), ValueViewRef::Float(y))
-        | (ValueViewRef::Float(y), ValueViewRef::Int(x)) => (x as f64) == y,
+        | (ValueViewRef::Float(y), ValueViewRef::Int(x)) => {
+            sema_core::num::cmp_int_float(x, y) == Some(std::cmp::Ordering::Equal)
+        }
         _ => a == b,
     }
 }
@@ -4404,8 +4436,12 @@ fn vm_lt(a: &Value, b: &Value) -> Result<bool, SemaError> {
     match (a.view_ref(), b.view_ref()) {
         (ValueViewRef::Int(x), ValueViewRef::Int(y)) => Ok(x < y),
         (ValueViewRef::Float(x), ValueViewRef::Float(y)) => Ok(x < y),
-        (ValueViewRef::Int(x), ValueViewRef::Float(y)) => Ok((x as f64) < y),
-        (ValueViewRef::Float(x), ValueViewRef::Int(y)) => Ok(x < (y as f64)),
+        (ValueViewRef::Int(x), ValueViewRef::Float(y)) => {
+            Ok(sema_core::num::cmp_int_float(x, y) == Some(std::cmp::Ordering::Less))
+        }
+        (ValueViewRef::Float(x), ValueViewRef::Int(y)) => {
+            Ok(sema_core::num::cmp_int_float(y, x) == Some(std::cmp::Ordering::Greater))
+        }
         (ValueViewRef::String(x), ValueViewRef::String(y)) => Ok(x < y),
         _ => Err(SemaError::type_error(
             "comparable values",

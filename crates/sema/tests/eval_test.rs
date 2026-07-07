@@ -1356,11 +1356,32 @@ eval_error_tests! {
     force_non_promise_errors: "(force 42)" => "thunk",
 }
 
-// Integer arithmetic is intentionally wrapping; pin current semantics so a
-// future regression away from wrap is loud.
+// Integer arithmetic raises on i64 overflow rather than silently wrapping
+// (there is no bignum type to promote to). Consistent with `abs` on i64::MIN.
+eval_error_tests! {
+    add_overflow_errors: "(+ 9223372036854775807 1)" => "integer overflow",
+    sub_underflow_errors: "(- -9223372036854775808 1)" => "integer overflow",
+    mul_overflow_errors: "(* 9223372036854775807 9223372036854775807)" => "integer overflow",
+    expt_result_overflow_errors: "(expt 2 64)" => "integer overflow",
+    expt_exponent_overflow_errors: "(expt 2 4294967296)" => "integer overflow",
+}
+
+// Regression tests for the runtime bug-hunt fixes (2026-07-07).
 eval_tests! {
-    add_overflow_wraps: "(+ 9223372036854775807 1)" => Value::int(i64::MIN),
-    sub_underflow_wraps: "(- -9223372036854775808 1)" => Value::int(i64::MAX),
+    // Int↔float comparison is exact above 2^53 (was lossy: `as f64` collapsed
+    // 2^53+1 onto 2^53, so distinct numbers compared equal).
+    int_float_eq_exact_above_2p53: "(= 9007199254740993 9007199254740992.0)" => Value::bool(false),
+    int_float_gt_exact_above_2p53: "(> 9007199254740993 9007199254740992.0)" => Value::bool(true),
+    int_float_eq_still_equal: "(= 1 1.0)" => Value::bool(true),
+    // A computed -0.0 is the same map key as +0.0 (Ord no longer splits them).
+    neg_zero_map_key_retrievable: "(get (assoc {} (- 0.0) \"x\") 0.0)" => Value::string("x"),
+    // Padding is by display width, not codepoint count: "日本語" is already 6
+    // columns wide, so pad-right to 6 adds nothing (stays 3 codepoints).
+    pad_right_uses_display_width: "(string-length (string/pad-right \"日本語\" 6))" => Value::int(3),
+    // Printing / re-entrant recursion over deep structures no longer aborts the
+    // process (stacker grows the stack); these complete and return a value.
+    deep_structure_str_no_abort: "(string-length (str (foldl (fn (acc _) (list acc)) (list 1) (range 5000))))" => Value::int(10003),
+    deep_reentrant_recursion_no_abort: "(begin (define (nest d) (if (= d 0) 0 (+ 1 (first (map (fn (x) (nest (- d 1))) (list 0)))))) (nest 1000))" => Value::int(1000),
 }
 
 // ============================================================
