@@ -1,3 +1,5 @@
+use num_bigint::BigInt;
+use num_integer::Integer;
 use sema_core::number::SemaNumber;
 use sema_core::{check_arity, SemaError, Value, ValueViewRef};
 
@@ -8,21 +10,30 @@ fn not_a_number(arg: &Value) -> SemaError {
     SemaError::type_error("number", arg.type_name())
 }
 
+/// `mod`/`modulo`: floored division (result takes the sign of the divisor),
+/// per R7RS, over any exact integer (fixnum or bignum). Float operands keep
+/// the existing `%` (IEEE truncated remainder) behavior — R7RS `modulo` is an
+/// integer-only operation; this stdlib historically also accepted floats, so
+/// that path is preserved rather than erroring.
 fn mod_impl(args: &[Value]) -> Result<Value, SemaError> {
     check_arity!(args, "mod", 2);
     match (args[0].view_ref(), args[1].view_ref()) {
-        (ValueViewRef::Int(a), ValueViewRef::Int(b)) => {
-            if b == 0 {
-                Err(SemaError::eval("mod: modulo by zero")
-                    .with_hint("mod: ensure the divisor is non-zero"))
-            } else {
-                Ok(Value::int(a % b))
-            }
-        }
         (ValueViewRef::Float(a), ValueViewRef::Float(b)) => Ok(Value::float(a % b)),
         (ValueViewRef::Int(a), ValueViewRef::Float(b)) => Ok(Value::float(a as f64 % b)),
         (ValueViewRef::Float(a), ValueViewRef::Int(b)) => Ok(Value::float(a % b as f64)),
-        _ => Err(SemaError::type_error("number", args[0].type_name())),
+        _ => {
+            let n = args[0]
+                .as_bigint()
+                .ok_or_else(|| SemaError::type_error("integer", args[0].type_name()))?;
+            let d = args[1]
+                .as_bigint()
+                .ok_or_else(|| SemaError::type_error("integer", args[1].type_name()))?;
+            if d == BigInt::from(0) {
+                return Err(SemaError::eval("mod: modulo by zero")
+                    .with_hint("mod: ensure the divisor is non-zero"));
+            }
+            Ok(Value::from_bigint(n.mod_floor(&d)))
+        }
     }
 }
 

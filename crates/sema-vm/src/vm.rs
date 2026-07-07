@@ -2691,27 +2691,10 @@ impl VM {
                     op::MOD => {
                         let b = unsafe { pop_unchecked(&mut self.stack) };
                         let a = unsafe { pop_unchecked(&mut self.stack) };
-                        match (a.as_int(), b.as_int()) {
-                            (Some(ai), Some(bi)) => {
-                                if bi == 0 {
-                                    let err = SemaError::eval("modulo by zero");
-                                    handle_err!(self, fi, pc, err, pc - op::SIZE_OP, 'dispatch);
-                                } else {
-                                    self.stack.push(Value::int(ai % bi));
-                                }
-                            }
-                            _ => {
-                                let af = a.as_float().or_else(|| a.as_int().map(|i| i as f64));
-                                let bf = b.as_float().or_else(|| b.as_int().map(|i| i as f64));
-                                match (af, bf) {
-                                    (Some(af), Some(bf)) => {
-                                        self.stack.push(Value::float(af % bf));
-                                    }
-                                    _ => {
-                                        let err = SemaError::type_error("number", a.type_name());
-                                        handle_err!(self, fi, pc, err, pc - op::SIZE_OP, 'dispatch);
-                                    }
-                                }
+                        match vm_mod(&a, &b) {
+                            Ok(v) => self.stack.push(v),
+                            Err(err) => {
+                                handle_err!(self, fi, pc, err, pc - op::SIZE_OP, 'dispatch)
                             }
                         }
                     }
@@ -4494,6 +4477,31 @@ fn vm_lt(a: &Value, b: &Value) -> Result<bool, SemaError> {
                 format!("{} and {}", a.type_name(), b.type_name()),
             )),
         },
+    }
+}
+
+/// `mod`/`modulo` intrinsic: floored division (result takes the sign of the
+/// divisor) over any exact integer (fixnum or bignum), matching the stdlib
+/// `mod` native fn. Float operands keep the existing `%` (IEEE truncated
+/// remainder) behavior.
+fn vm_mod(a: &Value, b: &Value) -> Result<Value, SemaError> {
+    use num_integer::Integer;
+    match (a.view_ref(), b.view_ref()) {
+        (ValueViewRef::Float(x), ValueViewRef::Float(y)) => Ok(Value::float(x % y)),
+        (ValueViewRef::Int(x), ValueViewRef::Float(y)) => Ok(Value::float(x as f64 % y)),
+        (ValueViewRef::Float(x), ValueViewRef::Int(y)) => Ok(Value::float(x % y as f64)),
+        _ => {
+            let n = a
+                .as_bigint()
+                .ok_or_else(|| SemaError::type_error("integer", a.type_name()))?;
+            let d = b
+                .as_bigint()
+                .ok_or_else(|| SemaError::type_error("integer", b.type_name()))?;
+            if d == num_bigint::BigInt::from(0) {
+                return Err(SemaError::eval("modulo by zero"));
+            }
+            Ok(Value::from_bigint(n.mod_floor(&d)))
+        }
     }
 }
 

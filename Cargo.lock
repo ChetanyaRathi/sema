@@ -3992,6 +3992,7 @@ dependencies = [
  "hashbrown 0.17.1",
  "lasso",
  "num-bigint",
+ "num-integer",
  "num-rational",
  "sema-core",
  "sema-reader",

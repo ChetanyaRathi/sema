@@ -1,5 +1,7 @@
 use std::cmp::Ordering;
 
+use num_bigint::BigInt;
+use num_integer::Integer;
 use sema_core::number::SemaNumber;
 use sema_core::{check_arity, SemaError, Value, ValueViewRef};
 
@@ -669,8 +671,66 @@ pub fn register(env: &sema_core::Env) {
         }
     });
 
+    // quotient/remainder: truncated division (result takes the sign of the
+    // dividend), per R7RS. Bignum-aware via `as_bigint`; errors on non-integer
+    // operands (rationals, floats, complex).
+    register_fn(env, "quotient", |args| {
+        let (n, d) = two_bigints(args, "quotient")?;
+        if d == BigInt::from(0) {
+            return Err(SemaError::eval("quotient: division by zero")
+                .with_hint("quotient: ensure the divisor is non-zero"));
+        }
+        Ok(Value::from_bigint(n / d))
+    });
+
+    register_fn(env, "remainder", |args| {
+        let (n, d) = two_bigints(args, "remainder")?;
+        if d == BigInt::from(0) {
+            return Err(SemaError::eval("remainder: division by zero")
+                .with_hint("remainder: ensure the divisor is non-zero"));
+        }
+        Ok(Value::from_bigint(n % d))
+    });
+
+    // gcd/lcm: variadic folds over bignums. `gcd` of no args is 0; `lcm` of no
+    // args is 1 (both per R7RS), matching the identity of the fold.
+    register_fn(env, "gcd", |args| {
+        let mut acc = BigInt::from(0);
+        for arg in args {
+            let n = arg
+                .as_bigint()
+                .ok_or_else(|| SemaError::type_error("integer", arg.type_name()))?;
+            acc = acc.gcd(&n);
+        }
+        Ok(Value::from_bigint(acc))
+    });
+
+    register_fn(env, "lcm", |args| {
+        let mut acc = BigInt::from(1);
+        for arg in args {
+            let n = arg
+                .as_bigint()
+                .ok_or_else(|| SemaError::type_error("integer", arg.type_name()))?;
+            acc = acc.lcm(&n);
+        }
+        Ok(Value::from_bigint(acc))
+    });
+
     env.set_str("math/infinity", Value::float(f64::INFINITY));
     env.set_str("math/nan", Value::float(f64::NAN));
+}
+
+/// Lift both arguments of a 2-arg integer builtin (`quotient`/`remainder`) to
+/// `BigInt`, erroring on non-integer operands (rationals, floats, complex).
+fn two_bigints(args: &[Value], name: &str) -> Result<(BigInt, BigInt), SemaError> {
+    check_arity!(args, name, 2);
+    let n = args[0]
+        .as_bigint()
+        .ok_or_else(|| SemaError::type_error("integer", args[0].type_name()))?;
+    let d = args[1]
+        .as_bigint()
+        .ok_or_else(|| SemaError::type_error("integer", args[1].type_name()))?;
+    Ok((n, d))
 }
 
 /// Shared fold for `min`/`max` over the whole tower. `keep_first` decides,

@@ -1565,6 +1565,20 @@ eval_tests! {
     max_rational: "(max 1/2 1/3)" => common::eval("1/2"),
 }
 
+// Task 5.4: quotient/remainder/modulo/mod/gcd/lcm over bignums, R7RS division
+// semantics (modulo/mod floored — sign of divisor; remainder/quotient
+// truncated — sign of dividend).
+eval_tests! {
+    quotient_bignum: "(quotient 100000000000000000000 7)" => common::eval("14285714285714285714"),
+    remainder_bignum: "(remainder 100000000000000000000 7)" => common::eval("2"),
+    modulo_negative_dividend: "(modulo -7 3)" => common::eval("2"),
+    remainder_negative_dividend: "(remainder -7 3)" => common::eval("-1"),
+    gcd_basic: "(gcd 12 18)" => common::eval("6"),
+    gcd_bignum: "(gcd 100000000000000000000 10)" => common::eval("10"),
+    lcm_basic: "(lcm 4 6)" => common::eval("12"),
+    mod_basic: "(mod 10 3)" => common::eval("1"),
+}
+
 // Regression tests for the runtime bug-hunt fixes (2026-07-07).
 eval_tests! {
     // Int↔float comparison is exact above 2^53 (was lossy: `as f64` collapsed
