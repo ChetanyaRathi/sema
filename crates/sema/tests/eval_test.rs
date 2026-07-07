@@ -1596,6 +1596,19 @@ eval_tests! {
     math_exp_accepts_bignum: "(math/exp 2)" => common::eval("7.38905609893065"),
 }
 
+// Task 5.6: `number->string`/`string->number` with radix over the tower.
+// `string->number` never errors — unparseable input returns `#f` (R7RS).
+eval_tests! {
+    number_to_string_radix_16: "(number->string 255 16)" => common::eval("\"ff\""),
+    number_to_string_rational: "(number->string 1/3)" => common::eval("\"1/3\""),
+    number_to_string_default_radix: "(number->string 255)" => common::eval("\"255\""),
+    string_to_number_radix_16: "(string->number \"ff\" 16)" => common::eval("255"),
+    string_to_number_rational: "(string->number \"1/3\")" => common::eval("1/3"),
+    string_to_number_float: "(string->number \"3.14\")" => common::eval("3.14"),
+    string_to_number_unparseable_is_false: "(string->number \"nope\")" => common::eval("#f"),
+    string_to_number_complex: "(string->number \"3+4i\")" => common::eval("3+4i"),
+}
+
 // Regression tests for the runtime bug-hunt fixes (2026-07-07).
 eval_tests! {
     // Int↔float comparison is exact above 2^53 (was lossy: `as f64` collapsed

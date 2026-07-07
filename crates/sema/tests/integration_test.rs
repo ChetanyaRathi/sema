@@ -2833,10 +2833,8 @@ fn test_string_to_number() {
     assert_eq!(eval(r#"(string->number "42")"#), Value::int(42));
     assert_eq!(eval(r#"(string->number "-7")"#), Value::int(-7));
     assert_eq!(eval(r#"(string->number "3.14")"#), Value::float(3.14));
-    // Invalid string should error
-    assert!(eval_err(r#"(string->number "abc")"#)
-        .to_string()
-        .contains("cannot parse"));
+    // Unparseable input returns #f rather than erroring (R7RS).
+    assert_eq!(eval(r#"(string->number "abc")"#), Value::bool(false));
 }
 
 // JSON encode-pretty
