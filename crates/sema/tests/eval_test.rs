@@ -1356,22 +1356,22 @@ eval_error_tests! {
     force_non_promise_errors: "(force 42)" => "thunk",
 }
 
-// Integer arithmetic raises on i64 overflow rather than silently wrapping
-// (there is no bignum type to promote to). Consistent with `abs` on i64::MIN.
-//
-// These exercise exactly 2 operands, which the compiler always compiles to
-// the inline `AddInt`/`SubInt`/`MulInt` VM opcodes (`try_compile_intrinsic` in
-// sema-vm/src/compiler.rs matches on `(name, argc)` alone, regardless of
-// operand type) — a separate overflow-raising code path from the stdlib
-// `+`/`-`/`*` native functions in `arithmetic.rs`. That VM fast path still
-// raises until Task 1.5 (`vm: fast-path opcodes and helpers promote on
-// overflow`) lands, so these stay accurate for now.
+// `expt` still raises on i64 overflow (it is generalized to bignums in a later
+// phase). The 2-operand `+`/`-`/`*` VM fast path no longer raises — those cases
+// promote to bignum (see the `vm_*_overflow_promotes` tests above).
 eval_error_tests! {
-    add_overflow_errors: "(+ 9223372036854775807 1)" => "integer overflow",
-    sub_underflow_errors: "(- -9223372036854775808 1)" => "integer overflow",
-    mul_overflow_errors: "(* 9223372036854775807 9223372036854775807)" => "integer overflow",
     expt_result_overflow_errors: "(expt 2 64)" => "integer overflow",
     expt_exponent_overflow_errors: "(expt 2 4294967296)" => "integer overflow",
+}
+
+// The inline `AddInt`/`SubInt`/`MulInt` VM opcodes (2-operand form, chosen by
+// `try_compile_intrinsic` on `(name, argc)`) promote to bignum on i64 overflow
+// instead of raising, matching the stdlib `+`/`-`/`*` native functions.
+eval_tests! {
+    add_overflow_promotes: "(+ 9223372036854775807 1)" => common::eval("9223372036854775808"),
+    sub_underflow_promotes: "(- -9223372036854775808 1)" => common::eval("-9223372036854775809"),
+    mul_overflow_promotes: "(* 9223372036854775807 9223372036854775807)"
+        => common::eval("85070591730234615847396907784232501249"),
 }
 
 // Stdlib `+ - *` promote to bignum on i64 overflow instead of raising.
@@ -1392,6 +1392,18 @@ eval_tests! {
     // in-range arithmetic is byte-identical to before
     bignum_add_in_range: "(+ 2 3)" => common::eval("5"),
     bignum_mul_in_range: "(* 6 7)" => common::eval("42"),
+}
+
+// Task 1.5: the VM's inline `AddInt`/`MulInt`/`LtInt`/`EqInt` intrinsics and
+// their generic `vm_add`/`vm_mul`/`vm_lt`/`vm_eq` helpers promote to bignum on
+// i64 overflow (2-operand form compiles to the intrinsic opcodes).
+eval_tests! {
+    vm_add_overflow_promotes: "(let ((a 9223372036854775807)) (+ a a))"
+        => common::eval("18446744073709551614"),
+    vm_mul_overflow_promotes: "(let ((a 9223372036854775807)) (* a a))"
+        => common::eval("85070591730234615847396907784232501249"),
+    vm_lt_bignum: "(< 9223372036854775807 9223372036854775808)" => common::eval("#t"),
+    vm_eq_bignum: "(= 9223372036854775808 9223372036854775808)" => common::eval("#t"),
 }
 
 // Regression tests for the runtime bug-hunt fixes (2026-07-07).
