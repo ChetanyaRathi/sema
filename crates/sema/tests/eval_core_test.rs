@@ -24,9 +24,11 @@ eval_tests! {
     abs_basic: "(abs -5)" => Value::int(5),
     min_basic: "(min 3 1 2)" => Value::int(1),
     max_basic: "(max 3 1 2)" => Value::int(3),
-    floor_basic: "(floor 3.7)" => Value::int(3),
-    ceil_basic: "(ceil 3.2)" => Value::int(4),
-    round_basic: "(round 3.5)" => Value::int(4),
+    // floor/ceiling/round/truncate are exactness-preserving (R7RS): a float
+    // argument rounds to a float, not an int (see Task 5.2).
+    floor_basic: "(floor 3.7)" => Value::float(3.0),
+    ceil_basic: "(ceil 3.2)" => Value::float(4.0),
+    round_basic: "(round 3.5)" => Value::float(4.0),
     pi_const: "(> pi 3.14)" => Value::bool(true),
     e_const: "(> e 2.71)" => Value::bool(true),
     math_clamp: "(math/clamp 15 0 10)" => Value::int(10),

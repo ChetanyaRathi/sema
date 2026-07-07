@@ -67,15 +67,28 @@ fn to_exact_impl(args: &[Value]) -> Result<Value, SemaError> {
     Ok(Value::from_number(n.to_exact()))
 }
 
-fn ceil_impl(args: &[Value]) -> Result<Value, SemaError> {
-    check_arity!(args, "ceil", 1);
-    match args[0].view_ref() {
-        ValueViewRef::Int(n) => Ok(Value::int(n)),
-        // An exact rational rounds up to an exact integer.
-        ValueViewRef::Rational(r) => Ok(Value::from_bigint(r.ceil().to_integer())),
-        ValueViewRef::Float(f) => float_to_int(f.ceil(), "ceil"),
-        _ => Err(SemaError::type_error("number", args[0].type_name())),
+/// Shared implementation for `floor`/`ceiling`/`round`/`truncate`: lift the
+/// argument into the tower, apply the exactness-preserving op, and lower back
+/// to the tightest `Value` (exact stays exact, inexact stays inexact — an
+/// exact rational rounds to an exact integer, a float rounds to a float).
+/// Complex has no rounding and is rejected before `f` ever sees it.
+fn round_op(
+    args: &[Value],
+    name: &str,
+    f: impl Fn(SemaNumber) -> SemaNumber,
+) -> Result<Value, SemaError> {
+    check_arity!(args, name, 1);
+    let n = args[0]
+        .as_number()
+        .ok_or_else(|| SemaError::type_error("number", args[0].type_name()))?;
+    if !n.is_real() {
+        return Err(SemaError::type_error("real number", args[0].type_name()));
     }
+    Ok(Value::from_number(f(n)))
+}
+
+fn ceil_impl(args: &[Value]) -> Result<Value, SemaError> {
+    round_op(args, "ceil", SemaNumber::ceil)
 }
 
 pub fn register(env: &sema_core::Env) {
@@ -131,28 +144,15 @@ pub fn register(env: &sema_core::Env) {
     });
 
     register_fn(env, "floor", |args| {
-        check_arity!(args, "floor", 1);
-        match args[0].view_ref() {
-            ValueViewRef::Int(n) => Ok(Value::int(n)),
-            // An exact rational rounds down to an exact integer.
-            ValueViewRef::Rational(r) => Ok(Value::from_bigint(r.floor().to_integer())),
-            ValueViewRef::Float(f) => float_to_int(f.floor(), "floor"),
-            _ => Err(SemaError::type_error("number", args[0].type_name())),
-        }
+        round_op(args, "floor", SemaNumber::floor)
     });
 
     register_fn(env, "ceil", ceil_impl);
     register_fn(env, "ceiling", ceil_impl);
 
+    // R7RS "banker's rounding": ties round to the nearest even integer.
     register_fn(env, "round", |args| {
-        check_arity!(args, "round", 1);
-        match args[0].view_ref() {
-            ValueViewRef::Int(n) => Ok(Value::int(n)),
-            // An exact rational rounds to the nearest exact integer.
-            ValueViewRef::Rational(r) => Ok(Value::from_bigint(r.round().to_integer())),
-            ValueViewRef::Float(f) => float_to_int(f.round(), "round"),
-            _ => Err(SemaError::type_error("number", args[0].type_name())),
-        }
+        round_op(args, "round", SemaNumber::round)
     });
 
     // Round to `places` decimal places, returning a float: (math/round-to 3.14159 2) => 3.14.
@@ -575,14 +575,7 @@ pub fn register(env: &sema_core::Env) {
     });
 
     register_fn(env, "truncate", |args| {
-        check_arity!(args, "truncate", 1);
-        match args[0].view_ref() {
-            ValueViewRef::Int(n) => Ok(Value::int(n)),
-            // An exact rational truncates toward zero to an exact integer.
-            ValueViewRef::Rational(r) => Ok(Value::from_bigint(r.trunc().to_integer())),
-            ValueViewRef::Float(f) => float_to_int(f.trunc(), "truncate"),
-            _ => Err(SemaError::type_error("number", args[0].type_name())),
-        }
+        round_op(args, "truncate", SemaNumber::truncate)
     });
 
     register_fn(env, "math/sinh", |args| {
@@ -738,37 +731,41 @@ mod tests {
     }
 
     #[test]
-    fn ceil_impl_guards_nan_and_overflow() {
-        // ceil_impl is the only free-fn rounding builtin; exercise it directly.
-        assert!(ceil_impl(&[Value::float(f64::NAN)]).is_err());
-        assert!(ceil_impl(&[Value::float(1.0e19)]).is_err());
-        assert!(ceil_impl(&[Value::float(f64::INFINITY)]).is_err());
-        assert_eq!(
-            ceil_impl(&[Value::float(2.3)]).unwrap(),
-            Value::int(3),
-            "ceil(2.3) should still round up to 3"
-        );
-        // Integer inputs pass through untouched.
+    fn ceil_impl_preserves_exactness() {
+        // Integer inputs pass through untouched (still exact).
         assert_eq!(ceil_impl(&[Value::int(42)]).unwrap(), Value::int(42));
+        // A float ceils to a float — inexact stays inexact, unlike the old
+        // behavior that lossily converted the result to an int.
+        assert_eq!(ceil_impl(&[Value::float(2.3)]).unwrap(), Value::float(3.0));
+        // Complex has no rounding.
+        assert!(ceil_impl(&[Value::complex(
+            SemaNumber::from_i64(1),
+            SemaNumber::from_i64(1)
+        )])
+        .is_err());
     }
 
     #[test]
-    fn rounding_builtins_error_on_nan_through_env() {
-        // Drive the registered closures (floor/round/truncate) end to end so the
-        // guard is exercised on every rounding builtin, not just ceil_impl.
+    fn rounding_builtins_preserve_float_exactness_through_env() {
+        // Drive the registered closures (floor/round/truncate/ceil) end to end.
+        // Since these no longer convert their result to an i64, NaN/out-of-range
+        // floats are no longer an overflow risk — they pass straight through.
         let env = sema_core::Env::new();
         register(&env);
         let ctx = sema_core::EvalContext::default();
         for name in ["ceil", "ceiling", "floor", "round", "truncate"] {
             let f = env.get_str(name).expect("builtin registered");
             let nf = f.as_native_fn_ref().expect("native fn");
+            let nan_result = (nf.func)(&ctx, &[Value::float(f64::NAN)]).unwrap();
             assert!(
-                (nf.func)(&ctx, &[Value::float(f64::NAN)]).is_err(),
-                "{name} should error on NaN"
+                matches!(nan_result.as_float(), Some(f) if f.is_nan()),
+                "{name} should return NaN unchanged"
             );
-            assert!(
-                (nf.func)(&ctx, &[Value::float(1.0e19)]).is_err(),
-                "{name} should error on out-of-range input"
+            let big_result = (nf.func)(&ctx, &[Value::float(1.0e19)]).unwrap();
+            assert_eq!(
+                big_result,
+                Value::float(1.0e19),
+                "{name} should return large floats unchanged"
             );
         }
     }

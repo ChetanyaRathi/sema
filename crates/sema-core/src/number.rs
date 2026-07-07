@@ -213,6 +213,68 @@ impl SemaNumber {
         .normalize()
     }
 
+    /// Round toward negative infinity. Exactness-preserving: an exact
+    /// rational rounds to an exact `Integer`; an inexact `Real` stays a
+    /// `Real`. Not meaningful for `Complex` — callers must guard with
+    /// `is_real()` before calling (mirrors `cmp_real`'s contract).
+    pub fn floor(self) -> SemaNumber {
+        match self {
+            SemaNumber::Integer(n) => SemaNumber::Integer(n),
+            SemaNumber::Rational(r) => SemaNumber::Integer(r.floor().to_integer()),
+            SemaNumber::Real(f) => SemaNumber::Real(f.floor()),
+            SemaNumber::Complex(_) => unreachable!("caller must guard complex via is_real()"),
+        }
+    }
+
+    /// Round toward positive infinity. See `floor` for exactness rules.
+    pub fn ceil(self) -> SemaNumber {
+        match self {
+            SemaNumber::Integer(n) => SemaNumber::Integer(n),
+            SemaNumber::Rational(r) => SemaNumber::Integer(r.ceil().to_integer()),
+            SemaNumber::Real(f) => SemaNumber::Real(f.ceil()),
+            SemaNumber::Complex(_) => unreachable!("caller must guard complex via is_real()"),
+        }
+    }
+
+    /// Round toward zero (truncate the fractional part). See `floor` for
+    /// exactness rules.
+    pub fn truncate(self) -> SemaNumber {
+        match self {
+            SemaNumber::Integer(n) => SemaNumber::Integer(n),
+            SemaNumber::Rational(r) => SemaNumber::Integer(r.trunc().to_integer()),
+            SemaNumber::Real(f) => SemaNumber::Real(f.trunc()),
+            SemaNumber::Complex(_) => unreachable!("caller must guard complex via is_real()"),
+        }
+    }
+
+    /// Round to the nearest integer, ties to even (R7RS "banker's rounding").
+    /// See `floor` for exactness rules.
+    pub fn round(self) -> SemaNumber {
+        use num_integer::Integer;
+        use std::cmp::Ordering;
+        match self {
+            SemaNumber::Integer(n) => SemaNumber::Integer(n),
+            SemaNumber::Rational(r) => {
+                let (numer, denom) = (r.numer().clone(), r.denom().clone());
+                // denom is always positive (BigRational's invariant), so
+                // div_floor/rem here behave like ordinary floored division.
+                let floor = numer.div_floor(&denom);
+                let rem = &numer - &floor * &denom; // in [0, denom)
+                let twice_rem = &rem * BigInt::from(2);
+                let round_up = match twice_rem.cmp(&denom) {
+                    Ordering::Less => false,
+                    Ordering::Greater => true,
+                    // Exact tie: round to whichever neighbor is even.
+                    Ordering::Equal => floor.is_odd(),
+                };
+                let result = if round_up { floor + 1 } else { floor };
+                SemaNumber::Integer(result)
+            }
+            SemaNumber::Real(f) => SemaNumber::Real(f.round_ties_even()),
+            SemaNumber::Complex(_) => unreachable!("caller must guard complex via is_real()"),
+        }
+    }
+
     #[allow(clippy::should_implement_trait)]
     pub fn mul(self, other: SemaNumber) -> SemaNumber {
         let (a, b) = SemaNumber::promote(self, other);
@@ -740,6 +802,28 @@ mod tests {
         // rejects garbage
         assert!(SemaNumber::parse_rational("1/0").is_none()); // zero denominator
         assert!(SemaNumber::parse_int_radix("xyz", 16).is_none());
+    }
+
+    #[test]
+    fn rounding_preserves_exactness() {
+        let r = |n: i64, d: i64| {
+            SemaNumber::Rational(BigRational::new(BigInt::from(n), BigInt::from(d)))
+        };
+        // 7/2 = 3.5
+        assert!(matches!(r(7, 2).floor(), SemaNumber::Integer(n) if n == BigInt::from(3)));
+        assert!(matches!(r(7, 2).ceil(), SemaNumber::Integer(n) if n == BigInt::from(4)));
+        // banker's rounding: ties round to the nearest EVEN integer.
+        assert!(matches!(r(7, 2).round(), SemaNumber::Integer(n) if n == BigInt::from(4))); // 3.5 -> 4
+        assert!(matches!(r(5, 2).round(), SemaNumber::Integer(n) if n == BigInt::from(2))); // 2.5 -> 2
+        assert!(matches!(r(-5, 2).round(), SemaNumber::Integer(n) if n == BigInt::from(-2))); // -2.5 -> -2
+        assert!(matches!(r(-7, 2).truncate(), SemaNumber::Integer(n) if n == BigInt::from(-3)));
+        // integers pass through unchanged.
+        assert!(
+            matches!(SemaNumber::Integer(BigInt::from(5)).floor(), SemaNumber::Integer(n) if n == BigInt::from(5))
+        );
+        // reals stay inexact.
+        assert!(matches!(SemaNumber::Real(2.5).floor(), SemaNumber::Real(f) if f == 2.0));
+        assert!(matches!(SemaNumber::Real(2.5).round(), SemaNumber::Real(f) if f == 2.0));
     }
 
     #[test]

@@ -1542,6 +1542,18 @@ eval_error_tests! {
     lt_complex_errors: "(< 1+2i 3)" => "cannot order complex",
 }
 
+// Task 5.2: floor/ceiling/round/truncate over rationals and bignums, with
+// R7RS banker's rounding (round-half-to-even) for the tie case.
+eval_tests! {
+    floor_rational: "(floor 7/2)" => common::eval("3"),
+    ceiling_rational: "(ceiling 7/2)" => common::eval("4"),
+    round_rational_ties_up_to_even: "(round 7/2)" => common::eval("4"),
+    round_rational_ties_down_to_even: "(round 5/2)" => common::eval("2"),
+    truncate_negative_rational: "(truncate -7/2)" => common::eval("-3"),
+    floor_float_stays_inexact: "(floor 2.5)" => common::eval("2.0"),
+    floor_int_identity: "(floor 5)" => common::eval("5"),
+}
+
 // Regression tests for the runtime bug-hunt fixes (2026-07-07).
 eval_tests! {
     // Int↔float comparison is exact above 2^53 (was lossy: `as f64` collapsed
