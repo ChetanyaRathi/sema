@@ -1609,6 +1609,19 @@ eval_tests! {
     string_to_number_complex: "(string->number \"3+4i\")" => common::eval("3+4i"),
 }
 
+// Task 5.7: `exact-integer-sqrt` (isqrt with remainder, bignum-aware) and
+// `rationalize` (simplest rational within a tolerance, R7RS exactness
+// contagion). `rationalize`'s expected literals are the actual output of the
+// Stern–Brocot implementation, pinned as the oracle.
+eval_tests! {
+    exact_integer_sqrt_nonsquare: "(exact-integer-sqrt 17)" => common::eval("'(4 1)"),
+    exact_integer_sqrt_bignum: "(exact-integer-sqrt 100000000000000000000)" => common::eval("'(10000000000 0)"),
+    exact_integer_sqrt_perfect_square: "(exact-integer-sqrt 144)" => common::eval("'(12 0)"),
+    rationalize_exact_stays_exact: "(rationalize 1/3 1/100)" => common::eval("1/3"),
+    rationalize_classic_scheme: "(rationalize 3/10 1/10)" => common::eval("1/3"),
+    rationalize_inexact_pi: "(rationalize 3.14159 1/100)" => common::eval("3.142857142857143"),
+}
+
 // Regression tests for the runtime bug-hunt fixes (2026-07-07).
 eval_tests! {
     // Int↔float comparison is exact above 2^53 (was lossy: `as f64` collapsed

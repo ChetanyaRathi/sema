@@ -533,6 +533,95 @@ impl SemaNumber {
     }
 }
 
+/// The simplest rational number in the closed interval `[lo, hi]` (requires
+/// `lo <= hi`): the one with the smallest denominator, and among those the
+/// smallest numerator magnitude. Descends the Stern–Brocot tree via the
+/// continued-fraction expansion of the endpoints — this is the mathematical
+/// core of R7RS `rationalize`.
+fn simplest_rational_in(lo: BigRational, hi: BigRational) -> BigRational {
+    use num_traits::{Signed, Zero};
+    if lo.is_positive() {
+        simplest_positive(lo, hi)
+    } else if hi.is_negative() {
+        // Reflect the interval into the positive reals, solve, negate back.
+        -simplest_positive(-hi, -lo)
+    } else {
+        // 0 lies in `[lo, hi]` and is the simplest rational of all.
+        BigRational::zero()
+    }
+}
+
+/// Simplest rational in `[lo, hi]` assuming `0 < lo <= hi`.
+fn simplest_positive(lo: BigRational, hi: BigRational) -> BigRational {
+    use num_traits::One;
+    let fl = lo.floor(); // integer-valued BigRational
+    if fl == lo {
+        // `lo` is itself an integer — the simplest value in the interval.
+        fl
+    } else if fl < hi.floor() {
+        // An integer strictly above `lo` still lies at/below `hi`.
+        fl + BigRational::one()
+    } else {
+        // `lo` and `hi` share an integer part; recurse on the reciprocals of
+        // their fractional parts (reciprocation flips the ordering, so the new
+        // lower bound comes from `hi`).
+        let frac_lo = &lo - &fl;
+        let frac_hi = &hi - &fl;
+        fl + simplest_positive(frac_hi.recip(), frac_lo.recip()).recip()
+    }
+}
+
+impl SemaNumber {
+    /// Exact `BigRational` value of a *real* tower number, or `None` for a
+    /// non-finite `Real` (±inf / NaN) or a `Complex`.
+    fn to_exact_rational(&self) -> Option<BigRational> {
+        match self {
+            SemaNumber::Integer(i) => Some(BigRational::from(i.clone())),
+            SemaNumber::Rational(r) => Some(r.clone()),
+            SemaNumber::Real(f) => BigRational::from_float(*f),
+            SemaNumber::Complex(_) => None,
+        }
+    }
+
+    /// The simplest rational number within `tol` of `self` (R7RS
+    /// `rationalize`). Both operands must be real (the builtin guards complex).
+    /// Computes exactly over `BigRational` — the interval is
+    /// `[self - |tol|, self + |tol|]` — then applies inexactness contagion:
+    /// the result is inexact iff either operand is inexact.
+    pub fn rationalize(&self, tol: &SemaNumber) -> SemaNumber {
+        use num_traits::{Signed, Zero};
+        let inexact = !self.is_exact() || !tol.is_exact();
+        let wrap = |r: BigRational| {
+            let n = SemaNumber::Rational(r).normalize();
+            if inexact {
+                n.to_inexact()
+            } else {
+                n
+            }
+        };
+        // A non-finite value has no meaningful nearby rational — return it as-is.
+        let xr = match self.to_exact_rational() {
+            Some(x) => x,
+            None => return self.clone(),
+        };
+        let er = match tol.to_exact_rational() {
+            Some(e) => e.abs(),
+            // An infinite tolerance admits every rational ⇒ 0 is simplest; a
+            // NaN tolerance has no interval ⇒ leave the value unchanged.
+            None => {
+                return if matches!(tol, SemaNumber::Real(f) if f.is_infinite()) {
+                    wrap(BigRational::zero())
+                } else {
+                    self.clone()
+                };
+            }
+        };
+        let lo = &xr - &er;
+        let hi = &xr + &er;
+        wrap(simplest_rational_in(lo, hi))
+    }
+}
+
 impl PartialEq for SemaNumber {
     fn eq(&self, other: &Self) -> bool {
         use SemaNumber::*;
@@ -867,6 +956,28 @@ mod tests {
         assert!(set.contains(&SemaNumber::Real(1.5)));
         // Ordering by level then value (used only for deterministic map keys).
         assert!(SemaNumber::Integer(BigInt::from(1)) < SemaNumber::Real(0.0)); // level 0 < 2
+    }
+
+    #[test]
+    fn rationalize_simplest_in_interval() {
+        let n = |v: i64| SemaNumber::Integer(BigInt::from(v));
+        let r = |a: i64, b: i64| {
+            SemaNumber::Rational(BigRational::new(BigInt::from(a), BigInt::from(b)))
+        };
+        // 1/3 within 1/100 is already the simplest rational at that scale.
+        assert_eq!(r(1, 3).rationalize(&r(1, 100)), r(1, 3));
+        // Classic Scheme example: rationalize(3/10, 1/10) => 1/3.
+        assert_eq!(r(3, 10).rationalize(&r(1, 10)), r(1, 3));
+        // Exact inputs stay exact.
+        assert!(r(1, 3).rationalize(&r(1, 100)).is_exact());
+        // rationalize(5, 4): interval [1, 9] — simplest is the integer 1.
+        assert_eq!(n(5).rationalize(&n(4)), n(1));
+        // A tolerance spanning zero admits 0, the simplest rational of all.
+        assert_eq!(n(3).rationalize(&n(5)), n(0));
+        // Inexactness contagion: an inexact operand yields an inexact result.
+        assert!(!SemaNumber::Real(0.3).rationalize(&r(1, 10)).is_exact());
+        // A negative value: rationalize(-3/10, 1/10) => -1/3 (mirror image).
+        assert_eq!(r(-3, 10).rationalize(&r(1, 10)), r(-1, 3));
     }
 
     #[test]

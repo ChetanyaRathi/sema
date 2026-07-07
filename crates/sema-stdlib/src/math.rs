@@ -684,6 +684,51 @@ pub fn register(env: &sema_core::Env) {
         Ok(Value::from_bigint(acc))
     });
 
+    // `(exact-integer-sqrt n)` → the list `(s r)` where `s = ⌊√n⌋` and
+    // `r = n - s²`, so `s² + r = n` and `0 ≤ r ≤ 2s`. Requires a non-negative
+    // exact integer (fixnum or bignum); rejects rationals, floats, and complex.
+    register_fn(env, "exact-integer-sqrt", |args| {
+        check_arity!(args, "exact-integer-sqrt", 1);
+        let n = args[0].as_bigint().ok_or_else(|| {
+            SemaError::type_error("exact integer", args[0].type_name())
+                .with_hint("exact-integer-sqrt: argument must be an exact integer")
+        })?;
+        if n.sign() == num_bigint::Sign::Minus {
+            return Err(
+                SemaError::eval("exact-integer-sqrt: argument must be non-negative")
+                    .with_hint("exact-integer-sqrt: √ of a negative integer is not real"),
+            );
+        }
+        let s = n.sqrt();
+        let r = &n - &s * &s;
+        Ok(Value::list(vec![
+            Value::from_bigint(s),
+            Value::from_bigint(r),
+        ]))
+    });
+
+    // `(rationalize x tol)` → the simplest rational within `tol` of `x` (R7RS).
+    // Both arguments must be real. Exactness follows the tower's contagion rule
+    // (inexact iff either operand is inexact); the math is the Stern–Brocot
+    // "simplest rational in interval" descent in `SemaNumber::rationalize`.
+    register_fn(env, "rationalize", |args| {
+        check_arity!(args, "rationalize", 2);
+        let x = args[0]
+            .as_number()
+            .ok_or_else(|| SemaError::type_error("real", args[0].type_name()))?;
+        let tol = args[1]
+            .as_number()
+            .ok_or_else(|| SemaError::type_error("real", args[1].type_name()))?;
+        if !x.is_real() || !tol.is_real() {
+            return Err(SemaError::type_error(
+                "real",
+                args[if x.is_real() { 1 } else { 0 }].type_name(),
+            )
+            .with_hint("rationalize: complex numbers have no simplest-rational approximation"));
+        }
+        Ok(Value::from_number(x.rationalize(&tol)))
+    });
+
     env.set_str("math/infinity", Value::float(f64::INFINITY));
     env.set_str("math/nan", Value::float(f64::NAN));
 }
