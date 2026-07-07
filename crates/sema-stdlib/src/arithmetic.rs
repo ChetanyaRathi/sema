@@ -236,42 +236,18 @@ pub fn register(env: &sema_core::Env) {
 
     register_fn(env, "/", |args| {
         check_arity!(args, "/", 2..);
-        // Fast path: two integers — use exact i64 division to avoid f64
-        // precision loss for values > 2^53, matching the constant folder.
-        if args.len() == 2 {
-            if let (Some(a), Some(b)) = (args[0].as_int(), args[1].as_int()) {
-                if b == 0 {
-                    return Err(SemaError::eval("/: division by zero")
-                        .with_hint("/: guard with (if (zero? d) ... (/ n d))"));
-                }
-                if a % b == 0 {
-                    return Ok(Value::int(a / b));
-                }
-                return Ok(Value::float(a as f64 / b as f64));
-            }
-        }
-        let mut result = match args[0].view_ref() {
-            ValueViewRef::Int(n) => n as f64,
-            ValueViewRef::Float(f) => f,
-            _ => return Err(SemaError::type_error("number", args[0].type_name())),
-        };
+        // Fold left through the tower: exact/exact division stays exact
+        // (`1/3`, not `0.333…`); any inexact operand contaminates the whole
+        // result, matching R7RS exactness contagion.
+        let mut acc = args[0].as_number().ok_or_else(|| not_a_number(&args[0]))?;
         for arg in &args[1..] {
-            let divisor = match arg.view_ref() {
-                ValueViewRef::Int(n) => n as f64,
-                ValueViewRef::Float(f) => f,
-                _ => return Err(SemaError::type_error("number", arg.type_name())),
-            };
-            if divisor == 0.0 {
-                return Err(SemaError::eval("/: division by zero")
-                    .with_hint("/: guard with (if (zero? d) ... (/ n d))"));
-            }
-            result /= divisor;
+            let d = arg.as_number().ok_or_else(|| not_a_number(arg))?;
+            acc = acc.div(d).map_err(|_| {
+                SemaError::eval("/: division by zero")
+                    .with_hint("/: guard with (if (zero? d) ... (/ n d))")
+            })?;
         }
-        if result.fract() == 0.0 && args.iter().all(|a| a.is_int()) {
-            Ok(Value::int(result as i64))
-        } else {
-            Ok(Value::float(result))
-        }
+        Ok(Value::from_number(acc))
     });
 
     register_fn(env, "mod", mod_impl);

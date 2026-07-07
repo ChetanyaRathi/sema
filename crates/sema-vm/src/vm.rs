@@ -4419,21 +4419,31 @@ fn vm_mul(a: &Value, b: &Value) -> Result<Value, SemaError> {
 #[inline(always)]
 fn vm_div(a: &Value, b: &Value) -> Result<Value, SemaError> {
     match (a.view_ref(), b.view_ref()) {
-        (ValueViewRef::Int(_), ValueViewRef::Int(0)) => Err(SemaError::eval("division by zero")),
+        (ValueViewRef::Int(_), ValueViewRef::Int(0)) => Err(SemaError::eval("division by zero")
+            .with_hint("/: guard with (if (zero? d) ... (/ n d))")),
         (ValueViewRef::Int(x), ValueViewRef::Int(y)) => {
             if x % y == 0 {
                 Ok(Value::int(x / y))
             } else {
-                Ok(Value::float(x as f64 / y as f64))
+                // Not evenly divisible: exact rational, not a lossy float.
+                Ok(Value::from_number(
+                    SemaNumber::from_i64(x)
+                        .div(SemaNumber::from_i64(y))
+                        .unwrap(),
+                ))
             }
         }
         (ValueViewRef::Float(x), ValueViewRef::Float(y)) => Ok(Value::float(x / y)),
         (ValueViewRef::Int(x), ValueViewRef::Float(y)) => Ok(Value::float(x as f64 / y)),
         (ValueViewRef::Float(x), ValueViewRef::Int(y)) => Ok(Value::float(x / y as f64)),
-        // Phase-1 stopgap: bignum operands divide as floats (replaced in Phase 2
-        // with exact rational division through `SemaNumber::div`).
+        // Any other numeric combination (bignum, rational) divides exactly
+        // through the tower; an exact-zero divisor signals, matching the
+        // stdlib `/` native fn.
         _ => match (a.as_number(), b.as_number()) {
-            (Some(x), Some(y)) => Ok(Value::float(x.to_f64() / y.to_f64())),
+            (Some(x), Some(y)) => x.div(y).map(Value::from_number).map_err(|_| {
+                SemaError::eval("/: division by zero")
+                    .with_hint("/: guard with (if (zero? d) ... (/ n d))")
+            }),
             _ => Err(SemaError::type_error(
                 "number",
                 format!("{} and {}", a.type_name(), b.type_name()),

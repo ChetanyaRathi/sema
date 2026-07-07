@@ -8,6 +8,7 @@
 
 use std::borrow::Cow;
 
+use sema_core::number::SemaNumber;
 use sema_core::{resolve as resolve_spur, Value};
 
 use crate::core_expr::{CoreExpr, PromptEntry};
@@ -360,7 +361,14 @@ fn fold_binary_op(name: &str, a: &Value, b: &Value) -> Option<Value> {
             } else if ai % bi == 0 {
                 Some(Value::int(ai / bi))
             } else {
-                Some(Value::float(ai as f64 / bi as f64))
+                // Not evenly divisible: fold to the exact rational, matching
+                // the runtime `/` (stdlib native fn + `vm_div`) instead of a
+                // lossy float — constant folding must not change semantics.
+                Some(Value::from_number(
+                    SemaNumber::from_i64(ai)
+                        .div(SemaNumber::from_i64(bi))
+                        .unwrap(),
+                ))
             }
         }
         "<" => Some(Value::bool(ai < bi)),

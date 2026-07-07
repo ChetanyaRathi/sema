@@ -1415,6 +1415,26 @@ eval_tests! {
     integer_pred_fractional_float: "(integer? 2.5)" => common::eval("#f"),
 }
 
+// Task 2.3: `/` yields exact rationals through both the stdlib native fn and
+// the VM's `vm_div` fast path — no more lossy `result as i64`/float stopgap.
+eval_tests! {
+    div_exact_rational: "(/ 1 3)" => common::eval("1/3"),
+    div_exact_whole: "(/ 6 3)" => common::eval("2"),
+    div_exact_rational_reduces: "(/ 10 4)" => common::eval("5/2"),
+    div_float_contagion: "(/ 1 2.0)" => common::eval("0.5"),
+    div_rational_add: "(+ 1/2 1/3)" => common::eval("5/6"),
+    div_rational_mul: "(* 2/3 3/4)" => common::eval("1/2"),
+    div_rational_sub: "(- 1/2 1/3)" => common::eval("1/6"),
+    div_rational_fold: "(/ 1 3 2)" => common::eval("1/6"),
+    // VM inline fast path (2-operand call compiles to the DivInt-style intrinsic).
+    vm_div_exact_rational: "(let ((a 1) (b 3)) (/ a b))" => common::eval("1/3"),
+    vm_div_exact_whole: "(let ((a 6) (b 3)) (/ a b))" => common::eval("2"),
+}
+
+eval_error_tests! {
+    div_by_zero_still_errors: "(/ 1 0)" => "division by zero",
+}
+
 // Regression tests for the runtime bug-hunt fixes (2026-07-07).
 eval_tests! {
     // Int↔float comparison is exact above 2^53 (was lossy: `as f64` collapsed
