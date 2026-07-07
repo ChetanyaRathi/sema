@@ -397,6 +397,60 @@ pub fn tokenize(input: &str) -> Result<Vec<SpannedToken>, SemaError> {
                                 i += 1;
                             }
                         }
+                        'x' | 'X' | 'o' | 'O' | 'b' | 'B' | 'd' | 'D' => {
+                            // Radix-prefixed integer literal: #xFF, #o17, #b101,
+                            // #d10. Sign-aware (#x-1F) and bignum-capable — the
+                            // digit run is parsed via `SemaNumber::parse_int_radix`
+                            // and lowered to the tightest token (Int or BigInt).
+                            let radix = match chars[i + 1] {
+                                'x' | 'X' => 16,
+                                'o' | 'O' => 8,
+                                'b' | 'B' => 2,
+                                'd' | 'D' => 10,
+                                _ => unreachable!(),
+                            };
+                            let digits_start = i + 2;
+                            let mut j = digits_start;
+                            if j < chars.len() && (chars[j] == '+' || chars[j] == '-') {
+                                j += 1;
+                            }
+                            let digits_body_start = j;
+                            while j < chars.len() && chars[j].is_ascii_alphanumeric() {
+                                j += 1;
+                            }
+                            if j == digits_body_start {
+                                return Err(SemaError::Reader {
+                                    message: format!(
+                                        "expected digits after #{} radix prefix",
+                                        chars[i + 1]
+                                    ),
+                                    span,
+                                });
+                            }
+                            let digits: String = chars[digits_start..j].iter().collect();
+                            let n =
+                                SemaNumber::parse_int_radix(&digits, radix).ok_or_else(|| {
+                                    SemaError::Reader {
+                                        message: format!("invalid radix-{radix} literal: {digits}"),
+                                        span,
+                                    }
+                                })?;
+                            let token = match n {
+                                SemaNumber::Integer(big) => match i64::try_from(&big) {
+                                    Ok(v) => Token::Int(v),
+                                    Err(_) => Token::BigInt(big),
+                                },
+                                _ => unreachable!("parse_int_radix only produces Integer"),
+                            };
+                            col += j - i;
+                            i = j;
+                            tokens.push(SpannedToken {
+                                token,
+                                span: span.with_end(line, col),
+                                byte_start: byte_offsets[token_start],
+                                byte_end: byte_offsets[i],
+                            });
+                        }
                         _ => {
                             return Err(SemaError::Reader {
                                 message: format!(
@@ -1270,5 +1324,23 @@ mod tests {
         assert!(matches!(first("/"), Token::Symbol(s) if s == "/"));
         // 1.5/2 is NOT a rational (float numerator) — 1.5 then symbol
         assert_eq!(first("1.5"), Token::Float(1.5));
+    }
+
+    #[test]
+    fn radix_prefixes() {
+        let first = |src: &str| tokenize(src).unwrap().into_iter().next().unwrap().token;
+        assert_eq!(first("#xFF"), Token::Int(255));
+        assert_eq!(first("#b101"), Token::Int(5));
+        assert_eq!(first("#o17"), Token::Int(15));
+        assert_eq!(first("#d10"), Token::Int(10));
+        assert_eq!(first("#x-1F"), Token::Int(-31));
+        assert_eq!(first("#xff"), Token::Int(255)); // lowercase digits
+                                                    // bignum-capable
+        use num_bigint::BigInt;
+        use std::str::FromStr;
+        assert_eq!(
+            first("#xFFFFFFFFFFFFFFFFF"),
+            Token::BigInt(BigInt::from_str("295147905179352825855").unwrap())
+        );
     }
 }

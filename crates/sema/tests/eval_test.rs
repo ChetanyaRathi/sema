@@ -1479,6 +1479,18 @@ eval_tests! {
     angle_negative_real: "(angle -5)" => Value::float(std::f64::consts::PI),
 }
 
+// Task 4.1: radix prefixes #x/#o/#b/#d — sign-aware, bignum-capable.
+eval_tests! {
+    radix_hex: "#xFF" => common::eval("255"),
+    radix_hex_lower: "#xff" => common::eval("255"),
+    radix_octal: "#o17" => common::eval("15"),
+    radix_binary: "#b101" => common::eval("5"),
+    radix_decimal: "#d10" => common::eval("10"),
+    radix_hex_negative: "#x-1F" => common::eval("-31"),
+    radix_hex_bignum: "#xFFFFFFFFFFFFFFFFF" => common::eval("295147905179352825855"),
+    radix_hex_in_arithmetic: "(+ #x10 #x10)" => common::eval("32"),
+}
+
 // Task 2.4: rational?/exact?/inexact?/exact-integer?/numerator/denominator.
 eval_tests! {
     rational_pred_rational: "(rational? 1/3)" => common::eval("#t"),
