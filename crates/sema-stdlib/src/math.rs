@@ -110,10 +110,17 @@ pub fn register(env: &sema_core::Env) {
     register_fn(env, "abs", |args| {
         check_arity!(args, "abs", 1);
         match args[0].view_ref() {
-            ValueViewRef::Int(n) => n.checked_abs().map(Value::int).ok_or_else(|| {
-                SemaError::eval("abs: |i64::MIN| overflows i64")
-                    .with_hint("convert to a float first, e.g. (abs (* 1.0 n))")
-            }),
+            // Fixnum fast path; `|i64::MIN|` overflows i64, so fall through to
+            // the tower where it promotes to an exact bignum.
+            ValueViewRef::Int(n) => match n.checked_abs() {
+                Some(a) => Ok(Value::int(a)),
+                None => {
+                    let m = args[0]
+                        .as_number()
+                        .ok_or_else(|| SemaError::type_error("number", args[0].type_name()))?;
+                    Ok(Value::from_number(m.abs()))
+                }
+            },
             ValueViewRef::Float(f) => Ok(Value::float(f.abs())),
             // Bignum/rational/complex: `SemaNumber::abs` is exactness-preserving
             // for reals (negate iff negative) and projects a complex to its

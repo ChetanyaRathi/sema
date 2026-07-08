@@ -1347,7 +1347,8 @@ eval_tests! {
 
 eval_error_tests! {
     string_repeat_negative_errors: r#"(string/repeat "ab" -1)"# => "non-negative",
-    abs_i64_min_errors: "(abs -9223372036854775808)" => "overflows i64",
+    // `(abs -9223372036854775808)` no longer errors — it promotes to an exact
+    // bignum (see `boundary_abs_min` in the numeric-tower parity block).
     // TODO(test-strength): VM `nth` uses generic "out of bounds" while tree-walker
     // says "non-negative" — strengthen after error UX wave unifies them.
     nth_negative_errors: "(nth (list 1 2 3) -1)",
@@ -1661,6 +1662,44 @@ eval_tests! {
     // process (stacker grows the stack); these complete and return a value.
     deep_structure_str_no_abort: "(string-length (str (foldl (fn (acc _) (list acc)) (list 1) (range 5000))))" => Value::int(10003),
     deep_reentrant_recursion_no_abort: "(begin (define (nest d) (if (= d 0) 0 (+ 1 (first (map (fn (x) (nest (- d 1))) (list 0)))))) (nest 1000))" => Value::int(1000),
+}
+
+// Task 7.1: VM/stdlib parity at the i64 boundary. Each case pins the same
+// literal oracle whether the operands flow through the inline `*_INT` VM fast
+// path (forced by `let`-binding the operands so they are runtime values, not
+// foldable constants) or the stdlib native `+`/`-`/`*` (direct literal call).
+// A divergence between the two arithmetic paths fails exactly one case.
+eval_tests! {
+    // i64::MAX + 1 overflows the fixnum path and promotes to a bignum.
+    boundary_add_max_direct: "(+ 9223372036854775807 1)" => common::eval("9223372036854775808"),
+    boundary_add_max_vm: "(let ((a 9223372036854775807) (b 1)) (+ a b))"
+        => common::eval("9223372036854775808"),
+    // i64::MIN - 1 underflows and promotes.
+    boundary_sub_min_direct: "(- -9223372036854775808 1)" => common::eval("-9223372036854775809"),
+    boundary_sub_min_vm: "(let ((a -9223372036854775808) (b 1)) (- a b))"
+        => common::eval("-9223372036854775809"),
+    // Multiplication overflow promotes: i64::MAX * 2.
+    boundary_mul_overflow_direct: "(* 9223372036854775807 2)" => common::eval("18446744073709551614"),
+    boundary_mul_overflow_vm: "(let ((a 9223372036854775807) (b 2)) (* a b))"
+        => common::eval("18446744073709551614"),
+    // Negating i64::MIN cannot fit in i64 (|MIN| = MAX+1) → promotes to bignum.
+    boundary_neg_min: "(- -9223372036854775808)" => common::eval("9223372036854775808"),
+    boundary_abs_min: "(abs -9223372036854775808)" => common::eval("9223372036854775808"),
+    // The just-past-i64 literal is a bignum that reads and compares exactly.
+    boundary_one_past_max_is_bignum: "(integer? 9223372036854775808)" => common::eval("#t"),
+    boundary_past_max_eq: "(= (+ 9223372036854775807 1) 9223372036854775808)" => common::eval("#t"),
+    // i64::MAX itself stays exact and fixnum-representable.
+    boundary_max_identity: "(+ 9223372036854775807 0)" => common::eval("9223372036854775807"),
+    boundary_min_identity_vm: "(let ((a -9223372036854775808) (b 0)) (+ a b))"
+        => common::eval("-9223372036854775808"),
+    // Exact/inexact mix at the boundary: any inexact operand makes it inexact,
+    // and the fixnum overflow path still yields the same float either way.
+    boundary_add_inexact_direct: "(+ 9223372036854775807 1.0)" => common::eval("9223372036854775808.0"),
+    boundary_add_inexact_vm: "(let ((a 9223372036854775807) (b 1.0)) (+ a b))"
+        => common::eval("9223372036854775808.0"),
+    // Round-trip: a bignum minus the same bignum returns to a fixnum zero.
+    boundary_round_trip_to_fixnum: "(- (+ 9223372036854775807 1) 9223372036854775808)"
+        => Value::int(0),
 }
 
 // ============================================================
