@@ -94,9 +94,20 @@ No `call/cc` or `call-with-current-continuation`. The trampoline evaluator canno
 
 No `values` / `call-with-values`.
 
-### 20. No Dynamic Binding
+### ~~20. No Dynamic Binding~~ → PARTIAL (`parameterize`/`make-parameter` RESOLVED)
 
-No `dynamic-wind`, `parameterize`, `make-parameter`.
+`make-parameter` / `parameterize` are implemented in the prelude (a parameter
+is a closure over a mutable cell; `parameterize` installs converted values and
+restores the prior raw values via the same try/catch/throw-rethrow-then-
+restore idiom as `with-stream`/`with-retry`, so restoration also happens
+across a raised condition). Still missing: `dynamic-wind` itself, and
+`parameterize`'s restore is unwind-on-error only — Sema has no `call/cc`, so
+there is no true continuation-based unwind. If a `parameterize` body suspends
+via an async park (an `AwaitIo` yield) rather than returning or raising, the
+`try` does not observe the suspension: the parameter stays bound across the
+yield and can leak into sibling tasks until the body resumes. Single-shot
+synchronous dynamic scoping is correct; cross-yield dynamic scoping is out of
+scope.
 
 ### 21. No Hygienic Macros
 
