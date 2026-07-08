@@ -171,6 +171,9 @@ fn lower_list(items: &[Value], tail: bool) -> Result<CoreExpr, SemaError> {
                 SpecialForm::Defmethod => lower_defmethod(args),
                 SpecialForm::Async => lower_async(args),
                 SpecialForm::Await => lower_await(args),
+                SpecialForm::LetValues => lower_let_values(args, tail),
+                SpecialForm::LetStarValues => lower_let_star_values(args, tail),
+                SpecialForm::DefineValues => lower_define_values(args),
             };
         }
     }
@@ -232,6 +235,9 @@ enum SpecialForm {
     Defmethod,
     Async,
     Await,
+    LetValues,
+    LetStarValues,
+    DefineValues,
 }
 
 /// The canonical (name, form) table. Names that share a handler (e.g. `define`
@@ -281,6 +287,9 @@ const SPECIAL_FORM_NAMES: &[(&str, SpecialForm)] = &[
     ("defmethod", SpecialForm::Defmethod),
     ("async", SpecialForm::Async),
     ("await", SpecialForm::Await),
+    ("let-values", SpecialForm::LetValues),
+    ("let*-values", SpecialForm::LetStarValues),
+    ("define-values", SpecialForm::DefineValues),
 ];
 
 thread_local! {
@@ -1011,6 +1020,213 @@ fn lower_await(args: &[Value]) -> Result<CoreExpr, SemaError> {
         args: vec![expr],
         tail: false,
     })
+}
+
+/// Parse a `values`-binding formals spec: either a bare symbol (binds ALL
+/// produced values as a list, R7RS's `(formals producer)` with `formals` a
+/// single identifier) or a `(a b . rest)` list handled by [`parse_params`].
+fn parse_values_formals(
+    formals: &Value,
+    context: &str,
+) -> Result<(Vec<Spur>, Option<Spur>), SemaError> {
+    if let Some(sym) = formals.as_symbol_spur() {
+        return Ok((vec![], Some(sym)));
+    }
+    let param_list = require_list(formals, context)?;
+    let param_spurs = extract_param_spurs(param_list, context)?;
+    Ok(parse_params(&param_spurs))
+}
+
+/// Build a zero-arg thunk lambda around a lowered producer expression, mirroring
+/// `lower_async`'s thunk-wrapping. `call-with-values` calls this with no
+/// arguments and inspects its result.
+fn make_producer_thunk(producer: &Value) -> Result<CoreExpr, SemaError> {
+    Ok(CoreExpr::Lambda(LambdaDef {
+        name: None,
+        params: vec![],
+        rest: None,
+        body: vec![lower_expr(producer, true)?],
+        upvalues: vec![],
+        upvalue_names: vec![],
+        n_locals: 0,
+    }))
+}
+
+/// A parsed `(formals producer)` clause shared by `let-values`/`let*-values`.
+struct ValuesClause {
+    params: Vec<Spur>,
+    rest: Option<Spur>,
+    producer: Value,
+}
+
+fn parse_values_clauses(
+    bindings_val: &Value,
+    context: &str,
+) -> Result<Vec<ValuesClause>, SemaError> {
+    let clauses = require_list(bindings_val, context)?;
+    clauses
+        .iter()
+        .map(|clause| {
+            let pair = require_list(clause, context)?;
+            if pair.len() != 2 {
+                return Err(SemaError::eval(format!(
+                    "{context}: each clause must be (formals producer)"
+                )));
+            }
+            let (params, rest) = parse_values_formals(&pair[0], context)?;
+            Ok(ValuesClause {
+                params,
+                rest,
+                producer: pair[1].clone(),
+            })
+        })
+        .collect()
+}
+
+/// `(let-values (((a b) (values 1 2)) ...) body ...)` — R7RS parallel binding:
+/// every producer runs in the OUTER environment before any clause's formals
+/// come into scope (so clause N cannot see clause N-1's bindings).
+///
+/// Desugars to `(let ((tmp0 (call-with-values thunk0 list)) ...) (apply
+/// (lambda formals0 (apply (lambda formals1 body...) tmp1)) tmp0))` — each
+/// `tmp_i` is the full list of values clause `i` produced (list-of-length-1 for
+/// an ordinary single value, since `call-with-values` spreads whatever
+/// `values` returned into `list`'s args), and `apply` rebinds `formals_i`
+/// against it, so arity mismatches surface as the normal lambda-arity error.
+fn lower_let_values(args: &[Value], tail: bool) -> Result<CoreExpr, SemaError> {
+    if args.len() < 2 {
+        return Err(SemaError::arity("let-values", "2+", args.len()));
+    }
+    let clauses = parse_values_clauses(&args[0], "let-values")?;
+    let body = &args[1..];
+
+    let mut outer_bindings = Vec::with_capacity(clauses.len());
+    let mut temps = Vec::with_capacity(clauses.len());
+    for clause in &clauses {
+        let tmp = gensym("lv");
+        let thunk = make_producer_thunk(&clause.producer)?;
+        let call = CoreExpr::Call {
+            func: Box::new(CoreExpr::Var(intern("call-with-values"))),
+            args: vec![thunk, CoreExpr::Var(intern("list"))],
+            tail: false,
+        };
+        outer_bindings.push((tmp, call));
+        temps.push(tmp);
+    }
+
+    let inner_tail = if clauses.is_empty() { tail } else { true };
+    let mut current = lower_body(body, inner_tail)?;
+    for (i, clause) in clauses.iter().enumerate().rev() {
+        let consumer = CoreExpr::Lambda(LambdaDef {
+            name: None,
+            params: clause.params.clone(),
+            rest: clause.rest,
+            body: current,
+            upvalues: vec![],
+            upvalue_names: vec![],
+            n_locals: 0,
+        });
+        let is_outermost = i == 0;
+        current = vec![CoreExpr::Call {
+            func: Box::new(CoreExpr::Var(intern("apply"))),
+            args: vec![consumer, CoreExpr::Var(temps[i])],
+            tail: if is_outermost { tail } else { true },
+        }];
+    }
+
+    Ok(CoreExpr::Let {
+        bindings: outer_bindings,
+        body: current,
+    })
+}
+
+/// `(let*-values (((a b) (values 1 2)) ((c) (values (+ a b)))) c)` — R7RS
+/// sequential binding: each producer sees the PRIOR clauses' bindings (unlike
+/// `let-values`). Nests directly: `(call-with-values thunk0 (lambda formals0
+/// (call-with-values thunk1 (lambda formals1 body...))))` — no intermediate
+/// list/apply indirection needed since sequential scoping falls out of the
+/// natural nesting of each consumer lambda inside the previous one.
+fn lower_let_star_values(args: &[Value], tail: bool) -> Result<CoreExpr, SemaError> {
+    if args.len() < 2 {
+        return Err(SemaError::arity("let*-values", "2+", args.len()));
+    }
+    let clauses = parse_values_clauses(&args[0], "let*-values")?;
+    let body = &args[1..];
+
+    let inner_tail = if clauses.is_empty() { tail } else { true };
+    let mut current = lower_body(body, inner_tail)?;
+    for (i, clause) in clauses.iter().enumerate().rev() {
+        let consumer = CoreExpr::Lambda(LambdaDef {
+            name: None,
+            params: clause.params.clone(),
+            rest: clause.rest,
+            body: current,
+            upvalues: vec![],
+            upvalue_names: vec![],
+            n_locals: 0,
+        });
+        let thunk = make_producer_thunk(&clause.producer)?;
+        let is_outermost = i == 0;
+        current = vec![CoreExpr::Call {
+            func: Box::new(CoreExpr::Var(intern("call-with-values"))),
+            args: vec![thunk, consumer],
+            tail: if is_outermost { tail } else { true },
+        }];
+    }
+
+    if current.len() == 1 {
+        Ok(current.into_iter().next().unwrap())
+    } else {
+        Ok(CoreExpr::Begin(current))
+    }
+}
+
+/// `(define-values (a b) (values 1 2))` / `(define-values (q . r) (values 1 2 3))`
+/// desugars to a `begin` of plain `define`s: bundle the producer's values into a
+/// gensym'd temp list via `call-with-values`/`list`, then `nth`/`drop` it apart —
+/// mirroring how `(define [a b] expr)` desugars to a `Begin` of `Define`s.
+fn lower_define_values(args: &[Value]) -> Result<CoreExpr, SemaError> {
+    if args.len() != 2 {
+        return Err(SemaError::arity("define-values", "2", args.len()));
+    }
+    let (params, rest) = parse_values_formals(&args[0], "define-values")?;
+    let thunk = make_producer_thunk(&args[1])?;
+    let tmp = gensym("dv");
+
+    let mut defines = Vec::with_capacity(params.len() + 2);
+    defines.push(CoreExpr::Define(
+        tmp,
+        Box::new(CoreExpr::Call {
+            func: Box::new(CoreExpr::Var(intern("call-with-values"))),
+            args: vec![thunk, CoreExpr::Var(intern("list"))],
+            tail: false,
+        }),
+    ));
+    for (i, param) in params.iter().enumerate() {
+        defines.push(CoreExpr::Define(
+            *param,
+            Box::new(CoreExpr::Call {
+                func: Box::new(CoreExpr::Var(intern("nth"))),
+                args: vec![CoreExpr::Var(tmp), CoreExpr::Const(Value::int(i as i64))],
+                tail: false,
+            }),
+        ));
+    }
+    if let Some(rest_name) = rest {
+        defines.push(CoreExpr::Define(
+            rest_name,
+            Box::new(CoreExpr::Call {
+                func: Box::new(CoreExpr::Var(intern("drop"))),
+                args: vec![
+                    CoreExpr::Const(Value::int(params.len() as i64)),
+                    CoreExpr::Var(tmp),
+                ],
+                tail: false,
+            }),
+        ));
+    }
+
+    Ok(CoreExpr::Begin(defines))
 }
 
 fn is_auto_gensym(sym: &str) -> bool {
