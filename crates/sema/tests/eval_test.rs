@@ -2256,3 +2256,79 @@ eval_error_tests! {
     param_uncaught_body_error_propagates:
         r#"(let ((p (make-parameter 1))) (parameterize ((p 2)) (error "kaboom")))"# => "kaboom",
 }
+
+// ============================================================
+// R7RS multiple values: `values`, `call-with-values`,
+// `let-values`/`let*-values`, `define-values`
+// ============================================================
+
+eval_tests! {
+    mv_call_with_values_variadic_consumer:
+        "(call-with-values (lambda () (values 1 2)) +)" => Value::int(3),
+    mv_call_with_values_list_consumer:
+        "(call-with-values (lambda () (values 1 2 3)) list)" => common::eval("'(1 2 3)"),
+    // A single-value producer (no `values` call) is treated as ONE value, not
+    // spread — `list` receives it as its sole argument.
+    mv_call_with_values_single_value_producer:
+        "(call-with-values (lambda () 42) list)" => common::eval("'(42)"),
+    mv_call_with_values_zero_values_into_variadic:
+        "(call-with-values (lambda () (values)) +)" => Value::int(0),
+    mv_call_with_values_zero_values_into_zero_arg_consumer:
+        "(call-with-values (lambda () (values)) (lambda () 99))" => Value::int(99),
+    mv_call_with_values_fixed_arity_consumer:
+        "(call-with-values (lambda () (values 1 2 3)) (lambda (a b c) (* a b c)))" => Value::int(6),
+    // R7RS: `(values x)` is identity, so a single value flows through ordinary
+    // single-value contexts unchanged.
+    mv_single_value_identity_in_comparison: "(= (values 5) 5)" => Value::bool(true),
+    mv_single_value_flows_through_arithmetic: "(+ (values 5) 1)" => Value::int(6),
+
+    mv_let_values_basic: "(let-values (((a b) (values 1 2))) (+ a b))" => Value::int(3),
+    mv_let_values_multiple_clauses:
+        "(let-values (((a b) (values 1 2)) ((c d) (values 3 4))) (+ a b c d))" => Value::int(10),
+    // Dotted/rest formals: `(a . rest)` binds the first value to `a` and the
+    // remaining values as a list to `rest`.
+    mv_let_values_dotted_rest:
+        "(let-values (((a . rest) (values 1 2 3))) rest)"
+        => Value::list(vec![Value::int(2), Value::int(3)]),
+    // Bare-symbol formals bind ALL produced values as a single list.
+    mv_let_values_bare_symbol_formals:
+        "(let-values ((all (values 1 2 3))) all)"
+        => Value::list(vec![Value::int(1), Value::int(2), Value::int(3)]),
+    mv_let_values_empty_bindings: "(let-values () 7)" => Value::int(7),
+    // PARALLEL: let-values evaluates every producer against the OUTER
+    // environment, so the second clause's producer sees the outer `a`, not the
+    // first clause's freshly-bound `a`.
+    mv_let_values_is_parallel:
+        "(let ((a 100)) (let-values (((a) (values 1)) ((b) (values a))) b))" => Value::int(100),
+    // SEQUENTIAL: let*-values's second producer sees the first clause's binding.
+    mv_let_star_values_is_sequential:
+        "(let ((a 100)) (let*-values (((a) (values 1)) ((b) (values a))) b))" => Value::int(1),
+    mv_let_star_values_chained:
+        "(let*-values (((a b) (values 1 2)) ((c) (values (+ a b)))) c)" => Value::int(3),
+
+    mv_define_values_basic:
+        "(begin (define-values (a b) (values 10 20)) (+ a b))" => Value::int(30),
+    mv_define_values_dotted_rest:
+        "(begin (define-values (q . r) (values 1 2 3)) r)"
+        => Value::list(vec![Value::int(2), Value::int(3)]),
+
+    // Builtins (including call-with-values itself) are first-class procedures.
+    mv_call_with_values_is_a_procedure: "(procedure? call-with-values)" => Value::bool(true),
+}
+
+eval_error_tests! {
+    // Too many produced values for the consumer's fixed arity is a normal
+    // lambda/apply arity error (R7RS "wrong number of values").
+    mv_let_values_too_many_values_errors:
+        "(let-values (((a b) (values 1 2 3))) a)" => "expects 2",
+    mv_call_with_values_consumer_arity_mismatch:
+        r#"(call-with-values (lambda () (values 1 2)) (lambda (x) x))"# => "expects 1",
+    mv_call_with_values_producer_not_callable:
+        "(call-with-values 5 list)" => "not callable",
+    // A producer error propagates as a normal thrown/re-raised error through
+    // call-with-values (no swallowing).
+    mv_call_with_values_producer_error_propagates:
+        r#"(call-with-values (lambda () (throw "boom")) list)"# => "boom",
+    mv_let_values_producer_error_propagates:
+        r#"(let-values (((a) (throw "bad"))) a)"# => "bad",
+}
