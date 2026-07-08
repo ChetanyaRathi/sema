@@ -103,6 +103,43 @@ fn validate_and_dedupe() {
 }
 
 #[test]
+fn validate_rejects_alias_colliding_with_another_entrys_name() {
+    // Regression (numeric tower): `inexact` was documented both as a first-class
+    // entry AND declared as an alias of `exact->inexact` in the same `math`
+    // module. When `dedupe` ran before `validate`, it silently dropped the
+    // standalone `inexact.md` (first-wins), losing that builtin's docs from the
+    // index while the gate stayed green. The gen pipeline now runs `validate`
+    // first, so an alias colliding with another entry's canonical name (or
+    // alias) MUST be a hard error, in strict and non-strict alike.
+    let aliased = parse_entry(
+        &p(),
+        "---\nname: \"exact->inexact\"\naliases: [\"inexact\"]\n---\nConvert to inexact.\n",
+        "math",
+        false,
+    )
+    .unwrap();
+    let standalone = parse_entry(
+        &p(),
+        "---\nname: \"inexact\"\n---\nConvert.\n",
+        "math",
+        false,
+    )
+    .unwrap();
+    for strict in [false, true] {
+        let result = validate(&[aliased.clone(), standalone.clone()], strict);
+        assert!(
+            result.is_err(),
+            "alias `inexact` colliding with a same-module entry named `inexact` must be a hard error (strict={strict})"
+        );
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains("inexact") && msg.to_lowercase().contains("duplicate"),
+            "error should name the colliding entry: {msg}"
+        );
+    }
+}
+
+#[test]
 fn signature_only_body_derives_summary_from_the_signature() {
     // A body that is ONLY a signature block (no prose) must still get a non-empty
     // summary (else it would fail the strict gate despite being documented).
