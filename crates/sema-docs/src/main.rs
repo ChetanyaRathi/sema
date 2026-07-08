@@ -60,12 +60,12 @@ fn load_validated(
     strict: bool,
 ) -> Result<Vec<sema_docs::DocEntry>, Box<dyn std::error::Error>> {
     let entries = sema_docs::load(&root.join(STDLIB_SRC), &root.join(SPECIAL_FORMS_SRC))?;
-    // Validate the RAW entries: a duplicate (module, name)/(module, alias) pair is a HARD
-    // error that fails generation. This is deliberately not run after `dedupe` — letting
-    // dedupe drop the collision first would silently discard a real builtin's doc entry
-    // from the index (e.g. an alias colliding with another entry's canonical name) while
-    // the gate stayed green. `dedupe` is retained (see lib.rs / entry_tests) but is no
-    // longer in the generation path, so uniqueness is enforced, never papered over.
+    // A duplicate (module, name)/(module, alias) pair is a HARD error that fails
+    // generation. Entries are never silently de-duplicated: the filename is an
+    // arbitrary slug and the canonical `name` is unique per module, so a collision
+    // (e.g. an alias clashing with another entry's canonical name) is always an
+    // authoring bug that must surface here rather than quietly dropping a builtin's
+    // docs from the index.
     let warnings = sema_docs::validate(&entries, strict)?;
     if !warnings.is_empty() {
         eprintln!("warning: {} issue(s):", warnings.len());
