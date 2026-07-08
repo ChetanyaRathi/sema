@@ -281,8 +281,8 @@ pub fn veteran_hint(name: &str) -> Option<&'static str> {
         "not=" => Some("Use (not (equal? a b)) for inequality in Sema"),
 
         // Scheme / Racket
-        "define-syntax" | "syntax-rules" | "syntax-case" => {
-            Some("Sema uses 'defmacro' for macro definitions")
+        "syntax-case" => {
+            Some("Sema supports 'define-syntax' with 'syntax-rules', or use 'defmacro'")
         }
         "call-with-current-continuation" | "call/cc" => Some(
             "Sema doesn't support first-class continuations; use 'try'/'throw' for control flow",

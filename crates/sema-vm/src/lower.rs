@@ -149,6 +149,7 @@ fn lower_list(items: &[Value], tail: bool) -> Result<CoreExpr, SemaError> {
                 SpecialForm::Unless => lower_unless(args, tail),
                 SpecialForm::While => lower_while(args),
                 SpecialForm::Defmacro => lower_defmacro(args),
+                SpecialForm::DefineSyntax => lower_define_syntax(args),
                 SpecialForm::Quasiquote => lower_quasiquote(args),
                 SpecialForm::Throw => lower_throw(args),
                 SpecialForm::Try => lower_try(args, tail),
@@ -213,6 +214,7 @@ enum SpecialForm {
     Unless,
     While,
     Defmacro,
+    DefineSyntax,
     Quasiquote,
     Throw,
     Try,
@@ -265,6 +267,7 @@ const SPECIAL_FORM_NAMES: &[(&str, SpecialForm)] = &[
     ("unless", SpecialForm::Unless),
     ("while", SpecialForm::While),
     ("defmacro", SpecialForm::Defmacro),
+    ("define-syntax", SpecialForm::DefineSyntax),
     ("quasiquote", SpecialForm::Quasiquote),
     ("throw", SpecialForm::Throw),
     ("try", SpecialForm::Try),
@@ -313,6 +316,14 @@ thread_local! {
 /// Resolve a head-position symbol's `Spur` to its [`SpecialForm`], if any.
 fn special_form_for(spur: Spur) -> Option<SpecialForm> {
     SPECIAL_FORMS.with(|m| m.get(&spur).copied())
+}
+
+/// Whether `name` is a built-in special form. Exposed for syntax-rules hygiene:
+/// a template identifier that names a special form must be kept verbatim (not
+/// alpha-renamed) because special forms are recognized structurally, not via an
+/// env binding.
+pub fn is_special_form(name: &str) -> bool {
+    SPECIAL_FORM_NAMES.iter().any(|&(n, _)| n == name)
 }
 
 fn require_symbol(val: &Value, context: &str) -> Result<Spur, SemaError> {
@@ -947,6 +958,21 @@ fn lower_defmacro(args: &[Value]) -> Result<CoreExpr, SemaError> {
     form.extend(args.iter().cloned());
     Ok(CoreExpr::Call {
         func: Box::new(CoreExpr::Var(intern("__vm-defmacro-form"))),
+        args: vec![CoreExpr::Const(Value::list(form))],
+        tail: false,
+    })
+}
+
+fn lower_define_syntax(args: &[Value]) -> Result<CoreExpr, SemaError> {
+    if args.len() != 2 {
+        return Err(SemaError::arity("define-syntax", "2", args.len()));
+    }
+    // Delegate to the eval-side registrar: reconstruct the original form and
+    // pass it quoted to __vm-define-syntax so the transformer stays unevaluated.
+    let mut form = vec![Value::symbol("define-syntax")];
+    form.extend(args.iter().cloned());
+    Ok(CoreExpr::Call {
+        func: Box::new(CoreExpr::Var(intern("__vm-define-syntax"))),
         args: vec![CoreExpr::Const(Value::list(form))],
         tail: false,
     })
@@ -2045,6 +2071,7 @@ mod tests {
             "unless",
             "while",
             "defmacro",
+            "define-syntax",
             "quasiquote",
             "throw",
             "try",
