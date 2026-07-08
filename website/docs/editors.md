@@ -33,13 +33,13 @@ TextMate-grammar highlighting plus a full LSP client, a bundled debug adapter, a
 
 ### Install
 
-From the Marketplace:
+From the [VS Marketplace](https://marketplace.visualstudio.com/items?itemName=sema-lang.sema-lang) (VS Code) or [Open VSX](https://open-vsx.org/extension/sema-lang/sema-lang) (VSCodium, Cursor, Windsurf, Gitpod, …):
 
 ```
-ext install helgesverre.sema
+ext install sema-lang.sema-lang
 ```
 
-Or open the Extensions view (<kbd>Cmd</kbd>+<kbd>Shift</kbd>+<kbd>X</kbd> / <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>X</kbd>) and search for **Sema**. Point the extension at a specific binary with the `sema.path` setting if `sema` isn't on your `PATH`.
+Or open the Extensions view (<kbd>Cmd</kbd>+<kbd>Shift</kbd>+<kbd>X</kbd> / <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>X</kbd>) and search for **Sema Lisp**. Point the extension at a specific binary with the `sema.path` setting if `sema` isn't on your `PATH`.
 
 ### Features
 
