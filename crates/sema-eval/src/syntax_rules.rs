@@ -11,18 +11,29 @@
 //!    matched input (a [`MatchTree`] that mirrors ellipsis nesting), then
 //! 2. instantiates the winning rule's template, substituting pattern variables
 //!    and driving ellipsis (`...`) expansion, while
-//! 3. applying **hygiene**: any template identifier that is not a pattern
-//!    variable, literal, ellipsis, special form, auxiliary keyword, or bound in
-//!    the environment is consistently alpha-renamed to a fresh gensym per
-//!    expansion. This reuses the same `next_gensym` engine as `foo#`
-//!    auto-gensym, so a macro-introduced binder and its references stay linked
-//!    but cannot capture (or be captured by) user identifiers of the same name.
+//! 3. applying **binder-directed hygiene**: before instantiating, a pass over
+//!    the winning rule's template collects the set of identifiers the template
+//!    itself introduces *as binders* (the vars a template-introduced `let` /
+//!    `let*` / `letrec[*]` / `lambda` / `fn` / `define` / `do` / named-let
+//!    binds — e.g. the `tmp` in `(let ((tmp a)) …)`). Only those binder
+//!    identifiers are consistently alpha-renamed to a fresh gensym per
+//!    expansion; every *other* template identifier — including free references
+//!    to user globals, builtins, special forms, and the macro's own name for
+//!    recursion — is kept verbatim and resolves at the use site / runtime.
+//!    Pattern variables are substituted before this decision, so they are never
+//!    renamed. Renaming reuses the same `next_gensym` engine as `foo#`
+//!    auto-gensym, so a macro-introduced binder and its in-template references
+//!    stay linked but cannot capture (or be captured by) user identifiers of
+//!    the same name.
 //!
-//! Hygiene here is an approximation of full R7RS: renaming keys off the
-//! use-site environment (== the global env for the common top-level-macro case),
-//! not a per-identifier definition environment. See `docs/limitations.md`.
+//! This is binder-directed rather than reference-directed: the decision keys off
+//! whether the template introduces the identifier as a binder, NOT off the
+//! use-site environment. That is what lets a macro template freely reference a
+//! user-defined global that is not yet bound when the macro is pre-expanded
+//! (whole-program mode). It is still an approximation of full R7RS (no
+//! per-identifier definition environments). See `docs/limitations.md`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use sema_core::{intern, next_gensym, resolve, Env, Macro, SemaError, Spur, Value, ValueView};
 
@@ -37,15 +48,12 @@ enum MatchTree {
 
 type Bindings = HashMap<Spur, MatchTree>;
 
-/// Auxiliary syntactic keywords that some special forms recognize *by name* as
-/// bare identifiers (they are not in `sema_vm`'s special-form table and are not
-/// env bindings), so hygiene must keep them verbatim rather than rename them.
-const AUX_KEYWORDS: &[&str] = &["catch", "else", "=>"];
-
 /// Expand one call to a `syntax-rules` macro. `args` are the (unevaluated) call
-/// arguments — i.e. the macro-call form minus its head. `env` is the use-site
-/// environment used for the hygiene keep decision.
-pub fn expand(mac: &Macro, args: &[Value], env: &Env) -> Result<Value, SemaError> {
+/// arguments — i.e. the macro-call form minus its head. `_env` is the use-site
+/// environment; it is intentionally NOT consulted for hygiene (binder-directed
+/// hygiene keys off the template, not the environment), and is kept only so the
+/// call sites need not change.
+pub fn expand(mac: &Macro, args: &[Value], _env: &Env) -> Result<Value, SemaError> {
     let sr = mac
         .syntax_rules
         .as_ref()
@@ -62,8 +70,12 @@ pub fn expand(mac: &Macro, args: &[Value], env: &Env) -> Result<Value, SemaError
         // macro name); it is ignored. Match the rest against the call args.
         let mut bindings = Bindings::new();
         if match_seq(&pat_elems[1..], args, sr, &mut bindings)? {
+            // Binder-directed hygiene: only identifiers the template introduces
+            // as binders get alpha-renamed; everything else stays verbatim.
+            let mut binders: HashSet<Spur> = HashSet::new();
+            collect_template_binders(template, &bindings, sr, &mut binders);
             let mut rename: HashMap<Spur, Spur> = HashMap::new();
-            return instantiate(template, &bindings, sr, &mut rename, env);
+            return instantiate(template, &bindings, sr, &binders, &mut rename);
         }
     }
 
@@ -211,23 +223,151 @@ fn match_seq(
     }
 }
 
-/// Should this non-pattern-var template identifier be kept verbatim (rather than
-/// hygienically renamed)?
-fn keep_identifier(s: Spur, name: &str, sr: &sema_core::SyntaxRules, env: &Env) -> bool {
-    sr.literals.contains(&s)
-        || AUX_KEYWORDS.contains(&name)
-        || sema_vm::is_special_form(name)
-        || env.get(s).is_some()
+/// Record `s` as a template-introduced binder, unless it is something that must
+/// never be renamed: a pattern variable (already in `bindings`), the ellipsis, a
+/// literal, or a structural marker (`.`, `&`, `_`).
+fn note_binder(s: Spur, bindings: &Bindings, sr: &sema_core::SyntaxRules, out: &mut HashSet<Spur>) {
+    if bindings.contains_key(&s) || s == sr.ellipsis || sr.literals.contains(&s) {
+        return;
+    }
+    match resolve(s).as_str() {
+        "." | "&" | "_" => {}
+        _ => {
+            out.insert(s);
+        }
+    }
+}
+
+/// Collect every symbol in a lambda/`fn`/define parameter list as a binder,
+/// including a rest parameter (`. rest` / `& rest`). Params are a flat list (or
+/// vector) of symbols with `.`/`&` markers; nested destructuring patterns are
+/// walked so their vars are captured too.
+fn note_param_binders(
+    params: &Value,
+    bindings: &Bindings,
+    sr: &sema_core::SyntaxRules,
+    out: &mut HashSet<Spur>,
+) {
+    if let Some(s) = params.as_symbol_spur() {
+        note_binder(s, bindings, sr, out);
+        return;
+    }
+    match params.view() {
+        ValueView::List(items) | ValueView::Vector(items) => {
+            for item in items.iter() {
+                note_param_binders(item, bindings, sr, out);
+            }
+        }
+        ValueView::Map(map) => {
+            for (k, v) in map.iter() {
+                note_param_binders(k, bindings, sr, out);
+                note_param_binders(v, bindings, sr, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Collect the identifiers the template introduces as binders. These — and only
+/// these — are the non-pattern-var identifiers that hygiene alpha-renames. The
+/// binding forms are recognized by resolving the head symbol's name; every
+/// sub-form is recursed into so nested binders are found.
+fn collect_template_binders(
+    tmpl: &Value,
+    bindings: &Bindings,
+    sr: &sema_core::SyntaxRules,
+    out: &mut HashSet<Spur>,
+) {
+    let items = match tmpl.view() {
+        ValueView::List(items) => items,
+        ValueView::Vector(items) => {
+            for item in items.iter() {
+                collect_template_binders(item, bindings, sr, out);
+            }
+            return;
+        }
+        ValueView::Map(map) => {
+            for (k, v) in map.iter() {
+                collect_template_binders(k, bindings, sr, out);
+                collect_template_binders(v, bindings, sr, out);
+            }
+            return;
+        }
+        _ => return,
+    };
+
+    if let Some(head) = items.first().and_then(|h| h.as_symbol_spur()) {
+        match resolve(head).as_str() {
+            "let" | "let*" | "letrec" | "letrec*" => {
+                // Named let `(let name ((v e) ...) body ...)` also binds `name`;
+                // distinguish it from `(let ((v e) ...) ...)` by a symbol in the
+                // 2nd slot (a plain let has a binding *list* there).
+                let mut idx = 1;
+                if resolve(head) == "let" {
+                    if let Some(n) = items.get(1).and_then(|x| x.as_symbol_spur()) {
+                        note_binder(n, bindings, sr, out);
+                        idx = 2;
+                    }
+                }
+                if let Some(binds) = items.get(idx).and_then(|b| b.as_list()) {
+                    for pair in binds {
+                        if let Some(v) = pair
+                            .as_list()
+                            .and_then(|pl| pl.first())
+                            .and_then(|x| x.as_symbol_spur())
+                        {
+                            note_binder(v, bindings, sr, out);
+                        }
+                    }
+                }
+            }
+            "lambda" | "fn" => {
+                if let Some(params) = items.get(1) {
+                    note_param_binders(params, bindings, sr, out);
+                }
+            }
+            "define" => match items.get(1) {
+                Some(target) if target.as_symbol_spur().is_some() => {
+                    note_binder(target.as_symbol_spur().unwrap(), bindings, sr, out);
+                }
+                // (define (f a b ...) body ...) → f and each arg symbol.
+                Some(target) => note_param_binders(target, bindings, sr, out),
+                None => {}
+            },
+            "do" => {
+                // (do ((v init step) ...) ...) → each v.
+                if let Some(specs) = items.get(1).and_then(|b| b.as_list()) {
+                    for spec in specs {
+                        if let Some(v) = spec
+                            .as_list()
+                            .and_then(|sl| sl.first())
+                            .and_then(|x| x.as_symbol_spur())
+                        {
+                            note_binder(v, bindings, sr, out);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // Recurse into every sub-form so nested binding forms are found.
+    for item in items.iter() {
+        collect_template_binders(item, bindings, sr, out);
+    }
 }
 
 /// Instantiate a template into a form, substituting pattern variables and
-/// applying hygiene.
+/// applying binder-directed hygiene. `binders` is the set of identifiers the
+/// template introduces as binders (see [`collect_template_binders`]); only those
+/// non-pattern-var identifiers are alpha-renamed.
 fn instantiate(
     tmpl: &Value,
     bindings: &Bindings,
     sr: &sema_core::SyntaxRules,
+    binders: &HashSet<Spur>,
     rename: &mut HashMap<Spur, Spur>,
-    env: &Env,
 ) -> Result<Value, SemaError> {
     if let Some(s) = tmpl.as_symbol_spur() {
         if let Some(mt) = bindings.get(&s) {
@@ -242,32 +382,32 @@ fn instantiate(
         if s == sr.ellipsis {
             return Ok(tmpl.clone());
         }
-        let name = resolve(s);
-        if keep_identifier(s, &name, sr, env) {
+        // Keep every non-pattern-var identifier verbatim UNLESS the template
+        // introduces it as a binder; a binder (and its in-template references)
+        // is alpha-renamed to a fresh gensym, one per identifier per expansion.
+        if !binders.contains(&s) {
             return Ok(tmpl.clone());
         }
-        // Macro-introduced identifier: alpha-rename to a fresh gensym, one per
-        // identifier per expansion (reused for every occurrence).
         let renamed = *rename
             .entry(s)
-            .or_insert_with(|| intern(&next_gensym(&name)));
+            .or_insert_with(|| intern(&next_gensym(&resolve(s))));
         return Ok(Value::symbol_from_spur(renamed));
     }
 
     match tmpl.view() {
         ValueView::List(elems) => {
-            let out = instantiate_seq(&elems, bindings, sr, rename, env)?;
+            let out = instantiate_seq(&elems, bindings, sr, binders, rename)?;
             Ok(Value::list(out))
         }
         ValueView::Vector(elems) => {
-            let out = instantiate_seq(&elems, bindings, sr, rename, env)?;
+            let out = instantiate_seq(&elems, bindings, sr, binders, rename)?;
             Ok(Value::vector(out))
         }
         ValueView::Map(map) => {
             let mut out = std::collections::BTreeMap::new();
             for (k, v) in map.iter() {
-                let nk = instantiate(k, bindings, sr, rename, env)?;
-                let nv = instantiate(v, bindings, sr, rename, env)?;
+                let nk = instantiate(k, bindings, sr, binders, rename)?;
+                let nv = instantiate(v, bindings, sr, binders, rename)?;
                 out.insert(nk, nv);
             }
             Ok(Value::map(out))
@@ -282,8 +422,8 @@ fn instantiate_seq(
     elems: &[Value],
     bindings: &Bindings,
     sr: &sema_core::SyntaxRules,
+    binders: &HashSet<Spur>,
     rename: &mut HashMap<Spur, Spur>,
-    env: &Env,
 ) -> Result<Vec<Value>, SemaError> {
     let mut out = Vec::new();
     let mut i = 0;
@@ -296,10 +436,10 @@ fn instantiate_seq(
             j += 1;
         }
         if ell == 0 {
-            out.push(instantiate(&elems[i], bindings, sr, rename, env)?);
+            out.push(instantiate(&elems[i], bindings, sr, binders, rename)?);
             i += 1;
         } else if ell == 1 {
-            expand_ellipsis(&elems[i], bindings, sr, rename, env, &mut out)?;
+            expand_ellipsis(&elems[i], bindings, sr, binders, rename, &mut out)?;
             i = j;
         } else {
             return Err(SemaError::eval(
@@ -316,8 +456,8 @@ fn expand_ellipsis(
     sub: &Value,
     bindings: &Bindings,
     sr: &sema_core::SyntaxRules,
+    binders: &HashSet<Spur>,
     rename: &mut HashMap<Spur, Spur>,
-    env: &Env,
     out: &mut Vec<Value>,
 ) -> Result<(), SemaError> {
     // The driver variables are the symbols in `sub` bound to a Seq.
@@ -351,7 +491,7 @@ fn expand_ellipsis(
                 child.insert(*v, items[idx].clone());
             }
         }
-        out.push(instantiate(sub, &child, sr, rename, env)?);
+        out.push(instantiate(sub, &child, sr, binders, rename)?);
     }
     Ok(())
 }
