@@ -2,6 +2,38 @@
 
 ## Unreleased
 
+### Added
+
+- **Full R7RS numeric tower — arbitrary-precision integers, exact rationals, and
+  complex numbers** (per `docs/plans/2026-07-07-numeric-tower.md`). Arithmetic no
+  longer overflows, truncates, or errors where mathematics has an answer:
+  - **Bignums (arbitrary-precision integers).** `+`, `-`, `*`, `expt`, and the
+    integer-division family (`quotient`/`remainder`/`modulo`/`gcd`/`lcm`) promote
+    past `i64` automatically, so `(expt 2 100)` and `(factorial 100)` return the
+    exact value instead of raising "integer overflow". The VM's inline `i64` fast
+    paths are preserved and fall through to the tower only on overflow.
+  - **Exact rationals.** Exact/exact division yields an exact reduced rational:
+    `(/ 1 3)` is `1/3`, not `0.333…`; `(/ 10 4)` is `5/2`; `(+ 1/2 1/3)` is `5/6`.
+    A rational whose denominator reduces to 1 collapses back to an integer.
+  - **Complex numbers.** `(sqrt -1)` is `+i`; `make-rectangular`/`make-polar`,
+    `real-part`/`imag-part`/`magnitude`/`angle`, and complex `+ - * /` are all
+    available. A complex with an exact-zero imaginary part normalizes to a real.
+  - **Exactness contagion.** Any inexact (float) operand makes the whole result
+    inexact; otherwise results stay exact. `sqrt` of a perfect square is exact
+    (`(sqrt 16)` ⇒ `4`), and `floor`/`ceiling`/`round`/`truncate` are
+    exactness-preserving (a float argument rounds to a float).
+  - **Reader literal grammar.** Rational (`1/3`), complex (`3+4i`, `+i`, `-2i`),
+    radix (`#xFF`, `#o17`, `#b101`, `#d10`), and exactness (`#e`, `#i`) prefixes,
+    combinable (`#e#xFF`), all round-trippable through print → read.
+  - **Generalized builtins.** Comparison and sign predicates, `abs`/`min`/`max`,
+    the transcendentals, `number->string`/`string->number` (radix-aware),
+    `exact-integer-sqrt`, `rationalize`, the new predicates
+    (`rational?`/`real?`/`complex?`/`exact?`/`inexact?`/`exact-integer?`), the
+    exactness conversions (`exact`/`inexact`/`exact->inexact`/`inexact->exact`),
+    and `numerator`/`denominator` all operate across the whole tower. Bitwise ops
+    are bignum-aware (two's-complement via `BigInt`), and JSON encodes bignums
+    natively (rationals/complex as strings).
+
 ### Changed
 
 - **Package registry (`pkg/`) now runs on SQLite, PostgreSQL, and MySQL from one
@@ -59,11 +91,11 @@
   stack on demand (`sema_core::stack::maybe_grow`, via `stacker`; a plain call
   on wasm), so deep-but-finite work completes and true runaways still hit the
   catchable frame guard.
-- **Integer overflow raises instead of silently wrapping.** `+`, `-`, `*`, and
-  `expt` on i64 now return a catchable "integer overflow" error (checked
-  arithmetic in the stdlib, VM, and constant folder) rather than wrapping to a
-  wrong number — consistent with `abs` on `i64::MIN`. `expt` also no longer
-  truncates its exponent (`(expt 2 4294967296)` was computing 2^0).
+- **Integer overflow no longer silently wraps to a wrong number.** `+`, `-`,
+  `*`, and `expt` on i64 previously wrapped on overflow; they now promote to an
+  arbitrary-precision bignum via the numeric tower (see Added above), so the
+  result is always mathematically correct. `expt` also no longer truncates its
+  exponent (`(expt 2 4294967296)` was computing 2^0).
 - **Int↔float comparison is exact above 2^53.** `=`/`<`/`>`/`<=`/`>=` between an
   int and a float compared via a lossy `as f64` cast, so e.g.
   `(= 9007199254740993 9007199254740992.0)` was `#t`. They now compare exactly.
