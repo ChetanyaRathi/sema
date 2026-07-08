@@ -49,6 +49,18 @@
   (sign of the dividend) for compatibility; `remainder` is the truncated
   counterpart for integers.
 
+### Fixed
+
+- **`i64::MIN` negation and `i64::MIN / -1` no longer panic.** The VM fast paths
+  and unary negate promote the overflowing result to a bignum
+  (`9223372036854775808`) instead of aborting on the arithmetic overflow.
+- **The reader's `#` correctly delimits a trailing imaginary `i`.** `3+4i#(…)`
+  now splits into the complex `3+4i` and a short lambda, just as `123#(…)` splits
+  into an integer and a short lambda.
+- **`int`/`float` conversions accept the whole real tower.** They now convert
+  bignums and exact rationals (e.g. `(int 5/2)` ⇒ `2`, `(float 1/3)`), not just
+  fixnums and floats.
+
 ## 1.29.0 — 2026-07-08
 
 ### Changed
