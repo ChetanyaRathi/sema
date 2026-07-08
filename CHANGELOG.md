@@ -43,6 +43,11 @@
   "integer overflow" error that 1.29.0 introduced for `+`/`-`/`*`/`expt` is
   gone; those operations now return the exact value (see the numeric tower
   above).
+- **`mod`/`modulo` on exact integers is now floored division** (result takes
+  the sign of the divisor, per R7RS): `(mod -7 2)` is `1`, where it previously
+  returned the truncated `-1`. Float operands keep the IEEE truncated `%`
+  (sign of the dividend) for compatibility; `remainder` is the truncated
+  counterpart for integers.
 
 ## 1.29.0 — 2026-07-08
 
