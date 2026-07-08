@@ -24,7 +24,7 @@ Sema's numeric error behavior follows one rule, split by type:
 
 This matches the hardware and mainstream numeric languages, so `NaN` propagates and `inf` accumulates rather than forcing error handling around every operation. If you need to reject these, test with `math/nan?` / `math/infinite?` explicitly.
 
-> **Integer overflow wraps** (two's-complement) — Sema does not yet have arbitrary-precision integers, so e.g. `(+ 9223372036854775807 1)` wraps to a negative number rather than raising or promoting. (See ADR #64.)
+> **No integer overflow** — Sema has a full numeric tower, so exact integer arithmetic never wraps. A result beyond `i64` range promotes to an arbitrary-precision bignum: `(+ 9223372036854775807 1)` → `9223372036854775808`, `(* 1000000000000 1000000000000)` → `1000000000000000000000000`. Exact division yields rationals (`(/ 1 3)` → `1/3`) and `(sqrt -1)` → `0+1i`. (See ADR #64 and the numeric-tower ADR.)
 
 ## Basic Arithmetic
 
