@@ -20,12 +20,12 @@ test.describe("AI Chat Demo", () => {
     await waitForSema(page);
 
     // Chat container should be visible
-    await expect(page.locator(".chat-container")).toBeVisible();
+    await expect(page.getByTestId("chat-container")).toBeVisible();
     await expect(page.locator("h2")).toHaveText("Sema AI Chat");
 
     // Input and send button should be present
-    await expect(page.locator("#chat-input")).toBeVisible();
-    await expect(page.locator('button[type="submit"]')).toHaveText("Send");
+    await expect(page.getByTestId("chat-input")).toBeVisible();
+    await expect(page.getByTestId("send-btn")).toHaveText("Send");
   });
 
   test("send message and receive streaming response", async ({ page }) => {
@@ -44,11 +44,11 @@ test.describe("AI Chat Demo", () => {
     });
 
     // User message should appear
-    await expect(page.locator(".message.user").first()).toBeVisible({ timeout: 5_000 });
-    await expect(page.locator(".message.user").first()).toContainText("Say hello");
+    await expect(page.getByTestId("msg-user").first()).toBeVisible({ timeout: 5_000 });
+    await expect(page.getByTestId("msg-user").first()).toContainText("Say hello");
 
     // Wait for assistant response (streaming or completed)
-    await expect(page.locator(".message.assistant")).toBeVisible({ timeout: 30_000 });
+    await expect(page.getByTestId("msg-assistant").or(page.getByTestId("msg-assistant-streaming"))).toBeVisible({ timeout: 30_000 });
 
     // Wait for streaming to finish
     await page.waitForFunction(
@@ -73,7 +73,7 @@ test.describe("AI Chat Demo", () => {
     });
 
     // Wait for the assistant response to appear (streaming or completed)
-    await expect(page.locator(".message.assistant")).toBeVisible({ timeout: 30_000 });
+    await expect(page.getByTestId("msg-assistant").or(page.getByTestId("msg-assistant-streaming"))).toBeVisible({ timeout: 30_000 });
 
     // Wait for streaming to finish — the message should have content
     await page.waitForFunction(
@@ -88,8 +88,8 @@ test.describe("AI Chat Demo", () => {
     );
 
     // Verify we have both user and assistant messages
-    await expect(page.locator(".message.user")).toHaveCount(1);
-    const assistantCount = await page.locator(".message.assistant, .message.assistant.streaming").count();
+    await expect(page.getByTestId("msg-user")).toHaveCount(1);
+    const assistantCount = await page.getByTestId("msg-assistant").or(page.getByTestId("msg-assistant-streaming")).count();
     expect(assistantCount).toBeGreaterThanOrEqual(1);
   });
 });

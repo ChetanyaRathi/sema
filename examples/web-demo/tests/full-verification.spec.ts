@@ -23,39 +23,39 @@ test.describe("Full Verification: Board Demo", () => {
     await waitForSema(page);
 
     // 1. Board loaded — columns visible
-    await expect(page.locator('[data-testid="column-todo"]')).toBeVisible({ timeout: 10_000 });
-    await expect(page.locator('[data-testid="column-in-progress"]')).toBeVisible();
-    await expect(page.locator('[data-testid="column-done"]')).toBeVisible();
-    const seedCount = await page.locator('[data-testid="board-card"]').count();
+    await expect(page.getByTestId("column-todo")).toBeVisible({ timeout: 10_000 });
+    await expect(page.getByTestId("column-in-progress")).toBeVisible();
+    await expect(page.getByTestId("column-done")).toBeVisible();
+    const seedCount = await page.getByTestId("board-card").count();
     expect(seedCount).toBeGreaterThanOrEqual(5);
     console.log(`PASS: Board loaded with ${seedCount} seed cards across 3 columns`);
 
     // 2. Add a card
-    await page.locator('[data-testid="add-card-todo"]').click();
-    const addInput = page.locator('[data-testid="add-card-input"]');
+    await page.getByTestId("add-card-todo").click();
+    const addInput = page.getByTestId("add-card-input");
     await expect(addInput).toBeVisible({ timeout: 3_000 });
     await addInput.fill("Verification card");
-    await page.locator('[data-testid="submit-add-card"]').click();
+    await page.getByTestId("submit-add-card").click();
     await page.waitForTimeout(500);
     await expect(page.locator('text=Verification card')).toBeVisible();
     console.log("PASS: Card added via UI");
 
     // 3. Search filters
-    await page.locator('[data-testid="search-input"]').fill("Verification");
+    await page.getByTestId("search-input").fill("Verification");
     await page.waitForTimeout(500);
-    const filtered = await page.locator('[data-testid="board-card"]').count();
+    const filtered = await page.getByTestId("board-card").count();
     expect(filtered).toBeLessThan(seedCount + 1); // fewer cards visible
-    await page.locator('[data-testid="search-input"]').fill("");
+    await page.getByTestId("search-input").fill("");
     await page.waitForTimeout(300);
     console.log("PASS: Search filtering works");
 
     // 4. Move card
-    const moveBtn = page.locator('[data-testid="column-todo"] [data-testid="move-right-btn"]').first();
+    const moveBtn = page.getByTestId("column-todo").getByTestId("move-right-btn").first();
     if (await moveBtn.isVisible()) {
-      const todoBefore = await page.locator('[data-testid="column-todo"] [data-testid="board-card"]').count();
+      const todoBefore = await page.getByTestId("column-todo").getByTestId("board-card").count();
       await moveBtn.click();
       await page.waitForTimeout(500);
-      const todoAfter = await page.locator('[data-testid="column-todo"] [data-testid="board-card"]').count();
+      const todoAfter = await page.getByTestId("column-todo").getByTestId("board-card").count();
       expect(todoAfter).toBe(todoBefore - 1);
       console.log("PASS: Card moved between columns");
     }
@@ -85,23 +85,23 @@ test.describe("Full Verification: Chat Widget", () => {
     await waitForSema(page);
 
     // 1. FAB visible
-    const fab = page.locator('[data-testid="chat-fab"]');
+    const fab = page.getByTestId("chat-fab");
     await expect(fab).toBeVisible({ timeout: 10_000 });
     console.log("PASS: Widget FAB visible");
 
     // 2. Open panel
     await fab.click();
-    const panel = page.locator('[data-testid="chat-panel"]');
+    const panel = page.getByTestId("chat-panel");
     await expect(panel).toBeVisible({ timeout: 3_000 });
     console.log("PASS: Chat panel opened");
 
     // 3. Input and send button present
-    await expect(page.locator('[data-testid="chat-input"]')).toBeVisible();
-    await expect(page.locator('[data-testid="send-btn"]')).toBeVisible();
+    await expect(page.getByTestId("chat-input")).toBeVisible();
+    await expect(page.getByTestId("send-btn")).toBeVisible();
     console.log("PASS: Chat input and send button present");
 
     // 4. Close panel
-    await page.locator('[data-testid="close-btn"]').click();
+    await page.getByTestId("close-btn").click();
     await page.waitForTimeout(500);
     await expect(panel).not.toBeVisible();
     console.log("PASS: Chat panel closed");
@@ -129,10 +129,10 @@ test.describe("Full Verification: Simple Chat", () => {
       web.eval('(put! current-stream (llm/chat-stream (list {:role "user" :content "Say hi"}) {}))');
     });
 
-    await expect(page.locator(".message.user").first()).toBeVisible({ timeout: 5_000 });
+    await expect(page.getByTestId("msg-user").first()).toBeVisible({ timeout: 5_000 });
     console.log("PASS: User message rendered");
 
-    await expect(page.locator(".message.assistant").first()).toBeVisible({ timeout: 30_000 });
+    await expect(page.getByTestId("msg-assistant").or(page.getByTestId("msg-assistant-streaming")).first()).toBeVisible({ timeout: 30_000 });
     await page.waitForFunction(
       () => {
         const msgs = document.querySelectorAll(".message.assistant");
