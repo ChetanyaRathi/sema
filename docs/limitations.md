@@ -127,20 +127,25 @@ scope.
 `(define-syntax name (syntax-rules (literals...) (pattern template)...))` is
 supported: pattern matching with literal identifiers and ellipsis (`...`),
 first-match-wins rule ordering, an optional custom ellipsis symbol, and template
-expansion. Hygiene is approximated with the gensym engine that backs `foo#`
-auto-gensym: a template-introduced identifier (one that is not a pattern
-variable, literal, ellipsis, special form, auxiliary keyword like `catch`/`else`,
-or bound in the environment) is consistently alpha-renamed to a fresh gensym per
-expansion, so introduced bindings cannot capture user identifiers of the same
-name (and vice versa).
+expansion. Hygiene is **binder-directed** and backed by the gensym engine that
+also powers `foo#` auto-gensym: a pass over the winning rule's template collects
+exactly the identifiers the template introduces *as binders* (the vars a
+template-introduced `let` / `let*` / `letrec[*]` / `lambda` / `fn` / `define` /
+`do` / named-let binds), and only those are consistently alpha-renamed to a
+fresh gensym per expansion. Every other template identifier — free references to
+user-defined globals, builtins, special forms, and the macro's own name for
+recursion — is kept verbatim and resolves at the use site / runtime. So a
+template's own introduced bindings cannot capture user identifiers of the same
+name, while a template can still freely reference user-defined globals (this
+works even in whole-program mode, where macros are pre-expanded before the
+user's `define`s run).
 
 Known limitations of the approximation:
 
-- Renaming keys off the **use-site** environment (== the global env for the
-  common top-level-macro case), not a per-identifier **definition** environment.
-  Referential transparency against a use-site that *shadows* a special
-  form/global that the template references (the rarer "other direction") is not
-  covered.
+- Hygiene is binder-directed, not built on per-identifier **definition**
+  environments. Referential transparency against a use-site that *shadows* a
+  special form/global that the template references (the rarer "other direction")
+  is not covered.
 - Nested ellipsis is supported in patterns (e.g. `((name val) ...)`), and single
   ellipsis in templates; a template with ellipsis depth > 1 (`x ... ...`) is
   rejected with a clear error rather than mis-expanded.
@@ -266,7 +271,7 @@ The last line is the footgun: `and` in head position is the special form, not th
 | 15  | No `guard` (R7RS)                        | Low      | Low       | `try`/`catch` covers the use case; `guard` is syntactic sugar                |
 | 18  | No Continuations                         | Low      | Very High | Requires CPS transform or VM rewrite; trampoline can't capture continuations |
 | 20  | No Dynamic Binding                       | Low      | Medium    | `parameterize`/`make-parameter` via thread-local state                       |
-| 21  | Hygienic Macros (`syntax-rules`) partial | —        | —         | Shipped: pattern/ellipsis/literals + gensym hygiene; see §21 for caveats     |
+| 21  | Hygienic Macros (`syntax-rules`) partial | —        | —         | Shipped: pattern/ellipsis/literals + binder-directed hygiene; see §21 for caveats |
 | 22  | No Tail Position in `do` Body            | Low      | Low       | Body is for side effects; result exprs already have TCO                      |
 | 23  | No `string-set!`                         | Low      | Low       | Intentional — immutable strings are simpler and safer                        |
 | 24  | No Proper Tail Recursion in map/filter   | Low      | Medium    | Stdlib uses Rust iteration; would need eval access                           |
@@ -292,7 +297,7 @@ The last line is the footgun: `and` in head position is the special form, not th
 - **Multiple values** — R7RS `values`, `call-with-values`, `let-values`, `let*-values`, `define-values`
 - **Bytevectors** — `#u8(1 2 3)` literal syntax. `make-bytevector`, `bytevector`, `bytevector-length`, `bytevector-u8-ref`, `bytevector-u8-set!` (COW), `bytevector-copy`, `bytevector-append`, `bytevector->list`, `list->bytevector`, `utf8->string`, `string->utf8`
 - **Character comparison** — R7RS `char=?`, `char<?`, `char>?`, `char<=?`, `char>=?` + case-insensitive `char-ci=?` etc.
-- **Macros** — `defmacro` with quasiquote/unquote/unquote-splicing (non-hygienic but functional); R7RS `define-syntax`/`syntax-rules` with pattern/ellipsis matching and gensym-based hygiene (approximate — see §21)
+- **Macros** — `defmacro` with quasiquote/unquote/unquote-splicing (non-hygienic but functional); R7RS `define-syntax`/`syntax-rules` with pattern/ellipsis matching and binder-directed hygiene (approximate — see §21)
 - **String operations** — split, trim, replace, contains?, format, str, index-of, chars, repeat, pad-left, pad-right
 - **Map operations** — hash-map, get, assoc, dissoc, keys, vals, merge, contains?, count, entries, map-vals, filter, select-keys, update
 - **List operations** — car/cdr + 12 compositions (caar through cdddr), cons, map (multi-list), filter, foldl, foldr, reduce, sort, range, take, drop, zip, flatten, partition, any, every, member, last, apply, index-of, unique, group-by, interleave, chunk, assoc/assq/assv (alist lookup)
