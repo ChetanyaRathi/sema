@@ -5,7 +5,7 @@ params: [{ name: x, type: "number | string" }]
 returns: "int"
 ---
 
-Convert a number or numeric string to an integer. Floats are truncated **toward zero** (the fractional part is dropped, not rounded). Signals an error if a string cannot be parsed as an integer.
+Convert a number or numeric string to an integer. Floats and exact rationals are truncated **toward zero** (the fractional part is dropped, not rounded); exact integers of any size pass through unchanged, so bignums stay exact. Signals an error if a string cannot be parsed as an integer.
 
 Truncation differs from `floor` on negatives: `int` chops toward zero while `floor` always rounds down. `(int -3.9)` is `-3`, but `(floor -3.9)` is `-4`. Use `int` for "drop the decimals", `floor`/`ceil` when you need a specific rounding direction.
 

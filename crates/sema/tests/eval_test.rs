@@ -79,6 +79,21 @@ eval_error_tests! {
     sci_int_overflow: "(int 1.0e19)" => "int",
 }
 
+// `int` and `float` accept the whole real tower: bignums pass through `int`
+// unchanged, and `float` projects bignums/rationals inexactly.
+eval_tests! {
+    int_of_bignum_is_identity: "(int 9223372036854775808)"
+        => common::eval("9223372036854775808"),
+    float_of_rational_projects: "(float 1/2)" => Value::float(0.5),
+    float_of_bignum_projects: "(float 9223372036854775808)"
+        => Value::float(9223372036854775808.0),
+}
+
+eval_error_tests! {
+    // Complex has no real projection, so `float` rejects it.
+    float_of_complex_rejected: "(float 3+4i)" => "real",
+}
+
 // ============================================================
 // Pattern Matching
 // ============================================================

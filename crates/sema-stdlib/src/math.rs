@@ -376,6 +376,8 @@ pub fn register(env: &sema_core::Env) {
         check_arity!(args, "int", 1);
         match args[0].view_ref() {
             ValueViewRef::Int(n) => Ok(Value::int(n)),
+            // Already an exact integer — identity, stays a bignum.
+            ValueViewRef::BigInt(b) => Ok(Value::from_bigint(b.clone())),
             // An exact rational truncates toward zero to an exact integer.
             ValueViewRef::Rational(r) => Ok(Value::from_bigint(r.trunc().to_integer())),
             // Truncate toward zero, but reject NaN/inf/out-of-range like every
@@ -398,6 +400,11 @@ pub fn register(env: &sema_core::Env) {
         match args[0].view_ref() {
             ValueViewRef::Int(n) => Ok(Value::float(n as f64)),
             ValueViewRef::Float(f) => Ok(Value::float(f)),
+            // Bignums and rationals project inexactly (like exact->inexact);
+            // real_arg rejects complex, which has no real projection.
+            ValueViewRef::BigInt(_) | ValueViewRef::Rational(_) | ValueViewRef::Complex(_) => {
+                Ok(Value::float(real_arg(&args[0], "float")?))
+            }
             ValueViewRef::String(s) => s
                 .parse::<f64>()
                 .map(Value::float)
