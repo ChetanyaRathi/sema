@@ -358,12 +358,17 @@ fn fold_binary_op(name: &str, a: &Value, b: &Value) -> Option<Value> {
         "/" => {
             if bi == 0 {
                 None
-            } else if ai % bi == 0 {
+            } else if ai.checked_rem(bi) == Some(0) {
+                // checked_rem rules out the i64::MIN / -1 overflow pair (it
+                // yields None there), so the quotient always fits a fixnum.
                 Some(Value::int(ai / bi))
             } else {
-                // Not evenly divisible: fold to the exact rational, matching
-                // the runtime `/` (stdlib native fn + `vm_div`) instead of a
-                // lossy float — constant folding must not change semantics.
+                // Not evenly divisible (exact rational), or i64::MIN / -1
+                // (quotient 2^63 overflows a fixnum): fold through the tower,
+                // matching the runtime `/` (stdlib native fn + `vm_div`)
+                // instead of a lossy float — constant folding must not change
+                // semantics. A whole-valued rational normalizes to an integer,
+                // so the overflow pair folds to a bignum.
                 Some(Value::from_number(
                     SemaNumber::from_i64(ai)
                         .div(SemaNumber::from_i64(bi))

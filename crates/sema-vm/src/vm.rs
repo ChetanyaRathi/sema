@@ -4417,10 +4417,14 @@ fn vm_div(a: &Value, b: &Value) -> Result<Value, SemaError> {
         (ValueViewRef::Int(_), ValueViewRef::Int(0)) => Err(SemaError::eval("division by zero")
             .with_hint("/: guard with (if (zero? d) ... (/ n d))")),
         (ValueViewRef::Int(x), ValueViewRef::Int(y)) => {
-            if x % y == 0 {
+            if x.checked_rem(y) == Some(0) {
+                // checked_rem rules out the i64::MIN / -1 overflow pair (it
+                // yields None there), so the quotient always fits a fixnum.
                 Ok(Value::int(x / y))
             } else {
-                // Not evenly divisible: exact rational, not a lossy float.
+                // Not evenly divisible (exact rational, not a lossy float),
+                // or i64::MIN / -1: the whole-valued rational normalizes to
+                // an integer, promoting the 2^63 quotient to a bignum.
                 Ok(Value::from_number(
                     SemaNumber::from_i64(x)
                         .div(SemaNumber::from_i64(y))

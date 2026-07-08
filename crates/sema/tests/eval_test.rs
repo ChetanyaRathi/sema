@@ -1373,6 +1373,14 @@ eval_tests! {
     sub_underflow_promotes: "(- -9223372036854775808 1)" => common::eval("-9223372036854775809"),
     mul_overflow_promotes: "(* 9223372036854775807 9223372036854775807)"
         => common::eval("85070591730234615847396907784232501249"),
+    // i64::MIN / -1 is the one integer division whose quotient (2^63)
+    // overflows a fixnum — it must promote to a bignum, not panic. The
+    // literal form exercises compile-time constant folding; the lambda form
+    // exercises the runtime `vm_div` fast path.
+    div_i64_min_by_neg1_folded_promotes: "(/ -9223372036854775808 -1)"
+        => common::eval("9223372036854775808"),
+    div_i64_min_by_neg1_runtime_promotes: "((fn (n d) (/ n d)) -9223372036854775808 -1)"
+        => common::eval("9223372036854775808"),
 }
 
 // Stdlib `+ - *` promote to bignum on i64 overflow instead of raising.
