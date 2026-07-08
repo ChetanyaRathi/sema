@@ -7,29 +7,34 @@ import { test, expect, Page } from '@playwright/test';
 
 async function waitForReady(page: Page) {
   await page.goto('/');
-  await page.waitForSelector('[data-testid="status"].status-ready', { timeout: 15000 });
+  await expect(page.getByTestId('status')).toHaveClass(/status-ready/, { timeout: 15000 });
 }
 
 async function setEditorCode(page: Page, code: string) {
   await page.getByTestId('editor').fill(code);
 }
 
-/** Click a gutter line number to toggle a breakpoint. */
+/** Click a gutter line number to toggle a breakpoint.
+ *  `.gutter-line` is rendered inside <sema-editor> (from @sema-lang/ui, not this
+ *  repo) with no exposed role/testid for individual line numbers — CSS nth-child
+ *  is the only way to target a specific line. */
 async function toggleBreakpoint(page: Page, lineNum: number) {
-  await page.click(`.gutter-line:nth-child(${lineNum})`);
+  await page.locator(`.gutter-line:nth-child(${lineNum})`).click();
 }
 
-/** Get the current line the debugger highlights. */
+/** Get the current line the debugger highlights.
+ *  `.gutter-line` internals come from <sema-editor> (@sema-lang/ui) — see
+ *  toggleBreakpoint for why CSS stays the fallback locator here. */
 async function getCurrentDebugLine(page: Page): Promise<number | null> {
-  const el = await page.$('.gutter-line.current-line');
-  if (!el) return null;
-  const text = await el.textContent();
+  const locator = page.locator('.gutter-line.current-line');
+  if ((await locator.count()) === 0) return null;
+  const text = await locator.textContent();
   return text ? parseInt(text, 10) : null;
 }
 
 /** Get all error output. */
 async function getErrors(page: Page): Promise<string[]> {
-  return page.$$eval('#output .output-error', els => els.map(el => el.textContent ?? ''));
+  return page.getByTestId('output-error').allTextContents();
 }
 
 /** Wait for the debugger to pause (status bar shows "Paused at line ..."). */
@@ -49,16 +54,17 @@ async function waitForIdle(page: Page, timeout = 12000) {
 }
 
 async function getStatus(page: Page): Promise<string> {
-  return await page.$eval('#status', el => el.textContent ?? '');
+  return await page.getByTestId('status').textContent() ?? '';
 }
 
 async function getOutputLines(page: Page): Promise<string[]> {
-  return page.$$eval('#output .output-line', els => els.map(el => el.textContent ?? ''));
+  return page.getByTestId('output-line').allTextContents();
 }
 
-/** Click a debug control and wait until the debugger is paused again or idle. */
-async function clickAndSettle(page: Page, selector: string) {
-  await page.click(selector);
+/** Click a debug control (by testid) and wait until the debugger is paused
+ *  again or idle. */
+async function clickAndSettle(page: Page, testId: string) {
+  await page.getByTestId(testId).click();
   await page.waitForFunction(
     () => {
       const s = document.getElementById('status')?.textContent ?? '';
@@ -68,15 +74,15 @@ async function clickAndSettle(page: Page, selector: string) {
   );
 }
 
-/** Repeatedly click `selector` (a step/continue control), recording the line at
+/** Repeatedly click `testId` (a step/continue control), recording the line at
  *  each stop, until the program goes idle or `maxSteps` is reached. */
-async function recordStops(page: Page, selector: string, maxSteps = 12): Promise<number[]> {
+async function recordStops(page: Page, testId: string, maxSteps = 12): Promise<number[]> {
   const lines: number[] = [];
   const first = await getCurrentDebugLine(page);
   if (first !== null) lines.push(first);
   for (let i = 0; i < maxSteps; i++) {
     if ((await getStatus(page)) === 'Ready') break;
-    await clickAndSettle(page, selector);
+    await clickAndSettle(page, testId);
     if ((await getStatus(page)) === 'Ready') break;
     const l = await getCurrentDebugLine(page);
     if (l !== null) lines.push(l);
@@ -89,7 +95,7 @@ async function recordStops(page: Page, selector: string, maxSteps = 12): Promise
 async function driveToIdle(page: Page, maxContinues = 25) {
   for (let i = 0; i < maxContinues; i++) {
     if ((await getStatus(page)) === 'Ready') return;
-    await clickAndSettle(page, '#dbg-continue');
+    await clickAndSettle(page, 'dbg-continue');
   }
   await waitForIdle(page);
 }
@@ -116,7 +122,7 @@ test.describe('Async debugger (cooperative WASM)', () => {
     expect(await getCurrentDebugLine(page)).toBe(2);
 
     // Continue → the task + the await must run to completion.
-    await page.click('#dbg-continue');
+    await page.getByTestId('dbg-continue').click();
     await waitForIdle(page);
 
     expect((await getErrors(page)).join('\n')).not.toContain('scheduler');
@@ -144,7 +150,7 @@ test.describe('Async debugger (cooperative WASM)', () => {
     // top-level async/all.
     expect(await getCurrentDebugLine(page)).toBe(4);
 
-    await page.click('#dbg-continue');
+    await page.getByTestId('dbg-continue').click();
     await waitForIdle(page);
 
     expect((await getErrors(page)).join('\n')).not.toContain('scheduler');
@@ -178,7 +184,7 @@ test.describe('Async debugger (cooperative WASM)', () => {
     await page.getByTestId('debug-btn').click();
     await waitForPaused(page);
 
-    const stops = await recordStops(page, '#dbg-continue');
+    const stops = await recordStops(page, 'dbg-continue');
     console.log('multi-bp Continue stops:', stops);
     // Each breakpoint is hit, in source order: main(1) → task body(4) → main(7).
     expect(stops).toEqual([1, 4, 7]);
@@ -193,7 +199,7 @@ test.describe('Async debugger (cooperative WASM)', () => {
     await page.getByTestId('debug-btn').click(); // no breakpoints → stop on entry
     await waitForPaused(page);
 
-    const lines = await recordStops(page, '#dbg-step-into');
+    const lines = await recordStops(page, 'dbg-step-into');
     console.log('step-into lines:', lines);
     // Step-into must DESCEND into add's body (which lives on line 1), so line 1 is
     // visited more than once (as the definition AND as the body during the call).
@@ -208,7 +214,7 @@ test.describe('Async debugger (cooperative WASM)', () => {
     await page.getByTestId('debug-btn').click();
     await waitForPaused(page);
 
-    const lines = await recordStops(page, '#dbg-step-over');
+    const lines = await recordStops(page, 'dbg-step-over');
     console.log('step-over lines:', lines);
     // Stays at the top level — line 1 is visited exactly once (the definition);
     // the call on line 2 is stepped OVER, never descending back into line 1.
@@ -231,7 +237,7 @@ test.describe('Async debugger (cooperative WASM)', () => {
     await waitForPaused(page);
     expect(await getCurrentDebugLine(page)).toBe(2);
 
-    await clickAndSettle(page, '#dbg-step-out');
+    await clickAndSettle(page, 'dbg-step-out');
     const after = await getCurrentDebugLine(page);
     const status = await getStatus(page);
     console.log('after step-out: line', after, 'status', status);
@@ -261,16 +267,16 @@ test.describe('Async debugger (cooperative WASM)', () => {
     expect(await getCurrentDebugLine(page)).toBe(2);
 
     // Stepping inside the stopped task advances within the task (2 → 3 → 4).
-    await clickAndSettle(page, '#dbg-step-into');
+    await clickAndSettle(page, 'dbg-step-into');
     const l3 = await getCurrentDebugLine(page);
     console.log('within-task step 1 → line', l3);
     expect(l3).toBe(3);
-    await clickAndSettle(page, '#dbg-step-into');
+    await clickAndSettle(page, 'dbg-step-into');
     const l4 = await getCurrentDebugLine(page);
     console.log('within-task step 2 → line', l4);
     expect(l4).toBe(4);
 
-    await page.click('#dbg-continue');
+    await page.getByTestId('dbg-continue').click();
     await waitForIdle(page);
     expect((await getErrors(page)).join('\n')).not.toContain('scheduler');
   });

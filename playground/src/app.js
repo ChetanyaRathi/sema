@@ -379,6 +379,7 @@ async function main() {
       setWorkerOutputHandler((line) => {
         const div = document.createElement('div');
         div.className = 'output-line';
+        div.setAttribute('data-testid', 'output-line');
         div.textContent = line;
         outputEl.appendChild(div);
         outputEl.scrollTop = outputEl.scrollHeight;
@@ -481,6 +482,7 @@ async function run() {
       for (const line of result.output) {
         const div = document.createElement('div');
         div.className = 'output-line';
+        div.setAttribute('data-testid', 'output-line');
         div.textContent = line;
         outputEl.appendChild(div);
       }
@@ -490,11 +492,13 @@ async function run() {
   if (result.error) {
     const div = document.createElement('div');
     div.className = 'output-error';
+    div.setAttribute('data-testid', 'output-error');
     div.textContent = result.error;
     outputEl.appendChild(div);
   } else if (result.value !== null) {
     const div = document.createElement('div');
     div.className = 'output-value';
+    div.setAttribute('data-testid', 'output-value');
     div.textContent = `=> ${result.value}`;
     outputEl.appendChild(div);
   }
@@ -539,6 +543,7 @@ document.getElementById('fmt-btn').addEventListener('click', () => {
     outputEl.innerHTML = '';
     const div = document.createElement('div');
     div.className = 'output-error';
+    div.setAttribute('data-testid', 'output-error');
     div.textContent = `Format error: ${result.error}`;
     outputEl.appendChild(div);
   } else if (result.formatted !== null) {
@@ -695,6 +700,7 @@ function handleDebugResult(result) {
     for (const line of result.output) {
       const div = document.createElement('div');
       div.className = 'output-line';
+      div.setAttribute('data-testid', 'output-line');
       div.textContent = line;
       outputEl.appendChild(div);
     }
@@ -725,6 +731,7 @@ function handleDebugResult(result) {
     if (result.value !== null && result.value !== undefined) {
       const div = document.createElement('div');
       div.className = 'output-value';
+      div.setAttribute('data-testid', 'output-value');
       div.textContent = `=> ${result.value}`;
       outputEl.appendChild(div);
     }
@@ -733,6 +740,7 @@ function handleDebugResult(result) {
   } else if (result.status === 'error') {
     const div = document.createElement('div');
     div.className = 'output-error';
+    div.setAttribute('data-testid', 'output-error');
     div.textContent = result.error;
     outputEl.appendChild(div);
     interp.debugStop();
@@ -771,6 +779,7 @@ async function handleDebugHttpNeeded(request) {
 function showDebugError(e) {
   const div = document.createElement('div');
   div.className = 'output-error';
+  div.setAttribute('data-testid', 'output-error');
   div.textContent = e.message || String(e);
   outputEl.appendChild(div);
   try { interp.debugStop(); } catch (_) { /* ignore */ }
@@ -793,6 +802,7 @@ function updateVariablesPanel() {
   const panel = document.createElement('div');
   panel.id = 'debug-vars';
   panel.className = 'debug-vars-panel';
+  panel.setAttribute('data-testid', 'debug-vars');
 
   const header = document.createElement('div');
   header.className = 'debug-vars-header';
@@ -802,7 +812,8 @@ function updateVariablesPanel() {
   for (const v of locals) {
     const row = document.createElement('div');
     row.className = 'debug-var-row';
-    row.innerHTML = `<span class="debug-var-name">${escapeHtml(v.name)}</span> = <span class="debug-var-value">${escapeHtml(v.value)}</span> <span class="debug-var-type">(${escapeHtml(v.type)})</span>`;
+    row.setAttribute('data-testid', 'debug-var-row');
+    row.innerHTML = `<span class="debug-var-name" data-testid="debug-var-name">${escapeHtml(v.name)}</span> = <span class="debug-var-value" data-testid="debug-var-value">${escapeHtml(v.value)}</span> <span class="debug-var-type">(${escapeHtml(v.type)})</span>`;
     panel.appendChild(row);
   }
 
