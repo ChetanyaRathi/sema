@@ -29,7 +29,7 @@ The extension at `editors/vscode/sema/` is already marketplace-ready. The `packa
 
 Update `website/docs/editors.md` to make the primary install method:
 
-> Search for **Sema** in the Extensions sidebar (`Ctrl+Shift+X` / `Cmd+Shift+X`), or run `ext install helgesverre.sema` from the command palette.
+> Search for **Sema** in the Extensions sidebar (`Ctrl+Shift+X` / `Cmd+Shift+X`), or run `ext install sema-lang.sema-lang` from the command palette.
 
 Keep the `curl`-based manual install as a fallback.
 

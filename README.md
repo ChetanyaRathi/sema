@@ -174,6 +174,11 @@ Hundreds of built-in functions, tail-call optimization, macros, modules, error h
     (if (= i n) a (loop (+ i 1) b (+ a b)))))
 (fibonacci 50) ;; => 12586269025
 
+;; Full R7RS numeric tower — bignums, exact rationals, complex numbers
+(expt 2 100)   ;; => 1267650600228229401496703205376
+(+ 1/2 1/3)    ;; => 5/6
+(sqrt -1)      ;; => 0+1i
+
 ;; Maps, keywords-as-functions, f-strings
 (define person {:name "Ada" :age 36 :langs ["Lisp" "Rust"]})
 (:name person) ;; => "Ada"
@@ -302,7 +307,7 @@ Each editor plugin lives in its own repo under the [`sema-lisp`](https://github.
 
 | Editor           | Repository                                                        | Install                                              |
 | ---------------- | ---------------------------------------------------------------- | ---------------------------------------------------- |
-| **VS Code**      | [`vscode-sema`](https://github.com/sema-lisp/vscode-sema)        | `ext install helgesverre.sema`                       |
+| **VS Code**      | [`vscode-sema`](https://github.com/sema-lisp/vscode-sema)        | `ext install sema-lang.sema-lang`                    |
 | **Zed**          | [`zed-sema`](https://github.com/sema-lisp/zed-sema)              | Extensions → search **Sema**                         |
 | **IntelliJ**     | [`intellij-sema`](https://github.com/sema-lisp/intellij-sema)    | JetBrains Marketplace → **Sema**                     |
 | **Neovim**       | [`sema.nvim`](https://github.com/sema-lisp/sema.nvim)            | `{ "sema-lisp/sema.nvim" }`                           |
@@ -387,15 +392,14 @@ language runtime, and the whole thing is one binary you can `scp` to a box.
 - **Standalone executables** — `sema build` compiles programs into self-contained binaries with auto-traced imports and bundled assets
 - **Embeddable** — [a Rust crate](https://crates.io/crates/sema-lang) with a builder API, or [`@sema-lang/sema`](https://www.npmjs.com/package/@sema-lang/sema) to run Sema client-side in JS via WebAssembly
 - **Full toolchain** — formatter, language server (LSP), debugger (DAP), and an MCP server for LLM clients, all built in
+- **Package manager** — `sema pkg` pulls dependencies from git or the live registry at [pkg.sema-lang.com](https://pkg.sema-lang.com), pinned by a `sema.lock` for reproducible installs
 - **Developer-friendly** — REPL with tab completion, structured error messages with hints, and 50+ example programs
 
 ### Why Not Sema?
 
-- No full numeric tower (rationals, bignums, complex numbers)
 - No continuations (`call/cc`) or fully hygienic macros (`syntax-rules`) — has auto-gensym (`foo#`) for preventing variable capture
 - Single-threaded — `Rc`-based, no cross-thread sharing of values
 - No JIT — bytecode compiler + stack-based VM, no native code generation
-- Package manager is git-based — central registry not yet live
 - Young language — solid but not battle-tested at scale
 
 ## Architecture
@@ -407,7 +411,9 @@ crates/
   sema-vm/       Bytecode compiler and virtual machine
   sema-eval/     Trampoline-based evaluator, special forms, modules
   sema-stdlib/   Built-in functions across many modules
+  sema-io/       Process-wide async I/O pool (tokio) behind the core seam
   sema-llm/      LLM provider trait + multi-provider clients
+  sema-workflow/ Dynamic-workflow runtime — journaled runs, bounded fan-out, --resume
   sema-otel/     OpenTelemetry tracing (GenAI semantic conventions)
   sema-docs/     Canonical builtin docs (powers LSP hover + REPL apropos)
   sema-lsp/      Language Server Protocol implementation

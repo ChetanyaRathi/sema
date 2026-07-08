@@ -710,7 +710,7 @@ The 620-line mini-evaluator (`sema_eval_value` + hand-rolled `call_function`) th
 ### 63. Package system: git + registry sources, lockfile
 
 - `sema pkg` CLI: `init`, `add`, `install`, `update`, `remove`, `list`, plus registry commands (`search`, `info`, `publish`, `yank`, `login`).
-- Two sources: **git repos** (`sema pkg add github.com/user/repo@ref` → `~/.sema/packages/`) and the **registry** (self-hostable single Rust binary in `pkg/` — SQLite/SeaORM, REST API, web UI; `DEFAULT_REGISTRY = pkg.sema-lang.com`, currently not serving — see `docs/plans/2026-06-09-pkg-registry-predeploy-hardening.md`).
+- Two sources: **git repos** (`sema pkg add github.com/user/repo@ref` → `~/.sema/packages/`) and the **registry** (self-hostable single Rust binary in `pkg/` — SQLite/SeaORM, REST API, web UI; `DEFAULT_REGISTRY = pkg.sema-lang.com`, live).
 - Manifest: `sema.toml` (`[package]` + `[deps]`; short names = registry, URL paths = git). Default entrypoint `package.sema`, overridable via `entrypoint`.
 - **Lockfile is implemented** (`sema.lock`: exact commit SHAs + registry checksums, `--locked` enforcement in `crates/sema/src/pkg.rs`).
 
