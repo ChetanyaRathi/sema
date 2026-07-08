@@ -5,7 +5,7 @@ outline: [2, 3]
 # Package Manager
 
 ::: tip Registry Status
-The central package registry is **live at [`pkg.sema-lang.com`](https://pkg.sema-lang.com)** and used by default — `sema pkg publish`, `search`, `info`, `yank`, and `login` all work against it out of the box (it's young, so the published catalog is still small). You can also install packages straight from a **git repository**, or point `sema pkg` at your own instance (see [Self-Hosted Registry](#self-hosted-registry)).
+The central package registry is **live at [`pkg.sema-lang.com`](https://pkg.sema-lang.com)** and used by default — `sema pkg publish`, `search`, `info`, `yank`, and `login` all work against it out of the box. You can also install packages straight from a **git repository**, or point `sema pkg` at your own instance (see [Self-Hosted Registry](#self-hosted-registry)).
 :::
 
 Sema supports two package sources: a **package registry** (for published packages with semver versions) and **direct git repos** (for development branches, private code, or unregistered packages). Both can be mixed freely in the same project.
