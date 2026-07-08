@@ -3114,6 +3114,19 @@
       "body": "Compositions of `car` and `cdr`. Available: `caar`, `cadr`, `cdar`, `cddr`, `caaar`, `caadr`, `cadar`, `caddr`, `cdaar`, `cdadr`, `cddar`, `cdddr`.\n\n```sema\n(cadr '(1 2 3))    ; => 2\n(caddr '(1 2 3))   ; => 3\n```"
     },
     {
+      "name": "call-with-values",
+      "module": "lists",
+      "section": "Multiple Values",
+      "summary": "Call the zero-argument `producer` thunk, then apply `consumer` to whatever it produced. If `producer` returned a bundle from `values` (zero or two-or-more values), each becomes a separate argument to `consumer`; an ordinary single value (including a plain, non-`values` return) is passed as `consumer`'s one argument.",
+      "returns": "any",
+      "examples": [
+        "(call-with-values (lambda () (values 1 2)) +)          ; => 3\n(call-with-values (lambda () (values 1 2 3)) list)      ; => (1 2 3)\n(call-with-values (lambda () 42) list)                  ; => (42)   ; single value, not spread\n(call-with-values (lambda () (values)) (lambda () 99))  ; => 99     ; zero values, zero-arg consumer",
+        "(call-with-values (lambda () (values 1 2)) (lambda (x) x))\n;; Arity error: <lambda> expects 1 args, got 2"
+      ],
+      "body": "Call the zero-argument `producer` thunk, then apply `consumer` to whatever it produced. If `producer` returned a bundle from `values` (zero or two-or-more values), each becomes a separate argument to `consumer`; an ordinary single value (including a plain, non-`values` return) is passed as `consumer`'s one argument.\n\n```sema\n(call-with-values (lambda () (values 1 2)) +)          ; => 3\n(call-with-values (lambda () (values 1 2 3)) list)      ; => (1 2 3)\n(call-with-values (lambda () 42) list)                  ; => (42)   ; single value, not spread\n(call-with-values (lambda () (values)) (lambda () 99))  ; => 99     ; zero values, zero-arg consumer\n```\n\nIf the number of produced values doesn't match `consumer`'s arity, the call fails with the ordinary lambda-arity error (R7RS's \"wrong number of values\"):\n\n```sema\n(call-with-values (lambda () (values 1 2)) (lambda (x) x))\n;; Arity error: <lambda> expects 1 args, got 2\n```\n\nAn error thrown by `producer` (or by `consumer`) propagates normally — `call-with-values` does not catch or swallow it.\n\n`let-values` and `let*-values` are the binding-form sugar built on top of `call-with-values`; reach for those directly when you just want local names bound to the produced values.\n\n**Note:** because `producer`/`consumer` are invoked through the same native dispatch as `apply`, a call across this boundary is not a true VM tail call — deep recursion written through `call-with-values` won't get the same tail-call optimization as a plain named-let.\n\n**See also:** `values` (produce the values), `apply` (spread a list's elements as arguments), `let-values`/`let*-values` (binding-form sugar).",
+      "syntax": "(call-with-values producer consumer)"
+    },
+    {
       "name": "car",
       "module": "lists",
       "section": "Construction & Access",
@@ -4217,6 +4230,19 @@
         "(tap 42 (fn (x) (println x)))   ; prints 42, returns 42\n\n(-> (range 5)\n    (tap (fn (xs) (println \"got:\" xs)))   ; logs (0 1 2 3 4), passes it through\n    (reverse))                            ; => (4 3 2 1 0)"
       ],
       "body": "Run a side-effecting function on a value, then return the **original value** unchanged — whatever the function returns is discarded. The value comes first, the function second: `(tap value f)`.\n\nThis lets you splice logging or inspection into the middle of a thread-first (`->`) pipeline without breaking the data flow.\n\n```sema\n(tap 42 (fn (x) (println x)))   ; prints 42, returns 42\n\n(-> (range 5)\n    (tap (fn (xs) (println \"got:\" xs)))   ; logs (0 1 2 3 4), passes it through\n    (reverse))                            ; => (4 3 2 1 0)\n```"
+    },
+    {
+      "name": "values",
+      "module": "lists",
+      "section": "Multiple Values",
+      "summary": "Produce zero or more values from a single expression, for use with `call-with-values`, `let-values`, `let*-values`, or `define-values`. This is R7RS's mechanism for a producer to return more than one value without packing them into a list.",
+      "returns": "any",
+      "examples": [
+        "(+ (values 5) 1)          ; => 6\n(= (values 5) 5)          ; => #t",
+        "(call-with-values (lambda () (values 1 2 3)) +)   ; => 6\n(let-values (((a b) (values 1 2))) (+ a b))       ; => 3"
+      ],
+      "body": "Produce zero or more values from a single expression, for use with `call-with-values`, `let-values`, `let*-values`, or `define-values`. This is R7RS's mechanism for a producer to return more than one value without packing them into a list.\n\n`(values x)` — exactly one value — is identity: it returns `x` unchanged, so a single-value `values` call flows through ordinary single-value contexts like arithmetic or comparison exactly as if `values` weren't there.\n\n```sema\n(+ (values 5) 1)          ; => 6\n(= (values 5) 5)          ; => #t\n```\n\nZero or two-or-more values only make sense when spread by one of the values-consuming forms:\n\n```sema\n(call-with-values (lambda () (values 1 2 3)) +)   ; => 6\n(let-values (((a b) (values 1 2))) (+ a b))       ; => 3\n```\n\nPassing a multiple-values result to an ordinary function that isn't expecting one (i.e. not through `call-with-values`/`let-values`/`define-values`) is unspecified by R7RS; Sema currently represents it as an opaque record, so it won't silently spread into that function's arguments.\n\n**See also:** `call-with-values` (call a producer, spread its values into a consumer), `let-values`/`let*-values` (bind multiple values as local variables), `define-values` (bind multiple values as top-level/global definitions).",
+      "syntax": "(values expr ...)"
     },
     {
       "name": "zip",
@@ -9079,6 +9105,17 @@
       "special_form": true
     },
     {
+      "name": "define-values",
+      "module": "special-forms",
+      "summary": "Bind the values produced by `producer` to top-level (or, inside a body, local) definitions — the `define` analogue of `let-values`. Formals follow the same rules: `(a b)` for exact names, dotted `(a . rest)` for a fixed prefix plus the remaining values as a list.",
+      "examples": [
+        "(define-values (a b) (values 10 20))\n(+ a b)\n;; => 30\n\n(define-values (q . r) (values 1 2 3))\nr\n;; => (2 3)"
+      ],
+      "body": "Bind the values produced by `producer` to top-level (or, inside a body, local) definitions — the `define` analogue of `let-values`. Formals follow the same rules: `(a b)` for exact names, dotted `(a . rest)` for a fixed prefix plus the remaining values as a list.\n\n```sema\n(define-values (a b) (values 10 20))\n(+ a b)\n;; => 30\n\n(define-values (q . r) (values 1 2 3))\nr\n;; => (2 3)\n```\n\nA producer that isn't a call to `values` is treated as a single value, same as `let-values`/`call-with-values`.\n\n**See also:** `let-values`/`let*-values` (scoped binding versions), `call-with-values`, `values`.",
+      "syntax": "(define-values (name ...) producer)",
+      "special_form": true
+    },
+    {
       "name": "defmacro",
       "module": "special-forms",
       "summary": "Define a compile-time macro. Macros receive their arguments unevaluated as Sema data structures and must return a new form that the evaluator then expands and evaluates. `defmacro` takes a name symbol, a parameter list, and one or more body expressions.",
@@ -9421,6 +9458,29 @@
       ],
       "body": "`let*` creates local bindings sequentially. Each init expression is evaluated in an environment that already contains the previous bindings, so later bindings can refer to earlier ones. The result is the value of the last body expression.\n\nLike `let`, `let*` supports destructuring with vector and map patterns. It is useful when a computation builds on values computed just before it, avoiding the need for deeply nested `let` forms.\n\n```sema\n(let* ((x 10) (y (* x 2)))\n  (+ x y))\n;; => 30\n```\n\n```sema\n(let* (({:keys [name age]} {:name \"Ada\" :age 36})\n       (greeting (format \"Hello, ~a\" name)))\n  greeting)\n;; => \"Hello, Ada\"\n```\n\n```sema\n(let* ((base 2)\n       (exp 8)\n       (result (expt base exp)))\n  result)\n;; => 256\n```\n\n**See also:** `let` (parallel — inits cannot see sibling bindings), `letrec` (for mutually recursive functions, where every name is visible to every init at once).",
       "syntax": "(let* ((name value) ...) body ...)",
+      "special_form": true
+    },
+    {
+      "name": "let*-values",
+      "module": "special-forms",
+      "summary": "Like `let-values`, but binding is **sequential**: each clause's `producer` is evaluated in an environment that already contains every earlier clause's bindings, so a later clause can refer to an earlier one's names. Formals follow the same rules as `let-values` — `(a b)`, dotted `(a . rest)`, or a bare symbol binding all values as a list.",
+      "examples": [
+        "(define a 100)\n(let*-values (((a) (values 1))\n              ((b) (values a)))   ; sees the NEW a (1) from the clause just above\n  b)\n;; => 1\n\n(let*-values (((a b) (values 1 2))\n              ((c) (values (+ a b))))\n  c)\n;; => 3"
+      ],
+      "body": "Like `let-values`, but binding is **sequential**: each clause's `producer` is evaluated in an environment that already contains every earlier clause's bindings, so a later clause can refer to an earlier one's names. Formals follow the same rules as `let-values` — `(a b)`, dotted `(a . rest)`, or a bare symbol binding all values as a list.\n\n```sema\n(define a 100)\n(let*-values (((a) (values 1))\n              ((b) (values a)))   ; sees the NEW a (1) from the clause just above\n  b)\n;; => 1\n\n(let*-values (((a b) (values 1 2))\n              ((c) (values (+ a b))))\n  c)\n;; => 3\n```\n\n**See also:** `let-values` (parallel — later producers can't see earlier bindings), `call-with-values`, `define-values`.",
+      "syntax": "(let*-values (((name ...) producer) ...) body ...)",
+      "special_form": true
+    },
+    {
+      "name": "let-values",
+      "module": "special-forms",
+      "summary": "Bind the values produced by one or more `values`-producing expressions to local names, then evaluate `body`. Like `let`, binding is **parallel**: every `producer` is evaluated against the *outer* environment before any clause's names come into scope, so a later clause cannot see an earlier clause's bindings.",
+      "examples": [
+        "(let-values (((a b) (values 1 2)))\n  (+ a b))\n;; => 3\n\n(let-values (((a . rest) (values 1 2 3)))\n  rest)\n;; => (2 3)\n\n(let-values ((all (values 1 2 3)))\n  all)\n;; => (1 2 3)",
+        "(define a 100)\n(let-values (((a) (values 1))\n             ((b) (values a)))   ; sees the OUTER a (100), not the new binding above\n  b)\n;; => 100"
+      ],
+      "body": "Bind the values produced by one or more `values`-producing expressions to local names, then evaluate `body`. Like `let`, binding is **parallel**: every `producer` is evaluated against the *outer* environment before any clause's names come into scope, so a later clause cannot see an earlier clause's bindings.\n\nEach clause's formals can be:\n\n- `(a b)` — bind exactly that many values by name.\n- `(a . rest)` — bind the first values by name, remaining values as a list in `rest` (dotted formals, same shape as a lambda's rest parameter).\n- `all` (a bare symbol, no parens) — bind ALL produced values as a single list.\n\nA producer that isn't a call to `values` is treated as a single value.\n\n```sema\n(let-values (((a b) (values 1 2)))\n  (+ a b))\n;; => 3\n\n(let-values (((a . rest) (values 1 2 3)))\n  rest)\n;; => (2 3)\n\n(let-values ((all (values 1 2 3)))\n  all)\n;; => (1 2 3)\n```\n\nMultiple clauses evaluate independently against the outer environment:\n\n```sema\n(define a 100)\n(let-values (((a) (values 1))\n             ((b) (values a)))   ; sees the OUTER a (100), not the new binding above\n  b)\n;; => 100\n```\n\nIf a clause produces the wrong number of values for its formals, that's an arity error (R7RS \"wrong number of values\"). A producer's error propagates normally.\n\n**See also:** `let*-values` (sequential — later producers see earlier bindings), `call-with-values` (the lower-level primitive this desugars to), `define-values` (top-level/global version).",
+      "syntax": "(let-values (((name ...) producer) ...) body ...)",
       "special_form": true
     },
     {
