@@ -16,3 +16,12 @@ rustflags = ["-C", "link-arg=-Wl,-headerpad,256"]
 
 [target.x86_64-apple-darwin]
 rustflags = ["-C", "link-arg=-Wl,-headerpad,256"]
+
+# MCP OAuth tokens default to the macOS login Keychain (via the `keyring` crate).
+# Every `cargo test`/`cargo run` rebuild is ad-hoc-signed with a fresh code
+# identity, so the Keychain "Always Allow" ACL never sticks and macOS pops a
+# SecurityAgent auth prompt on each run. Force the 0600 JSON file store for
+# cargo-launched processes (tests, `cargo run`) so local dev never touches the
+# Keychain. Installed/release binaries are unaffected and still use the Keychain.
+[env]
+SEMA_MCP_TOKEN_STORE = "file"
