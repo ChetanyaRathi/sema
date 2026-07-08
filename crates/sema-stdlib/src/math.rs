@@ -106,6 +106,55 @@ fn real_arg(v: &Value, name: &str) -> Result<f64, SemaError> {
     Ok(n.to_f64())
 }
 
+/// `quotient`/`math/quotient`: truncated division (result takes the sign of
+/// the dividend), per R7RS. Bignum-aware via `as_bigint`; errors on
+/// non-integer operands (rationals, floats, complex).
+fn quotient_impl(args: &[Value]) -> Result<Value, SemaError> {
+    let (n, d) = two_bigints(args, "quotient")?;
+    if d == BigInt::from(0) {
+        return Err(SemaError::eval("quotient: division by zero")
+            .with_hint("quotient: ensure the divisor is non-zero"));
+    }
+    Ok(Value::from_bigint(n / d))
+}
+
+/// `remainder`/`math/remainder`: truncated-division remainder (result takes
+/// the sign of the dividend), per R7RS. Bignum-aware via `as_bigint`.
+fn remainder_impl(args: &[Value]) -> Result<Value, SemaError> {
+    let (n, d) = two_bigints(args, "remainder")?;
+    if d == BigInt::from(0) {
+        return Err(SemaError::eval("remainder: division by zero")
+            .with_hint("remainder: ensure the divisor is non-zero"));
+    }
+    Ok(Value::from_bigint(n % d))
+}
+
+/// `gcd`/`math/gcd`: variadic fold over bignums. `gcd` of no args is 0 (R7RS),
+/// matching the identity of the fold.
+fn gcd_impl(args: &[Value]) -> Result<Value, SemaError> {
+    let mut acc = BigInt::from(0);
+    for arg in args {
+        let n = arg
+            .as_bigint()
+            .ok_or_else(|| SemaError::type_error("integer", arg.type_name()))?;
+        acc = acc.gcd(&n);
+    }
+    Ok(Value::from_bigint(acc))
+}
+
+/// `lcm`/`math/lcm`: variadic fold over bignums. `lcm` of no args is 1
+/// (R7RS), matching the identity of the fold.
+fn lcm_impl(args: &[Value]) -> Result<Value, SemaError> {
+    let mut acc = BigInt::from(1);
+    for arg in args {
+        let n = arg
+            .as_bigint()
+            .ok_or_else(|| SemaError::type_error("integer", arg.type_name()))?;
+        acc = acc.lcm(&n);
+    }
+    Ok(Value::from_bigint(acc))
+}
+
 pub fn register(env: &sema_core::Env) {
     register_fn(env, "abs", |args| {
         check_arity!(args, "abs", 1);
@@ -360,77 +409,6 @@ pub fn register(env: &sema_core::Env) {
         }
     });
 
-    register_fn(env, "math/quotient", |args| {
-        check_arity!(args, "math/quotient", 2);
-        let a = args[0]
-            .as_int()
-            .ok_or_else(|| SemaError::type_error("int", args[0].type_name()))?;
-        let b = args[1]
-            .as_int()
-            .ok_or_else(|| SemaError::type_error("int", args[1].type_name()))?;
-        if b == 0 {
-            return Err(SemaError::eval("math/quotient: division by zero")
-                .with_hint("math/quotient: ensure the divisor is non-zero"));
-        }
-        Ok(Value::int(a.wrapping_div(b)))
-    });
-
-    register_fn(env, "math/remainder", |args| {
-        check_arity!(args, "math/remainder", 2);
-        let a = args[0]
-            .as_int()
-            .ok_or_else(|| SemaError::type_error("int", args[0].type_name()))?;
-        let b = args[1]
-            .as_int()
-            .ok_or_else(|| SemaError::type_error("int", args[1].type_name()))?;
-        if b == 0 {
-            return Err(SemaError::eval("math/remainder: division by zero")
-                .with_hint("math/remainder: ensure the divisor is non-zero"));
-        }
-        Ok(Value::int(a % b))
-    });
-
-    register_fn(env, "math/gcd", |args| {
-        check_arity!(args, "math/gcd", 2);
-        let mut a = args[0]
-            .as_int()
-            .ok_or_else(|| SemaError::type_error("int", args[0].type_name()))?
-            .wrapping_abs();
-        let mut b = args[1]
-            .as_int()
-            .ok_or_else(|| SemaError::type_error("int", args[1].type_name()))?
-            .wrapping_abs();
-        while b != 0 {
-            let t = b;
-            b = a % b;
-            a = t;
-        }
-        Ok(Value::int(a))
-    });
-
-    register_fn(env, "math/lcm", |args| {
-        check_arity!(args, "math/lcm", 2);
-        let a = args[0]
-            .as_int()
-            .ok_or_else(|| SemaError::type_error("int", args[0].type_name()))?
-            .wrapping_abs();
-        let b = args[1]
-            .as_int()
-            .ok_or_else(|| SemaError::type_error("int", args[1].type_name()))?
-            .wrapping_abs();
-        if a == 0 && b == 0 {
-            return Ok(Value::int(0));
-        }
-        let mut ga = a;
-        let mut gb = b;
-        while gb != 0 {
-            let t = gb;
-            gb = ga % gb;
-            ga = t;
-        }
-        Ok(Value::int((a / ga).wrapping_mul(b)))
-    });
-
     register_fn(env, "math/tan", |args| {
         check_arity!(args, "math/tan", 1);
         Ok(Value::float(real_arg(&args[0], "math/tan")?.tan()))
@@ -646,50 +624,17 @@ pub fn register(env: &sema_core::Env) {
         }
     });
 
-    // quotient/remainder: truncated division (result takes the sign of the
-    // dividend), per R7RS. Bignum-aware via `as_bigint`; errors on non-integer
-    // operands (rationals, floats, complex).
-    register_fn(env, "quotient", |args| {
-        let (n, d) = two_bigints(args, "quotient")?;
-        if d == BigInt::from(0) {
-            return Err(SemaError::eval("quotient: division by zero")
-                .with_hint("quotient: ensure the divisor is non-zero"));
-        }
-        Ok(Value::from_bigint(n / d))
-    });
-
-    register_fn(env, "remainder", |args| {
-        let (n, d) = two_bigints(args, "remainder")?;
-        if d == BigInt::from(0) {
-            return Err(SemaError::eval("remainder: division by zero")
-                .with_hint("remainder: ensure the divisor is non-zero"));
-        }
-        Ok(Value::from_bigint(n % d))
-    });
-
-    // gcd/lcm: variadic folds over bignums. `gcd` of no args is 0; `lcm` of no
-    // args is 1 (both per R7RS), matching the identity of the fold.
-    register_fn(env, "gcd", |args| {
-        let mut acc = BigInt::from(0);
-        for arg in args {
-            let n = arg
-                .as_bigint()
-                .ok_or_else(|| SemaError::type_error("integer", arg.type_name()))?;
-            acc = acc.gcd(&n);
-        }
-        Ok(Value::from_bigint(acc))
-    });
-
-    register_fn(env, "lcm", |args| {
-        let mut acc = BigInt::from(1);
-        for arg in args {
-            let n = arg
-                .as_bigint()
-                .ok_or_else(|| SemaError::type_error("integer", arg.type_name()))?;
-            acc = acc.lcm(&n);
-        }
-        Ok(Value::from_bigint(acc))
-    });
+    // quotient/remainder/gcd/lcm: shared bignum-aware implementations,
+    // registered under both the unprefixed R7RS name and the `math/` alias
+    // (same pattern as `pow`/`expt`/`math/pow`).
+    register_fn(env, "quotient", quotient_impl);
+    register_fn(env, "math/quotient", quotient_impl);
+    register_fn(env, "remainder", remainder_impl);
+    register_fn(env, "math/remainder", remainder_impl);
+    register_fn(env, "gcd", gcd_impl);
+    register_fn(env, "math/gcd", gcd_impl);
+    register_fn(env, "lcm", lcm_impl);
+    register_fn(env, "math/lcm", lcm_impl);
 
     // `(exact-integer-sqrt n)` → the list `(s r)` where `s = ⌊√n⌋` and
     // `r = n - s²`, so `s² + r = n` and `0 ≤ r ≤ 2s`. Requires a non-negative

@@ -1591,6 +1591,24 @@ eval_tests! {
     mod_basic: "(mod 10 3)" => common::eval("1"),
 }
 
+// `math/quotient`/`math/remainder`/`math/gcd`/`math/lcm` are aliases of the
+// unprefixed R7RS names (same shared impl, mirroring `pow`/`expt`/`math/pow`)
+// — they must agree on bignums and on variadic gcd/lcm, not just fixnums.
+eval_tests! {
+    math_quotient_bignum: "(math/quotient 100000000000000000000 7)" => common::eval("14285714285714285714"),
+    math_remainder_bignum: "(math/remainder 100000000000000000000 7)" => common::eval("2"),
+    math_gcd_bignum: "(math/gcd 100000000000000000000 10)" => common::eval("10"),
+    math_lcm_basic: "(math/lcm 4 6)" => common::eval("12"),
+    gcd_variadic: "(gcd 12 18 24)" => common::eval("6"),
+    math_gcd_variadic: "(math/gcd 12 18 24)" => common::eval("6"),
+    lcm_variadic: "(lcm 2 3 4)" => common::eval("12"),
+    math_lcm_variadic: "(math/lcm 2 3 4)" => common::eval("12"),
+    quotient_and_math_quotient_agree: "(= (quotient 100000000000000000000 7) (math/quotient 100000000000000000000 7))" => common::eval("#t"),
+    remainder_and_math_remainder_agree: "(= (remainder -7 3) (math/remainder -7 3))" => common::eval("#t"),
+    gcd_and_math_gcd_agree: "(= (gcd 48 36) (math/gcd 48 36))" => common::eval("#t"),
+    lcm_and_math_lcm_agree: "(= (lcm 4 6) (math/lcm 4 6))" => common::eval("#t"),
+}
+
 // Task 5.5: `expt` exact for integer exponents (repeated squaring; a negative
 // exponent of an exact base yields an exact reciprocal rational), plus the
 // transcendental functions accepting exact (bignum/rational) arguments via

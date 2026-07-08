@@ -6199,11 +6199,18 @@
       "name": "math/gcd",
       "module": "math",
       "section": "Integer Math",
-      "summary": "Greatest common divisor of two integers — the largest number that divides both. `(math/gcd n 0)` is `n`. Pairs with `math/lcm` (least common multiple).",
-      "examples": [
-        "(math/gcd 12 8)    ; => 4\n(math/gcd 15 10)   ; => 5\n(math/gcd 7 13)    ; => 1   (coprime)"
+      "summary": "Greatest common divisor: the largest non-negative integer that divides all arguments. Variadic and bignum-aware; `(math/gcd)` with no arguments is `0` (the identity of the fold), per R7RS. Namespaced alias of [`gcd`](#gcd); pairs with [`math/lcm`](#math-lcm).",
+      "params": [
+        {
+          "name": "ns",
+          "type": "integer"
+        }
       ],
-      "body": "Greatest common divisor of two integers — the largest number that divides both. `(math/gcd n 0)` is `n`. Pairs with `math/lcm` (least common multiple).\n\n```sema\n(math/gcd 12 8)    ; => 4\n(math/gcd 15 10)   ; => 5\n(math/gcd 7 13)    ; => 1   (coprime)\n```"
+      "returns": "integer",
+      "examples": [
+        "(math/gcd 12 8)     ; => 4\n(math/gcd 15 10 25) ; => 5\n(math/gcd 7 13)     ; => 1   ; coprime\n(math/gcd)          ; => 0"
+      ],
+      "body": "Greatest common divisor: the largest non-negative integer that divides all arguments. Variadic and bignum-aware; `(math/gcd)` with no arguments is `0` (the identity of the fold), per R7RS. Namespaced alias of [`gcd`](#gcd); pairs with [`math/lcm`](#math-lcm).\n\n```sema\n(math/gcd 12 8)     ; => 4\n(math/gcd 15 10 25) ; => 5\n(math/gcd 7 13)     ; => 1   ; coprime\n(math/gcd)          ; => 0\n```"
     },
     {
       "name": "math/infinite?",
@@ -6229,11 +6236,18 @@
       "name": "math/lcm",
       "module": "math",
       "section": "Integer Math",
-      "summary": "Least common multiple of two integers — the smallest number both divide evenly. For coprime inputs it is just their product. Pairs with `math/gcd`.",
-      "examples": [
-        "(math/lcm 4 6)     ; => 12\n(math/lcm 3 5)     ; => 15   (coprime: 3 * 5)"
+      "summary": "Least common multiple: the smallest non-negative integer that every argument divides. Variadic and bignum-aware; `(math/lcm)` with no arguments is `1` (the identity of the fold), per R7RS. Namespaced alias of [`lcm`](#lcm); pairs with [`math/gcd`](#math-gcd).",
+      "params": [
+        {
+          "name": "ns",
+          "type": "integer"
+        }
       ],
-      "body": "Least common multiple of two integers — the smallest number both divide evenly. For coprime inputs it is just their product. Pairs with `math/gcd`.\n\n```sema\n(math/lcm 4 6)     ; => 12\n(math/lcm 3 5)     ; => 15   (coprime: 3 * 5)\n```"
+      "returns": "integer",
+      "examples": [
+        "(math/lcm 4 6)     ; => 12\n(math/lcm 2 3 4)   ; => 12\n(math/lcm 7 13)    ; => 91   ; coprime\n(math/lcm)         ; => 1"
+      ],
+      "body": "Least common multiple: the smallest non-negative integer that every argument divides. Variadic and bignum-aware; `(math/lcm)` with no arguments is `1` (the identity of the fold), per R7RS. Namespaced alias of [`lcm`](#lcm); pairs with [`math/gcd`](#math-gcd).\n\n```sema\n(math/lcm 4 6)     ; => 12\n(math/lcm 2 3 4)   ; => 12\n(math/lcm 7 13)    ; => 91   ; coprime\n(math/lcm)         ; => 1\n```"
     },
     {
       "name": "math/lerp",
@@ -6319,11 +6333,22 @@
       "name": "math/quotient",
       "module": "math",
       "section": "Integer Math",
-      "summary": "Integer quotient: divide and truncate toward zero. Unlike [`/`](#op-2), it never yields a fraction. Pairs with [`math/remainder`](#math-remainder) so that `(+ (* (math/quotient a b) b) (math/remainder a b))` reconstructs `a`.",
-      "examples": [
-        "(math/quotient 10 3)  ; => 3\n(math/quotient 7 2)   ; => 3\n(math/quotient -7 2)  ; => -3   ; truncates toward zero (not floored to -4)"
+      "summary": "Truncated integer division: the result takes the sign of the dividend (truncates toward zero), per R7RS. Bignum-aware; both arguments must be exact integers. Namespaced alias of [`quotient`](#quotient); pairs with [`math/remainder`](#math-remainder) so that `(+ (* (math/quotient n d) d) (math/remainder n d))` reconstructs `n`. Errors on a zero divisor.",
+      "params": [
+        {
+          "name": "n",
+          "type": "integer"
+        },
+        {
+          "name": "d",
+          "type": "integer"
+        }
       ],
-      "body": "Integer quotient: divide and truncate toward zero. Unlike [`/`](#op-2), it never yields a fraction. Pairs with [`math/remainder`](#math-remainder) so that `(+ (* (math/quotient a b) b) (math/remainder a b))` reconstructs `a`.\n\n```sema\n(math/quotient 10 3)  ; => 3\n(math/quotient 7 2)   ; => 3\n(math/quotient -7 2)  ; => -3   ; truncates toward zero (not floored to -4)\n```"
+      "returns": "integer",
+      "examples": [
+        "(math/quotient 10 3)   ; => 3\n(math/quotient -7 2)   ; => -3   ; truncates toward zero (not floored to -4)\n(math/quotient 100000000000000000000 7) ; => 14285714285714285714"
+      ],
+      "body": "Truncated integer division: the result takes the sign of the dividend (truncates toward zero), per R7RS. Bignum-aware; both arguments must be exact integers. Namespaced alias of [`quotient`](#quotient); pairs with [`math/remainder`](#math-remainder) so that `(+ (* (math/quotient n d) d) (math/remainder n d))` reconstructs `n`. Errors on a zero divisor.\n\n```sema\n(math/quotient 10 3)   ; => 3\n(math/quotient -7 2)   ; => -3   ; truncates toward zero (not floored to -4)\n(math/quotient 100000000000000000000 7) ; => 14285714285714285714\n```"
     },
     {
       "name": "math/radians->degrees",
@@ -6372,22 +6397,22 @@
       "name": "math/remainder",
       "module": "math",
       "section": "Integer Math",
-      "summary": "Remainder after truncated division: `(- a (* (math/quotient a b) b))`. The sign follows the dividend `a`. Identical to [`mod`](#mod); pairs with [`math/quotient`](#math-quotient).",
+      "summary": "Remainder of truncated integer division: the result takes the sign of the dividend, per R7RS. Bignum-aware; both arguments must be exact integers. Namespaced alias of [`remainder`](#remainder); pairs with [`math/quotient`](#math-quotient) so that `(+ (* (math/quotient n d) d) (math/remainder n d))` reconstructs `n`. Errors on a zero divisor.",
       "params": [
         {
-          "name": "a",
-          "type": "int"
+          "name": "n",
+          "type": "integer"
         },
         {
-          "name": "b",
-          "type": "int"
+          "name": "d",
+          "type": "integer"
         }
       ],
-      "returns": "int",
+      "returns": "integer",
       "examples": [
-        "(math/remainder 10 3) ; => 1\n(math/remainder 7 2)  ; => 1\n(math/remainder -7 3) ; => -1   ; sign follows the dividend"
+        "(math/remainder 10 3)  ; => 1\n(math/remainder -7 2)  ; => -1   ; sign of the dividend\n(math/remainder 7 -2)  ; => 1"
       ],
-      "body": "Remainder after truncated division: `(- a (* (math/quotient a b) b))`. The sign follows the dividend `a`. Identical to [`mod`](#mod); pairs with [`math/quotient`](#math-quotient).\n\n```sema\n(math/remainder 10 3) ; => 1\n(math/remainder 7 2)  ; => 1\n(math/remainder -7 3) ; => -1   ; sign follows the dividend\n```"
+      "body": "Remainder of truncated integer division: the result takes the sign of the dividend, per R7RS. Bignum-aware; both arguments must be exact integers. Namespaced alias of [`remainder`](#remainder); pairs with [`math/quotient`](#math-quotient) so that `(+ (* (math/quotient n d) d) (math/remainder n d))` reconstructs `n`. Errors on a zero divisor.\n\n```sema\n(math/remainder 10 3)  ; => 1\n(math/remainder -7 2)  ; => -1   ; sign of the dividend\n(math/remainder 7 -2)  ; => 1\n```"
     },
     {
       "name": "math/round-to",
