@@ -5841,12 +5841,9 @@
     },
     {
       "name": "exact->inexact",
-      "aliases": [
-        "inexact"
-      ],
       "module": "math",
       "section": "Exactness Conversion",
-      "summary": "Convert a number to inexact form (floating-point). All components are converted to `f64`. This is an alias for `inexact`; use either name.",
+      "summary": "Convert a number to inexact form (floating-point). All components are converted to `f64`. Identical to [`inexact`](./inexact) — both names are registered (R7RS `exact->inexact` and the shorthand `inexact`); use either.",
       "params": [
         {
           "name": "x",
@@ -5857,7 +5854,7 @@
       "examples": [
         "(exact->inexact 1/3)        ; => 0.3333333333333333\n(exact->inexact 42)         ; => 42.0\n(exact->inexact 3+4i)       ; => 3.0+4.0i"
       ],
-      "body": "Convert a number to inexact form (floating-point). All components are converted to `f64`. This is an alias for `inexact`; use either name.\n\n```sema\n(exact->inexact 1/3)        ; => 0.3333333333333333\n(exact->inexact 42)         ; => 42.0\n(exact->inexact 3+4i)       ; => 3.0+4.0i\n```"
+      "body": "Convert a number to inexact form (floating-point). All components are converted to `f64`. Identical to [`inexact`](./inexact) — both names are registered (R7RS `exact->inexact` and the shorthand `inexact`); use either.\n\n```sema\n(exact->inexact 1/3)        ; => 0.3333333333333333\n(exact->inexact 42)         ; => 42.0\n(exact->inexact 3+4i)       ; => 3.0+4.0i\n```"
     },
     {
       "name": "exact-integer-sqrt",
@@ -5963,6 +5960,23 @@
         "(imag-part 3+4i)       ; => 4\n(imag-part 2.5)        ; => 0\n(imag-part 1/3)        ; => 0\n(imag-part 5i)         ; => 5"
       ],
       "body": "Return the imaginary part of a complex number. For real numbers, returns exact 0.\n\n```sema\n(imag-part 3+4i)       ; => 4\n(imag-part 2.5)        ; => 0\n(imag-part 1/3)        ; => 0\n(imag-part 5i)         ; => 5\n```"
+    },
+    {
+      "name": "inexact",
+      "module": "math",
+      "section": "Exactness Conversion",
+      "summary": "Convert a number to inexact form (floating-point). All components are converted to `f64`. Useful for inexact contagion or for forcing floating-point arithmetic.",
+      "params": [
+        {
+          "name": "x",
+          "type": "number"
+        }
+      ],
+      "returns": "number",
+      "examples": [
+        "(inexact 1/3)        ; => 0.3333333333333333\n(inexact 42)         ; => 42.0\n(inexact 3+4i)       ; => 3.0+4.0i\n(inexact 3.14)       ; => 3.14 (already inexact)"
+      ],
+      "body": "Convert a number to inexact form (floating-point). All components are converted to `f64`. Useful for inexact contagion or for forcing floating-point arithmetic.\n\n```sema\n(inexact 1/3)        ; => 0.3333333333333333\n(inexact 42)         ; => 42.0\n(inexact 3+4i)       ; => 3.0+4.0i\n(inexact 3.14)       ; => 3.14 (already inexact)\n```"
     },
     {
       "name": "inexact->exact",

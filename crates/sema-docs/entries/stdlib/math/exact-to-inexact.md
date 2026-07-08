@@ -4,10 +4,9 @@ module: "math"
 section: "Exactness Conversion"
 params: [{ name: x, type: number }]
 returns: "number"
-aliases: ["inexact"]
 ---
 
-Convert a number to inexact form (floating-point). All components are converted to `f64`. This is an alias for `inexact`; use either name.
+Convert a number to inexact form (floating-point). All components are converted to `f64`. Identical to [`inexact`](./inexact) — both names are registered (R7RS `exact->inexact` and the shorthand `inexact`); use either.
 
 ```sema
 (exact->inexact 1/3)        ; => 0.3333333333333333
