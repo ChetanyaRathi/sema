@@ -5658,7 +5658,7 @@
       "name": "angle",
       "module": "math",
       "section": "Complex Polar Conversion",
-      "summary": "Return the angle (argument) of a complex number in radians, in the range (-π, π]. For a complex number a+bi, returns atan2(b, a). For a positive real number, returns 0; for a negative real number, returns π.",
+      "summary": "Return the angle (argument) of a complex number in radians, in the range (-π, π]. For a complex number a+bi this is `atan2(b, a)`; a positive real returns `0.0` and a negative real returns π. The result is always inexact — it comes out of a floating-point `atan2`, so even exact inputs produce a float.",
       "params": [
         {
           "name": "z",
@@ -5666,10 +5666,17 @@
         }
       ],
       "returns": "number",
-      "examples": [
-        "(angle 3+4i)           ; => 0.9273 (atan2(4, 3))\n(angle 5)              ; => 0.0\n(angle -5)             ; => 3.1416 (π)\n(angle 0+1i)           ; => 1.5708 (π/2)"
+      "see_also": [
+        "magnitude",
+        "make-polar",
+        "make-rectangular",
+        "real-part",
+        "imag-part"
       ],
-      "body": "Return the angle (argument) of a complex number in radians, in the range (-π, π]. For a complex number a+bi, returns atan2(b, a). For a positive real number, returns 0; for a negative real number, returns π.\n\n```sema\n(angle 3+4i)           ; => 0.9273 (atan2(4, 3))\n(angle 5)              ; => 0.0\n(angle -5)             ; => 3.1416 (π)\n(angle 0+1i)           ; => 1.5708 (π/2)\n```"
+      "examples": [
+        "(angle 3+4i)   ; => 0.9272952180016122   ; atan2(4, 3)\n(angle 5)      ; => 0.0                   ; positive real\n(angle -5)     ; => 3.141592653589793     ; π\n(angle 0+1i)   ; => 1.5707963267948966    ; π/2"
+      ],
+      "body": "Return the angle (argument) of a complex number in radians, in the range (-π, π]. For a complex number a+bi this is `atan2(b, a)`; a positive real returns `0.0` and a negative real returns π. The result is always inexact — it comes out of a floating-point `atan2`, so even exact inputs produce a float.\n\n```sema\n(angle 3+4i)   ; => 0.9272952180016122   ; atan2(4, 3)\n(angle 5)      ; => 0.0                   ; positive real\n(angle -5)     ; => 3.141592653589793     ; π\n(angle 0+1i)   ; => 1.5707963267948966    ; π/2\n```\n\nTogether with [`magnitude`](#magnitude) this gives the polar form of a number,\nand [`make-polar`](#make-polar) reconstructs a complex number from magnitude and\nangle."
     },
     {
       "name": "bit/and",
@@ -5810,7 +5817,7 @@
       "name": "denominator",
       "module": "math",
       "section": "Rational Accessors",
-      "summary": "Return the denominator of a rational number. For integers, returns 1 (since an integer n is n/1). For floats, no-op (floats have no rational decomposition).",
+      "summary": "Return the denominator of an exact rational number, always stored in lowest terms. An integer `n` counts as `n/1`, so its denominator is `1`. Applying it to a float or a complex number raises a type error (`expected rational, got float`) — floats have no canonical rational decomposition here, so convert with [`exact`](../exact) first if that is what you want.",
       "params": [
         {
           "name": "x",
@@ -5818,10 +5825,13 @@
         }
       ],
       "returns": "integer",
-      "examples": [
-        "(denominator 22/7)    ; => 7\n(denominator 1/2)     ; => 2\n(denominator 42)      ; => 1"
+      "see_also": [
+        "numerator"
       ],
-      "body": "Return the denominator of a rational number. For integers, returns 1 (since an integer n is n/1). For floats, no-op (floats have no rational decomposition).\n\n```sema\n(denominator 22/7)    ; => 7\n(denominator 1/2)     ; => 2\n(denominator 42)      ; => 1\n```"
+      "examples": [
+        "(denominator 22/7)    ; => 7\n(denominator 1/2)     ; => 2\n(denominator -6/4)    ; => 2    ; reduced to -3/2 first\n(denominator 42)      ; => 1    ; integers are n/1\n(denominator 0)       ; => 1"
+      ],
+      "body": "Return the denominator of an exact rational number, always stored in lowest terms. An integer `n` counts as `n/1`, so its denominator is `1`. Applying it to a float or a complex number raises a type error (`expected rational, got float`) — floats have no canonical rational decomposition here, so convert with [`exact`](../exact) first if that is what you want.\n\n```sema\n(denominator 22/7)    ; => 7\n(denominator 1/2)     ; => 2\n(denominator -6/4)    ; => 2    ; reduced to -3/2 first\n(denominator 42)      ; => 1    ; integers are n/1\n(denominator 0)       ; => 1\n```\n\nPairs with [`numerator`](#numerator): `(/ (numerator x) (denominator x))`\nreconstructs the reduced fraction."
     },
     {
       "name": "e",
@@ -5837,7 +5847,7 @@
       "name": "exact",
       "module": "math",
       "section": "Exactness Conversion",
-      "summary": "Convert a number to its exact form. Finite floats are converted to their exact rational representation; inexact components of complex numbers are converted. Already-exact numbers are returned unchanged.",
+      "summary": "Convert a number to its exact form. A finite float is converted to the *exact* rational it actually represents (not a rounded-off approximation), then reduced and normalized to an integer when the denominator is 1. Inexact components of a complex number are converted the same way, and already-exact numbers are returned unchanged. [`inexact->exact`](../inexact-to-exact) is the longer R7RS spelling of this same operation.",
       "params": [
         {
           "name": "x",
@@ -5845,16 +5855,21 @@
         }
       ],
       "returns": "number",
-      "examples": [
-        "(exact 0.5)           ; => 1/2\n(exact 2.0)           ; => 2 (normalizes to integer)\n(exact 3.14159)       ; => a rational very close to pi\n(exact 1/3)           ; => 1/3 (already exact)\n(exact 3.0+4.0i)      ; => 3+4i"
+      "see_also": [
+        "inexact",
+        "inexact->exact",
+        "exact->inexact"
       ],
-      "body": "Convert a number to its exact form. Finite floats are converted to their exact rational representation; inexact components of complex numbers are converted. Already-exact numbers are returned unchanged.\n\n```sema\n(exact 0.5)           ; => 1/2\n(exact 2.0)           ; => 2 (normalizes to integer)\n(exact 3.14159)       ; => a rational very close to pi\n(exact 1/3)           ; => 1/3 (already exact)\n(exact 3.0+4.0i)      ; => 3+4i\n```"
+      "examples": [
+        "(exact 0.5)       ; => 1/2\n(exact 0.25)      ; => 1/4\n(exact 2.0)       ; => 2                              ; normalizes to integer\n(exact 1/3)       ; => 1/3                            ; already exact\n(exact 3.0+4.0i)  ; => 3+4i\n(exact 3.14159)   ; => 3537115888337719/1125899906842624"
+      ],
+      "body": "Convert a number to its exact form. A finite float is converted to the *exact* rational it actually represents (not a rounded-off approximation), then reduced and normalized to an integer when the denominator is 1. Inexact components of a complex number are converted the same way, and already-exact numbers are returned unchanged. [`inexact->exact`](../inexact-to-exact) is the longer R7RS spelling of this same operation.\n\n```sema\n(exact 0.5)       ; => 1/2\n(exact 0.25)      ; => 1/4\n(exact 2.0)       ; => 2                              ; normalizes to integer\n(exact 1/3)       ; => 1/3                            ; already exact\n(exact 3.0+4.0i)  ; => 3+4i\n(exact 3.14159)   ; => 3537115888337719/1125899906842624\n```\n\nThe last result looks surprising but is correct: `3.14159` is not exactly\nrepresentable in binary, so the stored double is a specific fraction with a\npower-of-two denominator, and `exact` returns that fraction verbatim. To get a\ntidy approximation like `22/7` instead, use [`rationalize`](../rationalize)."
     },
     {
       "name": "exact->inexact",
       "module": "math",
       "section": "Exactness Conversion",
-      "summary": "Convert a number to inexact form (floating-point). All components are converted to `f64`. Identical to [`inexact`](./inexact) — both names are registered (R7RS `exact->inexact` and the shorthand `inexact`); use either.",
+      "summary": "Convert a number to inexact (floating-point) form. Every component is converted to `f64`, so an exact rational becomes its nearest double and a complex number's parts each become floats. This is the R7RS spelling; [`inexact`](../inexact) is the shorthand for the same operation and either name works.",
       "params": [
         {
           "name": "x",
@@ -5862,16 +5877,21 @@
         }
       ],
       "returns": "number",
-      "examples": [
-        "(exact->inexact 1/3)        ; => 0.3333333333333333\n(exact->inexact 42)         ; => 42.0\n(exact->inexact 3+4i)       ; => 3.0+4.0i"
+      "see_also": [
+        "inexact",
+        "exact",
+        "inexact->exact"
       ],
-      "body": "Convert a number to inexact form (floating-point). All components are converted to `f64`. Identical to [`inexact`](./inexact) — both names are registered (R7RS `exact->inexact` and the shorthand `inexact`); use either.\n\n```sema\n(exact->inexact 1/3)        ; => 0.3333333333333333\n(exact->inexact 42)         ; => 42.0\n(exact->inexact 3+4i)       ; => 3.0+4.0i\n```"
+      "examples": [
+        "(exact->inexact 1/3)   ; => 0.3333333333333333   ; nearest f64\n(exact->inexact 42)    ; => 42.0\n(exact->inexact 3+4i)  ; => 3.0+4.0i"
+      ],
+      "body": "Convert a number to inexact (floating-point) form. Every component is converted to `f64`, so an exact rational becomes its nearest double and a complex number's parts each become floats. This is the R7RS spelling; [`inexact`](../inexact) is the shorthand for the same operation and either name works.\n\n```sema\n(exact->inexact 1/3)   ; => 0.3333333333333333   ; nearest f64\n(exact->inexact 42)    ; => 42.0\n(exact->inexact 3+4i)  ; => 3.0+4.0i\n```\n\nThe inverse direction is [`inexact->exact`](../inexact-to-exact) / [`exact`](../exact)."
     },
     {
       "name": "exact-integer-sqrt",
       "module": "math",
       "section": "Integer Square Root",
-      "summary": "Compute the integer square root of a non-negative integer. Returns a list `(s r)` where `s²+r = n`, `0 ≤ r`, and both are exact integers. This works for arbitrarily large bignums.",
+      "summary": "Compute the exact integer square root of a non-negative integer. Returns a two-element list `(s r)` where `s` is the floor of √n and `r` is the remainder, so that `s*s + r = n` with `0 ≤ r ≤ 2s`. Both values are exact integers and the computation is exact for arbitrarily large bignums (no float rounding). A negative argument raises an error (`argument must be non-negative`).",
       "params": [
         {
           "name": "n",
@@ -5879,10 +5899,14 @@
         }
       ],
       "returns": "list",
-      "examples": [
-        "(exact-integer-sqrt 17)        ; => (4 1)    ; 4²+1 = 17\n(exact-integer-sqrt 100)       ; => (10 0)\n(exact-integer-sqrt 0)         ; => (0 0)\n(exact-integer-sqrt 1000000)   ; => (1000 0)"
+      "see_also": [
+        "exact",
+        "quotient"
       ],
-      "body": "Compute the integer square root of a non-negative integer. Returns a list `(s r)` where `s²+r = n`, `0 ≤ r`, and both are exact integers. This works for arbitrarily large bignums.\n\n```sema\n(exact-integer-sqrt 17)        ; => (4 1)    ; 4²+1 = 17\n(exact-integer-sqrt 100)       ; => (10 0)\n(exact-integer-sqrt 0)         ; => (0 0)\n(exact-integer-sqrt 1000000)   ; => (1000 0)\n```"
+      "examples": [
+        "(exact-integer-sqrt 17)                ; => (4 1)   ; 4*4 + 1 = 17\n(exact-integer-sqrt 100)               ; => (10 0)  ; perfect square\n(exact-integer-sqrt 0)                 ; => (0 0)\n(exact-integer-sqrt 15241578750190521) ; => (123456789 0)  ; exact on bignums"
+      ],
+      "body": "Compute the exact integer square root of a non-negative integer. Returns a two-element list `(s r)` where `s` is the floor of √n and `r` is the remainder, so that `s*s + r = n` with `0 ≤ r ≤ 2s`. Both values are exact integers and the computation is exact for arbitrarily large bignums (no float rounding). A negative argument raises an error (`argument must be non-negative`).\n\n```sema\n(exact-integer-sqrt 17)                ; => (4 1)   ; 4*4 + 1 = 17\n(exact-integer-sqrt 100)               ; => (10 0)  ; perfect square\n(exact-integer-sqrt 0)                 ; => (0 0)\n(exact-integer-sqrt 15241578750190521) ; => (123456789 0)  ; exact on bignums\n```"
     },
     {
       "name": "expt",
@@ -5908,7 +5932,7 @@
     {
       "name": "float",
       "module": "math",
-      "summary": "Convert a number or numeric string to a float. Signals an error if a string cannot be parsed as a float.",
+      "summary": "Convert a number or numeric string to a float. Any real number works — bignums and exact rationals project to the nearest float (like `exact->inexact`); complex numbers are rejected (no real projection). Signals an error if a string cannot be parsed as a float.",
       "params": [
         {
           "name": "x",
@@ -5917,9 +5941,9 @@
       ],
       "returns": "float",
       "examples": [
-        "(float 5)      ; => 5.0\n(float \"3.5\")  ; => 3.5"
+        "(float 5)      ; => 5.0\n(float \"3.5\")  ; => 3.5\n(float 1/2)    ; => 0.5"
       ],
-      "body": "Convert a number or numeric string to a float. Signals an error if a string cannot be parsed as a float.\n\n```sema\n(float 5)      ; => 5.0\n(float \"3.5\")  ; => 3.5\n```"
+      "body": "Convert a number or numeric string to a float. Any real number works — bignums and exact rationals project to the nearest float (like `exact->inexact`); complex numbers are rejected (no real projection). Signals an error if a string cannot be parsed as a float.\n\n```sema\n(float 5)      ; => 5.0\n(float \"3.5\")  ; => 3.5\n(float 1/2)    ; => 0.5\n```"
     },
     {
       "name": "floor",
@@ -5942,7 +5966,7 @@
       "name": "gcd",
       "module": "math",
       "section": "Integer Math",
-      "summary": "Greatest common divisor: the largest non-negative integer that divides all arguments. Variadic and bignum-aware; `(gcd)` with no arguments is `0` (the identity of the fold), per R7RS. Pairs with [`lcm`](#lcm).",
+      "summary": "Greatest common divisor: the largest non-negative integer that divides every argument. Variadic and bignum-aware, and it ignores the sign of its arguments (the result is always non-negative). `(gcd)` with no arguments is `0` — the identity of the fold — per R7RS, and `(gcd n)` is `|n|`. Pairs with [`lcm`](#lcm); [`math/gcd`](../math-gcd) is the namespaced alias.",
       "params": [
         {
           "name": "ns",
@@ -5950,16 +5974,20 @@
         }
       ],
       "returns": "integer",
-      "examples": [
-        "(gcd 12 8)     ; => 4\n(gcd 15 10 25) ; => 5\n(gcd 7 13)     ; => 1   ; coprime\n(gcd)          ; => 0"
+      "see_also": [
+        "lcm",
+        "math/gcd"
       ],
-      "body": "Greatest common divisor: the largest non-negative integer that divides all arguments. Variadic and bignum-aware; `(gcd)` with no arguments is `0` (the identity of the fold), per R7RS. Pairs with [`lcm`](#lcm).\n\n```sema\n(gcd 12 8)     ; => 4\n(gcd 15 10 25) ; => 5\n(gcd 7 13)     ; => 1   ; coprime\n(gcd)          ; => 0\n```"
+      "examples": [
+        "(gcd 12 8)     ; => 4\n(gcd 15 10 25) ; => 5\n(gcd -12 8)    ; => 4    ; sign-independent\n(gcd 7 13)     ; => 1    ; coprime\n(gcd)          ; => 0"
+      ],
+      "body": "Greatest common divisor: the largest non-negative integer that divides every argument. Variadic and bignum-aware, and it ignores the sign of its arguments (the result is always non-negative). `(gcd)` with no arguments is `0` — the identity of the fold — per R7RS, and `(gcd n)` is `|n|`. Pairs with [`lcm`](#lcm); [`math/gcd`](../math-gcd) is the namespaced alias.\n\n```sema\n(gcd 12 8)     ; => 4\n(gcd 15 10 25) ; => 5\n(gcd -12 8)    ; => 4    ; sign-independent\n(gcd 7 13)     ; => 1    ; coprime\n(gcd)          ; => 0\n```"
     },
     {
       "name": "imag-part",
       "module": "math",
       "section": "Complex Accessors",
-      "summary": "Return the imaginary part of a complex number. For real numbers, returns exact 0.",
+      "summary": "Return the imaginary part of a complex number. For any real number (integer, rational, or float) the imaginary part is exact `0`. The result preserves the exactness of the stored component, so an exact complex yields an exact imaginary part.",
       "params": [
         {
           "name": "z",
@@ -5967,16 +5995,22 @@
         }
       ],
       "returns": "number",
-      "examples": [
-        "(imag-part 3+4i)       ; => 4\n(imag-part 2.5)        ; => 0\n(imag-part 1/3)        ; => 0\n(imag-part 5i)         ; => 5"
+      "see_also": [
+        "real-part",
+        "make-rectangular",
+        "magnitude",
+        "angle"
       ],
-      "body": "Return the imaginary part of a complex number. For real numbers, returns exact 0.\n\n```sema\n(imag-part 3+4i)       ; => 4\n(imag-part 2.5)        ; => 0\n(imag-part 1/3)        ; => 0\n(imag-part 5i)         ; => 5\n```"
+      "examples": [
+        "(imag-part 3+4i)   ; => 4\n(imag-part 5i)     ; => 5\n(imag-part 2.5)    ; => 0    ; real number\n(imag-part 1/3)    ; => 0"
+      ],
+      "body": "Return the imaginary part of a complex number. For any real number (integer, rational, or float) the imaginary part is exact `0`. The result preserves the exactness of the stored component, so an exact complex yields an exact imaginary part.\n\n```sema\n(imag-part 3+4i)   ; => 4\n(imag-part 5i)     ; => 5\n(imag-part 2.5)    ; => 0    ; real number\n(imag-part 1/3)    ; => 0\n```\n\nThe companion accessor is [`real-part`](../real-part); together they invert\n[`make-rectangular`](../make-rectangular)."
     },
     {
       "name": "inexact",
       "module": "math",
       "section": "Exactness Conversion",
-      "summary": "Convert a number to inexact form (floating-point). All components are converted to `f64`. Useful for inexact contagion or for forcing floating-point arithmetic.",
+      "summary": "Convert a number to inexact (floating-point) form. Every component is converted to `f64`, so an exact rational becomes its nearest double and each part of a complex number becomes a float. Useful for forcing floating-point arithmetic or triggering inexact contagion. [`exact->inexact`](../exact-to-inexact) is the longer R7RS spelling of the same operation.",
       "params": [
         {
           "name": "x",
@@ -5984,16 +6018,21 @@
         }
       ],
       "returns": "number",
-      "examples": [
-        "(inexact 1/3)        ; => 0.3333333333333333\n(inexact 42)         ; => 42.0\n(inexact 3+4i)       ; => 3.0+4.0i\n(inexact 3.14)       ; => 3.14 (already inexact)"
+      "see_also": [
+        "exact",
+        "exact->inexact",
+        "inexact->exact"
       ],
-      "body": "Convert a number to inexact form (floating-point). All components are converted to `f64`. Useful for inexact contagion or for forcing floating-point arithmetic.\n\n```sema\n(inexact 1/3)        ; => 0.3333333333333333\n(inexact 42)         ; => 42.0\n(inexact 3+4i)       ; => 3.0+4.0i\n(inexact 3.14)       ; => 3.14 (already inexact)\n```"
+      "examples": [
+        "(inexact 1/3)   ; => 0.3333333333333333   ; nearest f64\n(inexact 42)    ; => 42.0\n(inexact 3+4i)  ; => 3.0+4.0i\n(inexact 3.14)  ; => 3.14                  ; already inexact"
+      ],
+      "body": "Convert a number to inexact (floating-point) form. Every component is converted to `f64`, so an exact rational becomes its nearest double and each part of a complex number becomes a float. Useful for forcing floating-point arithmetic or triggering inexact contagion. [`exact->inexact`](../exact-to-inexact) is the longer R7RS spelling of the same operation.\n\n```sema\n(inexact 1/3)   ; => 0.3333333333333333   ; nearest f64\n(inexact 42)    ; => 42.0\n(inexact 3+4i)  ; => 3.0+4.0i\n(inexact 3.14)  ; => 3.14                  ; already inexact\n```\n\nThe inverse direction is [`exact`](../exact) / [`inexact->exact`](../inexact-to-exact)."
     },
     {
       "name": "inexact->exact",
       "module": "math",
       "section": "Exactness Conversion",
-      "summary": "Convert a number to its exact form. Finite floats are converted to their exact rational representation; inexact components of complex numbers are converted. Already-exact numbers are returned unchanged. `exact` is the shorter R7RS spelling of the same operation.",
+      "summary": "Convert a number to its exact form. A finite float becomes the exact rational it actually represents (reduced, and normalized to an integer when possible); inexact components of a complex number are converted the same way, and already-exact numbers pass through unchanged. [`exact`](../exact) is the shorter R7RS spelling of this identical operation.",
       "params": [
         {
           "name": "x",
@@ -6001,15 +6040,20 @@
         }
       ],
       "returns": "number",
-      "examples": [
-        "(inexact->exact 0.5)           ; => 1/2\n(inexact->exact 2.0)           ; => 2 (normalizes to integer)\n(inexact->exact 3.0+4.0i)      ; => 3+4i"
+      "see_also": [
+        "exact",
+        "inexact",
+        "exact->inexact"
       ],
-      "body": "Convert a number to its exact form. Finite floats are converted to their exact rational representation; inexact components of complex numbers are converted. Already-exact numbers are returned unchanged. `exact` is the shorter R7RS spelling of the same operation.\n\n```sema\n(inexact->exact 0.5)           ; => 1/2\n(inexact->exact 2.0)           ; => 2 (normalizes to integer)\n(inexact->exact 3.0+4.0i)      ; => 3+4i\n```"
+      "examples": [
+        "(inexact->exact 0.5)       ; => 1/2\n(inexact->exact 2.0)       ; => 2                              ; normalizes to integer\n(inexact->exact 0.1)       ; => 3602879701896397/36028797018963968\n(inexact->exact 3.0+4.0i)  ; => 3+4i"
+      ],
+      "body": "Convert a number to its exact form. A finite float becomes the exact rational it actually represents (reduced, and normalized to an integer when possible); inexact components of a complex number are converted the same way, and already-exact numbers pass through unchanged. [`exact`](../exact) is the shorter R7RS spelling of this identical operation.\n\n```sema\n(inexact->exact 0.5)       ; => 1/2\n(inexact->exact 2.0)       ; => 2                              ; normalizes to integer\n(inexact->exact 0.1)       ; => 3602879701896397/36028797018963968\n(inexact->exact 3.0+4.0i)  ; => 3+4i\n```\n\n`0.1` shows the exactness caveat: it has no finite binary expansion, so the\nexact value of the stored double is that large power-of-two fraction, not `1/10`.\nThe inverse direction is [`exact->inexact`](../exact-to-inexact) / [`inexact`](../inexact)."
     },
     {
       "name": "int",
       "module": "math",
-      "summary": "Convert a number or numeric string to an integer. Floats are truncated **toward zero** (the fractional part is dropped, not rounded). Signals an error if a string cannot be parsed as an integer.",
+      "summary": "Convert a number or numeric string to an integer. Floats and exact rationals are truncated **toward zero** (the fractional part is dropped, not rounded); exact integers of any size pass through unchanged, so bignums stay exact. Signals an error if a string cannot be parsed as an integer.",
       "params": [
         {
           "name": "x",
@@ -6020,13 +6064,13 @@
       "examples": [
         "(int 3.9)     ; => 3\n(int -3.9)    ; => -3   (toward zero, not -4)\n(int \"42\")    ; => 42\n(floor -3.9)  ; => -4   (contrast: rounds down)"
       ],
-      "body": "Convert a number or numeric string to an integer. Floats are truncated **toward zero** (the fractional part is dropped, not rounded). Signals an error if a string cannot be parsed as an integer.\n\nTruncation differs from `floor` on negatives: `int` chops toward zero while `floor` always rounds down. `(int -3.9)` is `-3`, but `(floor -3.9)` is `-4`. Use `int` for \"drop the decimals\", `floor`/`ceil` when you need a specific rounding direction.\n\n```sema\n(int 3.9)     ; => 3\n(int -3.9)    ; => -3   (toward zero, not -4)\n(int \"42\")    ; => 42\n(floor -3.9)  ; => -4   (contrast: rounds down)\n```"
+      "body": "Convert a number or numeric string to an integer. Floats and exact rationals are truncated **toward zero** (the fractional part is dropped, not rounded); exact integers of any size pass through unchanged, so bignums stay exact. Signals an error if a string cannot be parsed as an integer.\n\nTruncation differs from `floor` on negatives: `int` chops toward zero while `floor` always rounds down. `(int -3.9)` is `-3`, but `(floor -3.9)` is `-4`. Use `int` for \"drop the decimals\", `floor`/`ceil` when you need a specific rounding direction.\n\n```sema\n(int 3.9)     ; => 3\n(int -3.9)    ; => -3   (toward zero, not -4)\n(int \"42\")    ; => 42\n(floor -3.9)  ; => -4   (contrast: rounds down)\n```"
     },
     {
       "name": "lcm",
       "module": "math",
       "section": "Integer Math",
-      "summary": "Least common multiple: the smallest non-negative integer that every argument divides. Variadic and bignum-aware; `(lcm)` with no arguments is `1` (the identity of the fold), per R7RS. Pairs with [`gcd`](#gcd).",
+      "summary": "Least common multiple: the smallest non-negative integer that every argument divides evenly. Variadic and bignum-aware, and it ignores the sign of its arguments (the result is always non-negative). If any argument is `0` the result is `0`. `(lcm)` with no arguments is `1` — the identity of the fold — per R7RS. Pairs with [`gcd`](#gcd); [`math/lcm`](../math-lcm) is the namespaced alias.",
       "params": [
         {
           "name": "ns",
@@ -6034,10 +6078,14 @@
         }
       ],
       "returns": "integer",
-      "examples": [
-        "(lcm 4 6)      ; => 12\n(lcm 2 3 4)    ; => 12\n(lcm 7 13)     ; => 91  ; coprime\n(lcm)          ; => 1"
+      "see_also": [
+        "gcd",
+        "math/lcm"
       ],
-      "body": "Least common multiple: the smallest non-negative integer that every argument divides. Variadic and bignum-aware; `(lcm)` with no arguments is `1` (the identity of the fold), per R7RS. Pairs with [`gcd`](#gcd).\n\n```sema\n(lcm 4 6)      ; => 12\n(lcm 2 3 4)    ; => 12\n(lcm 7 13)     ; => 91  ; coprime\n(lcm)          ; => 1\n```"
+      "examples": [
+        "(lcm 4 6)      ; => 12\n(lcm 2 3 4)    ; => 12\n(lcm -4 6)     ; => 12   ; sign-independent\n(lcm 0 5)      ; => 0    ; zero absorbs\n(lcm 7 13)     ; => 91   ; coprime\n(lcm)          ; => 1"
+      ],
+      "body": "Least common multiple: the smallest non-negative integer that every argument divides evenly. Variadic and bignum-aware, and it ignores the sign of its arguments (the result is always non-negative). If any argument is `0` the result is `0`. `(lcm)` with no arguments is `1` — the identity of the fold — per R7RS. Pairs with [`gcd`](#gcd); [`math/lcm`](../math-lcm) is the namespaced alias.\n\n```sema\n(lcm 4 6)      ; => 12\n(lcm 2 3 4)    ; => 12\n(lcm -4 6)     ; => 12   ; sign-independent\n(lcm 0 5)      ; => 0    ; zero absorbs\n(lcm 7 13)     ; => 91   ; coprime\n(lcm)          ; => 1\n```"
     },
     {
       "name": "log",
@@ -6060,7 +6108,7 @@
       "name": "magnitude",
       "module": "math",
       "section": "Complex Polar Conversion",
-      "summary": "Return the magnitude (absolute value) of a complex number. For a complex number a+bi, returns √(a²+b²). For real numbers, returns the absolute value.",
+      "summary": "Return the magnitude (modulus, absolute value) of a number. For a complex number a+bi this is `√(a²+b²)`, computed in floating point — so the magnitude of a complex number is inexact. For a real number it is just the absolute value and preserves exactness (an exact real stays exact).",
       "params": [
         {
           "name": "z",
@@ -6068,16 +6116,23 @@
         }
       ],
       "returns": "number",
-      "examples": [
-        "(magnitude 3+4i)       ; => 5.0\n(magnitude -5)         ; => 5\n(magnitude 1/3)        ; => 1/3\n(magnitude 0)          ; => 0"
+      "see_also": [
+        "angle",
+        "make-polar",
+        "make-rectangular",
+        "real-part",
+        "imag-part"
       ],
-      "body": "Return the magnitude (absolute value) of a complex number. For a complex number a+bi, returns √(a²+b²). For real numbers, returns the absolute value.\n\n```sema\n(magnitude 3+4i)       ; => 5.0\n(magnitude -5)         ; => 5\n(magnitude 1/3)        ; => 1/3\n(magnitude 0)          ; => 0\n```"
+      "examples": [
+        "(magnitude 3+4i)   ; => 5.0   ; √(9+16), inexact\n(magnitude -3-4i)  ; => 5.0\n(magnitude -5)     ; => 5     ; real: exact absolute value\n(magnitude 1/3)    ; => 1/3"
+      ],
+      "body": "Return the magnitude (modulus, absolute value) of a number. For a complex number a+bi this is `√(a²+b²)`, computed in floating point — so the magnitude of a complex number is inexact. For a real number it is just the absolute value and preserves exactness (an exact real stays exact).\n\n```sema\n(magnitude 3+4i)   ; => 5.0   ; √(9+16), inexact\n(magnitude -3-4i)  ; => 5.0\n(magnitude -5)     ; => 5     ; real: exact absolute value\n(magnitude 1/3)    ; => 1/3\n```\n\nPairs with [`angle`](../angle) to describe a number in polar form;\n[`make-polar`](../make-polar) goes the other way."
     },
     {
       "name": "make-polar",
       "module": "math",
       "section": "Complex Construction",
-      "summary": "Construct a complex number from polar coordinates (magnitude and angle in radians). Converts to rectangular form internally. If the angle is zero or a multiple of π, returns a real number.",
+      "summary": "Construct a complex number from polar coordinates: magnitude `r` and angle `θ` in radians, giving `r·cos θ + r·sin θ·i`. The conversion runs through `cos`/`sin` in floating point, so the result is always an inexact complex number (both parts are floats) — even when the angle is `0`.",
       "params": [
         {
           "name": "magnitude",
@@ -6089,16 +6144,23 @@
         }
       ],
       "returns": "number",
-      "examples": [
-        "(make-polar 1 0)                 ; => 1\n(make-polar 5 (math/atan2 3 4))  ; => 4.0+3.0i (approximately)\n(make-polar 2 (/ math/pi 2))     ; => 0+2i (π/2 radians)"
+      "see_also": [
+        "make-rectangular",
+        "magnitude",
+        "angle",
+        "real-part",
+        "imag-part"
       ],
-      "body": "Construct a complex number from polar coordinates (magnitude and angle in radians). Converts to rectangular form internally. If the angle is zero or a multiple of π, returns a real number.\n\n```sema\n(make-polar 1 0)                 ; => 1\n(make-polar 5 (math/atan2 3 4))  ; => 4.0+3.0i (approximately)\n(make-polar 2 (/ math/pi 2))     ; => 0+2i (π/2 radians)\n```"
+      "examples": [
+        "(make-polar 2 0)                  ; => 2.0+0.0i\n(make-polar 5 (math/atan2 3 4))   ; => 4.0+3.0i   ; magnitude 5 at atan2(3,4)\n(make-polar 1 pi)                 ; => -1.0+0.00000000000000012246467991473532i"
+      ],
+      "body": "Construct a complex number from polar coordinates: magnitude `r` and angle `θ` in radians, giving `r·cos θ + r·sin θ·i`. The conversion runs through `cos`/`sin` in floating point, so the result is always an inexact complex number (both parts are floats) — even when the angle is `0`.\n\n```sema\n(make-polar 2 0)                  ; => 2.0+0.0i\n(make-polar 5 (math/atan2 3 4))   ; => 4.0+3.0i   ; magnitude 5 at atan2(3,4)\n(make-polar 1 pi)                 ; => -1.0+0.00000000000000012246467991473532i\n```\n\nThe tiny `1.22e-16` imaginary part in the last example is genuine floating-point\ndust: `sin(π)` is not exactly `0` in `f64`. Polar conversions carry this kind of\nrounding, so compare results with a tolerance rather than for exact equality.\n[`make-rectangular`](../make-rectangular) builds a complex number from real and\nimaginary parts instead, and [`magnitude`](../magnitude)/[`angle`](../angle) recover the polar coordinates."
     },
     {
       "name": "make-rectangular",
       "module": "math",
       "section": "Complex Construction",
-      "summary": "Construct a complex number from real and imaginary parts. If the imaginary part is exact zero and the real part is real (not complex), returns just the real part.",
+      "summary": "Construct a complex number from a real part and an imaginary part. If the imaginary part is *exact* zero (and the real part is itself real), the result collapses to just the real part; an *inexact* zero imaginary part (`0.0`) keeps the number complex, since exactness is part of its identity.",
       "params": [
         {
           "name": "real",
@@ -6110,10 +6172,17 @@
         }
       ],
       "returns": "number",
-      "examples": [
-        "(make-rectangular 3 4)       ; => 3+4i\n(make-rectangular 2 0)       ; => 2 (imaginary part is exact zero)\n(make-rectangular 3.5 2.0)   ; => 3.5+2.0i\n(make-rectangular 1/3 1/2)   ; => 1/3+1/2i"
+      "see_also": [
+        "make-polar",
+        "real-part",
+        "imag-part",
+        "magnitude",
+        "angle"
       ],
-      "body": "Construct a complex number from real and imaginary parts. If the imaginary part is exact zero and the real part is real (not complex), returns just the real part.\n\n```sema\n(make-rectangular 3 4)       ; => 3+4i\n(make-rectangular 2 0)       ; => 2 (imaginary part is exact zero)\n(make-rectangular 3.5 2.0)   ; => 3.5+2.0i\n(make-rectangular 1/3 1/2)   ; => 1/3+1/2i\n```"
+      "examples": [
+        "(make-rectangular 3 4)       ; => 3+4i\n(make-rectangular 1/3 1/2)   ; => 1/3+1/2i\n(make-rectangular 3.5 2.0)   ; => 3.5+2.0i\n(make-rectangular 2 0)       ; => 2       ; exact-zero imaginary collapses\n(make-rectangular 3 0.0)     ; => 3+0.0i  ; inexact zero stays complex"
+      ],
+      "body": "Construct a complex number from a real part and an imaginary part. If the imaginary part is *exact* zero (and the real part is itself real), the result collapses to just the real part; an *inexact* zero imaginary part (`0.0`) keeps the number complex, since exactness is part of its identity.\n\n```sema\n(make-rectangular 3 4)       ; => 3+4i\n(make-rectangular 1/3 1/2)   ; => 1/3+1/2i\n(make-rectangular 3.5 2.0)   ; => 3.5+2.0i\n(make-rectangular 2 0)       ; => 2       ; exact-zero imaginary collapses\n(make-rectangular 3 0.0)     ; => 3+0.0i  ; inexact zero stays complex\n```\n\n[`make-polar`](../make-polar) is the polar-coordinate constructor;\n[`real-part`](../real-part) and [`imag-part`](../imag-part) take the pieces back out."
     },
     {
       "name": "math/acos",
@@ -6224,7 +6293,7 @@
       "name": "math/gcd",
       "module": "math",
       "section": "Integer Math",
-      "summary": "Greatest common divisor: the largest non-negative integer that divides all arguments. Variadic and bignum-aware; `(math/gcd)` with no arguments is `0` (the identity of the fold), per R7RS. Namespaced alias of [`gcd`](#gcd); pairs with [`math/lcm`](#math-lcm).",
+      "summary": "Greatest common divisor: the largest non-negative integer that divides every argument. Variadic and bignum-aware, and it ignores the sign of its arguments (the result is always non-negative). `(math/gcd)` with no arguments is `0` — the identity of the fold — per R7RS. This is the slash-namespaced spelling of [`gcd`](../gcd) (same implementation, identical behavior); pairs with [`math/lcm`](../math-lcm).",
       "params": [
         {
           "name": "ns",
@@ -6232,10 +6301,14 @@
         }
       ],
       "returns": "integer",
-      "examples": [
-        "(math/gcd 12 8)     ; => 4\n(math/gcd 15 10 25) ; => 5\n(math/gcd 7 13)     ; => 1   ; coprime\n(math/gcd)          ; => 0"
+      "see_also": [
+        "gcd",
+        "math/lcm"
       ],
-      "body": "Greatest common divisor: the largest non-negative integer that divides all arguments. Variadic and bignum-aware; `(math/gcd)` with no arguments is `0` (the identity of the fold), per R7RS. Namespaced alias of [`gcd`](#gcd); pairs with [`math/lcm`](#math-lcm).\n\n```sema\n(math/gcd 12 8)     ; => 4\n(math/gcd 15 10 25) ; => 5\n(math/gcd 7 13)     ; => 1   ; coprime\n(math/gcd)          ; => 0\n```"
+      "examples": [
+        "(math/gcd 12 8)     ; => 4\n(math/gcd 15 10 25) ; => 5\n(math/gcd -12 8)    ; => 4    ; sign-independent\n(math/gcd 7 13)     ; => 1    ; coprime\n(math/gcd)          ; => 0"
+      ],
+      "body": "Greatest common divisor: the largest non-negative integer that divides every argument. Variadic and bignum-aware, and it ignores the sign of its arguments (the result is always non-negative). `(math/gcd)` with no arguments is `0` — the identity of the fold — per R7RS. This is the slash-namespaced spelling of [`gcd`](../gcd) (same implementation, identical behavior); pairs with [`math/lcm`](../math-lcm).\n\n```sema\n(math/gcd 12 8)     ; => 4\n(math/gcd 15 10 25) ; => 5\n(math/gcd -12 8)    ; => 4    ; sign-independent\n(math/gcd 7 13)     ; => 1    ; coprime\n(math/gcd)          ; => 0\n```"
     },
     {
       "name": "math/infinite?",
@@ -6261,7 +6334,7 @@
       "name": "math/lcm",
       "module": "math",
       "section": "Integer Math",
-      "summary": "Least common multiple: the smallest non-negative integer that every argument divides. Variadic and bignum-aware; `(math/lcm)` with no arguments is `1` (the identity of the fold), per R7RS. Namespaced alias of [`lcm`](#lcm); pairs with [`math/gcd`](#math-gcd).",
+      "summary": "Least common multiple: the smallest non-negative integer that every argument divides evenly. Variadic and bignum-aware, sign-independent, and `0` whenever any argument is `0`. `(math/lcm)` with no arguments is `1` — the identity of the fold — per R7RS. This is the slash-namespaced spelling of [`lcm`](../lcm) (same implementation, identical behavior); pairs with [`math/gcd`](../math-gcd).",
       "params": [
         {
           "name": "ns",
@@ -6269,10 +6342,14 @@
         }
       ],
       "returns": "integer",
-      "examples": [
-        "(math/lcm 4 6)     ; => 12\n(math/lcm 2 3 4)   ; => 12\n(math/lcm 7 13)    ; => 91   ; coprime\n(math/lcm)         ; => 1"
+      "see_also": [
+        "lcm",
+        "math/gcd"
       ],
-      "body": "Least common multiple: the smallest non-negative integer that every argument divides. Variadic and bignum-aware; `(math/lcm)` with no arguments is `1` (the identity of the fold), per R7RS. Namespaced alias of [`lcm`](#lcm); pairs with [`math/gcd`](#math-gcd).\n\n```sema\n(math/lcm 4 6)     ; => 12\n(math/lcm 2 3 4)   ; => 12\n(math/lcm 7 13)    ; => 91   ; coprime\n(math/lcm)         ; => 1\n```"
+      "examples": [
+        "(math/lcm 4 6)     ; => 12\n(math/lcm 2 3 4)   ; => 12\n(math/lcm -4 6)    ; => 12   ; sign-independent\n(math/lcm 0 5)     ; => 0    ; zero absorbs\n(math/lcm 7 13)    ; => 91   ; coprime\n(math/lcm)         ; => 1"
+      ],
+      "body": "Least common multiple: the smallest non-negative integer that every argument divides evenly. Variadic and bignum-aware, sign-independent, and `0` whenever any argument is `0`. `(math/lcm)` with no arguments is `1` — the identity of the fold — per R7RS. This is the slash-namespaced spelling of [`lcm`](../lcm) (same implementation, identical behavior); pairs with [`math/gcd`](../math-gcd).\n\n```sema\n(math/lcm 4 6)     ; => 12\n(math/lcm 2 3 4)   ; => 12\n(math/lcm -4 6)    ; => 12   ; sign-independent\n(math/lcm 0 5)     ; => 0    ; zero absorbs\n(math/lcm 7 13)    ; => 91   ; coprime\n(math/lcm)         ; => 1\n```"
     },
     {
       "name": "math/lerp",
@@ -6358,7 +6435,7 @@
       "name": "math/quotient",
       "module": "math",
       "section": "Integer Math",
-      "summary": "Truncated integer division: the result takes the sign of the dividend (truncates toward zero), per R7RS. Bignum-aware; both arguments must be exact integers. Namespaced alias of [`quotient`](#quotient); pairs with [`math/remainder`](#math-remainder) so that `(+ (* (math/quotient n d) d) (math/remainder n d))` reconstructs `n`. Errors on a zero divisor.",
+      "summary": "Truncated integer division: `n ÷ d` rounded toward zero, so the result carries the sign it would have as a real quotient (`-7/2` truncates to `-3`, not floored to `-4`), per R7RS. Bignum-aware; both arguments must be exact integers, and a zero divisor raises an error. This is the slash-namespaced spelling of [`quotient`](../quotient) (same implementation, identical behavior); pairs with [`math/remainder`](../math-remainder) so that `(+ (* (math/quotient n d) d) (math/remainder n d))` reconstructs `n`.",
       "params": [
         {
           "name": "n",
@@ -6370,10 +6447,15 @@
         }
       ],
       "returns": "integer",
-      "examples": [
-        "(math/quotient 10 3)   ; => 3\n(math/quotient -7 2)   ; => -3   ; truncates toward zero (not floored to -4)\n(math/quotient 100000000000000000000 7) ; => 14285714285714285714"
+      "see_also": [
+        "quotient",
+        "math/remainder",
+        "modulo"
       ],
-      "body": "Truncated integer division: the result takes the sign of the dividend (truncates toward zero), per R7RS. Bignum-aware; both arguments must be exact integers. Namespaced alias of [`quotient`](#quotient); pairs with [`math/remainder`](#math-remainder) so that `(+ (* (math/quotient n d) d) (math/remainder n d))` reconstructs `n`. Errors on a zero divisor.\n\n```sema\n(math/quotient 10 3)   ; => 3\n(math/quotient -7 2)   ; => -3   ; truncates toward zero (not floored to -4)\n(math/quotient 100000000000000000000 7) ; => 14285714285714285714\n```"
+      "examples": [
+        "(math/quotient 10 3)   ; => 3\n(math/quotient -7 2)   ; => -3   ; truncates toward zero (not floored to -4)\n(math/quotient -7 -2)  ; => 3\n(math/quotient 100000000000000000000 7) ; => 14285714285714285714"
+      ],
+      "body": "Truncated integer division: `n ÷ d` rounded toward zero, so the result carries the sign it would have as a real quotient (`-7/2` truncates to `-3`, not floored to `-4`), per R7RS. Bignum-aware; both arguments must be exact integers, and a zero divisor raises an error. This is the slash-namespaced spelling of [`quotient`](../quotient) (same implementation, identical behavior); pairs with [`math/remainder`](../math-remainder) so that `(+ (* (math/quotient n d) d) (math/remainder n d))` reconstructs `n`.\n\n```sema\n(math/quotient 10 3)   ; => 3\n(math/quotient -7 2)   ; => -3   ; truncates toward zero (not floored to -4)\n(math/quotient -7 -2)  ; => 3\n(math/quotient 100000000000000000000 7) ; => 14285714285714285714\n```"
     },
     {
       "name": "math/radians->degrees",
@@ -6422,7 +6504,7 @@
       "name": "math/remainder",
       "module": "math",
       "section": "Integer Math",
-      "summary": "Remainder of truncated integer division: the result takes the sign of the dividend, per R7RS. Bignum-aware; both arguments must be exact integers. Namespaced alias of [`remainder`](#remainder); pairs with [`math/quotient`](#math-quotient) so that `(+ (* (math/quotient n d) d) (math/remainder n d))` reconstructs `n`. Errors on a zero divisor.",
+      "summary": "Remainder of truncated integer division: `n - d * (quotient n d)`, so the result takes the sign of the *dividend* `n`, per R7RS. Bignum-aware; both arguments must be exact integers, and a zero divisor raises an error. This is the slash-namespaced spelling of [`remainder`](../remainder) (same implementation, identical behavior); pairs with [`math/quotient`](../math-quotient) so that `(+ (* (math/quotient n d) d) (math/remainder n d))` reconstructs `n`.",
       "params": [
         {
           "name": "n",
@@ -6434,10 +6516,15 @@
         }
       ],
       "returns": "integer",
-      "examples": [
-        "(math/remainder 10 3)  ; => 1\n(math/remainder -7 2)  ; => -1   ; sign of the dividend\n(math/remainder 7 -2)  ; => 1"
+      "see_also": [
+        "remainder",
+        "math/quotient",
+        "modulo"
       ],
-      "body": "Remainder of truncated integer division: the result takes the sign of the dividend, per R7RS. Bignum-aware; both arguments must be exact integers. Namespaced alias of [`remainder`](#remainder); pairs with [`math/quotient`](#math-quotient) so that `(+ (* (math/quotient n d) d) (math/remainder n d))` reconstructs `n`. Errors on a zero divisor.\n\n```sema\n(math/remainder 10 3)  ; => 1\n(math/remainder -7 2)  ; => -1   ; sign of the dividend\n(math/remainder 7 -2)  ; => 1\n```"
+      "examples": [
+        "(math/remainder 10 3)  ; => 1\n(math/remainder -7 2)  ; => -1   ; sign of the dividend\n(math/remainder 7 -2)  ; => 1    ; still follows the dividend"
+      ],
+      "body": "Remainder of truncated integer division: `n - d * (quotient n d)`, so the result takes the sign of the *dividend* `n`, per R7RS. Bignum-aware; both arguments must be exact integers, and a zero divisor raises an error. This is the slash-namespaced spelling of [`remainder`](../remainder) (same implementation, identical behavior); pairs with [`math/quotient`](../math-quotient) so that `(+ (* (math/quotient n d) d) (math/remainder n d))` reconstructs `n`.\n\n```sema\n(math/remainder 10 3)  ; => 1\n(math/remainder -7 2)  ; => -1   ; sign of the dividend\n(math/remainder 7 -2)  ; => 1    ; still follows the dividend\n```\n\nUnlike [`modulo`](../modulo), whose result follows the divisor's sign,\n`math/remainder` follows the dividend."
     },
     {
       "name": "math/round-to",
@@ -6566,7 +6653,7 @@
       "name": "number->string",
       "module": "math",
       "section": "Number/String Conversion",
-      "summary": "Convert a number to its string representation. An optional radix parameter (2, 8, 10, or 16) selects the base for the output; only exact integers can be converted to bases other than 10.",
+      "summary": "Convert a number to its string representation. With the default radix 10 it renders any number in the tower — integers, rationals (`1/3`), floats, and complex numbers. An optional radix of 2, 8, 10, or 16 selects the output base, but only *exact integers* can be printed in a non-decimal base; passing a float, rational, or complex with a non-10 radix raises a type error (`expected exact integer`).",
       "params": [
         {
           "name": "n",
@@ -6579,16 +6666,19 @@
         }
       ],
       "returns": "string",
-      "examples": [
-        "(number->string 42)           ; => \"42\"\n(number->string 1/3)          ; => \"1/3\"\n(number->string 3.14)         ; => \"3.14\"\n(number->string 3+4i)         ; => \"3+4i\"\n(number->string 255 16)       ; => \"ff\"\n(number->string 5 2)          ; => \"101\""
+      "see_also": [
+        "string->number"
       ],
-      "body": "Convert a number to its string representation. An optional radix parameter (2, 8, 10, or 16) selects the base for the output; only exact integers can be converted to bases other than 10.\n\n```sema\n(number->string 42)           ; => \"42\"\n(number->string 1/3)          ; => \"1/3\"\n(number->string 3.14)         ; => \"3.14\"\n(number->string 3+4i)         ; => \"3+4i\"\n(number->string 255 16)       ; => \"ff\"\n(number->string 5 2)          ; => \"101\"\n```"
+      "examples": [
+        "(number->string 42)       ; => \"42\"\n(number->string 1/3)      ; => \"1/3\"\n(number->string 3.14)     ; => \"3.14\"\n(number->string 3+4i)     ; => \"3+4i\"\n(number->string 255 16)   ; => \"ff\"\n(number->string 5 2)      ; => \"101\"\n(number->string 42 8)     ; => \"52\""
+      ],
+      "body": "Convert a number to its string representation. With the default radix 10 it renders any number in the tower — integers, rationals (`1/3`), floats, and complex numbers. An optional radix of 2, 8, 10, or 16 selects the output base, but only *exact integers* can be printed in a non-decimal base; passing a float, rational, or complex with a non-10 radix raises a type error (`expected exact integer`).\n\n```sema\n(number->string 42)       ; => \"42\"\n(number->string 1/3)      ; => \"1/3\"\n(number->string 3.14)     ; => \"3.14\"\n(number->string 3+4i)     ; => \"3+4i\"\n(number->string 255 16)   ; => \"ff\"\n(number->string 5 2)      ; => \"101\"\n(number->string 42 8)     ; => \"52\"\n```\n\n[`string->number`](../string-to-number) is the inverse and round-trips with the\nsame radix."
     },
     {
       "name": "numerator",
       "module": "math",
       "section": "Rational Accessors",
-      "summary": "Return the numerator of a rational number. For integers, returns the integer itself. For floats, no-op (floats have no rational decomposition).",
+      "summary": "Return the numerator of an exact rational number, taken in lowest terms (so the sign lives on the numerator). An integer `n` is `n/1`, so its numerator is `n` itself. Applying it to a float or a complex number raises a type error (`expected rational, got float`) — convert with [`exact`](../exact) first if you need a rational.",
       "params": [
         {
           "name": "x",
@@ -6596,10 +6686,13 @@
         }
       ],
       "returns": "integer",
-      "examples": [
-        "(numerator 22/7)    ; => 22\n(numerator 1/2)     ; => 1\n(numerator 42)      ; => 42"
+      "see_also": [
+        "denominator"
       ],
-      "body": "Return the numerator of a rational number. For integers, returns the integer itself. For floats, no-op (floats have no rational decomposition).\n\n```sema\n(numerator 22/7)    ; => 22\n(numerator 1/2)     ; => 1\n(numerator 42)      ; => 42\n```"
+      "examples": [
+        "(numerator 22/7)   ; => 22\n(numerator 1/2)    ; => 1\n(numerator -6/4)   ; => -3   ; reduced to -3/2 first\n(numerator 42)     ; => 42   ; integers are n/1"
+      ],
+      "body": "Return the numerator of an exact rational number, taken in lowest terms (so the sign lives on the numerator). An integer `n` is `n/1`, so its numerator is `n` itself. Applying it to a float or a complex number raises a type error (`expected rational, got float`) — convert with [`exact`](../exact) first if you need a rational.\n\n```sema\n(numerator 22/7)   ; => 22\n(numerator 1/2)    ; => 1\n(numerator -6/4)   ; => -3   ; reduced to -3/2 first\n(numerator 42)     ; => 42   ; integers are n/1\n```\n\nPairs with [`denominator`](#denominator): `(/ (numerator x) (denominator x))`\nreconstructs the reduced fraction."
     },
     {
       "name": "pi",
@@ -6625,7 +6718,7 @@
       "name": "quotient",
       "module": "math",
       "section": "Integer Math",
-      "summary": "Truncated integer division: the result takes the sign of the dividend (truncates toward zero), per R7RS. Bignum-aware; both arguments must be exact integers. Pairs with [`remainder`](#remainder) so that `(+ (* (quotient n d) d) (remainder n d))` reconstructs `n`. Errors on a zero divisor.",
+      "summary": "Truncated integer division: `n ÷ d` rounded toward zero, so the result carries the sign it would have as a real quotient (`-7/2` truncates to `-3`, not floored to `-4`), per R7RS. Bignum-aware; both arguments must be exact integers, and a zero divisor raises an error (`division by zero`). Pairs with [`remainder`](#remainder) so that `(+ (* (quotient n d) d) (remainder n d))` reconstructs `n`.",
       "params": [
         {
           "name": "n",
@@ -6637,16 +6730,21 @@
         }
       ],
       "returns": "integer",
-      "examples": [
-        "(quotient 10 3)   ; => 3\n(quotient -7 2)   ; => -3   ; truncates toward zero (not floored to -4)\n(quotient 100000000000000000000 7) ; => 14285714285714285714"
+      "see_also": [
+        "remainder",
+        "modulo",
+        "math/quotient"
       ],
-      "body": "Truncated integer division: the result takes the sign of the dividend (truncates toward zero), per R7RS. Bignum-aware; both arguments must be exact integers. Pairs with [`remainder`](#remainder) so that `(+ (* (quotient n d) d) (remainder n d))` reconstructs `n`. Errors on a zero divisor.\n\n```sema\n(quotient 10 3)   ; => 3\n(quotient -7 2)   ; => -3   ; truncates toward zero (not floored to -4)\n(quotient 100000000000000000000 7) ; => 14285714285714285714\n```"
+      "examples": [
+        "(quotient 10 3)   ; => 3\n(quotient -7 2)   ; => -3   ; truncates toward zero (not floored to -4)\n(quotient -7 -2)  ; => 3\n(quotient 100000000000000000000 7) ; => 14285714285714285714"
+      ],
+      "body": "Truncated integer division: `n ÷ d` rounded toward zero, so the result carries the sign it would have as a real quotient (`-7/2` truncates to `-3`, not floored to `-4`), per R7RS. Bignum-aware; both arguments must be exact integers, and a zero divisor raises an error (`division by zero`). Pairs with [`remainder`](#remainder) so that `(+ (* (quotient n d) d) (remainder n d))` reconstructs `n`.\n\n```sema\n(quotient 10 3)   ; => 3\n(quotient -7 2)   ; => -3   ; truncates toward zero (not floored to -4)\n(quotient -7 -2)  ; => 3\n(quotient 100000000000000000000 7) ; => 14285714285714285714\n```\n\nFor floored division whose remainder follows the *divisor*'s sign, use\n[`modulo`](#modulo) with the ordinary `/`-style quotient instead of `quotient`."
     },
     {
       "name": "rationalize",
       "module": "math",
       "section": "Rational Approximation",
-      "summary": "Find the simplest rational number within `tol` of the given number `x`. Uses the Stern-Brocot tree algorithm to find the rational with the smallest denominator in the error interval. Useful for finding readable rational approximations to irrational or transcendental numbers.",
+      "summary": "Find the *simplest* rational number within `tol` of `x` — the one with the smallest denominator anywhere in the interval `[x - |tol|, x + |tol|]`. This is the R7RS `rationalize`, handy for turning a messy value into a readable fraction like `22/7`.",
       "params": [
         {
           "name": "x",
@@ -6657,17 +6755,23 @@
           "type": "number"
         }
       ],
-      "returns": "rational",
-      "examples": [
-        "(rationalize 0.333333 1/1000)  ; => 1/3\n(rationalize 3.14159 1/100)    ; => 22/7\n(rationalize 1/2 0.01)         ; => 1/2"
+      "returns": "number",
+      "see_also": [
+        "exact",
+        "inexact",
+        "denominator",
+        "numerator"
       ],
-      "body": "Find the simplest rational number within `tol` of the given number `x`. Uses the Stern-Brocot tree algorithm to find the rational with the smallest denominator in the error interval. Useful for finding readable rational approximations to irrational or transcendental numbers.\n\n```sema\n(rationalize 0.333333 1/1000)  ; => 1/3\n(rationalize 3.14159 1/100)    ; => 22/7\n(rationalize 1/2 0.01)         ; => 1/2\n```"
+      "examples": [
+        "(rationalize 1/3 1/1000)            ; => 1/3     ; exact in → exact out\n(rationalize (exact 3.14159) 1/100) ; => 22/7    ; simplest fraction near π\n(rationalize 3/10 1/10)             ; => 1/3     ; 1/3 is simpler than 3/10\n(rationalize 3.14159 1/100)         ; => 3.142857142857143   ; inexact in → inexact out (22/7 as f64)"
+      ],
+      "body": "Find the *simplest* rational number within `tol` of `x` — the one with the smallest denominator anywhere in the interval `[x - |tol|, x + |tol|]`. This is the R7RS `rationalize`, handy for turning a messy value into a readable fraction like `22/7`.\n\nExactness follows R7RS contagion: the result is exact only when **both** `x` and `tol` are exact. If either argument is inexact, the answer is an inexact real (the simplest rational, rendered as a float).\n\n```sema\n(rationalize 1/3 1/1000)            ; => 1/3     ; exact in → exact out\n(rationalize (exact 3.14159) 1/100) ; => 22/7    ; simplest fraction near π\n(rationalize 3/10 1/10)             ; => 1/3     ; 1/3 is simpler than 3/10\n(rationalize 3.14159 1/100)         ; => 3.142857142857143   ; inexact in → inexact out (22/7 as f64)\n```\n\nThe last example shows contagion: because `3.14159` is inexact, `rationalize`\nstill finds `22/7` but returns it as a float. An inexact *tolerance* has the same\neffect — `(rationalize 1/2 0.01)` yields `0.5`, not `1/2`. Use [`exact`](../exact)\non the inputs first when you want an exact fraction back."
     },
     {
       "name": "real-part",
       "module": "math",
       "section": "Complex Accessors",
-      "summary": "Return the real part of a complex number. For real numbers, returns the number itself.",
+      "summary": "Return the real part of a complex number. For a real number (integer, rational, or float) it returns the number itself unchanged; for a pure-imaginary value the real part is exact `0`. Exactness of the stored component is preserved.",
       "params": [
         {
           "name": "z",
@@ -6675,16 +6779,22 @@
         }
       ],
       "returns": "number",
-      "examples": [
-        "(real-part 3+4i)       ; => 3\n(real-part 2.5)        ; => 2.5\n(real-part 1/3)        ; => 1/3\n(real-part 5i)         ; => 0"
+      "see_also": [
+        "imag-part",
+        "make-rectangular",
+        "magnitude",
+        "angle"
       ],
-      "body": "Return the real part of a complex number. For real numbers, returns the number itself.\n\n```sema\n(real-part 3+4i)       ; => 3\n(real-part 2.5)        ; => 2.5\n(real-part 1/3)        ; => 1/3\n(real-part 5i)         ; => 0\n```"
+      "examples": [
+        "(real-part 3+4i)   ; => 3\n(real-part 5i)     ; => 0     ; pure imaginary\n(real-part 2.5)    ; => 2.5   ; real number\n(real-part 1/3)    ; => 1/3"
+      ],
+      "body": "Return the real part of a complex number. For a real number (integer, rational, or float) it returns the number itself unchanged; for a pure-imaginary value the real part is exact `0`. Exactness of the stored component is preserved.\n\n```sema\n(real-part 3+4i)   ; => 3\n(real-part 5i)     ; => 0     ; pure imaginary\n(real-part 2.5)    ; => 2.5   ; real number\n(real-part 1/3)    ; => 1/3\n```\n\nThe companion accessor is [`imag-part`](../imag-part); together they invert\n[`make-rectangular`](../make-rectangular)."
     },
     {
       "name": "remainder",
       "module": "math",
       "section": "Integer Math",
-      "summary": "Remainder of truncated integer division: the result takes the sign of the dividend, per R7RS. Bignum-aware; both arguments must be exact integers. Pairs with [`quotient`](#quotient) so that `(+ (* (quotient n d) d) (remainder n d))` reconstructs `n`. Unlike [`modulo`](#modulo), the sign follows the dividend rather than the divisor. Errors on a zero divisor.",
+      "summary": "Remainder of truncated integer division: `n - d * (quotient n d)`, so the result takes the sign of the *dividend* `n`, per R7RS. Bignum-aware; both arguments must be exact integers, and a zero divisor raises an error (`division by zero`). Pairs with [`quotient`](#quotient) so that `(+ (* (quotient n d) d) (remainder n d))` reconstructs `n`.",
       "params": [
         {
           "name": "n",
@@ -6696,10 +6806,15 @@
         }
       ],
       "returns": "integer",
-      "examples": [
-        "(remainder 10 3)   ; => 1\n(remainder -7 2)   ; => -1   ; sign of the dividend\n(remainder 7 -2)   ; => 1"
+      "see_also": [
+        "quotient",
+        "modulo",
+        "math/remainder"
       ],
-      "body": "Remainder of truncated integer division: the result takes the sign of the dividend, per R7RS. Bignum-aware; both arguments must be exact integers. Pairs with [`quotient`](#quotient) so that `(+ (* (quotient n d) d) (remainder n d))` reconstructs `n`. Unlike [`modulo`](#modulo), the sign follows the dividend rather than the divisor. Errors on a zero divisor.\n\n```sema\n(remainder 10 3)   ; => 1\n(remainder -7 2)   ; => -1   ; sign of the dividend\n(remainder 7 -2)   ; => 1\n```"
+      "examples": [
+        "(remainder 10 3)   ; => 1\n(remainder -7 2)   ; => -1   ; sign of the dividend\n(remainder 7 -2)   ; => 1    ; still follows the dividend"
+      ],
+      "body": "Remainder of truncated integer division: `n - d * (quotient n d)`, so the result takes the sign of the *dividend* `n`, per R7RS. Bignum-aware; both arguments must be exact integers, and a zero divisor raises an error (`division by zero`). Pairs with [`quotient`](#quotient) so that `(+ (* (quotient n d) d) (remainder n d))` reconstructs `n`.\n\n```sema\n(remainder 10 3)   ; => 1\n(remainder -7 2)   ; => -1   ; sign of the dividend\n(remainder 7 -2)   ; => 1    ; still follows the dividend\n```\n\nUnlike [`modulo`](#modulo), whose result follows the *divisor*'s sign,\n`remainder` follows the dividend — so `(remainder -7 2)` is `-1` where\n`(modulo -7 2)` is `1`."
     },
     {
       "name": "round",
@@ -6749,7 +6864,7 @@
       "name": "string->number",
       "module": "math",
       "section": "Number/String Conversion",
-      "summary": "Parse a string as a number. Returns `#f` if the string is not a valid number. Supports integers, rationals (1/3), floats (3.14), complex (3+4i), and radix prefixes when radix is specified. With radix != 10, parses the string as an integer in that base.",
+      "summary": "Parse a string as a number, returning `#f` (never an error) when the string is not a valid number. With the default radix 10 it accepts the whole tower: integers, rationals (`1/3`), floats (`3.14`, `1e3`), and complex literals (`3+4i`). Pass a radix of 2, 8, or 16 to parse the string as an integer in that base.",
       "params": [
         {
           "name": "s",
@@ -6762,10 +6877,13 @@
         }
       ],
       "returns": "number or #f",
-      "examples": [
-        "(string->number \"42\")         ; => 42\n(string->number \"1/3\")        ; => 1/3\n(string->number \"3.14\")       ; => 3.14\n(string->number \"3+4i\")       ; => 3+4i\n(string->number \"ff\" 16)      ; => 255\n(string->number \"101\" 2)      ; => 5\n(string->number \"nope\")       ; => #f"
+      "see_also": [
+        "number->string"
       ],
-      "body": "Parse a string as a number. Returns `#f` if the string is not a valid number. Supports integers, rationals (1/3), floats (3.14), complex (3+4i), and radix prefixes when radix is specified. With radix != 10, parses the string as an integer in that base.\n\n```sema\n(string->number \"42\")         ; => 42\n(string->number \"1/3\")        ; => 1/3\n(string->number \"3.14\")       ; => 3.14\n(string->number \"3+4i\")       ; => 3+4i\n(string->number \"ff\" 16)      ; => 255\n(string->number \"101\" 2)      ; => 5\n(string->number \"nope\")       ; => #f\n```"
+      "examples": [
+        "(string->number \"42\")     ; => 42\n(string->number \"1/3\")    ; => 1/3\n(string->number \"3.14\")   ; => 3.14\n(string->number \"3+4i\")   ; => 3+4i\n(string->number \"ff\" 16)  ; => 255\n(string->number \"101\" 2)  ; => 5\n(string->number \"nope\")   ; => #f\n(string->number \"\")       ; => #f"
+      ],
+      "body": "Parse a string as a number, returning `#f` (never an error) when the string is not a valid number. With the default radix 10 it accepts the whole tower: integers, rationals (`1/3`), floats (`3.14`, `1e3`), and complex literals (`3+4i`). Pass a radix of 2, 8, or 16 to parse the string as an integer in that base.\n\n```sema\n(string->number \"42\")     ; => 42\n(string->number \"1/3\")    ; => 1/3\n(string->number \"3.14\")   ; => 3.14\n(string->number \"3+4i\")   ; => 3+4i\n(string->number \"ff\" 16)  ; => 255\n(string->number \"101\" 2)  ; => 5\n(string->number \"nope\")   ; => #f\n(string->number \"\")       ; => #f\n```\n\nReturning `#f` instead of raising makes it convenient in a conditional. The\ninverse is [`number->string`](../number-to-string), and they round-trip with a\nmatching radix."
     },
     {
       "name": "truncate",
@@ -7525,7 +7643,7 @@
       "name": "complex?",
       "module": "predicates",
       "section": "Numeric Predicates",
-      "summary": "Test if a value is a complex number (a number of any type, since all numbers in the numeric tower are complex in the abstract algebra sense). In R7RS, every number is considered complex.",
+      "summary": "Test whether a value is a number. In R7RS the number types nest — every real is complex, every rational is real, every integer is rational — so `complex?` is true for *every* number in the tower (integers, rationals, floats, and genuine complex values alike) and false for non-numbers. It is the widest of the numeric predicates.",
       "params": [
         {
           "name": "v",
@@ -7533,10 +7651,17 @@
         }
       ],
       "returns": "bool",
-      "examples": [
-        "(complex? 42)      ; => #t\n(complex? 3.14)    ; => #t\n(complex? 1/3)     ; => #t\n(complex? 3+4i)    ; => #t\n(complex? \"hi\")    ; => #f"
+      "see_also": [
+        "real?",
+        "rational?",
+        "exact?",
+        "inexact?",
+        "exact-integer?"
       ],
-      "body": "Test if a value is a complex number (a number of any type, since all numbers in the numeric tower are complex in the abstract algebra sense). In R7RS, every number is considered complex.\n\n```sema\n(complex? 42)      ; => #t\n(complex? 3.14)    ; => #t\n(complex? 1/3)     ; => #t\n(complex? 3+4i)    ; => #t\n(complex? \"hi\")    ; => #f\n```"
+      "examples": [
+        "(complex? 42)      ; => #t\n(complex? 3.14)    ; => #t\n(complex? 1/3)     ; => #t\n(complex? 3+4i)    ; => #t\n(complex? \"hi\")    ; => #f   ; not a number"
+      ],
+      "body": "Test whether a value is a number. In R7RS the number types nest — every real is complex, every rational is real, every integer is rational — so `complex?` is true for *every* number in the tower (integers, rationals, floats, and genuine complex values alike) and false for non-numbers. It is the widest of the numeric predicates.\n\n```sema\n(complex? 42)      ; => #t\n(complex? 3.14)    ; => #t\n(complex? 1/3)     ; => #t\n(complex? 3+4i)    ; => #t\n(complex? \"hi\")    ; => #f   ; not a number\n```\n\nNarrow the test with [`real?`](../real-p) (excludes non-real complex numbers) or\n[`rational?`](../rational-p) (excludes floats and complex numbers)."
     },
     {
       "name": "conversation?",
@@ -7621,7 +7746,7 @@
       "name": "exact-integer?",
       "module": "predicates",
       "section": "Numeric Predicates",
-      "summary": "Test if a number is an exact integer (no fractional part, not a float). This combines `exact?` and `integer?`.",
+      "summary": "Test whether a value is an exact integer — true exactly when both `exact?` and `integer?` hold. This is stricter than a bare `integer?`: `2.0` is an integer *value* but an inexact one, so it fails `exact-integer?`. A rational like `1/2` fails because it is not an integer, while an exact integer wrapped as `3+0i` still counts (its exact-zero imaginary part collapses to a real integer).",
       "params": [
         {
           "name": "v",
@@ -7629,16 +7754,23 @@
         }
       ],
       "returns": "bool",
-      "examples": [
-        "(exact-integer? 42)    ; => #t\n(exact-integer? -17)   ; => #t\n(exact-integer? 1/2)   ; => #f (not an integer)\n(exact-integer? 2.0)   ; => #f (inexact)\n(exact-integer? 3+0i)  ; => #t (exact integer with zero imaginary)"
+      "see_also": [
+        "exact?",
+        "rational?",
+        "real?",
+        "complex?",
+        "inexact?"
       ],
-      "body": "Test if a number is an exact integer (no fractional part, not a float). This combines `exact?` and `integer?`.\n\n```sema\n(exact-integer? 42)    ; => #t\n(exact-integer? -17)   ; => #t\n(exact-integer? 1/2)   ; => #f (not an integer)\n(exact-integer? 2.0)   ; => #f (inexact)\n(exact-integer? 3+0i)  ; => #t (exact integer with zero imaginary)\n```"
+      "examples": [
+        "(exact-integer? 42)    ; => #t\n(exact-integer? -17)   ; => #t\n(exact-integer? 1/2)   ; => #f   ; not an integer\n(exact-integer? 2.0)   ; => #f   ; inexact\n(exact-integer? 3+0i)  ; => #t   ; exact integer with exact-zero imaginary"
+      ],
+      "body": "Test whether a value is an exact integer — true exactly when both `exact?` and `integer?` hold. This is stricter than a bare `integer?`: `2.0` is an integer *value* but an inexact one, so it fails `exact-integer?`. A rational like `1/2` fails because it is not an integer, while an exact integer wrapped as `3+0i` still counts (its exact-zero imaginary part collapses to a real integer).\n\n```sema\n(exact-integer? 42)    ; => #t\n(exact-integer? -17)   ; => #t\n(exact-integer? 1/2)   ; => #f   ; not an integer\n(exact-integer? 2.0)   ; => #f   ; inexact\n(exact-integer? 3+0i)  ; => #t   ; exact integer with exact-zero imaginary\n```\n\nUse [`exact?`](../exact-p) alone to also admit exact rationals."
     },
     {
       "name": "exact?",
       "module": "predicates",
       "section": "Numeric Predicates",
-      "summary": "Test if a number is exact (an integer or rational). Returns `#f` for inexact reals and complex numbers with any inexact component.",
+      "summary": "Test whether a number is exact — represented without floating point. Exact numbers are integers, exact rationals, and complex numbers whose real *and* imaginary parts are both exact. Any float, or any complex value with an inexact component, is inexact and returns `#f`. Exactly the complement of [`inexact?`](../inexact-p) on numbers.",
       "params": [
         {
           "name": "v",
@@ -7646,10 +7778,17 @@
         }
       ],
       "returns": "bool",
-      "examples": [
-        "(exact? 42)        ; => #t\n(exact? 1/3)       ; => #t\n(exact? 3.14)      ; => #f\n(exact? 3+4i)      ; => #t (both components exact)\n(exact? 3.0+4i)    ; => #f (real component inexact)"
+      "see_also": [
+        "inexact?",
+        "exact-integer?",
+        "rational?",
+        "real?",
+        "complex?"
       ],
-      "body": "Test if a number is exact (an integer or rational). Returns `#f` for inexact reals and complex numbers with any inexact component.\n\n```sema\n(exact? 42)        ; => #t\n(exact? 1/3)       ; => #t\n(exact? 3.14)      ; => #f\n(exact? 3+4i)      ; => #t (both components exact)\n(exact? 3.0+4i)    ; => #f (real component inexact)\n```"
+      "examples": [
+        "(exact? 42)      ; => #t\n(exact? 1/3)     ; => #t\n(exact? 3.14)    ; => #f   ; float\n(exact? 3+4i)    ; => #t   ; both components exact\n(exact? 3.0+4i)  ; => #f   ; real component inexact"
+      ],
+      "body": "Test whether a number is exact — represented without floating point. Exact numbers are integers, exact rationals, and complex numbers whose real *and* imaginary parts are both exact. Any float, or any complex value with an inexact component, is inexact and returns `#f`. Exactly the complement of [`inexact?`](../inexact-p) on numbers.\n\n```sema\n(exact? 42)      ; => #t\n(exact? 1/3)     ; => #t\n(exact? 3.14)    ; => #f   ; float\n(exact? 3+4i)    ; => #t   ; both components exact\n(exact? 3.0+4i)  ; => #f   ; real component inexact\n```\n\nConvert between the two forms with [`exact`](../../math/exact) and\n[`inexact`](../../math/inexact)."
     },
     {
       "name": "float?",
@@ -7675,7 +7814,7 @@
       "name": "inexact?",
       "module": "predicates",
       "section": "Numeric Predicates",
-      "summary": "Test if a number is inexact (contains a floating-point component). Inexact numbers cannot represent all real values exactly and may have rounding errors.",
+      "summary": "Test whether a number is inexact — carries a floating-point component and so may hold rounding error. True for any float and for any complex number with at least one inexact part. Exactly the complement of [`exact?`](../exact-p) on numbers.",
       "params": [
         {
           "name": "v",
@@ -7683,10 +7822,17 @@
         }
       ],
       "returns": "bool",
-      "examples": [
-        "(inexact? 42)      ; => #f\n(inexact? 3.14)    ; => #t\n(inexact? 1/3)     ; => #f (exact rational)\n(inexact? 3.0+4i)  ; => #t (real component inexact)"
+      "see_also": [
+        "exact?",
+        "exact-integer?",
+        "rational?",
+        "real?",
+        "complex?"
       ],
-      "body": "Test if a number is inexact (contains a floating-point component). Inexact numbers cannot represent all real values exactly and may have rounding errors.\n\n```sema\n(inexact? 42)      ; => #f\n(inexact? 3.14)    ; => #t\n(inexact? 1/3)     ; => #f (exact rational)\n(inexact? 3.0+4i)  ; => #t (real component inexact)\n```"
+      "examples": [
+        "(inexact? 42)      ; => #f   ; exact integer\n(inexact? 3.14)    ; => #t\n(inexact? 1/3)     ; => #f   ; exact rational\n(inexact? 3.0+4i)  ; => #t   ; real component inexact"
+      ],
+      "body": "Test whether a number is inexact — carries a floating-point component and so may hold rounding error. True for any float and for any complex number with at least one inexact part. Exactly the complement of [`exact?`](../exact-p) on numbers.\n\n```sema\n(inexact? 42)      ; => #f   ; exact integer\n(inexact? 3.14)    ; => #t\n(inexact? 1/3)     ; => #f   ; exact rational\n(inexact? 3.0+4i)  ; => #t   ; real component inexact\n```\n\nConvert between the two forms with [`inexact`](../../math/inexact) and\n[`exact`](../../math/exact)."
     },
     {
       "name": "integer?",
@@ -7946,7 +8092,7 @@
       "name": "rational?",
       "module": "predicates",
       "section": "Numeric Predicates",
-      "summary": "Test if a number is rational (exact and representable as a ratio of integers). Every integer is rational. Returns `#f` for floats and complex numbers.",
+      "summary": "Test whether a number is rational — exact and expressible as a ratio of two integers. Every exact integer and every exact rational qualifies. Floats return `#f` (they are inexact), and complex numbers with a non-zero imaginary part return `#f` (they are not real). In effect this predicate coincides with [`exact?`](../exact-p) restricted to real numbers.",
       "params": [
         {
           "name": "v",
@@ -7954,16 +8100,23 @@
         }
       ],
       "returns": "bool",
-      "examples": [
-        "(rational? 42)     ; => #t\n(rational? 1/3)    ; => #t\n(rational? 3.14)   ; => #f (inexact)\n(rational? 3+4i)   ; => #f (complex)"
+      "see_also": [
+        "real?",
+        "exact?",
+        "exact-integer?",
+        "complex?",
+        "inexact?"
       ],
-      "body": "Test if a number is rational (exact and representable as a ratio of integers). Every integer is rational. Returns `#f` for floats and complex numbers.\n\n```sema\n(rational? 42)     ; => #t\n(rational? 1/3)    ; => #t\n(rational? 3.14)   ; => #f (inexact)\n(rational? 3+4i)   ; => #f (complex)\n```"
+      "examples": [
+        "(rational? 42)     ; => #t\n(rational? 1/3)    ; => #t\n(rational? 3.14)   ; => #f   ; inexact\n(rational? 3+4i)   ; => #f   ; not real"
+      ],
+      "body": "Test whether a number is rational — exact and expressible as a ratio of two integers. Every exact integer and every exact rational qualifies. Floats return `#f` (they are inexact), and complex numbers with a non-zero imaginary part return `#f` (they are not real). In effect this predicate coincides with [`exact?`](../exact-p) restricted to real numbers.\n\n```sema\n(rational? 42)     ; => #t\n(rational? 1/3)    ; => #t\n(rational? 3.14)   ; => #f   ; inexact\n(rational? 3+4i)   ; => #f   ; not real\n```\n\nNote this is stricter than strict R7RS, where a finite float is also rational;\nhere rationality tracks exactness. For any real number regardless of exactness,\nuse [`real?`](../real-p)."
     },
     {
       "name": "real?",
       "module": "predicates",
       "section": "Numeric Predicates",
-      "summary": "Test if a number is real (has no non-zero imaginary part). All integers, rationals, and floating-point numbers are real.",
+      "summary": "Test whether a number is real — has no non-zero imaginary part. Every integer, rational, and float is real; `real?` is false *only* for a complex number with a genuine imaginary component. A complex written with an exact-zero imaginary part collapses to a real, so `3+0i` is real.",
       "params": [
         {
           "name": "v",
@@ -7971,10 +8124,17 @@
         }
       ],
       "returns": "bool",
-      "examples": [
-        "(real? 42)      ; => #t\n(real? 3.14)    ; => #t\n(real? 1/3)     ; => #t\n(real? 3+4i)    ; => #f\n(real? 3+0i)    ; => #t (imaginary part is exact zero)"
+      "see_also": [
+        "complex?",
+        "rational?",
+        "exact?",
+        "exact-integer?",
+        "inexact?"
       ],
-      "body": "Test if a number is real (has no non-zero imaginary part). All integers, rationals, and floating-point numbers are real.\n\n```sema\n(real? 42)      ; => #t\n(real? 3.14)    ; => #t\n(real? 1/3)     ; => #t\n(real? 3+4i)    ; => #f\n(real? 3+0i)    ; => #t (imaginary part is exact zero)\n```"
+      "examples": [
+        "(real? 42)      ; => #t\n(real? 3.14)    ; => #t\n(real? 1/3)     ; => #t\n(real? 3+4i)    ; => #f   ; non-zero imaginary part\n(real? 3+0i)    ; => #t   ; imaginary part is exact zero"
+      ],
+      "body": "Test whether a number is real — has no non-zero imaginary part. Every integer, rational, and float is real; `real?` is false *only* for a complex number with a genuine imaginary component. A complex written with an exact-zero imaginary part collapses to a real, so `3+0i` is real.\n\n```sema\n(real? 42)      ; => #t\n(real? 3.14)    ; => #t\n(real? 1/3)     ; => #t\n(real? 3+4i)    ; => #f   ; non-zero imaginary part\n(real? 3+0i)    ; => #t   ; imaginary part is exact zero\n```\n\n[`complex?`](../complex-p) is the wider test (true for all numbers);\n[`rational?`](../rational-p) is narrower (excludes floats)."
     },
     {
       "name": "record?",
