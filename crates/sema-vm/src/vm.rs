@@ -5380,11 +5380,12 @@ mod tests {
     // --- Regression tests: division and equality semantics ---
 
     #[test]
-    fn test_vm_div_int_returns_float_when_non_whole() {
+    fn test_vm_div_int_returns_rational_when_non_whole() {
+        // R7RS: exact/exact division yields an exact rational, not a float.
         let globals = make_test_env();
         let ctx = EvalContext::new();
         let result = eval_str("(/ 3 2)", &globals, &ctx).unwrap();
-        assert_eq!(result, Value::float(1.5));
+        assert_eq!(result, eval_str("3/2", &globals, &ctx).unwrap());
     }
 
     #[test]
@@ -5397,14 +5398,11 @@ mod tests {
 
     #[test]
     fn test_vm_div_int_negative_non_whole() {
+        // R7RS: exact/exact division yields an exact rational (7/3), not a float.
         let globals = make_test_env();
         let ctx = EvalContext::new();
         let result = eval_str("(/ 7 3)", &globals, &ctx).unwrap();
-        assert!(
-            result.as_float().is_some(),
-            "expected float, got {:?}",
-            result
-        );
+        assert_eq!(result, eval_str("7/3", &globals, &ctx).unwrap());
     }
 
     #[test]
@@ -6137,12 +6135,13 @@ mod tests {
             globals: None,
             functions: None,
         });
-        let mut vm = VM::new(globals, vec![], &[], 0).unwrap();
+        let mut vm = VM::new(globals.clone(), vec![], &[], 0).unwrap();
         let result = vm.execute(closure, &ctx).unwrap();
+        // R7RS: exact/exact division yields an exact rational (3/2), not a float or 1.
         assert_eq!(
             result,
-            Value::float(1.5),
-            "Op::Div 3/2 should return 1.5, not 1"
+            eval_str("3/2", &globals, &ctx).unwrap(),
+            "Op::Div 3/2 should return the exact rational 3/2"
         );
     }
 

@@ -20,7 +20,7 @@ eval_tests! {
     negative: "(+ -3 -7)" => Value::int(-10),
     mixed_int_float: "(* 2 3.5)" => Value::float(7.0),
     pow_basic: "(pow 2 10)" => Value::int(1024),
-    sqrt_basic: "(sqrt 16)" => Value::float(4.0),
+    sqrt_basic: "(sqrt 16)" => Value::int(4),
     abs_basic: "(abs -5)" => Value::int(5),
     min_basic: "(min 3 1 2)" => Value::int(1),
     max_basic: "(max 3 1 2)" => Value::int(3),
