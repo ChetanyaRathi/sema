@@ -6,7 +6,7 @@ test('debug exchange-rates via UI with HTTP fetch', async ({ page }) => {
   page.on('pageerror', err => logs.push(`[PAGE_ERROR] ${err.message}`));
 
   await page.goto('/');
-  await page.waitForSelector('[data-testid="status"].status-ready', { timeout: 15000 });
+  await expect(page.getByTestId('status')).toHaveClass(/status-ready/, { timeout: 15000 });
 
   // Load exchange-rates example code
   const code = await page.evaluate(async () => {
@@ -15,8 +15,11 @@ test('debug exchange-rates via UI with HTTP fetch', async ({ page }) => {
   });
   await page.getByTestId('editor').fill(code);
 
-  // Set breakpoint on line 13 (the println after HTTP data is parsed)
-  await page.click('.gutter-line:nth-child(13)');
+  // Set breakpoint on line 13 (the println after HTTP data is parsed).
+  // `.gutter-line` is rendered inside <sema-editor> (@sema-lang/ui, not this
+  // repo) with no exposed testid/role per line — CSS nth-child is the only way
+  // to target a specific line.
+  await page.locator('.gutter-line:nth-child(13)').click();
 
   // Click Debug
   await page.getByTestId('debug-btn').click();
@@ -27,21 +30,22 @@ test('debug exchange-rates via UI with HTTP fetch', async ({ page }) => {
     { timeout: 30000 }
   );
 
-  const status = await page.$eval('#status', el => el.textContent);
+  const status = await page.getByTestId('status').textContent();
   console.log('Status after debug + HTTP:', status);
 
-  // The debugger should have stopped (either entry or breakpoint)
-  const curLine = await page.$('.gutter-line.current-line');
-  const lineNum = curLine ? await curLine.textContent() : 'null';
+  // The debugger should have stopped (either entry or breakpoint). Same
+  // ui-library caveat as above for `.gutter-line`.
+  const curLineLocator = page.locator('.gutter-line.current-line');
+  const lineNum = (await curLineLocator.count()) > 0 ? await curLineLocator.textContent() : 'null';
   console.log('Stopped at line:', lineNum);
 
   // Continue to breakpoint at line 13
   while (true) {
-    const s = await page.$eval('#status', el => el.textContent ?? '');
+    const s = (await page.getByTestId('status').textContent()) ?? '';
     if (s === 'Ready') break;
     if (s.includes('13')) break;
 
-    await page.click('#dbg-continue');
+    await page.getByTestId('dbg-continue').click();
     await page.waitForFunction(
       () => {
         const s = document.getElementById('status')?.textContent ?? '';
@@ -51,11 +55,11 @@ test('debug exchange-rates via UI with HTTP fetch', async ({ page }) => {
     );
   }
 
-  const finalStatus = await page.$eval('#status', el => el.textContent);
+  const finalStatus = await page.getByTestId('status').textContent();
   console.log('Final status:', finalStatus);
 
   // Stop
-  await page.click('#dbg-stop');
+  await page.getByTestId('dbg-stop').click();
   await page.waitForFunction(
     () => document.getElementById('status')?.textContent === 'Ready',
     { timeout: 5000 }
@@ -71,7 +75,7 @@ test('debug exchange-rates.sema with breakpoint at line 18', async ({ page }) =>
   page.on('pageerror', err => logs.push(`[PAGE_ERROR] ${err.message}`));
 
   await page.goto('/');
-  await page.waitForSelector('[data-testid="status"].status-ready', { timeout: 15000 });
+  await expect(page.getByTestId('status')).toHaveClass(/status-ready/, { timeout: 15000 });
 
   // Read the exchange-rates example code
   const code = await page.evaluate(async () => {

@@ -238,26 +238,26 @@
         <span class="logo"><span class="paren">(</span>sema<span class="paren">)</span></span>
         <span class="lead">Workflow</span>
         <span class="dot-sep">—</span>
-        <span class="wf-name" id="wfname">audit-auth</span>
+        <span class="wf-name" id="wfname" data-testid="wfname">audit-auth</span>
       </div>
       <div class="run-status">
-        <span class="pill running" id="status-pill">running</span>
+        <span class="pill running" id="status-pill" data-testid="status-pill">running</span>
         <span class="elapsed tnum" id="elapsed">00:00</span>
       </div>
       <div class="rollup tnum">
-        <span><span class="num" id="r-phases">0</span> phases</span>
+        <span><span class="num" id="r-phases" data-testid="r-phases">0</span> phases</span>
         <span class="dot-sep">·</span>
-        <span><span class="num" id="r-agents">0</span> agents</span>
+        <span><span class="num" id="r-agents" data-testid="r-agents">0</span> agents</span>
         <span class="dot-sep">·</span>
-        <span><span class="num" id="r-tokens">0</span> tok</span>
+        <span><span class="num" id="r-tokens" data-testid="r-tokens">0</span> tok</span>
         <span class="dot-sep">·</span>
-        <span class="num" id="r-cost">—</span>
+        <span class="num" id="r-cost" data-testid="r-cost">—</span>
       </div>
     </div>
     <div class="meta-strip">
-      <div class="meta-cell"><span class="k">run id</span><span class="v ell tnum" id="m-runid"></span></div>
+      <div class="meta-cell"><span class="k">run id</span><span class="v ell tnum" id="m-runid" data-testid="m-runid"></span></div>
       <div class="meta-cell"><span class="k">workflow</span><span class="v ell" id="m-wf"></span></div>
-      <div class="meta-cell"><span class="k">code version</span><span class="v ell tnum" id="m-code"></span></div>
+      <div class="meta-cell"><span class="k">code version</span><span class="v ell tnum" id="m-code" data-testid="m-code"></span></div>
       <div class="meta-cell"><span class="k">started</span><span class="v ell tnum" id="m-started"></span></div>
       <div class="meta-cell">
         <span class="k">budget (tokens)</span>
@@ -277,7 +277,7 @@
     <div class="stream">
       <div class="stream-head">
         <span class="title">Event stream</span>
-        <span class="src ell">events.jsonl · seq &gt; <span id="stream-cursor">0</span></span>
+        <span class="src ell">events.jsonl · seq &gt; <span id="stream-cursor" data-testid="stream-cursor">0</span></span>
       </div>
       <div class="stream-body" id="stream-body"></div>
     </div>
@@ -450,11 +450,11 @@ const streamBody = document.getElementById("stream-body");
 function pGlyph(p){
   // Pending/skipped FIRST: their status is non-null, so without these branches they
   // would fall through to the ✓ "done" glyph — actively misleading.
-  if(p.status==="pending") return `<span class="pglyph g-pend">${G.pend}</span>`;
-  if(p.status==="skipped") return `<span class="pglyph g-skip">${G.skip}</span>`;
-  if(phaseOpen(p)) return `<span class="pglyph g-run pulse">${G.run}</span>`;
-  if(phaseHasFail(p)) return `<span class="pglyph g-fail">${G.fail}</span>`;
-  return `<span class="pglyph g-ok">${G.ok}</span>`;
+  if(p.status==="pending") return `<span class="pglyph g-pend" data-testid="phase-glyph">${G.pend}</span>`;
+  if(p.status==="skipped") return `<span class="pglyph g-skip" data-testid="phase-glyph">${G.skip}</span>`;
+  if(phaseOpen(p)) return `<span class="pglyph g-run pulse" data-testid="phase-glyph">${G.run}</span>`;
+  if(phaseHasFail(p)) return `<span class="pglyph g-fail" data-testid="phase-glyph">${G.fail}</span>`;
+  return `<span class="pglyph g-ok" data-testid="phase-glyph">${G.ok}</span>`;
 }
 
 function renderPhases(){
@@ -558,10 +558,10 @@ function renderDetail(){
     const dur = a.dur_ms!=null ? `<span class="c tnum">${fmtMs(a.dur_ms)}</span>`
                                : `<span class="c blank tnum">…</span>`;   // blank while running
     html +=
-      `<div class="${cls}" data-agent="${a.agent_id}" data-testid="agent-row" data-status="${st}">`+
+      `<div class="${cls}" data-agent="${a.agent_id}" data-testid="agent-row" data-status="${st}" data-selected="${sel}">`+
       aGlyph(st,"aglyph")+
       `<span class="albl"><span class="aname">${esc(a.agent_id)}</span>`+
-        `<span class="amodel">${esc(a.model)}</span></span>`+
+        `<span class="amodel" data-testid="agent-model">${esc(a.model)}</span></span>`+
       tok+
       `<span class="c tnum">${a.tools.length}</span>`+
       dur+
@@ -663,21 +663,21 @@ function wireDrill(){
    ========================================================================= */
 function evGlyph(e){
   switch(e.event){
-    case "run.started": return `<span class="eg g-pend">${G.cp}</span>`;
-    case "run.ended":   return `<span class="eg g-ok">${G.ok}</span>`;
-    case "phase.started": return `<span class="eg g-run">${G.run}</span>`;
-    case "phase.ended":   return `<span class="eg ${e.status==="failed"?"g-fail":"g-ok"}">${e.status==="failed"?G.fail:G.ok}</span>`;
+    case "run.started": return `<span class="eg g-pend" data-testid="ev-glyph">${G.cp}</span>`;
+    case "run.ended":   return `<span class="eg g-ok" data-testid="ev-glyph">${G.ok}</span>`;
+    case "phase.started": return `<span class="eg g-run" data-testid="ev-glyph">${G.run}</span>`;
+    case "phase.ended":   return `<span class="eg ${e.status==="failed"?"g-fail":"g-ok"}" data-testid="ev-glyph">${e.status==="failed"?G.fail:G.ok}</span>`;
     case "agent.started": {
       // Only pulse while the agent is genuinely still running; a finished run's
       // historical agent.started rows must not spin forever.
       const fin = M.agents.get(e.agent_id)?.status != null;
-      return `<span class="eg g-run${fin ? "" : " pulse"}">${G.run}</span>`;
+      return `<span class="eg g-run${fin ? "" : " pulse"}" data-testid="ev-glyph">${G.run}</span>`;
     }
-    case "agent.result":  return `<span class="eg ${e.status==="failed"?"g-fail":"g-ok"}">${e.status==="failed"?G.fail:G.ok}</span>`;
-    case "agent.tool_call": return `<span class="eg g-pend">${G.twig}</span>`;
-    case "checkpoint":    return `<span class="eg g-pend">${G.cp}</span>`;
-    case "budget":        return `<span class="eg g-pend">${G.bud}</span>`;
-    default: return `<span class="eg g-pend">${G.bud}</span>`;
+    case "agent.result":  return `<span class="eg ${e.status==="failed"?"g-fail":"g-ok"}" data-testid="ev-glyph">${e.status==="failed"?G.fail:G.ok}</span>`;
+    case "agent.tool_call": return `<span class="eg g-pend" data-testid="ev-glyph">${G.twig}</span>`;
+    case "checkpoint":    return `<span class="eg g-pend" data-testid="ev-glyph">${G.cp}</span>`;
+    case "budget":        return `<span class="eg g-pend" data-testid="ev-glyph">${G.bud}</span>`;
+    default: return `<span class="eg g-pend" data-testid="ev-glyph">${G.bud}</span>`;
   }
 }
 function evFields(e){

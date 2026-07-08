@@ -2,67 +2,72 @@ import { test, expect, Page } from '@playwright/test';
 
 async function waitForReady(page: Page) {
   await page.goto('/');
-  await page.waitForSelector('[data-testid="status"].status-ready', { timeout: 15000 });
+  await expect(page.getByTestId('status')).toHaveClass(/status-ready/, { timeout: 15000 });
 }
 
 async function setEditorCode(page: Page, code: string) {
   await page.getByTestId('editor').fill(code);
 }
 
-/** Click a gutter line number to toggle a breakpoint. */
+/** Click a gutter line number to toggle a breakpoint.
+ *  `.gutter-line` is rendered inside <sema-editor> (from @sema-lang/ui, not this
+ *  repo) with no exposed role/testid for individual line numbers — CSS nth-child
+ *  is the only way to target a specific line. */
 async function toggleBreakpoint(page: Page, lineNum: number) {
-  await page.click(`.gutter-line:nth-child(${lineNum})`);
+  await page.locator(`.gutter-line:nth-child(${lineNum})`).click();
 }
 
 /** Get the current debug state from the status bar. */
 async function getStatus(page: Page): Promise<string> {
-  return await page.$eval('#status', el => el.textContent ?? '');
+  return await page.getByTestId('status').textContent() ?? '';
 }
 
-/** Get the current line the debugger highlights. */
+/** Get the current line the debugger highlights.
+ *  `.gutter-line` internals come from <sema-editor> (@sema-lang/ui) — see
+ *  toggleBreakpoint for why CSS stays the fallback locator here. */
 async function getCurrentDebugLine(page: Page): Promise<number | null> {
-  const el = await page.$('.gutter-line.current-line');
-  if (!el) return null;
-  const text = await el.textContent();
+  const locator = page.locator('.gutter-line.current-line');
+  if ((await locator.count()) === 0) return null;
+  const text = await locator.textContent();
   return text ? parseInt(text, 10) : null;
 }
 
-/** Get all breakpoint line numbers. */
+/** Get all breakpoint line numbers.
+ *  `.gutter-line` internals come from <sema-editor> (@sema-lang/ui) — see
+ *  toggleBreakpoint for why CSS stays the fallback locator here. */
 async function getBreakpointLines(page: Page): Promise<number[]> {
-  return page.$$eval('.gutter-line.breakpoint', els =>
-    els.map(el => parseInt(el.textContent ?? '0', 10))
-  );
+  const texts = await page.locator('.gutter-line.breakpoint').allTextContents();
+  return texts.map(t => parseInt(t, 10));
 }
 
 /** Get all output lines (text content). */
 async function getOutputLines(page: Page): Promise<string[]> {
-  return page.$$eval('#output .output-line', els =>
-    els.map(el => el.textContent ?? '')
-  );
+  return page.getByTestId('output-line').allTextContents();
 }
 
 /** Get all error output. */
 async function getErrors(page: Page): Promise<string[]> {
-  return page.$$eval('#output .output-error', els =>
-    els.map(el => el.textContent ?? '')
-  );
+  return page.getByTestId('output-error').allTextContents();
 }
 
 /** Get debug variable names from the variables panel. */
 async function getDebugVarNames(page: Page): Promise<string[]> {
-  return page.$$eval('.debug-var-name', els =>
-    els.map(el => el.textContent ?? '')
-  );
+  return page.getByTestId('debug-var-name').allTextContents();
 }
 
 /** Get debug variable values from the variables panel. */
 async function getDebugVars(page: Page): Promise<{name: string, value: string}[]> {
-  return page.$$eval('.debug-var-row', els =>
-    els.map(el => ({
-      name: el.querySelector('.debug-var-name')?.textContent ?? '',
-      value: el.querySelector('.debug-var-value')?.textContent ?? '',
-    }))
-  );
+  const rows = page.getByTestId('debug-var-row');
+  const count = await rows.count();
+  const result: {name: string, value: string}[] = [];
+  for (let i = 0; i < count; i++) {
+    const row = rows.nth(i);
+    result.push({
+      name: (await row.getByTestId('debug-var-name').textContent()) ?? '',
+      value: (await row.getByTestId('debug-var-value').textContent()) ?? '',
+    });
+  }
+  return result;
 }
 
 /** Wait for debugger to pause (status bar shows "Paused at line ..."). */
@@ -98,7 +103,7 @@ test.describe('Debugger', () => {
     expect(line).toBe(1);
     
     // Stop debugging
-    await page.click('#dbg-stop');
+    await page.getByTestId('dbg-stop').click();
     await waitForIdle(page);
   });
 
@@ -133,7 +138,7 @@ test.describe('Debugger', () => {
     expect(bpLine).toBe(3);
 
     // Continue to end
-    await page.click('#dbg-continue');
+    await page.getByTestId('dbg-continue').click();
     await waitForIdle(page);
   });
 
@@ -154,7 +159,7 @@ test.describe('Debugger', () => {
     await toggleBreakpoint(page, 2);
     await page.getByTestId('debug-btn').click();
     await waitForPaused(page);
-    await page.click('#dbg-continue');
+    await page.getByTestId('dbg-continue').click();
     await waitForIdle(page);
 
     const errors = await getErrors(page);
@@ -176,7 +181,7 @@ test.describe('Debugger', () => {
     expect(entryLine).toBe(1);
 
     // Continue to end
-    await page.click('#dbg-continue');
+    await page.getByTestId('dbg-continue').click();
     await waitForIdle(page);
   });
 
@@ -196,7 +201,7 @@ test.describe('Debugger', () => {
       const status = await getStatus(page);
       if (status === 'Ready') break;
       
-      await page.click('#dbg-step-into');
+      await page.getByTestId('dbg-step-into').click();
       // Wait for either paused or idle
       await page.waitForFunction(
         () => {
@@ -236,7 +241,7 @@ test.describe('Debugger', () => {
       const status = await getStatus(page);
       if (status === 'Ready') break;
       
-      await page.click('#dbg-step-over');
+      await page.getByTestId('dbg-step-over').click();
       await page.waitForFunction(
         () => {
           const s = document.getElementById('status')?.textContent ?? '';
@@ -272,7 +277,7 @@ test.describe('Debugger', () => {
     expect(firstStop).toBe(2);
     
     // Continue past the breakpoint - should NOT stop on line 2 again
-    await page.click('#dbg-continue');
+    await page.getByTestId('dbg-continue').click();
     
     // Should reach end (idle), not stop on line 2 again
     await waitForIdle(page);
@@ -295,7 +300,7 @@ test.describe('Debugger', () => {
     console.log(`First loop hit: line ${firstHit}`);
 
     // Continue - should hit the same breakpoint again on the next iteration
-    await page.click('#dbg-continue');
+    await page.getByTestId('dbg-continue').click();
     await waitForPaused(page);
 
     const secondHit = await getCurrentDebugLine(page);
@@ -303,7 +308,7 @@ test.describe('Debugger', () => {
     expect(secondHit).toBe(firstHit);
     
     // Stop
-    await page.click('#dbg-stop');
+    await page.getByTestId('dbg-stop').click();
     await waitForIdle(page);
   });
 
@@ -315,11 +320,11 @@ test.describe('Debugger', () => {
     await waitForPaused(page);
     
     // Step past first define
-    await page.click('#dbg-step-into');
+    await page.getByTestId('dbg-step-into').click();
     await waitForPaused(page);
     
     // Step past second define  
-    await page.click('#dbg-step-into');
+    await page.getByTestId('dbg-step-into').click();
     await waitForPaused(page);
     
     // Check variables panel
@@ -331,7 +336,7 @@ test.describe('Debugger', () => {
     // At minimum, we should see some variables
     console.log('Variable names:', varNames);
     
-    await page.click('#dbg-stop');
+    await page.getByTestId('dbg-stop').click();
     await waitForIdle(page);
   });
 
@@ -342,7 +347,7 @@ test.describe('Debugger', () => {
     await waitForPaused(page);
     
     // Stop
-    await page.click('#dbg-stop');
+    await page.getByTestId('dbg-stop').click();
     await waitForIdle(page);
     
     // Verify UI is reset
@@ -361,8 +366,7 @@ test.describe('Debugger', () => {
     expect(curLine).toBeNull();
     
     // No variables panel
-    const varsPanel = await page.$('#debug-vars');
-    expect(varsPanel).toBeNull();
+    expect(await page.getByTestId('debug-vars').count()).toBe(0);
   });
 
   test('error during debug shows error and resets', async ({ page }) => {
@@ -373,7 +377,7 @@ test.describe('Debugger', () => {
     await waitForPaused(page);
     
     // Continue - should hit division by zero
-    await page.click('#dbg-continue');
+    await page.getByTestId('dbg-continue').click();
     
     // Wait for either error or idle
     await page.waitForFunction(
@@ -401,13 +405,13 @@ test.describe('Debugger', () => {
     await waitForPaused(page);
     
     // Continue — this enters the infinite loop
-    await page.click('#dbg-continue');
+    await page.getByTestId('dbg-continue').click();
     
     // Wait a moment for the yield loop to start
     await page.waitForTimeout(500);
     
     // Click stop — should work because VM yields to event loop
-    await page.click('#dbg-stop');
+    await page.getByTestId('dbg-stop').click();
     await waitForIdle(page, 3000);
     
     const status = await getStatus(page);
@@ -425,7 +429,7 @@ test.describe('Debugger', () => {
     await waitForPaused(page);
     
     // Entry stop - continue to breakpoint inside inner
-    await page.click('#dbg-continue');
+    await page.getByTestId('dbg-continue').click();
     
     // Should stop when inner is called  
     await page.waitForFunction(
@@ -439,7 +443,7 @@ test.describe('Debugger', () => {
     const line = await getCurrentDebugLine(page);
     console.log(`Stopped at line: ${line}`);
     
-    await page.click('#dbg-stop');
+    await page.getByTestId('dbg-stop').click();
     await waitForIdle(page);
   });
 
@@ -449,20 +453,18 @@ test.describe('Debugger', () => {
     // First session
     await page.getByTestId('debug-btn').click();
     await waitForPaused(page);
-    await page.click('#dbg-continue');
+    await page.getByTestId('dbg-continue').click();
     await waitForIdle(page);
     
     // Second session with different code
     await setEditorCode(page, '(* 3 4)');
     await page.getByTestId('debug-btn').click();
     await waitForPaused(page);
-    await page.click('#dbg-continue');
+    await page.getByTestId('dbg-continue').click();
     await waitForIdle(page);
     
     // Verify output from second session
-    const values = await page.$$eval('#output .output-value', els =>
-      els.map(el => el.textContent ?? '')
-    );
+    const values = await page.getByTestId('output-value').allTextContents();
     console.log('Output values:', values);
   });
 
@@ -477,7 +479,7 @@ test.describe('Debugger', () => {
     await waitForPaused(page);
     
     // Step to line 2
-    await page.click('#dbg-step-into');
+    await page.getByTestId('dbg-step-into').click();
     await page.waitForFunction(
       () => {
         const s = document.getElementById('status')?.textContent ?? '';
@@ -490,7 +492,7 @@ test.describe('Debugger', () => {
     console.log(`After first step: line ${atLine2}`);
     
     // Step into the function body
-    await page.click('#dbg-step-into');
+    await page.getByTestId('dbg-step-into').click();
     await page.waitForFunction(
       () => {
         const s = document.getElementById('status')?.textContent ?? '';
@@ -503,7 +505,7 @@ test.describe('Debugger', () => {
     console.log(`Inside function body: line ${inBody}`);
     
     // Step out — may finish execution since (f 10) is the last expression
-    await page.click('#dbg-step-out');
+    await page.getByTestId('dbg-step-out').click();
     await page.waitForFunction(
       () => {
         const s = document.getElementById('status')?.textContent ?? '';
@@ -518,7 +520,7 @@ test.describe('Debugger', () => {
     
     // Either paused at caller or finished — both are valid
     if (status !== 'Ready') {
-      await page.click('#dbg-stop');
+      await page.getByTestId('dbg-stop').click();
       await waitForIdle(page);
     }
   });
@@ -652,7 +654,7 @@ test.describe('Debugger', () => {
     expect(entryLine).toBe(1);
 
     // Continue — should hit the snapped breakpoint
-    await page.click('#dbg-continue');
+    await page.getByTestId('dbg-continue').click();
     await page.waitForFunction(
       () => {
         const s = document.getElementById('status')?.textContent ?? '';
@@ -667,7 +669,7 @@ test.describe('Debugger', () => {
       console.log(`Snapped breakpoint fired at line: ${bpLine}`);
       // Should have stopped at a valid line (1 or 3), not line 2
       expect(bpLine === 1 || bpLine === 3).toBe(true);
-      await page.click('#dbg-stop');
+      await page.getByTestId('dbg-stop').click();
       await waitForIdle(page);
     }
     // If status is 'Ready', session already finished — no cleanup needed

@@ -6,12 +6,12 @@ import { test, expect, Page } from '@playwright/test';
 async function waitForLoad(page: Page) {
   await page.goto('/', { waitUntil: 'networkidle' });
   // Cells are loaded via JS fetch after page load — wait for them
-  await page.waitForSelector('[data-testid="cell"]', { timeout: 15000 });
+  await page.getByTestId('cell').first().waitFor({ timeout: 15000 });
 }
 
 /** Get all cells on the page. */
 function cells(page: Page) {
-  return page.locator('[data-testid="cell"]');
+  return page.getByTestId('cell');
 }
 
 /** Get a cell by its 0-based index. */
@@ -21,19 +21,21 @@ function cellAt(page: Page, index: number) {
 
 /** Get cells of a specific type. */
 function cellsOfType(page: Page, type: 'code' | 'markdown') {
-  return page.locator(`[data-testid="cell"][data-cell-type="${type}"]`);
+  // data-cell-type is a real data attribute (not a testid) used to distinguish
+  // code/markdown cells; narrow the testid-selected set with it via `.and()`.
+  return page.getByTestId('cell').and(page.locator(`[data-cell-type="${type}"]`));
 }
 
 /** Wait for a cell's output to appear (stdout or value or error). */
 async function waitForOutput(page: Page, cellIndex: number) {
   const cell = cellAt(page, cellIndex);
-  await cell.locator('[data-testid^="cell-output-"]').first().waitFor({ timeout: 15000 });
+  await cell.getByTestId(/^cell-output-/).first().waitFor({ timeout: 15000 });
 }
 
 /** Get the text content of a cell's output. */
 async function getOutputText(page: Page, cellIndex: number) {
   const cell = cellAt(page, cellIndex);
-  const outputs = cell.locator('[data-testid="output-content"]');
+  const outputs = cell.getByTestId('output-content');
   const count = await outputs.count();
   const texts: string[] = [];
   for (let i = 0; i < count; i++) {
@@ -87,19 +89,19 @@ test.describe('Page structure', () => {
   });
 
   test('markdown cells are rendered by default', async ({ page }) => {
-    const rendered = page.locator('[data-testid="markdown-rendered"]');
+    const rendered = page.getByTestId('markdown-rendered');
     const count = await rendered.count();
     expect(count).toBeGreaterThan(0);
   });
 
   test('code cells have textareas', async ({ page }) => {
-    const textareas = page.locator('[data-testid="cell-textarea"]');
+    const textareas = page.getByTestId('cell-textarea');
     const count = await textareas.count();
     expect(count).toBeGreaterThan(0);
   });
 
   test('between-cell dividers exist', async ({ page }) => {
-    const dividers = page.locator('[data-testid="cell-divider"]');
+    const dividers = page.getByTestId('cell-divider');
     const count = await dividers.count();
     // There should be one more divider than cells (one before, one after each)
     const cellCount = await cells(page).count();
@@ -123,10 +125,10 @@ test.describe('Cell evaluation', () => {
     await codeCell.getByTestId('btn-cell-run').click();
 
     // Wait for output
-    await codeCell.locator('[data-testid="cell-output-stdout"]').waitFor({ timeout: 15000 });
+    await codeCell.getByTestId('cell-output-stdout').waitFor({ timeout: 15000 });
 
     // Check stdout content
-    const output = await codeCell.locator('[data-testid="output-content"]').first().textContent();
+    const output = await codeCell.getByTestId('output-content').first().textContent();
     expect(output).toContain('x = 42');
     expect(output).toContain('x + y = 50');
   });
@@ -141,10 +143,11 @@ test.describe('Cell evaluation', () => {
     const codeCell = cellsOfType(page, 'code').first();
     await codeCell.hover();
     await codeCell.getByTestId('btn-cell-run').click();
-    await codeCell.locator('[data-testid="cell-output-stdout"]').waitFor({ timeout: 15000 });
+    await codeCell.getByTestId('cell-output-stdout').waitFor({ timeout: 15000 });
 
     const rendered = await codeCell
-      .locator('[data-testid="cell-output-stdout"] .cell-output-content')
+      .getByTestId('cell-output-stdout')
+      .getByTestId('output-content')
       .first()
       .innerText();
     // First rendered character is real output, not leaked indentation.
@@ -160,8 +163,8 @@ test.describe('Cell evaluation', () => {
     await page.keyboard.press('Shift+Enter');
 
     // Wait for output
-    await codeCell.locator('[data-testid="cell-output-stdout"]').waitFor({ timeout: 15000 });
-    const output = await codeCell.locator('[data-testid="output-content"]').first().textContent();
+    await codeCell.getByTestId('cell-output-stdout').waitFor({ timeout: 15000 });
+    const output = await codeCell.getByTestId('output-content').first().textContent();
     expect(output).toContain('x = 42');
   });
 
@@ -173,9 +176,9 @@ test.describe('Cell evaluation', () => {
     await errorCell.getByTestId('btn-cell-run').click();
 
     // Wait for error output
-    await errorCell.locator('[data-testid="cell-output-error"]').waitFor({ timeout: 15000 });
+    await errorCell.getByTestId('cell-output-error').waitFor({ timeout: 15000 });
 
-    const output = await errorCell.locator('[data-testid="output-content"]').textContent();
+    const output = await errorCell.getByTestId('output-content').textContent();
     expect(output).toContain('division by zero');
   });
 
@@ -186,7 +189,7 @@ test.describe('Cell evaluation', () => {
     await page.waitForTimeout(3000);
 
     // Check that multiple cells have output
-    const outputs = page.locator('[data-testid^="cell-output-"]');
+    const outputs = page.getByTestId(/^cell-output-/);
     const count = await outputs.count();
     expect(count).toBeGreaterThan(3);
   });
@@ -211,20 +214,20 @@ test.describe('Output interaction', () => {
     const codeCell = cellsOfType(page, 'code').first();
     await codeCell.hover();
     await codeCell.getByTestId('btn-cell-run').click();
-    await codeCell.locator('[data-testid^="cell-output-"]').first().waitFor({ timeout: 15000 });
+    await codeCell.getByTestId(/^cell-output-/).first().waitFor({ timeout: 15000 });
 
     // Content should be visible
-    const content = codeCell.locator('[data-testid="output-content"]').first();
+    const content = codeCell.getByTestId('output-content').first();
     await expect(content).toBeVisible();
 
     // Click the chevron header to collapse
-    await codeCell.locator('.cell-output-header').first().click();
+    await codeCell.getByTestId('cell-output-header').first().click();
 
     // Content should be hidden
     await expect(content).toBeHidden();
 
     // Click again to expand
-    await codeCell.locator('.cell-output-header').first().click();
+    await codeCell.getByTestId('cell-output-header').first().click();
     await expect(content).toBeVisible();
   });
 });
@@ -290,7 +293,7 @@ test.describe('Markdown cells', () => {
   });
 
   test('markdown cells render as HTML by default', async ({ page }) => {
-    const rendered = page.locator('[data-testid="markdown-rendered"]').first();
+    const rendered = page.getByTestId('markdown-rendered').first();
     await expect(rendered).toBeVisible();
 
     // Should contain rendered HTML (h1, strong, etc.)
@@ -307,7 +310,7 @@ test.describe('Markdown cells', () => {
 
     // Should now show a textarea instead
     await expect(firstMarkdown.getByTestId('cell-textarea')).toBeVisible();
-    await expect(firstMarkdown.locator('[data-testid="markdown-rendered"]')).toHaveCount(0);
+    await expect(firstMarkdown.getByTestId('markdown-rendered')).toHaveCount(0);
   });
 
   test('Shift+Enter in markdown cell re-renders', async ({ page }) => {
@@ -449,12 +452,12 @@ test.describe('Reset', () => {
 
     // Load page and wait for outputs to render
     await page.goto('/', { waitUntil: 'networkidle' });
-    await page.waitForSelector('[data-testid="cell"]', { timeout: 15000 });
+    await page.getByTestId('cell').first().waitFor({ timeout: 15000 });
     // Give JS time to fetch and render
-    await page.waitForSelector('[data-testid^="cell-output-"]', { timeout: 10000 });
+    await page.getByTestId(/^cell-output-/).first().waitFor({ timeout: 10000 });
 
     // Confirm outputs exist
-    let outputs = page.locator('[data-testid^="cell-output-"]');
+    let outputs = page.getByTestId(/^cell-output-/);
     expect(await outputs.count()).toBeGreaterThan(0);
 
     // Reset via UI
@@ -463,7 +466,7 @@ test.describe('Reset', () => {
     await page.waitForTimeout(1000);
 
     // Outputs should be gone
-    outputs = page.locator('[data-testid^="cell-output-"]');
+    outputs = page.getByTestId(/^cell-output-/);
     expect(await outputs.count()).toBe(0);
   });
 });
@@ -492,8 +495,8 @@ test.describe('Undo', () => {
 
     // Load page and wait for outputs
     await page.goto('/', { waitUntil: 'networkidle' });
-    await page.waitForSelector('[data-testid="cell"]', { timeout: 15000 });
-    await page.waitForSelector('[data-testid^="cell-output-"]', { timeout: 10000 });
+    await page.getByTestId('cell').first().waitFor({ timeout: 15000 });
+    await page.getByTestId(/^cell-output-/).first().waitFor({ timeout: 10000 });
 
     // Click undo
     await page.getByTestId('btn-undo').click();
@@ -725,7 +728,7 @@ test.describe('Regression — notebook UI fixes', () => {
       if (/gstatic|googleapis|fonts\.google/.test(r.url())) external.push(r.url());
     });
     await page.goto('/', { waitUntil: 'networkidle' });
-    await page.waitForSelector('[data-testid="cell"]');
+    await page.getByTestId('cell').first().waitFor();
     expect(external, `unexpected CDN font requests: ${external.join(', ')}`).toHaveLength(0);
 
     const font = await request.get('/ui/fonts/jetbrains-mono-latin.woff2');

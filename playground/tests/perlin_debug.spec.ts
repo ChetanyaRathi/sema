@@ -2,7 +2,7 @@ import { test, expect } from '@playwright/test';
 
 async function waitForReady(page) {
   await page.goto('/');
-  await page.waitForSelector('[data-testid="status"].status-ready', { timeout: 15000 });
+  await expect(page.getByTestId('status')).toHaveClass(/status-ready/, { timeout: 15000 });
 }
 
 const PERLIN_HELPERS = `

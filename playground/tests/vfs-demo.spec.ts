@@ -2,12 +2,12 @@ import { test, expect, Page } from '@playwright/test';
 
 async function waitForReady(page: Page) {
   await page.goto('/');
-  await page.waitForSelector('#status.status-ready', { timeout: 15000 });
+  await expect(page.getByTestId('status')).toHaveClass(/status-ready/, { timeout: 15000 });
 }
 
 async function clickRun(page: Page) {
   await page.getByTestId('run-btn').click();
-  await page.waitForSelector('#status.status-ready', { timeout: 30000 });
+  await expect(page.getByTestId('status')).toHaveClass(/status-ready/, { timeout: 30000 });
 }
 
 test('VFS: run file-creating script and check file tree', async ({ page }) => {
@@ -21,12 +21,14 @@ test('VFS: run file-creating script and check file tree', async ({ page }) => {
 
   await clickRun(page);
 
-  // File tree is always visible in the files panel. It dogfoods <sema-tree>,
-  // so entries are <sema-tree-item> nodes keyed by their `label` attribute.
+  // File tree is always visible in the files panel. It dogfoods <sema-tree>
+  // (from @sema-lang/ui, not this repo) — entries are <sema-tree-item> nodes
+  // whose visible label is their `label` attribute value, so getByText locates
+  // them without depending on that internal attribute selector.
   const fileTree = page.getByTestId('file-tree');
   await expect(fileTree).toBeVisible();
-  await expect(fileTree.locator('sema-tree-item[label="test-dir"]')).toBeVisible();
-  await expect(fileTree.locator('sema-tree-item[label="hello.txt"]')).toBeVisible();
+  await expect(fileTree.getByText('test-dir', { exact: true })).toBeVisible();
+  await expect(fileTree.getByText('hello.txt', { exact: true })).toBeVisible();
 });
 
 test('VFS: clicking a file shows content in preview pane', async ({ page }) => {
@@ -37,8 +39,9 @@ test('VFS: clicking a file shows content in preview pane', async ({ page }) => {
 `);
   await clickRun(page);
 
-  // Click on the file in the tree (a <sema-tree-item> leaf)
-  const fileEntry = page.locator('sema-tree-item[label="greeting.txt"]');
+  // Click on the file in the tree (a <sema-tree-item> leaf from @sema-lang/ui;
+  // getByText matches its visible label rather than the internal attribute).
+  const fileEntry = page.getByTestId('file-tree').getByText('greeting.txt', { exact: true });
   await fileEntry.click();
 
   // File viewer should show content

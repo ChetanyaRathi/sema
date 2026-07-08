@@ -199,7 +199,7 @@
                       <template x-if="!(output.output_type === 'value' && !output.content)">
                         <div class="cell-output" :class="{ error: output.output_type === 'error' }"
                              :data-testid="'cell-output-' + (output.output_type === 'error' ? 'error' : output.output_type === 'stdout' ? 'stdout' : 'value')">
-                          <div class="cell-output-header" @click="toggleOutput($el)">
+                          <div class="cell-output-header" data-testid="cell-output-header" @click="toggleOutput($el)">
                             <span class="output-chevron" data-testid="output-chevron">&#9660;</span>
                             <span class="output-meta" data-testid="output-meta" x-text="formatMeta(output)"></span>
                           </div>
