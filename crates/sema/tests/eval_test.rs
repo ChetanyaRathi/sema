@@ -2340,3 +2340,153 @@ eval_error_tests! {
     mv_define_values_too_few_values_errors:
         "(begin (define-values (a b c) (values 1 2)) a)" => "expects 3",
 }
+
+// ============================================================
+// R7RS syntax-rules (define-syntax)
+// ============================================================
+
+eval_tests! {
+    // Basic pattern/template + set!
+    sr_swap_basic: r#"
+        (begin
+          (define-syntax swap!
+            (syntax-rules ()
+              ((_ a b) (let ((tmp a)) (set! a b) (set! b tmp)))))
+          (define x 1) (define y 2) (swap! x y) (list x y))
+    "# => common::eval("'(2 1)"),
+
+    // HYGIENE: introduced `tmp` must not capture the user's `tmp`
+    sr_swap_hygiene: r#"
+        (begin
+          (define-syntax swap!
+            (syntax-rules ()
+              ((_ a b) (let ((tmp a)) (set! a b) (set! b tmp)))))
+          (define tmp 1) (define y 2) (swap! tmp y) (list tmp y))
+    "# => common::eval("'(2 1)"),
+
+    // HYGIENE: introduced `t` must not capture user `t`; recursive ellipsis
+    sr_my_or_hygiene: r#"
+        (begin
+          (define-syntax my-or
+            (syntax-rules ()
+              ((_) #f)
+              ((_ e) e)
+              ((_ e1 e2 ...) (let ((t e1)) (if t t (my-or e2 ...))))))
+          (define t 5) (my-or #f t))
+    "# => Value::int(5),
+
+    // Recursive expansion terminates as the ellipsis list shrinks
+    sr_my_or_recursive: r#"
+        (begin
+          (define-syntax my-or
+            (syntax-rules ()
+              ((_) #f)
+              ((_ e) e)
+              ((_ e1 e2 ...) (let ((t e1)) (if t t (my-or e2 ...))))))
+          (my-or #f #f 7))
+    "# => Value::int(7),
+
+    // Ellipsis, multiple matches
+    sr_ellipsis_multiple: r#"
+        (begin
+          (define-syntax my-list (syntax-rules () ((_ x ...) (list x ...))))
+          (my-list 1 2 3))
+    "# => common::eval("'(1 2 3)"),
+
+    // Ellipsis, ZERO matches
+    sr_ellipsis_zero: r#"
+        (begin
+          (define-syntax my-list (syntax-rules () ((_ x ...) (list x ...))))
+          (my-list))
+    "# => common::eval("'()"),
+
+    // Nested ellipsis over (name val) pairs; two ellipsis vars in lockstep
+    sr_my_let: r#"
+        (begin
+          (define-syntax my-let
+            (syntax-rules ()
+              ((_ ((name val) ...) body ...)
+               ((lambda (name ...) body ...) val ...))))
+          (my-let ((a 1) (b 2)) (+ a b)))
+    "# => Value::int(3),
+
+    // Multiple rules / arity dispatch, first-match wins
+    sr_multi_rule: r#"
+        (begin
+          (define-syntax f
+            (syntax-rules ()
+              ((_ a) (+ a 1))
+              ((_ a b) (+ a b))))
+          (list (f 10) (f 3 4)))
+    "# => common::eval("'(11 7)"),
+
+    // Literal identifier `=>` matched structurally
+    sr_literal: r#"
+        (begin
+          (define-syntax my-cond1
+            (syntax-rules (=>)
+              ((_ (test => proc)) (let ((v test)) (if v (proc v) #f)))))
+          (my-cond1 (5 => (fn (n) (* n 2)))))
+    "# => Value::int(10),
+
+    // macroexpand path works; `*` kept (global), not renamed
+    sr_macroexpand: r#"
+        (begin
+          (define-syntax dbl (syntax-rules () ((_ x) (* 2 x))))
+          (macroexpand '(dbl 5)))
+    "# => common::eval("'(* 2 5)"),
+
+    // try/throw/catch kept verbatim by hygiene (special forms + `catch`
+    // auxiliary keyword); the expansion runs. Sema's catch binds the error
+    // object, so read its :value to recover the thrown datum.
+    sr_special_forms_kept: r#"
+        (begin
+          (define-syntax g
+            (syntax-rules () ((_ x) (try (throw x) (catch err (:value err))))))
+          (g "boom"))
+    "# => Value::string("boom"),
+
+    // Custom ellipsis symbol (`ooo`; Sema's reader treats `:` as a keyword
+    // prefix so R7RS's conventional `:::` is not a readable symbol here)
+    sr_custom_ellipsis: r#"
+        (begin
+          (define-syntax my-list2
+            (syntax-rules ooo () ((_ x ooo) (list x ooo))))
+          (my-list2 1 2))
+    "# => common::eval("'(1 2)"),
+
+    // TCO is preserved through syntax-rules: expansion happens before lowering,
+    // so a template that places the recursive call in tail position is lowered
+    // with normal tail-call analysis. Without TCO this deep loop would overflow.
+    sr_tco_preserved: r#"
+        (begin
+          (define-syntax my-if
+            (syntax-rules () ((_ c t e) (cond (c t) (else e)))))
+          (define (loop n acc)
+            (my-if (= n 0) acc (loop (- n 1) (+ acc 1))))
+          (loop 100000 0))
+    "# => Value::int(100000),
+
+    // Ellipsis body spliced into begin, tail value
+    sr_when_body: r#"
+        (begin
+          (define-syntax my-when
+            (syntax-rules () ((_ c body ...) (if c (begin body ...) #f))))
+          (my-when #t 1 2 3))
+    "# => Value::int(3),
+}
+
+eval_error_tests! {
+    // No rule matches arity
+    sr_no_match: r#"
+        (begin
+          (define-syntax only1 (syntax-rules () ((_ a) a)))
+          (only1 1 2))
+    "# => "no matching syntax-rules",
+
+    // Malformed transformer
+    sr_malformed: "(define-syntax bad (syntax-rules))" => "syntax-rules",
+
+    // Name must be a symbol
+    sr_bad_name: "(define-syntax 5 (syntax-rules () ((_ a) a)))" => "define-syntax",
+}
