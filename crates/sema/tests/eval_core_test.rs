@@ -269,21 +269,40 @@ eval_tests! {
 // ============================================================
 
 eval_tests! {
-    guard_message_from_user_throw: r#"(guard (e ((keyword? (:type e)) (:message e))) (throw "boom"))"# => Value::string("\"boom\""),
-    guard_literal_true_test: "(guard (e (#t (:value e))) (throw 42))" => Value::int(42),
-    guard_else_fallback: "(guard (e ((equal? (:value e) :bad) :handled) (else :fallback)) (throw :other))" => Value::keyword("fallback"),
-    guard_body_no_condition: "(guard (e ((number? (:value e)) (+ 1 (:value e)))) 100)" => Value::int(100),
-    guard_nested_rethrow_wraps: r#"(try (guard (e ((equal? (:value e) 1) :inner)) (throw 2)) (catch outer (:value (:value outer))))"# => Value::int(2),
-    guard_native_error_caught: "(guard (e (else (string? (:message e)))) (/ 1 0))" => Value::bool(true),
-    guard_tail_position: "((lambda () (guard (e (else (:value e))) (throw 99))))" => Value::int(99),
-    guard_multi_clause_dispatch: "(guard (e ((equal? (:value e) 5) 'a) ((equal? (:value e) 6) 'b) (else 'c)) (throw 6))" => Value::symbol("b"),
-    guard_else_can_rethrow: r#"(try (guard (e (else (throw {:code 500}))) (throw {:code 400})) (catch o (:code (:value o))))"# => Value::int(500),
+    // R7RS: the guard variable is bound to the RAISED OBJECT itself (not an
+    // error-map wrapper). (raise obj) / (throw obj) both raise obj raw.
+    guard_raise_binds_raw_object: r#"(guard (e (#t (list 'caught e))) (raise "oops"))"# => common::eval(r#"'(caught "oops")"#),
+    guard_raise_int_raw: "(guard (e (#t e)) (raise 42))" => Value::int(42),
+    guard_raise_symbol_raw: "(guard (e (#t e)) (raise 'x))" => Value::symbol("x"),
+    guard_throw_alias_raw: "(guard (e (#t e)) (throw 7))" => Value::int(7),
+    guard_predicate_clause_on_raw: r#"(guard (e ((string? e) e) (else :unknown)) (raise "x"))"# => Value::string("x"),
+    guard_else_fallback: "(guard (e ((equal? e :bad) :handled) (else :fallback)) (raise :other))" => Value::keyword("fallback"),
+    guard_body_no_condition: "(guard (e (#t (+ 1 e))) 100)" => Value::int(100),
+    guard_multi_clause_dispatch: "(guard (e ((equal? e 5) 'a) ((equal? e 6) 'b) (else 'c)) (raise 6))" => Value::symbol("b"),
+    guard_tail_position: "((lambda () (guard (e (else e)) (raise 99))))" => Value::int(99),
+    // A native runtime error has no raw raised object, so the variable is the
+    // error MAP; dispatch on (:type e)/(:message e).
+    guard_native_error_type: "(guard (e (else (:type e))) (/ 1 0))" => Value::keyword("eval"),
+    guard_native_error_message_is_string: "(guard (e (else (string? (:message e)))) (/ 1 0))" => Value::bool(true),
+    // Genuine runtime error (car of a non-sequence is a type error) IS caught.
+    guard_catches_runtime_type_error: "(guard (e (#t 'recovered)) (car 5))" => Value::symbol("recovered"),
+    // Re-raise is faithful: an inner guard with no matching clause re-raises the
+    // raw object; the outer guard again sees the same raw object.
+    guard_nested_faithful_reraise: "(guard (e (#t e)) (guard (inner ((equal? inner 1) :x)) (raise 2)))" => Value::int(2),
+    guard_else_can_reraise_fresh: "(guard (e (#t e)) (guard (inner (else (raise 500))) (raise 400)))" => Value::int(500),
+    // `raise` is a first-class procedure; try/catch sees the {:value ...} wrapper.
+    guard_raise_procedure_via_try: "(try (raise 5) (catch e (:value e)))" => Value::int(5),
 }
 
 eval_error_tests! {
-    guard_no_match_reraises: "(guard (e ((equal? (:value e) 1) :one)) (throw 2))" => "2",
-    guard_empty_clauses_rethrow: "(guard (e) (throw 7))" => "7",
-    guard_type_dispatch_no_else_reraises: r#"(guard (e ((eq? (:type e) :user) (:value e))) (error "oops"))"# => "oops",
+    // No clause matches and there is no `else`: the condition is re-raised.
+    guard_no_match_reraises: "(guard (e ((equal? e 1) :one)) (raise 2))" => "User exception: 2",
+    guard_empty_clauses_reraise: "(guard (e) (raise 7))" => "User exception: 7",
+    // A native error whose clause doesn't match is re-raised; its message survives.
+    guard_native_no_match_reraises: "(guard (e ((equal? e 1) :one)) (/ 1 0))" => "division by zero",
+    // (error "oops") has :type :eval, not :user, so this user-only clause fails
+    // and, with no else, the condition re-raises (message preserved).
+    guard_error_type_dispatch_reraise: r#"(guard (e ((and (map? e) (eq? (:type e) :user)) (:value e))) (error "oops"))"# => "oops",
 }
 
 // ============================================================

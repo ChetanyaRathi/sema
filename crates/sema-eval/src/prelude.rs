@@ -84,18 +84,24 @@ pub const PRELUDE: &str = r#"
 
 ;; guard: R7RS structured exception handling.
 ;; (guard (var clause ...) body ...) evaluates body; if a condition is raised
-;; (via `throw` or a native runtime error), it is bound to var and the clauses
-;; are evaluated like `cond` (an `else` clause, if present, must be last). If
-;; no clause matches, the condition is re-raised in guard's own dynamic
-;; position (guard's try/catch has already unwound body's frames, so the
-;; re-throw propagates from here, not from deep inside body).
+;; (via `raise`/`throw` or a native runtime error), it is bound to var and the
+;; clauses are evaluated like `cond` (an `else` clause, if present, must be
+;; last). If no clause matches, the condition is re-raised in guard's own
+;; dynamic position (guard's try/catch has already unwound body's frames, so
+;; the re-raise propagates from here, not from deep inside body).
 ;;
-;; Consistent with try/catch, var is bound to Sema's error MAP
-;; ({:type ... :message ... :value <thrown>}), not the raw raised object —
-;; there is no bare `raise` in Sema, only `throw`. Use (:value var) to get the
-;; value passed to (throw x); (:type var)/(:message var) for native errors
-;; (division by zero, unbound variable, (error "msg"), etc).
-;; (guard (e ((string? (:value e)) (:value e)) (else :unknown)) (throw "x"))
+;; R7RS semantics: var is bound to the RAISED OBJECT. For (raise obj)/(throw
+;; obj) that is obj itself (the raw value) — so clause tests read it directly:
+;;   (guard (e ((string? e) e) (else :unknown)) (raise "x")) ; => "x"
+;; A native runtime error ((/ 1 0), (car 5), (error "msg"), an unbound
+;; variable, …) has no raw raised object, so var is Sema's error MAP
+;; ({:type ... :message ... :value ...}); dispatch on (:type e)/(:message e).
+;; A clause that wants only native errors should gate on (map? e) first, since
+;; keyword access like (:type e) raises a type error on a raw non-map object.
+;;
+;; NOTE: (car '()) / (first []) return nil in Sema (a deliberate safe-accessor
+;; deviation from R7RS `car`), so they do NOT raise and guard never fires on
+;; them — use (car 5) or (/ 1 0) to see guard catch a native runtime error.
 (defmacro guard (spec . body)
   (let ((var (car spec))
         (clauses (cdr spec)))
@@ -106,11 +112,20 @@ pub const PRELUDE: &str = r#"
                         (equal? (car last-clause) 'else))))))
       `(try
          (begin ,@body)
-         (catch ,var
-           (cond ,@clauses
-                 ,@(if has-else
-                       (list)
-                       (list (list 'else (list 'throw var))))))))))
+         (catch guard-err#
+           ;; Unwrap the {:type :user :value obj} wrapper so var is the raw
+           ;; raised object; native errors (non-:user) stay as the error map.
+           (let ((,var (if (equal? (:type guard-err#) :user)
+                           (:value guard-err#)
+                           guard-err#)))
+             (cond ,@clauses
+                   ,@(if has-else
+                         (list)
+                         ;; No clause matched: re-raise the object bound to var.
+                         ;; Re-raising var (not the wrapper) keeps re-raise
+                         ;; faithful — an outer guard again unwraps :user and
+                         ;; recovers the same raw object (or native error map).
+                         (list (list 'else (list 'raise var)))))))))))
 
 ;; ws/listen: drive a receive loop on a websocket, dispatching each frame to the
 ;; matching handler. Spawns an async task and returns its promise — await it (or
