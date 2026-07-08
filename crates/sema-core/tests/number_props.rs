@@ -81,13 +81,9 @@ fn is_normalized(n: &SemaNumber) -> bool {
         SemaNumber::Integer(_) | SemaNumber::Real(_) => true,
         SemaNumber::Rational(r) => !r.denom().is_one(),
         SemaNumber::Complex(c) => {
-            let im_is_exact_zero =
-                matches!(&c.im, SemaNumber::Integer(z) if *z == BigInt::from(0));
+            let im_is_exact_zero = matches!(&c.im, SemaNumber::Integer(z) if *z == BigInt::from(0));
             let components_are_real = c.re.is_real() && c.im.is_real();
-            !im_is_exact_zero
-                && components_are_real
-                && is_normalized(&c.re)
-                && is_normalized(&c.im)
+            !im_is_exact_zero && components_are_real && is_normalized(&c.re) && is_normalized(&c.im)
         }
     }
 }
@@ -214,13 +210,22 @@ fn arithmetic_results_are_normalized() {
     for a in all_values() {
         for b in all_values() {
             let sum = a.clone().add(b.clone());
-            assert!(is_normalized(&sum), "add result not normalized: {a} + {b} = {sum}");
+            assert!(
+                is_normalized(&sum),
+                "add result not normalized: {a} + {b} = {sum}"
+            );
 
             let prod = a.clone().mul(b.clone());
-            assert!(is_normalized(&prod), "mul result not normalized: {a} * {b} = {prod}");
+            assert!(
+                is_normalized(&prod),
+                "mul result not normalized: {a} * {b} = {prod}"
+            );
 
             if let Ok(q) = a.clone().div(b.clone()) {
-                assert!(is_normalized(&q), "div result not normalized: {a} / {b} = {q}");
+                assert!(
+                    is_normalized(&q),
+                    "div result not normalized: {a} / {b} = {q}"
+                );
             }
         }
     }
