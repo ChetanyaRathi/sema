@@ -90,9 +90,22 @@ Full character type: `#\a`, `#\space`, `#\newline` literals. `char?`, `char->int
 
 No `call/cc` or `call-with-current-continuation`. The trampoline evaluator cannot capture continuations.
 
-### 19. No Multiple Return Values
+### ~~19. No Multiple Return Values~~ → RESOLVED
 
-No `values` / `call-with-values`.
+`values`, `call-with-values`, `let-values`, `let*-values`, `define-values`. A
+multi-value bundle is represented internally as a `Record` tagged
+`%multiple-values%` (see `crates/sema-stdlib/src/list.rs`) — no VM/opcode
+changes were needed. `(values x)` (exactly one value) is identity, so a single
+value flows through ordinary contexts (`(+ 1 (values 2))` works) exactly as
+if `values` weren't there; only `call-with-values` (and the `let-values`
+family built on it) inspects the bundle. Leaking a zero/multi-value bundle
+into a plain single-value context is unspecified by R7RS; Sema currently
+prints it as an opaque `#<record %multiple-values% …>` rather than spreading
+it. Because `call-with-values` dispatches producer/consumer through the same
+native `call_function` boundary as `apply`, that call is not a true VM tail
+call — deep recursion written through `let-values`/`call-with-values` won't
+get the same TCO as a plain named-let (same limitation as other stdlib HOF
+callbacks, #24).
 
 ### ~~20. No Dynamic Binding~~ → PARTIAL (`parameterize`/`make-parameter` RESOLVED)
 
@@ -133,17 +146,20 @@ Full R7RS character comparison: `char=?`, `char<?`, `char>?`, `char<=?`, `char>=
 
 Only `try`/`catch`/`throw`. No R7RS `with-exception-handler` / `raise` / `raise-continuable`.
 
-### 27. No `define-values`
+### ~~27. No `define-values`~~ → RESOLVED
 
-No destructuring bind for multiple values.
+See #19 — `define-values` desugars to a `begin` of plain `define`s over a
+gensym'd temp holding the produced values (`nth`/`drop` to pick them apart).
 
 ### ~~28. No Bytevectors~~ → RESOLVED
 
 `Value::Bytevector` with `#u8(1 2 3)` reader syntax. `make-bytevector`, `bytevector`, `bytevector-length`, `bytevector-u8-ref`, `bytevector-u8-set!` (COW), `bytevector-copy`, `bytevector-append`, `bytevector->list`, `list->bytevector`, `utf8->string`, `string->utf8`, `bytevector?`.
 
-### 29. No `let-values` / `receive`
+### ~~29. No `let-values`~~ → PARTIAL RESOLVED
 
-No destructuring forms for multiple return values (related to #19).
+`let-values` (parallel) and `let*-values` (sequential) are implemented — see
+#19. SRFI-8 `receive` is not (a thin macro over `call-with-values`; not yet
+added since it's not R7RS-required).
 
 ### ~~30. No Tail Calls Across Mutual Recursion in Stdlib~~ → RESOLVED (folded into #24)
 
@@ -226,15 +242,13 @@ The last line is the footgun: `and` in head position is the special form, not th
 | --- | ---------------------------------------- | -------- | --------- | ---------------------------------------------------------------------------- |
 | 15  | No `guard` (R7RS)                        | Low      | Low       | `try`/`catch` covers the use case; `guard` is syntactic sugar                |
 | 18  | No Continuations                         | Low      | Very High | Requires CPS transform or VM rewrite; trampoline can't capture continuations |
-| 19  | No Multiple Return Values                | Low      | Medium    | `values`/`call-with-values` need eval changes                                |
 | 20  | No Dynamic Binding                       | Low      | Medium    | `parameterize`/`make-parameter` via thread-local state                       |
 | 21  | No Hygienic Macros                       | Medium   | High      | `syntax-rules` requires pattern matcher + template expander                  |
 | 22  | No Tail Position in `do` Body            | Low      | Low       | Body is for side effects; result exprs already have TCO                      |
 | 23  | No `string-set!`                         | Low      | Low       | Intentional — immutable strings are simpler and safer                        |
 | 24  | No Proper Tail Recursion in map/filter   | Low      | Medium    | Stdlib uses Rust iteration; would need eval access                           |
 | 26  | No `with-exception-handler`              | Low      | Medium    | `try`/`catch` is sufficient for most use cases                               |
-| 27  | No `define-values`                       | Low      | Low       | Rarely needed without multiple return values                                 |
-| 29  | No `let-values`/`receive`                | Low      | Low       | Blocked by #19                                                               |
+| 29  | No `receive` (SRFI-8)                    | Low      | Low       | Thin macro over `call-with-values`; `let-values` covers the use case         |
 | 33  | VM `eval` sees globals only              | Medium   | High      | Reify design never built; lexical locals not reified for `eval`              |
 
 ---
@@ -243,8 +257,7 @@ The last line is the footgun: `and` in head position is the special form, not th
 
 1. **Dynamic binding** (#20) — `make-parameter`/`parameterize` via thread-local storage fits the existing architecture.
 2. **Hygienic macros** (#21) — High effort but important for library authors. Consider `syntax-rules` subset first.
-3. **Multiple return values** (#19) — `values`/`call-with-values` enables `define-values` and `let-values`.
-4. **`guard`** (#15) — Low effort syntactic sugar over `try`/`catch`.
+3. **`guard`** (#15) — Low effort syntactic sugar over `try`/`catch`.
 
 ---
 
@@ -254,6 +267,7 @@ The last line is the footgun: `and` in head position is the special form, not th
 - **Tail Call Optimization** — Trampoline-based, works for direct recursion in `if`/`cond`/`let`/`begin`/`and`/`or`/`when`/`unless` + named `let`
 - **Data types** — Int, Float, String, Char, Symbol, Keyword, List, Vector, Map, Record, Bytevector, Bool, Nil, Promise + LLM types
 - **Record types** — R7RS `define-record-type` with constructors, predicates, field accessors. `record?`, `type` returns record tag
+- **Multiple values** — R7RS `values`, `call-with-values`, `let-values`, `let*-values`, `define-values`
 - **Bytevectors** — `#u8(1 2 3)` literal syntax. `make-bytevector`, `bytevector`, `bytevector-length`, `bytevector-u8-ref`, `bytevector-u8-set!` (COW), `bytevector-copy`, `bytevector-append`, `bytevector->list`, `list->bytevector`, `utf8->string`, `string->utf8`
 - **Character comparison** — R7RS `char=?`, `char<?`, `char>?`, `char<=?`, `char>=?` + case-insensitive `char-ci=?` etc.
 - **Macros** — `defmacro` with quasiquote/unquote/unquote-splicing (non-hygienic but functional)
