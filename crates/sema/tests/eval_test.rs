@@ -2183,3 +2183,76 @@ eval_error_tests! {
     // (the SelfTailCall opcode arity-checks against the loop lambda).
     stc_wrong_arity: "(let loop ((a 1) (b 2)) (loop 1))" => "loop",
 }
+
+// ============================================================
+// R7RS make-parameter / parameterize
+// ============================================================
+// A parameter object is a zero-arg procedure returning its current value.
+// `parameterize` dynamically rebinds parameters to (converter v) for the
+// extent of its body, restoring the prior (unconverted) value on exit —
+// including on non-local exit via a raised condition.
+
+eval_tests! {
+    param_basic_call: "((make-parameter 42))" => Value::int(42),
+    param_is_procedure: "(procedure? (make-parameter 5))" => Value::bool(true),
+
+    param_install_then_restore:
+        "(let ((p (make-parameter 1))) (list (p) (parameterize ((p 2)) (p)) (p)))"
+        => Value::list(vec![Value::int(1), Value::int(2), Value::int(1)]),
+
+    param_body_value_returned:
+        "(let ((p (make-parameter 1))) (parameterize ((p 2)) (+ (p) 100)))" => Value::int(102),
+
+    param_converter_applied_to_init_and_new:
+        "(let ((p (make-parameter 10 (lambda (x) (* x 2))))) (list (p) (parameterize ((p 5)) (p)) (p)))"
+        => Value::list(vec![Value::int(20), Value::int(10), Value::int(20)]),
+
+    // Non-idempotent converter proves restore is RAW (not re-converted): if
+    // restore re-applied the converter, the final value would be 2, not 1.
+    param_restore_is_raw_not_reconverted:
+        "(let ((p (make-parameter 0 (lambda (x) (+ x 1))))) (list (p) (parameterize ((p 10)) (p)) (p)))"
+        => Value::list(vec![Value::int(1), Value::int(11), Value::int(1)]),
+
+    param_nested_extents:
+        "(let ((p (make-parameter 1))) (parameterize ((p 2)) (list (p) (parameterize ((p 3)) (p)) (p))))"
+        => Value::list(vec![Value::int(2), Value::int(3), Value::int(2)]),
+
+    param_multiple_parameters:
+        "(let ((a (make-parameter 1)) (b (make-parameter 2))) (parameterize ((a 10) (b 20)) (list (a) (b))))"
+        => Value::list(vec![Value::int(10), Value::int(20)]),
+
+    param_multi_form_body_last_value:
+        "(let ((p (make-parameter 0))) (parameterize ((p 9)) (p) (* (p) (p))))" => Value::int(81),
+
+    param_restored_after_throw:
+        r#"(let ((p (make-parameter 1))) (try (parameterize ((p 2)) (throw "boom")) (catch e nil)) (p))"#
+        => Value::int(1),
+
+    param_error_reraised_and_value_restored:
+        r#"(let ((p (make-parameter 1))) (list (try (parameterize ((p 2)) (error "x")) (catch e :caught)) (p)))"#
+        => Value::list(vec![Value::keyword("caught"), Value::int(1)]),
+
+    // Atomicity: a throwing converter must install NOTHING — all new values are
+    // converted before any parameter is mutated.
+    param_throwing_converter_installs_nothing:
+        r#"(let ((p (make-parameter 1 (lambda (x) (if (> x 5) (error "big") x))))) (list (try (parameterize ((p 10)) (p)) (catch e :caught)) (p)))"#
+        => Value::list(vec![Value::keyword("caught"), Value::int(1)]),
+
+    param_throwing_value_expr_never_enters:
+        r#"(let ((p (make-parameter 1))) (list (try (parameterize ((p (error "bad"))) (p)) (catch e :caught)) (p)))"#
+        => Value::list(vec![Value::keyword("caught"), Value::int(1)]),
+
+    param_empty_binding_list: "(parameterize () 42)" => Value::int(42),
+
+    // SRFI-39 style mutating call: (p v) sets and converts the new value.
+    param_mutating_call: "(let ((p (make-parameter 1))) (p 5) (p))" => Value::int(5),
+    param_mutating_call_applies_converter:
+        "(let ((p (make-parameter 1 (lambda (x) (* x 10))))) (p 5) (p))" => Value::int(50),
+}
+
+eval_error_tests! {
+    // An uncaught error inside a parameterize body propagates with its message
+    // (parameterize restores state but does not swallow the condition).
+    param_uncaught_body_error_propagates:
+        r#"(let ((p (make-parameter 1))) (parameterize ((p 2)) (error "kaboom")))"# => "kaboom",
+}
