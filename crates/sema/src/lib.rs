@@ -123,6 +123,7 @@ impl InterpreterBuilder {
 
         sema_core::set_eval_callback(&ctx, sema_eval::eval_value_vm);
         sema_core::set_call_callback(&ctx, sema_eval::call_value);
+        sema_core::set_call_owned_callback(&ctx, sema_eval::call_value_owned);
 
         if self.stdlib {
             sema_stdlib::register_stdlib(&env, &self.sandbox);

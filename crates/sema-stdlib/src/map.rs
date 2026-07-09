@@ -7,6 +7,22 @@ use sema_core::{check_arity, SemaError, Value, ValueViewRef};
 use crate::list::call_function;
 use crate::register_fn;
 
+/// Reject interior-mutable containers (mutable arrays/cells) as map keys:
+/// their contents can change after insertion, which would silently corrupt
+/// the map's lookup invariants (hash bucket / sort position). The check is
+/// deep — a key that merely wraps a mutable container (e.g. a vector holding
+/// a mutable array) mutates underneath the map all the same.
+pub(crate) fn check_map_key(key: &Value, who: &str) -> Result<(), SemaError> {
+    if key.contains_mutable_container() {
+        return Err(
+            SemaError::type_error("immutable map key", key.type_name()).with_hint(format!(
+                "{who}: freeze the key first (mutable-array/->vector or mutable-cell/get)"
+            )),
+        );
+    }
+    Ok(())
+}
+
 pub fn register(env: &sema_core::Env) {
     register_fn(env, "hash-map", |args| {
         if args.len() % 2 != 0 {
@@ -16,6 +32,7 @@ pub fn register(env: &sema_core::Env) {
         }
         let mut map = BTreeMap::new();
         for pair in args.chunks(2) {
+            check_map_key(&pair[0], "hash-map")?;
             map.insert(pair[0].clone(), pair[1].clone());
         }
         Ok(Value::map(map))
@@ -65,6 +82,9 @@ pub fn register(env: &sema_core::Env) {
             return Err(SemaError::eval(
                 "assoc: requires (key alist) or (map key val ...)",
             ));
+        }
+        for pair in args[1..].chunks(2) {
+            check_map_key(&pair[0], "assoc")?;
         }
         // COW fast path: if refcount==1, mutate in place without any Rc clone.
         // This avoids the refcount inflation from view()/as_*_rc() that prevented
@@ -365,6 +385,7 @@ pub fn register(env: &sema_core::Env) {
                 let mut result = BTreeMap::new();
                 for (k, v) in m.iter() {
                     let new_k = call_function(&args[0], &[k.clone()])?;
+                    check_map_key(&new_k, "map/map-keys")?;
                     result.insert(new_k, v.clone());
                 }
                 Ok(Value::map(result))
@@ -373,6 +394,7 @@ pub fn register(env: &sema_core::Env) {
                 let mut result = HBHashMap::with_capacity(m.len());
                 for (k, v) in m.iter() {
                     let new_k = call_function(&args[0], &[k.clone()])?;
+                    check_map_key(&new_k, "map/map-keys")?;
                     result.insert(new_k, v.clone());
                 }
                 Ok(Value::hashmap_from_rc(Rc::new(result)))
@@ -407,6 +429,7 @@ pub fn register(env: &sema_core::Env) {
                     "map/from-entries: each entry must be a pair (key value)",
                 ));
             }
+            check_map_key(&pair[0], "map/from-entries")?;
             map.insert(pair[0].clone(), pair[1].clone());
         }
         Ok(Value::map(map))
@@ -414,6 +437,7 @@ pub fn register(env: &sema_core::Env) {
 
     register_fn(env, "map/update", |args| {
         check_arity!(args, "map/update", 3);
+        check_map_key(&args[1], "map/update")?;
         if let Some(rc) = args[0].as_map_rc() {
             let mut map = match Rc::try_unwrap(rc) {
                 Ok(map) => map,
@@ -448,6 +472,7 @@ pub fn register(env: &sema_core::Env) {
         }
         let mut map = HBHashMap::with_capacity(args.len() / 2);
         for pair in args.chunks(2) {
+            check_map_key(&pair[0], "hashmap/new")?;
             map.insert(pair[0].clone(), pair[1].clone());
         }
         Ok(Value::hashmap_from_rc(Rc::new(map)))
@@ -475,6 +500,9 @@ pub fn register(env: &sema_core::Env) {
             return Err(SemaError::eval(
                 "hashmap/assoc: requires hashmap and even number of key-value pairs",
             ));
+        }
+        for pair in args[1..].chunks(2) {
+            check_map_key(&pair[0], "hashmap/assoc")?;
         }
         if let Some(()) = args[0].with_hashmap_mut_if_unique(|map| {
             for pair in args[1..].chunks(2) {
@@ -595,6 +623,7 @@ pub fn register(env: &sema_core::Env) {
         };
         let mut map = BTreeMap::new();
         for (k, v) in keys.into_iter().zip(vals) {
+            check_map_key(&k, "map/zip")?;
             map.insert(k, v);
         }
         Ok(Value::map(map))
@@ -650,6 +679,9 @@ pub fn register(env: &sema_core::Env) {
         };
         if path.is_empty() {
             return Ok(args[2].clone());
+        }
+        for key in &path {
+            check_map_key(key, "assoc-in")?;
         }
         fn assoc_in_recursive(m: &Value, path: &[Value], val: &Value) -> Result<Value, SemaError> {
             let key = &path[0];
@@ -712,6 +744,9 @@ pub fn register(env: &sema_core::Env) {
         };
         if path.is_empty() {
             return call_function(&args[2], &[args[0].clone()]);
+        }
+        for key in &path {
+            check_map_key(key, "update-in")?;
         }
         fn update_in_recursive(m: &Value, path: &[Value], f: &Value) -> Result<Value, SemaError> {
             let key = &path[0];

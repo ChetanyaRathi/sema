@@ -1662,6 +1662,56 @@ eval_tests! {
     string_to_number_complex: "(string->number \"3+4i\")" => common::eval("3+4i"),
 }
 
+// `string->number` decimal fast path: plain i64/float token shapes parse
+// directly; every other input falls back to the reader round-trip. This is a
+// differential suite across that boundary — each expected literal is the
+// output of the reader-backed path, so fast-path and fallback answers must
+// coincide exactly (including the deliberate rejections: the lexer reads
+// `+5`, `.5`, `5.`, `1e`, and `1_000` as symbols or multiple tokens).
+eval_tests! {
+    str2num_int: r#"(string->number "42")"# => Value::int(42),
+    str2num_negative_int: r#"(string->number "-5")"# => Value::int(-5),
+    str2num_leading_zeros: r#"(string->number "007")"# => Value::int(7),
+    str2num_negative_zero_int: r#"(string->number "-0")"# => Value::int(0),
+    str2num_plus_prefix_rejected: r#"(string->number "+5")"# => Value::bool(false),
+    str2num_underscores_rejected: r#"(string->number "1_000")"# => Value::bool(false),
+    str2num_float: r#"(string->number "12.5")"# => Value::float(12.5),
+    str2num_neg_float: r#"(string->number "-12.5")"# => Value::float(-12.5),
+    str2num_zero_float: r#"(string->number "0.0")"# => Value::float(0.0),
+    str2num_exponent: r#"(string->number "1e3")"# => Value::float(1000.0),
+    str2num_exponent_upper: r#"(string->number "1E3")"# => Value::float(1000.0),
+    str2num_exponent_neg_sign: r#"(string->number "1.5e-3")"# => Value::float(0.0015),
+    str2num_exponent_pos_sign: r#"(string->number "2e+2")"# => Value::float(200.0),
+    str2num_huge_exponent_is_inf: r#"(string->number "1e999")"# => Value::float(f64::INFINITY),
+    str2num_neg_zero_float_keeps_sign:
+        r#"(< (/ 1.0 (string->number "-0.0")) 0.0)"# => Value::bool(true),
+    str2num_leading_dot_rejected: r#"(string->number ".5")"# => Value::bool(false),
+    str2num_trailing_dot_rejected: r#"(string->number "5.")"# => Value::bool(false),
+    str2num_neg_leading_dot_rejected: r#"(string->number "-.5")"# => Value::bool(false),
+    str2num_bare_exponent_rejected: r#"(string->number "1e")"# => Value::bool(false),
+    str2num_bare_exponent_sign_rejected: r#"(string->number "1e+")"# => Value::bool(false),
+    str2num_double_dot_rejected: r#"(string->number "1..2")"# => Value::bool(false),
+    str2num_second_dot_rejected: r#"(string->number "1.2.3")"# => Value::bool(false),
+    str2num_surrounding_whitespace: "(string->number \" \\t42\\n \")" => Value::int(42),
+    str2num_comment_after_token: r#"(string->number "42 ; c")"# => Value::int(42),
+    str2num_empty_rejected: r#"(string->number "")"# => Value::bool(false),
+    str2num_blank_rejected: r#"(string->number "   ")"# => Value::bool(false),
+    str2num_minus_alone_rejected: r#"(string->number "-")"# => Value::bool(false),
+    str2num_i64_max: r#"(string->number "9223372036854775807")"# => Value::int(i64::MAX),
+    str2num_i64_min: r#"(string->number "-9223372036854775808")"# => Value::int(i64::MIN),
+    str2num_bignum_above_i64: r#"(string->number "9223372036854775808")"#
+        => common::eval("9223372036854775808"),
+    str2num_bignum_below_i64: r#"(string->number "-9223372036854775809")"#
+        => common::eval("-9223372036854775809"),
+    str2num_rational_falls_back: r#"(string->number "1/2")"# => common::eval("1/2"),
+    str2num_hex_prefix_falls_back: r##"(string->number "#x10")"## => Value::int(16),
+    str2num_imaginary_falls_back: r#"(string->number "2i")"# => common::eval("2i"),
+    str2num_inf_symbol_form: r#"(string->number "inf")"# => Value::float(f64::INFINITY),
+    str2num_nan_symbol_form: r#"(math/nan? (string->number "nan"))"# => Value::bool(true),
+    str2num_r7rs_inf_form_rejected: r#"(string->number "+inf.0")"# => Value::bool(false),
+    str2num_r7rs_neg_inf_form_rejected: r#"(string->number "-inf.0")"# => Value::bool(false),
+}
+
 // Task 5.7: `exact-integer-sqrt` (isqrt with remainder, bignum-aware) and
 // `rationalize` (simplest rational within a tolerance, R7RS exactness
 // contagion). `rationalize`'s expected literals are the actual output of the
@@ -1899,6 +1949,72 @@ eval_error_tests! {
     optimizer_rest_param_shadows_builtin: "((lambda (x . +) (+ 1 2)) 9 5)",
 }
 
+// ============================================================
+// (if (not X) then else) branch-polarity peephole
+//
+// The compiler folds the Not into the branch (compile X, invert the jump).
+// These pin that exactly one arm — the right one — evaluates, and that the
+// fold is suppressed when `not` is (re)defined in the same program, matching
+// the Not intrinsic's redefinition guard.
+// ============================================================
+
+eval_tests! {
+    // Side-effecting arms: only the taken arm may run.
+    if_not_polarity_takes_else_arm:
+        "(begin
+           (define log '())
+           (define (note v) (set! log (cons v log)) v)
+           (define (pick x) (if (not x) (note 'then-arm) (note 'else-arm)))
+           (list (pick #t) log))" => common::eval("'(else-arm (else-arm))"),
+    if_not_polarity_takes_then_arm:
+        "(begin
+           (define log '())
+           (define (note v) (set! log (cons v log)) v)
+           (define (pick x) (if (not x) (note 'then-arm) (note 'else-arm)))
+           (list (pick #f) log))" => common::eval("'(then-arm (then-arm))"),
+    // Nested (not (not x)) keeps double-negation semantics.
+    if_not_not_polarity:
+        "(begin (define (pick x) (if (not (not x)) 'truthy 'falsy)) (list (pick 1) (pick #f)))"
+        => common::eval("'(truthy falsy)"),
+    // A user-defined `not` in the same program disables the fold: the if
+    // dispatches to the redefinition (identity here), so a truthy argument
+    // takes the then arm.
+    if_not_redefined_before_use:
+        "(begin
+           (define not (lambda (x) x))
+           (define (pick x) (if (not x) 'not-was-truthy 'not-was-falsy))
+           (list (pick 1) (pick #f)))" => common::eval("'(not-was-truthy not-was-falsy)"),
+    // Define-after-use: the guard scans the whole program, so a later
+    // (define not ...) still disables the fold for earlier code.
+    if_not_redefined_after_use:
+        "(begin
+           (define (pick x) (if (not x) 'not-was-truthy 'not-was-falsy))
+           (define not (lambda (x) x))
+           (list (pick 1) (pick #f)))" => common::eval("'(not-was-truthy not-was-falsy)"),
+    // A lexically shadowed `not` resolves as a local, never as the global
+    // intrinsic — no fold, the local binding is called.
+    if_not_lexically_shadowed:
+        "(let ((not (lambda (x) x))) (if (not 1) 'shadow-truthy 'shadow-falsy))"
+        => common::eval("'shadow-truthy"),
+    // Constant-argument calls are folded per top-level form, so the folder
+    // must see SIBLING top-level redefinitions too (not just same-begin
+    // ones): (not 1) must reach the user's identity fn, not fold to #f.
+    fold_not_redefined_sibling_toplevel:
+        "(define not (lambda (x) x)) (not 1)" => Value::int(1),
+    fold_if_not_redefined_sibling_toplevel:
+        "(define not odd?) (if (not 3) 'then 'else)" => common::eval("'then"),
+    // Same for arithmetic FOLDABLE_NAMES; the oracle is the resolved-call
+    // (non-constant-argument) path pinned below.
+    fold_plus_redefined_sibling_toplevel:
+        "(define + (lambda (a b) 99)) (+ 1 2)" => Value::int(99),
+    fold_plus_redefined_nonconstant_oracle:
+        "(define + (lambda (a b) 99)) (define x 1) (+ x 2)" => Value::int(99),
+    // Define-after-use: suppression only defers to runtime dispatch, which
+    // still sees the builtin until the later define executes.
+    fold_not_redefined_after_use_runs_builtin:
+        "(define r (not 1)) (define not (lambda (x) x)) r" => Value::bool(false),
+}
+
 // Wide-integer runtime arithmetic: operands beyond the ±2^44 small-int fast-path
 // range, applied via a lambda so the optimizer cannot constant-fold them. This
 // exercises the vm_add/vm_sub/vm_mul fallback helpers at runtime (the small-int
@@ -2001,6 +2117,17 @@ eval_tests! {
     string_append_coerce_num: r#"(string-append "n=" 42)"# => Value::string("n=42"),
     // N-ary string-append stays on the generic path and must still work.
     string_append_nary: r#"(string-append "a" "b" "c" "d")"# => Value::string("abcd"),
+    // More than 8 args exercises the native-call arg buffer's heap-spill path.
+    string_append_many_args:
+        r#"(string-append "a" "b" "c" "d" "e" "f" "g" "h" "i" "j")"# => Value::string("abcdefghij"),
+    native_call_many_args: "(max 1 2 3 4 5 6 7 8 9 10)" => Value::int(10),
+    // Multi-byte operands exercise the exact-capacity concat path.
+    string_append_unicode: r#"(string-append "hé" "llø")"# => Value::string("héllø"),
+
+    // `+` on two strings concatenates (vm_add's string arm).
+    plus_string_concat: r#"(+ "foo" "bar")"# => Value::string("foobar"),
+    plus_string_empty_left: r#"(+ "" "x")"# => Value::string("x"),
+    plus_string_unicode: r#"(+ "hé" "llø")"# => Value::string("héllø"),
 }
 
 eval_error_tests! {
@@ -2047,10 +2174,12 @@ eval_tests! {
     gc_collect_returns_stats_map: "(map? (gc/collect))" => Value::bool(true),
     gc_stats_has_registry_size: "(integer? (:registry-size (gc/stats)))" => Value::bool(true),
     // Direct self-recursion (shape U): the churned closure's cell⇄closure
-    // cycle is unreachable after the call and must be reclaimed.
+    // cycle is unreachable after the call and must be reclaimed. The self-call
+    // is non-tail — a tail-only self-recursion elides its self capture
+    // (issue #62) and never forms the cycle.
     gc_self_recursive_local_collected: "(begin
         (define (churn)
-          (define (loop n) (if (<= n 0) 0 (loop (- n 1))))
+          (define (loop n) (if (<= n 0) 0 (+ 1 (loop (- n 1)))))
           (loop 3))
         (churn)
         (> (:collected (gc/collect)) 0))" => Value::bool(true),
@@ -2176,10 +2305,669 @@ eval_tests! {
     // is disabled and the real self-capture is retained — result must be right.
     stc_escape_as_value:
         "(let loop ((n 3) (acc '())) (if (= n 0) (length acc) (loop (- n 1) (cons loop acc))))" => Value::int(3),
+
+    // --- Internal defines get the same treatment as letrec bindings ---
+
+    // Deep self-tail recursion through an internal define reuses the frame
+    // (SelfTailCall): 1e6 iterations must not grow the stack.
+    stc_internal_define_deep_tco:
+        "(begin
+           (define (run)
+             (define (loop n acc) (if (= n 0) acc (loop (- n 1) (+ acc 1))))
+             (loop 1000000 0))
+           (run))" => Value::int(1000000),
+    // Internal define capturing an outer local referenced before the
+    // self-call: dropping the self upvalue shifts the other capture down.
+    stc_internal_define_capture_remap:
+        "(begin
+           (define (run c)
+             (define (loop n) (if (> n 0) (loop (- n 1)) c))
+             (loop 5))
+           (run 100))" => Value::int(100),
+    // Escape inside the define's own body (name consed into a list) disables
+    // the opt; the real self-capture keeps working.
+    stc_internal_define_escape_as_value:
+        "(begin
+           (define (run)
+             (define (loop n acc) (if (= n 0) (length acc) (loop (- n 1) (cons loop acc))))
+             (loop 3 '()))
+           (run))" => Value::int(3),
+    // The define's name returned as a value from the ENCLOSING function is a
+    // plain local load in the outer frame; the returned closure still
+    // self-recurses correctly.
+    stc_internal_define_returned_fn:
+        "(begin
+           (define (mk)
+             (define (f n) (if (= n 0) 'done (f (- n 1))))
+             f)
+           ((mk) 5))" => common::eval("'done"),
+    // Mutually recursive internal defines reference each OTHER (no self
+    // upvalue to elide); cross-captures must survive untouched.
+    stc_internal_define_mutual_recursion:
+        "(begin
+           (define (run n)
+             (define (ev? x) (if (= x 0) #t (od? (- x 1))))
+             (define (od? x) (if (= x 0) #f (ev? (- x 1))))
+             (ev? n))
+           (list (run 10) (run 11)))" => common::eval("'(#t #f)"),
+
+    // --- Rebinding disqualifies the optimization (letrec* semantics) ---
+
+    // A sibling set! rebinds the internal define; a copy saved before the
+    // set! must recurse into the CURRENT binding, not the original closure.
+    stc_internal_define_sibling_set_rebinds:
+        "(begin
+           (define (test)
+             (define (f n) (if (= n 0) 'done (f (- n 1))))
+             (define g f)
+             (set! f (fn (n) 'other))
+             (g 3))
+           (test))" => common::eval("'other"),
+    // Same when the set! happens inside a sibling helper (the rebind scan
+    // sees through nested lambdas).
+    stc_internal_define_setter_lambda_rebinds:
+        "(begin
+           (define (test)
+             (define (f n) (if (= n 0) 'done (f (- n 1))))
+             (define g f)
+             (define (patch!) (set! f (fn (n) 'other)))
+             (patch!)
+             (g 3))
+           (test))" => common::eval("'other"),
+    // A second define of the same name reuses the slot — also a rebinding.
+    stc_internal_define_redefine_rebinds:
+        "(begin
+           (define (test)
+             (define (f n) (if (= n 0) 'done (f (- n 1))))
+             (define g f)
+             (define (f n) 'other)
+             (g 3))
+           (test))" => common::eval("'other"),
+    // The letrec path has the same rule: a body set! of a binding name must
+    // reach copies of the original closure.
+    stc_letrec_sibling_set_rebinds:
+        "(letrec ((f (lambda (n) (if (= n 0) 'done (f (- n 1))))))
+           (let ((g f))
+             (set! f (lambda (n) 'other))
+             (g 3)))" => common::eval("'other"),
 }
 
 eval_error_tests! {
     // A self-call with the wrong argument count still reports an arity error
     // (the SelfTailCall opcode arity-checks against the loop lambda).
     stc_wrong_arity: "(let loop ((a 1) (b 2)) (loop 1))" => "loop",
+}
+
+// ============================================================
+// R7RS make-parameter / parameterize
+// ============================================================
+// A parameter object is a zero-arg procedure returning its current value.
+// `parameterize` dynamically rebinds parameters to (converter v) for the
+// extent of its body, restoring the prior (unconverted) value on exit —
+// including on non-local exit via a raised condition.
+
+eval_tests! {
+    param_basic_call: "((make-parameter 42))" => Value::int(42),
+    param_is_procedure: "(procedure? (make-parameter 5))" => Value::bool(true),
+
+    param_install_then_restore:
+        "(let ((p (make-parameter 1))) (list (p) (parameterize ((p 2)) (p)) (p)))"
+        => Value::list(vec![Value::int(1), Value::int(2), Value::int(1)]),
+
+    param_body_value_returned:
+        "(let ((p (make-parameter 1))) (parameterize ((p 2)) (+ (p) 100)))" => Value::int(102),
+
+    param_converter_applied_to_init_and_new:
+        "(let ((p (make-parameter 10 (lambda (x) (* x 2))))) (list (p) (parameterize ((p 5)) (p)) (p)))"
+        => Value::list(vec![Value::int(20), Value::int(10), Value::int(20)]),
+
+    // Non-idempotent converter proves restore is RAW (not re-converted): if
+    // restore re-applied the converter, the final value would be 2, not 1.
+    param_restore_is_raw_not_reconverted:
+        "(let ((p (make-parameter 0 (lambda (x) (+ x 1))))) (list (p) (parameterize ((p 10)) (p)) (p)))"
+        => Value::list(vec![Value::int(1), Value::int(11), Value::int(1)]),
+
+    param_nested_extents:
+        "(let ((p (make-parameter 1))) (parameterize ((p 2)) (list (p) (parameterize ((p 3)) (p)) (p))))"
+        => Value::list(vec![Value::int(2), Value::int(3), Value::int(2)]),
+
+    param_multiple_parameters:
+        "(let ((a (make-parameter 1)) (b (make-parameter 2))) (parameterize ((a 10) (b 20)) (list (a) (b))))"
+        => Value::list(vec![Value::int(10), Value::int(20)]),
+
+    param_multi_form_body_last_value:
+        "(let ((p (make-parameter 0))) (parameterize ((p 9)) (p) (* (p) (p))))" => Value::int(81),
+
+    param_restored_after_throw:
+        r#"(let ((p (make-parameter 1))) (try (parameterize ((p 2)) (throw "boom")) (catch e nil)) (p))"#
+        => Value::int(1),
+
+    param_error_reraised_and_value_restored:
+        r#"(let ((p (make-parameter 1))) (list (try (parameterize ((p 2)) (error "x")) (catch e :caught)) (p)))"#
+        => Value::list(vec![Value::keyword("caught"), Value::int(1)]),
+
+    // Atomicity: a throwing converter must install NOTHING — all new values are
+    // converted before any parameter is mutated.
+    param_throwing_converter_installs_nothing:
+        r#"(let ((p (make-parameter 1 (lambda (x) (if (> x 5) (error "big") x))))) (list (try (parameterize ((p 10)) (p)) (catch e :caught)) (p)))"#
+        => Value::list(vec![Value::keyword("caught"), Value::int(1)]),
+
+    param_throwing_value_expr_never_enters:
+        r#"(let ((p (make-parameter 1))) (list (try (parameterize ((p (error "bad"))) (p)) (catch e :caught)) (p)))"#
+        => Value::list(vec![Value::keyword("caught"), Value::int(1)]),
+
+    param_empty_binding_list: "(parameterize () 42)" => Value::int(42),
+
+    // SRFI-39 style mutating call: (p v) sets and converts the new value.
+    param_mutating_call: "(let ((p (make-parameter 1))) (p 5) (p))" => Value::int(5),
+    param_mutating_call_applies_converter:
+        "(let ((p (make-parameter 1 (lambda (x) (* x 10))))) (p 5) (p))" => Value::int(50),
+}
+
+eval_error_tests! {
+    // An uncaught error inside a parameterize body propagates with its message
+    // (parameterize restores state but does not swallow the condition).
+    param_uncaught_body_error_propagates:
+        r#"(let ((p (make-parameter 1))) (parameterize ((p 2)) (error "kaboom")))"# => "kaboom",
+}
+
+// ============================================================
+// R7RS multiple values: `values`, `call-with-values`,
+// `let-values`/`let*-values`, `define-values`
+// ============================================================
+
+eval_tests! {
+    mv_call_with_values_variadic_consumer:
+        "(call-with-values (lambda () (values 1 2)) +)" => Value::int(3),
+    mv_call_with_values_list_consumer:
+        "(call-with-values (lambda () (values 1 2 3)) list)" => common::eval("'(1 2 3)"),
+    // A single-value producer (no `values` call) is treated as ONE value, not
+    // spread — `list` receives it as its sole argument.
+    mv_call_with_values_single_value_producer:
+        "(call-with-values (lambda () 42) list)" => common::eval("'(42)"),
+    mv_call_with_values_zero_values_into_variadic:
+        "(call-with-values (lambda () (values)) +)" => Value::int(0),
+    mv_call_with_values_zero_values_into_zero_arg_consumer:
+        "(call-with-values (lambda () (values)) (lambda () 99))" => Value::int(99),
+    mv_call_with_values_fixed_arity_consumer:
+        "(call-with-values (lambda () (values 1 2 3)) (lambda (a b c) (* a b c)))" => Value::int(6),
+    // R7RS: `(values x)` is identity, so a single value flows through ordinary
+    // single-value contexts unchanged.
+    mv_single_value_identity_in_comparison: "(= (values 5) 5)" => Value::bool(true),
+    mv_single_value_flows_through_arithmetic: "(+ (values 5) 1)" => Value::int(6),
+
+    mv_let_values_basic: "(let-values (((a b) (values 1 2))) (+ a b))" => Value::int(3),
+    mv_let_values_multiple_clauses:
+        "(let-values (((a b) (values 1 2)) ((c d) (values 3 4))) (+ a b c d))" => Value::int(10),
+    // Dotted/rest formals: `(a . rest)` binds the first value to `a` and the
+    // remaining values as a list to `rest`.
+    mv_let_values_dotted_rest:
+        "(let-values (((a . rest) (values 1 2 3))) rest)"
+        => Value::list(vec![Value::int(2), Value::int(3)]),
+    // Bare-symbol formals bind ALL produced values as a single list.
+    mv_let_values_bare_symbol_formals:
+        "(let-values ((all (values 1 2 3))) all)"
+        => Value::list(vec![Value::int(1), Value::int(2), Value::int(3)]),
+    mv_let_values_empty_bindings: "(let-values () 7)" => Value::int(7),
+    // PARALLEL: let-values evaluates every producer against the OUTER
+    // environment, so the second clause's producer sees the outer `a`, not the
+    // first clause's freshly-bound `a`.
+    mv_let_values_is_parallel:
+        "(let ((a 100)) (let-values (((a) (values 1)) ((b) (values a))) b))" => Value::int(100),
+    // SEQUENTIAL: let*-values's second producer sees the first clause's binding.
+    mv_let_star_values_is_sequential:
+        "(let ((a 100)) (let*-values (((a) (values 1)) ((b) (values a))) b))" => Value::int(1),
+    mv_let_star_values_chained:
+        "(let*-values (((a b) (values 1 2)) ((c) (values (+ a b)))) c)" => Value::int(3),
+
+    mv_define_values_basic:
+        "(begin (define-values (a b) (values 10 20)) (+ a b))" => Value::int(30),
+    mv_define_values_dotted_rest:
+        "(begin (define-values (q . r) (values 1 2 3)) r)"
+        => Value::list(vec![Value::int(2), Value::int(3)]),
+
+    // Builtins (including call-with-values itself) are first-class procedures.
+    mv_call_with_values_is_a_procedure: "(procedure? call-with-values)" => Value::bool(true),
+}
+
+eval_error_tests! {
+    // Too many produced values for the consumer's fixed arity is a normal
+    // lambda/apply arity error (R7RS "wrong number of values").
+    mv_let_values_too_many_values_errors:
+        "(let-values (((a b) (values 1 2 3))) a)" => "expects 2",
+    mv_call_with_values_consumer_arity_mismatch:
+        r#"(call-with-values (lambda () (values 1 2)) (lambda (x) x))"# => "expects 1",
+    mv_call_with_values_producer_not_callable:
+        "(call-with-values 5 list)" => "not callable",
+    // A producer error propagates as a normal thrown/re-raised error through
+    // call-with-values (no swallowing).
+    mv_call_with_values_producer_error_propagates:
+        r#"(call-with-values (lambda () (throw "boom")) list)"# => "boom",
+    mv_let_values_producer_error_propagates:
+        r#"(let-values (((a) (throw "bad"))) a)"# => "bad",
+    // R7RS 5.3.3: define-values matches formals like a lambda's parameters, so
+    // too many produced values for a fixed formal list is an arity error (not a
+    // silent drop of the surplus).
+    mv_define_values_too_many_values_errors:
+        "(begin (define-values (a b) (values 1 2 3)) (list a b))" => "expects 2",
+    // Too few produced values is likewise a clean arity error.
+    mv_define_values_too_few_values_errors:
+        "(begin (define-values (a b c) (values 1 2)) a)" => "expects 3",
+}
+
+// ============================================================
+// R7RS syntax-rules (define-syntax)
+// ============================================================
+
+eval_tests! {
+    // Basic pattern/template + set!
+    sr_swap_basic: r#"
+        (begin
+          (define-syntax swap!
+            (syntax-rules ()
+              ((_ a b) (let ((tmp a)) (set! a b) (set! b tmp)))))
+          (define x 1) (define y 2) (swap! x y) (list x y))
+    "# => common::eval("'(2 1)"),
+
+    // HYGIENE: introduced `tmp` must not capture the user's `tmp`
+    sr_swap_hygiene: r#"
+        (begin
+          (define-syntax swap!
+            (syntax-rules ()
+              ((_ a b) (let ((tmp a)) (set! a b) (set! b tmp)))))
+          (define tmp 1) (define y 2) (swap! tmp y) (list tmp y))
+    "# => common::eval("'(2 1)"),
+
+    // HYGIENE: introduced `t` must not capture user `t`; recursive ellipsis
+    sr_my_or_hygiene: r#"
+        (begin
+          (define-syntax my-or
+            (syntax-rules ()
+              ((_) #f)
+              ((_ e) e)
+              ((_ e1 e2 ...) (let ((t e1)) (if t t (my-or e2 ...))))))
+          (define t 5) (my-or #f t))
+    "# => Value::int(5),
+
+    // Recursive expansion terminates as the ellipsis list shrinks
+    sr_my_or_recursive: r#"
+        (begin
+          (define-syntax my-or
+            (syntax-rules ()
+              ((_) #f)
+              ((_ e) e)
+              ((_ e1 e2 ...) (let ((t e1)) (if t t (my-or e2 ...))))))
+          (my-or #f #f 7))
+    "# => Value::int(7),
+
+    // Ellipsis, multiple matches
+    sr_ellipsis_multiple: r#"
+        (begin
+          (define-syntax my-list (syntax-rules () ((_ x ...) (list x ...))))
+          (my-list 1 2 3))
+    "# => common::eval("'(1 2 3)"),
+
+    // Ellipsis, ZERO matches
+    sr_ellipsis_zero: r#"
+        (begin
+          (define-syntax my-list (syntax-rules () ((_ x ...) (list x ...))))
+          (my-list))
+    "# => common::eval("'()"),
+
+    // Nested ellipsis over (name val) pairs; two ellipsis vars in lockstep
+    sr_my_let: r#"
+        (begin
+          (define-syntax my-let
+            (syntax-rules ()
+              ((_ ((name val) ...) body ...)
+               ((lambda (name ...) body ...) val ...))))
+          (my-let ((a 1) (b 2)) (+ a b)))
+    "# => Value::int(3),
+
+    // Multiple rules / arity dispatch, first-match wins
+    sr_multi_rule: r#"
+        (begin
+          (define-syntax f
+            (syntax-rules ()
+              ((_ a) (+ a 1))
+              ((_ a b) (+ a b))))
+          (list (f 10) (f 3 4)))
+    "# => common::eval("'(11 7)"),
+
+    // Literal identifier `=>` matched structurally
+    sr_literal: r#"
+        (begin
+          (define-syntax my-cond1
+            (syntax-rules (=>)
+              ((_ (test => proc)) (let ((v test)) (if v (proc v) #f)))))
+          (my-cond1 (5 => (fn (n) (* n 2)))))
+    "# => Value::int(10),
+
+    // macroexpand path works; `*` kept (global), not renamed
+    sr_macroexpand: r#"
+        (begin
+          (define-syntax dbl (syntax-rules () ((_ x) (* 2 x))))
+          (macroexpand '(dbl 5)))
+    "# => common::eval("'(* 2 5)"),
+
+    // try/throw/catch kept verbatim by hygiene (special forms + `catch`
+    // auxiliary keyword); the expansion runs. Sema's catch binds the error
+    // object, so read its :value to recover the thrown datum.
+    sr_special_forms_kept: r#"
+        (begin
+          (define-syntax g
+            (syntax-rules () ((_ x) (try (throw x) (catch err (:value err))))))
+          (g "boom"))
+    "# => Value::string("boom"),
+
+    // Custom ellipsis symbol (`ooo`; Sema's reader treats `:` as a keyword
+    // prefix so R7RS's conventional `:::` is not a readable symbol here)
+    sr_custom_ellipsis: r#"
+        (begin
+          (define-syntax my-list2
+            (syntax-rules ooo () ((_ x ooo) (list x ooo))))
+          (my-list2 1 2))
+    "# => common::eval("'(1 2)"),
+
+    // TCO is preserved through syntax-rules: expansion happens before lowering,
+    // so a template that places the recursive call in tail position is lowered
+    // with normal tail-call analysis. Without TCO this deep loop would overflow.
+    sr_tco_preserved: r#"
+        (begin
+          (define-syntax my-if
+            (syntax-rules () ((_ c t e) (cond (c t) (else e)))))
+          (define (loop n acc)
+            (my-if (= n 0) acc (loop (- n 1) (+ acc 1))))
+          (loop 100000 0))
+    "# => Value::int(100000),
+
+    // Ellipsis body spliced into begin, tail value
+    sr_when_body: r#"
+        (begin
+          (define-syntax my-when
+            (syntax-rules () ((_ c body ...) (if c (begin body ...) #f))))
+          (my-when #t 1 2 3))
+    "# => Value::int(3),
+
+    // Binder-directed hygiene: a template that references a user-defined global
+    // FUNCTION must keep that name verbatim (not alpha-rename it), so it still
+    // resolves after whole-program pre-expansion. Regression for the bug where
+    // `helper` became `helper__0` (Unbound variable).
+    sr_calls_user_function: r#"
+        (begin
+          (define (helper x) (* x 10))
+          (define-syntax m (syntax-rules () ((_ x) (helper x))))
+          (m 4))
+    "# => Value::int(40),
+
+    // A template that references a user-defined global VARIABLE keeps it verbatim.
+    sr_references_user_global: r#"
+        (begin
+          (define g 100)
+          (define-syntax getg (syntax-rules () ((_) g)))
+          (getg))
+    "# => Value::int(100),
+
+    // Calling a user function through the template with ellipsis-spread args.
+    sr_calls_user_function_ellipsis: r#"
+        (begin
+          (define (sum3 a b c) (+ a b c))
+          (define-syntax s3 (syntax-rules () ((_ e ...) (sum3 e ...))))
+          (s3 4 5 6))
+    "# => Value::int(15),
+
+    // A template-introduced binder (`r`) is still renamed and never leaks:
+    // the outer user `r` is untouched by the expansion.
+    sr_binder_does_not_leak: r#"
+        (begin
+          (define-syntax twice (syntax-rules () ((_ e) (let ((r e)) (+ r r)))))
+          (define r 1000)
+          (list (twice 5) r))
+    "# => common::eval("'(10 1000)"),
+}
+
+eval_error_tests! {
+    // No rule matches arity
+    sr_no_match: r#"
+        (begin
+          (define-syntax only1 (syntax-rules () ((_ a) a)))
+          (only1 1 2))
+    "# => "no matching syntax-rules",
+
+    // Malformed transformer
+    sr_malformed: "(define-syntax bad (syntax-rules))" => "syntax-rules",
+
+    // Name must be a symbol
+    sr_bad_name: "(define-syntax 5 (syntax-rules () ((_ a) a)))" => "define-syntax",
+}
+
+// ============================================================
+// Mutable arrays / cells
+// ============================================================
+
+eval_tests! {
+    mutable_array_push_get: "(let ((a (mutable-array/new))) (mutable-array/push! a 1) (mutable-array/push! a 2) (mutable-array/get a 1))" => Value::int(2),
+    // Reference sharing: mutation through one handle is visible through another.
+    mutable_array_shared_mutation: "(let* ((a (mutable-array/new)) (b a)) (mutable-array/push! a 7) (mutable-array/get b 0))" => Value::int(7),
+    mutable_array_new_filled: "(mutable-array/->vector (mutable-array/new 3 0))" => common::eval("[0 0 0]"),
+    mutable_array_capacity_starts_empty: "(mutable-array/length (mutable-array/new 64))" => Value::int(0),
+    mutable_array_set: "(let ((a (mutable-array/new 2 0))) (mutable-array/set! a 1 9) (mutable-array/->vector a))" => common::eval("[0 9]"),
+    mutable_array_get_default: "(mutable-array/get (mutable-array/new) 5 :missing)" => Value::keyword("missing"),
+    mutable_array_length: "(mutable-array/length (mutable-array/new 3 :x))" => Value::int(3),
+    mutable_array_nth_interop: "(nth (mutable-array/new 2 :v) 1)" => Value::keyword("v"),
+    mutable_array_type_name: "(type (mutable-array/new))" => Value::keyword("mutable-array"),
+    // ->vector freezes a snapshot: later mutation does not change it.
+    mutable_array_freeze_snapshots: "(let* ((a (mutable-array/new 1 0)) (v (mutable-array/->vector a))) (mutable-array/set! a 0 9) v)" => common::eval("[0]"),
+    mutable_array_equal_by_contents: "(equal? (mutable-array/new 2 1) (mutable-array/new 2 1))" => Value::bool(true),
+    mutable_array_unequal_contents: "(equal? (mutable-array/new 2 1) (mutable-array/new 2 2))" => Value::bool(false),
+    mutable_array_not_equal_to_vector: "(equal? (mutable-array/new 1 0) [0])" => Value::bool(false),
+    // Cyclic comparison terminates (coinductive equality, no infinite loop).
+    mutable_array_cyclic_equal_terminates: "(let ((a (mutable-array/new)) (b (mutable-array/new))) (mutable-array/push! a a) (mutable-array/push! b b) (equal? a b))" => Value::bool(true),
+    // Ord agrees with equality (content-based): distinct mutable containers
+    // are distinct BTreeMap/BTreeSet keys, so the transient-collection
+    // helpers (frequencies, list/unique, list/group-by) group by content at
+    // call time instead of aliasing every mutable container to one key.
+    mutable_array_frequencies_distinct: "(let ((a (mutable-array/new 1 1)) (b (mutable-array/new 1 2))) (vals (frequencies (list a b))))" => common::eval("'(1 1)"),
+    mutable_array_frequencies_merges_equal_contents: "(let ((a (mutable-array/new 1 1)) (b (mutable-array/new 1 1))) (vals (frequencies (list a b))))" => common::eval("'(2)"),
+    mutable_array_unique_keeps_distinct: "(let ((a (mutable-array/new 1 1)) (b (mutable-array/new 1 2))) (length (list/unique (list a b))))" => Value::int(2),
+    mutable_array_group_by_keeps_groups: "(let ((a (mutable-array/new 1 1)) (b (mutable-array/new 1 2))) (length (keys (list/group-by (lambda (x) x) (list a b)))))" => Value::int(2),
+    mutable_array_vs_cell_distinct_keys: "(length (list/unique (list (mutable-array/new) (mutable-cell/new nil))))" => Value::int(2),
+    mutable_array_sort_by_content: "(map (lambda (x) (mutable-array/get x 0)) (sort-by (lambda (x) x) (list (mutable-array/new 1 2) (mutable-array/new 1 1))))" => common::eval("'(1 2)"),
+    // Cyclic ordering terminates: an in-flight pair compares Equal (the same
+    // coinductive convention as equality), so unique collapses the pair.
+    mutable_array_cyclic_ord_terminates: "(let ((a (mutable-array/new)) (b (mutable-array/new))) (mutable-array/push! a a) (mutable-array/push! b b) (length (list/unique (list a b))))" => Value::int(1),
+    // --- MutArrGet / MutArrSet intrinsic opcodes (2-arg get, 3-arg set!) ---
+    // These pin observational equivalence with the native path; expected
+    // values were verified against the pre-intrinsic binary.
+    mutable_array_set_get_roundtrip: "(let ((a (mutable-array/new 3 0))) (mutable-array/set! a 1 42) (mutable-array/get a 1))" => Value::int(42),
+    // set! returns the array itself (not the value, not nil) …
+    mutable_array_set_returns_array: "(let ((a (mutable-array/new 2 0))) (mutable-array/->vector (mutable-array/set! a 0 9)))" => common::eval("[9 0]"),
+    // … and the very same handle (identity, not a copy).
+    mutable_array_set_returns_same_handle: "(let ((a (mutable-array/new 1 0))) (eq? a (mutable-array/set! a 0 1)))" => Value::bool(true),
+    // Left-to-right evaluation: the value expression runs after arr/idx and
+    // may itself mutate the array; its write is then overwritten.
+    mutable_array_set_eval_order: "(let ((a (mutable-array/new 1 1))) (mutable-array/set! a 0 (begin (mutable-array/set! a 0 5) (+ (mutable-array/get a 0) 1))) (mutable-array/get a 0))" => Value::int(6),
+    // Nested accessors compose (a set! through a get result).
+    mutable_array_nested_set_through_get: "(let ((a (mutable-array/new 1 0)) (b (mutable-array/new 1 0))) (mutable-array/set! a 0 b) (mutable-array/set! (mutable-array/get a 0) 0 :deep) (mutable-array/get b 0))" => Value::keyword("deep"),
+    // In-bounds 3-arg get ignores the default (stays on the native path).
+    mutable_array_get_default_in_bounds: "(mutable-array/get (mutable-array/new 2 7) 1 :missing)" => Value::int(7),
+    // Intrinsic errors unwind through try/catch like the native's.
+    mutable_array_get_oob_catchable: "(try (mutable-array/get (mutable-array/new) 5) (catch e :caught))" => Value::keyword("caught"),
+    // Redefinition guard: a program-level redefine disables the intrinsic.
+    mutable_array_get_redefined: "(define (mutable-array/get a i) :mine) (mutable-array/get (mutable-array/new 1 5) 0)" => Value::keyword("mine"),
+    // A let-bound shadow resolves locally (never the intrinsic).
+    mutable_array_get_local_shadow: "(let ((mutable-array/get (fn (a i) :local))) (mutable-array/get 1 2))" => Value::keyword("local"),
+    mutable_cell_round_trip: "(let ((c (mutable-cell/new 1))) (mutable-cell/set! c 99) (mutable-cell/get c))" => Value::int(99),
+    mutable_cell_shared_mutation: "(let* ((c (mutable-cell/new 0)) (d c)) (mutable-cell/set! c 5) (mutable-cell/get d))" => Value::int(5),
+    mutable_cell_equal_by_contents: "(equal? (mutable-cell/new 1) (mutable-cell/new 1))" => Value::bool(true),
+    mutable_cell_type_name: "(type (mutable-cell/new nil))" => Value::keyword("mutable-cell"),
+}
+
+eval_error_tests! {
+    // get/set! errors are raised by the MutArrGet/MutArrSet intrinsic arms;
+    // the full messages are pinned (shared with the natives via
+    // sema_core::mutable_ops, so both paths stay byte-identical).
+    mutable_array_get_oob: "(mutable-array/get (mutable-array/new) 0)" => "mutable-array/get: index 0 out of bounds (length 0)",
+    mutable_array_get_type_error: "(mutable-array/get [1] 0)" => "expected mutable-array, got vector",
+    mutable_array_get_negative_index: "(mutable-array/get (mutable-array/new 1 0) -1)" => "mutable-array/get: expected a non-negative integer, got -1",
+    mutable_array_get_non_int_index: "(mutable-array/get (mutable-array/new 1 0) :x)" => "expected int, got keyword",
+    mutable_array_set_oob: "(mutable-array/set! (mutable-array/new) 0 1)" => "mutable-array/set!: index 0 out of bounds (length 0)",
+    mutable_array_set_type_error: "(mutable-array/set! [1] 0 1)" => "expected mutable-array, got vector",
+    mutable_array_set_negative_index: "(mutable-array/set! (mutable-array/new 1 0) -1 5)" => "mutable-array/set!: expected a non-negative integer, got -1",
+    mutable_array_set_non_int_index: "(mutable-array/set! (mutable-array/new 1 0) \"x\" 5)" => "expected int, got string",
+    // Wrong-arity calls fall through to the native, whose arity error fires.
+    mutable_array_set_arity: "(mutable-array/set! (mutable-array/new 1 0) 0)" => "mutable-array/set!",
+    mutable_array_push_type_error: "(mutable-array/push! [1] 2)" => "mutable-array",
+    mutable_array_new_arity: "(mutable-array/new 1 2 3)" => "mutable-array/new",
+    mutable_cell_get_type_error: "(mutable-cell/get 5)" => "mutable-cell",
+    mutable_cell_set_arity: "(mutable-cell/set! (mutable-cell/new 1))" => "mutable-cell/set!",
+    // Mutable containers cannot be map keys (contents can change after insert).
+    mutable_array_map_key_rejected: "(hash-map (mutable-array/new) 1)" => "immutable map key",
+    mutable_array_assoc_key_rejected: "(assoc {} (mutable-array/new) 1)" => "immutable map key",
+    mutable_array_literal_key_rejected: "(let ((a (mutable-array/new))) {a 1})" => "immutable map key",
+    mutable_cell_hashmap_key_rejected: "(hashmap/new (mutable-cell/new 1) 2)" => "immutable map key",
+    // The guard covers every key-insert path, not just the constructors.
+    mutable_array_map_update_key_rejected: "(map/update {} (mutable-array/new) (lambda (v) 1))" => "immutable map key",
+    mutable_array_assoc_in_key_rejected: "(assoc-in {} (list (mutable-array/new)) 1)" => "immutable map key",
+    mutable_array_assoc_in_nested_path_key_rejected: "(assoc-in {} (list :a (mutable-array/new)) 1)" => "immutable map key",
+    mutable_array_update_in_key_rejected: "(update-in {} [(mutable-array/new)] (lambda (v) 1))" => "immutable map key",
+    // The guard is deep: a key that merely wraps a mutable container is
+    // rejected too (the wrapper's Ord recurses into the mutable contents).
+    mutable_array_nested_vector_key_rejected: "(hash-map (vector (mutable-array/new)) 10)" => "immutable map key",
+    mutable_cell_nested_list_key_rejected: "(assoc {} (list (mutable-cell/new 1)) 2)" => "immutable map key",
+    mutable_array_nested_literal_key_rejected: "(let ((a (mutable-array/new))) {[a] 1})" => "immutable map key",
+    mutable_array_nested_map_value_key_rejected: "(hashmap/new {:k (mutable-array/new)} 1)" => "immutable map key",
+}
+
+// ============================================================
+// bytes/* byte-oriented ops on bytevectors
+// ============================================================
+
+eval_tests! {
+    bytes_length: "(bytes/length (string->utf8 \"abc\"))" => Value::int(3),
+    bytes_ref: "(bytes/ref (string->utf8 \"abc\") 1)" => Value::int(98),
+    bytes_find_byte: "(bytes/find (string->utf8 \"a;b\") 59)" => Value::int(1),
+    bytes_find_string_needle: "(bytes/find (string->utf8 \"hello\") \"llo\")" => Value::int(2),
+    bytes_find_bytevector_needle: "(bytes/find (string->utf8 \"hello\") (string->utf8 \"lo\"))" => Value::int(3),
+    // The optional start offset returns absolute indices.
+    bytes_find_from_start: "(bytes/find (string->utf8 \"a;b;c\") 59 2)" => Value::int(3),
+    bytes_find_missing_is_nil: "(bytes/find (string->utf8 \"abc\") 59)" => Value::nil(),
+    bytes_slice: "(bytes/->string (bytes/slice (string->utf8 \"hello\") 1 3))" => Value::string("el"),
+    bytes_slice_to_end: "(bytes/->string (bytes/slice (string->utf8 \"hello\") 3))" => Value::string("lo"),
+    bytes_to_string_range: "(bytes/->string (string->utf8 \"Oslo;-12.3\") 0 4)" => Value::string("Oslo"),
+    // The 1BRC fixed-point trick: one-decimal temperatures scale to ints.
+    bytes_parse_int10_decimal: "(bytes/parse-int10 (string->utf8 \"-12.3\"))" => Value::int(-123),
+    bytes_parse_int10_no_decimal: "(bytes/parse-int10 (string->utf8 \"5\"))" => Value::int(50),
+    bytes_parse_int10_negative_zero: "(bytes/parse-int10 (string->utf8 \"-0.0\"))" => Value::int(0),
+    bytes_parse_int10_start_offset: "(bytes/parse-int10 (string->utf8 \"Oslo;-12.3\") 5)" => Value::int(-123),
+}
+
+eval_error_tests! {
+    bytes_ref_oob: "(bytes/ref (string->utf8 \"a\") 5)" => "out of bounds",
+    bytes_slice_oob: "(bytes/slice (string->utf8 \"ab\") 1 9)" => "out of bounds",
+    bytes_length_type_error: "(bytes/length \"abc\")" => "bytevector",
+    bytes_find_needle_type_error: "(bytes/find (string->utf8 \"a\") 1.5)" => "int, bytevector, or string",
+    bytes_parse_int10_bad_digit: "(bytes/parse-int10 (string->utf8 \"12x\"))" => "invalid digit",
+    bytes_parse_int10_two_decimals: "(bytes/parse-int10 (string->utf8 \"1.23\"))" => "one digit",
+    bytes_parse_int10_empty: "(bytes/parse-int10 (string->utf8 \"\"))" => "digit",
+    bytes_to_string_invalid_utf8: "(bytes/->string (bytevector 255 254))" => "invalid UTF-8",
+}
+
+// ============================================================
+// CallSelf: direct self-call fast path for top-level defines
+// ============================================================
+
+eval_tests! {
+    // Deep non-tail self-recursion (tak-shaped) runs on CallSelf frames.
+    call_self_tak: "(define (tak x y z) (if (not (< y x)) z (tak (tak (- x 1) y z) (tak (- y 1) z x) (tak (- z 1) x y)))) (tak 6 4 2)" => Value::int(3),
+    call_self_fib: "(define (fib n) (if (< n 2) n (+ (fib (- n 1)) (fib (- n 2))))) (fib 15)" => Value::int(610),
+    call_self_deep_nontail: "(define (count n) (if (= n 0) 0 (+ 1 (count (- n 1))))) (count 1000)" => Value::int(1000),
+    // REPL-style redefinition: a second define opts the name out, so the later
+    // call dispatches to the new binding exactly as before.
+    call_self_redefinition: "(define (f n) (if (= n 0) 0 (+ 1 (f (- n 1))))) (define r1 (f 3)) (define (f n) 42) (list r1 (f 3))" => common::eval("'(3 42)"),
+    // A global set! (even mid-recursion, through a helper) opts the name out:
+    // the recursive call sees the rebound global, as it always did.
+    call_self_set_mid_run: "(define (redef!) (set! f (fn (n) 100))) (define (f n) (if (= n 0) 0 (begin (redef!) (+ 1 (f (- n 1)))))) (f 3)" => Value::int(101),
+    // Mutual recursion never takes the self-call path.
+    call_self_mutual_recursion: "(define (my-even n) (if (= n 0) #t (my-odd (- n 1)))) (define (my-odd n) (if (= n 0) #f (my-even (- n 1)))) (list (my-even 10) (my-odd 7))" => common::eval("'(#t #t)"),
+    // A value reference to the name stays a plain global load: identity is
+    // preserved and the escaped closure still recurses correctly.
+    call_self_identity_preserved: "(define (f n) (if (= n 0) 'done (car (list (f (- n 1)))))) (define g f) (list (eq? f g) (f 2) (g 2))" => common::eval("'(#t done done)"),
+    call_self_escaped_value_call: "(define (f n) (if (= n 0) 0 (+ 1 ((first (list f)) (- n 1))))) (f 3)" => Value::int(3),
+    // Rest params flow through the self-call frame setup.
+    call_self_rest_params: "(define (f x . rest) (if (null? rest) x (+ 1 (f (car rest))))) (f 1 2)" => Value::int(3),
+    // Interplay with internal defines and letrec: shadowed names resolve as
+    // locals/upvalues and never hijack the enclosing define's fast path.
+    call_self_internal_define_mix: "(define (f n) (define (g k) (if (= k 0) 0 (+ 1 (g (- k 1))))) (+ (g n) (if (= n 0) 0 (f (- n 1))))) (f 2)" => Value::int(3),
+    call_self_internal_define_shadows: "(define (f n) (define (f k) (* k 2)) (f n)) (f 5)" => Value::int(10),
+    call_self_letrec_shadows: "(define (f n) (letrec ((f (lambda (k) (if (= k 0) 0 (+ 1 (f (- k 1))))))) (f n))) (f 4)" => Value::int(4),
+}
+
+eval_error_tests! {
+    // Arity is still checked on the self-call frame path.
+    call_self_arity_error: "(define (f n) (if (= n 0) 0 (+ 1 (f)))) (f 1)" => "expects 1 args, got 0",
+}
+
+// ============================================================
+// TakeLocal: moving last-use local loads (COW-unlocking)
+// ============================================================
+// A taken slot must be observationally identical to a cloned one: the
+// in-place map fast paths only fire at strong_count == 1, so any live alias
+// forces the clone path. Every case here was pinned against the pre-TakeLocal
+// binary as the oracle.
+
+eval_tests! {
+    // THE alias test: an accumulator also held by another binding must not be
+    // mutated in place — `keep` still sees the pre-assoc map.
+    take_local_alias_not_mutated: "((fn () (let* ((m0 {:a 1}) (keep m0) (m1 (assoc m0 :b 2))) (list keep m1))))" => common::eval("'({:a 1} {:a 1 :b 2})"),
+    // Idiomatic fold accumulator (the pattern this opcode exists for).
+    take_local_fold_assoc: "((fn () (foldl (fn (acc x) (assoc acc x (* x 10))) {} (list 1 2 3))))" => common::eval("{1 10 2 20 3 30}"),
+    // An accumulator snapshot escaping mid-fold (global set!) pins that later
+    // in-place steps never retroactively mutate the escaped alias.
+    take_local_fold_escaped_snapshot: "(define keep nil) (define r (foldl (fn (acc x) (begin (when (= x 2) (set! keep acc)) (assoc acc x 1))) {} (list 1 2 3))) (list keep r)" => common::eval("'({1 1} {1 1 2 1 3 1})"),
+    // Branch-local last uses: each arm may move the slot independently.
+    take_local_both_branches: "(define (pick m) (if (nil? (get m :k)) (assoc m :k 0) m)) (list (pick {}) (pick {:k 5}))" => common::eval("'({:k 0} {:k 5})"),
+    // A slot captured by an inner lambda is never moved: the closure still
+    // reads the original map after the assoc.
+    take_local_captured_slot: "((fn (m) (let ((g (fn () m))) (list (assoc m :k 1) (g)))) {:a 1})" => common::eval("'({:a 1 :k 1} {:a 1})"),
+    // set! targets are never moved; the store still lands.
+    take_local_set_target: "((fn (m) (let ((r1 (assoc m :k 1))) (set! m {:fresh 1}) (list r1 m))) {})" => common::eval("'({:k 1} {:fresh 1})"),
+    // Shadowing: the init reads the param, the body reads the new binding.
+    take_local_shadowed_rebind: "((fn (x) (let ((x (list x x))) x)) 7)" => common::eval("'(7 7)"),
+    // A chain of single-use accumulators moves through every step.
+    take_local_letstar_chain: "((fn (a) (let* ((b (assoc a :b 1)) (c (assoc b :c 2))) c)) {:a 0})" => common::eval("{:a 0 :b 1 :c 2}"),
+    // The untaken branch still sees the untouched value.
+    take_local_untaken_branch: "((fn (m) (if (= 1 2) (assoc m :x 1) m)) {:z 9})" => common::eval("{:z 9}"),
+    // A function containing try opts out entirely: the handler observes the
+    // argument unmodified even though the body's assoc never completed.
+    take_local_try_handler_sees_slot: "((fn (m) (try (assoc m :k (throw \"boom\")) (catch e m))) {:a 1})" => common::eval("{:a 1}"),
+    // Rest params are ordinary slots.
+    take_local_rest_param: "((fn (x . rest) (append rest (list x))) 1 2 3)" => common::eval("'(2 3 1)"),
+    // dissoc shares the same uniqueness gate as assoc.
+    take_local_dissoc: "((fn (m) (dissoc m :a)) {:a 1 :b 2})" => common::eval("{:b 2}"),
+    // Only the last use moves; the earlier get still sees the value.
+    take_local_earlier_read_intact: "((fn (m) (list (get m :a) (assoc m :z 9))) {:a 7})" => common::eval("'(7 {:a 7 :z 9})"),
+}
+
+// ============================================================
+// Owned-args callback protocol (stdlib folds move the accumulator)
+// ============================================================
+// foldl/reduce/file-fold hand their accumulator to the callback by MOVE
+// (call_callback_owned), so the in-place fast paths can fire inside the
+// callback. These pin that every callable shape and error path behaves
+// identically to the borrowed protocol.
+
+eval_tests! {
+    // reduce seeds from the first element and moves the accumulator through.
+    owned_args_reduce_assoc: "(reduce (fn (a b) (assoc a b 1)) (list {:z 0} :a :b))" => common::eval("{:a 1 :b 1 :z 0}"),
+    // Plain-native callbacks fall back to the borrowed protocol.
+    owned_args_native_callback: "(foldl + 0 (list 1 2 3))" => Value::int(6),
+    owned_args_native_reduce: "(reduce + (list 1 2 3))" => Value::int(6),
+    // Rest params flow through the owned frame setup.
+    owned_args_rest_param_callback: "(foldl (fn (a . more) (+ a (first more))) 0 (list 1 2 3))" => Value::int(6),
+    // set! through an upvalue still writes back to the caller's live slot
+    // (the owned path routes through the same current-VM nested run).
+    owned_args_upvalue_writeback: "(let ((n 0)) (foldl (fn (acc x) (set! n (+ n x)) (+ acc x)) 0 (list 1 2 3)) n)" => Value::int(6),
+    // A throw inside the callback unwinds cleanly out of the owned run.
+    owned_args_callback_throw: "(try (foldl (fn (acc x) (if (> x 2) (throw \"boom\") (+ acc x))) 0 (list 1 2 3)) (catch e (:value e)))" => common::eval("\"boom\""),
 }

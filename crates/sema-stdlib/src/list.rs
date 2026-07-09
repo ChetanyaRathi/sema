@@ -1,7 +1,14 @@
 use sema_core::number::SemaNumber;
-use sema_core::{check_arity, SemaError, Value, ValueViewRef};
+use sema_core::{check_arity, intern, Record, SemaError, Value, ValueViewRef};
 
 use crate::register_fn;
+
+/// Record `type_tag` used to bundle zero-or-multiple values produced by `values`
+/// and unpacked by `call-with-values`. Chosen to be unlikely to collide with a
+/// user `define-record-type` tag; R7RS leaves "multiple values leaking into a
+/// single-value context" unspecified, so a user constructing this exact tag via
+/// `define-record-type` is already outside spec.
+const MULTIPLE_VALUES_TAG: &str = "%multiple-values%";
 
 /// Sort category of a value for the comparator-free `sort`. Every real number
 /// (fixnum, bignum, rational, float) shares the `Number` family and compares by
@@ -142,9 +149,17 @@ pub fn register(env: &sema_core::Env) {
             v.get(idx).cloned().ok_or_else(|| {
                 SemaError::eval(format!("index {idx} out of bounds (length {})", v.len()))
             })
+        } else if let Some(arr) = args[0].as_mutable_array() {
+            let items = arr.items.borrow();
+            items.get(idx).cloned().ok_or_else(|| {
+                SemaError::eval(format!(
+                    "index {idx} out of bounds (length {})",
+                    items.len()
+                ))
+            })
         } else {
             Err(SemaError::type_error("list or vector", args[0].type_name())
-                .with_hint("nth: argument 1 must be a list or vector"))
+                .with_hint("nth: argument 1 must be a list, vector, or mutable-array"))
         }
     });
 
@@ -192,7 +207,10 @@ pub fn register(env: &sema_core::Env) {
         let items = get_sequence(&args[2], "foldl")?;
         let mut acc = args[1].clone();
         for item in items {
-            acc = call_function(&args[0], &[acc, item.clone()])?;
+            // Owned handoff: the accumulator moves into the callback frame so
+            // uniqueness-gated in-place updates (assoc & co.) can fire.
+            let mut cb_args = [std::mem::replace(&mut acc, Value::nil()), item.clone()];
+            acc = call_function_owned(&args[0], &mut cb_args)?;
         }
         Ok(acc)
     });
@@ -266,6 +284,33 @@ pub fn register(env: &sema_core::Env) {
         let mut all_args: Vec<Value> = args[1..args.len() - 1].to_vec();
         all_args.extend(last_items.iter().cloned());
         call_function(func, &all_args)
+    });
+
+    // R7RS `values`: 1 arg is just that value (so it flows through ordinary
+    // single-value contexts like `(+ 1 (values 2))`); 0 or 2+ args bundle into
+    // a `Record` tagged `MULTIPLE_VALUES_TAG` that only `call-with-values`
+    // inspects. Any other consumer sees an opaque record — R7RS leaves
+    // multi-values-in-single-value-context unspecified.
+    register_fn(env, "values", |args| match args.len() {
+        1 => Ok(args[0].clone()),
+        _ => Ok(Value::record(Record {
+            type_tag: intern(MULTIPLE_VALUES_TAG),
+            field_names: vec![],
+            fields: args.to_vec(),
+        })),
+    });
+
+    // R7RS `call-with-values`: call `producer` with no args, spread its result
+    // (a values-bundle or a single ordinary value) as arguments to `consumer`.
+    register_fn(env, "call-with-values", |args| {
+        check_arity!(args, "call-with-values", 2);
+        let produced = call_function(&args[0], &[])?;
+        match produced.as_record() {
+            Some(rec) if rec.type_tag == intern(MULTIPLE_VALUES_TAG) => {
+                call_function(&args[1], &rec.fields.clone())
+            }
+            _ => call_function(&args[1], &[produced]),
+        }
     });
 
     register_fn(env, "take", |args| {
@@ -364,7 +409,9 @@ pub fn register(env: &sema_core::Env) {
         }
         let mut acc = items[0].clone();
         for item in &items[1..] {
-            acc = call_function(&args[0], &[acc, item.clone()])?;
+            // Owned handoff — see foldl.
+            let mut cb_args = [std::mem::replace(&mut acc, Value::nil()), item.clone()];
+            acc = call_function_owned(&args[0], &mut cb_args)?;
         }
         Ok(acc)
     });
@@ -1331,6 +1378,21 @@ pub fn call_function(func: &Value, args: &[Value]) -> Result<Value, SemaError> {
         sema_core::with_stdlib_ctx(|ctx| sema_core::call_callback(ctx, func, args))
     };
 
+    check_hof_yield(result)
+}
+
+/// [`call_function`] with an args buffer the caller owns and will not reuse:
+/// a VM-closure callee moves the values into its frame (the buffer is left
+/// holding nils), keeping a fold accumulator uniquely owned across the
+/// callback boundary so the `strong_count == 1` in-place fast paths can fire.
+pub fn call_function_owned(func: &Value, args: &mut [Value]) -> Result<Value, SemaError> {
+    let result = sema_core::with_stdlib_ctx(|ctx| sema_core::call_callback_owned(ctx, func, args));
+    check_hof_yield(result)
+}
+
+/// Shared post-call guard for HOF callback invocations: a yielding native
+/// passed directly (not wrapped in a lambda) cannot suspend cleanly here.
+fn check_hof_yield(result: Result<Value, SemaError>) -> Result<Value, SemaError> {
     if sema_core::in_async_context() && sema_core::take_yield_signal().is_some() {
         return Err(SemaError::eval(
             "yielding native passed directly to a higher-order function — \

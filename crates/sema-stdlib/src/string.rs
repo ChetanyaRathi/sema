@@ -111,6 +111,71 @@ thread_local! {
     static STRING_INTERN_TABLE: RefCell<HashMap<String, Rc<String>>> = RefCell::new(HashMap::new());
 }
 
+/// Fast radix-10 parse for `string->number`, covering exactly the token
+/// shapes the reader lexes as a plain i64 or float: `-?[0-9]+` and
+/// `-?[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?` with at least one of fraction or
+/// exponent present. Both this path and the lexer hand the identical byte
+/// slice to Rust's `i64`/`f64` parser, so accepted inputs produce
+/// bit-identical values. Everything else returns `None` and falls back to
+/// the reader: out-of-i64-range integers (bignums), rationals, complex
+/// literals, `#x`/`#b`/`#o`/`#e`/`#i` prefixes, the `inf`/`nan` symbol
+/// forms, comments, and multi-token input. A leading `+` is deliberately
+/// rejected — the lexer reads `+5` as a symbol, so `string->number`
+/// yields `#f` for it. Trims only the whitespace the lexer skips between
+/// tokens (space, tab, CR, LF); anything else falls through.
+fn parse_decimal_fast(s: &str) -> Option<Value> {
+    let t = s.trim_matches([' ', '\t', '\r', '\n']);
+    let b = t.as_bytes();
+    let mut i = 0;
+    if i < b.len() && b[i] == b'-' {
+        i += 1;
+    }
+    let int_start = i;
+    while i < b.len() && b[i].is_ascii_digit() {
+        i += 1;
+    }
+    if i == int_start {
+        return None; // no integer digits: not a plain decimal token
+    }
+    let mut is_float = false;
+    if i < b.len() && b[i] == b'.' {
+        let frac_start = i + 1;
+        let mut j = frac_start;
+        while j < b.len() && b[j].is_ascii_digit() {
+            j += 1;
+        }
+        if j == frac_start {
+            return None; // trailing dot (`5.`): the lexer leaves it to the symbol path
+        }
+        i = j;
+        is_float = true;
+    }
+    if i < b.len() && (b[i] == b'e' || b[i] == b'E') {
+        let mut j = i + 1;
+        if j < b.len() && (b[j] == b'+' || b[j] == b'-') {
+            j += 1;
+        }
+        let exp_start = j;
+        while j < b.len() && b[j].is_ascii_digit() {
+            j += 1;
+        }
+        if j == exp_start {
+            return None; // bare `1e` / `1e+`: symbol territory
+        }
+        i = j;
+        is_float = true;
+    }
+    if i != b.len() {
+        return None; // trailing bytes: rationals, complex, garbage — reader decides
+    }
+    if is_float {
+        t.parse::<f64>().ok().map(Value::float)
+    } else {
+        // Out-of-range integers are bignums: leave them to the reader.
+        t.parse::<i64>().ok().map(Value::int)
+    }
+}
+
 pub fn register(env: &sema_core::Env) {
     register_fn(env, "string-append", |args| {
         use std::fmt::Write;
@@ -122,7 +187,7 @@ pub fn register(env: &sema_core::Env) {
                 write!(&mut result, "{}", arg).unwrap();
             }
         }
-        Ok(Value::string(&result))
+        Ok(Value::string_owned(result))
     });
 
     register_fn(env, "string-length", |args| {
@@ -268,7 +333,7 @@ pub fn register(env: &sema_core::Env) {
         let s = args[0]
             .as_str()
             .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
-        Ok(Value::string(&s.to_uppercase()))
+        Ok(Value::string_owned(s.to_uppercase()))
     });
 
     register_fn(env, "string/lower", |args| {
@@ -276,7 +341,7 @@ pub fn register(env: &sema_core::Env) {
         let s = args[0]
             .as_str()
             .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
-        Ok(Value::string(&s.to_lowercase()))
+        Ok(Value::string_owned(s.to_lowercase()))
     });
 
     register_fn(env, "string/replace", |args| {
@@ -290,7 +355,7 @@ pub fn register(env: &sema_core::Env) {
         let to = args[2]
             .as_str()
             .ok_or_else(|| SemaError::type_error("string", args[2].type_name()))?;
-        Ok(Value::string(&s.replace(from, to)))
+        Ok(Value::string_owned(s.replace(from, to)))
     });
 
     register_fn(env, "string/join", |args| {
@@ -313,7 +378,7 @@ pub fn register(env: &sema_core::Env) {
                 }
             })
             .collect();
-        Ok(Value::string(&strs.join(sep)))
+        Ok(Value::string_owned(strs.join(sep)))
     });
 
     register_fn(env, "format", |args| {
@@ -357,7 +422,7 @@ pub fn register(env: &sema_core::Env) {
                 result.push(ch);
             }
         }
-        Ok(Value::string(&result))
+        Ok(Value::string_owned(result))
     });
 
     register_fn(env, "string->symbol", |args| {
@@ -373,7 +438,7 @@ pub fn register(env: &sema_core::Env) {
         let s = args[0]
             .as_symbol()
             .ok_or_else(|| SemaError::type_error("symbol", args[0].type_name()))?;
-        Ok(Value::string(&s))
+        Ok(Value::string_owned(s))
     });
 
     register_fn(env, "string->keyword", |args| {
@@ -389,7 +454,7 @@ pub fn register(env: &sema_core::Env) {
         let kw = args[0]
             .as_keyword()
             .ok_or_else(|| SemaError::type_error("keyword", args[0].type_name()))?;
-        Ok(Value::string(&kw))
+        Ok(Value::string_owned(kw))
     });
 
     // `(number->string n [radix])`. Radix 10 (the default) uses the tower's
@@ -408,7 +473,7 @@ pub fn register(env: &sema_core::Env) {
             let n = args[0]
                 .as_number()
                 .ok_or_else(|| SemaError::type_error("number", args[0].type_name()))?;
-            return Ok(Value::string(&n.to_string()));
+            return Ok(Value::string_owned(n.to_string()));
         }
         if !matches!(radix, 2 | 8 | 16) {
             return Err(SemaError::eval(format!(
@@ -418,15 +483,17 @@ pub fn register(env: &sema_core::Env) {
         let n = args[0]
             .as_bigint()
             .ok_or_else(|| SemaError::type_error("exact integer", args[0].type_name()))?;
-        Ok(Value::string(&n.to_str_radix(radix as u32)))
+        Ok(Value::string_owned(n.to_str_radix(radix as u32)))
     });
 
     // `(string->number s [radix])`. Never errors on unparseable input — R7RS
     // has it return `#f` instead. Radix 10 (the default) delegates to the
     // reader's own number lexing (accepted only if the string is exactly one
     // numeric token), so it parses ints, bignums, rationals, floats, and
-    // complex literals for free. Any other radix (2, 8, 16) requires the
-    // string to be a bare (optionally signed) integer in that base.
+    // complex literals for free — with a fast path for the common plain
+    // int/float shapes that skips the full lexer+parser round-trip. Any
+    // other radix (2, 8, 16) requires the string to be a bare (optionally
+    // signed) integer in that base.
     register_fn(env, "string->number", |args| {
         check_arity!(args, "string->number", 1..=2);
         let s = args[0]
@@ -448,6 +515,9 @@ pub fn register(env: &sema_core::Env) {
                 Some(n) => Value::from_number(n),
                 None => Value::bool(false),
             });
+        }
+        if let Some(v) = parse_decimal_fast(s) {
+            return Ok(v);
         }
         let is_number = |v: &Value| {
             matches!(
@@ -522,7 +592,7 @@ pub fn register(env: &sema_core::Env) {
                 )),
             );
         }
-        Ok(Value::string(&s.repeat(n)))
+        Ok(Value::string_owned(s.repeat(n)))
     });
 
     register_fn(env, "string/trim-left", |args| {
@@ -564,7 +634,7 @@ pub fn register(env: &sema_core::Env) {
         } else {
             ' '
         };
-        Ok(Value::string(&pad_to_width(s, width, pad_char, true)))
+        Ok(Value::string_owned(pad_to_width(s, width, pad_char, true)))
     });
 
     register_fn(env, "string/pad-right", |args| {
@@ -581,7 +651,7 @@ pub fn register(env: &sema_core::Env) {
         } else {
             ' '
         };
-        Ok(Value::string(&pad_to_width(s, width, pad_char, false)))
+        Ok(Value::string_owned(pad_to_width(s, width, pad_char, false)))
     });
 
     register_fn(env, "string/last-index-of", |args| {
@@ -606,7 +676,7 @@ pub fn register(env: &sema_core::Env) {
         let s = args[0]
             .as_str()
             .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
-        Ok(Value::string(&s.chars().rev().collect::<String>()))
+        Ok(Value::string_owned(s.chars().rev().collect::<String>()))
     });
 
     register_fn(env, "string/empty?", |args| {
@@ -633,7 +703,7 @@ pub fn register(env: &sema_core::Env) {
             }
             None => String::new(),
         };
-        Ok(Value::string(&result))
+        Ok(Value::string_owned(result))
     });
 
     register_fn(env, "string/title-case", |args| {
@@ -657,7 +727,7 @@ pub fn register(env: &sema_core::Env) {
                 }
             })
             .collect();
-        Ok(Value::string(&result.join(" ")))
+        Ok(Value::string_owned(result.join(" ")))
     });
 
     // Character functions
@@ -741,7 +811,7 @@ pub fn register(env: &sema_core::Env) {
         let c = args[0]
             .as_char()
             .ok_or_else(|| SemaError::type_error("char", args[0].type_name()))?;
-        Ok(Value::string(&c.to_string()))
+        Ok(Value::string_owned(c.to_string()))
     });
 
     register_fn(env, "string->char", |args| {
@@ -842,7 +912,7 @@ pub fn register(env: &sema_core::Env) {
                 .ok_or_else(|| SemaError::type_error("char", item.type_name()))?;
             s.push(c);
         }
-        Ok(Value::string(&s))
+        Ok(Value::string_owned(s))
     });
 
     register_fn(env, "string/map", |args| {
@@ -861,7 +931,7 @@ pub fn register(env: &sema_core::Env) {
                 return Err(SemaError::type_error("char or string", mapped.type_name()));
             }
         }
-        Ok(Value::string(&result))
+        Ok(Value::string_owned(result))
     });
 
     register_fn(env, "string/byte-length", |args| {
@@ -898,7 +968,7 @@ pub fn register(env: &sema_core::Env) {
             })?;
             s.push(c);
         }
-        Ok(Value::string(&s))
+        Ok(Value::string_owned(s))
     });
 
     register_fn(env, "string/normalize", |args| {
@@ -923,7 +993,7 @@ pub fn register(env: &sema_core::Env) {
                 )))
             }
         };
-        Ok(Value::string(&normalized))
+        Ok(Value::string_owned(normalized))
     });
 
     register_fn(env, "string/foldcase", |args| {
@@ -935,7 +1005,7 @@ pub fn register(env: &sema_core::Env) {
         // e.g. "Straße" -> "strasse", final-sigma "ς" folds like "σ". This is what
         // makes foldcase the correct basis for caseless comparison, distinct from
         // string/lower (which leaves "ß" intact).
-        Ok(Value::string(&caseless::default_case_fold_str(s)))
+        Ok(Value::string_owned(caseless::default_case_fold_str(s)))
     });
 
     register_fn(env, "string-ci=?", |args| {
@@ -1076,7 +1146,7 @@ pub fn register(env: &sema_core::Env) {
         if s.starts_with(prefix) {
             Ok(Value::string(s))
         } else {
-            Ok(Value::string(&format!("{}{}", prefix, s)))
+            Ok(Value::string_owned(format!("{}{}", prefix, s)))
         }
     });
 
@@ -1092,7 +1162,7 @@ pub fn register(env: &sema_core::Env) {
         if s.ends_with(suffix) {
             Ok(Value::string(s))
         } else {
-            Ok(Value::string(&format!("{}{}", s, suffix)))
+            Ok(Value::string_owned(format!("{}{}", s, suffix)))
         }
     });
 
@@ -1153,7 +1223,7 @@ pub fn register(env: &sema_core::Env) {
         let needle = args[1]
             .as_str()
             .ok_or_else(|| SemaError::type_error("string", args[1].type_name()))?;
-        Ok(Value::string(&s.replace(needle, "")))
+        Ok(Value::string_owned(s.replace(needle, "")))
     });
 
     // string/take — first N chars (positive) or last N chars (negative)
@@ -1168,11 +1238,15 @@ pub fn register(env: &sema_core::Env) {
         let char_count = s.chars().count() as i64;
         if n >= 0 {
             let take = (n as usize).min(char_count as usize);
-            Ok(Value::string(&s.chars().take(take).collect::<String>()))
+            Ok(Value::string_owned(
+                s.chars().take(take).collect::<String>(),
+            ))
         } else {
             let take = ((-n) as usize).min(char_count as usize);
             let skip = char_count as usize - take;
-            Ok(Value::string(&s.chars().skip(skip).collect::<String>()))
+            Ok(Value::string_owned(
+                s.chars().skip(skip).collect::<String>(),
+            ))
         }
     });
 
@@ -1232,7 +1306,7 @@ pub fn register(env: &sema_core::Env) {
             .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
         let words = split_identifier_words(s);
         let result: Vec<String> = words.iter().map(|w| w.to_lowercase()).collect();
-        Ok(Value::string(&result.join("_")))
+        Ok(Value::string_owned(result.join("_")))
     });
 
     register_fn(env, "string/kebab-case", |args| {
@@ -1242,7 +1316,7 @@ pub fn register(env: &sema_core::Env) {
             .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
         let words = split_identifier_words(s);
         let result: Vec<String> = words.iter().map(|w| w.to_lowercase()).collect();
-        Ok(Value::string(&result.join("-")))
+        Ok(Value::string_owned(result.join("-")))
     });
 
     register_fn(env, "string/camel-case", |args| {
@@ -1263,7 +1337,7 @@ pub fn register(env: &sema_core::Env) {
                 }
             }
         }
-        Ok(Value::string(&result))
+        Ok(Value::string_owned(result))
     });
 
     register_fn(env, "string/pascal-case", |args| {
@@ -1280,7 +1354,7 @@ pub fn register(env: &sema_core::Env) {
                 result.push_str(&chars.collect::<String>().to_lowercase());
             }
         }
-        Ok(Value::string(&result))
+        Ok(Value::string_owned(result))
     });
 
     register_fn(env, "string/headline", |args| {
@@ -1303,7 +1377,7 @@ pub fn register(env: &sema_core::Env) {
                 }
             })
             .collect();
-        Ok(Value::string(&result.join(" ")))
+        Ok(Value::string_owned(result.join(" ")))
     });
 
     register_fn(env, "string/words", |args| {
@@ -1313,7 +1387,7 @@ pub fn register(env: &sema_core::Env) {
             .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
         let words = split_identifier_words(s);
         Ok(Value::list(
-            words.into_iter().map(|w| Value::string(&w)).collect(),
+            words.into_iter().map(Value::string_owned).collect(),
         ))
     });
 
@@ -1333,7 +1407,7 @@ pub fn register(env: &sema_core::Env) {
         } else {
             left
         };
-        Ok(Value::string(&format!("{}{}{}", left, s, right)))
+        Ok(Value::string_owned(format!("{}{}{}", left, s, right)))
     });
 
     // string/unwrap — remove surrounding delimiters if both present

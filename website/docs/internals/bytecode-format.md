@@ -428,7 +428,7 @@ The VM's hot dispatch loop uses an unchecked stack pop (`pop_unchecked`) for spe
 
 The verifier abstract-interprets each chunk:
 
-- Each opcode has a static stack effect (`Op::stack_effect()` — the single source of truth shared with the VM dispatch arms). Variable-arity opcodes (`Call`, `TailCall`, `SelfTailCall`, `CallGlobal`, `CallNative`, `MakeList`, `MakeVector`, `MakeMap`, `MakeHashMap`) compute their effect from the decoded operand count. `SelfTailCall` pops only its `argc` args (the callee is the running frame's own closure, not a stack value) and exits the frame; the other calls pop the callee too.
+- Each opcode has a static stack effect (`Op::stack_effect()` — the single source of truth shared with the VM dispatch arms). Variable-arity opcodes (`Call`, `TailCall`, `SelfTailCall`, `CallSelf`, `CallGlobal`, `CallNative`, `MakeList`, `MakeVector`, `MakeMap`, `MakeHashMap`) compute their effect from the decoded operand count. `SelfTailCall` and `CallSelf` pop only their `argc` args (the callee is the running frame's own closure, not a stack value); `SelfTailCall` additionally exits the frame; the other calls pop the callee too.
 - A worklist tracks the operand-stack depth on entry to every reachable instruction, following fallthrough and jump edges. Exception handlers are seeded as additional roots at their known entry depth (`stack_depth - n_locals + 1`).
 - Join points must agree on depth exactly (strict-equality lattice, like the JVM/CLR verifiers). A disagreement, a reachable pop deeper than the current depth (underflow), a depth above the maximum (overflow), or control falling off the end of a chunk are all rejected with a descriptive `SemaError`.
 
@@ -452,7 +452,28 @@ String indexing is by **Unicode scalar (char)**, not byte, matching the stdlib s
 
 ### Self-tail-call (`SelfTailCall` 0x45)
 
-`SelfTailCall argc` (`u16 argc`) is a tail call whose callee is the **current frame's own closure**, so — unlike `TailCall` — no callee value is pushed onto the stack; only the `argc` args are. The compiler emits it for a self-recursive named-let / `letrec` loop whose name is referenced only in tail-call position: the resolver elides the self upvalue (see `VarResolution::SelfFn` in `resolve.rs`), so the running frame reads its own closure instead of a captured cell — eliminating the per-entry self-reference cycle (issue #62 / ADR #66). It reuses the frame in place (rebind args, jump to entry, arity-checked). Additive within the existing encoding (`u16` operand, no new operand shape), so it does not change `format_version`.
+`SelfTailCall argc` (`u16 argc`) is a tail call whose callee is the **current frame's own closure**, so — unlike `TailCall` — no callee value is pushed onto the stack; only the `argc` args are. The compiler emits it for a self-recursive named-let / `letrec` loop whose name is referenced only in tail-call position: the resolver elides the self upvalue (see `VarResolution::SelfFn` in `resolve.rs`), so the running frame reads its own closure instead of a captured cell — eliminating the per-entry self-reference cycle (issue #62 / ADR #66). It reuses the frame in place (rebind args, jump to entry, arity-checked). It is also emitted for a tail self-call inside an eligible top-level define's own lambda (see `CallSelf` below). Additive within the existing encoding (`u16` operand, no new operand shape), so it does not change `format_version`.
+
+### Direct self-call (`CallSelf` 0x46)
+
+`CallSelf argc` (`u16 argc`) is the non-tail counterpart of `SelfTailCall`: a call whose callee is the **current frame's own closure**, so no callee value is on the stack and no global lookup or callable dispatch happens — the VM pushes a frame for the running closure directly (arity-checked, rest params supported). The compiler emits it inside a top-level `(define (f …))` lambda for direct non-tail calls to `f` when nothing else in the program rebinds the name — a second `define` of `f` or a global `set!` of `f` at any depth opts the name out (the intrinsics' program-wide redefinition rule, extended to `set!`). Tail-position self-calls under the same eligibility emit `SelfTailCall`. Value (non-operator) references to `f` remain `LoadGlobal`, so identity (`eq?`) and escape semantics are unchanged. Additive within the existing encoding (`u16` operand, no new operand shape), so it does not change `format_version`.
+
+### Take-local (`TakeLocal` 0x47)
+
+`TakeLocal slot` (`u16 slot`) is a **moving** `LoadLocal`: it pushes `locals[slot]` and replaces the slot with nil, instead of cloning (refcount-bumping) the slot value. Same encoding and stack effect as `LoadLocal` (push 1, pop 0). The compiler emits it for the *statically last* use of a local slot that is never captured by an inner lambda and never a `set!` target, as proven by a conservative backward liveness analysis (`crates/sema-vm/src/takelocal.rs`); functions containing `try`, `do` loops, or self-frame-reuse calls opt out entirely. Dropping the dead slot reference lets uniquely-owned values hit the stdlib's `strong_count == 1` in-place fast paths (`assoc`/`dissoc`/`update` on maps, etc.) instead of deep-cloning.
+
+Because the slot is proven dead, the nil left behind is unobservable by the program. The only surface that can still read the slot is the **debug inspector** (DAP variable views / `evaluate`): a variable whose last use has executed displays as `nil` for the remainder of its lexical scope. This is accepted debugger behavior, mirroring registerized locals in native debuggers. Additive within the existing encoding (`u16` operand, no new operand shape), so it does not change `format_version`.
+
+### Mutable-array accessors (`MutArrGet` 0x48, `MutArrSet` 0x49)
+
+Single-byte inline intrinsics for the `mutable-array` accessors, following the same emission rules as the other stdlib intrinsics (canonical global name, exact arity, name not redefined anywhere in the program):
+
+| Opcode | Source form | Stack effect | Behavior |
+|--------|-------------|--------------|----------|
+| `MutArrGet` (0x48) | `(mutable-array/get arr idx)` | pop 2, push 1 | push `arr[idx]`; errors on non-array, negative/non-int index, or out-of-bounds index |
+| `MutArrSet` (0x49) | `(mutable-array/set! arr idx val)` | pop 3, push 1 | `arr[idx] = val`, push the array itself (the Sema-level return value); errors on non-array, negative/non-int index, or out-of-bounds index |
+
+The 3-arg (default) form of `mutable-array/get` and any wrong-arity call stay on the generic `CallGlobal` path — the native owns the default logic and the arity errors. Both opcodes share their implementation with the stdlib natives (`sema_core::mutable_ops`), so error messages are byte-identical across dispatch paths. Additive within the existing encoding (single-byte, no new operand shapes), so they do not change `format_version`.
 
 ## Example
 

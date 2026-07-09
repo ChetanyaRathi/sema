@@ -3381,6 +3381,132 @@ fn test_file_fold_lines() {
 }
 
 #[test]
+fn test_file_fold_lines_bytes() {
+    let dir = unique_temp_dir("fold-lines-bytes");
+    let dir = dir.display().to_string();
+    let dir = dir.as_str();
+    // Mixed \n / \r\n endings and one-decimal / no-decimal temperatures —
+    // the exact shape of a 1BRC measurements file.
+    std::fs::write(
+        format!("{dir}/temps.txt"),
+        "Oslo;-12.3\r\nBergen;5\nTromso;0.0\n",
+    )
+    .expect("write fixture");
+
+    // Sum temperatures as scaled ints via bytes/parse-int10 (int*10 trick):
+    // -123 + 50 + 0 = -73. Lines arrive as bytevectors with \n and \r stripped.
+    let sum = eval(&format!(
+        r#"(file/fold-lines-bytes "{dir}/temps.txt"
+             (fn (acc line)
+               (let ((semi (bytes/find line 59)))
+                 (+ acc (bytes/parse-int10 line (+ semi 1)))))
+             0)"#
+    ));
+    assert_eq!(sum, Value::int(-73));
+
+    // Station names decode from the byte prefix; accumulate into a
+    // mutable array and freeze at the end.
+    let names = eval(&format!(
+        r#"(mutable-array/->vector
+             (file/fold-lines-bytes "{dir}/temps.txt"
+               (fn (acc line)
+                 (mutable-array/push! acc (bytes/->string line 0 (bytes/find line 59))))
+               (mutable-array/new)))"#
+    ));
+    assert_eq!(names, eval(r#"["Oslo" "Bergen" "Tromso"]"#));
+
+    // Empty file — returns the initial accumulator untouched.
+    std::fs::write(format!("{dir}/empty.txt"), "").expect("write fixture");
+    let empty = eval(&format!(
+        r#"(file/fold-lines-bytes "{dir}/empty.txt" (fn (acc line) (+ acc 1)) 42)"#
+    ));
+    assert_eq!(empty, Value::int(42));
+
+    // CR parity with file/fold-lines: \r is only stripped as part of a \r\n
+    // pair, so a final unterminated line ending in a bare \r keeps it as
+    // content. Line lengths must match the string sibling's exactly.
+    std::fs::write(format!("{dir}/cr.txt"), "line1\r\nline2\rmid\nlast\r").expect("write fixture");
+    let byte_lens = eval(&format!(
+        r#"(file/fold-lines-bytes "{dir}/cr.txt"
+             (fn (acc line) (cons (bytes/length line) acc))
+             '())"#
+    ));
+    let str_lens = eval(&format!(
+        r#"(file/fold-lines "{dir}/cr.txt"
+             (fn (acc line) (cons (string-length line) acc))
+             '())"#
+    ));
+    assert_eq!(byte_lens, eval("'(5 9 5)"));
+    assert_eq!(byte_lens, str_lens);
+
+    // Arity errors
+    assert_arity_error(r#"(file/fold-lines-bytes "f" (fn (a b) a))"#);
+    assert_arity_error(r#"(file/fold-lines-bytes)"#);
+
+    // Non-existent file → IO error
+    assert!(matches!(
+        eval_err(&format!(
+            r#"(file/fold-lines-bytes "{}" (fn (a l) a) 0)"#,
+            temp_path("nonexistent-sema-bytes.txt")
+        ))
+        .inner(),
+        SemaError::Io(_)
+    ));
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Pins the exact aggregate line of `benchmarks/1brc/1brc.sema` on an
+/// adversarial fixture: negative temps, -0.x forms, a single-row station,
+/// a multi-byte UTF-8 name, a mean landing on a round-half tie
+/// (ties-to-even), and a blank line (skipped). The expected string is what
+/// a float/string reference implementation (string/split + string->float +
+/// float stats) produces on the same fixture — the correctness oracle for
+/// the benchmark's byte-oriented int*10 hot loop.
+#[test]
+fn test_1brc_benchmark_output() {
+    let dir = unique_temp_dir("1brc-output");
+    let fixture = dir.join("measurements.txt");
+    std::fs::write(
+        &fixture,
+        "Oslo;-12.3\nOslo;-0.3\nOslo;0.0\nKuala Lumpur;27.8\nKuala Lumpur;27.9\n\
+         São Paulo;20.1\nSolo;-7.8\nLima;5.0\nTie;1.0\nTie;1.1\n\
+         T2;0.3\nT2;0.3\nT2;0.3\nHot;99.9\nCold;-99.9\nCold;-99.8\n\
+         NegMean;-0.1\nNegMean;-0.2\n\nZed;0.1\n",
+    )
+    .expect("write fixture");
+
+    let script = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../benchmarks/1brc/1brc.sema"
+    );
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_sema"))
+        .args([script, "--", fixture.to_str().unwrap()])
+        .output()
+        .expect("failed to run 1brc.sema");
+    assert!(
+        output.status.success(),
+        "1brc.sema failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let aggregate = stdout
+        .lines()
+        .find(|l| l.starts_with('{'))
+        .expect("no aggregate line in 1brc output");
+    assert_eq!(
+        aggregate,
+        "{Cold=-99.9/-99.8/-99.8, Hot=99.9/99.9/99.9, Kuala Lumpur=27.8/27.8/27.9, \
+         Lima=5.0/5.0/5.0, NegMean=-0.2/-0.2/-0.1, Oslo=-12.3/-4.2/0.0, \
+         Solo=-7.8/-7.8/-7.8, São Paulo=20.1/20.1/20.1, T2=0.3/0.3/0.3, \
+         Tie=1.0/1.0/1.1, Zed=0.1/0.1/0.1}"
+    );
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
 fn test_file_copy() {
     let dir = temp_path("sema-test-copy");
     let dir = dir.as_str();

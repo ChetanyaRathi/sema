@@ -62,6 +62,11 @@ if [[ ! -f "$TRAIN_DATA" ]]; then
 fi
 if [[ -f "$TRAIN_DATA" ]]; then
   "$BIN" "$BENCH_DIR/1brc.sema" -- "$TRAIN_DATA" >/dev/null
+  # The byte-oriented 1BRC solution and the naive tier exercise different hot
+  # paths (bytes/* + mutable-array vs string/split + assoc + string->number);
+  # train all three so none of them is laid out cold in the release binary.
+  "$BIN" benchmarks/1brc/1brc.sema -- "$TRAIN_DATA" >/dev/null
+  "$BIN" benchmarks/1brc/simple/1brc.sema -- "$TRAIN_DATA" >/dev/null
 fi
 # Compute / closure / string / data / exception workloads exercise the dispatch loop.
 for b in tak nqueens deriv upvalue-counter closure-storm higher-order-fold \

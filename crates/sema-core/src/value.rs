@@ -189,12 +189,32 @@ pub struct Lambda {
 }
 
 /// A macro definition.
+///
+/// A procedural `defmacro` uses `params`/`rest_param`/`body` and leaves
+/// `syntax_rules` as `None`. An R7RS `(define-syntax name (syntax-rules ...))`
+/// leaves the procedural fields empty and carries its transformer in
+/// `syntax_rules`. Both share `TAG_MACRO` so env lookup, display, and GC
+/// tracing treat them uniformly.
 #[derive(Debug, Clone)]
 pub struct Macro {
     pub params: Vec<Spur>,
     pub rest_param: Option<Spur>,
     pub body: Vec<Value>,
     pub name: Spur,
+    /// `Some` for a `syntax-rules` transformer; `None` for procedural macros.
+    pub syntax_rules: Option<Rc<SyntaxRules>>,
+}
+
+/// An R7RS `syntax-rules` transformer: a list of `(pattern template)` rewrite
+/// rules, a set of literal identifiers matched by name, and the ellipsis symbol
+/// (`...` by default, or a custom one). Patterns and templates are stored as raw
+/// quoted `Value` data (list/symbol structure), so they are traced by the GC.
+#[derive(Debug, Clone)]
+pub struct SyntaxRules {
+    pub literals: Vec<Spur>,
+    pub ellipsis: Spur,
+    /// Each entry is `(pattern, template)`.
+    pub rules: Vec<(Value, Value)>,
 }
 
 /// A lazy promise: delay/force with memoization.
@@ -293,6 +313,54 @@ pub struct Record {
     pub type_tag: Spur,
     pub field_names: Vec<Spur>,
     pub fields: Vec<Value>,
+}
+
+/// A mutable array: an in-place mutable vector of Values (Janet-style
+/// `array`). Sharing is by reference — pushing through one handle is visible
+/// through every other handle to the same array.
+pub struct MutableArray {
+    pub items: RefCell<Vec<Value>>,
+}
+
+impl fmt::Debug for MutableArray {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Length only: a mutable array can contain itself, so formatting the
+        // elements could recurse forever.
+        match self.items.try_borrow() {
+            Ok(items) => write!(f, "<mutable-array {}>", items.len()),
+            Err(_) => write!(f, "<mutable-array (borrowed)>"),
+        }
+    }
+}
+
+impl Clone for MutableArray {
+    fn clone(&self) -> Self {
+        MutableArray {
+            items: RefCell::new(self.items.borrow().clone()),
+        }
+    }
+}
+
+/// A mutable cell: a single in-place mutable Value slot (Janet-style boxed
+/// value). Like [`MutableArray`], sharing is by reference.
+pub struct MutableCell {
+    pub value: RefCell<Value>,
+}
+
+impl fmt::Debug for MutableCell {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // No contents: a cell can contain itself (directly or through an
+        // array), so formatting the inner value could recurse forever.
+        write!(f, "<mutable-cell>")
+    }
+}
+
+impl Clone for MutableCell {
+    fn clone(&self) -> Self {
+        MutableCell {
+            value: RefCell::new(self.value.borrow().clone()),
+        }
+    }
 }
 
 /// A message role in a conversation.
@@ -552,6 +620,8 @@ const TAG_CHANNEL: u64 = 29;
 const TAG_BIGINT: u64 = 30;
 const TAG_RATIONAL: u64 = 31;
 const TAG_COMPLEX: u64 = 32;
+const TAG_MUTABLE_ARRAY: u64 = 33;
+const TAG_MUTABLE_CELL: u64 = 34;
 
 /// Small-int range: [-2^44, 2^44 - 1] = [-17_592_186_044_416, +17_592_186_044_415]
 const SMALL_INT_MIN: i64 = -(1i64 << 44);
@@ -650,6 +720,8 @@ pub enum ValueView {
     I64Array(Rc<Vec<i64>>),
     AsyncPromise(Rc<AsyncPromise>),
     Channel(Rc<Channel>),
+    MutableArray(Rc<MutableArray>),
+    MutableCell(Rc<MutableCell>),
 }
 
 /// A borrowing view of a `Value` — like `ValueView` but returns references
@@ -688,6 +760,8 @@ pub enum ValueViewRef<'a> {
     I64Array(&'a [i64]),
     AsyncPromise(&'a AsyncPromise),
     Channel(&'a Channel),
+    MutableArray(&'a MutableArray),
+    MutableCell(&'a MutableCell),
 }
 
 // ── The NaN-boxed Value type ──────────────────────────────────────
@@ -816,6 +890,13 @@ impl Value {
 
     pub fn string(s: &str) -> Value {
         Value::from_rc_ptr(TAG_STRING, Rc::new(s.to_string()))
+    }
+
+    /// Construct a string value from an already-owned `String` without the
+    /// extra copy `Value::string(&s)` would make. Prefer this whenever the
+    /// caller has just built the `String` and won't use it again.
+    pub fn string_owned(s: String) -> Value {
+        Value::from_rc_ptr(TAG_STRING, Rc::new(s))
     }
 
     pub fn string_from_rc(rc: Rc<String>) -> Value {
@@ -1009,6 +1090,31 @@ impl Value {
     pub fn channel_from_rc(rc: Rc<Channel>) -> Value {
         Value::from_rc_ptr(TAG_CHANNEL, rc)
     }
+    pub fn mutable_array(items: Vec<Value>) -> Value {
+        let rc = Rc::new(MutableArray {
+            items: RefCell::new(items),
+        });
+        // Cold data-cycle constructor (CORE-2): the array can hold values
+        // that reach back to the array itself (e.g. an array pushed into
+        // itself) with no closure on the cycle.
+        crate::cycle::register_candidate(crate::cycle::GcNode::MutableArray(Rc::downgrade(&rc)));
+        Value::from_rc_ptr(TAG_MUTABLE_ARRAY, rc)
+    }
+    pub fn mutable_array_from_rc(rc: Rc<MutableArray>) -> Value {
+        Value::from_rc_ptr(TAG_MUTABLE_ARRAY, rc)
+    }
+    pub fn mutable_cell(value: Value) -> Value {
+        let rc = Rc::new(MutableCell {
+            value: RefCell::new(value),
+        });
+        // Cold data-cycle constructor (CORE-2): the cell's slot can close a
+        // closure-free cycle (e.g. a cell set to a list containing the cell).
+        crate::cycle::register_candidate(crate::cycle::GcNode::MutableCell(Rc::downgrade(&rc)));
+        Value::from_rc_ptr(TAG_MUTABLE_CELL, rc)
+    }
+    pub fn mutable_cell_from_rc(rc: Rc<MutableCell>) -> Value {
+        Value::from_rc_ptr(TAG_MUTABLE_CELL, rc)
+    }
 }
 
 // Const-compatible boxed encoding (no function calls)
@@ -1153,6 +1259,8 @@ impl Value {
             TAG_I64_ARRAY => ValueView::I64Array(unsafe { self.get_rc::<Vec<i64>>() }),
             TAG_ASYNC_PROMISE => ValueView::AsyncPromise(unsafe { self.get_rc::<AsyncPromise>() }),
             TAG_CHANNEL => ValueView::Channel(unsafe { self.get_rc::<Channel>() }),
+            TAG_MUTABLE_ARRAY => ValueView::MutableArray(unsafe { self.get_rc::<MutableArray>() }),
+            TAG_MUTABLE_CELL => ValueView::MutableCell(unsafe { self.get_rc::<MutableCell>() }),
             _ => unreachable!("invalid NaN-boxed tag: {}", tag),
         }
     }
@@ -1231,6 +1339,12 @@ impl Value {
                 ValueViewRef::AsyncPromise(unsafe { self.borrow_ref::<AsyncPromise>() })
             }
             TAG_CHANNEL => ValueViewRef::Channel(unsafe { self.borrow_ref::<Channel>() }),
+            TAG_MUTABLE_ARRAY => {
+                ValueViewRef::MutableArray(unsafe { self.borrow_ref::<MutableArray>() })
+            }
+            TAG_MUTABLE_CELL => {
+                ValueViewRef::MutableCell(unsafe { self.borrow_ref::<MutableCell>() })
+            }
             _ => unreachable!("invalid NaN-boxed tag: {}", tag),
         }
     }
@@ -1291,6 +1405,8 @@ impl Value {
                 TAG_I64_ARRAY => count_at::<Vec<i64>>(ptr),
                 TAG_ASYNC_PROMISE => count_at::<AsyncPromise>(ptr),
                 TAG_CHANNEL => count_at::<Channel>(ptr),
+                TAG_MUTABLE_ARRAY => count_at::<MutableArray>(ptr),
+                TAG_MUTABLE_CELL => count_at::<MutableCell>(ptr),
                 _ => unreachable!("invalid heap tag in heap_strong_count"),
             }
         };
@@ -1335,6 +1451,8 @@ impl Value {
             TAG_I64_ARRAY => "i64-array",
             TAG_ASYNC_PROMISE => "async-promise",
             TAG_CHANNEL => "channel",
+            TAG_MUTABLE_ARRAY => "mutable-array",
+            TAG_MUTABLE_CELL => "mutable-cell",
             _ => "unknown",
         }
     }
@@ -1924,6 +2042,91 @@ impl Value {
             None
         }
     }
+
+    pub fn as_mutable_array(&self) -> Option<&MutableArray> {
+        if is_boxed(self.0) && get_tag(self.0) == TAG_MUTABLE_ARRAY {
+            Some(unsafe { self.borrow_ref::<MutableArray>() })
+        } else {
+            None
+        }
+    }
+
+    pub fn as_mutable_array_rc(&self) -> Option<Rc<MutableArray>> {
+        if is_boxed(self.0) && get_tag(self.0) == TAG_MUTABLE_ARRAY {
+            Some(unsafe { self.get_rc::<MutableArray>() })
+        } else {
+            None
+        }
+    }
+
+    pub fn as_mutable_cell(&self) -> Option<&MutableCell> {
+        if is_boxed(self.0) && get_tag(self.0) == TAG_MUTABLE_CELL {
+            Some(unsafe { self.borrow_ref::<MutableCell>() })
+        } else {
+            None
+        }
+    }
+
+    pub fn as_mutable_cell_rc(&self) -> Option<Rc<MutableCell>> {
+        if is_boxed(self.0) && get_tag(self.0) == TAG_MUTABLE_CELL {
+            Some(unsafe { self.get_rc::<MutableCell>() })
+        } else {
+            None
+        }
+    }
+
+    /// True for interior-mutable containers (mutable arrays and cells), whose
+    /// contents can change after a map insertion. Map constructors reject
+    /// these as keys — a mutated key would silently corrupt lookup order.
+    #[inline(always)]
+    pub fn is_mutable_container(&self) -> bool {
+        is_boxed(self.0) && matches!(get_tag(self.0), TAG_MUTABLE_ARRAY | TAG_MUTABLE_CELL)
+    }
+
+    /// True if this value is, or transitively contains, an interior-mutable
+    /// container. Map keys must be deeply immutable: a vector wrapping a
+    /// mutable array still mutates underneath the map, corrupting lookup
+    /// order just as a bare mutable key would (Ord recurses into container
+    /// elements). Iterative worklist — no visited set or depth cap needed
+    /// because the walk never descends into a mutable container (it returns
+    /// true on sight) and cycles are only constructible through one.
+    pub fn contains_mutable_container(&self) -> bool {
+        fn scan(v: &Value, pending: &mut Vec<Value>) -> bool {
+            if v.is_mutable_container() {
+                return true;
+            }
+            match v.view_ref() {
+                ValueViewRef::List(items) | ValueViewRef::Vector(items) => {
+                    pending.extend(items.iter().cloned());
+                }
+                ValueViewRef::Map(m) => {
+                    for (k, val) in m.iter() {
+                        pending.push(k.clone());
+                        pending.push(val.clone());
+                    }
+                }
+                ValueViewRef::HashMap(m) => {
+                    for (k, val) in m.iter() {
+                        pending.push(k.clone());
+                        pending.push(val.clone());
+                    }
+                }
+                ValueViewRef::Record(r) => pending.extend(r.fields.iter().cloned()),
+                _ => {}
+            }
+            false
+        }
+        let mut pending = Vec::new();
+        if scan(self, &mut pending) {
+            return true;
+        }
+        while let Some(v) = pending.pop() {
+            if scan(&v, &mut pending) {
+                return true;
+            }
+        }
+        false
+    }
 }
 
 // ── Clone ─────────────────────────────────────────────────────────
@@ -1976,6 +2179,8 @@ impl Clone for Value {
                         TAG_I64_ARRAY => Rc::increment_strong_count(ptr as *const Vec<i64>),
                         TAG_ASYNC_PROMISE => Rc::increment_strong_count(ptr as *const AsyncPromise),
                         TAG_CHANNEL => Rc::increment_strong_count(ptr as *const Channel),
+                        TAG_MUTABLE_ARRAY => Rc::increment_strong_count(ptr as *const MutableArray),
+                        TAG_MUTABLE_CELL => Rc::increment_strong_count(ptr as *const MutableCell),
                         _ => unreachable!("invalid heap tag in clone: {}", tag),
                     }
                 }
@@ -2031,6 +2236,8 @@ impl Drop for Value {
                         TAG_I64_ARRAY => drop(Rc::from_raw(ptr as *const Vec<i64>)),
                         TAG_ASYNC_PROMISE => drop(Rc::from_raw(ptr as *const AsyncPromise)),
                         TAG_CHANNEL => drop(Rc::from_raw(ptr as *const Channel)),
+                        TAG_MUTABLE_ARRAY => drop(Rc::from_raw(ptr as *const MutableArray)),
+                        TAG_MUTABLE_CELL => drop(Rc::from_raw(ptr as *const MutableCell)),
                         _ => {} // unreachable, but don't panic in drop
                     }
                 }
@@ -2040,6 +2247,49 @@ impl Drop for Value {
 }
 
 // ── PartialEq / Eq ────────────────────────────────────────────────
+
+thread_local! {
+    /// Pairs of mutable-container allocations currently being compared
+    /// structurally. Mutable arrays/cells are the only heap types with both
+    /// content-based comparison and interior mutability, so they are the only
+    /// place `PartialEq`/`Ord` can meet cyclic data: without this guard,
+    /// comparing two distinct self-referential arrays would recurse forever.
+    /// Shared between `PartialEq` and `Ord` — an equality assumption in
+    /// flight is exactly the coinductive hypothesis a nested `cmp` of the
+    /// same pair should answer `Equal` to (and vice versa).
+    static CMP_IN_FLIGHT: RefCell<Vec<(usize, usize)>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Run `body` with the `(a, b)` allocation pair marked in-flight. A pair
+/// already in flight yields `on_cycle` without descending (coinductive
+/// comparison — the R7RS `equal?` answer for cyclic structures: `true` for
+/// equality, `Ordering::Equal` for ordering).
+fn with_cycle_guard<T>(a: usize, b: usize, on_cycle: T, body: impl FnOnce() -> T) -> T {
+    let already_in_flight = CMP_IN_FLIGHT.with(|s| {
+        let mut s = s.borrow_mut();
+        if s.contains(&(a, b)) {
+            true
+        } else {
+            s.push((a, b));
+            false
+        }
+    });
+    if already_in_flight {
+        return on_cycle;
+    }
+    // Pop on every exit path (including a panicking comparator) so a stale
+    // pair can never make a later, unrelated comparison lie.
+    struct PopGuard;
+    impl Drop for PopGuard {
+        fn drop(&mut self) {
+            CMP_IN_FLIGHT.with(|s| {
+                s.borrow_mut().pop();
+            });
+        }
+    }
+    let _guard = PopGuard;
+    body()
+}
 
 impl PartialEq for Value {
     fn eq(&self, other: &Self) -> bool {
@@ -2089,6 +2339,28 @@ impl PartialEq for Value {
             (ValueViewRef::Stream(a), ValueViewRef::Stream(b)) => std::ptr::eq(a, b),
             (ValueViewRef::AsyncPromise(a), ValueViewRef::AsyncPromise(b)) => std::ptr::eq(a, b),
             (ValueViewRef::Channel(a), ValueViewRef::Channel(b)) => std::ptr::eq(a, b),
+            // Content equality (identity is the bits fast path above). The
+            // guard keeps self-referential arrays/cells from recursing
+            // forever; an unavailable borrow (contents mid-mutation) is not
+            // observably equal, so it compares false.
+            (ValueViewRef::MutableArray(a), ValueViewRef::MutableArray(b)) => with_cycle_guard(
+                a as *const MutableArray as usize,
+                b as *const MutableArray as usize,
+                true,
+                || match (a.items.try_borrow(), b.items.try_borrow()) {
+                    (Ok(x), Ok(y)) => *x == *y,
+                    _ => false,
+                },
+            ),
+            (ValueViewRef::MutableCell(a), ValueViewRef::MutableCell(b)) => with_cycle_guard(
+                a as *const MutableCell as usize,
+                b as *const MutableCell as usize,
+                true,
+                || match (a.value.try_borrow(), b.value.try_borrow()) {
+                    (Ok(x), Ok(y)) => *x == *y,
+                    _ => false,
+                },
+            ),
             _ => false,
         }
     }
@@ -2183,6 +2455,13 @@ impl Hash for Value {
                 29u8.hash(state);
                 (c as *const _ as usize).hash(state);
             }
+            // Discriminant only: equality is content-based but the contents
+            // can mutate, so hashing them would let a mutated key silently
+            // land in the wrong bucket. A constant hash keeps the Hash/Eq
+            // contract under mutation; map constructors reject these as keys
+            // anyway (`is_mutable_container`).
+            ValueViewRef::MutableArray(_) => 33u8.hash(state),
+            ValueViewRef::MutableCell(_) => 34u8.hash(state),
             _ => {}
         }
     }
@@ -2220,6 +2499,10 @@ impl Ord for Value {
                 ValueViewRef::Stream(_) => 16,
                 ValueViewRef::Rational(_) => 18,
                 ValueViewRef::Complex(_) => 19,
+                // Distinct ranks: an array and a cell must never compare
+                // Equal (Eq/Ord consistency — see the cmp arms below).
+                ValueViewRef::MutableArray(_) => 20,
+                ValueViewRef::MutableCell(_) => 21,
                 _ => 17,
             }
         }
@@ -2259,6 +2542,35 @@ impl Ord for Value {
                 .map(|(x, y)| x.total_cmp(y))
                 .find(|o| *o != std::cmp::Ordering::Equal)
                 .unwrap_or_else(|| a.len().cmp(&b.len())),
+            // Deep content comparison, parallel to the immutable Vector/List
+            // arms and consistent with `PartialEq` (Eq/Ord agreement is what
+            // keeps distinct values from aliasing as BTreeMap/BTreeSet keys).
+            // An in-flight pair compares Equal — the coinductive convention
+            // `PartialEq` uses — so a self-referential array cannot hang cmp.
+            // Contents mid-mutation (borrow unavailable) order by allocation
+            // address: a stable within-process tiebreak that, like the
+            // PartialEq `false` answer, never calls two distinct live
+            // mutations equal.
+            (ValueViewRef::MutableArray(a), ValueViewRef::MutableArray(b)) => {
+                let pa = a as *const MutableArray as usize;
+                let pb = b as *const MutableArray as usize;
+                with_cycle_guard(pa, pb, Ordering::Equal, || {
+                    match (a.items.try_borrow(), b.items.try_borrow()) {
+                        (Ok(x), Ok(y)) => (*x).cmp(&*y),
+                        _ => pa.cmp(&pb),
+                    }
+                })
+            }
+            (ValueViewRef::MutableCell(a), ValueViewRef::MutableCell(b)) => {
+                let pa = a as *const MutableCell as usize;
+                let pb = b as *const MutableCell as usize;
+                with_cycle_guard(pa, pb, Ordering::Equal, || {
+                    match (a.value.try_borrow(), b.value.try_borrow()) {
+                        (Ok(x), Ok(y)) => (*x).cmp(&y),
+                        _ => pa.cmp(&pb),
+                    }
+                })
+            }
             _ => type_order(self).cmp(&type_order(other)),
         }
     }
@@ -2443,6 +2755,14 @@ impl fmt::Display for Value {
                     write!(f, "<channel {len}/{}>", c.capacity)
                 }
             }
+            // Length/opaque only: a mutable array or cell can contain itself,
+            // so printing contents could recurse forever. Freeze with
+            // `mutable-array/->vector` (or `mutable-cell/get`) to inspect.
+            ValueViewRef::MutableArray(a) => match a.items.try_borrow() {
+                Ok(items) => write!(f, "<mutable-array {}>", items.len()),
+                Err(_) => write!(f, "<mutable-array (borrowed)>"),
+            },
+            ValueViewRef::MutableCell(_) => write!(f, "<mutable-cell>"),
         })
     }
 }
@@ -2610,6 +2930,8 @@ impl fmt::Debug for Value {
             ValueView::Stream(s) => write!(f, "Stream({:?})", s.stream_type()),
             ValueView::AsyncPromise(p) => write!(f, "{p:?}"),
             ValueView::Channel(c) => write!(f, "{c:?}"),
+            ValueView::MutableArray(a) => write!(f, "{a:?}"),
+            ValueView::MutableCell(c) => write!(f, "{c:?}"),
         }
     }
 }

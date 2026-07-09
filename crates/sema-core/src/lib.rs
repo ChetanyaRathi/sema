@@ -8,6 +8,7 @@ pub mod home;
 pub mod io_backend;
 pub mod json;
 pub mod mcp_cassette;
+pub mod mutable_ops;
 pub mod net;
 pub mod num;
 pub mod number;
@@ -38,8 +39,9 @@ pub use async_signal::{
     UsageScopeTakeFn, YieldReason,
 };
 pub use context::{
-    call_callback, eval_callback, set_call_callback, set_eval_callback, with_stdlib_ctx,
-    CallCallbackFn, EvalCallbackFn, EvalContext,
+    call_callback, call_callback_owned, eval_callback, set_call_callback, set_call_owned_callback,
+    set_eval_callback, with_stdlib_ctx, CallCallbackFn, CallOwnedCallbackFn, EvalCallbackFn,
+    EvalContext,
 };
 pub use cycle::{
     collect as gc_collect, env_chain_pins as gc_env_chain_pins, last_stats as gc_last_stats,
@@ -61,13 +63,15 @@ pub use mcp_cassette::{
     clear_mcp_cassette_hook, mcp_cassette_decide, mcp_cassette_record, set_mcp_cassette_hook,
     McpCassetteDecision,
 };
+pub use mutable_ops::{mutable_array_get, mutable_array_set};
 pub use output_hook::{set_stderr_hook, set_stdout_hook, write_stderr, write_stdout};
 pub use sandbox::{Caps, Sandbox};
 pub use text_util::truncate_chars;
 pub use value::{
     bits_to_spur, compare_spurs, intern, interner_stats, next_gensym, pretty_print, resolve,
     spur_to_bits, with_resolved, Agent, AsyncPromise, Channel, Conversation, Env, ImageAttachment,
-    Lambda, Macro, Message, MultiMethod, NativeFn, PromiseState, Prompt, Record, Role, SemaStream,
-    StreamBox, Thunk, ToolDefinition, Value, ValueView, ValueViewRef, NAN_INT_SIGN_BIT,
-    NAN_INT_SMALL_PATTERN, NAN_PAYLOAD_BITS, NAN_PAYLOAD_MASK, NAN_TAG_MASK, TAG_NATIVE_FN,
+    Lambda, Macro, Message, MultiMethod, MutableArray, MutableCell, NativeFn, PromiseState, Prompt,
+    Record, Role, SemaStream, StreamBox, SyntaxRules, Thunk, ToolDefinition, Value, ValueView,
+    ValueViewRef, NAN_INT_SIGN_BIT, NAN_INT_SMALL_PATTERN, NAN_PAYLOAD_BITS, NAN_PAYLOAD_MASK,
+    NAN_TAG_MASK, TAG_NATIVE_FN,
 };

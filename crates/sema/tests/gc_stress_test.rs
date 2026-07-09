@@ -77,6 +77,44 @@ fn quiescent_double_collect_frees_nothing() {
     assert_eq!(v, Value::bool(true));
 }
 
+// ── Mutable containers: data-only self-cycles reclaimed ───────────
+
+#[test]
+fn mutable_container_self_cycles_collected() {
+    // An array pushed into itself and a cell set to itself are pure
+    // data cycles (no closure on the cycle): reclaiming them exercises the
+    // creation-time candidate registration in the mutable constructors and
+    // the trace/sever arms for both types.
+    let v = eval_ok(
+        "(begin
+           (gc/collect)
+           (define (make-cycles)
+             (let ((a (mutable-array/new))
+                   (c (mutable-cell/new nil)))
+               (mutable-array/push! a a)
+               (mutable-cell/set! c c)
+               nil))
+           (make-cycles)
+           (>= (:collected (gc/collect)) 2))",
+    );
+    assert_eq!(v, Value::bool(true));
+}
+
+#[test]
+fn live_mutable_array_untouched_by_collect() {
+    // A globally rooted array — even one on a self-cycle — must survive a
+    // pass with its contents intact (severing it would be freeing live data).
+    let v = eval_ok(
+        "(begin
+           (define a (mutable-array/new))
+           (mutable-array/push! a 1)
+           (mutable-array/push! a a)
+           (gc/collect)
+           (list (mutable-array/length a) (mutable-array/get a 0)))",
+    );
+    assert_eq!(v, eval_ok("'(2 1)"));
+}
+
 // ── Mutual local recursion: garbage collected, live pair untouched ─
 
 #[test]
@@ -504,7 +542,9 @@ fn deep_closure_capture_chain_live_and_garbage() {
     // NativeFn → payload → closure → cell → NativeFn per link, so the
     // worklist (not native recursion) must carry the depth. The live chain
     // returns its full length before and after a 500-link garbage chain
-    // (hung off a recursive closure) is reclaimed.
+    // (hung off a recursive closure) is reclaimed. `r`'s inner self-call is
+    // non-tail so the closure really self-captures — a tail-only
+    // self-recursion elides the capture (issue #62) and forms no cycle.
     let v = eval_ok(
         "(begin
            (gc/collect)
@@ -518,7 +558,7 @@ fn deep_closure_capture_chain_live_and_garbage() {
            (define total (chain))
            (define (mk-garbage-chain)
              (define c (make-chain 500))
-             (define (r k) (if (<= k 0) c (r (- k 1))))
+             (define (r k) (if (<= k 0) c (r (r (- k 1)))))
              nil)
            (mk-garbage-chain)
            (list total (> (:collected (gc/collect)) 500) (chain)))",
@@ -608,7 +648,11 @@ fn deep_nested_list_garbage_collected_without_crash_live_kept() {
     // A 3000-deep nested list hangs off a garbage recursive closure's cell:
     // MarkGray/Scan/CollectWhite must walk it with worklists (a per-level
     // native frame would overflow). The same structure held live must come
-    // back intact — full depth verified by walking it.
+    // back intact — full depth verified by walking it. The garbage `r`'s
+    // inner self-call is non-tail so the closure really self-captures — a
+    // tail-only self-recursion elides the capture (issue #62) and forms no
+    // cycle; the live `r` keeps the tail shape to pin that an elided closure
+    // still resolves its captures when called.
     let v = eval_ok(
         "(begin
            (gc/collect)
@@ -616,7 +660,7 @@ fn deep_nested_list_garbage_collected_without_crash_live_kept() {
            (define (depth v acc) (if (list? v) (depth (first v) (+ acc 1)) acc))
            (define (mk-garbage)
              (define deep (nest 3000 42))
-             (define (r k) (if (<= k 0) deep (r (- k 1))))
+             (define (r k) (if (<= k 0) deep (r (r (- k 1)))))
              nil)
            (mk-garbage)
            (define freed (:collected (gc/collect)))

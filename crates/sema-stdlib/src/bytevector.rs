@@ -2,6 +2,92 @@ use sema_core::{check_arity, SemaError, Value};
 
 use crate::register_fn;
 
+/// Coerce a `bytes/*` argument to its byte slice.
+fn as_bytes<'a>(v: &'a Value, name: &str) -> Result<&'a [u8], SemaError> {
+    v.as_bytevector().ok_or_else(|| {
+        SemaError::type_error("bytevector", v.type_name()).with_hint(format!(
+            "{name}: read one with file/read-bytes or string->utf8"
+        ))
+    })
+}
+
+/// Resolve optional `[start [end]]` arguments (at positions `from..` in
+/// `args`) against a buffer of `len` bytes, validating `start <= end <= len`.
+fn opt_range(
+    args: &[Value],
+    from: usize,
+    len: usize,
+    name: &str,
+) -> Result<(usize, usize), SemaError> {
+    let start = match args.get(from) {
+        Some(v) => v.as_index(name)?,
+        None => 0,
+    };
+    let end = match args.get(from + 1) {
+        Some(v) => v.as_index(name)?,
+        None => len,
+    };
+    if start > end || end > len {
+        return Err(SemaError::eval(format!(
+            "{name}: range {start}..{end} out of bounds for {len} bytes"
+        )));
+    }
+    Ok((start, end))
+}
+
+/// First occurrence of `needle` in `hay` (byte index), `None` if absent.
+/// An empty needle matches at 0.
+fn find_sub(hay: &[u8], needle: &[u8]) -> Option<usize> {
+    match needle.len() {
+        0 => Some(0),
+        1 => {
+            let b = needle[0];
+            hay.iter().position(|&x| x == b)
+        }
+        n => hay.windows(n).position(|w| w == needle),
+    }
+}
+
+/// Parse ASCII `-?digits(.digit)?` as a base-10 integer scaled by 10
+/// (`"-12.3"` → `-123`, `"5"` → `50`) — the 1BRC fixed-point trick:
+/// one-decimal temperatures become exact ints with no float math.
+fn parse_int10(bytes: &[u8]) -> Result<i64, String> {
+    let (neg, rest) = match bytes.split_first() {
+        Some((b'-', rest)) => (true, rest),
+        _ => (false, bytes),
+    };
+    let overflow = || "value overflows an int".to_string();
+    let mut n: i64 = 0;
+    let mut i = 0;
+    while i < rest.len() && rest[i] != b'.' {
+        let b = rest[i];
+        if !b.is_ascii_digit() {
+            return Err(format!("invalid digit {:?} at byte {i}", b as char));
+        }
+        n = n
+            .checked_mul(10)
+            .and_then(|n| n.checked_add((b - b'0') as i64))
+            .ok_or_else(overflow)?;
+        i += 1;
+    }
+    if i == 0 {
+        return Err("expected at least one digit".to_string());
+    }
+    if i < rest.len() {
+        // A '.' must be followed by exactly one final digit.
+        if i + 2 != rest.len() || !rest[i + 1].is_ascii_digit() {
+            return Err("expected exactly one digit after '.'".to_string());
+        }
+        n = n
+            .checked_mul(10)
+            .and_then(|n| n.checked_add((rest[i + 1] - b'0') as i64))
+            .ok_or_else(overflow)?;
+    } else {
+        n = n.checked_mul(10).ok_or_else(overflow)?;
+    }
+    Ok(if neg { -n } else { n })
+}
+
 pub fn register(env: &sema_core::Env) {
     register_fn(env, "make-bytevector", |args| {
         check_arity!(args, "make-bytevector", 1..=2);
@@ -183,6 +269,90 @@ pub fn register(env: &sema_core::Env) {
             .as_str()
             .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
         Ok(Value::bytevector(s.as_bytes().to_vec()))
+    });
+
+    // bytes/* — byte-oriented ops on bytevectors for hot loops that avoid
+    // UTF-8 work (e.g. the 1BRC pipeline: file/fold-lines-bytes → bytes/find
+    // the separator → bytes/parse-int10 the temperature → bytes/->string the
+    // key). Optional start/end args index the same bytevector without an
+    // intermediate bytes/slice allocation.
+    register_fn(env, "bytes/length", |args| {
+        check_arity!(args, "bytes/length", 1);
+        let bytes = as_bytes(&args[0], "bytes/length")?;
+        Ok(Value::int(bytes.len() as i64))
+    });
+
+    register_fn(env, "bytes/ref", |args| {
+        check_arity!(args, "bytes/ref", 2);
+        let bytes = as_bytes(&args[0], "bytes/ref")?;
+        let idx = args[1].as_index("bytes/ref")?;
+        bytes
+            .get(idx)
+            .map(|&b| Value::int(b as i64))
+            .ok_or_else(|| {
+                SemaError::eval(format!(
+                    "bytes/ref: index {idx} out of bounds (length {})",
+                    bytes.len()
+                ))
+            })
+    });
+
+    register_fn(env, "bytes/find", |args| {
+        check_arity!(args, "bytes/find", 2..=3);
+        let hay = as_bytes(&args[0], "bytes/find")?;
+        let start = match args.get(2) {
+            Some(v) => v.as_index("bytes/find")?,
+            None => 0,
+        };
+        if start > hay.len() {
+            return Ok(Value::nil());
+        }
+        let pos = if let Some(b) = args[1].as_int() {
+            if !(0..=255).contains(&b) {
+                return Err(SemaError::eval(format!(
+                    "bytes/find: byte value {b} out of range 0..255"
+                )));
+            }
+            let b = b as u8;
+            hay[start..].iter().position(|&x| x == b)
+        } else if let Some(needle) = args[1].as_bytevector() {
+            find_sub(&hay[start..], needle)
+        } else if let Some(s) = args[1].as_str() {
+            find_sub(&hay[start..], s.as_bytes())
+        } else {
+            return Err(
+                SemaError::type_error("int, bytevector, or string", args[1].type_name())
+                    .with_hint("bytes/find: the needle is a byte (0-255), bytevector, or string"),
+            );
+        };
+        Ok(pos
+            .map(|i| Value::int((start + i) as i64))
+            .unwrap_or(Value::nil()))
+    });
+
+    register_fn(env, "bytes/slice", |args| {
+        check_arity!(args, "bytes/slice", 2..=3);
+        let bytes = as_bytes(&args[0], "bytes/slice")?;
+        let (start, end) = opt_range(args, 1, bytes.len(), "bytes/slice")?;
+        Ok(Value::bytevector(bytes[start..end].to_vec()))
+    });
+
+    register_fn(env, "bytes/->string", |args| {
+        check_arity!(args, "bytes/->string", 1..=3);
+        let bytes = as_bytes(&args[0], "bytes/->string")?;
+        let (start, end) = opt_range(args, 1, bytes.len(), "bytes/->string")?;
+        let s = std::str::from_utf8(&bytes[start..end])
+            .map_err(|e| SemaError::eval(format!("bytes/->string: invalid UTF-8: {e}")))?;
+        Ok(Value::string(s))
+    });
+
+    register_fn(env, "bytes/parse-int10", |args| {
+        check_arity!(args, "bytes/parse-int10", 1..=3);
+        let bytes = as_bytes(&args[0], "bytes/parse-int10")?;
+        let (start, end) = opt_range(args, 1, bytes.len(), "bytes/parse-int10")?;
+        parse_int10(&bytes[start..end])
+            .map(Value::int)
+            .map_err(|e| SemaError::eval(format!("bytes/parse-int10: {e}")))
     });
 
     // module/function aliases for legacy Scheme names (Decision #24)
