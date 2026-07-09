@@ -14,8 +14,7 @@ task run suite="all" runs="10" warmup="3": [release]
 @needs hyperfine "brew install hyperfine"
 task save suite="all" runs="10" warmup="3": [release]
     mkdir -p target/bench
-    ./scripts/bench.sh --suite {{suite}} --runs {{runs}} --warmup {{warmup}} \
-        --export target/bench/bench-$(git rev-parse --short HEAD 2>/dev/null || echo nogit).json
+    ./scripts/bench.sh --suite {{suite}} --runs {{runs}} --warmup {{warmup}} --export target/bench/bench-$(git rev-parse --short HEAD 2>/dev/null || echo nogit).json
 
 @group bench
 @desc "Export a baseline snapshot for later comparison"
@@ -29,8 +28,7 @@ task baseline runs="10" warmup="3": [release]
 @needs hyperfine "brew install hyperfine"
 task compare runs="10" warmup="3": [release]
     mkdir -p target/bench
-    ./scripts/bench.sh --runs {{runs}} --warmup {{warmup}} \
-        --export target/bench/current.json --compare target/bench/baseline.json
+    ./scripts/bench.sh --runs {{runs}} --warmup {{warmup}} --export target/bench/current.json --compare target/bench/baseline.json
 
 # 1BRC (billion-row challenge) size ladder — a recipe name can't start with a
 # digit, so the size is a param: `jake bench.brc rows=1m|10m|100m`.
@@ -48,7 +46,6 @@ task brc rows="1m": [release]
 task profile bench="tak":
     mkdir -p target/profiles
     RUSTFLAGS="-C force-frame-pointers=yes" cargo build --profile release-with-debug -p sema-lang
-    samply record --save-only --output target/profiles/{{bench}}-vm.json -- \
-        ./target/release-with-debug/sema --no-llm examples/benchmarks/{{bench}}.sema
+    samply record --save-only --output target/profiles/{{bench}}-vm.json -- ./target/release-with-debug/sema --no-llm examples/benchmarks/{{bench}}.sema
     echo "Profile saved: target/profiles/{{bench}}-vm.json"
     echo "Open with: samply load target/profiles/{{bench}}-vm.json"

@@ -8,8 +8,7 @@
 task build:
     @needs wasm-pack "cargo install wasm-pack"
     @needs node
-    cd crates/sema-wasm && wasm-pack build --target web --out-dir ../../playground/pkg \
-        -- --config 'profile.release.package.sema-wasm.opt-level="s"'
+    cd crates/sema-wasm && wasm-pack build --target web --out-dir ../../playground/pkg -- --config 'profile.release.package.sema-wasm.opt-level="s"'
     cd playground && node build.mjs
 
 @group pg

@@ -28,8 +28,7 @@ task build: [packages/sema-wasm/pkg/sema_wasm_bg.wasm]
 @desc "Build WASM VM + the JS embedding packages"
 task js-lib-build: [build]
     @needs wasm-pack npm
-    wasm-pack build crates/sema-wasm --target web --release --scope sema-lang \
-        --out-dir ../../packages/sema-wasm/pkg -- --config 'profile.release.package.sema-wasm.opt-level="s"'
+    wasm-pack build crates/sema-wasm --target web --release --scope sema-lang --out-dir ../../packages/sema-wasm/pkg -- --config 'profile.release.package.sema-wasm.opt-level="s"'
     cd packages/sema && npm install && npm run build
 
 @group wasm
