@@ -191,7 +191,6 @@ fn vm_import_keeps_module_isolation() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-
 // === M4: VM-native import (module body runs on the VM) ===
 
 #[test]
