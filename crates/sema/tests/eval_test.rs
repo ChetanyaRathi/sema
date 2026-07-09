@@ -2333,6 +2333,46 @@ eval_tests! {
              (define (od? x) (if (= x 0) #f (ev? (- x 1))))
              (ev? n))
            (list (run 10) (run 11)))" => common::eval("'(#t #f)"),
+
+    // --- Rebinding disqualifies the optimization (letrec* semantics) ---
+
+    // A sibling set! rebinds the internal define; a copy saved before the
+    // set! must recurse into the CURRENT binding, not the original closure.
+    stc_internal_define_sibling_set_rebinds:
+        "(begin
+           (define (test)
+             (define (f n) (if (= n 0) 'done (f (- n 1))))
+             (define g f)
+             (set! f (fn (n) 'other))
+             (g 3))
+           (test))" => common::eval("'other"),
+    // Same when the set! happens inside a sibling helper (the rebind scan
+    // sees through nested lambdas).
+    stc_internal_define_setter_lambda_rebinds:
+        "(begin
+           (define (test)
+             (define (f n) (if (= n 0) 'done (f (- n 1))))
+             (define g f)
+             (define (patch!) (set! f (fn (n) 'other)))
+             (patch!)
+             (g 3))
+           (test))" => common::eval("'other"),
+    // A second define of the same name reuses the slot — also a rebinding.
+    stc_internal_define_redefine_rebinds:
+        "(begin
+           (define (test)
+             (define (f n) (if (= n 0) 'done (f (- n 1))))
+             (define g f)
+             (define (f n) 'other)
+             (g 3))
+           (test))" => common::eval("'other"),
+    // The letrec path has the same rule: a body set! of a binding name must
+    // reach copies of the original closure.
+    stc_letrec_sibling_set_rebinds:
+        "(letrec ((f (lambda (n) (if (= n 0) 'done (f (- n 1))))))
+           (let ((g f))
+             (set! f (lambda (n) 'other))
+             (g 3)))" => common::eval("'other"),
 }
 
 eval_error_tests! {
