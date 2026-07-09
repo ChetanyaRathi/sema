@@ -16,6 +16,169 @@ Sema is also an MCP **client** — it can *consume* external MCP servers' tools 
 
 ---
 
+## Connecting Clients
+
+Register `sema mcp` as a stdio server with your client of choice. With no file arguments it serves the [default tools](#default-mcp-tools); append filepaths to any command below to also expose your own `deftool` definitions (see [Filepath Mode](#filepath-mode--custom-tools)).
+
+### Claude Code
+
+```bash
+claude mcp add sema -- sema mcp
+```
+
+Registered for the current project by default; add `--scope user` to make it available everywhere.
+
+### Codex
+
+```bash
+codex mcp add sema -- sema mcp
+```
+
+Written to `~/.codex/config.toml`, equivalent to:
+
+```toml
+[mcp_servers.sema]
+command = "sema"
+args = ["mcp"]
+```
+
+### GitHub Copilot CLI
+
+```bash
+copilot mcp add sema -- sema mcp
+```
+
+Written to `~/.copilot/mcp-config.json` (user-wide). Copilot also picks up a project-local `.mcp.json` in the same `mcpServers` format shown below.
+
+### Gemini CLI
+
+```bash
+gemini mcp add sema sema mcp
+```
+
+Registered for the current project by default (`.gemini/settings.json`); add `-s user` to make it available everywhere.
+
+### Amp
+
+```bash
+amp mcp add sema -- sema mcp
+```
+
+Written to `~/.config/amp/settings.json`; add `--workspace` for a project-local registration.
+
+### Glue
+
+```bash
+glue mcp add sema --transport stdio -- sema mcp
+```
+
+Unlike the CLIs above, [Glue](https://getglue.dev) requires an explicit `--transport`. Written to `~/.glue/config.yaml`.
+
+### Cursor
+
+Add to the project's `.cursor/mcp.json` (or `~/.cursor/mcp.json` for all projects):
+
+```json
+{
+  "mcpServers": {
+    "sema": {
+      "command": "sema",
+      "args": ["mcp"]
+    }
+  }
+}
+```
+
+### VS Code
+
+```bash
+code --add-mcp '{"name":"sema","command":"sema","args":["mcp"]}'
+```
+
+Or add it to a project's `.vscode/mcp.json` — note VS Code uses a `servers` key:
+
+```json
+{
+  "servers": {
+    "sema": {
+      "type": "stdio",
+      "command": "sema",
+      "args": ["mcp"]
+    }
+  }
+}
+```
+
+### Zed
+
+Add to Zed's `settings.json` (also reachable via Settings → AI → MCP Servers):
+
+```json
+{
+  "context_servers": {
+    "sema": {
+      "command": "sema",
+      "args": ["mcp"]
+    }
+  }
+}
+```
+
+### OpenCode
+
+Add to the project's `opencode.json`:
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "sema": {
+      "type": "local",
+      "command": ["sema", "mcp"],
+      "enabled": true
+    }
+  }
+}
+```
+
+### Pi
+
+[Pi](https://pi.dev) consumes MCP servers through the [pi-mcp-adapter](https://github.com/nicobailon/pi-mcp-adapter) extension, which reads the standard MCP config files:
+
+```bash
+pi install npm:pi-mcp-adapter
+```
+
+Then add Sema to the project's `.mcp.json` (or the user-global `~/.config/mcp/mcp.json`):
+
+```json
+{
+  "mcpServers": {
+    "sema": {
+      "command": "sema",
+      "args": ["mcp"]
+    }
+  }
+}
+```
+
+### Hermes
+
+[Hermes](https://github.com/NousResearch/hermes-agent) has no MCP CLI command — add an `mcp_servers` entry to `~/.hermes/config.yaml`:
+
+```yaml
+mcp_servers:
+  sema:
+    command: sema
+    args: ["mcp"]
+```
+
+### Everything Else
+
+Any other client needs the same two facts: command `sema`, args `["mcp"]`. CLI agents mostly follow the `mcp add` pattern above (e.g. Factory's `droid mcp add sema "sema mcp"`), and GUI clients — Claude Desktop (`claude_desktop_config.json`), Cline, Roo Code, Windsurf, JetBrains AI Assistant, Warp, LM Studio — accept the standard `mcpServers` JSON shown for Cursor.
+
+---
+
 ## Default MCP Tools
 
 When started, the MCP server exposes a set of core developer tools:
