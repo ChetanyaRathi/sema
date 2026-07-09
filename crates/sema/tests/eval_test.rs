@@ -2047,10 +2047,12 @@ eval_tests! {
     gc_collect_returns_stats_map: "(map? (gc/collect))" => Value::bool(true),
     gc_stats_has_registry_size: "(integer? (:registry-size (gc/stats)))" => Value::bool(true),
     // Direct self-recursion (shape U): the churned closure's cell⇄closure
-    // cycle is unreachable after the call and must be reclaimed.
+    // cycle is unreachable after the call and must be reclaimed. The self-call
+    // is non-tail — a tail-only self-recursion elides its self capture
+    // (issue #62) and never forms the cycle.
     gc_self_recursive_local_collected: "(begin
         (define (churn)
-          (define (loop n) (if (<= n 0) 0 (loop (- n 1))))
+          (define (loop n) (if (<= n 0) 0 (+ 1 (loop (- n 1)))))
           (loop 3))
         (churn)
         (> (:collected (gc/collect)) 0))" => Value::bool(true),
@@ -2176,6 +2178,51 @@ eval_tests! {
     // is disabled and the real self-capture is retained — result must be right.
     stc_escape_as_value:
         "(let loop ((n 3) (acc '())) (if (= n 0) (length acc) (loop (- n 1) (cons loop acc))))" => Value::int(3),
+
+    // --- Internal defines get the same treatment as letrec bindings ---
+
+    // Deep self-tail recursion through an internal define reuses the frame
+    // (SelfTailCall): 1e6 iterations must not grow the stack.
+    stc_internal_define_deep_tco:
+        "(begin
+           (define (run)
+             (define (loop n acc) (if (= n 0) acc (loop (- n 1) (+ acc 1))))
+             (loop 1000000 0))
+           (run))" => Value::int(1000000),
+    // Internal define capturing an outer local referenced before the
+    // self-call: dropping the self upvalue shifts the other capture down.
+    stc_internal_define_capture_remap:
+        "(begin
+           (define (run c)
+             (define (loop n) (if (> n 0) (loop (- n 1)) c))
+             (loop 5))
+           (run 100))" => Value::int(100),
+    // Escape inside the define's own body (name consed into a list) disables
+    // the opt; the real self-capture keeps working.
+    stc_internal_define_escape_as_value:
+        "(begin
+           (define (run)
+             (define (loop n acc) (if (= n 0) (length acc) (loop (- n 1) (cons loop acc))))
+             (loop 3 '()))
+           (run))" => Value::int(3),
+    // The define's name returned as a value from the ENCLOSING function is a
+    // plain local load in the outer frame; the returned closure still
+    // self-recurses correctly.
+    stc_internal_define_returned_fn:
+        "(begin
+           (define (mk)
+             (define (f n) (if (= n 0) 'done (f (- n 1))))
+             f)
+           ((mk) 5))" => common::eval("'done"),
+    // Mutually recursive internal defines reference each OTHER (no self
+    // upvalue to elide); cross-captures must survive untouched.
+    stc_internal_define_mutual_recursion:
+        "(begin
+           (define (run n)
+             (define (ev? x) (if (= x 0) #t (od? (- x 1))))
+             (define (od? x) (if (= x 0) #f (ev? (- x 1))))
+             (ev? n))
+           (list (run 10) (run 11)))" => common::eval("'(#t #f)"),
 }
 
 eval_error_tests! {
