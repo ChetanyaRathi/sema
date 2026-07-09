@@ -490,12 +490,9 @@ pub fn call_closure_owned(
     args: &mut [Value],
 ) -> Option<Result<Value, SemaError>> {
     let (closure, functions) = extract_vm_closure(func)?;
-    let globals = match &closure.globals {
-        Some(g) => g.clone(),
-        // The top-level main closure never travels as a callback value; if it
-        // somehow does, let the generic borrowed path handle it.
-        None => return None,
-    };
+    // The top-level main closure never travels as a callback value; if it
+    // somehow does (globals is None), let the generic borrowed path handle it.
+    let globals = closure.globals.as_ref()?.clone();
     if sema_core::in_async_context() {
         // The task VM clones args while setting up regardless; ownership is
         // moot here. See the fallback wrapper for why yields need this route.
@@ -1241,13 +1238,9 @@ impl VM {
                     // there), and resume the main VM from after that native call.
                     // A rejected/cancelled target surfaces as an error here — the
                     // same error the native would have produced had it not paused.
-                    match reconstruct_coop_resume_value(&how) {
-                        Ok(resume_value) => {
-                            self.replace_stack_top(resume_value);
-                            return self.run_inner::<true>(ctx, Some(debug));
-                        }
-                        Err(e) => return Err(e),
-                    }
+                    let resume_value = reconstruct_coop_resume_value(&how)?;
+                    self.replace_stack_top(resume_value);
+                    return self.run_inner::<true>(ctx, Some(debug));
                 }
                 Err(e) => return Err(e),
             }

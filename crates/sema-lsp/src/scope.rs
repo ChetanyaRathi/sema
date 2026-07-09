@@ -986,10 +986,7 @@ impl ScopeTree {
                     });
                 }
             }
-            match scope.parent {
-                Some(parent) => idx = parent,
-                None => return None,
-            }
+            idx = scope.parent?;
         }
     }
 
