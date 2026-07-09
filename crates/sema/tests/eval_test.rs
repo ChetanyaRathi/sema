@@ -2526,3 +2526,47 @@ eval_error_tests! {
     // Name must be a symbol
     sr_bad_name: "(define-syntax 5 (syntax-rules () ((_ a) a)))" => "define-syntax",
 }
+
+// ============================================================
+// Mutable arrays / cells
+// ============================================================
+
+eval_tests! {
+    mutable_array_push_get: "(let ((a (mutable-array/new))) (mutable-array/push! a 1) (mutable-array/push! a 2) (mutable-array/get a 1))" => Value::int(2),
+    // Reference sharing: mutation through one handle is visible through another.
+    mutable_array_shared_mutation: "(let* ((a (mutable-array/new)) (b a)) (mutable-array/push! a 7) (mutable-array/get b 0))" => Value::int(7),
+    mutable_array_new_filled: "(mutable-array/->vector (mutable-array/new 3 0))" => common::eval("[0 0 0]"),
+    mutable_array_capacity_starts_empty: "(mutable-array/length (mutable-array/new 64))" => Value::int(0),
+    mutable_array_set: "(let ((a (mutable-array/new 2 0))) (mutable-array/set! a 1 9) (mutable-array/->vector a))" => common::eval("[0 9]"),
+    mutable_array_get_default: "(mutable-array/get (mutable-array/new) 5 :missing)" => Value::keyword("missing"),
+    mutable_array_length: "(mutable-array/length (mutable-array/new 3 :x))" => Value::int(3),
+    mutable_array_nth_interop: "(nth (mutable-array/new 2 :v) 1)" => Value::keyword("v"),
+    mutable_array_type_name: "(type (mutable-array/new))" => Value::keyword("mutable-array"),
+    // ->vector freezes a snapshot: later mutation does not change it.
+    mutable_array_freeze_snapshots: "(let* ((a (mutable-array/new 1 0)) (v (mutable-array/->vector a))) (mutable-array/set! a 0 9) v)" => common::eval("[0]"),
+    mutable_array_equal_by_contents: "(equal? (mutable-array/new 2 1) (mutable-array/new 2 1))" => Value::bool(true),
+    mutable_array_unequal_contents: "(equal? (mutable-array/new 2 1) (mutable-array/new 2 2))" => Value::bool(false),
+    mutable_array_not_equal_to_vector: "(equal? (mutable-array/new 1 0) [0])" => Value::bool(false),
+    // Cyclic comparison terminates (coinductive equality, no infinite loop).
+    mutable_array_cyclic_equal_terminates: "(let ((a (mutable-array/new)) (b (mutable-array/new))) (mutable-array/push! a a) (mutable-array/push! b b) (equal? a b))" => Value::bool(true),
+    mutable_cell_round_trip: "(let ((c (mutable-cell/new 1))) (mutable-cell/set! c 99) (mutable-cell/get c))" => Value::int(99),
+    mutable_cell_shared_mutation: "(let* ((c (mutable-cell/new 0)) (d c)) (mutable-cell/set! c 5) (mutable-cell/get d))" => Value::int(5),
+    mutable_cell_equal_by_contents: "(equal? (mutable-cell/new 1) (mutable-cell/new 1))" => Value::bool(true),
+    mutable_cell_type_name: "(type (mutable-cell/new nil))" => Value::keyword("mutable-cell"),
+}
+
+eval_error_tests! {
+    mutable_array_get_oob: "(mutable-array/get (mutable-array/new) 0)" => "out of bounds",
+    mutable_array_set_oob: "(mutable-array/set! (mutable-array/new) 0 1)" => "out of bounds",
+    mutable_array_set_negative_index: "(mutable-array/set! (mutable-array/new 1 0) -1 5)" => "non-negative",
+    mutable_array_push_type_error: "(mutable-array/push! [1] 2)" => "mutable-array",
+    mutable_array_new_arity: "(mutable-array/new 1 2 3)" => "mutable-array/new",
+    mutable_cell_get_type_error: "(mutable-cell/get 5)" => "mutable-cell",
+    mutable_cell_set_arity: "(mutable-cell/set! (mutable-cell/new 1))" => "mutable-cell/set!",
+    // Mutable containers cannot be map keys (contents can change after insert).
+    mutable_array_map_key_rejected: "(hash-map (mutable-array/new) 1)" => "immutable map key",
+    mutable_array_assoc_key_rejected: "(assoc {} (mutable-array/new) 1)" => "immutable map key",
+    mutable_array_literal_key_rejected: "(let ((a (mutable-array/new))) {a 1})" => "immutable map key",
+    mutable_cell_hashmap_key_rejected: "(hashmap/new (mutable-cell/new 1) 2)" => "immutable map key",
+}
+

@@ -77,6 +77,44 @@ fn quiescent_double_collect_frees_nothing() {
     assert_eq!(v, Value::bool(true));
 }
 
+// ── Mutable containers: data-only self-cycles reclaimed ───────────
+
+#[test]
+fn mutable_container_self_cycles_collected() {
+    // An array pushed into itself and a cell set to itself are pure
+    // data cycles (no closure on the cycle): reclaiming them exercises the
+    // creation-time candidate registration in the mutable constructors and
+    // the trace/sever arms for both types.
+    let v = eval_ok(
+        "(begin
+           (gc/collect)
+           (define (make-cycles)
+             (let ((a (mutable-array/new))
+                   (c (mutable-cell/new nil)))
+               (mutable-array/push! a a)
+               (mutable-cell/set! c c)
+               nil))
+           (make-cycles)
+           (>= (:collected (gc/collect)) 2))",
+    );
+    assert_eq!(v, Value::bool(true));
+}
+
+#[test]
+fn live_mutable_array_untouched_by_collect() {
+    // A globally rooted array — even one on a self-cycle — must survive a
+    // pass with its contents intact (severing it would be freeing live data).
+    let v = eval_ok(
+        "(begin
+           (define a (mutable-array/new))
+           (mutable-array/push! a 1)
+           (mutable-array/push! a a)
+           (gc/collect)
+           (list (mutable-array/length a) (mutable-array/get a 0)))",
+    );
+    assert_eq!(v, eval_ok("'(2 1)"));
+}
+
 // ── Mutual local recursion: garbage collected, live pair untouched ─
 
 #[test]
