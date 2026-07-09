@@ -4615,11 +4615,18 @@ pub fn compile_program_with_spans_and_natives(
     known_natives: Option<std::collections::HashSet<Spur>>,
 ) -> Result<CompiledProgram, SemaError> {
     let source_file = source_file.map(|p| std::fs::canonicalize(&p).unwrap_or(p));
+    let mut cores = Vec::with_capacity(vals.len());
+    for val in vals {
+        cores.push(crate::lower::lower(val, Some(span_map))?);
+    }
+    // Lower everything first: a sibling top-level form can redefine a
+    // foldable builtin, and the folder must see the whole program (the
+    // compiler's redefined_globals scan is likewise program-wide).
+    let redefined = crate::optimize::redefined_foldable_names(&cores);
     let mut resolved = Vec::new();
     let mut total_locals: u16 = 0;
-    for val in vals {
-        let core = crate::lower::lower(val, Some(span_map))?;
-        let core = crate::optimize::optimize(core);
+    for core in cores {
+        let core = crate::optimize::optimize_with_redefined(core, &redefined);
         let (res, n) = crate::resolve::resolve_with_locals(&core)?;
         total_locals = total_locals.max(n);
         resolved.push(res);
@@ -4761,11 +4768,17 @@ pub fn compile_program(
     vals: &[Value],
     known_natives: Option<std::collections::HashSet<Spur>>,
 ) -> Result<CompiledProgram, SemaError> {
+    let mut cores = Vec::with_capacity(vals.len());
+    for val in vals {
+        cores.push(crate::lower::lower(val, None)?);
+    }
+    // Sibling top-level redefinitions of foldable builtins suppress folding
+    // program-wide (see compile_program_with_spans_and_natives).
+    let redefined = crate::optimize::redefined_foldable_names(&cores);
     let mut resolved = Vec::new();
     let mut total_locals: u16 = 0;
-    for val in vals {
-        let core = crate::lower::lower(val, None)?;
-        let core = crate::optimize::optimize(core);
+    for core in cores {
+        let core = crate::optimize::optimize_with_redefined(core, &redefined);
         let (res, n) = crate::resolve::resolve_with_locals(&core)?;
         total_locals = total_locals.max(n);
         resolved.push(res);

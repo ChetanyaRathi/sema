@@ -1996,6 +1996,23 @@ eval_tests! {
     if_not_lexically_shadowed:
         "(let ((not (lambda (x) x))) (if (not 1) 'shadow-truthy 'shadow-falsy))"
         => common::eval("'shadow-truthy"),
+    // Constant-argument calls are folded per top-level form, so the folder
+    // must see SIBLING top-level redefinitions too (not just same-begin
+    // ones): (not 1) must reach the user's identity fn, not fold to #f.
+    fold_not_redefined_sibling_toplevel:
+        "(define not (lambda (x) x)) (not 1)" => Value::int(1),
+    fold_if_not_redefined_sibling_toplevel:
+        "(define not odd?) (if (not 3) 'then 'else)" => common::eval("'then"),
+    // Same for arithmetic FOLDABLE_NAMES; the oracle is the resolved-call
+    // (non-constant-argument) path pinned below.
+    fold_plus_redefined_sibling_toplevel:
+        "(define + (lambda (a b) 99)) (+ 1 2)" => Value::int(99),
+    fold_plus_redefined_nonconstant_oracle:
+        "(define + (lambda (a b) 99)) (define x 1) (+ x 2)" => Value::int(99),
+    // Define-after-use: suppression only defers to runtime dispatch, which
+    // still sees the builtin until the later define executes.
+    fold_not_redefined_after_use_runs_builtin:
+        "(define r (not 1)) (define not (lambda (x) x)) r" => Value::bool(false),
 }
 
 // Wide-integer runtime arithmetic: operands beyond the ±2^44 small-int fast-path
