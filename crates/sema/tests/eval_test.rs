@@ -2836,3 +2836,26 @@ eval_tests! {
     // Only the last use moves; the earlier get still sees the value.
     take_local_earlier_read_intact: "((fn (m) (list (get m :a) (assoc m :z 9))) {:a 7})" => common::eval("'(7 {:a 7 :z 9})"),
 }
+
+// ============================================================
+// Owned-args callback protocol (stdlib folds move the accumulator)
+// ============================================================
+// foldl/reduce/file-fold hand their accumulator to the callback by MOVE
+// (call_callback_owned), so the in-place fast paths can fire inside the
+// callback. These pin that every callable shape and error path behaves
+// identically to the borrowed protocol.
+
+eval_tests! {
+    // reduce seeds from the first element and moves the accumulator through.
+    owned_args_reduce_assoc: "(reduce (fn (a b) (assoc a b 1)) (list {:z 0} :a :b))" => common::eval("{:a 1 :b 1 :z 0}"),
+    // Plain-native callbacks fall back to the borrowed protocol.
+    owned_args_native_callback: "(foldl + 0 (list 1 2 3))" => Value::int(6),
+    owned_args_native_reduce: "(reduce + (list 1 2 3))" => Value::int(6),
+    // Rest params flow through the owned frame setup.
+    owned_args_rest_param_callback: "(foldl (fn (a . more) (+ a (first more))) 0 (list 1 2 3))" => Value::int(6),
+    // set! through an upvalue still writes back to the caller's live slot
+    // (the owned path routes through the same current-VM nested run).
+    owned_args_upvalue_writeback: "(let ((n 0)) (foldl (fn (acc x) (set! n (+ n x)) (+ acc x)) 0 (list 1 2 3)) n)" => Value::int(6),
+    // A throw inside the callback unwinds cleanly out of the owned run.
+    owned_args_callback_throw: "(try (foldl (fn (acc x) (if (> x 2) (throw \"boom\") (+ acc x))) 0 (list 1 2 3)) (catch e (:value e)))" => common::eval("\"boom\""),
+}

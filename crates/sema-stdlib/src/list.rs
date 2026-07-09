@@ -207,7 +207,10 @@ pub fn register(env: &sema_core::Env) {
         let items = get_sequence(&args[2], "foldl")?;
         let mut acc = args[1].clone();
         for item in items {
-            acc = call_function(&args[0], &[acc, item.clone()])?;
+            // Owned handoff: the accumulator moves into the callback frame so
+            // uniqueness-gated in-place updates (assoc & co.) can fire.
+            let mut cb_args = [std::mem::replace(&mut acc, Value::nil()), item.clone()];
+            acc = call_function_owned(&args[0], &mut cb_args)?;
         }
         Ok(acc)
     });
@@ -406,7 +409,9 @@ pub fn register(env: &sema_core::Env) {
         }
         let mut acc = items[0].clone();
         for item in &items[1..] {
-            acc = call_function(&args[0], &[acc, item.clone()])?;
+            // Owned handoff — see foldl.
+            let mut cb_args = [std::mem::replace(&mut acc, Value::nil()), item.clone()];
+            acc = call_function_owned(&args[0], &mut cb_args)?;
         }
         Ok(acc)
     });
@@ -1373,6 +1378,21 @@ pub fn call_function(func: &Value, args: &[Value]) -> Result<Value, SemaError> {
         sema_core::with_stdlib_ctx(|ctx| sema_core::call_callback(ctx, func, args))
     };
 
+    check_hof_yield(result)
+}
+
+/// [`call_function`] with an args buffer the caller owns and will not reuse:
+/// a VM-closure callee moves the values into its frame (the buffer is left
+/// holding nils), keeping a fold accumulator uniquely owned across the
+/// callback boundary so the `strong_count == 1` in-place fast paths can fire.
+pub fn call_function_owned(func: &Value, args: &mut [Value]) -> Result<Value, SemaError> {
+    let result = sema_core::with_stdlib_ctx(|ctx| sema_core::call_callback_owned(ctx, func, args));
+    check_hof_yield(result)
+}
+
+/// Shared post-call guard for HOF callback invocations: a yielding native
+/// passed directly (not wrapped in a lambda) cannot suspend cleanly here.
+fn check_hof_yield(result: Result<Value, SemaError>) -> Result<Value, SemaError> {
     if sema_core::in_async_context() && sema_core::take_yield_signal().is_some() {
         return Err(SemaError::eval(
             "yielding native passed directly to a higher-order function — \

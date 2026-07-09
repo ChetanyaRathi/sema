@@ -422,6 +422,15 @@ fn try_run_on_current_vm(
     args: &[Value],
     ctx: &EvalContext,
 ) -> Option<Result<Value, SemaError>> {
+    try_run_on_current_vm_args(closure, globals, CallArgs::Borrowed(args), ctx)
+}
+
+fn try_run_on_current_vm_args(
+    closure: &Rc<Closure>,
+    globals: &Rc<Env>,
+    args: CallArgs,
+    ctx: &EvalContext,
+) -> Option<Result<Value, SemaError>> {
     let closure_root = env_root(globals);
     // Snapshot the innermost compatible VM pointer, then release the borrow
     // before re-entering the VM (the nested run may itself register a new
@@ -437,12 +446,75 @@ fn try_run_on_current_vm(
         })
     })?;
     // SAFETY: the owning VM is paused at the native call site that registered
-    // this pointer and does not touch `self` until the call returns. Args have
-    // been copied into an owned slice by the native caller, so there is no
-    // outstanding borrow of the VM's stack. The reference does not escape this
-    // call.
+    // this pointer and does not touch `self` until the call returns. Args live
+    // in a buffer owned by the native caller (borrowed or handed over for
+    // moving out — see `CallArgs`), so there is no outstanding borrow of the
+    // VM's stack. The reference does not escape this call.
     let vm = unsafe { &mut *vm_ptr };
-    Some(vm.run_nested_closure(closure.clone(), args, ctx))
+    Some(vm.run_nested_closure_args(closure.clone(), args, ctx))
+}
+
+/// Args handoff mode when pushing a callee frame from a native boundary:
+/// `Borrowed` clones each value into its local slot (the caller keeps its
+/// buffer intact); `Owned` moves each value out, leaving nil behind (the
+/// caller promised not to reuse the buffer). `Owned` is the refcount-shedding
+/// protocol behind [`call_closure_owned`] — it keeps a uniquely-owned
+/// accumulator uniquely owned across the callback boundary.
+enum CallArgs<'a> {
+    Borrowed(&'a [Value]),
+    Owned(&'a mut [Value]),
+}
+
+impl CallArgs<'_> {
+    fn len(&self) -> usize {
+        match self {
+            CallArgs::Borrowed(a) => a.len(),
+            CallArgs::Owned(a) => a.len(),
+        }
+    }
+}
+
+/// Call a NativeFn-wrapped VM closure with an args buffer the caller owns and
+/// will NOT reuse: the values are MOVED into the callee frame (the buffer is
+/// left holding nils). Combined with the compiler's `TakeLocal` last-use
+/// moves, this lets a fold accumulator reach the stdlib's `strong_count == 1`
+/// in-place fast paths (`assoc` & co.) instead of deep-cloning per step.
+///
+/// Mirrors the borrowed fallback wrapper built in `make_closure`
+/// decision-for-decision (async inline task → current-VM nested run → foreign
+/// fresh VM). Returns `None` when `func` is not a VM closure; the caller then
+/// falls back to the borrowed protocol.
+pub fn call_closure_owned(
+    func: &Value,
+    ctx: &EvalContext,
+    args: &mut [Value],
+) -> Option<Result<Value, SemaError>> {
+    let (closure, functions) = extract_vm_closure(func)?;
+    let globals = match &closure.globals {
+        Some(g) => g.clone(),
+        // The top-level main closure never travels as a callback value; if it
+        // somehow does, let the generic borrowed path handle it.
+        None => return None,
+    };
+    if sema_core::in_async_context() {
+        // The task VM clones args while setting up regardless; ownership is
+        // moot here. See the fallback wrapper for why yields need this route.
+        return Some(crate::scheduler::run_closure_as_inline_task(
+            ctx, closure, functions, &*args,
+        ));
+    }
+    if let Some(result) = try_run_on_current_vm_args(&closure, &globals, CallArgs::Owned(args), ctx)
+    {
+        return Some(result);
+    }
+    // Foreign fresh VM: snapshot open upvalues against the owning VM (if any)
+    // before running on a different stack.
+    close_closure_upvalues_for_foreign_run(&closure);
+    let mut vm = VM::new_with_rc_functions(globals, functions);
+    if let Err(e) = vm.setup_for_call_args(closure, CallArgs::Owned(args)) {
+        return Some(Err(e));
+    }
+    Some(vm.run(ctx))
 }
 
 /// The home globals env of the VM currently executing a native call on this
@@ -1266,10 +1338,10 @@ impl VM {
     /// The dispatch loop is bounded by `frame_floor`: it returns as soon as the
     /// frame it pushed (and any frames pushed beneath it) have returned, without
     /// unwinding the caller's frames.
-    fn run_nested_closure(
+    fn run_nested_closure_args(
         &mut self,
         closure: Rc<Closure>,
-        args: &[Value],
+        args: CallArgs,
         ctx: &EvalContext,
     ) -> Result<Value, SemaError> {
         // Floor = the parent's current frame depth. After setup_for_call pushes
@@ -1284,7 +1356,7 @@ impl VM {
         // still in progress (e.g. `current_vm_globals()` for nested imports).
         let saved_globals = self.globals.clone();
         let saved_functions = self.functions.clone();
-        self.setup_for_call(closure, args)?;
+        self.setup_for_call_args(closure, args)?;
         let saved_floor = self.frame_floor;
         self.frame_floor = floor;
         // Each native→VM re-entry nests a fresh dispatch loop on the *Rust*
@@ -1405,43 +1477,67 @@ impl VM {
         closure: Rc<Closure>,
         args: &[Value],
     ) -> Result<(), SemaError> {
+        self.setup_for_call_args(closure, CallArgs::Borrowed(args))
+    }
+
+    /// [`Self::setup_for_call`] parametrized over the args handoff: `Borrowed`
+    /// clones each value into its slot, `Owned` moves it out of the caller's
+    /// buffer (leaving nil) so the slot holds the value's only new reference.
+    fn setup_for_call_args(
+        &mut self,
+        closure: Rc<Closure>,
+        args: CallArgs,
+    ) -> Result<(), SemaError> {
         let func = &closure.func;
         let arity = func.arity as usize;
         let has_rest = func.has_rest;
         let n_locals = func.chunk.n_locals as usize;
+        let argc = args.len();
 
         if has_rest {
-            if args.len() < arity {
+            if argc < arity {
                 return Err(SemaError::arity(
                     func.name
                         .map(resolve_spur)
                         .unwrap_or_else(|| "<lambda>".to_string()),
                     format!("{}+", arity),
-                    args.len(),
+                    argc,
                 ));
             }
-        } else if args.len() != arity {
+        } else if argc != arity {
             return Err(SemaError::arity(
                 func.name
                     .map(resolve_spur)
                     .unwrap_or_else(|| "<lambda>".to_string()),
                 arity.to_string(),
-                args.len(),
+                argc,
             ));
         }
 
         self.ensure_cache_space(func);
         let base = self.stack.len();
         self.stack.resize(base + n_locals, Value::nil());
-        if has_rest {
-            for i in 0..arity {
-                self.stack[base + i] = args.get(i).cloned().unwrap_or(Value::nil());
+        match args {
+            CallArgs::Borrowed(args) => {
+                for i in 0..arity {
+                    self.stack[base + i] = args.get(i).cloned().unwrap_or(Value::nil());
+                }
+                if has_rest {
+                    let rest: Vec<Value> = args[arity..].to_vec();
+                    self.stack[base + arity] = Value::list(rest);
+                }
             }
-            let rest: Vec<Value> = args[arity..].to_vec();
-            self.stack[base + arity] = Value::list(rest);
-        } else {
-            for i in 0..arity {
-                self.stack[base + i] = args.get(i).cloned().unwrap_or(Value::nil());
+            CallArgs::Owned(args) => {
+                for (i, arg) in args.iter_mut().enumerate().take(arity) {
+                    self.stack[base + i] = std::mem::replace(arg, Value::nil());
+                }
+                if has_rest {
+                    let rest: Vec<Value> = args[arity..]
+                        .iter_mut()
+                        .map(|v| std::mem::replace(v, Value::nil()))
+                        .collect();
+                    self.stack[base + arity] = Value::list(rest);
+                }
             }
         }
         self.frames.push(CallFrame {
