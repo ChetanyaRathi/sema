@@ -1259,6 +1259,68 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
     crate::register_fn_path_gated(
         env,
         sandbox,
+        Caps::FS_READ,
+        "file/fold-lines-bytes",
+        &[0],
+        |args| {
+            check_arity!(args, "file/fold-lines-bytes", 3);
+            let path = args[0]
+                .as_str()
+                .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
+            let func = args[1].clone();
+            let mut acc = args[2].clone();
+            let file = std::fs::File::open(path)
+                .map_err(|e| SemaError::Io(format!("file/fold-lines-bytes {path}: {e}")))?;
+            // 256KB buffer (vs default 8KB) improves throughput for large file reads.
+            let mut reader = std::io::BufReader::with_capacity(256 * 1024, file);
+
+            sema_core::with_stdlib_ctx(|ctx| {
+                // One reusable read buffer per fold; each line is copied into
+                // the bytevector the callback receives (the callback may
+                // retain it, so the buffer itself cannot be handed out). No
+                // UTF-8 validation — this is the byte-oriented sibling of
+                // file/fold-lines for `bytes/*` pipelines.
+                let mut line_buf: Vec<u8> = Vec::with_capacity(128);
+                // Fast path: if the callback is a NativeFn, call it directly.
+                // This avoids the call_callback indirection and, critically, avoids
+                // the VM closure fallback wrapper's clone of args (which prevents
+                // COW optimizations in functions like assoc).
+                #[allow(clippy::type_complexity)]
+                let native: Option<
+                    &dyn Fn(&EvalContext, &[Value]) -> Result<Value, SemaError>,
+                > = func.as_native_fn_ref().map(|n| &*n.func);
+                loop {
+                    line_buf.clear();
+                    let n = reader
+                        .read_until(b'\n', &mut line_buf)
+                        .map_err(|e| SemaError::Io(format!("file/fold-lines-bytes {path}: {e}")))?;
+                    if n == 0 {
+                        break;
+                    }
+                    // Lines carry no terminator: strip the trailing \n and \r.
+                    let mut end = line_buf.len();
+                    if end > 0 && line_buf[end - 1] == b'\n' {
+                        end -= 1;
+                    }
+                    if end > 0 && line_buf[end - 1] == b'\r' {
+                        end -= 1;
+                    }
+                    let line_val = Value::bytevector(line_buf[..end].to_vec());
+                    let call_args = [std::mem::replace(&mut acc, Value::nil()), line_val];
+                    acc = if let Some(f) = native {
+                        f(ctx, &call_args)?
+                    } else {
+                        sema_core::call_callback(ctx, &func, &call_args)?
+                    };
+                }
+                Ok(acc)
+            })
+        },
+    );
+
+    crate::register_fn_path_gated(
+        env,
+        sandbox,
         Caps::FS_WRITE,
         "file/write-lines",
         &[0],

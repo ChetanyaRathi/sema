@@ -3381,6 +3381,65 @@ fn test_file_fold_lines() {
 }
 
 #[test]
+fn test_file_fold_lines_bytes() {
+    let dir = unique_temp_dir("fold-lines-bytes");
+    let dir = dir.display().to_string();
+    let dir = dir.as_str();
+    // Mixed \n / \r\n endings and one-decimal / no-decimal temperatures —
+    // the exact shape of a 1BRC measurements file.
+    std::fs::write(
+        format!("{dir}/temps.txt"),
+        "Oslo;-12.3\r\nBergen;5\nTromso;0.0\n",
+    )
+    .expect("write fixture");
+
+    // Sum temperatures as scaled ints via bytes/parse-int10 (int*10 trick):
+    // -123 + 50 + 0 = -73. Lines arrive as bytevectors with \n and \r stripped.
+    let sum = eval(&format!(
+        r#"(file/fold-lines-bytes "{dir}/temps.txt"
+             (fn (acc line)
+               (let ((semi (bytes/find line 59)))
+                 (+ acc (bytes/parse-int10 line (+ semi 1)))))
+             0)"#
+    ));
+    assert_eq!(sum, Value::int(-73));
+
+    // Station names decode from the byte prefix; accumulate into a
+    // mutable array and freeze at the end.
+    let names = eval(&format!(
+        r#"(mutable-array/->vector
+             (file/fold-lines-bytes "{dir}/temps.txt"
+               (fn (acc line)
+                 (mutable-array/push! acc (bytes/->string line 0 (bytes/find line 59))))
+               (mutable-array/new)))"#
+    ));
+    assert_eq!(names, eval(r#"["Oslo" "Bergen" "Tromso"]"#));
+
+    // Empty file — returns the initial accumulator untouched.
+    std::fs::write(format!("{dir}/empty.txt"), "").expect("write fixture");
+    let empty = eval(&format!(
+        r#"(file/fold-lines-bytes "{dir}/empty.txt" (fn (acc line) (+ acc 1)) 42)"#
+    ));
+    assert_eq!(empty, Value::int(42));
+
+    // Arity errors
+    assert_arity_error(r#"(file/fold-lines-bytes "f" (fn (a b) a))"#);
+    assert_arity_error(r#"(file/fold-lines-bytes)"#);
+
+    // Non-existent file → IO error
+    assert!(matches!(
+        eval_err(&format!(
+            r#"(file/fold-lines-bytes "{}" (fn (a l) a) 0)"#,
+            temp_path("nonexistent-sema-bytes.txt")
+        ))
+        .inner(),
+        SemaError::Io(_)
+    ));
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
 fn test_file_copy() {
     let dir = temp_path("sema-test-copy");
     let dir = dir.as_str();
