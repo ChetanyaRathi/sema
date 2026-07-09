@@ -125,6 +125,11 @@ pub struct NativeFn {
     pub name: String,
     pub func: Box<NativeFnInner>,
     pub payload: Option<Rc<dyn Any>>,
+    /// Fixed parameter names, in declaration order, for VM-compiled closures
+    /// wrapped as native functions. `None` for genuine native functions and
+    /// closures whose metadata is unavailable. Rc-shared with the compiled
+    /// `Function` so wrapper creation stays allocation-free.
+    pub param_names: Option<Rc<[Spur]>>,
     /// True when this `NativeFn` is actually the fallback wrapper for a VM
     /// closure (a user-defined `lambda`/`fn`), not a genuine builtin. The VM
     /// represents closures as `NativeFn`s carrying a `VmClosurePayload`; this
@@ -142,6 +147,7 @@ impl NativeFn {
             name: name.into(),
             func: Box::new(move |_ctx, args| f(args)),
             payload: None,
+            param_names: None,
             is_closure: false,
         }
     }
@@ -154,6 +160,7 @@ impl NativeFn {
             name: name.into(),
             func: Box::new(f),
             payload: None,
+            param_names: None,
             is_closure: false,
         }
     }
@@ -167,6 +174,7 @@ impl NativeFn {
             name: name.into(),
             func: Box::new(f),
             payload: Some(payload),
+            param_names: None,
             is_closure: false,
         }
     }

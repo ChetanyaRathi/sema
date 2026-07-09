@@ -9050,15 +9050,12 @@ fn execute_tool_call(
     }
 }
 
-/// Convert JSON arguments into a list of Sema values based on the parameter schema order.
-/// When the handler is a lambda, uses its param names (declaration order) instead of
-/// BTreeMap key order (alphabetical), fixing argument ordering mismatches.
+/// Convert JSON arguments into a list of Sema values based on handler declaration order.
+/// Falling back to the parameter map uses BTreeMap key order (alphabetical).
 fn json_args_to_sema(params: &Value, arguments: &serde_json::Value, handler: &Value) -> Vec<Value> {
     if let serde_json::Value::Object(json_obj) = arguments {
-        // Prefer lambda param names (preserves declaration order) over BTreeMap keys
-        if let Some(lambda) = handler.as_lambda_rc() {
-            return lambda
-                .params
+        if let Some(param_names) = handler_param_names(handler) {
+            return param_names
                 .iter()
                 .map(|name| {
                     json_obj
@@ -9086,6 +9083,17 @@ fn json_args_to_sema(params: &Value, arguments: &serde_json::Value, handler: &Va
         }
     }
     vec![sema_core::json_to_value(arguments)]
+}
+
+fn handler_param_names(handler: &Value) -> Option<std::rc::Rc<[sema_core::Spur]>> {
+    if let Some(lambda) = handler.as_lambda_rc() {
+        return Some(lambda.params.as_slice().into());
+    }
+
+    handler
+        .as_native_fn_ref()
+        .filter(|native| native.is_closure)
+        .and_then(|native| native.param_names.clone())
 }
 
 /// Detect media type from file magic bytes.

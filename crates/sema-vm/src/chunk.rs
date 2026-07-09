@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::rc::Rc;
 
 use sema_core::{Span, Spur, Value};
 
@@ -53,6 +54,12 @@ pub struct Function {
     pub upvalue_names: Vec<Spur>,
     pub arity: u16,
     pub has_rest: bool,
+    /// Fixed parameter names in declaration order (excludes the rest param).
+    /// Consumed by callers that bind named arguments to positions (LLM tool
+    /// dispatch). Rc-shared so per-closure wrappers clone refcount-only.
+    /// Not serialized (like `cache_offset`); rebuilt from `local_names` when
+    /// loading a `.semac` file — empty when that reconstruction is incomplete.
+    pub param_names: Rc<[Spur]>,
     pub local_names: Vec<(u16, Spur)>,
     /// Block scope of each block-introduced local, as `(slot, start_pc, end_pc)`
     /// half-open pc ranges. Used by the debugger to hide locals that are not yet

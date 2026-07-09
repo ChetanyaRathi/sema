@@ -749,6 +749,23 @@ pub fn deserialize_function(
         local_scopes.push((slot, start_pc, end_pc));
     }
 
+    // param_names is not part of the format; rebuild it from local_names (the
+    // compiler records every param there). If any slot in 0..arity lacks a
+    // name, leave it empty — consumers fall back to schema-order binding
+    // rather than misbinding a partial list.
+    let reconstructed: Vec<Spur> = (0..arity)
+        .filter_map(|slot| {
+            local_names
+                .iter()
+                .find_map(|&(s, name)| (s == slot).then_some(name))
+        })
+        .collect();
+    let param_names: std::rc::Rc<[Spur]> = if reconstructed.len() == arity as usize {
+        reconstructed.into()
+    } else {
+        Vec::new().into()
+    };
+
     Ok(Function {
         name,
         chunk,
@@ -756,6 +773,7 @@ pub fn deserialize_function(
         upvalue_names,
         arity,
         has_rest,
+        param_names,
         local_names,
         local_scopes,
         source_file: None,
@@ -2002,6 +2020,7 @@ mod tests {
             upvalue_names: vec![intern("outer-x"), intern("outer-y")],
             arity: 2,
             has_rest: true,
+            param_names: Vec::new().into(),
             local_names: vec![(0, intern("x")), (1, intern("y"))],
             source_file: None,
             local_scopes: vec![(2, 0, 7), (3, 4, 9)],
@@ -2048,6 +2067,7 @@ mod tests {
             upvalue_names: vec![],
             arity: 0,
             has_rest: false,
+            param_names: Vec::new().into(),
             local_names: vec![],
             source_file: None,
             local_scopes: Vec::new(),
@@ -2114,6 +2134,7 @@ mod tests {
             upvalue_names: vec![],
             arity: 1,
             has_rest: false,
+            param_names: Vec::new().into(),
             local_names: vec![(0, intern("x"))],
             source_file: None,
             local_scopes: Vec::new(),

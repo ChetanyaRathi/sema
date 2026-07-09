@@ -3593,6 +3593,12 @@ impl VM {
         // payload tracer. Closure/functions/globals are derived from it at call
         // time.
         let payload_for_box = Rc::clone(&payload);
+        // Complete only when every fixed param has a name (a `.semac` load may
+        // reconstruct an empty list); a partial list would misbind named args.
+        let param_names = {
+            let func = &payload.closure.func;
+            (func.param_names.len() == func.arity as usize).then(|| Rc::clone(&func.param_names))
+        };
         let name = payload
             .closure
             .func
@@ -3653,6 +3659,7 @@ impl VM {
         );
         // Mark this wrapper so `type`/`type_name` report `:lambda`, not `:native-fn`.
         native_fn.is_closure = true;
+        native_fn.param_names = param_names;
         let native_rc = Rc::new(native_fn);
 
         // Zero-upvalue exemption: a closure that captured NO upvalues is not
@@ -4799,6 +4806,7 @@ pub fn compile_program_with_spans_and_natives(
             upvalue_names: Vec::new(),
             arity: 0,
             has_rest: false,
+            param_names: Vec::new().into(),
             local_names: Vec::new(),
             source_file,
             local_scopes: Vec::new(),
@@ -4942,6 +4950,7 @@ pub fn compile_program(
             upvalue_names: Vec::new(),
             arity: 0,
             has_rest: false,
+            param_names: Vec::new().into(),
             local_names: Vec::new(),
             source_file: None,
             local_scopes: Vec::new(),
@@ -5145,6 +5154,7 @@ mod tests {
             upvalue_names: vec![],
             arity: 0,
             has_rest: false,
+            param_names: Vec::new().into(),
             local_names: vec![],
             source_file: None,
             local_scopes: Vec::new(),
@@ -5196,6 +5206,7 @@ mod tests {
             upvalue_names: vec![],
             arity: 1,
             has_rest: false,
+            param_names: Vec::new().into(),
             local_names: vec![],
             source_file: None,
             local_scopes: Vec::new(),
@@ -5716,6 +5727,7 @@ mod tests {
             upvalue_names: vec![],
             arity: 0,
             has_rest: false,
+            param_names: Vec::new().into(),
             local_names: vec![],
             source_file: None,
             local_scopes: Vec::new(),
@@ -5757,6 +5769,7 @@ mod tests {
             upvalue_names: vec![],
             arity: 0,
             has_rest: false,
+            param_names: Vec::new().into(),
             local_names: vec![],
             source_file: None,
             local_scopes: Vec::new(),
@@ -5878,6 +5891,7 @@ mod tests {
             upvalue_names: vec![],
             arity: 0,
             has_rest: false,
+            param_names: Vec::new().into(),
             local_names: vec![],
             source_file: None,
             local_scopes: Vec::new(),
@@ -6263,6 +6277,7 @@ mod tests {
             upvalue_descs: vec![],
             arity: 0,
             has_rest: false,
+            param_names: Vec::new().into(),
             local_names: vec![],
             upvalue_names: vec![],
             source_file: Some(source_a.clone()),
@@ -6286,6 +6301,7 @@ mod tests {
             upvalue_descs: vec![],
             arity: 0,
             has_rest: false,
+            param_names: Vec::new().into(),
             local_names: vec![],
             upvalue_names: vec![],
             source_file: Some(source_b.clone()),
@@ -6366,6 +6382,7 @@ mod tests {
             upvalue_names: vec![],
             arity: 0,
             has_rest: false,
+            param_names: Vec::new().into(),
             local_names: vec![],
             source_file: None,
             local_scopes: Vec::new(),

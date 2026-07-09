@@ -37,6 +37,7 @@ fn eval_roundtrip(input: &str) -> Value {
             upvalue_names: Vec::new(),
             arity: 0,
             has_rest: false,
+            param_names: Vec::new().into(),
             local_names: Vec::new(),
             local_scopes: Vec::new(),
             source_file: None,

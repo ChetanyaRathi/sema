@@ -132,6 +132,111 @@ fn agent_loop_round2_is_correlated() {
     );
 }
 
+#[test]
+fn vm_compiled_tool_handler_args_bind_by_declaration_order() {
+    let fake = FakeProvider::builder("fake")
+        .model("fake-model")
+        .tool_call(
+            "call_1",
+            "capture",
+            serde_json::json!({"path": "PATH", "content": "CONTENT"}),
+        )
+        .reply("done")
+        .build();
+
+    let src = r#"
+        (deftool capture "Capture argument binding order"
+          {:path {:type :string}
+           :content {:type :string}}
+          (fn (path content)
+            (string-append "path=" path ";content=" content)))
+        (defagent bot {:model "fake-model" :tools [capture] :max-turns 5})
+        (agent/run bot "call capture")
+    "#;
+
+    let (result, recorder) = eval_with_fake(src, fake);
+    result.expect("agent/run should complete");
+
+    let reqs = recorder.requests();
+    let round2 = &reqs[1];
+    let tool_msg = round2
+        .messages
+        .iter()
+        .find(|m| m.tool_call_id.as_deref() == Some("call_1"))
+        .expect("round 2 must include the capture tool result");
+    assert_eq!(
+        tool_msg.content.to_text(),
+        "path=PATH;content=CONTENT",
+        "tool JSON args must bind to VM-compiled handler params by declaration order"
+    );
+}
+
+#[test]
+fn tool_handler_with_unused_param_binds_by_declaration_order() {
+    let fake = FakeProvider::builder("fake")
+        .model("fake-model")
+        .tool_call(
+            "call_1",
+            "capture",
+            serde_json::json!({"path": "PATH", "content": "CONTENT"}),
+        )
+        .reply("done")
+        .build();
+
+    let src = r#"
+        (deftool capture "handler ignores its first param"
+          {:path {:type :string}
+           :content {:type :string}}
+          (fn (path content)
+            (string-append "content-only=" content)))
+        (defagent bot {:model "fake-model" :tools [capture] :max-turns 5})
+        (agent/run bot "call capture")
+    "#;
+
+    let (result, recorder) = eval_with_fake(src, fake);
+    result.expect("agent/run should complete");
+
+    let reqs = recorder.requests();
+    let round2 = &reqs[1];
+    let tool_msg = round2
+        .messages
+        .iter()
+        .find(|m| m.tool_call_id.as_deref() == Some("call_1"))
+        .expect("round 2 must include the capture tool result");
+    assert_eq!(
+        tool_msg.content.to_text(),
+        "content-only=CONTENT",
+        "an unused parameter must not shift the binding of later ones"
+    );
+}
+
+#[test]
+fn zero_arity_tool_handler_receives_no_args() {
+    let fake = FakeProvider::builder("fake")
+        .model("fake-model")
+        .tool_call("call_1", "ping", serde_json::json!({}))
+        .reply("done")
+        .build();
+
+    let src = r#"
+        (deftool ping "no parameters" {} (fn () "pong"))
+        (defagent bot {:model "fake-model" :tools [ping] :max-turns 5})
+        (agent/run bot "call ping")
+    "#;
+
+    let (result, recorder) = eval_with_fake(src, fake);
+    result.expect("agent/run should complete");
+
+    let reqs = recorder.requests();
+    let round2 = &reqs[1];
+    let tool_msg = round2
+        .messages
+        .iter()
+        .find(|m| m.tool_call_id.as_deref() == Some("call_1"))
+        .expect("round 2 must include the ping tool result");
+    assert_eq!(tool_msg.content.to_text(), "pong");
+}
+
 // ── Phase 3: recoverable tool errors + argument validation ──────────────────
 
 /// A handler that throws on round 1 must NOT abort the run; the error is fed back

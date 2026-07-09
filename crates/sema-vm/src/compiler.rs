@@ -807,6 +807,7 @@ impl Compiler {
             upvalue_names: def.upvalue_names.clone(),
             arity: def.params.len() as u16,
             has_rest: def.rest.is_some(),
+            param_names: def.params.as_slice().into(),
             local_names,
             local_scopes,
             source_file: None,
