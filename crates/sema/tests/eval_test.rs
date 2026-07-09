@@ -2776,6 +2776,27 @@ eval_tests! {
     // Cyclic ordering terminates: an in-flight pair compares Equal (the same
     // coinductive convention as equality), so unique collapses the pair.
     mutable_array_cyclic_ord_terminates: "(let ((a (mutable-array/new)) (b (mutable-array/new))) (mutable-array/push! a a) (mutable-array/push! b b) (length (list/unique (list a b))))" => Value::int(1),
+    // --- MutArrGet / MutArrSet intrinsic opcodes (2-arg get, 3-arg set!) ---
+    // These pin observational equivalence with the native path; expected
+    // values were verified against the pre-intrinsic binary.
+    mutable_array_set_get_roundtrip: "(let ((a (mutable-array/new 3 0))) (mutable-array/set! a 1 42) (mutable-array/get a 1))" => Value::int(42),
+    // set! returns the array itself (not the value, not nil) …
+    mutable_array_set_returns_array: "(let ((a (mutable-array/new 2 0))) (mutable-array/->vector (mutable-array/set! a 0 9)))" => common::eval("[9 0]"),
+    // … and the very same handle (identity, not a copy).
+    mutable_array_set_returns_same_handle: "(let ((a (mutable-array/new 1 0))) (eq? a (mutable-array/set! a 0 1)))" => Value::bool(true),
+    // Left-to-right evaluation: the value expression runs after arr/idx and
+    // may itself mutate the array; its write is then overwritten.
+    mutable_array_set_eval_order: "(let ((a (mutable-array/new 1 1))) (mutable-array/set! a 0 (begin (mutable-array/set! a 0 5) (+ (mutable-array/get a 0) 1))) (mutable-array/get a 0))" => Value::int(6),
+    // Nested accessors compose (a set! through a get result).
+    mutable_array_nested_set_through_get: "(let ((a (mutable-array/new 1 0)) (b (mutable-array/new 1 0))) (mutable-array/set! a 0 b) (mutable-array/set! (mutable-array/get a 0) 0 :deep) (mutable-array/get b 0))" => Value::keyword("deep"),
+    // In-bounds 3-arg get ignores the default (stays on the native path).
+    mutable_array_get_default_in_bounds: "(mutable-array/get (mutable-array/new 2 7) 1 :missing)" => Value::int(7),
+    // Intrinsic errors unwind through try/catch like the native's.
+    mutable_array_get_oob_catchable: "(try (mutable-array/get (mutable-array/new) 5) (catch e :caught))" => Value::keyword("caught"),
+    // Redefinition guard: a program-level redefine disables the intrinsic.
+    mutable_array_get_redefined: "(define (mutable-array/get a i) :mine) (mutable-array/get (mutable-array/new 1 5) 0)" => Value::keyword("mine"),
+    // A let-bound shadow resolves locally (never the intrinsic).
+    mutable_array_get_local_shadow: "(let ((mutable-array/get (fn (a i) :local))) (mutable-array/get 1 2))" => Value::keyword("local"),
     mutable_cell_round_trip: "(let ((c (mutable-cell/new 1))) (mutable-cell/set! c 99) (mutable-cell/get c))" => Value::int(99),
     mutable_cell_shared_mutation: "(let* ((c (mutable-cell/new 0)) (d c)) (mutable-cell/set! c 5) (mutable-cell/get d))" => Value::int(5),
     mutable_cell_equal_by_contents: "(equal? (mutable-cell/new 1) (mutable-cell/new 1))" => Value::bool(true),
@@ -2783,9 +2804,19 @@ eval_tests! {
 }
 
 eval_error_tests! {
-    mutable_array_get_oob: "(mutable-array/get (mutable-array/new) 0)" => "out of bounds",
-    mutable_array_set_oob: "(mutable-array/set! (mutable-array/new) 0 1)" => "out of bounds",
-    mutable_array_set_negative_index: "(mutable-array/set! (mutable-array/new 1 0) -1 5)" => "non-negative",
+    // get/set! errors are raised by the MutArrGet/MutArrSet intrinsic arms;
+    // the full messages are pinned (shared with the natives via
+    // sema_core::mutable_ops, so both paths stay byte-identical).
+    mutable_array_get_oob: "(mutable-array/get (mutable-array/new) 0)" => "mutable-array/get: index 0 out of bounds (length 0)",
+    mutable_array_get_type_error: "(mutable-array/get [1] 0)" => "expected mutable-array, got vector",
+    mutable_array_get_negative_index: "(mutable-array/get (mutable-array/new 1 0) -1)" => "mutable-array/get: expected a non-negative integer, got -1",
+    mutable_array_get_non_int_index: "(mutable-array/get (mutable-array/new 1 0) :x)" => "expected int, got keyword",
+    mutable_array_set_oob: "(mutable-array/set! (mutable-array/new) 0 1)" => "mutable-array/set!: index 0 out of bounds (length 0)",
+    mutable_array_set_type_error: "(mutable-array/set! [1] 0 1)" => "expected mutable-array, got vector",
+    mutable_array_set_negative_index: "(mutable-array/set! (mutable-array/new 1 0) -1 5)" => "mutable-array/set!: expected a non-negative integer, got -1",
+    mutable_array_set_non_int_index: "(mutable-array/set! (mutable-array/new 1 0) \"x\" 5)" => "expected int, got string",
+    // Wrong-arity calls fall through to the native, whose arity error fires.
+    mutable_array_set_arity: "(mutable-array/set! (mutable-array/new 1 0) 0)" => "mutable-array/set!",
     mutable_array_push_type_error: "(mutable-array/push! [1] 2)" => "mutable-array",
     mutable_array_new_arity: "(mutable-array/new 1 2 3)" => "mutable-array/new",
     mutable_cell_get_type_error: "(mutable-cell/get 5)" => "mutable-cell",
@@ -2840,4 +2871,103 @@ eval_error_tests! {
     bytes_parse_int10_two_decimals: "(bytes/parse-int10 (string->utf8 \"1.23\"))" => "one digit",
     bytes_parse_int10_empty: "(bytes/parse-int10 (string->utf8 \"\"))" => "digit",
     bytes_to_string_invalid_utf8: "(bytes/->string (bytevector 255 254))" => "invalid UTF-8",
+}
+
+// ============================================================
+// CallSelf: direct self-call fast path for top-level defines
+// ============================================================
+
+eval_tests! {
+    // Deep non-tail self-recursion (tak-shaped) runs on CallSelf frames.
+    call_self_tak: "(define (tak x y z) (if (not (< y x)) z (tak (tak (- x 1) y z) (tak (- y 1) z x) (tak (- z 1) x y)))) (tak 6 4 2)" => Value::int(3),
+    call_self_fib: "(define (fib n) (if (< n 2) n (+ (fib (- n 1)) (fib (- n 2))))) (fib 15)" => Value::int(610),
+    call_self_deep_nontail: "(define (count n) (if (= n 0) 0 (+ 1 (count (- n 1))))) (count 1000)" => Value::int(1000),
+    // REPL-style redefinition: a second define opts the name out, so the later
+    // call dispatches to the new binding exactly as before.
+    call_self_redefinition: "(define (f n) (if (= n 0) 0 (+ 1 (f (- n 1))))) (define r1 (f 3)) (define (f n) 42) (list r1 (f 3))" => common::eval("'(3 42)"),
+    // A global set! (even mid-recursion, through a helper) opts the name out:
+    // the recursive call sees the rebound global, as it always did.
+    call_self_set_mid_run: "(define (redef!) (set! f (fn (n) 100))) (define (f n) (if (= n 0) 0 (begin (redef!) (+ 1 (f (- n 1)))))) (f 3)" => Value::int(101),
+    // Mutual recursion never takes the self-call path.
+    call_self_mutual_recursion: "(define (my-even n) (if (= n 0) #t (my-odd (- n 1)))) (define (my-odd n) (if (= n 0) #f (my-even (- n 1)))) (list (my-even 10) (my-odd 7))" => common::eval("'(#t #t)"),
+    // A value reference to the name stays a plain global load: identity is
+    // preserved and the escaped closure still recurses correctly.
+    call_self_identity_preserved: "(define (f n) (if (= n 0) 'done (car (list (f (- n 1)))))) (define g f) (list (eq? f g) (f 2) (g 2))" => common::eval("'(#t done done)"),
+    call_self_escaped_value_call: "(define (f n) (if (= n 0) 0 (+ 1 ((first (list f)) (- n 1))))) (f 3)" => Value::int(3),
+    // Rest params flow through the self-call frame setup.
+    call_self_rest_params: "(define (f x . rest) (if (null? rest) x (+ 1 (f (car rest))))) (f 1 2)" => Value::int(3),
+    // Interplay with internal defines and letrec: shadowed names resolve as
+    // locals/upvalues and never hijack the enclosing define's fast path.
+    call_self_internal_define_mix: "(define (f n) (define (g k) (if (= k 0) 0 (+ 1 (g (- k 1))))) (+ (g n) (if (= n 0) 0 (f (- n 1))))) (f 2)" => Value::int(3),
+    call_self_internal_define_shadows: "(define (f n) (define (f k) (* k 2)) (f n)) (f 5)" => Value::int(10),
+    call_self_letrec_shadows: "(define (f n) (letrec ((f (lambda (k) (if (= k 0) 0 (+ 1 (f (- k 1))))))) (f n))) (f 4)" => Value::int(4),
+}
+
+eval_error_tests! {
+    // Arity is still checked on the self-call frame path.
+    call_self_arity_error: "(define (f n) (if (= n 0) 0 (+ 1 (f)))) (f 1)" => "expects 1 args, got 0",
+}
+
+// ============================================================
+// TakeLocal: moving last-use local loads (COW-unlocking)
+// ============================================================
+// A taken slot must be observationally identical to a cloned one: the
+// in-place map fast paths only fire at strong_count == 1, so any live alias
+// forces the clone path. Every case here was pinned against the pre-TakeLocal
+// binary as the oracle.
+
+eval_tests! {
+    // THE alias test: an accumulator also held by another binding must not be
+    // mutated in place — `keep` still sees the pre-assoc map.
+    take_local_alias_not_mutated: "((fn () (let* ((m0 {:a 1}) (keep m0) (m1 (assoc m0 :b 2))) (list keep m1))))" => common::eval("'({:a 1} {:a 1 :b 2})"),
+    // Idiomatic fold accumulator (the pattern this opcode exists for).
+    take_local_fold_assoc: "((fn () (foldl (fn (acc x) (assoc acc x (* x 10))) {} (list 1 2 3))))" => common::eval("{1 10 2 20 3 30}"),
+    // An accumulator snapshot escaping mid-fold (global set!) pins that later
+    // in-place steps never retroactively mutate the escaped alias.
+    take_local_fold_escaped_snapshot: "(define keep nil) (define r (foldl (fn (acc x) (begin (when (= x 2) (set! keep acc)) (assoc acc x 1))) {} (list 1 2 3))) (list keep r)" => common::eval("'({1 1} {1 1 2 1 3 1})"),
+    // Branch-local last uses: each arm may move the slot independently.
+    take_local_both_branches: "(define (pick m) (if (nil? (get m :k)) (assoc m :k 0) m)) (list (pick {}) (pick {:k 5}))" => common::eval("'({:k 0} {:k 5})"),
+    // A slot captured by an inner lambda is never moved: the closure still
+    // reads the original map after the assoc.
+    take_local_captured_slot: "((fn (m) (let ((g (fn () m))) (list (assoc m :k 1) (g)))) {:a 1})" => common::eval("'({:a 1 :k 1} {:a 1})"),
+    // set! targets are never moved; the store still lands.
+    take_local_set_target: "((fn (m) (let ((r1 (assoc m :k 1))) (set! m {:fresh 1}) (list r1 m))) {})" => common::eval("'({:k 1} {:fresh 1})"),
+    // Shadowing: the init reads the param, the body reads the new binding.
+    take_local_shadowed_rebind: "((fn (x) (let ((x (list x x))) x)) 7)" => common::eval("'(7 7)"),
+    // A chain of single-use accumulators moves through every step.
+    take_local_letstar_chain: "((fn (a) (let* ((b (assoc a :b 1)) (c (assoc b :c 2))) c)) {:a 0})" => common::eval("{:a 0 :b 1 :c 2}"),
+    // The untaken branch still sees the untouched value.
+    take_local_untaken_branch: "((fn (m) (if (= 1 2) (assoc m :x 1) m)) {:z 9})" => common::eval("{:z 9}"),
+    // A function containing try opts out entirely: the handler observes the
+    // argument unmodified even though the body's assoc never completed.
+    take_local_try_handler_sees_slot: "((fn (m) (try (assoc m :k (throw \"boom\")) (catch e m))) {:a 1})" => common::eval("{:a 1}"),
+    // Rest params are ordinary slots.
+    take_local_rest_param: "((fn (x . rest) (append rest (list x))) 1 2 3)" => common::eval("'(2 3 1)"),
+    // dissoc shares the same uniqueness gate as assoc.
+    take_local_dissoc: "((fn (m) (dissoc m :a)) {:a 1 :b 2})" => common::eval("{:b 2}"),
+    // Only the last use moves; the earlier get still sees the value.
+    take_local_earlier_read_intact: "((fn (m) (list (get m :a) (assoc m :z 9))) {:a 7})" => common::eval("'(7 {:a 7 :z 9})"),
+}
+
+// ============================================================
+// Owned-args callback protocol (stdlib folds move the accumulator)
+// ============================================================
+// foldl/reduce/file-fold hand their accumulator to the callback by MOVE
+// (call_callback_owned), so the in-place fast paths can fire inside the
+// callback. These pin that every callable shape and error path behaves
+// identically to the borrowed protocol.
+
+eval_tests! {
+    // reduce seeds from the first element and moves the accumulator through.
+    owned_args_reduce_assoc: "(reduce (fn (a b) (assoc a b 1)) (list {:z 0} :a :b))" => common::eval("{:a 1 :b 1 :z 0}"),
+    // Plain-native callbacks fall back to the borrowed protocol.
+    owned_args_native_callback: "(foldl + 0 (list 1 2 3))" => Value::int(6),
+    owned_args_native_reduce: "(reduce + (list 1 2 3))" => Value::int(6),
+    // Rest params flow through the owned frame setup.
+    owned_args_rest_param_callback: "(foldl (fn (a . more) (+ a (first more))) 0 (list 1 2 3))" => Value::int(6),
+    // set! through an upvalue still writes back to the caller's live slot
+    // (the owned path routes through the same current-VM nested run).
+    owned_args_upvalue_writeback: "(let ((n 0)) (foldl (fn (acc x) (set! n (+ n x)) (+ acc x)) 0 (list 1 2 3)) n)" => Value::int(6),
+    // A throw inside the callback unwinds cleanly out of the owned run.
+    owned_args_callback_throw: "(try (foldl (fn (acc x) (if (> x 2) (throw \"boom\") (+ acc x))) 0 (list 1 2 3)) (catch e (:value e)))" => common::eval("\"boom\""),
 }

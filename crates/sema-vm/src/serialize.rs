@@ -802,12 +802,14 @@ fn advance_pc(code: &[u8], pc: usize) -> Result<(Op, usize), SemaError> {
         }
         Op::Const
         | Op::LoadLocal
+        | Op::TakeLocal
         | Op::StoreLocal
         | Op::LoadUpvalue
         | Op::StoreUpvalue
         | Op::Call
         | Op::TailCall
         | Op::SelfTailCall
+        | Op::CallSelf
         | Op::MakeList
         | Op::MakeVector
         | Op::MakeMap
@@ -1034,7 +1036,7 @@ fn validate_chunk_bytecode(
                     )));
                 }
             }
-            Op::LoadLocal | Op::StoreLocal => {
+            Op::LoadLocal | Op::TakeLocal | Op::StoreLocal => {
                 let slot = u16::from_le_bytes([code[pc + 1], code[pc + 2]]) as usize;
                 if slot >= n_locals {
                     return Err(SemaError::eval(format!(
@@ -1122,6 +1124,7 @@ fn stack_effect_operand(code: &[u8], pc: usize, op: Op) -> Result<u16, SemaError
         Op::Call
         | Op::TailCall
         | Op::SelfTailCall
+        | Op::CallSelf
         | Op::MakeList
         | Op::MakeVector
         | Op::MakeMap

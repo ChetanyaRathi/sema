@@ -66,6 +66,21 @@ pub fn compile(
             compiler.redefined_globals.insert(spur);
         });
     }
+    // Self-call fast-path eligibility: a top-level `(define (f ...))` may call
+    // itself directly (CallSelf / SelfTailCall — no global lookup) only when
+    // nothing else in the program can rebind `f`. A second `define` of the same
+    // name or a global `set!` at any depth opts the name out — the same
+    // program-wide redefinition rule the intrinsics use, extended to `set!`.
+    {
+        let mut seen: HashSet<Spur> = HashSet::new();
+        for expr in exprs {
+            scan_global_rebinds(expr, &mut |spur, is_set| {
+                if is_set || !seen.insert(spur) {
+                    compiler.self_rebound_globals.insert(spur);
+                }
+            });
+        }
+    }
     compiler.n_locals = n_locals;
     for (i, expr) in exprs.iter().enumerate() {
         compiler.compile_expr(expr)?;
@@ -100,6 +115,139 @@ fn collect_defines(expr: &ResolvedExpr, f: &mut impl FnMut(Spur)) {
     }
 }
 
+/// Walk a resolved tree and report every site that (re)binds a global name:
+/// `Define` nodes (`is_set = false`) and `set!` targets that resolved as Global
+/// (`is_set = true`). Unlike `collect_defines` (the intrinsics' shallow
+/// top-level walk), this descends into lambda, module, and binding bodies so
+/// the self-call fast path is disabled by a rebind at any depth.
+fn scan_global_rebinds(expr: &ResolvedExpr, f: &mut impl FnMut(Spur, bool)) {
+    use ResolvedExpr as E;
+    match expr {
+        E::Const(_) | E::Quote(_) | E::Var(_) | E::DefineRecordType { .. } => {}
+        E::Define(spur, val) => {
+            f(*spur, false);
+            scan_global_rebinds(val, f);
+        }
+        E::Set(vr, val) => {
+            if let VarResolution::Global { spur } = vr.resolution {
+                f(spur, true);
+            }
+            scan_global_rebinds(val, f);
+        }
+        E::Lambda(def) => {
+            for e in &def.body {
+                scan_global_rebinds(e, f);
+            }
+        }
+        E::If { test, then, else_ } => {
+            scan_global_rebinds(test, f);
+            scan_global_rebinds(then, f);
+            scan_global_rebinds(else_, f);
+        }
+        E::Begin(v) | E::And(v) | E::Or(v) | E::MakeList(v) | E::MakeVector(v) => {
+            for e in v {
+                scan_global_rebinds(e, f);
+            }
+        }
+        E::Call { func, args, .. } => {
+            scan_global_rebinds(func, f);
+            for a in args {
+                scan_global_rebinds(a, f);
+            }
+        }
+        E::Let { bindings, body }
+        | E::LetStar { bindings, body }
+        | E::Letrec { bindings, body } => {
+            for (_, init) in bindings {
+                scan_global_rebinds(init, f);
+            }
+            for e in body {
+                scan_global_rebinds(e, f);
+            }
+        }
+        E::Do(do_loop) => {
+            for v in &do_loop.vars {
+                scan_global_rebinds(&v.init, f);
+                if let Some(s) = &v.step {
+                    scan_global_rebinds(s, f);
+                }
+            }
+            scan_global_rebinds(&do_loop.test, f);
+            for e in &do_loop.result {
+                scan_global_rebinds(e, f);
+            }
+            for e in &do_loop.body {
+                scan_global_rebinds(e, f);
+            }
+        }
+        E::Try { body, handler, .. } => {
+            for e in body {
+                scan_global_rebinds(e, f);
+            }
+            for e in handler {
+                scan_global_rebinds(e, f);
+            }
+        }
+        E::Throw(val)
+        | E::Load(val)
+        | E::Eval(val)
+        | E::Delay(val)
+        | E::Force(val)
+        | E::Macroexpand(val)
+        | E::Spanned(_, val) => scan_global_rebinds(val, f),
+        E::MakeMap(pairs) => {
+            for (k, v) in pairs {
+                scan_global_rebinds(k, f);
+                scan_global_rebinds(v, f);
+            }
+        }
+        E::Defmacro { body, .. } | E::Module { body, .. } => {
+            for e in body {
+                scan_global_rebinds(e, f);
+            }
+        }
+        E::Import { path, .. } => scan_global_rebinds(path, f),
+        E::Prompt(entries) => {
+            for entry in entries {
+                match entry {
+                    PromptEntry::RoleContent { parts, .. } => {
+                        for e in parts {
+                            scan_global_rebinds(e, f);
+                        }
+                    }
+                    PromptEntry::Expr(e) => scan_global_rebinds(e, f),
+                }
+            }
+        }
+        E::Message { role, parts } => {
+            scan_global_rebinds(role, f);
+            for e in parts {
+                scan_global_rebinds(e, f);
+            }
+        }
+        E::Deftool {
+            description,
+            parameters,
+            handler,
+            ..
+        } => {
+            scan_global_rebinds(description, f);
+            scan_global_rebinds(parameters, f);
+            scan_global_rebinds(handler, f);
+        }
+        E::Defagent { options, .. } => scan_global_rebinds(options, f),
+    }
+}
+
+/// True iff `expr` is a lambda, peeking through span wrappers.
+fn is_lambda_shaped(expr: &ResolvedExpr) -> bool {
+    match expr {
+        ResolvedExpr::Lambda(_) => true,
+        ResolvedExpr::Spanned(_, inner) => is_lambda_shaped(inner),
+        _ => false,
+    }
+}
+
 /// Walk bytecode and add `offset` to all MakeClosure func_id operands.
 fn patch_closure_func_ids(chunk: &mut Chunk, offset: u16) {
     let code = &mut chunk.code;
@@ -124,12 +272,14 @@ fn patch_closure_func_ids(chunk: &mut Chunk, offset: u16) {
             // Variable-length instructions: skip op + operands
             Op::Const
             | Op::LoadLocal
+            | Op::TakeLocal
             | Op::StoreLocal
             | Op::LoadUpvalue
             | Op::StoreUpvalue
             | Op::Call
             | Op::TailCall
             | Op::SelfTailCall
+            | Op::CallSelf
             | Op::MakeList
             | Op::MakeVector
             | Op::MakeMap
@@ -178,6 +328,25 @@ struct Compiler {
     /// Global names that are (re)defined in this program — intrinsics must not
     /// be emitted for these since the user may have changed the binding.
     redefined_globals: HashSet<Spur>,
+    /// Global names bound more than once (second `define`) or `set!` anywhere
+    /// in this program — the self-call fast path must not fire for these.
+    self_rebound_globals: HashSet<Spur>,
+    /// The global name of the top-level define whose own lambda body this
+    /// compiler is compiling, when that name is eligible for the self-call fast
+    /// path. Calls to it compile to CallSelf / SelfTailCall (the running
+    /// frame's closure IS the defined function). `None` for the top-level
+    /// chunk and for nested lambdas, whose frames are not the defined function.
+    self_global: Option<Spur>,
+    /// Handoff slot from `compile_define` to `compile_lambda`: arms
+    /// `self_global` on the inner compiler for the define's own lambda (the
+    /// next lambda compiled, reached only through span wrappers).
+    pending_self_global: Option<Spur>,
+    /// `Var` load sites (addresses of the `VarRef` inside `ResolvedExpr::Var`
+    /// nodes of the lambda body being compiled) proven by `takelocal.rs` to be
+    /// the statically-last use of their never-captured local slot. These
+    /// compile to `TakeLocal` (move) instead of `LoadLocal` (clone). Always
+    /// empty for the top-level chunk, whose slots may outlive the chunk (REPL).
+    take_loads: HashSet<crate::takelocal::LoadSite>,
     /// Local slot names for debugger scope inspection.
     local_names: Vec<(u16, Spur)>,
     /// Block scope `(slot, start_pc, end_pc)` of each block-introduced local, so
@@ -207,6 +376,10 @@ impl Compiler {
             native_id_map: hashbrown::HashMap::new(),
             next_cache_slot: 0,
             redefined_globals: HashSet::new(),
+            self_rebound_globals: HashSet::new(),
+            self_global: None,
+            pending_self_global: None,
+            take_loads: HashSet::new(),
             local_names: Vec::new(),
             local_scopes: Vec::new(),
         }
@@ -405,16 +578,28 @@ impl Compiler {
 
     fn compile_var_load(&mut self, vr: &VarRef) -> Result<(), SemaError> {
         match vr.resolution {
-            VarResolution::Local { slot } => match slot {
-                0 => self.emit.emit_op(Op::LoadLocal0),
-                1 => self.emit.emit_op(Op::LoadLocal1),
-                2 => self.emit.emit_op(Op::LoadLocal2),
-                3 => self.emit.emit_op(Op::LoadLocal3),
-                _ => {
-                    self.emit.emit_op(Op::LoadLocal);
+            VarResolution::Local { slot } => {
+                // Statically-last use of a never-captured slot: move the value
+                // (TakeLocal) instead of cloning it, so a uniquely-owned value
+                // can hit the stdlib's in-place COW fast paths. The slot reads
+                // nil afterwards, which nothing can observe except the debug
+                // inspector (documented in the bytecode format spec).
+                if self.take_loads.contains(&crate::takelocal::load_site(vr)) {
+                    self.emit.emit_op(Op::TakeLocal);
                     self.emit.emit_u16(slot);
+                    return Ok(());
                 }
-            },
+                match slot {
+                    0 => self.emit.emit_op(Op::LoadLocal0),
+                    1 => self.emit.emit_op(Op::LoadLocal1),
+                    2 => self.emit.emit_op(Op::LoadLocal2),
+                    3 => self.emit.emit_op(Op::LoadLocal3),
+                    _ => {
+                        self.emit.emit_op(Op::LoadLocal);
+                        self.emit.emit_u16(slot);
+                    }
+                }
+            }
             VarResolution::Upvalue { index } => {
                 self.emit.emit_op(Op::LoadUpvalue);
                 self.emit.emit_u16(index);
@@ -536,7 +721,16 @@ impl Compiler {
     }
 
     fn compile_define(&mut self, spur: Spur, val: &ResolvedExpr) -> Result<(), SemaError> {
-        self.compile_expr(val)?;
+        // A define's own lambda may call itself directly — the running frame's
+        // closure IS the defined function — when nothing in the program rebinds
+        // the name. Hand the name to compile_lambda, which arms the self-call
+        // fast path (CallSelf / SelfTailCall) on the lambda's own compiler.
+        if is_lambda_shaped(val) && !self.self_rebound_globals.contains(&spur) {
+            self.pending_self_global = Some(spur);
+        }
+        let result = self.compile_expr(val);
+        self.pending_self_global = None;
+        result?;
         self.emit.emit_op(Op::DefineGlobal);
         self.emit.emit_u32(spur_to_u32(spur));
         self.emit.emit_op(Op::Nil); // define returns nil
@@ -552,6 +746,24 @@ impl Compiler {
         // not just in the top-level chunk.
         let mut inner = Compiler::new();
         inner.redefined_globals = self.redefined_globals.clone();
+        inner.self_rebound_globals = self.self_rebound_globals.clone();
+        // Arm the self-call fast path iff this lambda is the value of an
+        // eligible top-level define (set by compile_define). `take()` keeps it
+        // off nested lambdas — their running frames are not the defined
+        // function, so a self-call there must stay a global call.
+        inner.self_global = self.pending_self_global.take();
+        // Last-use moves: a *tail* self-call under an armed self_global reuses
+        // this frame in place (SelfTailCall), which the straight-line liveness
+        // walk cannot see — skip the analysis for those functions (takelocal.rs
+        // handles the resolver-elided SelfFn loops itself). Non-tail self-calls
+        // (CallSelf) push a fresh frame and need no special treatment.
+        let reuses_own_frame = match inner.self_global {
+            Some(sg) => crate::takelocal::has_tail_self_call(&def.body, sg),
+            None => false,
+        };
+        if !reuses_own_frame {
+            inner.take_loads = crate::takelocal::takeable_loads(def);
+        }
         inner.n_locals = def.n_locals;
         for (slot, &name) in def.params.iter().enumerate() {
             inner.local_names.push((slot as u16, name));
@@ -677,6 +889,12 @@ impl Compiler {
             ("mod", 2) | ("modulo", 2) => Op::Mod,
             // Indexed access
             ("nth", 2) => Op::Nth,
+            // Mutable-array accessors. Only the exact arities are intrinsified:
+            // the 3-arg (default) form of get and any wrong-arity call fall
+            // through to the native, which owns the default logic and the
+            // arity errors.
+            ("mutable-array/get", 2) => Op::MutArrGet,
+            ("mutable-array/set!", 3) => Op::MutArrSet,
             // String operations (legacy Scheme names, Decision #24).
             // string-append is N-ary in stdlib; only the 2-arg case is
             // intrinsified (mirrors the Append precedent) — N-ary stays generic.
@@ -718,6 +936,29 @@ impl Compiler {
                     }
                     let argc = args.len() as u16;
                     self.emit.emit_op(Op::SelfTailCall);
+                    self.emit.emit_u16(argc);
+                    self.stack_height -= argc;
+                    return Ok(());
+                }
+            }
+        }
+
+        // Direct self-call: inside an eligible top-level define's own lambda, a
+        // call to the defining name targets the running frame's own closure —
+        // no global lookup, no callable dispatch. Tail calls reuse the frame
+        // (SelfTailCall); non-tail calls push a frame directly (CallSelf).
+        // Value (non-operator) references to the name stay LoadGlobal, so
+        // identity and escape semantics are unchanged.
+        if let ResolvedExpr::Var(vr) = func {
+            if let VarResolution::Global { spur } = vr.resolution {
+                if self.self_global == Some(spur) {
+                    for arg in args {
+                        self.compile_expr(arg)?;
+                        self.stack_height += 1;
+                    }
+                    let argc = args.len() as u16;
+                    self.emit
+                        .emit_op(if tail { Op::SelfTailCall } else { Op::CallSelf });
                     self.emit.emit_u16(argc);
                     self.stack_height -= argc;
                     return Ok(());
@@ -1365,12 +1606,14 @@ mod tests {
             match op {
                 Op::Const
                 | Op::LoadLocal
+                | Op::TakeLocal
                 | Op::StoreLocal
                 | Op::LoadUpvalue
                 | Op::StoreUpvalue
                 | Op::Call
                 | Op::TailCall
                 | Op::SelfTailCall
+                | Op::CallSelf
                 | Op::MakeList
                 | Op::MakeVector
                 | Op::MakeMap
@@ -1512,9 +1755,10 @@ mod tests {
         assert_eq!(func.arity, 1);
         assert!(!func.has_rest);
 
-        // Inner function: LoadLocal0, Return
+        // Inner function: TakeLocal(0), Return — the identity read is x's
+        // last use, so it moves the slot value instead of cloning it.
         let inner_ops = extract_ops(&func.chunk);
-        assert_eq!(inner_ops, vec![Op::LoadLocal0, Op::Return]);
+        assert_eq!(inner_ops, vec![Op::TakeLocal, Op::Return]);
 
         // Top-level: MakeClosure, Return
         let top_ops = extract_ops(&result.chunk);
@@ -1609,12 +1853,13 @@ mod tests {
 
     #[test]
     fn test_compile_intrinsic_in_tail_position() {
-        // Intrinsics work in tail position too (they don't create frames)
+        // Intrinsics work in tail position too (they don't create frames).
+        // Both reads are last uses, so both move (TakeLocal).
         let result = compile_str("(lambda (x y) (+ x y))");
         let inner_ops = extract_ops(&result.functions[0].chunk);
         assert_eq!(
             inner_ops,
-            vec![Op::LoadLocal0, Op::LoadLocal1, Op::AddInt, Op::Return]
+            vec![Op::TakeLocal, Op::TakeLocal, Op::AddInt, Op::Return]
         );
     }
 
@@ -1627,15 +1872,90 @@ mod tests {
     }
 
     #[test]
+    fn test_compile_intrinsic_mut_arr_get() {
+        let result = compile_str("(mutable-array/get a 0)");
+        let ops = extract_ops(&result.chunk);
+        assert_eq!(
+            ops,
+            vec![Op::LoadGlobal, Op::Const, Op::MutArrGet, Op::Return]
+        );
+    }
+
+    #[test]
+    fn test_compile_intrinsic_mut_arr_set() {
+        let result = compile_str("(mutable-array/set! a 0 1)");
+        let ops = extract_ops(&result.chunk);
+        assert_eq!(
+            ops,
+            vec![
+                Op::LoadGlobal,
+                Op::Const,
+                Op::Const,
+                Op::MutArrSet,
+                Op::Return
+            ]
+        );
+    }
+
+    #[test]
+    fn test_compile_mut_arr_get_default_form_stays_call_global() {
+        // The 3-arg (default) form is not intrinsified — the native owns the
+        // default logic.
+        let result = compile_str("(mutable-array/get a 0 :missing)");
+        let ops = extract_ops(&result.chunk);
+        assert!(
+            !ops.contains(&Op::MutArrGet),
+            "3-arg get must not intrinsify: {ops:?}"
+        );
+        assert!(
+            ops.contains(&Op::CallGlobal),
+            "3-arg get dispatches to the native: {ops:?}"
+        );
+    }
+
+    #[test]
+    fn test_compile_mut_arr_set_wrong_arity_stays_call_global() {
+        // Wrong-arity calls fall through to the native so its arity error fires.
+        let result = compile_str("(mutable-array/set! a 0)");
+        let ops = extract_ops(&result.chunk);
+        assert!(
+            !ops.contains(&Op::MutArrSet),
+            "2-arg set! must not intrinsify: {ops:?}"
+        );
+        assert!(
+            ops.contains(&Op::CallGlobal),
+            "2-arg set! dispatches to the native: {ops:?}"
+        );
+    }
+
+    #[test]
+    fn test_compile_mut_arr_intrinsics_guarded_by_redefinition() {
+        // A program-level (re)define of the accessor disables the intrinsic —
+        // calls dispatch to the user's definition.
+        let result =
+            compile_many_str("(define (mutable-array/get a i) :mine) (mutable-array/get x 0)");
+        let ops = extract_ops(&result.chunk);
+        assert!(
+            !ops.contains(&Op::MutArrGet),
+            "redefined mutable-array/get must not intrinsify: {ops:?}"
+        );
+        assert!(
+            ops.contains(&Op::CallGlobal),
+            "must dispatch to the user fn: {ops:?}"
+        );
+    }
+
+    #[test]
     fn test_compile_if_not_peephole() {
         // (if (not x) then else) → compile x, JumpIfTrue
         let result = compile_str("(lambda (x) (if (not x) 1 2))");
         let inner_ops = extract_ops(&result.functions[0].chunk);
-        // LoadLocal0(x), JumpIfTrue, Const(1), Jump, Const(2), Return
+        // TakeLocal(x) — the test read is x's last use — JumpIfTrue,
+        // Const(1), Jump, Const(2), Return
         assert_eq!(
             inner_ops,
             vec![
-                Op::LoadLocal0,
+                Op::TakeLocal,
                 Op::JumpIfTrue,
                 Op::Const,
                 Op::Jump,
@@ -1679,7 +1999,8 @@ mod tests {
     fn test_compile_let() {
         let result = compile_str("(lambda () (let ((x 1) (y 2)) x))");
         let inner_ops = extract_ops(&result.functions[0].chunk);
-        // CONST(1), CONST(2), StoreLocal1(y=1), StoreLocal0(x=0), LoadLocal0(x=0), Return
+        // CONST(1), CONST(2), StoreLocal1(y=1), StoreLocal0(x=0),
+        // TakeLocal(x=0) — the body read is x's last use — Return
         assert_eq!(
             inner_ops,
             vec![
@@ -1687,7 +2008,7 @@ mod tests {
                 Op::Const,
                 Op::StoreLocal1,
                 Op::StoreLocal0,
-                Op::LoadLocal0,
+                Op::TakeLocal,
                 Op::Return
             ]
         );
@@ -1698,15 +2019,16 @@ mod tests {
         // let* stores sequentially so later bindings see earlier ones
         let result = compile_str("(lambda () (let* ((x 1) (y x)) y))");
         let inner_ops = extract_ops(&result.functions[0].chunk);
-        // CONST(1), StoreLocal0(x), LoadLocal0(x), StoreLocal1(y), LoadLocal1(y), Return
+        // CONST(1), StoreLocal0(x), TakeLocal(x), StoreLocal1(y),
+        // TakeLocal(y), Return — both reads are last uses, so both move.
         assert_eq!(
             inner_ops,
             vec![
                 Op::Const,
                 Op::StoreLocal0,
-                Op::LoadLocal0,
+                Op::TakeLocal,
                 Op::StoreLocal1,
-                Op::LoadLocal1,
+                Op::TakeLocal,
                 Op::Return
             ]
         );
@@ -1716,7 +2038,8 @@ mod tests {
     fn test_compile_letrec() {
         let result = compile_str("(lambda () (letrec ((x 1)) x))");
         let inner_ops = extract_ops(&result.functions[0].chunk);
-        // Nil, StoreLocal0(x), CONST(1), StoreLocal0(x), LoadLocal0(x), Return
+        // Nil, StoreLocal0(x), CONST(1), StoreLocal0(x),
+        // TakeLocal(x) — the body read is x's last use — Return
         assert_eq!(
             inner_ops,
             vec![
@@ -1724,7 +2047,7 @@ mod tests {
                 Op::StoreLocal0,
                 Op::Const,
                 Op::StoreLocal0,
-                Op::LoadLocal0,
+                Op::TakeLocal,
                 Op::Return
             ]
         );
@@ -1981,6 +2304,284 @@ mod tests {
                 "escaping loop must not self-tail-call"
             );
         }
+    }
+
+    // --- CallSelf: direct self-call fast path for top-level defines ---
+
+    fn find_fn<'a>(result: &'a CompileResult, name: &str) -> &'a Function {
+        result
+            .functions
+            .iter()
+            .find(|f| f.name == Some(intern(name)))
+            .unwrap_or_else(|| panic!("no compiled function named `{name}`"))
+    }
+
+    #[test]
+    fn test_compile_define_nontail_self_call_emits_call_self() {
+        let result = compile_str("(define (f n) (if (< n 2) 1 (+ (f (- n 1)) n)))");
+        let ops = extract_ops(&find_fn(&result, "f").chunk);
+        assert!(
+            ops.contains(&Op::CallSelf),
+            "non-tail self-call must emit CallSelf: {ops:?}"
+        );
+        assert!(
+            !ops.contains(&Op::CallGlobal),
+            "self-call must not go through CallGlobal: {ops:?}"
+        );
+    }
+
+    #[test]
+    fn test_compile_define_tail_self_call_emits_self_tail_call() {
+        let result = compile_str("(define (walk n) (if (= n 0) 'done (walk (- n 1))))");
+        let ops = extract_ops(&find_fn(&result, "walk").chunk);
+        assert!(
+            ops.contains(&Op::SelfTailCall),
+            "tail self-call must emit SelfTailCall: {ops:?}"
+        );
+        assert!(
+            !ops.contains(&Op::TailCall) && !ops.contains(&Op::LoadGlobal),
+            "tail self-call must not load the global: {ops:?}"
+        );
+    }
+
+    #[test]
+    fn test_compile_redefined_name_disables_self_call() {
+        // A second define of the same name opts it out — every call dispatches
+        // through the global so redefinition behaves exactly as before.
+        let result = compile_many_str("(define (f n) (+ (f (- n 1)) 1)) (define (f n) 42)");
+        for func in &result.functions {
+            let ops = extract_ops(&func.chunk);
+            assert!(
+                !ops.contains(&Op::CallSelf) && !ops.contains(&Op::SelfTailCall),
+                "redefined name must not self-call: {ops:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_compile_global_set_disables_self_call() {
+        // A global set! anywhere in the program (here inside another function)
+        // opts the name out of the self-call fast path.
+        let result = compile_many_str("(define (f n) (+ (f (- n 1)) 1)) (define (g) (set! f 9))");
+        for func in &result.functions {
+            let ops = extract_ops(&func.chunk);
+            assert!(
+                !ops.contains(&Op::CallSelf) && !ops.contains(&Op::SelfTailCall),
+                "set! name must not self-call: {ops:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_compile_mutual_recursion_stays_global() {
+        // Calls to a DIFFERENT global never become self-calls.
+        let result = compile_many_str("(define (f n) (g n)) (define (g n) (f n))");
+        for func in &result.functions {
+            let ops = extract_ops(&func.chunk);
+            assert!(
+                !ops.contains(&Op::CallSelf) && !ops.contains(&Op::SelfTailCall),
+                "mutual recursion must stay on the global path: {ops:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_compile_nested_lambda_self_name_stays_global() {
+        // A nested lambda's running frame is not `f`, so its call to f must
+        // stay a global call even though the enclosing define is eligible.
+        let result = compile_str("(define (f n) (+ 1 ((lambda (x) (f x)) n)))");
+        for func in &result.functions {
+            let ops = extract_ops(&func.chunk);
+            assert!(
+                !ops.contains(&Op::CallSelf) && !ops.contains(&Op::SelfTailCall),
+                "nested lambda must not self-call the outer define: {ops:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_compile_value_reference_stays_load_global() {
+        // Operator self-calls get CallSelf; a value (non-operator) reference to
+        // the name stays LoadGlobal, preserving identity/escape semantics.
+        let result = compile_str("(define (f n) (if (= n 0) f (car (list (f (- n 1))))))");
+        let ops = extract_ops(&find_fn(&result, "f").chunk);
+        assert!(
+            ops.contains(&Op::CallSelf),
+            "operator self-call must emit CallSelf: {ops:?}"
+        );
+        assert!(
+            ops.contains(&Op::LoadGlobal),
+            "value self-reference must stay LoadGlobal: {ops:?}"
+        );
+    }
+
+    // --- TakeLocal: moving loads for statically-last uses ---
+
+    #[test]
+    fn test_take_local_last_use_call_arg() {
+        // `m`'s only use is dead after the call — compiled as a move.
+        let result = compile_str("(fn (m) (assoc m :k 1))");
+        let ops = extract_ops(&result.functions[0].chunk);
+        assert!(
+            ops.contains(&Op::TakeLocal),
+            "last use must emit TakeLocal: {ops:?}"
+        );
+        assert!(
+            !ops.contains(&Op::LoadLocal0) && !ops.contains(&Op::LoadLocal),
+            "no cloning load should remain for m: {ops:?}"
+        );
+    }
+
+    #[test]
+    fn test_take_local_only_at_last_use() {
+        // First read stays a clone (the slot is read again later); only the
+        // final read moves.
+        let result = compile_str("(fn (m) (list (get m :a) (assoc m :k 1)))");
+        let ops = extract_ops(&result.functions[0].chunk);
+        assert_eq!(
+            ops.iter().filter(|&&op| op == Op::TakeLocal).count(),
+            1,
+            "exactly one move: {ops:?}"
+        );
+        assert!(
+            ops.contains(&Op::LoadLocal0),
+            "earlier use must stay a cloning load: {ops:?}"
+        );
+        // The clone must come before the move.
+        let load_pos = ops.iter().position(|&op| op == Op::LoadLocal0).unwrap();
+        let take_pos = ops.iter().position(|&op| op == Op::TakeLocal).unwrap();
+        assert!(load_pos < take_pos, "clone before move: {ops:?}");
+    }
+
+    #[test]
+    fn test_take_local_in_both_branches() {
+        // Mutually exclusive branches may each take the slot; the test read
+        // before the branch stays a clone (both arms still read m).
+        let result = compile_str("(fn (m) (if (null? m) m (assoc m :k 1)))");
+        let ops = extract_ops(&result.functions[0].chunk);
+        assert_eq!(
+            ops.iter().filter(|&&op| op == Op::TakeLocal).count(),
+            2,
+            "each branch's use is last on its path: {ops:?}"
+        );
+        assert!(
+            ops.contains(&Op::LoadLocal0),
+            "the test read must stay a cloning load: {ops:?}"
+        );
+    }
+
+    #[test]
+    fn test_take_local_blocked_by_read_after_branch() {
+        // The use inside the `if` is NOT last — the slot is read again after
+        // the join. Only the final read moves.
+        let result = compile_str("(fn (m) (list (if (contains? m :a) (get m :a) 1) m))");
+        let ops = extract_ops(&result.functions[0].chunk);
+        assert_eq!(
+            ops.iter().filter(|&&op| op == Op::TakeLocal).count(),
+            1,
+            "only the post-join use is last: {ops:?}"
+        );
+        assert!(
+            ops.contains(&Op::LoadLocal0),
+            "in-branch use must stay a cloning load: {ops:?}"
+        );
+    }
+
+    #[test]
+    fn test_no_take_for_captured_slot() {
+        // `m` is captured by the inner lambda: an upvalue cell aliases the
+        // slot, so it must never be moved out.
+        let result = compile_str("(fn (m) (list (fn () m) (assoc m :k 1)))");
+        for f in &result.functions {
+            let ops = extract_ops(&f.chunk);
+            assert!(
+                !ops.contains(&Op::TakeLocal),
+                "captured slot must never be taken: {ops:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_no_take_for_set_target() {
+        let result = compile_str("(fn (m) (set! m {:x 1}) (assoc m :k 2))");
+        let ops = extract_ops(&result.functions[0].chunk);
+        assert!(
+            !ops.contains(&Op::TakeLocal),
+            "set! target slot must never be taken: {ops:?}"
+        );
+    }
+
+    #[test]
+    fn test_no_take_in_function_with_try() {
+        let result = compile_str("(fn (m) (try (assoc m :k 1) (catch e m)))");
+        for f in &result.functions {
+            let ops = extract_ops(&f.chunk);
+            assert!(
+                !ops.contains(&Op::TakeLocal),
+                "a function containing try opts out entirely: {ops:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_no_take_in_function_with_do_loop() {
+        let result = compile_str("(fn (m) (do ((i 0 (+ i 1))) ((= i 3) m) (get m i)))");
+        for f in &result.functions {
+            let ops = extract_ops(&f.chunk);
+            assert!(
+                !ops.contains(&Op::TakeLocal),
+                "a function containing a do loop opts out entirely: {ops:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_no_take_in_self_tail_recursive_define() {
+        // A tail self-call reuses the frame in place — the whole function
+        // opts out of moves.
+        let result = compile_str("(define (walk n) (if (= n 0) 'done (walk (- n 1))))");
+        let ops = extract_ops(&find_fn(&result, "walk").chunk);
+        assert!(ops.contains(&Op::SelfTailCall), "sanity: {ops:?}");
+        assert!(
+            !ops.contains(&Op::TakeLocal),
+            "frame-reusing function must not take: {ops:?}"
+        );
+    }
+
+    #[test]
+    fn test_take_in_nontail_self_recursive_define() {
+        // Non-tail self-calls push a fresh frame; takes stay enabled.
+        let result = compile_str("(define (f n) (if (< n 2) 1 (+ (f (- n 1)) n)))");
+        let ops = extract_ops(&find_fn(&result, "f").chunk);
+        assert!(ops.contains(&Op::CallSelf), "sanity: {ops:?}");
+        assert!(
+            ops.contains(&Op::TakeLocal),
+            "the final read of n is a move: {ops:?}"
+        );
+    }
+
+    #[test]
+    fn test_no_take_in_named_let_loop() {
+        let result = compile_str("(let loop ((n 5) (m {})) (if (= n 0) m (loop (- n 1) m)))");
+        for f in &result.functions {
+            let ops = extract_ops(&f.chunk);
+            assert!(
+                !ops.contains(&Op::TakeLocal),
+                "SelfFn loop frame is reused — no takes: {ops:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_no_take_in_top_level_chunk() {
+        // Top-level locals may outlive the chunk (REPL/eval continuation):
+        // the main chunk never takes.
+        let result = compile_str("(let ((m {})) (assoc m :k 1))");
+        let ops = extract_ops(&result.chunk);
+        assert!(
+            !ops.contains(&Op::TakeLocal),
+            "top-level chunk must not take: {ops:?}"
+        );
     }
 
     // --- compile_many ---

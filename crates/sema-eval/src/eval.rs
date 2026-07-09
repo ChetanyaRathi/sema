@@ -97,6 +97,7 @@ impl Interpreter {
         // Register eval/call callbacks so stdlib can invoke the real evaluator
         sema_core::set_eval_callback(&ctx, eval_value_vm);
         sema_core::set_call_callback(&ctx, call_value);
+        sema_core::set_call_owned_callback(&ctx, call_value_owned);
         // Register stdlib
         sema_stdlib::register_stdlib(&env, &sema_core::Sandbox::allow_all());
         // Register LLM builtins
@@ -116,6 +117,7 @@ impl Interpreter {
         let ctx = EvalContext::new_with_sandbox(sandbox.clone());
         sema_core::set_eval_callback(&ctx, eval_value_vm);
         sema_core::set_call_callback(&ctx, call_value);
+        sema_core::set_call_owned_callback(&ctx, call_value_owned);
         sema_stdlib::register_stdlib(&env, sandbox);
         #[cfg(not(target_arch = "wasm32"))]
         {
@@ -500,6 +502,19 @@ pub fn call_value(ctx: &EvalContext, func: &Value, args: &[Value]) -> EvalResult
                 .with_hint("expected a function, lambda, or keyword"),
         ),
     }
+}
+
+/// Like [`call_value`], but the caller passes an args buffer it OWNS and will
+/// not reuse: a VM-closure callee moves the values into its frame slots (the
+/// buffer is left holding nils), so a uniquely-owned accumulator stays
+/// uniquely owned across the callback boundary — the enabler for the stdlib's
+/// `strong_count == 1` in-place fast paths inside fold callbacks. Every other
+/// callable falls back to the borrowed protocol (args intact).
+pub fn call_value_owned(ctx: &EvalContext, func: &Value, args: &mut [Value]) -> EvalResult {
+    if let Some(result) = sema_vm::call_closure_owned(func, ctx, args) {
+        return result;
+    }
+    call_value(ctx, func, args)
 }
 
 /// Call a multimethod: dispatch on args, look up handler, call it.

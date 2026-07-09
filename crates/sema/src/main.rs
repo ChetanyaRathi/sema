@@ -2629,6 +2629,7 @@ fn chunk_to_json(chunk: &sema_vm::Chunk, name: &str) -> serde_json::Value {
             }
             Some(
                 sema_vm::Op::LoadLocal
+                | sema_vm::Op::TakeLocal
                 | sema_vm::Op::StoreLocal
                 | sema_vm::Op::LoadUpvalue
                 | sema_vm::Op::StoreUpvalue,
@@ -2639,9 +2640,7 @@ fn chunk_to_json(chunk: &sema_vm::Chunk, name: &str) -> serde_json::Value {
                     pc + 3,
                 )
             }
-            Some(
-                sema_vm::Op::LoadGlobal | sema_vm::Op::StoreGlobal | sema_vm::Op::DefineGlobal,
-            ) => {
+            Some(sema_vm::Op::StoreGlobal | sema_vm::Op::DefineGlobal) => {
                 let spur_bits =
                     u32::from_le_bytes([code[pc + 1], code[pc + 2], code[pc + 3], code[pc + 4]]);
                 // The deserialized bytecode has already remapped indices to valid Spurs.
@@ -2656,6 +2655,37 @@ fn chunk_to_json(chunk: &sema_vm::Chunk, name: &str) -> serde_json::Value {
                     pc + 5,
                 )
             }
+            Some(sema_vm::Op::LoadGlobal) => {
+                let spur_bits =
+                    u32::from_le_bytes([code[pc + 1], code[pc + 2], code[pc + 3], code[pc + 4]]);
+                let name_str = if spur_bits != 0 {
+                    let spur = sema_core::bits_to_spur(spur_bits);
+                    sema_core::resolve(spur)
+                } else {
+                    format!("spur({spur_bits})")
+                };
+                let cache_slot = u16::from_le_bytes([code[pc + 5], code[pc + 6]]);
+                (
+                    serde_json::json!({"pc": pc, "op": op_name, "name": name_str, "cache_slot": cache_slot}),
+                    pc + 7,
+                )
+            }
+            Some(sema_vm::Op::CallGlobal) => {
+                let spur_bits =
+                    u32::from_le_bytes([code[pc + 1], code[pc + 2], code[pc + 3], code[pc + 4]]);
+                let name_str = if spur_bits != 0 {
+                    let spur = sema_core::bits_to_spur(spur_bits);
+                    sema_core::resolve(spur)
+                } else {
+                    format!("spur({spur_bits})")
+                };
+                let argc = u16::from_le_bytes([code[pc + 5], code[pc + 6]]);
+                let cache_slot = u16::from_le_bytes([code[pc + 7], code[pc + 8]]);
+                (
+                    serde_json::json!({"pc": pc, "op": op_name, "name": name_str, "argc": argc, "cache_slot": cache_slot}),
+                    pc + 9,
+                )
+            }
             Some(sema_vm::Op::Jump | sema_vm::Op::JumpIfFalse | sema_vm::Op::JumpIfTrue) => {
                 let offset =
                     i32::from_le_bytes([code[pc + 1], code[pc + 2], code[pc + 3], code[pc + 4]]);
@@ -2665,7 +2695,12 @@ fn chunk_to_json(chunk: &sema_vm::Chunk, name: &str) -> serde_json::Value {
                     pc + 5,
                 )
             }
-            Some(sema_vm::Op::Call | sema_vm::Op::TailCall) => {
+            Some(
+                sema_vm::Op::Call
+                | sema_vm::Op::TailCall
+                | sema_vm::Op::SelfTailCall
+                | sema_vm::Op::CallSelf,
+            ) => {
                 let argc = u16::from_le_bytes([code[pc + 1], code[pc + 2]]);
                 (
                     serde_json::json!({"pc": pc, "op": op_name, "argc": argc}),

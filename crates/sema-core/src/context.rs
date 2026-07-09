@@ -13,6 +13,11 @@ pub type EvalCallbackFn = fn(&EvalContext, &Value, &Env) -> Result<Value, SemaEr
 /// Function-pointer type for calling a function value with evaluated arguments: (ctx, func, args) -> Result<Value, SemaError>
 pub type CallCallbackFn = fn(&EvalContext, &Value, &[Value]) -> Result<Value, SemaError>;
 
+/// Function-pointer type for the owned-args variant of the call callback: the
+/// caller passes a buffer it owns and will not reuse, and the callee may move
+/// values out of it (leaving nil behind). See [`call_callback_owned`].
+pub type CallOwnedCallbackFn = fn(&EvalContext, &Value, &mut [Value]) -> Result<Value, SemaError>;
+
 pub struct EvalContext {
     pub module_cache: RefCell<BTreeMap<PathBuf, BTreeMap<String, Value>>>,
     pub embedded_files: RefCell<BTreeMap<PathBuf, Vec<u8>>>,
@@ -36,6 +41,7 @@ pub struct EvalContext {
     pub context_stacks: RefCell<BTreeMap<Value, Vec<Value>>>,
     pub eval_fn: Cell<Option<EvalCallbackFn>>,
     pub call_fn: Cell<Option<CallCallbackFn>>,
+    pub call_owned_fn: Cell<Option<CallOwnedCallbackFn>>,
     pub interactive: Cell<bool>,
 }
 
@@ -74,6 +80,7 @@ impl EvalContext {
             context_stacks: RefCell::new(BTreeMap::new()),
             eval_fn: Cell::new(None),
             call_fn: Cell::new(None),
+            call_owned_fn: Cell::new(None),
             interactive: Cell::new(false),
         }
     }
@@ -98,6 +105,7 @@ impl EvalContext {
             context_stacks: RefCell::new(BTreeMap::new()),
             eval_fn: Cell::new(None),
             call_fn: Cell::new(None),
+            call_owned_fn: Cell::new(None),
             interactive: Cell::new(false),
         }
     }
@@ -643,4 +651,29 @@ pub fn call_callback(ctx: &EvalContext, func: &Value, args: &[Value]) -> Result<
         SemaError::eval("call callback not registered — Interpreter::new() must be called first")
     })?;
     f(ctx, func, args)
+}
+
+/// Register the owned-args call callback. Called by `sema-eval` during
+/// interpreter init, alongside [`set_call_callback`].
+pub fn set_call_owned_callback(ctx: &EvalContext, f: CallOwnedCallbackFn) {
+    ctx.call_owned_fn.set(Some(f));
+    STDLIB_CTX.with(|stdlib| stdlib.call_owned_fn.set(Some(f)));
+}
+
+/// Call a function value with an args buffer the CALLER owns and will not
+/// reuse after the call: the callee may move values out of it (leaving nil
+/// behind). This is the refcount-shedding variant of [`call_callback`] — a
+/// fold-style accumulator handed off this way stays uniquely owned across the
+/// callback boundary, so the stdlib's `strong_count == 1` in-place fast paths
+/// (e.g. `assoc` on a map) can fire inside the callback. Falls back to the
+/// borrowed protocol (args intact) when no owned callback is registered.
+pub fn call_callback_owned(
+    ctx: &EvalContext,
+    func: &Value,
+    args: &mut [Value],
+) -> Result<Value, SemaError> {
+    if let Some(f) = ctx.call_owned_fn.get() {
+        return f(ctx, func, args);
+    }
+    call_callback(ctx, func, args)
 }
