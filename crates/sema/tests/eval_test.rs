@@ -1899,6 +1899,55 @@ eval_error_tests! {
     optimizer_rest_param_shadows_builtin: "((lambda (x . +) (+ 1 2)) 9 5)",
 }
 
+// ============================================================
+// (if (not X) then else) branch-polarity peephole
+//
+// The compiler folds the Not into the branch (compile X, invert the jump).
+// These pin that exactly one arm — the right one — evaluates, and that the
+// fold is suppressed when `not` is (re)defined in the same program, matching
+// the Not intrinsic's redefinition guard.
+// ============================================================
+
+eval_tests! {
+    // Side-effecting arms: only the taken arm may run.
+    if_not_polarity_takes_else_arm:
+        "(begin
+           (define log '())
+           (define (note v) (set! log (cons v log)) v)
+           (define (pick x) (if (not x) (note 'then-arm) (note 'else-arm)))
+           (list (pick #t) log))" => common::eval("'(else-arm (else-arm))"),
+    if_not_polarity_takes_then_arm:
+        "(begin
+           (define log '())
+           (define (note v) (set! log (cons v log)) v)
+           (define (pick x) (if (not x) (note 'then-arm) (note 'else-arm)))
+           (list (pick #f) log))" => common::eval("'(then-arm (then-arm))"),
+    // Nested (not (not x)) keeps double-negation semantics.
+    if_not_not_polarity:
+        "(begin (define (pick x) (if (not (not x)) 'truthy 'falsy)) (list (pick 1) (pick #f)))"
+        => common::eval("'(truthy falsy)"),
+    // A user-defined `not` in the same program disables the fold: the if
+    // dispatches to the redefinition (identity here), so a truthy argument
+    // takes the then arm.
+    if_not_redefined_before_use:
+        "(begin
+           (define not (lambda (x) x))
+           (define (pick x) (if (not x) 'not-was-truthy 'not-was-falsy))
+           (list (pick 1) (pick #f)))" => common::eval("'(not-was-truthy not-was-falsy)"),
+    // Define-after-use: the guard scans the whole program, so a later
+    // (define not ...) still disables the fold for earlier code.
+    if_not_redefined_after_use:
+        "(begin
+           (define (pick x) (if (not x) 'not-was-truthy 'not-was-falsy))
+           (define not (lambda (x) x))
+           (list (pick 1) (pick #f)))" => common::eval("'(not-was-truthy not-was-falsy)"),
+    // A lexically shadowed `not` resolves as a local, never as the global
+    // intrinsic — no fold, the local binding is called.
+    if_not_lexically_shadowed:
+        "(let ((not (lambda (x) x))) (if (not 1) 'shadow-truthy 'shadow-falsy))"
+        => common::eval("'shadow-truthy"),
+}
+
 // Wide-integer runtime arithmetic: operands beyond the ±2^44 small-int fast-path
 // range, applied via a lambda so the optimizer cannot constant-fold them. This
 // exercises the vm_add/vm_sub/vm_mul fallback helpers at runtime (the small-int
