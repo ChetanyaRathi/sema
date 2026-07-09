@@ -1,5 +1,7 @@
 # Sema Runtime Performance: Implementation Plan
 
+> **Status (2026-07-09):** Phase 1 shipped in modified form — `MutableArray`/`MutableCell` landed at tags 33/34 (30-32 were taken by the numeric tower), and the planned `ByteString`/`StringSlice` types were replaced by `bytes/*` ops on the existing `Bytevector` (optional start/end args stand in for zero-copy slices), plus `file/fold-lines-bytes`. Phase 3 (1BRC rewrite) shipped against those APIs. Phase 2 (tracing GC) is **superseded** — see `docs/performance-roadmap.md` §2: `TakeLocal` + the owned-args callback protocol unlock the existing Rc-uniqueness COW gates instead. Result: Sema ahead of Janet on all four suite benchmarks.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use `superpowers:subagent-driven-development` (recommended) or `superpowers:executing-plans` to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Reach Janet-level performance on the optimized 1brc benchmark by adding mutable arrays, byte-oriented strings/slices, and a tracing GC to the Sema runtime.
