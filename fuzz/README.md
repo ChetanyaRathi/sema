@@ -58,15 +58,13 @@ referentially-transparent expressions.
 ## Running
 
 ```bash
-make fuzz-grammar                         # default sweep, random seed
-make fuzz-grammar SEED=123 N=20000 DEPTH=5
-make fuzz-grammar V=1                      # verbose: print passing forms too
-make fuzz-grammar-emit N=10                # print sample generated programs
-make fuzz-grammar-emit N=50 OUT=/tmp/progs.sema
+jake fuzz.grammar                          # default sweep, random seed
+jake fuzz.grammar seed=123 n=20000 depth=5
+jake fuzz.grammar-emit n=10                 # print sample generated programs
 
-# or call the driver directly (no rebuild):
-./scripts/grammar-fuzz.sh check -n 5000 -d 4
-./scripts/grammar-fuzz.sh emit  -n 10 -s 7
+# jake exposes n/depth/seed; verbose and emit-to-file are driver-only (no rebuild):
+./scripts/grammar-fuzz.sh check -n 5000 -d 4 -v       # verbose: print passing forms too
+./scripts/grammar-fuzz.sh emit  -n 50 -s 7 -o /tmp/progs.sema
 ```
 
 The driver exits `0` on success, `1` on a deterministic mismatch (round-trip or

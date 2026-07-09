@@ -22,7 +22,7 @@ This example shows the recommended production flow for a browser app built with
 From the repository root:
 
 ```bash
-make sema-web-example
+jake wasm.sema-web-example
 ```
 
 Then open:

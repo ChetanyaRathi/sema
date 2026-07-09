@@ -1,8 +1,8 @@
 //! Asset-serving tests for the embedded notebook UI.
 
-/// The vendored `@sema/ui` bundle (built from `ui/` via `make notebook-ui-vendor`)
-/// must be served at `/ui/vendor/sema-ui.js` so the notebook can use the shared
-/// web components while staying a single offline binary.
+/// The vendored `@sema-lang/ui` bundle (the published npm package's `dist/sema-ui.js`,
+/// fetched from the unpkg CDN) must be served at `/ui/vendor/sema-ui.js` so the notebook
+/// can use the shared web components while staying a single offline binary.
 #[test]
 fn serves_vendored_sema_ui_bundle() {
     let asset = sema_notebook::ui::asset("vendor/sema-ui.js");

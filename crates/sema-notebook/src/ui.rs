@@ -58,9 +58,13 @@ fn js() -> &'static str {
     include_str!("ui/notebook.js")
 }
 
-/// The `@sema/ui` web-component bundle, vendored from `ui/dist/sema-ui.js` by the
-/// `notebook-ui-vendor` make target. Provides `<sema-code-editor>`,
-/// `<sema-markdown>`, and `<sema-editable-markdown>` for the notebook cells.
+/// The `@sema-lang/ui` web-component bundle — `<sema-code-editor>`, `<sema-markdown>`,
+/// and `<sema-editable-markdown>` for the notebook cells — embedded via `include_str!`
+/// so the binary stays a single offline artifact. Vendored from the published npm
+/// package's `dist/sema-ui.js` (the mono pins `@sema-lang/ui` in `playground/package.json`).
+/// Refresh by fetching the pinned version from the unpkg CDN:
+///   curl -fsSL https://unpkg.com/@sema-lang/ui@<version>/dist/sema-ui.js \
+///     -o crates/sema-notebook/src/ui/vendor/sema-ui.js
 fn sema_ui_js() -> &'static str {
     include_str!("ui/vendor/sema-ui.js")
 }

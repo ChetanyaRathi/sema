@@ -15,10 +15,10 @@ runs:
 
 ```bash
 cargo test --workspace      # unit + integration tests
-make examples               # smoke-test every .sema example (catches eval regressions)
-make smoke-bytecode         # bytecode round-trip smoke test
-make lint                   # fmt-check + clippy -D warnings
-make docs-check             # builtin doc index fresh
+jake examples               # smoke-test every .sema example (catches eval regressions)
+jake smoke-bytecode         # bytecode round-trip smoke test
+jake lint                   # fmt-check + clippy -D warnings
+jake docs-check             # builtin doc index fresh
 git status --short          # the release commit should only bump version + Cargo.lock
 ```
 

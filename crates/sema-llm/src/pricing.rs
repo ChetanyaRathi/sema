@@ -2,7 +2,7 @@
 //!
 //! Pricing comes from a single source of truth: a snapshot of [models.dev](https://models.dev)
 //! (MIT-licensed data) vendored at `pricing-data.json` and embedded at build time via
-//! `include_str!`. Refresh it with `make update-pricing` (see
+//! `include_str!`. Refresh it with `jake update-pricing` (see
 //! `scripts/update-pricing.sh`) and ship the diff in a patch release — we deliberately do
 //! not fetch pricing at runtime (no dependency on a third-party endpoint we don't control;
 //! see `docs/done/plans/2026-06-18-llm-pricing-models-dev.md`).
@@ -19,7 +19,7 @@ use std::sync::OnceLock;
 
 use crate::types::Usage;
 
-/// Vendored pricing snapshot, generated from models.dev by `make update-pricing`.
+/// Vendored pricing snapshot, generated from models.dev by `jake update-pricing`.
 const EMBEDDED_PRICING_JSON: &str = include_str!("pricing-data.json");
 
 #[derive(Debug, serde::Deserialize)]
@@ -69,7 +69,7 @@ fn embedded() -> &'static EmbeddedPricing {
         // Invariant: pricing-data.json is vendored, compiled in, and validated by
         // `test_embedded_pricing_parses` — a parse failure here means a broken build.
         let data: PricingData = serde_json::from_str(EMBEDDED_PRICING_JSON)
-            .expect("embedded pricing-data.json must be valid JSON (run `make update-pricing`)");
+            .expect("embedded pricing-data.json must be valid JSON (run `jake update-pricing`)");
         let mut by_id = HashMap::new();
         let mut by_qualified = HashMap::with_capacity(data.prices.len());
         let mut entries = Vec::new();

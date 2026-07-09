@@ -92,7 +92,7 @@ fn cmd_gen(root: &Path, strict: bool) -> Result<(), Box<dyn std::error::Error>> 
     Ok(())
 }
 
-/// Idempotent write so `make docs` produces no diff when nothing changed.
+/// Idempotent write so `jake docs` produces no diff when nothing changed.
 fn write_if_changed(path: &Path, content: &str) -> std::io::Result<()> {
     if let Ok(existing) = std::fs::read_to_string(path) {
         if existing == content {

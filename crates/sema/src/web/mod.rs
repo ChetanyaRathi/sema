@@ -16,7 +16,7 @@ use sema_eval::Interpreter;
 pub fn run(entry: &str, host: &str, port: u16, open: bool, llm: bool) -> Result<(), String> {
     if !runtime::is_available() {
         return Err("this `sema` build has no embedded web runtime.\n  \
-             Run `make web-runtime` to vendor it, then rebuild the binary."
+             Run `jake wasm.web-runtime` to vendor it, then rebuild the binary."
             .to_string());
     }
 

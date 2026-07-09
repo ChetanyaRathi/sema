@@ -571,7 +571,7 @@ mod tests {
     /// A resent assistant tool-call turn must echo the model's opaque
     /// `thoughtSignature` in its functionCall part — Gemini 2.5+ rejects the
     /// request with 400 INVALID_ARGUMENT otherwise (found live by the
-    /// `make llm-stress` provider matrix; FakeProvider cannot see wire drift).
+    /// `jake llm-stress` provider matrix; FakeProvider cannot see wire drift).
     #[test]
     fn resent_tool_call_turn_echoes_thought_signature() {
         use crate::types::{ChatMessage, ChatRequest, ToolCall};

@@ -1,7 +1,7 @@
 //! Integration tests for the `sema web` dev server's serving layer.
 //!
 //! These spawn the real binary. They require the browser runtime to be
-//! embedded (`make web-runtime` before building); when it isn't, the server
+//! embedded (`jake wasm.web-runtime` before building); when it isn't, the server
 //! exits with a clear message and the test skips rather than failing, so a
 //! plain `cargo build` checkout still passes. Marked `#[ignore]` like the other
 //! server tests (they bind localhost sockets).
@@ -33,7 +33,7 @@ fn spawn_dev_server(app: &str, port: u16) -> Option<Child> {
             let _ = s.read_to_string(&mut err);
         }
         eprintln!(
-            "skipping: `sema web` exited early ({}). Run `make web-runtime` and rebuild.",
+            "skipping: `sema web` exited early ({}). Run `jake wasm.web-runtime` and rebuild.",
             err.trim()
         );
         return None;
@@ -42,7 +42,7 @@ fn spawn_dev_server(app: &str, port: u16) -> Option<Child> {
 }
 
 #[test]
-#[ignore] // requires network + embedded web runtime (`make web-runtime`)
+#[ignore] // requires network + embedded web runtime (`jake wasm.web-runtime`)
 fn test_web_dev_server_serves_runtime_shell_and_app() {
     let port = 19930;
     let Some(mut child) = spawn_dev_server("examples/web/counter.sema", port) else {

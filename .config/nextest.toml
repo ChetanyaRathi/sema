@@ -1,6 +1,6 @@
 # cargo-nextest configuration. See https://nexte.st/docs/configuration/
 #
-# nextest is the sole local/CI test runner (`make test`, CI "Run tests" step).
+# nextest is the sole local/CI test runner (`jake test`, CI "Run tests" step).
 # It runs each test in its own process and schedules across all workspace test
 # binaries, which is ~2.6x faster than the libtest harness on this suite.
 #

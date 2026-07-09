@@ -1,6 +1,6 @@
 //! The browser runtime `sema web` serves: the WASM VM glue + JS bundle a
 //! sema-web app needs to boot with no bundler. Vendored under `assets/` by
-//! `make web-runtime` and embedded via `include_bytes!`. The assets are
+//! `jake wasm.web-runtime` and embedded via `include_bytes!`. The assets are
 //! gitignored (built, multi-MB), so everything here is gated behind the
 //! `web_runtime` cfg that build.rs emits only when they are present.
 

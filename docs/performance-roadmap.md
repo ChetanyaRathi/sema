@@ -176,7 +176,7 @@ The VM dispatcher in `sema-vm` calls into `sema-core` value operations (`view()`
 **Effort:** Trivial (RUSTFLAGS)
 **Status:** ⚠️ Tested (Jun 2026), not pursued — zero measurable gain, and it breaks portable/distributable binaries. Keep it out of release builds.
 
-Building with `RUSTFLAGS="-C target-cpu=native"` lets LLVM use the full instruction set of the host CPU (e.g., Apple Silicon NEON, AVX2 on x86). Not suitable for distributed binaries, but should be standard practice for local benchmarking. Can be added to `.cargo/config.toml` under a `[target]` profile or a `Makefile` benchmark target.
+Building with `RUSTFLAGS="-C target-cpu=native"` lets LLVM use the full instruction set of the host CPU (e.g., Apple Silicon NEON, AVX2 on x86). Not suitable for distributed binaries, but should be standard practice for local benchmarking. Can be added to `.cargo/config.toml` under a `[target]` profile or a jake benchmark recipe (jake/bench.jake).
 
 ### 12. `#[inline(always)]` audit on hot Value accessors
 

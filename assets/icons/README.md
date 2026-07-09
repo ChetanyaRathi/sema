@@ -24,7 +24,7 @@ those copies by hand.
 ## Regenerate
 
 ```bash
-make icons-assets     # render png/ + sync every consumer copy
+jake icons-assets     # render png/ + sync every consumer copy
 ```
 
 This runs `scripts/gen-icon-assets.py`: it verifies each SVG is flattened,
@@ -37,4 +37,4 @@ The website `/icons` showcase inlines these via
 
 To edit an icon: change the file in `svg/` (keep it flattened — use
 `scripts/flatten-svg-text.py` if you introduce `<text>`), then run
-`make icons-assets`.
+`jake icons-assets`.
