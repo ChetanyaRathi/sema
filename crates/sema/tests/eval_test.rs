@@ -2242,11 +2242,33 @@ eval_tests! {
         (outer 1))" => Value::int(1),
 }
 
+// Prelude macro names are ordinary identifiers in binding positions: lexical
+// bindings and same-unit top-level defines shadow macros, and binding
+// positions themselves (define-sugar heads, params, let names) never expand.
+eval_tests! {
+    define_sugar_head_shadows_prelude_macro: "(define (step n) n) (step 3)" => Value::int(3),
+    top_level_define_shadows_macro_call_site: "(define step (fn (n) n)) (step 7)" => Value::int(7),
+    define_of_phase_shadows_locally: "(define (phase n) n) (phase 5)" => Value::int(5),
+    lambda_param_shadows_macro: "((fn (step) (step 4)) (fn (n) (* n 2)))" => Value::int(8),
+    let_binding_shadows_macro: "(let ((step (fn (n) (+ n 1)))) (step 4))" => Value::int(5),
+    let_star_binding_shadows_macro: "(let* ((step (fn (n) n)) (r (step 9))) r)" => Value::int(9),
+    internal_define_shadows_macro: "(define (outer) (define (step n) n) (step 3)) (outer)" => Value::int(3),
+    internal_define_in_lambda_shadows: "(define (outer a) (fn () (define (step n) (let ((v 1)) v)) (step 3))) ((outer 1))" => Value::int(1),
+    catch_var_named_after_macro_binds: "(try (throw 42) (catch step (:value step)))" => Value::int(42),
+    match_pattern_var_shadows_macro: "(match (list (fn (n) n) 2) ([step x] (step x)))" => Value::int(2),
+}
+
 eval_error_tests! {
-    // `step` is the prelude workflow macro; its expansion (a `let` template)
-    // lands in the define head, so define sugar sees no symbol.
-    prelude_macro_name_in_define_sugar_head_errors:
-        "(define (step n) n)" => "define: expected a symbol",
+    // Defining `phase` must NOT clobber `workflow/phase` (the macro expands to
+    // a workflow/phase call; pre-fix the define-sugar head expanded and
+    // silently redefined it). The original native still type-errors on an int.
+    define_of_phase_does_not_clobber_workflow:
+        "(define (phase n) n) (workflow/phase 3)" => "expected string",
+    // Shadowing is lexical: outside the (fn (step) ...) scope the `checkpoint`
+    // macro still expands (its runtime then rejects it outside a workflow —
+    // which is the proof the macro path ran, not an unbound/shadowed call).
+    shadow_is_lexical_not_global:
+        "(begin ((fn (step) (step 1)) (fn (n) n)) (checkpoint \"cp\"))" => "checkpoint outside a workflow",
 }
 
 // ============================================================
