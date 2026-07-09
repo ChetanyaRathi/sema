@@ -702,6 +702,22 @@ fn foreign_upvalue_error() -> SemaError {
     )
 }
 
+/// Reject interior-mutable containers (mutable arrays/cells) as keys in map
+/// literals (`{k v}` / hashmap literals): their contents can change after
+/// insertion, which would silently corrupt the map's lookup invariants.
+/// `items` is the flattened `[k, v, k, v, …]` slice popped for the literal.
+fn check_literal_map_keys(items: &[Value]) -> Result<(), SemaError> {
+    for pair in items.chunks(2) {
+        if pair[0].is_mutable_container() {
+            return Err(
+                SemaError::type_error("immutable map key", pair[0].type_name())
+                    .with_hint("freeze the key first (mutable-array/->vector or mutable-cell/get)"),
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Close all open upvalues in the given open_upvalues vec, reading from the stack.
 fn close_open_upvalues(open: &mut [Option<Rc<UpvalueCell>>], stack: &[Value], base: usize) {
     for (slot, maybe_cell) in open.iter_mut().enumerate() {
@@ -2163,6 +2179,9 @@ impl VM {
                         let n = read_u16!(code, pc) as usize;
                         let start = self.stack.len() - n * 2;
                         let items: Vec<Value> = self.stack.drain(start..).collect();
+                        if let Err(err) = check_literal_map_keys(&items) {
+                            handle_err!(self, fi, pc, err, pc - op::SIZE_OP_U16, 'dispatch);
+                        }
                         let mut map = BTreeMap::new();
                         for pair in items.chunks(2) {
                             map.insert(pair[0].clone(), pair[1].clone());
@@ -2173,6 +2192,9 @@ impl VM {
                         let n = read_u16!(code, pc) as usize;
                         let start = self.stack.len() - n * 2;
                         let items: Vec<Value> = self.stack.drain(start..).collect();
+                        if let Err(err) = check_literal_map_keys(&items) {
+                            handle_err!(self, fi, pc, err, pc - op::SIZE_OP_U16, 'dispatch);
+                        }
                         let mut map = hashbrown::HashMap::new();
                         for pair in items.chunks(2) {
                             map.insert(pair[0].clone(), pair[1].clone());
@@ -2786,6 +2808,19 @@ impl VM {
                                         "index {} out of bounds (length {})",
                                         idx,
                                         v.len()
+                                    ));
+                                    handle_err!(self, fi, pc, err, pc - op::SIZE_OP, 'dispatch);
+                                }
+                            }
+                        } else if let Some(arr) = coll.as_mutable_array() {
+                            let item = arr.items.borrow().get(idx).cloned();
+                            match item {
+                                Some(v) => self.stack.push(v),
+                                None => {
+                                    let err = SemaError::eval(format!(
+                                        "index {} out of bounds (length {})",
+                                        idx,
+                                        arr.items.borrow().len()
                                     ));
                                     handle_err!(self, fi, pc, err, pc - op::SIZE_OP, 'dispatch);
                                 }

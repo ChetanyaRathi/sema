@@ -176,6 +176,151 @@
       "body": "List the entry names contained in the ZIP archive at `zip-path`, returning a list of strings without extracting anything. Requires the `fs-read` capability.\n\n```sema\n(zip/list \"bundle.zip\")\n```"
     },
     {
+      "name": "bytes/->string",
+      "module": "bytevectors",
+      "section": "Byte Ops",
+      "summary": "Decode a bytevector (or the byte range `start..end` of it) as a UTF-8 string. Invalid UTF-8 is an error, like `utf8->string`; the optional range decodes a sub-slice with no intermediate `bytes/slice` allocation.",
+      "params": [
+        {
+          "name": "bv",
+          "type": "bytevector"
+        },
+        {
+          "name": "start",
+          "type": "int"
+        },
+        {
+          "name": "end",
+          "type": "int",
+          "doc": "exclusive; defaults to the length"
+        }
+      ],
+      "returns": "string",
+      "examples": [
+        "(bytes/->string (string->utf8 \"Oslo;-12.3\") 0 4)   ; => \"Oslo\"\n(bytes/->string (string->utf8 \"abc\"))              ; => \"abc\""
+      ],
+      "body": "Decode a bytevector (or the byte range `start..end` of it) as a UTF-8 string. Invalid UTF-8 is an error, like `utf8->string`; the optional range decodes a sub-slice with no intermediate `bytes/slice` allocation.\n\n```sema\n(bytes/->string (string->utf8 \"Oslo;-12.3\") 0 4)   ; => \"Oslo\"\n(bytes/->string (string->utf8 \"abc\"))              ; => \"abc\"\n```"
+    },
+    {
+      "name": "bytes/find",
+      "module": "bytevectors",
+      "section": "Byte Ops",
+      "summary": "Find the first occurrence of a needle in a bytevector: a memchr-style byte search. Returns the absolute byte index, or `nil` when absent. The needle is a single byte (int 0–255), a bytevector, or a string (searched as its UTF-8 bytes). The optional `start` offset resumes a scan without slicing.",
+      "params": [
+        {
+          "name": "bv",
+          "type": "bytevector",
+          "doc": "haystack"
+        },
+        {
+          "name": "needle",
+          "type": "any",
+          "doc": "a byte (int 0-255), bytevector, or string"
+        },
+        {
+          "name": "start",
+          "type": "int",
+          "doc": "search from this byte offset"
+        }
+      ],
+      "returns": "int or nil",
+      "examples": [
+        "(bytes/find (string->utf8 \"Oslo;-12.3\") 59)      ; => 4 (the ';' byte)\n(bytes/find (string->utf8 \"hello\") \"llo\")        ; => 2\n(bytes/find (string->utf8 \"a;b;c\") 59 2)         ; => 3\n(bytes/find (string->utf8 \"abc\") 59)             ; => nil"
+      ],
+      "body": "Find the first occurrence of a needle in a bytevector: a memchr-style byte search. Returns the absolute byte index, or `nil` when absent. The needle is a single byte (int 0–255), a bytevector, or a string (searched as its UTF-8 bytes). The optional `start` offset resumes a scan without slicing.\n\n```sema\n(bytes/find (string->utf8 \"Oslo;-12.3\") 59)      ; => 4 (the ';' byte)\n(bytes/find (string->utf8 \"hello\") \"llo\")        ; => 2\n(bytes/find (string->utf8 \"a;b;c\") 59 2)         ; => 3\n(bytes/find (string->utf8 \"abc\") 59)             ; => nil\n```"
+    },
+    {
+      "name": "bytes/length",
+      "module": "bytevectors",
+      "section": "Byte Ops",
+      "summary": "Return the length of a bytevector in bytes. Part of the `bytes/*` family for byte-oriented hot loops (no UTF-8 work); same result as `bytevector/length`.",
+      "params": [
+        {
+          "name": "bv",
+          "type": "bytevector"
+        }
+      ],
+      "returns": "int",
+      "examples": [
+        "(bytes/length (string->utf8 \"abc\"))   ; => 3"
+      ],
+      "body": "Return the length of a bytevector in bytes. Part of the `bytes/*` family for byte-oriented hot loops (no UTF-8 work); same result as `bytevector/length`.\n\n```sema\n(bytes/length (string->utf8 \"abc\"))   ; => 3\n```"
+    },
+    {
+      "name": "bytes/parse-int10",
+      "module": "bytevectors",
+      "section": "Byte Ops",
+      "summary": "Parse ASCII `-?digits(.digit)?` as a base-10 integer scaled by 10: `\"-12.3\"` → `-123`, `\"5\"` → `50`. This is the fixed-point trick for one-decimal measurements (e.g. 1BRC temperatures): the value times ten as an exact int, with no float math or string allocation. At most one fractional digit is accepted; anything else (empty input, stray characters, more decimals) is an error. The optional `start`/`end` range parses a sub-slice in place.",
+      "params": [
+        {
+          "name": "bv",
+          "type": "bytevector"
+        },
+        {
+          "name": "start",
+          "type": "int"
+        },
+        {
+          "name": "end",
+          "type": "int",
+          "doc": "exclusive; defaults to the length"
+        }
+      ],
+      "returns": "int",
+      "examples": [
+        "(bytes/parse-int10 (string->utf8 \"-12.3\"))            ; => -123\n(bytes/parse-int10 (string->utf8 \"5\"))                ; => 50\n(bytes/parse-int10 (string->utf8 \"Oslo;-12.3\") 5)     ; => -123"
+      ],
+      "body": "Parse ASCII `-?digits(.digit)?` as a base-10 integer scaled by 10: `\"-12.3\"` → `-123`, `\"5\"` → `50`. This is the fixed-point trick for one-decimal measurements (e.g. 1BRC temperatures): the value times ten as an exact int, with no float math or string allocation. At most one fractional digit is accepted; anything else (empty input, stray characters, more decimals) is an error. The optional `start`/`end` range parses a sub-slice in place.\n\n```sema\n(bytes/parse-int10 (string->utf8 \"-12.3\"))            ; => -123\n(bytes/parse-int10 (string->utf8 \"5\"))                ; => 50\n(bytes/parse-int10 (string->utf8 \"Oslo;-12.3\") 5)     ; => -123\n```"
+    },
+    {
+      "name": "bytes/ref",
+      "module": "bytevectors",
+      "section": "Byte Ops",
+      "summary": "Return the byte (0–255) at a zero-based index of a bytevector. Out of bounds is an error.",
+      "params": [
+        {
+          "name": "bv",
+          "type": "bytevector"
+        },
+        {
+          "name": "index",
+          "type": "int",
+          "doc": "zero-based"
+        }
+      ],
+      "returns": "int",
+      "examples": [
+        "(bytes/ref (string->utf8 \"abc\") 1)   ; => 98"
+      ],
+      "body": "Return the byte (0–255) at a zero-based index of a bytevector. Out of bounds is an error.\n\n```sema\n(bytes/ref (string->utf8 \"abc\") 1)   ; => 98\n```"
+    },
+    {
+      "name": "bytes/slice",
+      "module": "bytevectors",
+      "section": "Byte Ops",
+      "summary": "Copy the byte range `start..end` (end exclusive, defaulting to the end) out of a bytevector. Indices are byte offsets — no UTF-8 validation or char-boundary rules, unlike `substring`. Prefer the optional start/end arguments of `bytes/->string`, `bytes/find`, and `bytes/parse-int10` in hot loops; they read the same range without this copy.",
+      "params": [
+        {
+          "name": "bv",
+          "type": "bytevector"
+        },
+        {
+          "name": "start",
+          "type": "int"
+        },
+        {
+          "name": "end",
+          "type": "int",
+          "doc": "exclusive; defaults to the length"
+        }
+      ],
+      "returns": "bytevector",
+      "examples": [
+        "(bytes/slice (string->utf8 \"hello\") 1 3)   ; => #u8(101 108)\n(bytes/->string (bytes/slice (string->utf8 \"hello\") 3))   ; => \"lo\""
+      ],
+      "body": "Copy the byte range `start..end` (end exclusive, defaulting to the end) out of a bytevector. Indices are byte offsets — no UTF-8 validation or char-boundary rules, unlike `substring`. Prefer the optional start/end arguments of `bytes/->string`, `bytes/find`, and `bytes/parse-int10` in hot loops; they read the same range without this copy.\n\n```sema\n(bytes/slice (string->utf8 \"hello\") 1 3)   ; => #u8(101 108)\n(bytes/->string (bytes/slice (string->utf8 \"hello\") 3))   ; => \"lo\"\n```"
+    },
+    {
       "name": "bytevector",
       "module": "bytevectors",
       "section": "Construction",
@@ -2144,6 +2289,32 @@
         ";; Count lines.\n(file/fold-lines \"data.csv\" (fn (acc line) (+ acc 1)) 0)\n; => 42\n\n;; Sum the first CSV column without loading the file.\n(file/fold-lines \"nums.csv\"\n  (fn (total line) (+ total (string->number (first (string/split line \",\")))))\n  0)"
       ],
       "body": "Fold over the lines of a file with an accumulator, streaming one line at a time. The reducer receives `(acc line)` — accumulator first, then the current line (newline already stripped) — and returns the next accumulator.\n\nThis is the memory-efficient way to summarize a large file: it never holds the whole file in memory, unlike `(foldl f init (file/read-lines path))`, which materializes every line as a list first. Uses a 256KB read buffer for throughput. Reach for `file/for-each-line` instead when you only need side effects and no running result.\n\n```sema\n;; Count lines.\n(file/fold-lines \"data.csv\" (fn (acc line) (+ acc 1)) 0)\n; => 42\n\n;; Sum the first CSV column without loading the file.\n(file/fold-lines \"nums.csv\"\n  (fn (total line) (+ total (string->number (first (string/split line \",\")))))\n  0)\n```"
+    },
+    {
+      "name": "file/fold-lines-bytes",
+      "module": "file-io",
+      "section": "File Operations",
+      "summary": "Fold over the lines of a file with an accumulator, passing each line to the reducer as a **bytevector** (trailing `\\n`/`\\r\\n` stripped, no UTF-8 validation). The byte-oriented sibling of `file/fold-lines`, for `bytes/*` pipelines that avoid per-line string decoding: `bytes/find` the separator, `bytes/parse-int10` the number, `bytes/->string` only what must become text.",
+      "params": [
+        {
+          "name": "path",
+          "type": "string"
+        },
+        {
+          "name": "f",
+          "type": "function",
+          "doc": "(acc line-bytes) -> acc"
+        },
+        {
+          "name": "init",
+          "type": "any"
+        }
+      ],
+      "returns": "any",
+      "examples": [
+        ";; Sum one-decimal temperatures from \"Name;-12.3\" lines as ints ×10.\n(file/fold-lines-bytes \"measurements.txt\"\n  (fn (acc line)\n    (let ((semi (bytes/find line 59)))          ; 59 = ';'\n      (+ acc (bytes/parse-int10 line (+ semi 1)))))\n  0)"
+      ],
+      "body": "Fold over the lines of a file with an accumulator, passing each line to the reducer as a **bytevector** (trailing `\\n`/`\\r\\n` stripped, no UTF-8 validation). The byte-oriented sibling of `file/fold-lines`, for `bytes/*` pipelines that avoid per-line string decoding: `bytes/find` the separator, `bytes/parse-int10` the number, `bytes/->string` only what must become text.\n\nStreams with a 256KB read buffer and never holds the whole file in memory. Reach for `file/fold-lines` when you want lines as strings.\n\n```sema\n;; Sum one-decimal temperatures from \"Name;-12.3\" lines as ints ×10.\n(file/fold-lines-bytes \"measurements.txt\"\n  (fn (acc line)\n    (let ((semi (bytes/find line 59)))          ; 59 = ';'\n      (+ acc (bytes/parse-int10 line (+ semi 1)))))\n  0)\n```"
     },
     {
       "name": "file/for-each-line",
@@ -7170,6 +7341,193 @@
         "(message/with-image :user \"Describe this picture\" png-bytes {:media-type \"image/png\"})"
       ],
       "body": "Build a multimodal message with text plus an attached image. Role is `:system`, `:user`, `:assistant`, or `:tool`; the image is a bytevector that is base64-encoded. The media type is auto-detected unless overridden via opts `:media-type`.\n\n```sema\n(message/with-image :user \"Describe this picture\" png-bytes {:media-type \"image/png\"})\n```"
+    },
+    {
+      "name": "mutable-array/->vector",
+      "module": "mutable",
+      "section": "Mutable Containers",
+      "summary": "Freeze a mutable array into an immutable vector — a snapshot copy: later mutation of the array does not change the returned vector. This is the hand-off point from an imperative accumulation loop back to the persistent world (sortable, printable, usable as map values).",
+      "params": [
+        {
+          "name": "arr",
+          "type": "mutable-array"
+        }
+      ],
+      "returns": "vector",
+      "examples": [
+        "(define a (mutable-array/new))\n(mutable-array/push! a 1)\n(define v (mutable-array/->vector a))\n(mutable-array/set! a 0 9)\nv   ; => [1] — the snapshot is unaffected"
+      ],
+      "body": "Freeze a mutable array into an immutable vector — a snapshot copy: later mutation of the array does not change the returned vector. This is the hand-off point from an imperative accumulation loop back to the persistent world (sortable, printable, usable as map values).\n\n```sema\n(define a (mutable-array/new))\n(mutable-array/push! a 1)\n(define v (mutable-array/->vector a))\n(mutable-array/set! a 0 9)\nv   ; => [1] — the snapshot is unaffected\n```"
+    },
+    {
+      "name": "mutable-array/get",
+      "module": "mutable",
+      "section": "Mutable Containers",
+      "summary": "Read the element at a zero-based index of a mutable array. Out of bounds is an error unless a `default` is supplied. `(nth arr i)` also works on mutable arrays.",
+      "params": [
+        {
+          "name": "arr",
+          "type": "mutable-array"
+        },
+        {
+          "name": "index",
+          "type": "int",
+          "doc": "zero-based"
+        },
+        {
+          "name": "default",
+          "type": "any",
+          "doc": "returned when the index is out of bounds"
+        }
+      ],
+      "returns": "any",
+      "examples": [
+        "(define a (mutable-array/new 2 :x))\n(mutable-array/get a 1)            ; => :x\n(mutable-array/get a 9 :missing)   ; => :missing"
+      ],
+      "body": "Read the element at a zero-based index of a mutable array. Out of bounds is an error unless a `default` is supplied. `(nth arr i)` also works on mutable arrays.\n\n```sema\n(define a (mutable-array/new 2 :x))\n(mutable-array/get a 1)            ; => :x\n(mutable-array/get a 9 :missing)   ; => :missing\n```"
+    },
+    {
+      "name": "mutable-array/length",
+      "module": "mutable",
+      "section": "Mutable Containers",
+      "summary": "Return the number of elements currently in a mutable array (not its capacity).",
+      "params": [
+        {
+          "name": "arr",
+          "type": "mutable-array"
+        }
+      ],
+      "returns": "int",
+      "examples": [
+        "(mutable-array/length (mutable-array/new 64))    ; => 0\n(mutable-array/length (mutable-array/new 3 :x))  ; => 3"
+      ],
+      "body": "Return the number of elements currently in a mutable array (not its capacity).\n\n```sema\n(mutable-array/length (mutable-array/new 64))    ; => 0\n(mutable-array/length (mutable-array/new 3 :x))  ; => 3\n```"
+    },
+    {
+      "name": "mutable-array/new",
+      "module": "mutable",
+      "section": "Mutable Containers",
+      "summary": "Create a mutable array — an in-place mutable container for imperative hot loops, unlike the persistent (copy-on-write) `vector`. With no arguments it is empty; with one argument the array is still empty but pre-allocates capacity for that many pushes; with two arguments it holds `n` copies of `fill`, ready for indexed `mutable-array/set!`.",
+      "params": [
+        {
+          "name": "cap-or-n",
+          "type": "int",
+          "doc": "capacity hint (1-arg) or element count (2-arg)"
+        },
+        {
+          "name": "fill",
+          "type": "any",
+          "doc": "fill value for the 2-arg form"
+        }
+      ],
+      "returns": "mutable-array",
+      "examples": [
+        "(define a (mutable-array/new))        ; empty\n(mutable-array/push! a 1)\n(mutable-array/->vector a)            ; => [1]\n\n(mutable-array/->vector (mutable-array/new 3 0))  ; => [0 0 0]\n(mutable-array/length (mutable-array/new 64))     ; => 0 (capacity only)"
+      ],
+      "body": "Create a mutable array — an in-place mutable container for imperative hot loops, unlike the persistent (copy-on-write) `vector`. With no arguments it is empty; with one argument the array is still empty but pre-allocates capacity for that many pushes; with two arguments it holds `n` copies of `fill`, ready for indexed `mutable-array/set!`.\n\nMutable arrays are shared by reference: mutating through one binding is visible through every other binding to the same array. `equal?` compares contents; use `mutable-array/->vector` to freeze a snapshot for the immutable world. Mutable arrays cannot be used as map keys.\n\n```sema\n(define a (mutable-array/new))        ; empty\n(mutable-array/push! a 1)\n(mutable-array/->vector a)            ; => [1]\n\n(mutable-array/->vector (mutable-array/new 3 0))  ; => [0 0 0]\n(mutable-array/length (mutable-array/new 64))     ; => 0 (capacity only)\n```"
+    },
+    {
+      "name": "mutable-array/push!",
+      "module": "mutable",
+      "section": "Mutable Containers",
+      "summary": "Append a value to the end of a mutable array, in place. Returns the array itself, so pushes chain and work as the accumulator of a fold.",
+      "params": [
+        {
+          "name": "arr",
+          "type": "mutable-array"
+        },
+        {
+          "name": "value",
+          "type": "any"
+        }
+      ],
+      "returns": "mutable-array",
+      "examples": [
+        "(define a (mutable-array/new))\n(mutable-array/push! (mutable-array/push! a 1) 2)\n(mutable-array/->vector a)   ; => [1 2]\n\n;; As a fold accumulator:\n(mutable-array/->vector\n  (foldl (fn (acc x) (mutable-array/push! acc (* x x)))\n         (mutable-array/new)\n         '(1 2 3)))\n; => [1 4 9]"
+      ],
+      "body": "Append a value to the end of a mutable array, in place. Returns the array itself, so pushes chain and work as the accumulator of a fold.\n\n```sema\n(define a (mutable-array/new))\n(mutable-array/push! (mutable-array/push! a 1) 2)\n(mutable-array/->vector a)   ; => [1 2]\n\n;; As a fold accumulator:\n(mutable-array/->vector\n  (foldl (fn (acc x) (mutable-array/push! acc (* x x)))\n         (mutable-array/new)\n         '(1 2 3)))\n; => [1 4 9]\n```"
+    },
+    {
+      "name": "mutable-array/set!",
+      "module": "mutable",
+      "section": "Mutable Containers",
+      "summary": "Overwrite the element at a zero-based index of a mutable array, in place. The slot must already exist (`index < length`) — use `mutable-array/push!` to grow. Returns the array. Unlike `vector` updates, no copy is made: every binding to the array sees the new value.",
+      "params": [
+        {
+          "name": "arr",
+          "type": "mutable-array"
+        },
+        {
+          "name": "index",
+          "type": "int",
+          "doc": "zero-based; must be < length"
+        },
+        {
+          "name": "value",
+          "type": "any"
+        }
+      ],
+      "returns": "mutable-array",
+      "examples": [
+        "(define stats (mutable-array/new 4 0))   ; [min max sum count] accumulator\n(mutable-array/set! stats 2 (+ (mutable-array/get stats 2) 57))\n(mutable-array/->vector stats)   ; => [0 0 57 0]"
+      ],
+      "body": "Overwrite the element at a zero-based index of a mutable array, in place. The slot must already exist (`index < length`) — use `mutable-array/push!` to grow. Returns the array. Unlike `vector` updates, no copy is made: every binding to the array sees the new value.\n\n```sema\n(define stats (mutable-array/new 4 0))   ; [min max sum count] accumulator\n(mutable-array/set! stats 2 (+ (mutable-array/get stats 2) 57))\n(mutable-array/->vector stats)   ; => [0 0 57 0]\n```"
+    },
+    {
+      "name": "mutable-cell/get",
+      "module": "mutable",
+      "section": "Mutable Containers",
+      "summary": "Read the current contents of a mutable cell.",
+      "params": [
+        {
+          "name": "cell",
+          "type": "mutable-cell"
+        }
+      ],
+      "returns": "any",
+      "examples": [
+        "(define c (mutable-cell/new :ready))\n(mutable-cell/get c)   ; => :ready"
+      ],
+      "body": "Read the current contents of a mutable cell.\n\n```sema\n(define c (mutable-cell/new :ready))\n(mutable-cell/get c)   ; => :ready\n```"
+    },
+    {
+      "name": "mutable-cell/new",
+      "module": "mutable",
+      "section": "Mutable Containers",
+      "summary": "Create a mutable cell: a single in-place mutable slot holding one value (a boxed value). Like mutable arrays, cells are shared by reference — the imperative escape hatch for a counter or running aggregate threaded through callbacks without rebuilding a container per update. Cells cannot be used as map keys.",
+      "params": [
+        {
+          "name": "value",
+          "type": "any",
+          "doc": "initial contents"
+        }
+      ],
+      "returns": "mutable-cell",
+      "examples": [
+        "(define counter (mutable-cell/new 0))\n(mutable-cell/set! counter (+ 1 (mutable-cell/get counter)))\n(mutable-cell/get counter)   ; => 1"
+      ],
+      "body": "Create a mutable cell: a single in-place mutable slot holding one value (a boxed value). Like mutable arrays, cells are shared by reference — the imperative escape hatch for a counter or running aggregate threaded through callbacks without rebuilding a container per update. Cells cannot be used as map keys.\n\n```sema\n(define counter (mutable-cell/new 0))\n(mutable-cell/set! counter (+ 1 (mutable-cell/get counter)))\n(mutable-cell/get counter)   ; => 1\n```"
+    },
+    {
+      "name": "mutable-cell/set!",
+      "module": "mutable",
+      "section": "Mutable Containers",
+      "summary": "Replace the contents of a mutable cell, in place. Returns the cell. Every binding to the cell sees the new value.",
+      "params": [
+        {
+          "name": "cell",
+          "type": "mutable-cell"
+        },
+        {
+          "name": "value",
+          "type": "any"
+        }
+      ],
+      "returns": "mutable-cell",
+      "examples": [
+        "(define best (mutable-cell/new nil))\n(mutable-cell/set! best 42)\n(mutable-cell/get best)   ; => 42"
+      ],
+      "body": "Replace the contents of a mutable cell, in place. Returns the cell. Every binding to the cell sees the new value.\n\n```sema\n(define best (mutable-cell/new nil))\n(mutable-cell/set! best 42)\n(mutable-cell/get best)   ; => 42\n```"
     },
     {
       "name": "otel/configure",

@@ -30,6 +30,7 @@ mod map;
 mod markup;
 mod math;
 mod meta;
+mod mutable;
 mod otel;
 #[cfg(not(target_arch = "wasm32"))]
 mod pdf;
@@ -143,6 +144,7 @@ pub fn register_stdlib(env: &Env, sandbox: &Sandbox) {
     ws::register(env, sandbox);
     bitwise::register(env);
     crypto::register(env);
+    mutable::register(env);
     datetime::register(env);
     csv_ops::register(env);
     bytevector::register(env);

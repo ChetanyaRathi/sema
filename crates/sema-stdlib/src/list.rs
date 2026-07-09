@@ -149,9 +149,17 @@ pub fn register(env: &sema_core::Env) {
             v.get(idx).cloned().ok_or_else(|| {
                 SemaError::eval(format!("index {idx} out of bounds (length {})", v.len()))
             })
+        } else if let Some(arr) = args[0].as_mutable_array() {
+            let items = arr.items.borrow();
+            items.get(idx).cloned().ok_or_else(|| {
+                SemaError::eval(format!(
+                    "index {idx} out of bounds (length {})",
+                    items.len()
+                ))
+            })
         } else {
             Err(SemaError::type_error("list or vector", args[0].type_name())
-                .with_hint("nth: argument 1 must be a list or vector"))
+                .with_hint("nth: argument 1 must be a list, vector, or mutable-array"))
         }
     });
 

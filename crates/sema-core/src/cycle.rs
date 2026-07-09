@@ -7,7 +7,8 @@
 //! allocation's data pointer. Cycles are reclaimed by *severing* the mutable
 //! cell every Sema cycle must pass through (invariant I1: env bindings,
 //! upvalue cells, `Thunk.forced`, promise state, channel buffers, multimethod
-//! tables) and letting the ordinary `Rc` drop cascade free the memory.
+//! tables, mutable-array elements, mutable-cell slots) and letting the
+//! ordinary `Rc` drop cascade free the memory.
 //!
 //! Candidate discovery is a creation-time registry of the only objects that
 //! can be *born into* cycles (plan §4 option B), not a decrement buffer —
@@ -24,7 +25,7 @@ use std::rc::{Rc, Weak};
 use hashbrown::{hash_map, HashMap, HashSet};
 use lasso::Spur;
 
-use crate::value::{AsyncPromise, Channel, MultiMethod, Thunk};
+use crate::value::{AsyncPromise, Channel, MultiMethod, MutableArray, MutableCell, Thunk};
 use crate::value::{Env, NativeFn, PromiseState, Value, ValueViewRef};
 
 /// The shared bindings allocation of an [`Env`] — the env's *node identity*
@@ -142,6 +143,10 @@ pub enum GcNode {
     Channel(Weak<Channel>),
     /// Multimethod (data-only cycles via the method table).
     MultiMethod(Weak<MultiMethod>),
+    /// Mutable array (data-only cycles via the element vector).
+    MutableArray(Weak<MutableArray>),
+    /// Mutable cell (data-only cycles via the value slot).
+    MutableCell(Weak<MutableCell>),
 }
 
 impl GcNode {
@@ -155,6 +160,8 @@ impl GcNode {
             GcNode::Promise(w) => w.strong_count(),
             GcNode::Channel(w) => w.strong_count(),
             GcNode::MultiMethod(w) => w.strong_count(),
+            GcNode::MutableArray(w) => w.strong_count(),
+            GcNode::MutableCell(w) => w.strong_count(),
         }
     }
 
@@ -188,6 +195,14 @@ impl GcNode {
             GcNode::MultiMethod(w) => w.upgrade().map(|rc| {
                 let ptr = NodePtr::of_rc(&rc);
                 (ptr, NodeHandle::Value(Value::multimethod_from_rc(rc)))
+            }),
+            GcNode::MutableArray(w) => w.upgrade().map(|rc| {
+                let ptr = NodePtr::of_rc(&rc);
+                (ptr, NodeHandle::Value(Value::mutable_array_from_rc(rc)))
+            }),
+            GcNode::MutableCell(w) => w.upgrade().map(|rc| {
+                let ptr = NodePtr::of_rc(&rc);
+                (ptr, NodeHandle::Value(Value::mutable_cell_from_rc(rc)))
             }),
         }
     }
@@ -601,6 +616,22 @@ pub fn trace_value(v: &Value, sink: &mut dyn FnMut(GcEdge)) -> bool {
                 for item in buffer.iter() {
                     sink(GcEdge::Value(item));
                 }
+                true
+            }
+            Err(_) => false,
+        },
+        ValueViewRef::MutableArray(a) => match a.items.try_borrow() {
+            Ok(items) => {
+                for item in items.iter() {
+                    sink(GcEdge::Value(item));
+                }
+                true
+            }
+            Err(_) => false,
+        },
+        ValueViewRef::MutableCell(c) => match c.value.try_borrow() {
+            Ok(slot) => {
+                sink(GcEdge::Value(&slot));
                 true
             }
             Err(_) => false,
@@ -1348,6 +1379,14 @@ fn sever_node(ptr: NodePtr, handle: &NodeHandle, severed: &mut Vec<Value>) {
                 Ok(mut buffer) => severed.extend(buffer.drain(..)),
                 Err(_) => debug_assert!(false, "white channel borrowed during severing"),
             },
+            ValueViewRef::MutableArray(a) => match a.items.try_borrow_mut() {
+                Ok(mut items) => severed.extend(items.drain(..)),
+                Err(_) => debug_assert!(false, "white mutable array borrowed during severing"),
+            },
+            ValueViewRef::MutableCell(c) => match c.value.try_borrow_mut() {
+                Ok(mut slot) => severed.push(std::mem::replace(&mut *slot, Value::NIL)),
+                Err(_) => debug_assert!(false, "white mutable cell borrowed during severing"),
+            },
             ValueViewRef::MultiMethod(m) => {
                 match m.methods.try_borrow_mut() {
                     Ok(mut methods) => {
@@ -1400,6 +1439,8 @@ fn value_node_ptr(v: &Value) -> Option<NodePtr> {
         | ValueViewRef::MultiMethod(_)
         | ValueViewRef::Channel(_)
         | ValueViewRef::AsyncPromise(_)
+        | ValueViewRef::MutableArray(_)
+        | ValueViewRef::MutableCell(_)
         | ValueViewRef::Macro(_)
         | ValueViewRef::Lambda(_)
         | ValueViewRef::NativeFn(_) => Some(NodePtr(ptr)),
@@ -1592,6 +1633,61 @@ mod tests {
         assert_eq!(stats.collected, 4, "nf + payload + cell + list");
         assert!(weak_nf.upgrade().is_none());
         assert_eq!(weak_cell.strong_count(), 0);
+    }
+
+    // Mutable-array self-cycle (an array pushed into itself) collected via
+    // the constructor's creation-time candidate registration.
+    #[test]
+    fn mutable_array_self_cycle_collected() {
+        let arr = Value::mutable_array(Vec::new());
+        let a = arr
+            .as_mutable_array_rc()
+            .expect("constructor yields a mutable array");
+        a.items.borrow_mut().push(arr.clone());
+        let weak = Rc::downgrade(&a);
+        drop((arr, a));
+        assert!(
+            weak.upgrade().is_some(),
+            "self-cycle keeps the array alive pre-collect"
+        );
+
+        let stats = collect(&[], GcTrigger::Explicit);
+
+        assert!(!stats.aborted);
+        assert!(stats.collected >= 1);
+        assert_eq!(weak.strong_count(), 0, "array reclaimed");
+    }
+
+    // Mutable-cell self-cycle (a cell set to itself) collected the same way.
+    #[test]
+    fn mutable_cell_self_cycle_collected() {
+        let cell = Value::mutable_cell(Value::NIL);
+        let c = cell
+            .as_mutable_cell_rc()
+            .expect("constructor yields a mutable cell");
+        *c.value.borrow_mut() = cell.clone();
+        let weak = Rc::downgrade(&c);
+        drop((cell, c));
+        assert!(
+            weak.upgrade().is_some(),
+            "self-cycle keeps the cell alive pre-collect"
+        );
+
+        let stats = collect(&[], GcTrigger::Explicit);
+
+        assert!(!stats.aborted);
+        assert!(stats.collected >= 1);
+        assert_eq!(weak.strong_count(), 0, "cell reclaimed");
+    }
+
+    // A live mutable array next to garbage cycles keeps its contents intact.
+    #[test]
+    fn live_mutable_array_kept_intact() {
+        let arr = Value::mutable_array(vec![Value::int(1), Value::int(2)]);
+        let stats = collect(&[], GcTrigger::Explicit);
+        assert!(!stats.aborted);
+        let a = arr.as_mutable_array().expect("still a mutable array");
+        assert_eq!(&*a.items.borrow(), &[Value::int(1), Value::int(2)]);
     }
 
     // 3. Thunk.forced self-cycle collected; live unforced thunk kept intact.

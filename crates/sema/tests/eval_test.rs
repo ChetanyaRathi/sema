@@ -2683,3 +2683,80 @@ eval_error_tests! {
     // Name must be a symbol
     sr_bad_name: "(define-syntax 5 (syntax-rules () ((_ a) a)))" => "define-syntax",
 }
+
+// ============================================================
+// Mutable arrays / cells
+// ============================================================
+
+eval_tests! {
+    mutable_array_push_get: "(let ((a (mutable-array/new))) (mutable-array/push! a 1) (mutable-array/push! a 2) (mutable-array/get a 1))" => Value::int(2),
+    // Reference sharing: mutation through one handle is visible through another.
+    mutable_array_shared_mutation: "(let* ((a (mutable-array/new)) (b a)) (mutable-array/push! a 7) (mutable-array/get b 0))" => Value::int(7),
+    mutable_array_new_filled: "(mutable-array/->vector (mutable-array/new 3 0))" => common::eval("[0 0 0]"),
+    mutable_array_capacity_starts_empty: "(mutable-array/length (mutable-array/new 64))" => Value::int(0),
+    mutable_array_set: "(let ((a (mutable-array/new 2 0))) (mutable-array/set! a 1 9) (mutable-array/->vector a))" => common::eval("[0 9]"),
+    mutable_array_get_default: "(mutable-array/get (mutable-array/new) 5 :missing)" => Value::keyword("missing"),
+    mutable_array_length: "(mutable-array/length (mutable-array/new 3 :x))" => Value::int(3),
+    mutable_array_nth_interop: "(nth (mutable-array/new 2 :v) 1)" => Value::keyword("v"),
+    mutable_array_type_name: "(type (mutable-array/new))" => Value::keyword("mutable-array"),
+    // ->vector freezes a snapshot: later mutation does not change it.
+    mutable_array_freeze_snapshots: "(let* ((a (mutable-array/new 1 0)) (v (mutable-array/->vector a))) (mutable-array/set! a 0 9) v)" => common::eval("[0]"),
+    mutable_array_equal_by_contents: "(equal? (mutable-array/new 2 1) (mutable-array/new 2 1))" => Value::bool(true),
+    mutable_array_unequal_contents: "(equal? (mutable-array/new 2 1) (mutable-array/new 2 2))" => Value::bool(false),
+    mutable_array_not_equal_to_vector: "(equal? (mutable-array/new 1 0) [0])" => Value::bool(false),
+    // Cyclic comparison terminates (coinductive equality, no infinite loop).
+    mutable_array_cyclic_equal_terminates: "(let ((a (mutable-array/new)) (b (mutable-array/new))) (mutable-array/push! a a) (mutable-array/push! b b) (equal? a b))" => Value::bool(true),
+    mutable_cell_round_trip: "(let ((c (mutable-cell/new 1))) (mutable-cell/set! c 99) (mutable-cell/get c))" => Value::int(99),
+    mutable_cell_shared_mutation: "(let* ((c (mutable-cell/new 0)) (d c)) (mutable-cell/set! c 5) (mutable-cell/get d))" => Value::int(5),
+    mutable_cell_equal_by_contents: "(equal? (mutable-cell/new 1) (mutable-cell/new 1))" => Value::bool(true),
+    mutable_cell_type_name: "(type (mutable-cell/new nil))" => Value::keyword("mutable-cell"),
+}
+
+eval_error_tests! {
+    mutable_array_get_oob: "(mutable-array/get (mutable-array/new) 0)" => "out of bounds",
+    mutable_array_set_oob: "(mutable-array/set! (mutable-array/new) 0 1)" => "out of bounds",
+    mutable_array_set_negative_index: "(mutable-array/set! (mutable-array/new 1 0) -1 5)" => "non-negative",
+    mutable_array_push_type_error: "(mutable-array/push! [1] 2)" => "mutable-array",
+    mutable_array_new_arity: "(mutable-array/new 1 2 3)" => "mutable-array/new",
+    mutable_cell_get_type_error: "(mutable-cell/get 5)" => "mutable-cell",
+    mutable_cell_set_arity: "(mutable-cell/set! (mutable-cell/new 1))" => "mutable-cell/set!",
+    // Mutable containers cannot be map keys (contents can change after insert).
+    mutable_array_map_key_rejected: "(hash-map (mutable-array/new) 1)" => "immutable map key",
+    mutable_array_assoc_key_rejected: "(assoc {} (mutable-array/new) 1)" => "immutable map key",
+    mutable_array_literal_key_rejected: "(let ((a (mutable-array/new))) {a 1})" => "immutable map key",
+    mutable_cell_hashmap_key_rejected: "(hashmap/new (mutable-cell/new 1) 2)" => "immutable map key",
+}
+
+// ============================================================
+// bytes/* byte-oriented ops on bytevectors
+// ============================================================
+
+eval_tests! {
+    bytes_length: "(bytes/length (string->utf8 \"abc\"))" => Value::int(3),
+    bytes_ref: "(bytes/ref (string->utf8 \"abc\") 1)" => Value::int(98),
+    bytes_find_byte: "(bytes/find (string->utf8 \"a;b\") 59)" => Value::int(1),
+    bytes_find_string_needle: "(bytes/find (string->utf8 \"hello\") \"llo\")" => Value::int(2),
+    bytes_find_bytevector_needle: "(bytes/find (string->utf8 \"hello\") (string->utf8 \"lo\"))" => Value::int(3),
+    // The optional start offset returns absolute indices.
+    bytes_find_from_start: "(bytes/find (string->utf8 \"a;b;c\") 59 2)" => Value::int(3),
+    bytes_find_missing_is_nil: "(bytes/find (string->utf8 \"abc\") 59)" => Value::nil(),
+    bytes_slice: "(bytes/->string (bytes/slice (string->utf8 \"hello\") 1 3))" => Value::string("el"),
+    bytes_slice_to_end: "(bytes/->string (bytes/slice (string->utf8 \"hello\") 3))" => Value::string("lo"),
+    bytes_to_string_range: "(bytes/->string (string->utf8 \"Oslo;-12.3\") 0 4)" => Value::string("Oslo"),
+    // The 1BRC fixed-point trick: one-decimal temperatures scale to ints.
+    bytes_parse_int10_decimal: "(bytes/parse-int10 (string->utf8 \"-12.3\"))" => Value::int(-123),
+    bytes_parse_int10_no_decimal: "(bytes/parse-int10 (string->utf8 \"5\"))" => Value::int(50),
+    bytes_parse_int10_negative_zero: "(bytes/parse-int10 (string->utf8 \"-0.0\"))" => Value::int(0),
+    bytes_parse_int10_start_offset: "(bytes/parse-int10 (string->utf8 \"Oslo;-12.3\") 5)" => Value::int(-123),
+}
+
+eval_error_tests! {
+    bytes_ref_oob: "(bytes/ref (string->utf8 \"a\") 5)" => "out of bounds",
+    bytes_slice_oob: "(bytes/slice (string->utf8 \"ab\") 1 9)" => "out of bounds",
+    bytes_length_type_error: "(bytes/length \"abc\")" => "bytevector",
+    bytes_find_needle_type_error: "(bytes/find (string->utf8 \"a\") 1.5)" => "int, bytevector, or string",
+    bytes_parse_int10_bad_digit: "(bytes/parse-int10 (string->utf8 \"12x\"))" => "invalid digit",
+    bytes_parse_int10_two_decimals: "(bytes/parse-int10 (string->utf8 \"1.23\"))" => "one digit",
+    bytes_parse_int10_empty: "(bytes/parse-int10 (string->utf8 \"\"))" => "digit",
+    bytes_to_string_invalid_utf8: "(bytes/->string (bytevector 255 254))" => "invalid UTF-8",
+}
