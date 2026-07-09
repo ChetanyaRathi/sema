@@ -272,6 +272,7 @@ fn patch_closure_func_ids(chunk: &mut Chunk, offset: u16) {
             // Variable-length instructions: skip op + operands
             Op::Const
             | Op::LoadLocal
+            | Op::TakeLocal
             | Op::StoreLocal
             | Op::LoadUpvalue
             | Op::StoreUpvalue
@@ -340,6 +341,12 @@ struct Compiler {
     /// `self_global` on the inner compiler for the define's own lambda (the
     /// next lambda compiled, reached only through span wrappers).
     pending_self_global: Option<Spur>,
+    /// `Var` load sites (addresses of the `VarRef` inside `ResolvedExpr::Var`
+    /// nodes of the lambda body being compiled) proven by `takelocal.rs` to be
+    /// the statically-last use of their never-captured local slot. These
+    /// compile to `TakeLocal` (move) instead of `LoadLocal` (clone). Always
+    /// empty for the top-level chunk, whose slots may outlive the chunk (REPL).
+    take_loads: HashSet<crate::takelocal::LoadSite>,
     /// Local slot names for debugger scope inspection.
     local_names: Vec<(u16, Spur)>,
     /// Block scope `(slot, start_pc, end_pc)` of each block-introduced local, so
@@ -372,6 +379,7 @@ impl Compiler {
             self_rebound_globals: HashSet::new(),
             self_global: None,
             pending_self_global: None,
+            take_loads: HashSet::new(),
             local_names: Vec::new(),
             local_scopes: Vec::new(),
         }
@@ -570,16 +578,28 @@ impl Compiler {
 
     fn compile_var_load(&mut self, vr: &VarRef) -> Result<(), SemaError> {
         match vr.resolution {
-            VarResolution::Local { slot } => match slot {
-                0 => self.emit.emit_op(Op::LoadLocal0),
-                1 => self.emit.emit_op(Op::LoadLocal1),
-                2 => self.emit.emit_op(Op::LoadLocal2),
-                3 => self.emit.emit_op(Op::LoadLocal3),
-                _ => {
-                    self.emit.emit_op(Op::LoadLocal);
+            VarResolution::Local { slot } => {
+                // Statically-last use of a never-captured slot: move the value
+                // (TakeLocal) instead of cloning it, so a uniquely-owned value
+                // can hit the stdlib's in-place COW fast paths. The slot reads
+                // nil afterwards, which nothing can observe except the debug
+                // inspector (documented in the bytecode format spec).
+                if self.take_loads.contains(&crate::takelocal::load_site(vr)) {
+                    self.emit.emit_op(Op::TakeLocal);
                     self.emit.emit_u16(slot);
+                    return Ok(());
                 }
-            },
+                match slot {
+                    0 => self.emit.emit_op(Op::LoadLocal0),
+                    1 => self.emit.emit_op(Op::LoadLocal1),
+                    2 => self.emit.emit_op(Op::LoadLocal2),
+                    3 => self.emit.emit_op(Op::LoadLocal3),
+                    _ => {
+                        self.emit.emit_op(Op::LoadLocal);
+                        self.emit.emit_u16(slot);
+                    }
+                }
+            }
             VarResolution::Upvalue { index } => {
                 self.emit.emit_op(Op::LoadUpvalue);
                 self.emit.emit_u16(index);
@@ -732,6 +752,18 @@ impl Compiler {
         // off nested lambdas — their running frames are not the defined
         // function, so a self-call there must stay a global call.
         inner.self_global = self.pending_self_global.take();
+        // Last-use moves: a *tail* self-call under an armed self_global reuses
+        // this frame in place (SelfTailCall), which the straight-line liveness
+        // walk cannot see — skip the analysis for those functions (takelocal.rs
+        // handles the resolver-elided SelfFn loops itself). Non-tail self-calls
+        // (CallSelf) push a fresh frame and need no special treatment.
+        let reuses_own_frame = match inner.self_global {
+            Some(sg) => crate::takelocal::has_tail_self_call(&def.body, sg),
+            None => false,
+        };
+        if !reuses_own_frame {
+            inner.take_loads = crate::takelocal::takeable_loads(def);
+        }
         inner.n_locals = def.n_locals;
         for (slot, &name) in def.params.iter().enumerate() {
             inner.local_names.push((slot as u16, name));
@@ -1568,6 +1600,7 @@ mod tests {
             match op {
                 Op::Const
                 | Op::LoadLocal
+                | Op::TakeLocal
                 | Op::StoreLocal
                 | Op::LoadUpvalue
                 | Op::StoreUpvalue
@@ -1716,9 +1749,10 @@ mod tests {
         assert_eq!(func.arity, 1);
         assert!(!func.has_rest);
 
-        // Inner function: LoadLocal0, Return
+        // Inner function: TakeLocal(0), Return — the identity read is x's
+        // last use, so it moves the slot value instead of cloning it.
         let inner_ops = extract_ops(&func.chunk);
-        assert_eq!(inner_ops, vec![Op::LoadLocal0, Op::Return]);
+        assert_eq!(inner_ops, vec![Op::TakeLocal, Op::Return]);
 
         // Top-level: MakeClosure, Return
         let top_ops = extract_ops(&result.chunk);
@@ -1813,12 +1847,13 @@ mod tests {
 
     #[test]
     fn test_compile_intrinsic_in_tail_position() {
-        // Intrinsics work in tail position too (they don't create frames)
+        // Intrinsics work in tail position too (they don't create frames).
+        // Both reads are last uses, so both move (TakeLocal).
         let result = compile_str("(lambda (x y) (+ x y))");
         let inner_ops = extract_ops(&result.functions[0].chunk);
         assert_eq!(
             inner_ops,
-            vec![Op::LoadLocal0, Op::LoadLocal1, Op::AddInt, Op::Return]
+            vec![Op::TakeLocal, Op::TakeLocal, Op::AddInt, Op::Return]
         );
     }
 
@@ -1835,11 +1870,12 @@ mod tests {
         // (if (not x) then else) → compile x, JumpIfTrue
         let result = compile_str("(lambda (x) (if (not x) 1 2))");
         let inner_ops = extract_ops(&result.functions[0].chunk);
-        // LoadLocal0(x), JumpIfTrue, Const(1), Jump, Const(2), Return
+        // TakeLocal(x) — the test read is x's last use — JumpIfTrue,
+        // Const(1), Jump, Const(2), Return
         assert_eq!(
             inner_ops,
             vec![
-                Op::LoadLocal0,
+                Op::TakeLocal,
                 Op::JumpIfTrue,
                 Op::Const,
                 Op::Jump,
@@ -1883,7 +1919,8 @@ mod tests {
     fn test_compile_let() {
         let result = compile_str("(lambda () (let ((x 1) (y 2)) x))");
         let inner_ops = extract_ops(&result.functions[0].chunk);
-        // CONST(1), CONST(2), StoreLocal1(y=1), StoreLocal0(x=0), LoadLocal0(x=0), Return
+        // CONST(1), CONST(2), StoreLocal1(y=1), StoreLocal0(x=0),
+        // TakeLocal(x=0) — the body read is x's last use — Return
         assert_eq!(
             inner_ops,
             vec![
@@ -1891,7 +1928,7 @@ mod tests {
                 Op::Const,
                 Op::StoreLocal1,
                 Op::StoreLocal0,
-                Op::LoadLocal0,
+                Op::TakeLocal,
                 Op::Return
             ]
         );
@@ -1902,15 +1939,16 @@ mod tests {
         // let* stores sequentially so later bindings see earlier ones
         let result = compile_str("(lambda () (let* ((x 1) (y x)) y))");
         let inner_ops = extract_ops(&result.functions[0].chunk);
-        // CONST(1), StoreLocal0(x), LoadLocal0(x), StoreLocal1(y), LoadLocal1(y), Return
+        // CONST(1), StoreLocal0(x), TakeLocal(x), StoreLocal1(y),
+        // TakeLocal(y), Return — both reads are last uses, so both move.
         assert_eq!(
             inner_ops,
             vec![
                 Op::Const,
                 Op::StoreLocal0,
-                Op::LoadLocal0,
+                Op::TakeLocal,
                 Op::StoreLocal1,
-                Op::LoadLocal1,
+                Op::TakeLocal,
                 Op::Return
             ]
         );
@@ -1920,7 +1958,8 @@ mod tests {
     fn test_compile_letrec() {
         let result = compile_str("(lambda () (letrec ((x 1)) x))");
         let inner_ops = extract_ops(&result.functions[0].chunk);
-        // Nil, StoreLocal0(x), CONST(1), StoreLocal0(x), LoadLocal0(x), Return
+        // Nil, StoreLocal0(x), CONST(1), StoreLocal0(x),
+        // TakeLocal(x) — the body read is x's last use — Return
         assert_eq!(
             inner_ops,
             vec![
@@ -1928,7 +1967,7 @@ mod tests {
                 Op::StoreLocal0,
                 Op::Const,
                 Op::StoreLocal0,
-                Op::LoadLocal0,
+                Op::TakeLocal,
                 Op::Return
             ]
         );
@@ -2293,6 +2332,175 @@ mod tests {
         assert!(
             ops.contains(&Op::LoadGlobal),
             "value self-reference must stay LoadGlobal: {ops:?}"
+        );
+    }
+
+    // --- TakeLocal: moving loads for statically-last uses ---
+
+    #[test]
+    fn test_take_local_last_use_call_arg() {
+        // `m`'s only use is dead after the call — compiled as a move.
+        let result = compile_str("(fn (m) (assoc m :k 1))");
+        let ops = extract_ops(&result.functions[0].chunk);
+        assert!(
+            ops.contains(&Op::TakeLocal),
+            "last use must emit TakeLocal: {ops:?}"
+        );
+        assert!(
+            !ops.contains(&Op::LoadLocal0) && !ops.contains(&Op::LoadLocal),
+            "no cloning load should remain for m: {ops:?}"
+        );
+    }
+
+    #[test]
+    fn test_take_local_only_at_last_use() {
+        // First read stays a clone (the slot is read again later); only the
+        // final read moves.
+        let result = compile_str("(fn (m) (list (get m :a) (assoc m :k 1)))");
+        let ops = extract_ops(&result.functions[0].chunk);
+        assert_eq!(
+            ops.iter().filter(|&&op| op == Op::TakeLocal).count(),
+            1,
+            "exactly one move: {ops:?}"
+        );
+        assert!(
+            ops.contains(&Op::LoadLocal0),
+            "earlier use must stay a cloning load: {ops:?}"
+        );
+        // The clone must come before the move.
+        let load_pos = ops.iter().position(|&op| op == Op::LoadLocal0).unwrap();
+        let take_pos = ops.iter().position(|&op| op == Op::TakeLocal).unwrap();
+        assert!(load_pos < take_pos, "clone before move: {ops:?}");
+    }
+
+    #[test]
+    fn test_take_local_in_both_branches() {
+        // Mutually exclusive branches may each take the slot; the test read
+        // before the branch stays a clone (both arms still read m).
+        let result = compile_str("(fn (m) (if (null? m) m (assoc m :k 1)))");
+        let ops = extract_ops(&result.functions[0].chunk);
+        assert_eq!(
+            ops.iter().filter(|&&op| op == Op::TakeLocal).count(),
+            2,
+            "each branch's use is last on its path: {ops:?}"
+        );
+        assert!(
+            ops.contains(&Op::LoadLocal0),
+            "the test read must stay a cloning load: {ops:?}"
+        );
+    }
+
+    #[test]
+    fn test_take_local_blocked_by_read_after_branch() {
+        // The use inside the `if` is NOT last — the slot is read again after
+        // the join. Only the final read moves.
+        let result = compile_str("(fn (m) (list (if (contains? m :a) (get m :a) 1) m))");
+        let ops = extract_ops(&result.functions[0].chunk);
+        assert_eq!(
+            ops.iter().filter(|&&op| op == Op::TakeLocal).count(),
+            1,
+            "only the post-join use is last: {ops:?}"
+        );
+        assert!(
+            ops.contains(&Op::LoadLocal0),
+            "in-branch use must stay a cloning load: {ops:?}"
+        );
+    }
+
+    #[test]
+    fn test_no_take_for_captured_slot() {
+        // `m` is captured by the inner lambda: an upvalue cell aliases the
+        // slot, so it must never be moved out.
+        let result = compile_str("(fn (m) (list (fn () m) (assoc m :k 1)))");
+        for f in &result.functions {
+            let ops = extract_ops(&f.chunk);
+            assert!(
+                !ops.contains(&Op::TakeLocal),
+                "captured slot must never be taken: {ops:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_no_take_for_set_target() {
+        let result = compile_str("(fn (m) (set! m {:x 1}) (assoc m :k 2))");
+        let ops = extract_ops(&result.functions[0].chunk);
+        assert!(
+            !ops.contains(&Op::TakeLocal),
+            "set! target slot must never be taken: {ops:?}"
+        );
+    }
+
+    #[test]
+    fn test_no_take_in_function_with_try() {
+        let result = compile_str("(fn (m) (try (assoc m :k 1) (catch e m)))");
+        for f in &result.functions {
+            let ops = extract_ops(&f.chunk);
+            assert!(
+                !ops.contains(&Op::TakeLocal),
+                "a function containing try opts out entirely: {ops:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_no_take_in_function_with_do_loop() {
+        let result = compile_str("(fn (m) (do ((i 0 (+ i 1))) ((= i 3) m) (get m i)))");
+        for f in &result.functions {
+            let ops = extract_ops(&f.chunk);
+            assert!(
+                !ops.contains(&Op::TakeLocal),
+                "a function containing a do loop opts out entirely: {ops:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_no_take_in_self_tail_recursive_define() {
+        // A tail self-call reuses the frame in place — the whole function
+        // opts out of moves.
+        let result = compile_str("(define (walk n) (if (= n 0) 'done (walk (- n 1))))");
+        let ops = extract_ops(&find_fn(&result, "walk").chunk);
+        assert!(ops.contains(&Op::SelfTailCall), "sanity: {ops:?}");
+        assert!(
+            !ops.contains(&Op::TakeLocal),
+            "frame-reusing function must not take: {ops:?}"
+        );
+    }
+
+    #[test]
+    fn test_take_in_nontail_self_recursive_define() {
+        // Non-tail self-calls push a fresh frame; takes stay enabled.
+        let result = compile_str("(define (f n) (if (< n 2) 1 (+ (f (- n 1)) n)))");
+        let ops = extract_ops(&find_fn(&result, "f").chunk);
+        assert!(ops.contains(&Op::CallSelf), "sanity: {ops:?}");
+        assert!(
+            ops.contains(&Op::TakeLocal),
+            "the final read of n is a move: {ops:?}"
+        );
+    }
+
+    #[test]
+    fn test_no_take_in_named_let_loop() {
+        let result = compile_str("(let loop ((n 5) (m {})) (if (= n 0) m (loop (- n 1) m)))");
+        for f in &result.functions {
+            let ops = extract_ops(&f.chunk);
+            assert!(
+                !ops.contains(&Op::TakeLocal),
+                "SelfFn loop frame is reused — no takes: {ops:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_no_take_in_top_level_chunk() {
+        // Top-level locals may outlive the chunk (REPL/eval continuation):
+        // the main chunk never takes.
+        let result = compile_str("(let ((m {})) (assoc m :k 1))");
+        let ops = extract_ops(&result.chunk);
+        assert!(
+            !ops.contains(&Op::TakeLocal),
+            "top-level chunk must not take: {ops:?}"
         );
     }
 

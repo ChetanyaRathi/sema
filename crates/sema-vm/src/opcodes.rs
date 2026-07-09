@@ -124,6 +124,14 @@ pub enum Op {
     // program rebinds the name (see `Compiler::self_global`). Appended last to
     // keep all preceding opcode numbers stable for `.semac` compatibility.
     CallSelf, // u16 argc → push a frame for the current frame's own closure
+
+    // Moving load — like `LoadLocal`, but MOVES the slot value onto the operand
+    // stack, leaving nil in the slot. Emitted by the compiler for the statically
+    // last use of a never-captured local (see `takelocal.rs`), so the slot's
+    // refcount doesn't pin the value and the stdlib's uniqueness-gated in-place
+    // fast paths (`with_hashmap_mut_if_unique` & co.) can fire. Appended last to
+    // keep all preceding opcode numbers stable for `.semac` compatibility.
+    TakeLocal, // u16 slot → push locals[slot]; locals[slot] = nil
 }
 
 impl Op {
@@ -205,6 +213,7 @@ impl Op {
             68 => Some(Op::StringAppend),
             69 => Some(Op::SelfTailCall),
             70 => Some(Op::CallSelf),
+            71 => Some(Op::TakeLocal),
             _ => None,
         }
     }
@@ -227,7 +236,7 @@ impl Op {
         let operand = operand as u32;
         match self {
             // 0 pops, 1 push — produce a value
-            Const | Nil | True | False | Dup | LoadLocal | LoadUpvalue | LoadGlobal
+            Const | Nil | True | False | Dup | LoadLocal | TakeLocal | LoadUpvalue | LoadGlobal
             | LoadLocal0 | LoadLocal1 | LoadLocal2 | LoadLocal3 | MakeClosure => StackEffect {
                 pops: 0,
                 pushes: 1,
@@ -395,6 +404,7 @@ const _: () = {
             Op::StringAppend => {}
             Op::SelfTailCall => {}
             Op::CallSelf => {}
+            Op::TakeLocal => {}
         }
     }
 };
@@ -473,6 +483,7 @@ pub mod op {
     pub const STRING_APPEND: u8 = Op::StringAppend as u8;
     pub const SELF_TAIL_CALL: u8 = Op::SelfTailCall as u8;
     pub const CALL_SELF: u8 = Op::CallSelf as u8;
+    pub const TAKE_LOCAL: u8 = Op::TakeLocal as u8;
 
     // Instruction sizes (opcode byte + operand bytes)
     /// Size of a bare opcode with no operands: 1

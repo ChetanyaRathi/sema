@@ -802,6 +802,7 @@ fn advance_pc(code: &[u8], pc: usize) -> Result<(Op, usize), SemaError> {
         }
         Op::Const
         | Op::LoadLocal
+        | Op::TakeLocal
         | Op::StoreLocal
         | Op::LoadUpvalue
         | Op::StoreUpvalue
@@ -1035,7 +1036,7 @@ fn validate_chunk_bytecode(
                     )));
                 }
             }
-            Op::LoadLocal | Op::StoreLocal => {
+            Op::LoadLocal | Op::TakeLocal | Op::StoreLocal => {
                 let slot = u16::from_le_bytes([code[pc + 1], code[pc + 2]]) as usize;
                 if slot >= n_locals {
                     return Err(SemaError::eval(format!(

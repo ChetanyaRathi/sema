@@ -2795,3 +2795,44 @@ eval_error_tests! {
     // Arity is still checked on the self-call frame path.
     call_self_arity_error: "(define (f n) (if (= n 0) 0 (+ 1 (f)))) (f 1)" => "expects 1 args, got 0",
 }
+
+// ============================================================
+// TakeLocal: moving last-use local loads (COW-unlocking)
+// ============================================================
+// A taken slot must be observationally identical to a cloned one: the
+// in-place map fast paths only fire at strong_count == 1, so any live alias
+// forces the clone path. Every case here was pinned against the pre-TakeLocal
+// binary as the oracle.
+
+eval_tests! {
+    // THE alias test: an accumulator also held by another binding must not be
+    // mutated in place — `keep` still sees the pre-assoc map.
+    take_local_alias_not_mutated: "((fn () (let* ((m0 {:a 1}) (keep m0) (m1 (assoc m0 :b 2))) (list keep m1))))" => common::eval("'({:a 1} {:a 1 :b 2})"),
+    // Idiomatic fold accumulator (the pattern this opcode exists for).
+    take_local_fold_assoc: "((fn () (foldl (fn (acc x) (assoc acc x (* x 10))) {} (list 1 2 3))))" => common::eval("{1 10 2 20 3 30}"),
+    // An accumulator snapshot escaping mid-fold (global set!) pins that later
+    // in-place steps never retroactively mutate the escaped alias.
+    take_local_fold_escaped_snapshot: "(define keep nil) (define r (foldl (fn (acc x) (begin (when (= x 2) (set! keep acc)) (assoc acc x 1))) {} (list 1 2 3))) (list keep r)" => common::eval("'({1 1} {1 1 2 1 3 1})"),
+    // Branch-local last uses: each arm may move the slot independently.
+    take_local_both_branches: "(define (pick m) (if (nil? (get m :k)) (assoc m :k 0) m)) (list (pick {}) (pick {:k 5}))" => common::eval("'({:k 0} {:k 5})"),
+    // A slot captured by an inner lambda is never moved: the closure still
+    // reads the original map after the assoc.
+    take_local_captured_slot: "((fn (m) (let ((g (fn () m))) (list (assoc m :k 1) (g)))) {:a 1})" => common::eval("'({:a 1 :k 1} {:a 1})"),
+    // set! targets are never moved; the store still lands.
+    take_local_set_target: "((fn (m) (let ((r1 (assoc m :k 1))) (set! m {:fresh 1}) (list r1 m))) {})" => common::eval("'({:k 1} {:fresh 1})"),
+    // Shadowing: the init reads the param, the body reads the new binding.
+    take_local_shadowed_rebind: "((fn (x) (let ((x (list x x))) x)) 7)" => common::eval("'(7 7)"),
+    // A chain of single-use accumulators moves through every step.
+    take_local_letstar_chain: "((fn (a) (let* ((b (assoc a :b 1)) (c (assoc b :c 2))) c)) {:a 0})" => common::eval("{:a 0 :b 1 :c 2}"),
+    // The untaken branch still sees the untouched value.
+    take_local_untaken_branch: "((fn (m) (if (= 1 2) (assoc m :x 1) m)) {:z 9})" => common::eval("{:z 9}"),
+    // A function containing try opts out entirely: the handler observes the
+    // argument unmodified even though the body's assoc never completed.
+    take_local_try_handler_sees_slot: "((fn (m) (try (assoc m :k (throw \"boom\")) (catch e m))) {:a 1})" => common::eval("{:a 1}"),
+    // Rest params are ordinary slots.
+    take_local_rest_param: "((fn (x . rest) (append rest (list x))) 1 2 3)" => common::eval("'(2 3 1)"),
+    // dissoc shares the same uniqueness gate as assoc.
+    take_local_dissoc: "((fn (m) (dissoc m :a)) {:a 1 :b 2})" => common::eval("{:b 2}"),
+    // Only the last use moves; the earlier get still sees the value.
+    take_local_earlier_read_intact: "((fn (m) (list (get m :a) (assoc m :z 9))) {:a 7})" => common::eval("'(7 {:a 7 :z 9})"),
+}

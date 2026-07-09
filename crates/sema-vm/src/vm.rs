@@ -1873,6 +1873,16 @@ impl VM {
                         let slot = read_u16!(code, pc) as usize;
                         self.stack.push(self.stack[base + slot].clone());
                     }
+                    op::TAKE_LOCAL => {
+                        // Moving load: the compiler proved this is the statically
+                        // last use of a never-captured slot (takelocal.rs), so the
+                        // slot ref is dead — move it instead of bumping the
+                        // refcount, leaving nil behind. This is what lets the
+                        // stdlib's strong_count==1 in-place fast paths fire.
+                        let slot = read_u16!(code, pc) as usize;
+                        let val = std::mem::replace(&mut self.stack[base + slot], Value::nil());
+                        self.stack.push(val);
+                    }
                     op::STORE_LOCAL => {
                         let slot = read_u16!(code, pc) as usize;
                         let val = unsafe { pop_unchecked(&mut self.stack) };

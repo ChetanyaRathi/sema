@@ -2629,6 +2629,7 @@ fn chunk_to_json(chunk: &sema_vm::Chunk, name: &str) -> serde_json::Value {
             }
             Some(
                 sema_vm::Op::LoadLocal
+                | sema_vm::Op::TakeLocal
                 | sema_vm::Op::StoreLocal
                 | sema_vm::Op::LoadUpvalue
                 | sema_vm::Op::StoreUpvalue,

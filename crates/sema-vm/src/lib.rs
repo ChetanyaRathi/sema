@@ -11,6 +11,7 @@ mod optimize;
 mod resolve;
 mod scheduler;
 mod serialize;
+mod takelocal;
 mod vm;
 
 pub use chunk::{Chunk, ExceptionEntry, Function, UpvalueDesc};

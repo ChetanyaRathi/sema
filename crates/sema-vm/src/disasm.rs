@@ -100,6 +100,7 @@ fn op_name(op: Op) -> &'static str {
         Op::StringAppend => "STRING_APPEND",
         Op::SelfTailCall => "SELF_TAIL_CALL",
         Op::CallSelf => "CALL_SELF",
+        Op::TakeLocal => "TAKE_LOCAL",
     }
 }
 
@@ -131,7 +132,7 @@ pub fn disassemble(chunk: &Chunk, name: Option<&str>) -> String {
                 pc += 3;
             }
 
-            Op::LoadLocal | Op::StoreLocal | Op::LoadUpvalue | Op::StoreUpvalue => {
+            Op::LoadLocal | Op::TakeLocal | Op::StoreLocal | Op::LoadUpvalue | Op::StoreUpvalue => {
                 let slot = read_u16(code, pc + 1);
                 writeln!(out, "{pc:04}  {:<16} {slot}", op_name(op)).unwrap();
                 pc += 3;

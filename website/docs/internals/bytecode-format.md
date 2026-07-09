@@ -458,6 +458,12 @@ String indexing is by **Unicode scalar (char)**, not byte, matching the stdlib s
 
 `CallSelf argc` (`u16 argc`) is the non-tail counterpart of `SelfTailCall`: a call whose callee is the **current frame's own closure**, so no callee value is on the stack and no global lookup or callable dispatch happens — the VM pushes a frame for the running closure directly (arity-checked, rest params supported). The compiler emits it inside a top-level `(define (f …))` lambda for direct non-tail calls to `f` when nothing else in the program rebinds the name — a second `define` of `f` or a global `set!` of `f` at any depth opts the name out (the intrinsics' program-wide redefinition rule, extended to `set!`). Tail-position self-calls under the same eligibility emit `SelfTailCall`. Value (non-operator) references to `f` remain `LoadGlobal`, so identity (`eq?`) and escape semantics are unchanged. Additive within the existing encoding (`u16` operand, no new operand shape), so it does not change `format_version`.
 
+### Take-local (`TakeLocal` 0x47)
+
+`TakeLocal slot` (`u16 slot`) is a **moving** `LoadLocal`: it pushes `locals[slot]` and replaces the slot with nil, instead of cloning (refcount-bumping) the slot value. Same encoding and stack effect as `LoadLocal` (push 1, pop 0). The compiler emits it for the *statically last* use of a local slot that is never captured by an inner lambda and never a `set!` target, as proven by a conservative backward liveness analysis (`crates/sema-vm/src/takelocal.rs`); functions containing `try`, `do` loops, or self-frame-reuse calls opt out entirely. Dropping the dead slot reference lets uniquely-owned values hit the stdlib's `strong_count == 1` in-place fast paths (`assoc`/`dissoc`/`update` on maps, etc.) instead of deep-cloning.
+
+Because the slot is proven dead, the nil left behind is unobservable by the program. The only surface that can still read the slot is the **debug inspector** (DAP variable views / `evaluate`): a variable whose last use has executed displays as `nil` for the remainder of its lexical scope. This is accepted debugger behavior, mirroring registerized locals in native debuggers. Additive within the existing encoding (`u16` operand, no new operand shape), so it does not change `format_version`.
+
 ## Example
 
 Given this source file:
