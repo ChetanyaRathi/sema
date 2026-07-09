@@ -704,11 +704,12 @@ fn foreign_upvalue_error() -> SemaError {
 
 /// Reject interior-mutable containers (mutable arrays/cells) as keys in map
 /// literals (`{k v}` / hashmap literals): their contents can change after
-/// insertion, which would silently corrupt the map's lookup invariants.
+/// insertion, which would silently corrupt the map's lookup invariants. The
+/// check is deep — a key wrapping a mutable container mutates all the same.
 /// `items` is the flattened `[k, v, k, v, …]` slice popped for the literal.
 fn check_literal_map_keys(items: &[Value]) -> Result<(), SemaError> {
     for pair in items.chunks(2) {
-        if pair[0].is_mutable_container() {
+        if pair[0].contains_mutable_container() {
             return Err(
                 SemaError::type_error("immutable map key", pair[0].type_name())
                     .with_hint("freeze the key first (mutable-array/->vector or mutable-cell/get)"),

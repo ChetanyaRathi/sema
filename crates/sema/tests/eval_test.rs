@@ -2738,6 +2738,17 @@ eval_error_tests! {
     mutable_array_assoc_key_rejected: "(assoc {} (mutable-array/new) 1)" => "immutable map key",
     mutable_array_literal_key_rejected: "(let ((a (mutable-array/new))) {a 1})" => "immutable map key",
     mutable_cell_hashmap_key_rejected: "(hashmap/new (mutable-cell/new 1) 2)" => "immutable map key",
+    // The guard covers every key-insert path, not just the constructors.
+    mutable_array_map_update_key_rejected: "(map/update {} (mutable-array/new) (lambda (v) 1))" => "immutable map key",
+    mutable_array_assoc_in_key_rejected: "(assoc-in {} (list (mutable-array/new)) 1)" => "immutable map key",
+    mutable_array_assoc_in_nested_path_key_rejected: "(assoc-in {} (list :a (mutable-array/new)) 1)" => "immutable map key",
+    mutable_array_update_in_key_rejected: "(update-in {} [(mutable-array/new)] (lambda (v) 1))" => "immutable map key",
+    // The guard is deep: a key that merely wraps a mutable container is
+    // rejected too (the wrapper's Ord recurses into the mutable contents).
+    mutable_array_nested_vector_key_rejected: "(hash-map (vector (mutable-array/new)) 10)" => "immutable map key",
+    mutable_cell_nested_list_key_rejected: "(assoc {} (list (mutable-cell/new 1)) 2)" => "immutable map key",
+    mutable_array_nested_literal_key_rejected: "(let ((a (mutable-array/new))) {[a] 1})" => "immutable map key",
+    mutable_array_nested_map_value_key_rejected: "(hashmap/new {:k (mutable-array/new)} 1)" => "immutable map key",
 }
 
 // ============================================================

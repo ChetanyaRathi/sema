@@ -2082,6 +2082,51 @@ impl Value {
     pub fn is_mutable_container(&self) -> bool {
         is_boxed(self.0) && matches!(get_tag(self.0), TAG_MUTABLE_ARRAY | TAG_MUTABLE_CELL)
     }
+
+    /// True if this value is, or transitively contains, an interior-mutable
+    /// container. Map keys must be deeply immutable: a vector wrapping a
+    /// mutable array still mutates underneath the map, corrupting lookup
+    /// order just as a bare mutable key would (Ord recurses into container
+    /// elements). Iterative worklist — no visited set or depth cap needed
+    /// because the walk never descends into a mutable container (it returns
+    /// true on sight) and cycles are only constructible through one.
+    pub fn contains_mutable_container(&self) -> bool {
+        fn scan(v: &Value, pending: &mut Vec<Value>) -> bool {
+            if v.is_mutable_container() {
+                return true;
+            }
+            match v.view_ref() {
+                ValueViewRef::List(items) | ValueViewRef::Vector(items) => {
+                    pending.extend(items.iter().cloned());
+                }
+                ValueViewRef::Map(m) => {
+                    for (k, val) in m.iter() {
+                        pending.push(k.clone());
+                        pending.push(val.clone());
+                    }
+                }
+                ValueViewRef::HashMap(m) => {
+                    for (k, val) in m.iter() {
+                        pending.push(k.clone());
+                        pending.push(val.clone());
+                    }
+                }
+                ValueViewRef::Record(r) => pending.extend(r.fields.iter().cloned()),
+                _ => {}
+            }
+            false
+        }
+        let mut pending = Vec::new();
+        if scan(self, &mut pending) {
+            return true;
+        }
+        while let Some(v) = pending.pop() {
+            if scan(&v, &mut pending) {
+                return true;
+            }
+        }
+        false
+    }
 }
 
 // ── Clone ─────────────────────────────────────────────────────────
