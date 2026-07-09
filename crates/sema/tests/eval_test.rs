@@ -2570,3 +2570,36 @@ eval_error_tests! {
     mutable_cell_hashmap_key_rejected: "(hashmap/new (mutable-cell/new 1) 2)" => "immutable map key",
 }
 
+// ============================================================
+// bytes/* byte-oriented ops on bytevectors
+// ============================================================
+
+eval_tests! {
+    bytes_length: "(bytes/length (string->utf8 \"abc\"))" => Value::int(3),
+    bytes_ref: "(bytes/ref (string->utf8 \"abc\") 1)" => Value::int(98),
+    bytes_find_byte: "(bytes/find (string->utf8 \"a;b\") 59)" => Value::int(1),
+    bytes_find_string_needle: "(bytes/find (string->utf8 \"hello\") \"llo\")" => Value::int(2),
+    bytes_find_bytevector_needle: "(bytes/find (string->utf8 \"hello\") (string->utf8 \"lo\"))" => Value::int(3),
+    // The optional start offset returns absolute indices.
+    bytes_find_from_start: "(bytes/find (string->utf8 \"a;b;c\") 59 2)" => Value::int(3),
+    bytes_find_missing_is_nil: "(bytes/find (string->utf8 \"abc\") 59)" => Value::nil(),
+    bytes_slice: "(bytes/->string (bytes/slice (string->utf8 \"hello\") 1 3))" => Value::string("el"),
+    bytes_slice_to_end: "(bytes/->string (bytes/slice (string->utf8 \"hello\") 3))" => Value::string("lo"),
+    bytes_to_string_range: "(bytes/->string (string->utf8 \"Oslo;-12.3\") 0 4)" => Value::string("Oslo"),
+    // The 1BRC fixed-point trick: one-decimal temperatures scale to ints.
+    bytes_parse_int10_decimal: "(bytes/parse-int10 (string->utf8 \"-12.3\"))" => Value::int(-123),
+    bytes_parse_int10_no_decimal: "(bytes/parse-int10 (string->utf8 \"5\"))" => Value::int(50),
+    bytes_parse_int10_negative_zero: "(bytes/parse-int10 (string->utf8 \"-0.0\"))" => Value::int(0),
+    bytes_parse_int10_start_offset: "(bytes/parse-int10 (string->utf8 \"Oslo;-12.3\") 5)" => Value::int(-123),
+}
+
+eval_error_tests! {
+    bytes_ref_oob: "(bytes/ref (string->utf8 \"a\") 5)" => "out of bounds",
+    bytes_slice_oob: "(bytes/slice (string->utf8 \"ab\") 1 9)" => "out of bounds",
+    bytes_length_type_error: "(bytes/length \"abc\")" => "bytevector",
+    bytes_find_needle_type_error: "(bytes/find (string->utf8 \"a\") 1.5)" => "int, bytevector, or string",
+    bytes_parse_int10_bad_digit: "(bytes/parse-int10 (string->utf8 \"12x\"))" => "invalid digit",
+    bytes_parse_int10_two_decimals: "(bytes/parse-int10 (string->utf8 \"1.23\"))" => "one digit",
+    bytes_parse_int10_empty: "(bytes/parse-int10 (string->utf8 \"\"))" => "digit",
+    bytes_to_string_invalid_utf8: "(bytes/->string (bytevector 255 254))" => "invalid UTF-8",
+}
