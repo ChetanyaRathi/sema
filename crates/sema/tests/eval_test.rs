@@ -1662,6 +1662,56 @@ eval_tests! {
     string_to_number_complex: "(string->number \"3+4i\")" => common::eval("3+4i"),
 }
 
+// `string->number` decimal fast path: plain i64/float token shapes parse
+// directly; every other input falls back to the reader round-trip. This is a
+// differential suite across that boundary — each expected literal is the
+// output of the reader-backed path, so fast-path and fallback answers must
+// coincide exactly (including the deliberate rejections: the lexer reads
+// `+5`, `.5`, `5.`, `1e`, and `1_000` as symbols or multiple tokens).
+eval_tests! {
+    str2num_int: r#"(string->number "42")"# => Value::int(42),
+    str2num_negative_int: r#"(string->number "-5")"# => Value::int(-5),
+    str2num_leading_zeros: r#"(string->number "007")"# => Value::int(7),
+    str2num_negative_zero_int: r#"(string->number "-0")"# => Value::int(0),
+    str2num_plus_prefix_rejected: r#"(string->number "+5")"# => Value::bool(false),
+    str2num_underscores_rejected: r#"(string->number "1_000")"# => Value::bool(false),
+    str2num_float: r#"(string->number "12.5")"# => Value::float(12.5),
+    str2num_neg_float: r#"(string->number "-12.5")"# => Value::float(-12.5),
+    str2num_zero_float: r#"(string->number "0.0")"# => Value::float(0.0),
+    str2num_exponent: r#"(string->number "1e3")"# => Value::float(1000.0),
+    str2num_exponent_upper: r#"(string->number "1E3")"# => Value::float(1000.0),
+    str2num_exponent_neg_sign: r#"(string->number "1.5e-3")"# => Value::float(0.0015),
+    str2num_exponent_pos_sign: r#"(string->number "2e+2")"# => Value::float(200.0),
+    str2num_huge_exponent_is_inf: r#"(string->number "1e999")"# => Value::float(f64::INFINITY),
+    str2num_neg_zero_float_keeps_sign:
+        r#"(< (/ 1.0 (string->number "-0.0")) 0.0)"# => Value::bool(true),
+    str2num_leading_dot_rejected: r#"(string->number ".5")"# => Value::bool(false),
+    str2num_trailing_dot_rejected: r#"(string->number "5.")"# => Value::bool(false),
+    str2num_neg_leading_dot_rejected: r#"(string->number "-.5")"# => Value::bool(false),
+    str2num_bare_exponent_rejected: r#"(string->number "1e")"# => Value::bool(false),
+    str2num_bare_exponent_sign_rejected: r#"(string->number "1e+")"# => Value::bool(false),
+    str2num_double_dot_rejected: r#"(string->number "1..2")"# => Value::bool(false),
+    str2num_second_dot_rejected: r#"(string->number "1.2.3")"# => Value::bool(false),
+    str2num_surrounding_whitespace: "(string->number \" \\t42\\n \")" => Value::int(42),
+    str2num_comment_after_token: r#"(string->number "42 ; c")"# => Value::int(42),
+    str2num_empty_rejected: r#"(string->number "")"# => Value::bool(false),
+    str2num_blank_rejected: r#"(string->number "   ")"# => Value::bool(false),
+    str2num_minus_alone_rejected: r#"(string->number "-")"# => Value::bool(false),
+    str2num_i64_max: r#"(string->number "9223372036854775807")"# => Value::int(i64::MAX),
+    str2num_i64_min: r#"(string->number "-9223372036854775808")"# => Value::int(i64::MIN),
+    str2num_bignum_above_i64: r#"(string->number "9223372036854775808")"#
+        => common::eval("9223372036854775808"),
+    str2num_bignum_below_i64: r#"(string->number "-9223372036854775809")"#
+        => common::eval("-9223372036854775809"),
+    str2num_rational_falls_back: r#"(string->number "1/2")"# => common::eval("1/2"),
+    str2num_hex_prefix_falls_back: r##"(string->number "#x10")"## => Value::int(16),
+    str2num_imaginary_falls_back: r#"(string->number "2i")"# => common::eval("2i"),
+    str2num_inf_symbol_form: r#"(string->number "inf")"# => Value::float(f64::INFINITY),
+    str2num_nan_symbol_form: r#"(math/nan? (string->number "nan"))"# => Value::bool(true),
+    str2num_r7rs_inf_form_rejected: r#"(string->number "+inf.0")"# => Value::bool(false),
+    str2num_r7rs_neg_inf_form_rejected: r#"(string->number "-inf.0")"# => Value::bool(false),
+}
+
 // Task 5.7: `exact-integer-sqrt` (isqrt with remainder, bignum-aware) and
 // `rationalize` (simplest rational within a tolerance, R7RS exactness
 // contagion). `rationalize`'s expected literals are the actual output of the
