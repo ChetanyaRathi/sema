@@ -2706,6 +2706,19 @@ eval_tests! {
     mutable_array_not_equal_to_vector: "(equal? (mutable-array/new 1 0) [0])" => Value::bool(false),
     // Cyclic comparison terminates (coinductive equality, no infinite loop).
     mutable_array_cyclic_equal_terminates: "(let ((a (mutable-array/new)) (b (mutable-array/new))) (mutable-array/push! a a) (mutable-array/push! b b) (equal? a b))" => Value::bool(true),
+    // Ord agrees with equality (content-based): distinct mutable containers
+    // are distinct BTreeMap/BTreeSet keys, so the transient-collection
+    // helpers (frequencies, list/unique, list/group-by) group by content at
+    // call time instead of aliasing every mutable container to one key.
+    mutable_array_frequencies_distinct: "(let ((a (mutable-array/new 1 1)) (b (mutable-array/new 1 2))) (vals (frequencies (list a b))))" => common::eval("'(1 1)"),
+    mutable_array_frequencies_merges_equal_contents: "(let ((a (mutable-array/new 1 1)) (b (mutable-array/new 1 1))) (vals (frequencies (list a b))))" => common::eval("'(2)"),
+    mutable_array_unique_keeps_distinct: "(let ((a (mutable-array/new 1 1)) (b (mutable-array/new 1 2))) (length (list/unique (list a b))))" => Value::int(2),
+    mutable_array_group_by_keeps_groups: "(let ((a (mutable-array/new 1 1)) (b (mutable-array/new 1 2))) (length (keys (list/group-by (lambda (x) x) (list a b)))))" => Value::int(2),
+    mutable_array_vs_cell_distinct_keys: "(length (list/unique (list (mutable-array/new) (mutable-cell/new nil))))" => Value::int(2),
+    mutable_array_sort_by_content: "(map (lambda (x) (mutable-array/get x 0)) (sort-by (lambda (x) x) (list (mutable-array/new 1 2) (mutable-array/new 1 1))))" => common::eval("'(1 2)"),
+    // Cyclic ordering terminates: an in-flight pair compares Equal (the same
+    // coinductive convention as equality), so unique collapses the pair.
+    mutable_array_cyclic_ord_terminates: "(let ((a (mutable-array/new)) (b (mutable-array/new))) (mutable-array/push! a a) (mutable-array/push! b b) (length (list/unique (list a b))))" => Value::int(1),
     mutable_cell_round_trip: "(let ((c (mutable-cell/new 1))) (mutable-cell/set! c 99) (mutable-cell/get c))" => Value::int(99),
     mutable_cell_shared_mutation: "(let* ((c (mutable-cell/new 0)) (d c)) (mutable-cell/set! c 5) (mutable-cell/get d))" => Value::int(5),
     mutable_cell_equal_by_contents: "(equal? (mutable-cell/new 1) (mutable-cell/new 1))" => Value::bool(true),
