@@ -58,6 +58,8 @@ zip = { version = "8", default-features = false, features = ["deflate"] }
 # compile time. `debug-embed` forces embedding in every profile so a build never
 # reads the assets from the source tree at runtime — see src/web/runtime.rs.
 rust-embed = { version = "8", features = ["debug-embed"] }
+self-replace.workspace = true
+indicatif.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

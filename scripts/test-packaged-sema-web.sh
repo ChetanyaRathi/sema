@@ -23,12 +23,17 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# No --offline: cargo package must rewrite the internal path dependencies
+# (sema-core, sema-reader, ...) into pure registry version requirements and
+# confirm they resolve, which needs the crates.io index. A fresh CI runner's
+# local index cache has never been queried for these crates (a normal build
+# resolves them via path, never touching the registry), so --offline fails
+# here even though the crates themselves are published.
 PACKAGE_TARGET="$TMP/package-target"
 CARGO_TARGET_DIR="$PACKAGE_TARGET" cargo package \
   --manifest-path "$ROOT/Cargo.toml" \
   -p sema-lang \
   --allow-dirty \
-  --offline \
   --no-verify
 
 CRATE="$(find "$PACKAGE_TARGET/package" -maxdepth 1 -name 'sema-lang-*.crate' -print -quit)"

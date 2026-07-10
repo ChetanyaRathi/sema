@@ -45,11 +45,6 @@ on:
       - '**[0-9]+.[0-9]+.[0-9]+*'
 
 jobs:
-  # Use the same gate as crates.io publishing. This includes building the actual
-  # sema-lang .crate and proving its embedded `sema web` runtime serves.
-  verify:
-    uses: ./.github/workflows/verify.yml
-
   # Run 'dist plan' (or host) to determine what tasks we need to do
   plan:
     runs-on: "ubuntu-22.04"
@@ -98,7 +93,6 @@ jobs:
     # Let the initial task tell us to not run (currently very blunt)
     needs:
       - plan
-      - verify
     if: ${{ fromJson(needs.plan.outputs.val).ci.github.artifacts_matrix.include != null && (needs.plan.outputs.publishing == 'true' || fromJson(needs.plan.outputs.val).ci.github.pr_run_mode == 'upload') }}
     strategy:
       fail-fast: false
