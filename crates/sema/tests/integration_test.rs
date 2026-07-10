@@ -2893,6 +2893,49 @@ fn test_shell_command() {
     }
 }
 
+/// A trailing `{:cwd "path"}` options map runs the command in that directory.
+/// `pwd` and the target dir are both canonicalized before comparing so macOS
+/// `/tmp` → `/private/tmp` symlink resolution doesn't make the assertion flaky.
+#[test]
+#[cfg(unix)]
+fn test_shell_cwd_option() {
+    let dir = unique_temp_dir("shell-cwd");
+    std::fs::create_dir_all(&dir).unwrap();
+    let canonical = std::fs::canonicalize(&dir).unwrap();
+    let dir_str = dir.to_string_lossy().replace('\\', "/");
+    let src = format!(r#"(:stdout (shell "pwd" {{:cwd "{dir_str}"}}))"#);
+    let out = eval(&src);
+    let printed = out.as_str().expect("stdout string");
+    let got = std::fs::canonicalize(printed.trim()).unwrap();
+    assert_eq!(got, canonical, "shell :cwd did not change working dir");
+}
+
+/// A trailing `{:env {...}}` options map injects env vars into the child.
+#[test]
+#[cfg(unix)]
+fn test_shell_env_option() {
+    let out = eval(r#"(:stdout (shell "echo $SEMA_TEST_FOO" {:env {"SEMA_TEST_FOO" "bar"}}))"#);
+    assert_eq!(out.as_str().map(str::trim), Some("bar"));
+}
+
+/// The options map also applies to the explicit-argv (direct-exec) form, not
+/// just the single-string `sh -c` form.
+#[test]
+#[cfg(unix)]
+fn test_shell_cwd_option_argv_form() {
+    let dir = unique_temp_dir("shell-cwd-argv");
+    std::fs::create_dir_all(&dir).unwrap();
+    let canonical = std::fs::canonicalize(&dir).unwrap();
+    let dir_str = dir.to_string_lossy().replace('\\', "/");
+    // Extra positional args select the direct-exec path (`pwd` run as a program,
+    // not via `sh -c`); `-P` prints the physical dir. The options map is still
+    // the trailing arg.
+    let src = format!(r#"(:stdout (shell "pwd" "-P" {{:cwd "{dir_str}"}}))"#);
+    let out = eval(&src);
+    let got = std::fs::canonicalize(out.as_str().unwrap().trim()).unwrap();
+    assert_eq!(got, canonical);
+}
+
 #[test]
 fn test_time_ms() {
     let result = eval("(time-ms)");

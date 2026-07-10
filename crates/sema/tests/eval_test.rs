@@ -3014,3 +3014,14 @@ eval_error_tests! {
     // message, not a stringified condition map.
     rethrown_error_prints_original_message: "(try (+ 1 undefined-var) (catch e (throw e)))" => "Unbound variable: undefined-var",
 }
+
+// shell/quote — POSIX single-quote quoting so a value survives `sh -c` as one
+// literal word. Wraps in single quotes; each embedded `'` becomes `'\''`; the
+// empty string becomes `''`.
+eval_tests! {
+    shell_quote_space: r#"(shell/quote "a b")"# => Value::string("'a b'"),
+    shell_quote_plain: r#"(shell/quote "abc")"# => Value::string("'abc'"),
+    shell_quote_empty: r#"(shell/quote "")"# => Value::string("''"),
+    shell_quote_single_quote: r#"(shell/quote "a'b")"# => Value::string(r#"'a'\''b'"#),
+    shell_quote_metachars: r#"(shell/quote "$x; rm -rf /")"# => Value::string("'$x; rm -rf /'"),
+}
