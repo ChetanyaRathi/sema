@@ -11933,10 +11933,22 @@
       "summary": "Run a shell command. Returns a map with `:stdout`, `:stderr`, and `:exit-code`.",
       "returns": "map",
       "examples": [
-        "(shell \"echo hello\")\n; => {:exit-code 0 :stderr \"\" :stdout \"hello\\n\"}\n\n(:stdout (shell \"echo hello\"))   ; => \"hello\\n\""
+        "(shell \"echo hello\")\n; => {:exit-code 0 :stderr \"\" :stdout \"hello\\n\"}\n\n(:stdout (shell \"echo hello\"))          ; => \"hello\\n\"\n\n(:stdout (shell \"pwd\" {:cwd \"/tmp\"}))   ; => \"/tmp\\n\"\n(:stdout (shell \"echo $FOO\" {:env {\"FOO\" \"bar\"}}))  ; => \"bar\\n\""
       ],
-      "body": "Run a shell command. Returns a map with `:stdout`, `:stderr`, and `:exit-code`.\n\n```sema\n(shell \"echo hello\")\n; => {:exit-code 0 :stderr \"\" :stdout \"hello\\n\"}\n\n(:stdout (shell \"echo hello\"))   ; => \"hello\\n\"\n```",
-      "syntax": "(shell cmd arg ...)"
+      "body": "Run a shell command. Returns a map with `:stdout`, `:stderr`, and `:exit-code`.\n\nA single string runs through the system shell (`sh -c` on Unix, `cmd /C` on Windows); extra positional\nstrings run the program directly (no shell). An optional trailing options map\n`{:cwd \"path\" :env {\"KEY\" \"val\"}}` pins the working directory and injects\nenvironment variables (same shape as `proc/spawn`).\n\n```sema\n(shell \"echo hello\")\n; => {:exit-code 0 :stderr \"\" :stdout \"hello\\n\"}\n\n(:stdout (shell \"echo hello\"))          ; => \"hello\\n\"\n\n(:stdout (shell \"pwd\" {:cwd \"/tmp\"}))   ; => \"/tmp\\n\"\n(:stdout (shell \"echo $FOO\" {:env {\"FOO\" \"bar\"}}))  ; => \"bar\\n\"\n```\n\nUse `shell/quote` to safely interpolate an untrusted value into a single-string\ncommand.",
+      "syntax": "(shell cmd arg ... opts?)"
+    },
+    {
+      "name": "shell/quote",
+      "module": "system",
+      "section": "Shell & Process Control",
+      "summary": "POSIX single-quote a string so it survives a POSIX shell (e.g. `sh -c`) as one literal word — no metacharacter is special inside single quotes, so this defuses command injection. Wraps the value in single quotes and rewrites each embedded `'` as `\\'\\''`; the empty string becomes `''`. Note: the single-string form of `shell` uses `sh -c` on Unix but `cmd /C` on Windows.",
+      "returns": "string",
+      "examples": [
+        "(shell/quote \"a b\")            ; => \"'a b'\"\n(shell/quote \"a'b\")            ; => \"'a'\\\\''b'\"\n(shell/quote \"\")               ; => \"''\"\n\n(shell (str \"echo \" (shell/quote \"hi; rm -rf /\")))\n; => {:exit-code 0 :stdout \"hi; rm -rf /\\n\" ...}  ; the payload is echoed, not run"
+      ],
+      "body": "POSIX single-quote a string so it survives a POSIX shell (e.g. `sh -c`) as one literal word —\nno metacharacter is special inside single quotes, so this defuses command injection. Wraps the\nvalue in single quotes and rewrites each embedded `'` as `\\'\\''`; the empty string becomes `''`.\nNote: the single-string form of `shell` uses `sh -c` on Unix but `cmd /C` on Windows.\n\n```sema\n(shell/quote \"a b\")            ; => \"'a b'\"\n(shell/quote \"a'b\")            ; => \"'a'\\\\''b'\"\n(shell/quote \"\")               ; => \"''\"\n\n(shell (str \"echo \" (shell/quote \"hi; rm -rf /\")))\n; => {:exit-code 0 :stdout \"hi; rm -rf /\\n\" ...}  ; the payload is echoed, not run\n```",
+      "syntax": "(shell/quote s)"
     },
     {
       "name": "spy",
