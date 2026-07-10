@@ -198,6 +198,67 @@ pub enum WorkflowEvent {
         /// Number of messages appended or facts set (1 per operation).
         count: u64,
     },
+
+    /// A declared `:mcp` server's auth requirement could not be satisfied from the
+    /// token store (the headless-precursor gate; see
+    /// `docs/plans/2026-06-24-workflow-mcp-auth.md` §3/§6). Emitted during the
+    /// implicit auth-resolution step before the first user `phase` runs. Redaction
+    /// rule: alias + scopes + expiry only, NEVER token material — `server` is the
+    /// workflow's declared ALIAS for the server (e.g. `"asana"`), never a token,
+    /// header, or URL with credentials. Declared LAST (append-only); this variant is
+    /// never emitted in old runs, so pre-existing goldens stay byte-identical.
+    #[serde(rename = "auth.required")]
+    AuthRequired {
+        seq: u64,
+        ts: String,
+        /// The workflow's declared alias for the server (e.g. `"asana"`), never a
+        /// token, header, or URL with credentials.
+        server: String,
+        /// The `:mcp` spec's requested OAuth scopes.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        scopes: Vec<String>,
+        /// The `:mcp` spec's `:tools` least-privilege manifest.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        tools: Vec<String>,
+        /// Where the resulting session would be persisted once granted: one of
+        /// `"keyring"`, `"workflow"`, `"run"`, `"none"`.
+        persist: String,
+    },
+
+    /// A declared server's auth gate cleared: a usable session (cached, refreshed, or
+    /// freshly consented) is now available, so the run can proceed. Redaction rule:
+    /// alias + scopes + expiry only, NEVER token material.
+    #[serde(rename = "auth.granted")]
+    AuthGranted {
+        seq: u64,
+        ts: String,
+        /// The workflow's declared alias for the server, never a token, header, or
+        /// URL with credentials.
+        server: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        scopes: Vec<String>,
+        /// Absolute unix-seconds expiry of the granted session; `None` when the
+        /// session doesn't expire (or the provider didn't report one).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expires_at: Option<u64>,
+        /// One of `"cached"`, `"refreshed"`, `"consented"`.
+        source: String,
+    },
+
+    /// A declared server's auth flow could not complete (consent refused, discovery
+    /// failed, callback timed out, …); the run ends `{:status :failed :reason :auth}`.
+    /// Redaction rule: alias + reason only, NEVER token material.
+    #[serde(rename = "auth.failed")]
+    AuthFailed {
+        seq: u64,
+        ts: String,
+        /// The workflow's declared alias for the server, never a token, header, or
+        /// URL with credentials.
+        server: String,
+        /// Short opaque failure label/message (e.g. `"consent_denied"`), never token
+        /// material.
+        reason: String,
+    },
 }
 
 #[cfg(test)]
@@ -328,6 +389,91 @@ mod tests {
         assert_eq!(
             line,
             r#"{"event":"memory","seq":5,"ts":"0","memory_id":"x","namespace":"default","op":"remember","key":"theme","value_digest":"def456","count":1}"#
+        );
+    }
+
+    #[test]
+    fn auth_required_wire_shape() {
+        let ev = WorkflowEvent::AuthRequired {
+            seq: 4,
+            ts: "0".into(),
+            server: "asana".into(),
+            scopes: vec!["default".into()],
+            tools: vec!["create_task".into(), "search_tasks".into()],
+            persist: "workflow".into(),
+        };
+        let line = serde_json::to_string(&ev).unwrap();
+        assert_eq!(
+            line,
+            r#"{"event":"auth.required","seq":4,"ts":"0","server":"asana","scopes":["default"],"tools":["create_task","search_tasks"],"persist":"workflow"}"#
+        );
+    }
+
+    #[test]
+    fn auth_required_skips_empty_scopes_and_tools() {
+        let ev = WorkflowEvent::AuthRequired {
+            seq: 4,
+            ts: "0".into(),
+            server: "fs".into(),
+            scopes: Vec::new(),
+            tools: Vec::new(),
+            persist: "none".into(),
+        };
+        let line = serde_json::to_string(&ev).unwrap();
+        // scopes and tools are empty → both skipped.
+        assert_eq!(
+            line,
+            r#"{"event":"auth.required","seq":4,"ts":"0","server":"fs","persist":"none"}"#
+        );
+    }
+
+    #[test]
+    fn auth_granted_wire_shape() {
+        let ev = WorkflowEvent::AuthGranted {
+            seq: 6,
+            ts: "0".into(),
+            server: "asana".into(),
+            scopes: vec!["default".into()],
+            expires_at: Some(1_800_000_000),
+            source: "consented".into(),
+        };
+        let line = serde_json::to_string(&ev).unwrap();
+        assert_eq!(
+            line,
+            r#"{"event":"auth.granted","seq":6,"ts":"0","server":"asana","scopes":["default"],"expires_at":1800000000,"source":"consented"}"#
+        );
+    }
+
+    #[test]
+    fn auth_granted_skips_empty_scopes_and_none_expiry() {
+        let ev = WorkflowEvent::AuthGranted {
+            seq: 6,
+            ts: "0".into(),
+            server: "asana".into(),
+            scopes: Vec::new(),
+            expires_at: None,
+            source: "cached".into(),
+        };
+        let line = serde_json::to_string(&ev).unwrap();
+        // scopes is empty and expires_at is None → both skipped.
+        assert_eq!(
+            line,
+            r#"{"event":"auth.granted","seq":6,"ts":"0","server":"asana","source":"cached"}"#
+        );
+    }
+
+    #[test]
+    fn auth_failed_wire_shape() {
+        let ev = WorkflowEvent::AuthFailed {
+            seq: 7,
+            ts: "0".into(),
+            server: "asana".into(),
+            reason: "consent_denied".into(),
+        };
+        let line = serde_json::to_string(&ev).unwrap();
+        assert_eq!(
+            line,
+            r#"{"event":"auth.failed","seq":7,"ts":"0","server":"asana","reason":"consent_denied"}"#
         );
     }
 }
