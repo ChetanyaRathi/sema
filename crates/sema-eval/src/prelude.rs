@@ -607,6 +607,34 @@ pub const PRELUDE: &str = r#"
                                   (go# (+ n# 1) (* delay# wr-fac#)))))))))
          (go# 1 wr-base#)))))
 
+;; retry: run `thunk` up to :max-attempts times (default 3), backing off
+;; :base-delay-ms (default 100) * :backoff (default 2.0) ^ attempt between
+;; failures, re-raising the last error once attempts are exhausted.
+;;   (retry thunk) or (retry thunk {:max-attempts 3 :base-delay-ms 100 :backoff 2.0})
+;; A native cannot suspend and resume its own Rust loop state across a
+;; scheduler yield (the park delivers the resume value to the CALL SITE, not
+;; back into the middle of a Rust for-loop — see `sema_core::async_signal`),
+;; so in async context the loop lives here, backing off via `async/sleep`
+;; (cooperative: siblings run during the wait) instead of blocking the VM
+;; thread. `__retry-setup` shares its option-parsing/clamping with the
+;; blocking native so both paths default and coerce identically. At top level
+;; the byte-identical blocking native runs (real `thread::sleep`, no
+;; scheduler involved).
+(define (retry thunk . __retry-rest)
+  (if (__async-context?)
+      (let ((__retry-opts (apply __retry-setup thunk __retry-rest)))
+        (letrec ((__retry-go (fn (__retry-n __retry-delay)
+                    (try (thunk)
+                         (catch __retry-e
+                           (if (>= __retry-n (:max-attempts __retry-opts))
+                               (throw __retry-e)
+                               (begin
+                                 (when (> __retry-delay 0) (async/sleep __retry-delay))
+                                 (__retry-go (+ __retry-n 1)
+                                             (int (* __retry-delay (:backoff __retry-opts)))))))))))
+          (__retry-go 1 (:base-delay-ms __retry-opts))))
+      (apply __retry-blocking thunk __retry-rest)))
+
 ;; make-parameter: R7RS parameter object. Returns a variadic procedure closed
 ;; over a mutable cell (the current value) and an optional converter.
 ;;   (p)      -> current value

@@ -2903,6 +2903,14 @@ fn test_time_ms() {
     }
 }
 
+// Sync-context regression: `sleep` outside any async scheduler task must take
+// the plain `thread::sleep` path unconditionally, exactly as before it grew an
+// `in_async_context()` branch — no yield signal in flight, no error, nil back.
+#[test]
+fn test_sleep_returns_nil_at_top_level() {
+    assert_eq!(eval("(sleep 1)"), Value::nil());
+}
+
 // List functions: nth, take, drop, last, zip, sort, flatten
 
 #[test]

@@ -3,7 +3,10 @@ use std::collections::HashMap;
 use std::io::IsTerminal;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use sema_core::{check_arity, Caps, SemaError, Value};
+use sema_core::{
+    check_arity, in_async_context, set_yield_signal, take_resume_value, Caps, SemaError, Value,
+    YieldReason,
+};
 
 use crate::register_fn;
 
@@ -322,6 +325,18 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
         let ms = args[0]
             .as_int()
             .ok_or_else(|| SemaError::type_error("int", args[0].type_name()))?;
+        // In an async scheduler task, blocking the VM thread would freeze
+        // every sibling task. Yield exactly like `async/sleep` (async_ops.rs)
+        // so the scheduler parks this task and drives siblings while the
+        // sleep elapses.
+        if in_async_context() {
+            if let Some(cached) = take_resume_value() {
+                return Ok(cached);
+            }
+            set_yield_signal(YieldReason::Sleep(ms as u64));
+            return Ok(Value::nil());
+        }
+        // Outside async (REPL/scripts/top level): unchanged real sleep.
         std::thread::sleep(std::time::Duration::from_millis(ms as u64));
         Ok(Value::nil())
     });

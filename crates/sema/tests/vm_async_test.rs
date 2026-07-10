@@ -1304,3 +1304,108 @@ fn parallel_and_pipeline_handle_empty_and_zero_stages() {
         common::eval(r#"'(1 2 3)"#)
     );
 }
+
+// === WP-TIMING: `sleep` / `retry` yield instead of blocking the VM thread ===
+//
+// `sleep_builtin_...`'s proof uses the same completion-order oracle as
+// `sleep_duration_determines_wake_order_not_spawn_order` above: a sibling
+// with no wait of its own sends to a channel BEFORE the sleeper can, which is
+// only possible if the wait parks the task (yields) rather than blocking the
+// single VM thread outright. Under the pre-fix `sleep` (unconditional
+// `thread::sleep`) the sleeping task would run start-to-finish in one
+// uninterrupted scheduler step, so the sibling could never get in first and
+// the order would come out reversed.
+//
+// `retry_backoff_...` can't reuse that same no-wait-sibling shape: calling a
+// Sema lambda thunk from a native while `in_async_context()` ALREADY routes
+// through `run_closure_as_inline_task` (vm.rs's `make_closure` NativeFn
+// wrapper) regardless of this WP, so a sibling with no wait of its own would
+// get a free ride during retry's very first (pre-backoff) attempt and the
+// test would pass even against the unfixed code — not a real proof. Instead
+// the sibling races retry's backoff on the VIRTUAL CLOCK: it does its own
+// short `async/sleep`, shorter than retry's backoff delay. If the backoff is
+// a real `YieldReason::Sleep` (the fix), it competes fairly in the same wake
+// order as any other sleeper and the shorter sibling sleep must resolve
+// first (exactly like `sleep_duration_determines_wake_order_not_spawn_
+// order`). If the backoff is a raw blocking `thread::sleep` (the bug), it
+// runs on the OS thread with the scheduler's virtual clock frozen — the
+// sibling's sleep can't be woken until that native call returns, so retry
+// finishes (and sends first) before the sibling ever wakes.
+#[test]
+fn sleep_builtin_yields_lets_sibling_complete_first() {
+    let out = eval(
+        r#"
+        (let ((out (channel/new 8)))
+          (async/all
+            (list (async/spawn (fn () (sleep 30) (channel/send out :slow)))
+                  (async/spawn (fn () (channel/send out :fast)))))
+          (list (channel/recv out) (channel/recv out)))
+        "#,
+    );
+    assert_eq!(
+        out,
+        Value::list(vec![Value::keyword("fast"), Value::keyword("slow")]),
+        "a sibling with no sleep must complete before the sleeper wakes"
+    );
+}
+
+#[test]
+fn retry_backoff_yields_lets_sibling_complete_first() {
+    // The thunk fails once (counter 0 -> 1, still < 2) so `retry` backs off
+    // 40ms before its second attempt succeeds (counter -> 2); the sibling's
+    // own sleep (10ms) is strictly shorter, so it must win the wake race.
+    let out = eval(
+        r#"
+        (let ((out (channel/new 8))
+              (counter 0))
+          (async/all
+            (list (async/spawn (fn ()
+                    (retry (fn ()
+                             (set! counter (+ counter 1))
+                             (if (< counter 2) (error "not yet") counter))
+                           {:max-attempts 5 :base-delay-ms 40})
+                    (channel/send out :slow)))
+                  (async/spawn (fn () (async/sleep 10) (channel/send out :fast)))))
+          (list (channel/recv out) (channel/recv out)))
+        "#,
+    );
+    assert_eq!(
+        out,
+        Value::list(vec![Value::keyword("fast"), Value::keyword("slow")]),
+        "a sibling sleeping for LESS than retry's backoff delay must wake first"
+    );
+}
+
+#[test]
+fn retry_backoff_in_async_context_still_succeeds_and_returns_value() {
+    // Full functional check alongside the ordering proof above: exhausting
+    // two failures then succeeding on the third attempt returns the success
+    // value, same as the sync-path oracle (`test_retry_counter`).
+    let result = eval(
+        r#"
+        (let ((p (async
+                   (define counter 0)
+                   (retry (fn ()
+                            (set! counter (+ counter 1))
+                            (if (< counter 3) (error "not yet") counter))
+                          {:max-attempts 5 :base-delay-ms 0}))))
+          (await p))
+        "#,
+    );
+    assert_eq!(result, Value::int(3));
+}
+
+#[test]
+fn retry_exhausted_in_async_context_reraises_last_error() {
+    let err = eval_vm_err(
+        r#"
+        (let ((p (async
+                   (retry (fn () (error "always fails")) {:max-attempts 2 :base-delay-ms 0}))))
+          (await p))
+        "#,
+    );
+    assert!(
+        err.contains("always fails"),
+        "expected the exhausted retry's last error to surface, got: {err}"
+    );
+}
