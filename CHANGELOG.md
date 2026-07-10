@@ -15,6 +15,15 @@
   optional ellipsis string appended within the width budget. TUI cells that
   clip long text (palette descriptions, tool-arg cells) no longer misalign by
   falling back to a codepoint count.
+- **`sema update`** — updates sema to the latest (or a specific `--version`)
+  released binary in place. Downloads with a byte-progress bar, verifies the
+  SHA256 checksum against the same `.sha256` sidecar cargo-dist publishes for
+  every release asset, sanity-checks the downloaded binary (`--version`)
+  before touching anything live, then atomically swaps the running executable
+  via `self_replace` (safe on Windows' locked-exe semantics too). Warns (does
+  not block) if the install looks Homebrew/Linuxbrew/Scoop-managed, pointing
+  at the package manager's own upgrade command instead. `--check` reports an
+  available update without installing it; `-y`/`--yes` skips the prompt.
 
 ### Changed
 
