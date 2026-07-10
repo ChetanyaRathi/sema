@@ -1730,11 +1730,15 @@ impl VM {
             ctx.check_loop_interrupt()?;
             let fi = self.frames.len() - 1;
             let frame = &self.frames[fi];
-            let code = frame.closure.func.chunk.code.as_ptr();
-            let consts: *const [Value] = frame.closure.func.chunk.consts.as_slice();
-            let base = frame.base;
+            // `mut` because the frame-preserving native-call fast paths
+            // (CallNative / CallGlobal's Native arm) re-derive these from the
+            // frame after the call instead of keeping them live across it —
+            // that keeps the dispatch loop's register pressure flat.
+            let mut code = frame.closure.func.chunk.code.as_ptr();
+            let mut consts: *const [Value] = frame.closure.func.chunk.consts.as_slice();
+            let mut base = frame.base;
             let mut pc = frame.pc;
-            let code_len = frame.closure.func.chunk.code.len();
+            let mut code_len = frame.closure.func.chunk.code.len();
             // Point `self.globals` and `self.functions` at the running closure's
             // home env / function table (a `None` closure — the top-level main
             // closure — uses the VM's base snapshots). The hot global opcodes
@@ -2337,7 +2341,26 @@ impl VM {
                                 handle_err!(self, fi, pc, err, saved_pc, 'dispatch);
                             }
                         }
-                        continue 'dispatch;
+                        // The native completed on this frame (a re-entrant
+                        // callback ran nested — run_nested_closure floors at
+                        // this frame and restores globals/functions), so stay
+                        // in the inner loop instead of re-entering 'dispatch.
+                        // The length check guards the invariant; DEBUG
+                        // re-enters so stepping/breakpoint semantics are
+                        // unchanged.
+                        if DEBUG || self.frames.len() != fi + 1 {
+                            continue 'dispatch;
+                        }
+                        // Re-derive the frame-cached locals from the unchanged
+                        // frame rather than keeping them live across the native
+                        // call (frames[fi].pc was synced to the post-operand pc
+                        // above).
+                        let frame = &self.frames[fi];
+                        code = frame.closure.func.chunk.code.as_ptr();
+                        consts = frame.closure.func.chunk.consts.as_slice();
+                        base = frame.base;
+                        pc = frame.pc;
+                        code_len = frame.closure.func.chunk.code.len();
                     }
 
                     // --- Data constructors ---
@@ -2702,7 +2725,7 @@ impl VM {
                             }
                         }
 
-                        let result = match &self.inline_cache[cache_idx].2 {
+                        match &self.inline_cache[cache_idx].2 {
                             // Fast path: VM closure — direct call without a
                             // function slot on the stack.
                             CachedGlobal::VmClosure {
@@ -2723,33 +2746,74 @@ impl VM {
                             }
                             CachedGlobal::Native { func, .. } => {
                                 let func = func.clone();
-                                self.call_native_with(&func, argc, ctx)
+                                match self.call_native_with(&func, argc, ctx) {
+                                    Ok(()) => {
+                                        if let Some(reason) = sema_core::take_yield_signal() {
+                                            // The call already pushed a result value.
+                                            // Replace it with a nil placeholder; on
+                                            // resume the scheduler substitutes the
+                                            // actual resume value.
+                                            if let Some(top) = self.stack.last_mut() {
+                                                *top = Value::nil();
+                                            }
+                                            self.frames[fi].pc = pc; // PC already past CALL_GLOBAL
+                                            return Ok(crate::debug::VmExecResult::AsyncYield(
+                                                reason,
+                                            ));
+                                        }
+                                        // The native completed on this frame (a
+                                        // re-entrant callback ran nested —
+                                        // run_nested_closure floors at this frame
+                                        // and restores globals/functions), so stay
+                                        // in the inner loop instead of re-entering
+                                        // 'dispatch. The length check guards the
+                                        // invariant; DEBUG re-enters so stepping
+                                        // and breakpoint semantics are unchanged.
+                                        if DEBUG || self.frames.len() != fi + 1 {
+                                            continue 'dispatch;
+                                        }
+                                        // Re-derive the frame-cached locals from
+                                        // the unchanged frame rather than keeping
+                                        // them live across the native call
+                                        // (frames[fi].pc was synced to the
+                                        // post-operand pc above).
+                                        let frame = &self.frames[fi];
+                                        code = frame.closure.func.chunk.code.as_ptr();
+                                        consts = frame.closure.func.chunk.consts.as_slice();
+                                        base = frame.base;
+                                        pc = frame.pc;
+                                        code_len = frame.closure.func.chunk.code.len();
+                                    }
+                                    Err(err) => {
+                                        drop(sema_core::take_yield_signal());
+                                        handle_err!(self, fi, pc, err, saved_pc, 'dispatch);
+                                    }
+                                }
                             }
                             // Slow path: non-native callable — use call_value_with
                             CachedGlobal::Plain(value) => {
                                 let func_val = value.clone();
-                                self.call_value_with(func_val, argc, ctx)
-                            }
-                        };
-                        if let Err(err) = result {
-                            drop(sema_core::take_yield_signal());
-                            match self.handle_exception(err, saved_pc)? {
-                                ExceptionAction::Handled => {}
-                                ExceptionAction::Propagate(e) => return Err(e),
+                                if let Err(err) = self.call_value_with(func_val, argc, ctx) {
+                                    drop(sema_core::take_yield_signal());
+                                    match self.handle_exception(err, saved_pc)? {
+                                        ExceptionAction::Handled => {}
+                                        ExceptionAction::Propagate(e) => return Err(e),
+                                    }
+                                }
+                                // Check if the native signaled async yield
+                                if let Some(reason) = sema_core::take_yield_signal() {
+                                    // The call already pushed a result value. Replace it
+                                    // with nil placeholder. On resume, the scheduler replaces
+                                    // this with the actual resume value.
+                                    if let Some(top) = self.stack.last_mut() {
+                                        *top = Value::nil();
+                                    }
+                                    self.frames[fi].pc = pc; // PC already past CALL_GLOBAL
+                                    return Ok(crate::debug::VmExecResult::AsyncYield(reason));
+                                }
+                                continue 'dispatch;
                             }
                         }
-                        // Check if the native signaled async yield
-                        if let Some(reason) = sema_core::take_yield_signal() {
-                            // The call already pushed a result value. Replace it
-                            // with nil placeholder. On resume, the scheduler replaces
-                            // this with the actual resume value.
-                            if let Some(top) = self.stack.last_mut() {
-                                *top = Value::nil();
-                            }
-                            self.frames[fi].pc = pc; // PC already past CALL_GLOBAL
-                            return Ok(crate::debug::VmExecResult::AsyncYield(reason));
-                        }
-                        continue 'dispatch;
                     }
 
                     op::STORE_LOCAL0 => {
