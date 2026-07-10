@@ -2090,6 +2090,18 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
                 request.reasoning_effort = reasoning_effort;
                 request.timeout_ms = opt_timeout_ms(args.get(1));
                 let _conv = conv_scope.open();
+
+                // Inside a scheduler task: offload + yield so siblings overlap; the
+                // poller accounts and shapes the value. Sync branch below is
+                // byte-identical to before. Mirrors `llm/complete`.
+                #[cfg(not(target_arch = "wasm32"))]
+                if sema_core::in_async_context() {
+                    return do_complete_async_yield(
+                        request,
+                        Box::new(|resp| Ok(Value::string(&resp.content))),
+                    );
+                }
+
                 let response = do_complete(request)?;
                 track_usage(&response.usage)?;
                 Ok(Value::string(&response.content))
@@ -2497,29 +2509,42 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
         request.max_tokens = max_tokens.or(Some(4096));
         request.system = system;
 
+        // Build the new conversation (user message + assistant reply appended).
+        // Shared by the sync and async paths — conversation state mutation (the
+        // history append) happens here, AFTER the response lands (on the VM
+        // thread in the async case), never inside the offload.
+        let finalize = move |response: ChatResponse| -> Result<Value, SemaError> {
+            let mut new_messages = conv.messages.clone();
+            new_messages.push(Message {
+                role: Role::User,
+                content: user_msg,
+                images: Vec::new(),
+            });
+            new_messages.push(Message {
+                role: Role::Assistant,
+                content: response.content,
+                images: Vec::new(),
+            });
+
+            let mut metadata = conv.metadata.clone();
+            accumulate_usage(&mut metadata, &response.usage);
+            Ok(Value::conversation(Conversation {
+                messages: new_messages,
+                model: conv.model.clone(),
+                metadata,
+            }))
+        };
+
+        // Inside a scheduler task: offload + yield so siblings overlap. Sync
+        // branch below is byte-identical to before. Mirrors `llm/complete`.
+        #[cfg(not(target_arch = "wasm32"))]
+        if sema_core::in_async_context() {
+            return do_complete_async_yield(request, Box::new(finalize));
+        }
+
         let response = do_complete(request)?;
         track_usage(&response.usage)?;
-
-        // Build new conversation with user message + assistant reply
-        let mut new_messages = conv.messages.clone();
-        new_messages.push(Message {
-            role: Role::User,
-            content: user_msg,
-            images: Vec::new(),
-        });
-        new_messages.push(Message {
-            role: Role::Assistant,
-            content: response.content,
-            images: Vec::new(),
-        });
-
-        let mut metadata = conv.metadata.clone();
-        accumulate_usage(&mut metadata, &response.usage);
-        Ok(Value::conversation(Conversation {
-            messages: new_messages,
-            model: conv.model.clone(),
-            metadata,
-        }))
+        finalize(response)
     });
 
     // (conversation/messages conv)
@@ -4227,29 +4252,42 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
         request.max_tokens = max_tokens.or(Some(4096));
         request.system = Some(system_override);
 
+        // Build new conversation preserving the original system message (not the
+        // override). Shared by the sync and async paths — conversation state
+        // mutation (the history append) happens here, AFTER the response lands
+        // (on the VM thread in the async case), never inside the offload.
+        let finalize = move |response: ChatResponse| -> Result<Value, SemaError> {
+            let mut new_messages = conv.messages.clone();
+            new_messages.push(Message {
+                role: Role::User,
+                content: user_msg,
+                images: Vec::new(),
+            });
+            new_messages.push(Message {
+                role: Role::Assistant,
+                content: response.content,
+                images: Vec::new(),
+            });
+
+            let mut metadata = conv.metadata.clone();
+            accumulate_usage(&mut metadata, &response.usage);
+            Ok(Value::conversation(Conversation {
+                messages: new_messages,
+                model: conv.model.clone(),
+                metadata,
+            }))
+        };
+
+        // Inside a scheduler task: offload + yield so siblings overlap. Sync
+        // branch below is byte-identical to before. Mirrors `llm/complete`.
+        #[cfg(not(target_arch = "wasm32"))]
+        if sema_core::in_async_context() {
+            return do_complete_async_yield(request, Box::new(finalize));
+        }
+
         let response = do_complete(request)?;
         track_usage(&response.usage)?;
-
-        // Build new conversation preserving the original system message (not the override)
-        let mut new_messages = conv.messages.clone();
-        new_messages.push(Message {
-            role: Role::User,
-            content: user_msg,
-            images: Vec::new(),
-        });
-        new_messages.push(Message {
-            role: Role::Assistant,
-            content: response.content,
-            images: Vec::new(),
-        });
-
-        let mut metadata = conv.metadata.clone();
-        accumulate_usage(&mut metadata, &response.usage);
-        Ok(Value::conversation(Conversation {
-            messages: new_messages,
-            model: conv.model.clone(),
-            metadata,
-        }))
+        finalize(response)
     });
 
     // (conversation/token-count conv) — count total tokens in conversation messages
@@ -5425,6 +5463,16 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
         request.system = Some(system);
         request.max_tokens = Some(4096);
 
+        // Inside a scheduler task: offload + yield so siblings overlap. Sync
+        // branch below is byte-identical to before. Mirrors `llm/complete`.
+        #[cfg(not(target_arch = "wasm32"))]
+        if sema_core::in_async_context() {
+            return do_complete_async_yield(
+                request,
+                Box::new(|resp| Ok(Value::string(&resp.content))),
+            );
+        }
+
         let response = do_complete(request)?;
         track_usage(&response.usage)?;
         Ok(Value::string(&response.content))
@@ -5459,25 +5507,37 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
         let mut request = ChatRequest::new(model, messages);
         request.system = Some(system);
 
+        // Parse the comparison JSON out of the reply. Shared by the sync and
+        // async paths.
+        let parse_comparison = |response: ChatResponse| -> Result<Value, SemaError> {
+            let content = response.content.trim();
+            let json_str = if content.starts_with("```") {
+                content
+                    .trim_start_matches("```json")
+                    .trim_start_matches("```")
+                    .trim_end_matches("```")
+                    .trim()
+            } else {
+                content
+            };
+            let json: serde_json::Value = serde_json::from_str(json_str).map_err(|e| {
+                SemaError::Llm(format!(
+                    "failed to parse comparison JSON: {e}\nResponse: {content}"
+                ))
+            })?;
+            Ok(sema_core::json_to_value(&json))
+        };
+
+        // Inside a scheduler task: offload + yield so siblings overlap. Sync
+        // branch below is byte-identical to before. Mirrors `llm/complete`.
+        #[cfg(not(target_arch = "wasm32"))]
+        if sema_core::in_async_context() {
+            return do_complete_async_yield(request, Box::new(parse_comparison));
+        }
+
         let response = do_complete(request)?;
         track_usage(&response.usage)?;
-
-        let content = response.content.trim();
-        let json_str = if content.starts_with("```") {
-            content
-                .trim_start_matches("```json")
-                .trim_start_matches("```")
-                .trim_end_matches("```")
-                .trim()
-        } else {
-            content
-        };
-        let json: serde_json::Value = serde_json::from_str(json_str).map_err(|e| {
-            SemaError::Llm(format!(
-                "failed to parse comparison JSON: {e}\nResponse: {content}"
-            ))
-        })?;
-        Ok(sema_core::json_to_value(&json))
+        parse_comparison(response)
     });
 
     // (llm/io-sleep-once id [ms]) — AwaitIo spike leaf (NOT for production use).
@@ -5600,6 +5660,15 @@ fn complete_with_prompt(prompt: &Prompt, opts: Option<&Value>) -> Result<Value, 
 
     // Per-call observability tags/metadata (read inside do_complete's span).
     let _tele = install_call_telemetry(opts.and_then(|v| v.as_map_rc()).as_ref());
+
+    // Inside a scheduler task: offload + yield so siblings overlap (shared by
+    // `llm/send` and the Prompt-arg branch of `llm/complete`). Sync branch below
+    // is byte-identical to before. Mirrors `llm/complete`.
+    #[cfg(not(target_arch = "wasm32"))]
+    if sema_core::in_async_context() {
+        return do_complete_async_yield(request, Box::new(|resp| Ok(Value::string(&resp.content))));
+    }
+
     let response = do_complete(request)?;
     track_usage(&response.usage)?;
     Ok(Value::string(&response.content))
