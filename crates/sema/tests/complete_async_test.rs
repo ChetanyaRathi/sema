@@ -599,3 +599,120 @@ fn embed_budget_enforced_across_spawn_and_yield() {
         "a spawned embed must charge the captured budget frame and raise on overrun"
     );
 }
+
+/// `llm/with-rate-limit`'s pacing gap must not stall a sibling task: the SECOND of
+/// two rate-limited `llm/complete` calls has to wait out the configured interval
+/// before its send, and a concurrently-spawned non-LLM sibling (a short `sleep`)
+/// must complete WHILE that wait is elapsing — proving the wait is spent off the
+/// VM thread (inside the offloaded future), not as a blocking `thread::sleep` on
+/// it. Ordering is asserted via a channel (deterministic), never a wall-clock
+/// duration: the sibling's channel send must land strictly BEFORE the second
+/// completion's. Both completions still complete correctly (recorder sees 2
+/// requests) — the yield behavior is under test, not precise pacing.
+#[test]
+#[serial]
+fn rate_limit_pacing_gap_lets_sibling_complete() {
+    let _cap = sema_otel::testing::install();
+    reset_io_inflight();
+
+    // Echo mode: reply text == prompt text, so completions are identifiable by
+    // content regardless of channel receive order.
+    let fake = FakeProvider::builder("fake")
+        .model("fake-chat")
+        .echo()
+        .build();
+    let recorder = fake.recorder();
+
+    let interp = Interpreter::new();
+    reset_runtime_state();
+    register_test_provider(Box::new(fake));
+
+    // 5 rps => 200ms minimum spacing. Spawned in this order, task "a" reserves
+    // its slot first (no wait) and task "b" reserves second (~200ms wait, spent
+    // inside b's offloaded future). The sibling's 20ms sleep is short enough to
+    // resolve well inside that 200ms gap if — and only if — the VM thread kept
+    // running siblings while b's pacing wait elapsed.
+    let program = r#"
+        (let ((out (channel/new 8)))
+          (llm/with-rate-limit 5.0
+            (fn ()
+              (async/all
+                (list
+                  (async/spawn (fn () (channel/send out (llm/complete "a"))))
+                  (async/spawn (fn () (channel/send out (llm/complete "b"))))
+                  (async/spawn (fn () (sleep 20) (channel/send out "sibling")))))))
+          (list (channel/recv out) (channel/recv out) (channel/recv out)))
+    "#;
+    let result = interp
+        .eval_str_compiled(program)
+        .expect("rate-limited concurrent completes evaluated");
+    let received: Vec<String> = result
+        .as_list()
+        .expect("three channel receives")
+        .iter()
+        .map(|v| v.as_str().expect("string value").to_string())
+        .collect();
+    assert_eq!(received.len(), 3);
+
+    let sibling_pos = received
+        .iter()
+        .position(|v| v == "sibling")
+        .expect("sibling value received");
+    let second_pos = received
+        .iter()
+        .position(|v| v == "b")
+        .expect("second completion (b) received");
+    assert!(
+        sibling_pos < second_pos,
+        "the non-LLM sibling must complete before the rate-limited second call's \
+         pacing gap elapses (got order {received:?})"
+    );
+    // Both completions succeeded (the fake never errors) and the provider was
+    // actually dispatched twice — pacing didn't drop or dedupe either call.
+    assert!(received.contains(&"a".to_string()));
+    assert_eq!(
+        recorder.call_count(),
+        2,
+        "both rate-limited completions must reach the provider exactly once each"
+    );
+}
+
+/// Sync-context regression: `llm/with-rate-limit` at TOP LEVEL (no scheduler task)
+/// still works exactly as before — both completions succeed and reach the
+/// provider. `enforce_rate_limit` (the blocking sync gate) is untouched by the
+/// async-path fix (`reserve_rate_limit_wait_ms`, used only by
+/// `do_complete_async_yield`/`stream_run_begin`); this is the functional
+/// companion to the unit test `enforce_rate_limit_survives_backward_clock`, which
+/// covers the sync gate's own edge-case robustness. No duration is asserted
+/// (matching the removed flaky test this gap was tracked under) — only that
+/// pacing two calls at a real interval still returns correct results.
+#[test]
+#[serial]
+fn sync_rate_limit_still_works() {
+    let _cap = sema_otel::testing::install();
+    reset_io_inflight();
+
+    let fake = FakeProvider::builder("fake")
+        .model("fake-chat")
+        .echo()
+        .build();
+    let recorder = fake.recorder();
+
+    let interp = Interpreter::new();
+    reset_runtime_state();
+    register_test_provider(Box::new(fake));
+
+    // A high rps keeps the real sleep this exercises (interval ~1ms) negligible.
+    let program = r#"
+        (llm/with-rate-limit 1000.0
+          (fn () (list (llm/complete "a") (llm/complete "b"))))
+    "#;
+    let result = interp
+        .eval_str_compiled(program)
+        .expect("sync rate-limited completes evaluated");
+    let res = result.as_list().expect("results list");
+    assert_eq!(res.len(), 2);
+    assert_eq!(res[0].as_str(), Some("a"));
+    assert_eq!(res[1].as_str(), Some("b"));
+    assert_eq!(recorder.call_count(), 2);
+}

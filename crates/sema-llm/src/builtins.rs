@@ -6305,7 +6305,10 @@ fn do_complete_async_yield(
 
     // ── Resolve the fallback chain (or default provider) into Arc clones ──
     // Done on the VM thread so the offloaded worker touches no thread-locals.
-    enforce_rate_limit();
+    // Reserve this call's rate-limit slot HERE, synchronously, before the
+    // offload starts (see `reserve_rate_limit_wait_ms`); the wait itself (if
+    // any) is spent inside the spawned future below, never on the VM thread.
+    let rate_limit_wait_ms = reserve_rate_limit_wait_ms();
     let max_retries = NETWORK_MAX_RETRIES.with(|c| c.get());
     // Capture the retry-backoff base on the VM thread so the offloaded wire
     // stage honors it (pool workers have their own RETRY_BASE_MS TLS copies) —
@@ -6383,6 +6386,13 @@ fn do_complete_async_yield(
     let abort = sema_io::io_spawn(async move {
         // Balance in-flight on EVERY exit — normal completion or abort-drop.
         let _inflight = inflight;
+        // Spend the reserved rate-limit pacing gap HERE, on the pool worker —
+        // never on the VM thread — so sibling tasks keep running while it
+        // elapses. An abort during this wait drops the whole future (dropping
+        // the sleep with it), same as an abort mid-request.
+        if rate_limit_wait_ms > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(rate_limit_wait_ms)).await;
+        }
         let r = run_fallback_retry_async(chain, req2, max_retries, retry_base_ms).await;
         let _ = tx.send(r);
         sema_core::notify_io_complete();
@@ -7354,6 +7364,68 @@ fn enforce_rate_limit() {
             .unwrap_or(0);
         RATE_LIMIT_LAST.with(|l| l.set(actual_now));
     }
+}
+
+/// Non-blocking counterpart to `enforce_rate_limit`, for the two async-path
+/// callers (`do_complete_async_yield`, `stream_run_begin`). Runs on the VM
+/// thread, synchronously, BEFORE the offload is dispatched — it never sleeps
+/// itself. It returns how many milliseconds THIS call's send must be delayed
+/// (0 if the gate is clear), and the caller is responsible for spending that
+/// delay somewhere that isn't the VM thread (a `tokio::time::sleep` inside the
+/// offloaded future, or a `std::thread::sleep` on a pool worker) so sibling
+/// tasks keep running while the pacing gap elapses.
+///
+/// Reserve-then-go: unlike `enforce_rate_limit` (which stamps `RATE_LIMIT_LAST`
+/// to the actual wall-clock time AFTER it wakes from its own blocking sleep),
+/// this stamps it to the RESERVED slot — which may be in the future — before
+/// returning. The scheduler is single-threaded, so a burst of async calls each
+/// run this function to completion, one at a time, in dispatch order; a later
+/// call in the same burst sees the earlier one's reservation already advanced
+/// and queues one interval further out. Without reserving up front, every call
+/// in the burst would read the same stale `RATE_LIMIT_LAST` (none of them have
+/// sent yet — their waits run on background workers) and compute the same
+/// wait, so they'd all fire together the instant it elapses instead of staying
+/// paced.
+fn reserve_rate_limit_wait_ms() -> u64 {
+    let rps = RATE_LIMIT_RPS.with(|r| r.get());
+    let Some(rps) = rps else {
+        return 0;
+    };
+    let min_interval_ms = (1000.0 / rps) as u64;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let last = RATE_LIMIT_LAST.with(|l| l.get());
+    // A `last` slot more than this far ahead of `now` cannot be a legitimate
+    // reservation queue — the wall clock jumped backward since it was
+    // stamped. Discard it, exactly like `enforce_rate_limit`'s
+    // `saturating_sub` guard for the same condition (see
+    // `enforce_rate_limit_survives_backward_clock`), so a corrupted `last`
+    // cannot wedge a call behind a real multi-minute wait. Scaled to
+    // `min_interval_ms` (floored at 60s) rather than a bare constant: a very
+    // low configured rps can legitimately reserve slots far ahead of `now`
+    // after just a few concurrent dispatches (e.g. 0.05 rps ⇒ 20s apart), and
+    // a fixed cap too close to one interval would misclassify that as clock
+    // skew and silently under-pace it.
+    const MIN_TRUSTED_RESERVATION_AHEAD_MS: u64 = 60_000;
+    let max_trusted_ahead_ms = min_interval_ms
+        .saturating_mul(4)
+        .max(MIN_TRUSTED_RESERVATION_AHEAD_MS);
+    let last = if last > now.saturating_add(max_trusted_ahead_ms) {
+        0
+    } else {
+        last
+    };
+    // No prior dispatch/reservation (or the stale value just discarded above):
+    // this call's slot is now — no wait, nothing to reserve ahead of `now`.
+    let slot = if last == 0 {
+        now
+    } else {
+        now.max(last.saturating_add(min_interval_ms))
+    };
+    RATE_LIMIT_LAST.with(|l| l.set(slot));
+    slot.saturating_sub(now)
 }
 
 /// Build ToolSchema list from Sema ToolDef values.
@@ -8419,16 +8491,22 @@ fn resolve_stream_chain() -> Result<Vec<ResolvedProvider>, SemaError> {
     })
 }
 
-/// Start a non-blocking stream run: budget pre-gate + rate limit, cassette
-/// decision on the VM thread (replay pre-fills the run — drained without
-/// parking; recording captures the key for finalize), chain resolution into
-/// `Arc` clones, then the wire walk offloaded onto the I/O pool with
-/// `notify_io_complete` after every send so the parked scheduler wakes per
-/// delta. `span` is the caller's DETACHED chat span (attributes already set);
-/// it is finalized when `Done` lands. Returns the slab token.
+/// Start a non-blocking stream run: budget pre-gate, cassette decision on the
+/// VM thread (replay pre-fills the run — drained without parking; recording
+/// captures the key for finalize), then — for a real dispatch only — the
+/// rate-limit gate, chain resolution into `Arc` clones, and the wire walk
+/// offloaded onto the I/O pool with `notify_io_complete` after every send so
+/// the parked scheduler wakes per delta. `span` is the caller's DETACHED chat
+/// span (attributes already set); it is finalized when `Done` lands. Returns
+/// the slab token.
+///
+/// The rate-limit gate sits AFTER the cassette decision (unlike the sync
+/// `stream_with_dispatch`, which always calls `enforce_rate_limit` up front):
+/// a replay makes no provider call, so — mirroring `do_complete_async_yield`'s
+/// cache/cassette-hit paths, which skip the gate entirely — it doesn't
+/// consume a pacing slot either.
 fn stream_run_begin(request: ChatRequest, span: sema_otel::LlmSpan) -> Result<Value, SemaError> {
     stream_budget_pregate()?;
-    enforce_rate_limit();
 
     // Keyed by the request as-is (no default-model resolution), matching the
     // synchronous `stream_with_cassette` so record/replay agree across paths.
@@ -8460,11 +8538,18 @@ fn stream_run_begin(request: ChatRequest, span: sema_otel::LlmSpan) -> Result<Va
     let rx = if prefilled {
         None
     } else {
+        // Reserve this dispatch's rate-limit slot HERE, synchronously, before
+        // the offload starts (see `reserve_rate_limit_wait_ms`). The wait
+        // itself is spent on the I/O pool worker below, never the VM thread.
+        let rate_limit_wait_ms = reserve_rate_limit_wait_ms();
         let chain = resolve_stream_chain()?;
         let (tx, rx) = std::sync::mpsc::channel::<StreamEvent>();
         #[cfg(not(target_arch = "wasm32"))]
         {
             sema_io::io_spawn_blocking(move || {
+                if rate_limit_wait_ms > 0 {
+                    std::thread::sleep(std::time::Duration::from_millis(rate_limit_wait_ms));
+                }
                 let mut emit = |ev: StreamEvent| {
                     let _ = tx.send(ev);
                     sema_core::notify_io_complete();
@@ -8476,6 +8561,11 @@ fn stream_run_begin(request: ChatRequest, span: sema_otel::LlmSpan) -> Result<Va
         {
             // No I/O pool on wasm: run the walk inline (blocking) — deltas are
             // delivered after the stream completes, in order, exactly once.
+            // Single-threaded (no siblings to stall), so the reserved wait is
+            // spent inline too, unlike the pool-offloaded path above.
+            if rate_limit_wait_ms > 0 {
+                sema_core::blocking_sleep_ms(rate_limit_wait_ms);
+            }
             let mut emit = |ev: StreamEvent| {
                 let _ = tx.send(ev);
             };
@@ -9223,6 +9313,58 @@ mod tests {
         assert!(
             start.elapsed() < std::time::Duration::from_secs(1),
             "backward clock should not cause a long sleep"
+        );
+        RATE_LIMIT_RPS.with(|r| r.set(None));
+        RATE_LIMIT_LAST.with(|l| l.set(0));
+    }
+
+    #[test]
+    fn reserve_rate_limit_wait_ms_stays_zero_with_no_gate() {
+        RATE_LIMIT_RPS.with(|r| r.set(None));
+        RATE_LIMIT_LAST.with(|l| l.set(0));
+        assert_eq!(reserve_rate_limit_wait_ms(), 0);
+    }
+
+    #[test]
+    fn reserve_rate_limit_wait_ms_stages_a_concurrent_burst() {
+        // Three back-to-back reservations at rps=10 (100ms interval) with no
+        // real time elapsing between them: the first is free, and each next
+        // one is pushed exactly one interval further out than the last —
+        // proving concurrent async dispatches get staggered instead of all
+        // computing the same wait against a stale `RATE_LIMIT_LAST`.
+        RATE_LIMIT_RPS.with(|r| r.set(Some(10.0)));
+        RATE_LIMIT_LAST.with(|l| l.set(0));
+        let first = reserve_rate_limit_wait_ms();
+        let second = reserve_rate_limit_wait_ms();
+        let third = reserve_rate_limit_wait_ms();
+        assert_eq!(first, 0, "no prior reservation: the gate is clear");
+        assert!(
+            (90..=110).contains(&second),
+            "second reservation should land ~100ms out, got {second}"
+        );
+        assert!(
+            (190..=210).contains(&third),
+            "third reservation should land ~200ms out, got {third}"
+        );
+        RATE_LIMIT_RPS.with(|r| r.set(None));
+        RATE_LIMIT_LAST.with(|l| l.set(0));
+    }
+
+    #[test]
+    fn reserve_rate_limit_wait_ms_survives_backward_clock() {
+        // Mirrors `enforce_rate_limit_survives_backward_clock`: a reserved slot
+        // far in the future (wall clock jumped backward since it was stamped)
+        // must not wedge this call behind a real multi-minute wait.
+        RATE_LIMIT_RPS.with(|r| r.set(Some(10.0)));
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        RATE_LIMIT_LAST.with(|l| l.set(now + 1_000_000));
+        let wait = reserve_rate_limit_wait_ms();
+        assert!(
+            wait < 1_000,
+            "backward clock should not produce a huge reserved wait, got {wait}ms"
         );
         RATE_LIMIT_RPS.with(|r| r.set(None));
         RATE_LIMIT_LAST.with(|l| l.set(0));
