@@ -1367,6 +1367,32 @@ eval_tests! {
 }
 
 // ============================================================
+// map-indexed and enumerate (#90)
+// ============================================================
+
+eval_tests! {
+    map_indexed_basic: "(map-indexed (fn (i x) (list i x)) '(10 20 30))"
+        => common::eval("'((0 10) (1 20) (2 30))"),
+    map_indexed_empty: "(map-indexed (fn (i x) (list i x)) '())" => Value::list(vec![]),
+    map_indexed_vector_input: "(map-indexed (fn (i x) (+ i x)) (vector 10 20 30))"
+        => Value::list(vec![Value::int(10), Value::int(21), Value::int(32)]),
+    map_indexed_index_only: "(map-indexed (fn (i x) i) '(a b c))"
+        => Value::list(vec![Value::int(0), Value::int(1), Value::int(2)]),
+
+    enumerate_basic: "(enumerate '(10 20 30))" => common::eval("'((0 10) (1 20) (2 30))"),
+    enumerate_empty: "(enumerate '())" => Value::list(vec![]),
+    enumerate_vector_input: "(enumerate (vector 'a 'b))" => common::eval("'((0 a) (1 b))"),
+    enumerate_then_map_destructure: "(map (fn (pair) (car pair)) (enumerate '(x y z)))"
+        => Value::list(vec![Value::int(0), Value::int(1), Value::int(2)]),
+}
+
+eval_error_tests! {
+    map_indexed_wrong_arity: "(map-indexed (fn (i x) x))" => "arity",
+    map_indexed_non_sequence_errors: "(map-indexed (fn (i x) x) 5)" => "list, vector, or mutable-array",
+    enumerate_non_sequence_errors: "(enumerate 5)" => "list, vector, or mutable-array",
+}
+
+// ============================================================
 // Input validation — negative counts/indices (C7, C8, C9)
 // ============================================================
 
@@ -2828,6 +2854,18 @@ eval_tests! {
     mutable_array_get_redefined: "(define (mutable-array/get a i) :mine) (mutable-array/get (mutable-array/new 1 5) 0)" => Value::keyword("mine"),
     // A let-bound shadow resolves locally (never the intrinsic).
     mutable_array_get_local_shadow: "(let ((mutable-array/get (fn (a i) :local))) (mutable-array/get 1 2))" => Value::keyword("local"),
+    // --- Sequence HOF / length interop (#91): the shared `get_sequence`
+    // coercion accepts a mutable-array by snapshotting it up front, so
+    // map/filter/for-each and generic `length` treat it like a list/vector.
+    mutable_array_map_interop: "(let ((a (mutable-array/new))) (mutable-array/push! a 5) (mutable-array/push! a 6) (map (lambda (x) (* x 2)) a))" => common::eval("'(10 12)"),
+    mutable_array_filter_interop: "(let ((a (mutable-array/new))) (mutable-array/push! a 1) (mutable-array/push! a 2) (mutable-array/push! a 3) (filter odd? a))" => common::eval("'(1 3)"),
+    // for-each returns nil; observe its effect by accumulating into a cell.
+    mutable_array_for_each_interop: "(let ((a (mutable-array/new)) (sum (mutable-cell/new 0))) (mutable-array/push! a 3) (mutable-array/push! a 4) (for-each (lambda (x) (mutable-cell/set! sum (+ (mutable-cell/get sum) x))) a) (mutable-cell/get sum))" => Value::int(7),
+    mutable_array_length_interop: "(let ((a (mutable-array/new))) (mutable-array/push! a 5) (mutable-array/push! a 6) (length a))" => Value::int(2),
+    // Reentrancy: the snapshot is taken before the loop, so a callback that
+    // grows the same array does not panic ("already borrowed") and iteration
+    // still ranges over the original two elements.
+    mutable_array_map_reentrant_snapshot: "(let ((a (mutable-array/new))) (mutable-array/push! a 1) (mutable-array/push! a 2) (map (lambda (x) (mutable-array/push! a 99) x) a))" => common::eval("'(1 2)"),
     mutable_cell_round_trip: "(let ((c (mutable-cell/new 1))) (mutable-cell/set! c 99) (mutable-cell/get c))" => Value::int(99),
     mutable_cell_shared_mutation: "(let* ((c (mutable-cell/new 0)) (d c)) (mutable-cell/set! c 5) (mutable-cell/get d))" => Value::int(5),
     mutable_cell_equal_by_contents: "(equal? (mutable-cell/new 1) (mutable-cell/new 1))" => Value::bool(true),
