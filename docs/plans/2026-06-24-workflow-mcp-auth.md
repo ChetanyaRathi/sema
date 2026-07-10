@@ -1,13 +1,20 @@
 # Authenticated MCP servers in workflow runs — scoping (future feature)
 
-> **Status (2026-07-09):** the hard blocker is gone — the MCP client with OAuth shipped (`crates/sema-mcp/{client.rs,client_auth.rs,oauth/}`, PR #59). The workflow `:mcp` projection and dashboard auth surface described here are still not started; this plan is now actionable as written.
+> **Status (2026-07-10):** the headless precursor — §9 items (a)+(b)+(c) — SHIPPED
+> on branch `feat/workflow-mcp-auth`: the `:mcp` declaration + runtime
+> auth-resolution step with the `{:status :needs-auth}` exit, scoped encrypted
+> token stores (`:keyring`/`:workflow`/`:run`/`:none`), `auth.required` /
+> `auth.granted` / `auth.failed` journal events, `sema mcp login --token` + the
+> CLI's exit-2 guidance, and the read-only dashboard auth status endpoint + panel.
+> Item (d) — dashboard WRITE auth endpoints + CSRF + the live one-click HITL gate —
+> remains deferred (see §9).
 
-**Status:** Scoping / future feature (2026-06-24). **Not started.** Depends on work
-that does not exist yet (the MCP *client* + its OAuth engine). This doc scopes the
-*workflow + dashboard* integration: how a `defworkflow` declares the MCP servers /
-tools it needs, how the web UI drives the login flow for the ones that require
-auth, and how the resulting auth session is persisted so the run (and later runs)
-can use it.
+**Status:** Headless precursor shipped (2026-07-10) — see the blockquote above.
+The live one-click dashboard auth gate (item (d)) is not started. This doc scopes
+the *workflow + dashboard* integration: how a `defworkflow` declares the MCP
+servers / tools it needs, how the web UI drives the login flow for the ones that
+require auth, and how the resulting auth session is persisted so the run (and
+later runs) can use it.
 
 **Companions (read together):**
 - `docs/plans/2026-06-21-mcp-client-spike.md` — Sema as an MCP *client* (Layer 1

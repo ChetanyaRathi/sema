@@ -1,5 +1,40 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- **Authenticated MCP servers in workflow runs — headless precursor** (per
+  `docs/plans/2026-06-24-workflow-mcp-auth.md`, §9 items a–c). A `defworkflow`
+  can declare the MCP servers its leaves need in a new `:mcp` meta key
+  (alias → the same spec `mcp/connect` accepts, plus `:auth`, a least-privilege
+  `:tools` manifest, and a `:persist` store scope); the runtime resolves and
+  connects them all **before any phase runs**:
+  - Declared aliases are bound in the workflow body as live, connected handles —
+    leaves never call `mcp/connect` themselves. Calls to tools outside the
+    declared `:tools` manifest fail fast before touching the wire, and agents
+    built from the connection only ever see declared tools.
+  - A server whose OAuth session can't be satisfied from the token store gates
+    the run: it exits `{:status :needs-auth :servers […]}` (CLI exit code 2)
+    with per-server `sema mcp login <url>` guidance instead of burning compute.
+    Authenticate once, re-run, and the persisted session is reused — and
+    refreshed — silently on every later run.
+  - Scoped, encrypted token stores via `:persist`: `:keyring` (OS keychain),
+    `:workflow` (`.sema/auth/<workflow>/`), `:run`
+    (`.sema/runs/<run-id>/auth/`), `:none` (in-memory). File-backed scopes are
+    ChaCha20-Poly1305-encrypted at rest with a keyring-held (or
+    `SEMA_MCP_AUTH_KEY`) key, written `0600`, and refuse to write a token under
+    a directory git would track.
+  - The journal gains additive `auth.required` / `auth.granted` / `auth.failed`
+    events (alias + scopes + expiry only — never token material), the `:mcp`
+    manifest lands in `metadata.json` with header/env values redacted, and
+    `sema workflow view` shows a `needs-auth` pill plus a read-only per-server
+    auth panel (`GET /api/run/:id/auth`).
+  - `sema mcp login` accepts `--token` (and `--expires-in`) to install a
+    pre-issued token on headless/CI machines without a browser flow.
+  - The live one-click dashboard auth gate (write endpoints + CSRF + in-process
+    resume) is deferred — the plan's §9 item (d).
+
 ## 1.30.0 — 2026-07-09
 
 ### Added
