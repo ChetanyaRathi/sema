@@ -12,14 +12,19 @@
 //! so every path that can run a workflow (REPL, `sema run`, `sema workflow run`,
 //! and any embedder that opts in) gets it.
 
+use std::cell::Cell;
 use std::path::PathBuf;
 use std::rc::Rc;
 
 use sema_core::Value;
 use sema_mcp::oauth::login::{self, LoginConfig};
+use sema_mcp::oauth::loopback::BrowserOpener;
 use sema_mcp::oauth::scoped::{store_encryption_key, MemoryStore, ScopedFileStore};
 use sema_mcp::oauth::store::{self, TokenSet, TokenStore};
-use sema_mcp::{close_handle, connect_from_config, ConnectFailure, ConnectOpts};
+use sema_mcp::{
+    browser_open_allowed, close_handle, connect_from_config, gated_browser_opener,
+    login_interactive, ConnectFailure, ConnectOpts,
+};
 use sema_stdlib::workflow_mcp::{
     self, AuthGrant, McpAuthDecl, McpDecl, McpPersist, McpSpecDecl, ServerResolution,
     WorkflowMcpResolver,
@@ -29,6 +34,71 @@ use sema_stdlib::workflow_mcp::{
 /// expiry — mirrors `oauth::login`'s own `EXPIRY_SKEW_SECS` (private to that
 /// module), reused here via the public [`TokenSet::is_expired`].
 const EXPIRY_SKEW_SECS: u64 = 60;
+
+/// The test/embedder browser-opener override — see [`set_interactive_login_opener`].
+type TestOpenerFn = fn(&str) -> Result<(), String>;
+
+thread_local! {
+    // See `set_interactive_auth`. Defaults to `false` — a fresh thread/process
+    // (REPL, `sema run`, an embedder that never calls `set_interactive_auth`)
+    // gets exactly today's headless behavior.
+    static INTERACTIVE_AUTH: Cell<bool> = const { Cell::new(false) };
+    // TEST/embedder seam: see `set_interactive_login_opener`.
+    static TEST_LOGIN_OPENER: Cell<Option<TestOpenerFn>> = const { Cell::new(None) };
+}
+
+/// Enable (or disable) inline interactive MCP auth at the run-start resolution
+/// gate: when `true`, a declared server this process finds no usable session
+/// for runs the SAME browser/loopback login `sema mcp login` performs, right
+/// where the headless precursor would otherwise gate with
+/// `{:status :needs-auth}` (plan `docs/plans/2026-06-24-workflow-mcp-auth.md`
+/// §3). `run_workflow_command` (`crates/sema/src/main.rs`) is the only caller
+/// in the binary; it enables this iff stdin AND stderr are TTYs, `CI` is
+/// unset/empty, and `--no-auth-prompt` was not passed.
+///
+/// Resolution happens before any workflow phase runs, so a browser prompt here
+/// has nothing to park/resume — this collapses the plan's "live gate"
+/// (yield-signal parking, shared with the deferred HITL-approval-gate
+/// milestone) for the run-start case specifically. That yield machinery is
+/// NOT needed for this path and is not built here; a mid-run re-auth (a token
+/// revoked while phases are already executing) is out of scope too.
+///
+/// Thread-local because a Sema interpreter (and thus a workflow run) is
+/// single-threaded.
+pub fn set_interactive_auth(enabled: bool) {
+    INTERACTIVE_AUTH.with(|c| c.set(enabled));
+}
+
+fn interactive_auth_enabled() -> bool {
+    INTERACTIVE_AUTH.with(|c| c.get())
+}
+
+/// TEST/embedder seam: override the browser opener the interactive run-start
+/// auth path uses, so a test can drive the OAuth redirect programmatically
+/// (the `crates/sema-mcp/tests/mcp_oauth_test.rs` loopback-driving pattern —
+/// a blocking GET that follows the authorization server's redirect to the
+/// loopback listener) instead of popping a real browser. `None` (the default)
+/// reverts to the real, sandbox-gated browser opener
+/// (`sema_mcp::gated_browser_opener`).
+///
+/// A plain `fn` pointer, not a capturing closure: `LoopbackDriver::drive` runs
+/// the opener on a thread IT spawns, and thread-locals never propagate to a
+/// spawned thread, so the opener to use must be resolved and boxed on the
+/// calling thread before handoff — trivial for a `Copy` fn pointer, impossible
+/// for a thread-local lookup performed from inside the opener itself.
+pub fn set_interactive_login_opener(opener: Option<TestOpenerFn>) {
+    TEST_LOGIN_OPENER.with(|c| c.set(opener));
+}
+
+/// The opener to hand to [`login_interactive`]: the test override if one is
+/// set, else the real sandbox-gated browser opener. Resolved on the calling
+/// (evaluator) thread — see [`set_interactive_login_opener`].
+fn interactive_login_opener() -> BrowserOpener {
+    match TEST_LOGIN_OPENER.with(|c| c.get()) {
+        Some(f) => Box::new(f),
+        None => gated_browser_opener(),
+    }
+}
 
 /// Install the real, `sema-mcp`-backed resolver as the process' active
 /// [`WorkflowMcpResolver`]. Idempotent (replacing is cheap and side-effect-free).
@@ -57,7 +127,9 @@ fn resolve_one(decl: &McpDecl, workflow: &str, run_id: &str) -> ServerResolution
     match (&decl.spec, &decl.auth) {
         // Stdio never speaks OAuth (declared_mcp already forbids :auth there);
         // HTTP without :auth is bring-your-own (:headers) or genuinely open.
-        (McpSpecDecl::Stdio { .. }, _) | (McpSpecDecl::Http { .. }, None) => connect_plain(decl),
+        (McpSpecDecl::Stdio { .. }, _) | (McpSpecDecl::Http { .. }, None) => {
+            connect_plain(decl, workflow, run_id)
+        }
         (McpSpecDecl::Http { .. }, Some(auth)) => {
             resolve_authenticated_http(decl, auth, workflow, run_id)
         }
@@ -135,9 +207,13 @@ fn spec_config_value(spec: &McpSpecDecl, bearer: Option<&str>) -> Value {
 
 /// Stdio, or HTTP without `:auth`: connect directly (never chasing an OAuth
 /// challenge — `interactive_auth: false`). An undeclared-auth server that
-/// challenges anyway is honestly reported as `NeedsAuth`, scopes empty (none were
-/// ever declared) and tools/persist taken from the decl.
-fn connect_plain(decl: &McpDecl) -> ServerResolution {
+/// challenges anyway is honestly reported as `NeedsAuth` (scopes empty — none
+/// were ever declared, tools/persist taken from the decl) UNLESS interactive
+/// auth is enabled, in which case this is the "no-`:auth` HTTP connect path
+/// when the server unexpectedly challenges" case §3(3) of the interactive-auth
+/// requirements calls out by name: try the same inline login as the declared-
+/// `:auth` path before gating.
+fn connect_plain(decl: &McpDecl, workflow: &str, run_id: &str) -> ServerResolution {
     let cfg = spec_config_value(&decl.spec, None);
     let opts = ConnectOpts {
         interactive_auth: false,
@@ -149,13 +225,10 @@ fn connect_plain(decl: &McpDecl) -> ServerResolution {
             handle,
             auth: None,
         },
-        Err(ConnectFailure::NeedsAuth { url }) => ServerResolution::NeedsAuth {
-            alias: decl.alias.clone(),
-            url,
-            scopes: Vec::new(),
-            tools: decl.tools.clone(),
-            persist: persist_str(decl.persist).to_string(),
-        },
+        Err(ConnectFailure::NeedsAuth { url }) => {
+            let auth = decl.auth.clone().unwrap_or_default();
+            needs_auth_or_interactive(decl, &auth, &url, workflow, run_id)
+        }
         Err(ConnectFailure::Failed(reason)) => ServerResolution::Failed {
             alias: decl.alias.clone(),
             reason,
@@ -170,6 +243,67 @@ fn needs_auth(decl: &McpDecl, auth: &McpAuthDecl, url: &str) -> ServerResolution
         scopes: auth.scopes.clone(),
         tools: decl.tools.clone(),
         persist: persist_str(decl.persist).to_string(),
+    }
+}
+
+/// A `ServerResolution::NeedsAuth` return point — the headless-precursor gate
+/// (`needs_auth`, above) — reinterpreted for an interactive run: if
+/// [`set_interactive_auth`] enabled inline login for this run AND the sandbox
+/// permits opening a browser (`Caps::PROCESS`, checked via
+/// `sema_mcp::browser_open_allowed` — the SAME gate the interactive
+/// `mcp/connect` path applies; a denial here NEVER attempts a browser, it just
+/// falls straight through to the ordinary headless gate), run the SAME
+/// browser/loopback OAuth flow `sema mcp login` performs, synchronously, right
+/// here. Multiple unsatisfied servers are prompted sequentially — `resolve`
+/// (above) calls this once per declared server, in alias order, and each call
+/// blocks until that server's login resolves — one browser tab at a time.
+///
+/// On success: persist to `decl`'s scoped store — unless `:persist :none`,
+/// which uses the credential for this connection only, matching the same
+/// "use without persisting" semantics `:none` already has elsewhere in this
+/// file — then connect with the fresh token, `source: "consented"` (the
+/// `AuthGranted.source` value the plan reserves for this case). On any
+/// failure (declined consent, timed-out redirect, discovery/DCR error,
+/// `store_for` failure): print ONE stderr line naming the reason — never the
+/// token — and fall back to the ordinary `NeedsAuth` resolution, so the run
+/// gates and exits 2 with guidance exactly as the non-interactive path
+/// already does.
+fn needs_auth_or_interactive(
+    decl: &McpDecl,
+    auth: &McpAuthDecl,
+    url: &str,
+    workflow: &str,
+    run_id: &str,
+) -> ServerResolution {
+    if !interactive_auth_enabled() || !browser_open_allowed() {
+        return needs_auth(decl, auth, url);
+    }
+
+    let scoped_store = match store_for(decl.persist, workflow, run_id) {
+        Ok(s) => s,
+        Err(reason) => {
+            eprintln!("{}: authentication failed — {reason}", decl.alias);
+            return needs_auth(decl, auth, url);
+        }
+    };
+
+    eprintln!("{}: authentication required — opening browser…", decl.alias);
+
+    match login_interactive(
+        url,
+        auth.client_id.as_deref(),
+        Some(interactive_login_opener()),
+    ) {
+        Ok(creds) => {
+            if decl.persist != McpPersist::None {
+                let _ = scoped_store.save(&creds);
+            }
+            connect_with_token(decl, &creds.tokens, "consented")
+        }
+        Err(reason) => {
+            eprintln!("{}: authentication failed — {reason}", decl.alias);
+            needs_auth(decl, auth, url)
+        }
     }
 }
 
@@ -254,7 +388,7 @@ fn resolve_authenticated_http(
     };
 
     let Some(mut stored) = stored else {
-        return needs_auth(decl, auth, url);
+        return needs_auth_or_interactive(decl, auth, url, workflow, run_id);
     };
 
     if imported_from_default && decl.persist != McpPersist::None {
@@ -285,12 +419,12 @@ fn resolve_authenticated_http(
                 // creds (plan §10 Q3: "refresh silently; only re-gate if
                 // refresh fails" — the stale refresh token might still work
                 // later, e.g. a transient network error).
-                return needs_auth(decl, auth, url);
+                return needs_auth_or_interactive(decl, auth, url, workflow, run_id);
             }
         }
     }
 
-    needs_auth(decl, auth, url)
+    needs_auth_or_interactive(decl, auth, url, workflow, run_id)
 }
 
 /// Connect with a resolved access token attached as a Bearer header. A connect

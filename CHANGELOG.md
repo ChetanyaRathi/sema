@@ -34,6 +34,16 @@
     pre-issued token on headless/CI machines without a browser flow.
   - The live one-click dashboard auth gate (write endpoints + CSRF + in-process
     resume) is deferred — the plan's §9 item (d).
+- **Interactive MCP auth inline on `sema workflow run`**. On a real terminal
+  (stdin AND stderr both TTYs, no `CI`, and `--no-auth-prompt` not passed), a
+  needs-auth gate now logs in right there — the same browser/loopback flow
+  `sema mcp login` runs — instead of exiting 2. Success persists to the
+  declared server's `:persist` store (`:none` uses the session for this
+  connection only) and continues the run with `auth.granted` `source:
+  "consented"`; a declined/failed/timed-out login prints one line and falls
+  back to the existing exit-2 guidance. Headless runs, CI, and
+  `--no-auth-prompt` are unaffected — byte-for-byte the same exit-2 contract
+  as before.
 
 ## 1.30.0 — 2026-07-09
 

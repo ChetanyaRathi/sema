@@ -41,8 +41,11 @@ thread_local! {
 
 /// A browser opener that refuses to launch (spawn) a browser when the sandbox
 /// denies `PROCESS`. Only invoked when a browser is actually needed (a full
-/// login), so cached/refresh flows are unaffected.
-fn gated_browser_opener() -> crate::oauth::loopback::BrowserOpener {
+/// login), so cached/refresh flows are unaffected. Public: the workflow
+/// interactive-auth path (`crates/sema/src/workflow_mcp.rs`) reuses this exact
+/// opener so a run-start browser login is gated identically to `mcp/connect`'s
+/// own interactive path — never a separate, laxer gate.
+pub fn gated_browser_opener() -> crate::oauth::loopback::BrowserOpener {
     Box::new(|url: &str| {
         if let Some(err) = SANDBOX.with(|s| {
             let sb = s.borrow();
@@ -55,6 +58,24 @@ fn gated_browser_opener() -> crate::oauth::loopback::BrowserOpener {
             return Err(err.to_string());
         }
         crate::oauth::loopback::open_browser(url)
+    })
+}
+
+/// Whether the sandbox captured by the most recent [`register_mcp_builtins`]
+/// call on this thread currently permits opening a browser (`Caps::PROCESS`).
+/// Consult this BEFORE attempting an interactive login, not just
+/// [`gated_browser_opener`]'s internal check: `LoopbackDriver::drive` runs the
+/// opener on a spawned thread and discards its `Err` (`let _ = opener(&url)`),
+/// so a denied opener alone would silently sit waiting for a redirect that can
+/// never arrive, until the full login timeout elapses. Checking here lets a
+/// denied sandbox degrade immediately to the headless `NeedsAuth` path.
+pub fn browser_open_allowed() -> bool {
+    SANDBOX.with(|s| {
+        let sb = s.borrow();
+        sb.is_unrestricted()
+            || sb
+                .check(Caps::PROCESS, "mcp/connect (open browser)")
+                .is_ok()
     })
 }
 

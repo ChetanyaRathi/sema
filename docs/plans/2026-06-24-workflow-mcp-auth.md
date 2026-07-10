@@ -6,11 +6,14 @@
 > token stores (`:keyring`/`:workflow`/`:run`/`:none`), `auth.required` /
 > `auth.granted` / `auth.failed` journal events, `sema mcp login --token` + the
 > CLI's exit-2 guidance, and the read-only dashboard auth status endpoint + panel.
-> Item (d) — dashboard WRITE auth endpoints + CSRF + the live one-click HITL gate —
-> remains deferred (see §9).
+> Item (a2) — inline interactive login on a TTY `sema workflow run` — also
+> SHIPPED (see §3's status note). Item (d) — dashboard WRITE auth endpoints +
+> CSRF + the live one-click gate for headless/dashboard-started runs — remains
+> deferred (see §9).
 
-**Status:** Headless precursor shipped (2026-07-10) — see the blockquote above.
-The live one-click dashboard auth gate (item (d)) is not started. This doc scopes
+**Status:** Headless precursor + run-start interactive login shipped
+(2026-07-10) — see the blockquote above. The live one-click dashboard auth gate
+(item (d)) is not started. This doc scopes
 the *workflow + dashboard* integration: how a `defworkflow` declares the MCP
 servers / tools it needs, how the web UI drives the login flow for the ones that
 require auth, and how the resulting auth session is persisted so the run (and
@@ -146,6 +149,20 @@ can clear:
 Recommend shipping the **headless precursor first** (it delivers the scenario with
 far less machinery) and the live gate as a follow-on.
 
+> **Status (2026-07-10):** run-start interactive login SHIPPED on
+> `feat/workflow-mcp-auth`. On an interactive terminal (stdin AND stderr both
+> TTYs, no `CI`, no `--no-auth-prompt`), `sema workflow run` now performs the
+> browser/loopback login inline at the needs-auth gate — the same flow `sema
+> mcp login` runs, sharing its implementation (`sema_mcp::login_interactive`)
+> — instead of exiting 2. This deliberately does NOT build the yield-signal
+> "live gate" described above: resolution happens before any phase runs, so
+> there is nothing to park/resume for the run-start case, which the interactive
+> path collapses entirely. The device-code flow and the dashboard's one-click
+> write-endpoint gate remain out of scope for this path (headless CI keeps the
+> exit-2 contract unchanged; a non-TTY or `--no-auth-prompt` run is byte-for-byte
+> the same as before). See §9 — item (d) now covers only the dashboard write
+> surface.
+
 ---
 
 ## 4. Persistence — where the auth session lives
@@ -275,8 +292,14 @@ the implicit "Auth" phase, and they back the `/api/run/:id/auth` status.
         │
         ├─► (c) journal auth.* events + dashboard read-only auth status panel
         │
-        └─► (d) dashboard WRITE auth endpoints + CSRF + the LIVE HITL gate
-                 (reuses the async yield mechanism) — the full one-click flow
+        ├─► (a2) run-start interactive login: a TTY `sema workflow run` logs in
+        │        inline at the needs-auth gate instead of exiting 2 — SHIPPED,
+        │        see the §3 status note (no yield machinery needed here)
+        │
+        └─► (d) dashboard WRITE auth endpoints + CSRF + the LIVE one-click gate
+                 for a run started headlessly/from the dashboard (reuses the
+                 async yield mechanism) — (a2) already covers the TTY run-start
+                 case, so this item is now scoped to the dashboard write surface
 ```
 
 Build order: the MCP client first (its own plan), then (a)+(b) for the headless

@@ -1,4 +1,5 @@
 use std::cell::RefCell;
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
@@ -508,7 +509,9 @@ enum WorkflowCommands {
     ///
     /// Exit codes: 0 success, 1 failed, 2 the run needs MCP authentication (see
     /// stderr for which server(s) and the `sema mcp login` command to run, then
-    /// re-run this workflow).
+    /// re-run this workflow). On an interactive terminal, a needs-auth gate logs
+    /// in inline (the browser/loopback flow) instead of exiting 2; `--no-auth-prompt`
+    /// forces the headless exit-2 behavior even on a TTY.
     Run {
         /// Path to the `.sema` workflow file.
         file: String,
@@ -537,6 +540,13 @@ enum WorkflowCommands {
         /// version and re-runs everything.
         #[arg(long)]
         resume: Option<String>,
+
+        /// Never log in inline on a needs-auth gate, even on an interactive
+        /// terminal — always exit 2 with `sema mcp login` guidance instead. No
+        /// effect when running headlessly (no TTY, or `CI` set): that already
+        /// gets the exit-2 behavior.
+        #[arg(long)]
+        no_auth_prompt: bool,
     },
     /// Backfill the cross-run SQLite index (`<run-dir>/index.db`) from every run's
     /// journal — for offline/CI use; the viewer also syncs lazily on request.
@@ -1090,7 +1100,7 @@ fn main() {
 /// `defworkflow`s and runs it) with the run-directory + args seams wired, then
 /// exit non-zero if the run's `{:status …}` envelope reports failure.
 fn run_workflow_command(command: WorkflowCommands, sandbox: &sema_core::Sandbox) {
-    let (file, args, run_dir, view, view_port, resume) = match command {
+    let (file, args, run_dir, view, view_port, resume, no_auth_prompt) = match command {
         WorkflowCommands::Run {
             file,
             args,
@@ -1098,7 +1108,8 @@ fn run_workflow_command(command: WorkflowCommands, sandbox: &sema_core::Sandbox)
             view,
             port,
             resume,
-        } => (file, args, run_dir, view, port, resume),
+            no_auth_prompt,
+        } => (file, args, run_dir, view, port, resume, no_auth_prompt),
         WorkflowCommands::View {
             run_dir,
             host,
@@ -1144,6 +1155,17 @@ fn run_workflow_command(command: WorkflowCommands, sandbox: &sema_core::Sandbox)
             std::process::exit(workflow_check::report(&file, &diags, strict, json));
         }
     };
+
+    // Interactive MCP auth (docs/plans/2026-06-24-workflow-mcp-auth.md §3): on a
+    // real terminal, a needs-auth gate logs in inline instead of exiting 2. See
+    // `should_enable_interactive_auth` for the exact decision and
+    // `sema::workflow_mcp::set_interactive_auth` for what enabling it does.
+    sema::workflow_mcp::set_interactive_auth(should_enable_interactive_auth(
+        std::io::stdin().is_terminal(),
+        std::io::stderr().is_terminal(),
+        std::env::var("CI").ok().as_deref(),
+        no_auth_prompt,
+    ));
 
     // The workflow runtime (sema-workflow) reads this seam to choose the run-dir
     // base; the run lands in `<run-dir>/<run-id>/`.
@@ -1332,6 +1354,37 @@ fn format_needs_auth_guidance(envelope: &Value) -> String {
     }
     out.push_str("then re-run this workflow. (or authenticate from `sema workflow view`)\n");
     out
+}
+
+/// Whether `run_workflow_command` should enable inline interactive MCP auth
+/// (`sema::workflow_mcp::set_interactive_auth`) for this run: a needs-auth
+/// gate logs in right there instead of exiting 2. Pure over its inputs — no
+/// direct `IsTerminal`/`env::var` calls here — so this is unit-testable
+/// without a real TTY; the caller supplies `std::io::stdin().is_terminal()`,
+/// `std::io::stderr().is_terminal()`, `std::env::var("CI").ok()`, and the
+/// `--no-auth-prompt` flag.
+///
+/// Both stdin AND stderr must be TTYs: stdin implies a human is actually at
+/// the keyboard to complete a browser (or, if this run were headless, a
+/// device-code) flow; stderr is where the "opening browser…" line and any
+/// failure reason land, so it must be a place a human will actually see them
+/// — an interactive stdin with redirected stderr (e.g. `sema workflow run x
+/// 2>log.txt`) is exactly the case that should NOT pop a browser unannounced.
+/// `--no-auth-prompt` and a non-empty `CI` both force the headless path
+/// unconditionally, regardless of the TTY checks.
+fn should_enable_interactive_auth(
+    stdin_is_tty: bool,
+    stderr_is_tty: bool,
+    ci_env: Option<&str>,
+    no_auth_prompt: bool,
+) -> bool {
+    if no_auth_prompt {
+        return false;
+    }
+    if ci_env.is_some_and(|v| !v.is_empty()) {
+        return false;
+    }
+    stdin_is_tty && stderr_is_tty
 }
 
 /// Best-effort: open `url` in the default browser via the platform opener. Silent
@@ -3793,5 +3846,43 @@ mod tests {
         let envelope = sema_reader::read(r#"{:status :needs-auth}"#).expect("valid sema literal");
         let out = format_needs_auth_guidance(&envelope);
         assert!(out.starts_with("run needs authentication for 0 MCP server(s):\n"));
+    }
+
+    // ── should_enable_interactive_auth ─────────────────────────────────────
+
+    #[test]
+    fn interactive_auth_enabled_only_when_both_streams_are_ttys() {
+        assert!(should_enable_interactive_auth(true, true, None, false));
+        assert!(!should_enable_interactive_auth(false, true, None, false));
+        assert!(!should_enable_interactive_auth(true, false, None, false));
+        assert!(!should_enable_interactive_auth(false, false, None, false));
+    }
+
+    #[test]
+    fn interactive_auth_disabled_by_no_auth_prompt_even_on_a_tty() {
+        assert!(!should_enable_interactive_auth(true, true, None, true));
+    }
+
+    #[test]
+    fn interactive_auth_disabled_by_nonempty_ci_even_on_a_tty() {
+        assert!(!should_enable_interactive_auth(
+            true,
+            true,
+            Some("true"),
+            false
+        ));
+        assert!(!should_enable_interactive_auth(
+            true,
+            true,
+            Some("1"),
+            false
+        ));
+    }
+
+    #[test]
+    fn interactive_auth_ignores_an_empty_ci_value() {
+        // `CI=` (set but empty) is treated the same as unset — matches the
+        // brief's "env CI is unset/empty" wording exactly.
+        assert!(should_enable_interactive_auth(true, true, Some(""), false));
     }
 }
