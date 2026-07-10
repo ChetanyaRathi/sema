@@ -32,8 +32,8 @@
     auth panel (`GET /api/run/:id/auth`).
   - `sema mcp login` accepts `--token` (and `--expires-in`) to install a
     pre-issued token on headless/CI machines without a browser flow.
-  - The live one-click dashboard auth gate (write endpoints + CSRF + in-process
-    resume) is deferred — the plan's §9 item (d).
+  - The dashboard's one-click Connect/Forget write endpoints (plan's §9 item
+    (d)) shipped separately — see below.
 - **Interactive MCP auth inline on `sema workflow run`**. On a real terminal
   (stdin AND stderr both TTYs, no `CI`, and `--no-auth-prompt` not passed), a
   needs-auth gate now logs in right there — the same browser/loopback flow
@@ -44,6 +44,19 @@
   back to the existing exit-2 guidance. Headless runs, CI, and
   `--no-auth-prompt` are unaffected — byte-for-byte the same exit-2 contract
   as before.
+- **Dashboard one-click Connect/Forget for MCP auth** (plan's §9 item (d)).
+  `sema workflow view`'s Auth panel gains `POST /api/run/:id/auth/:alias/connect`
+  and `.../forget`: `[Connect]` runs the same browser/loopback OAuth flow
+  `sema mcp login` does, in the background, and persists the session to the
+  declared server's `:persist` store; `[Forget]` deletes it from both the
+  scoped and default stores. Every write route requires a random per-process
+  session token (`X-Sema-View-Token`, minted at startup and embedded in the
+  served page) — missing or wrong is a `403` with no side effects, and the
+  custom header alone defeats cross-origin CSRF (no preflight response, ever).
+  `GET /api/run/:id/auth` now merges in-memory flow state over the journal-
+  derived status, so the panel reflects a pending/just-finished dashboard login
+  immediately (`"connecting"`, then `"authorized"`/`"failed"` + reason) without
+  waiting on a new run.
 
 ## 1.30.0 — 2026-07-09
 

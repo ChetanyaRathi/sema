@@ -7,13 +7,14 @@
 > `auth.granted` / `auth.failed` journal events, `sema mcp login --token` + the
 > CLI's exit-2 guidance, and the read-only dashboard auth status endpoint + panel.
 > Item (a2) — inline interactive login on a TTY `sema workflow run` — also
-> SHIPPED (see §3's status note). Item (d) — dashboard WRITE auth endpoints +
-> CSRF + the live one-click gate for headless/dashboard-started runs — remains
-> deferred (see §9).
+> SHIPPED (see §3's status note). Item (d)'s dashboard WRITE endpoints — one-click
+> `POST …/connect|forget`, the §8 session-token hardening, and the panel
+> `[Connect]`/`[Forget]` buttons — also SHIPPED (see §5's status note); only the
+> in-process live-resume sub-piece of (d) remains, and it is moot (see §9).
 
-**Status:** Headless precursor + run-start interactive login shipped
-(2026-07-10) — see the blockquote above. The live one-click dashboard auth gate
-(item (d)) is not started. This doc scopes
+**Status:** Headless precursor + run-start interactive login + the dashboard's
+one-click Connect/Forget write endpoints are all shipped (2026-07-10) — see the
+blockquote above. This doc scopes
 the *workflow + dashboard* integration: how a `defworkflow` declares the MCP
 servers / tools it needs, how the web UI drives the login flow for the ones that
 require auth, and how the resulting auth session is persisted so the run (and
@@ -203,27 +204,49 @@ run dir.
 
 ## 5. The web-UI authentication flow (dashboard)
 
+> **Status (2026-07-10): SHIPPED**, on the shape below rather than the original
+> `/api/auth/:server/…` sketch. The endpoints actually landed as
+> `POST /api/run/:id/auth/:alias/connect|forget` — sibling routes to the
+> existing `GET /api/run/:id/auth`, so a write action stays scoped to the SAME
+> `(run, alias)` pair the read side already keys on, rather than a
+> global-by-server-name route. `connect` does not implement a "signal the
+> parked run" live resume — the run-start interactive-login path (§3, item
+> (a2)) already covers the TTY case, and a headless/dashboard-started run has
+> already exited by the time anyone could click `[Connect]` in a browser (see
+> §9's note on item (d)) — so `connect` only pre-authenticates the NEXT run;
+> the panel says so (`re-run the workflow to proceed`). The §8 mitigation
+> (session token) is implemented exactly as scoped there.
+
 This is what turns `sema workflow view` from read-only into the run's control
 surface. New, **write** endpoints on the viewer server (so the no-auth/loopback
 security model must be revisited — see §8):
 
 - `GET  /api/run/:id/auth` → the auth manifest + live status per declared server:
-  `[{alias:"asana", needs_auth:true, status:"needs-consent"|"authorized"|"expired", scopes:[…], tools:[…]}]` (derived from the new journal events + the token store).
-- `POST /api/auth/:server/start` → begins the OAuth flow for that server: the
-  server-side MCP-client OAuth engine does discovery → DCR/PKCE → builds the
-  authorize URL, opens the browser (`open` crate) and runs the **loopback callback**
-  (the MCP-client doc's `127.0.0.1:0` + `/callback` → `oneshot`), exchanges the
-  code, persists the session (§4), and **signals the parked run** (live gate) or
-  just stores it (headless precursor). Returns `{status:"authorized"|"failed", …}`.
-- `POST /api/auth/:server/forget` → delete the stored session (re-consent next time).
+  `[{alias:"asana", needs_auth:true, status:"needs-consent"|"connecting"|"authorized"|"expired"|"failed"|"open", scopes:[…], tools:[…], expires_at?, reason?}]`
+  (derived from the redacted `:mcp` manifest + journal `auth.*` events, with a
+  same-process `connect`/`forget` outcome overriding per alias while pending or
+  just-finished — `crates/sema/src/workflow_view/auth.rs`).
+- `POST /api/run/:id/auth/:alias/connect` → validates the alias is declared and
+  is an HTTP server (else `404`/`400`), then — unless a flow for that
+  `(run, alias)` is already pending (idempotent `202`) — runs the SAME
+  `login_interactive` browser/loopback OAuth flow `sema mcp login` and the
+  run-start interactive path use, on a background task. Answers immediately
+  `202 {"status":"connecting"}`; the panel polls `GET …/auth` for the terminal
+  state. On success, persists to the decl's `:persist` scoped store (skipped for
+  `:none`) — `crates/sema/src/workflow_view/connect.rs`.
+- `POST /api/run/:id/auth/:alias/forget` → deletes the stored session (both the
+  scoped store AND the default store, so an imported session can't silently
+  resurrect) and clears any in-memory flow state. Best-effort; `200
+  {"status":"forgotten"}` even when there was nothing to delete.
 
 **UX (on the variant-5b brand, terminal-quiet):** when a run is at the auth gate,
 the run header shows a `needs-auth` pill, and a compact **Auth panel** lists each
-required server as a row: `asana · not connected · [Connect]` / `· authorized ·
-expires 13:40 · [Forget]`. `[Connect]` → spinner → browser consent → row flips to
-`authorized` and the run's `running` resumes. No charts, no chrome — a row per
-server, exactly like an agent row. The consent screen's scope/tools come from the
-`:tools` manifest so the user sees *what the workflow can do* before granting.
+required server as a row: `asana · not connected [Connect]` / `· authorized ·
+expires 13:40 [Forget]`. `[Connect]`/`[Forget]` are bracket-label spans (not
+buttons), matching the file's existing terminal-quiet idiom — clicking flips the
+row to `connecting…` (dim pulse) and the panel's existing 1s poll picks up the
+terminal state. No charts, no chrome — a row per server, exactly like an agent
+row.
 
 A non-browser/CI path: `sema mcp login asana` (or `sema workflow run … --auth asana`)
 does the same flow headlessly where a browser can pop, or accepts a device-code /
@@ -267,6 +290,17 @@ the implicit "Auth" phase, and they back the `/api/run/:id/auth` status.
 
 ## 8. Security model (the load-bearing part)
 
+> **Status (2026-07-10): the write-endpoint mitigation is SHIPPED**, as the
+> "cheap, sufficient" option this section left open rather than an Option-B
+> rewrite: `sema workflow view` mints a random 32-hex session token at startup
+> and substitutes it into the served HTML; every write route requires header
+> `X-Sema-View-Token: <token>` matching exactly, or `403` with no side effects.
+> A custom header also forces a CORS preflight this server never answers, so a
+> cross-origin page's `fetch` can't even reach the route regardless of the
+> token — the token itself only has to defeat a same-origin/drive-by guess.
+> GET routes are unchanged (still unauthenticated, loopback-only). See
+> `crates/sema/src/workflow_view.rs`'s module doc for the implementation.
+
 - **The dashboard gains write/auth endpoints**, so the notebook-style "loopback +
   no auth" model is **no longer sufficient on its own** for the auth routes: a
   local process could POST `/api/auth/asana/start` and trigger a consent. Mitigations
@@ -296,17 +330,22 @@ the implicit "Auth" phase, and they back the `/api/run/:id/auth` status.
         │        inline at the needs-auth gate instead of exiting 2 — SHIPPED,
         │        see the §3 status note (no yield machinery needed here)
         │
-        └─► (d) dashboard WRITE auth endpoints + CSRF + the LIVE one-click gate
-                 for a run started headlessly/from the dashboard (reuses the
-                 async yield mechanism) — (a2) already covers the TTY run-start
-                 case, so this item is now scoped to the dashboard write surface
+        └─► (d) dashboard WRITE auth endpoints + session-token hardening — SHIPPED
+                 (see §5/§8 status notes). Reduced to just "in-process live
+                 resume" (signaling a PARKED run to continue after `[Connect]`)
+                 — which the run-start design makes MOOT: (a2) already covers
+                 the TTY case inline, and a headless/dashboard-started run has
+                 already exited by the time a browser click could reach it, so
+                 there is no parked run left to signal. Nothing left to build
+                 here.
 ```
 
 Build order: the MCP client first (its own plan), then (a)+(b) for the headless
 scenario, then (c) for visibility, then (d) for the polished one-click web flow.
-(d) also wants the dashboard's **Option B** server (the read-only Option-A spike
-has no write path) — so it is naturally sequenced after the SQLite/live-tail
-dashboard upgrade.
+(d) turned out NOT to need the dashboard's **Option B** server first — the owner
+call was the §8 session-token mitigation on the existing Option-A read-only
+spike, not a rewrite (see §5/§8's status notes), so the write endpoints landed
+directly on the current server.
 
 ---
 
