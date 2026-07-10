@@ -54,6 +54,8 @@ flate2.workspace = true
 crc32fast = "1"
 xz2 = "0.1"
 zip = { version = "8", default-features = false, features = ["deflate"] }
+self-replace.workspace = true
+indicatif.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
