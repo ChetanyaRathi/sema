@@ -7,12 +7,16 @@
 //! deterministic coordination (marker files, a busy flag) so the assertions
 //! below are ordering/completion signals — never wall-clock timing thresholds.
 
-use std::path::PathBuf;
+use std::collections::BTreeMap;
+use std::io::{BufRead, BufReader};
+use std::path::{Path, PathBuf};
+use std::process::{Child, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use sema::{Interpreter, Value};
 use sema_llm::builtins::{install_cassette, take_cassette};
 use sema_llm::cassette::{Cassette, CassetteMode};
+use sema_mcp::{connect_from_config, ConnectOpts};
 
 /// A unique path under the system temp dir for one test's scratch file(s).
 fn unique_temp_path(tag: &str) -> PathBuf {
@@ -539,4 +543,263 @@ fn cassette_replay_stays_synchronous_inside_async_task() {
     assert_eq!(r3.as_str(), Some("call-2"));
 
     interp.eval_str("(mcp/close server)").ok();
+}
+
+// ── Scenario 8: mid-call 401 → non-interactive reauth fails cleanly, async ──
+//
+// The one new thread-hop-sensitive path this offload introduced that scenarios
+// 1-7 don't cover: `call_tool_async`'s mid-session 401-then-reauth-then-retry
+// branch, exercised from INSIDE `async/spawn` (so the offloaded call path with
+// `OpenerSource::Resolved` runs, never `OpenerSource::Live`).
+//
+// The FULL success slice (401 → silent refresh-token self-heal → retry
+// succeeds) is not reachable here without adding a new production seam:
+// `reauthorize_async` hardcodes `crate::oauth::store::default_store()` with no
+// injection point for a test-owned token store, and there is no stored
+// refresh token for this test's freshly-bound loopback URL to refresh from.
+// Mutating process-wide env (`HOME`/`XDG_CONFIG_HOME`) to redirect the default
+// store path would also race every other test in this shared-process binary —
+// exactly the "new production seam" / unsafe-global-mutation the task brief
+// says not to introduce. So this test exercises the closest deterministic,
+// hermetic slice instead: `connect_from_config` with `interactive_auth: false`
+// (the same `ConnectOpts` a workflow `:mcp` manifest uses) means a mid-call 401
+// drives `NoInteractiveDriver`, which refuses the browser leg unconditionally —
+// no network, no thread hop, no flakiness — so the original 401 must surface
+// cleanly rather than hang or panic, and the scheduler must not stall a
+// sibling task while the multi-round-trip reauth attempt (discovery + DCR) is
+// in flight on the `sema-io` pool.
+//
+// The mock plays MCP server AND (partial) OAuth authorization server: the
+// first `tools/call` for tool `flaky` always 401s with a `WWW-Authenticate`
+// challenge; `/.well-known/oauth-protected-resource`,
+// `/.well-known/oauth-authorization-server`, and `/register` (DCR) all answer
+// so `reauth_on_challenge`'s `login()` reaches the interactive leg — the two
+// marker files below are touched by discovery/DCR, proving reauth was actually
+// attempted (not silently skipped) before `NoInteractiveDriver::drive()`
+// refuses it. No `/authorize`/`/token` handler is needed: `drive()` never
+// makes a network call.
+
+const FLAKY_AUTH_HTTP_SERVER: &str = r#"
+import json, sys, os
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from urllib.parse import urlparse
+
+PORT = None
+MARKER_DIR = sys.argv[1]
+
+class H(BaseHTTPRequestHandler):
+    def log_message(self, *a):
+        pass
+
+    def base(self):
+        return "http://127.0.0.1:%d" % PORT
+
+    def _json(self, obj, code=200, headers=None):
+        data = json.dumps(obj).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        for k, v in (headers or {}).items():
+            self.send_header(k, v)
+        self.end_headers()
+        self.wfile.write(data)
+
+    def do_GET(self):
+        p = urlparse(self.path)
+        if p.path == "/.well-known/oauth-protected-resource":
+            open(os.path.join(MARKER_DIR, "discovery-hit"), "w").close()
+            return self._json({"resource": self.base() + "/mcp",
+                               "authorization_servers": [self.base()],
+                               "scopes_supported": ["mcp:tools"]})
+        if p.path == "/.well-known/oauth-authorization-server":
+            return self._json({"issuer": self.base(),
+                               "authorization_endpoint": self.base() + "/authorize",
+                               "token_endpoint": self.base() + "/token",
+                               "registration_endpoint": self.base() + "/register",
+                               "code_challenge_methods_supported": ["S256"]})
+        self.send_response(404)
+        self.end_headers()
+
+    def do_POST(self):
+        p = urlparse(self.path)
+        length = int(self.headers.get("Content-Length", 0))
+        raw = self.rfile.read(length) if length else b""
+        if p.path == "/register":
+            open(os.path.join(MARKER_DIR, "register-hit"), "w").close()
+            return self._json({"client_id": "reauth-test-client"}, code=201)
+        if p.path == "/mcp":
+            msg = json.loads(raw) if raw else {}
+            method = msg.get("method")
+            rid = msg.get("id")
+            if rid is None:
+                self.send_response(202)
+                self.end_headers()
+                return
+            if method == "initialize":
+                return self._json({"jsonrpc": "2.0", "id": rid, "result": {
+                    "protocolVersion": "2025-11-25", "capabilities": {},
+                    "serverInfo": {"name": "flaky-auth", "version": "1.0"}}},
+                    headers={"Mcp-Session-Id": "sess-1"})
+            if method == "tools/list":
+                return self._json({"jsonrpc": "2.0", "id": rid, "result": {"tools": [
+                    {"name": "flaky", "description": "always needs auth mid-session",
+                     "inputSchema": {"type": "object", "properties": {}}}]}})
+            if method == "tools/call":
+                self.send_response(401)
+                self.send_header("WWW-Authenticate",
+                                 'Bearer error="invalid_token", resource_metadata="%s/.well-known/oauth-protected-resource"' % self.base())
+                self.end_headers()
+                return
+            return self._json({"jsonrpc": "2.0", "id": rid,
+                               "error": {"code": -32601, "message": "Method not found"}})
+        self.send_response(404)
+        self.end_headers()
+
+srv = HTTPServer(("127.0.0.1", 0), H)
+PORT = srv.server_address[1]
+print(PORT, flush=True)
+srv.serve_forever()
+"#;
+
+struct ServerGuard {
+    child: Child,
+    _stdout: BufReader<ChildStdout>,
+}
+impl Drop for ServerGuard {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+fn start_flaky_auth_server(marker_dir: &Path) -> (ServerGuard, u16) {
+    let mut child = Command::new("python3")
+        .args(["-c", FLAKY_AUTH_HTTP_SERVER, &marker_dir.to_string_lossy()])
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn python3 flaky-auth http server");
+    let stdout = child.stdout.take().unwrap();
+    let mut reader = BufReader::new(stdout);
+    let mut line = String::new();
+    reader.read_line(&mut line).expect("read port");
+    let port: u16 = line.trim().parse().expect("port");
+    (
+        ServerGuard {
+            child,
+            _stdout: reader,
+        },
+        port,
+    )
+}
+
+fn http_config(url: &str) -> Value {
+    let mut map = BTreeMap::new();
+    map.insert(Value::keyword("url"), Value::string(url));
+    Value::map(map)
+}
+
+fn unique_marker_dir(tag: &str) -> PathBuf {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+    std::env::temp_dir().join(format!("sema-mcp-async-{tag}-{}-{n}", std::process::id()))
+}
+
+#[test]
+fn async_context_mid_call_401_noninteractive_reauth_fails_cleanly() {
+    let marker_dir = unique_marker_dir("reauth-markers");
+    std::fs::create_dir_all(&marker_dir).expect("create marker dir");
+
+    let (_server, port) = start_flaky_auth_server(&marker_dir);
+    let url = format!("http://127.0.0.1:{port}/mcp");
+
+    // Plain synchronous connect (never inside async/spawn — same as the
+    // workflow `:mcp` pre-phase): `initialize`/`tools/list` never 401, so this
+    // succeeds without any OAuth involvement.
+    let opts = ConnectOpts {
+        interactive_auth: false,
+        allowed_tools: None,
+    };
+    let handle_value =
+        connect_from_config(&http_config(&url), opts).expect("initial connect must succeed");
+    let handle = handle_value
+        .as_str()
+        .expect("handle is a string")
+        .to_string();
+    let handle_lit = sema_str(&handle);
+
+    // `mcp/call`'s offloaded failure rejects the WHOLE spawned task at the
+    // scheduler level (`YieldReason::AwaitIo` resolving to `Err` transitions
+    // that task straight to `Failed` — see `wake_blocked_tasks` in
+    // `scheduler.rs` — it never resumes the task's own Sema code with a
+    // catchable in-task exception). So `try`/`catch` must wrap the COMBINATOR
+    // awaiting that task's promise (`async/all`, same idiom as the existing
+    // `cancellation_tombstones_connection...` scenario's `(try (async/timeout
+    // ...) (catch e ...))`), not the `mcp/call` expression itself — a `try`
+    // placed directly around `mcp/call` inside the failing task would never
+    // run its `catch` arm.
+    let interp = Interpreter::new();
+    let program = format!(
+        r#"
+        (async/timeout 15000
+          (async/spawn (fn ()
+            (let ((order (channel/new 2)))
+              (try
+                (async/all
+                  (list
+                    (async/spawn (fn () (mcp/call {handle_lit} "flaky" {{}})))
+                    (async/spawn (fn () (channel/send order "sibling")))))
+                (catch e (channel/send order (:message e))))
+              (list (channel/recv order) (channel/recv order))))))
+        "#
+    );
+    let result = interp
+        .eval_str(&program)
+        .expect("the caught reauth failure must not hang/panic the whole program");
+    let items = result.as_seq().expect("a list of two order markers");
+    assert_eq!(items.len(), 2);
+    assert_eq!(
+        items[0].as_str(),
+        Some("sibling"),
+        "the no-I/O sibling task must finish and record its marker BEFORE the \
+         401-then-reauth-then-refuse round trip resolves — a stalled scheduler \
+         would reorder this (got {items:?})"
+    );
+    let outcome = items[1]
+        .as_str()
+        .expect("second item is the caught error's :message string");
+    assert!(
+        outcome.contains("HTTP 401") && outcome.contains("tools/call"),
+        "a failed non-interactive reauth must surface the ORIGINAL 401 error \
+         (call_tool_async's fallback on reauth failure), not a different \
+         message; got: {outcome}"
+    );
+
+    // Reauth was actually ATTEMPTED (not skipped): discovery and DCR both ran
+    // before `NoInteractiveDriver::drive()` cleanly refused the browser leg.
+    assert!(
+        marker_dir.join("discovery-hit").exists(),
+        "the 401 branch must have driven OAuth discovery, proving the \
+         reauth-then-retry path actually ran"
+    );
+    assert!(
+        marker_dir.join("register-hit").exists(),
+        "the 401 branch must have reached dynamic client registration before \
+         the non-interactive driver refuses the browser leg"
+    );
+
+    // The interpreter/scheduler remains healthy: no orphaned task, ordinary
+    // evaluation still works.
+    let healthy = interp
+        .eval_str("(+ 1 2)")
+        .expect("interpreter must remain usable after the failed reauth attempt");
+    assert_eq!(healthy, Value::int(3));
+    assert_eq!(
+        sema_vm::scheduler_task_count(),
+        0,
+        "no task should be left orphaned in the scheduler after the offloaded \
+         401-reauth-refuse-retry sequence completes"
+    );
+
+    sema_mcp::close_handle(&handle_value);
+    let _ = std::fs::remove_dir_all(&marker_dir);
 }

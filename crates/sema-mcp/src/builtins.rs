@@ -1106,6 +1106,12 @@ fn checkout_offload<T: Send + 'static>(
             match &mut phase {
                 Phase::Acquire => match try_checkout(&poll_entry) {
                     Err(e) => return sema_core::IoPoll::Ready(Err(e.to_string())),
+                    // Not FIFO, but not starvation-prone either: each scheduler
+                    // sweep polls every Blocked(AwaitIo) poller (this one
+                    // included) BEFORE running any Ready task, so a queued
+                    // sibling gets a fresh checkout attempt every sweep rather
+                    // than being starved by a fast-path caller that keeps
+                    // acquiring the slot ahead of it.
                     Ok(None) => return sema_core::IoPoll::Pending,
                     Ok(Some(conn)) => {
                         poll_checked_out.set(true);
@@ -1151,7 +1157,11 @@ fn checkout_offload<T: Send + 'static>(
         // slot is untouched, so whoever holds it (or whoever else is queued)
         // is unaffected.
         if checked_out_ever.get() {
-            tombstone_slot(&entry, "connection lost: cancelled mid-call");
+            // Just "cancelled mid-call": `tombstone_error` itself prepends
+            // "mcp connection lost: " to whatever reason is stored here — an
+            // extra "connection lost: " prefix on this end would double up
+            // to "mcp connection lost: connection lost: cancelled mid-call".
+            tombstone_slot(&entry, "cancelled mid-call");
         }
     })))
 }
@@ -1664,7 +1674,7 @@ mod tests {
         // Busy: nothing to check out yet.
         assert!(matches!(try_checkout(&entry), Ok(None)));
         // Tombstoned: errors, names the reason.
-        tombstone_slot(&entry, "connection lost: cancelled mid-call");
+        tombstone_slot(&entry, "cancelled mid-call");
         let err = match try_checkout(&entry) {
             Err(e) => e,
             Ok(_) => panic!("tombstoned slot must error"),
