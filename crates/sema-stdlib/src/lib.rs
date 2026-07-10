@@ -63,6 +63,8 @@ mod workflow;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod workflow_check;
 #[cfg(not(target_arch = "wasm32"))]
+pub mod workflow_mcp;
+#[cfg(not(target_arch = "wasm32"))]
 mod ws;
 
 #[cfg(not(target_arch = "wasm32"))]

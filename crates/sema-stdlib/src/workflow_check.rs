@@ -289,9 +289,112 @@ fn check_workflow(items: &[Value], form: &Value, spans: &SpanMap, out: &mut Vec<
         }
     }
 
+    // (d) :mcp declarations — only checked when the value is a literal map (same
+    // tolerance as (b)/(c) above; a computed :mcp value is left to the runtime).
+    if let Some(meta) = &meta {
+        check_mcp_decls(meta, wf_span, out);
+    }
+
     // Marker arity/opts checks across the whole body (including nested forms).
     for f in body {
         walk_markers(f, spans, out);
+    }
+}
+
+/// `:mcp` diagnostics: `E-MCP-SPEC` (`:mcp` not a map / alias not a symbol / spec
+/// not a map / missing-or-conflicting `:url`/`:command` / `:auth` on a stdio spec),
+/// `E-MCP-PERSIST` (invalid `:persist` keyword), and `W-MCP-TOOLS` (`:tools` present
+/// but not a list of strings — a warning here; `workflow_mcp::declared_mcp` hard-
+/// errors on the same shape at runtime). Reuses `workflow_mcp`'s shared predicates
+/// ([`crate::workflow_mcp::spec_transport`], [`crate::workflow_mcp::is_valid_persist_keyword`],
+/// [`crate::workflow_mcp::is_string_list`]) so the two never disagree about shape.
+fn check_mcp_decls(meta: &BTreeMap<Value, Value>, span: Option<Span>, out: &mut Vec<Diag>) {
+    use crate::workflow_mcp::{
+        is_string_list, is_valid_persist_keyword, spec_transport, SpecTransport,
+    };
+
+    let Some(mcp_val) = meta.get(&Value::keyword("mcp")) else {
+        return;
+    };
+    let Some(mcp_map) = mcp_val.as_map_ref() else {
+        out.push(Diag::error(
+            span,
+            "E-MCP-SPEC",
+            ":mcp must be a map of alias -> server spec",
+        ));
+        return;
+    };
+
+    for (alias_val, spec_val) in mcp_map.iter() {
+        let alias = match alias_val.as_symbol() {
+            Some(a) => a,
+            None => {
+                out.push(Diag::error(
+                    span,
+                    "E-MCP-SPEC",
+                    format!(":mcp alias {alias_val} must be a bare symbol"),
+                ));
+                continue;
+            }
+        };
+        let Some(spec_map) = spec_val.as_map_ref() else {
+            out.push(Diag::error(
+                span,
+                "E-MCP-SPEC",
+                format!(":mcp {alias}: spec must be a map"),
+            ));
+            continue;
+        };
+
+        let transport = spec_transport(spec_map);
+        match transport {
+            SpecTransport::Http | SpecTransport::Stdio => {}
+            SpecTransport::Missing => out.push(Diag::error(
+                span,
+                "E-MCP-SPEC",
+                format!(":mcp {alias}: spec is missing :url or :command"),
+            )),
+            SpecTransport::Conflict => out.push(Diag::error(
+                span,
+                "E-MCP-SPEC",
+                format!(
+                    ":mcp {alias}: spec has both :url and :command — pick exactly one transport"
+                ),
+            )),
+        }
+
+        if transport == SpecTransport::Stdio && spec_map.contains_key(&Value::keyword("auth")) {
+            out.push(Diag::error(
+                span,
+                "E-MCP-SPEC",
+                format!(":mcp {alias}: :auth is not valid on a stdio (:command) spec"),
+            ));
+        }
+
+        if let Some(persist_val) = spec_map.get(&Value::keyword("persist")) {
+            let valid = persist_val
+                .as_keyword()
+                .is_some_and(|kw| is_valid_persist_keyword(&kw));
+            if !valid {
+                out.push(Diag::error(
+                    span,
+                    "E-MCP-PERSIST",
+                    format!(
+                        ":mcp {alias}: :persist must be one of :keyring, :workflow, :run, :none"
+                    ),
+                ));
+            }
+        }
+
+        if let Some(tools_val) = spec_map.get(&Value::keyword("tools")) {
+            if !is_string_list(tools_val) {
+                out.push(Diag::warn(
+                    span,
+                    "W-MCP-TOOLS",
+                    format!(":mcp {alias}: :tools should be a list of strings"),
+                ));
+            }
+        }
     }
 }
 
@@ -691,6 +794,90 @@ mod tests {
     fn empty_fanout_warns() {
         let c = codes(r#"(defworkflow d "d" {} (phase "P") (pipeline) {:status :ok})"#);
         assert!(c.contains(&"W-FANOUT-ARITY"), "got {c:?}");
+    }
+
+    // ── :mcp diagnostics ─────────────────────────────────────────────────
+
+    #[test]
+    fn mcp_clean_declaration_has_no_diagnostics() {
+        let src = r#"
+            (defworkflow demo "d" {:mcp {asana {:url "https://mcp.asana.com/mcp"
+                                                 :auth {:scopes ["default"]}
+                                                 :tools ["create_task" "search_tasks"]
+                                                 :persist :workflow}
+                                          fs    {:command "npx" :args ["-y" "server-filesystem" "."]}}}
+              (phase "P")
+              {:status :ok})
+        "#;
+        let c = codes(src);
+        assert!(
+            !c.iter()
+                .any(|code| code.starts_with("E-MCP") || code.starts_with("W-MCP")),
+            "got {c:?}"
+        );
+    }
+
+    #[test]
+    fn mcp_not_a_map_errors() {
+        let c = codes(r#"(defworkflow d "d" {:mcp [1 2 3]} (phase "P") {:status :ok})"#);
+        assert!(c.contains(&"E-MCP-SPEC"), "got {c:?}");
+    }
+
+    #[test]
+    fn mcp_alias_not_a_symbol_errors() {
+        let c = codes(
+            r#"(defworkflow d "d" {:mcp {:asana {:url "https://x"}}} (phase "P") {:status :ok})"#,
+        );
+        assert!(c.contains(&"E-MCP-SPEC"), "got {c:?}");
+    }
+
+    #[test]
+    fn mcp_spec_not_a_map_errors() {
+        let c =
+            codes(r#"(defworkflow d "d" {:mcp {asana "https://x"}} (phase "P") {:status :ok})"#);
+        assert!(c.contains(&"E-MCP-SPEC"), "got {c:?}");
+    }
+
+    #[test]
+    fn mcp_missing_transport_errors() {
+        let c = codes(
+            r#"(defworkflow d "d" {:mcp {asana {:persist :run}}} (phase "P") {:status :ok})"#,
+        );
+        assert!(c.contains(&"E-MCP-SPEC"), "got {c:?}");
+    }
+
+    #[test]
+    fn mcp_conflicting_transport_errors() {
+        let c = codes(
+            r#"(defworkflow d "d" {:mcp {asana {:url "https://x" :command "npx"}}} (phase "P") {:status :ok})"#,
+        );
+        assert!(c.contains(&"E-MCP-SPEC"), "got {c:?}");
+    }
+
+    #[test]
+    fn mcp_auth_on_stdio_spec_errors() {
+        let c = codes(
+            r#"(defworkflow d "d" {:mcp {fs {:command "npx" :auth {:scopes ["default"]}}}} (phase "P") {:status :ok})"#,
+        );
+        assert!(c.contains(&"E-MCP-SPEC"), "got {c:?}");
+    }
+
+    #[test]
+    fn mcp_invalid_persist_errors() {
+        let c = codes(
+            r#"(defworkflow d "d" {:mcp {asana {:url "https://x" :persist :bogus}}} (phase "P") {:status :ok})"#,
+        );
+        assert!(c.contains(&"E-MCP-PERSIST"), "got {c:?}");
+    }
+
+    #[test]
+    fn mcp_tools_not_a_list_of_strings_warns() {
+        let c = codes(
+            r#"(defworkflow d "d" {:mcp {asana {:url "https://x" :tools "create_task"}}} (phase "P") {:status :ok})"#,
+        );
+        assert!(c.contains(&"W-MCP-TOOLS"), "got {c:?}");
+        // A checker-level warning, not a hard error.
+        assert!(!c.contains(&"E-MCP-SPEC"), "got {c:?}");
     }
 
     #[test]
