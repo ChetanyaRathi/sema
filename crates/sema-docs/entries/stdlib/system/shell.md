@@ -8,7 +8,7 @@ returns: "map"
 
 Run a shell command. Returns a map with `:stdout`, `:stderr`, and `:exit-code`.
 
-A single string runs through the system shell (`sh -c`); extra positional
+A single string runs through the system shell (`sh -c` on Unix, `cmd /C` on Windows); extra positional
 strings run the program directly (no shell). An optional trailing options map
 `{:cwd "path" :env {"KEY" "val"}}` pins the working directory and injects
 environment variables (same shape as `proc/spawn`).
