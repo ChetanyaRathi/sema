@@ -399,3 +399,30 @@ run, surfaced as a per-cell badge and a session-cumulative status bar. Scoped
 - Headless `notebook run` should print the same summary line at the end.
 
 Deferred: feature work, not async-runtime scope. Filed as a GitHub issue.
+
+## MCP-4 — `mcp/call` blocks the cooperative scheduler
+
+**Found 2026-07-10 during the workflow `:mcp` work.** Every MCP builtin
+(`mcp/connect`, `mcp/tools`, `mcp/call`, `mcp/close`, …) does `block_on` on a
+thread-local current-thread Tokio runtime (`crates/sema-mcp/src/builtins.rs`,
+the `TOKIO_RT` thread-local + `block_on` helper). Unlike `llm/*`, `http/*`,
+`ws/*`, and `exec/*` — which offload their I/O and yield `AwaitIo` so the
+cooperative scheduler can run sibling tasks while they wait — a slow `mcp/call`
+inside a `parallel`/`pipeline` fan-out (or any concurrent leaf) blocks the
+entire scheduler thread until that one call completes, stalling every sibling
+task for the duration.
+
+**Why deferred:** the fix is structural. The `AwaitIo` poller mechanism needs
+`Send` work to offload onto a background executor, but `McpConnection` (and the
+`McpClient` it wraps) is `Rc<RefCell<…>>` thread-local by design — connections
+would need to move to a background executor with channel-based dispatch back to
+the owning evaluator thread, the same shape the `llm/*`/`http/*` offload paths
+already use. That's a real (if mechanical) refactor of the connection registry
+and call path, not a quick fix.
+
+**Not a correctness bug for this feature:** the workflow `:mcp` auth-resolution
+step (`docs/plans/2026-06-24-workflow-mcp-auth.md` §3) resolves declared
+servers SEQUENTIALLY, before any concurrent fan-out starts — it never runs
+inside a `parallel`/`pipeline` batch, so it is unaffected. Only a workflow body
+that calls `mcp/call` concurrently (e.g. `(parallel (list (fn () (mcp/call …))
+…))`) hits the stall, and only for the duration of that one call.
