@@ -620,9 +620,14 @@ enum NotebookCommands {
 /// plus the MCP *client* builtins (`mcp/connect`, `mcp/tools`, `mcp/tools->sema`,
 /// …). The MCP builtins live in `sema-mcp`, which depends on `sema-eval`, so they
 /// can't be registered inside `sema-eval` itself — the binary wires them in here.
+/// The real `WorkflowMcpResolver` (`sema::workflow_mcp`) is registered right
+/// alongside them, so every CLI path built through this function (REPL, `sema
+/// run`, `sema workflow run`, …) can resolve a workflow's declared `:mcp`
+/// servers — see docs/plans/2026-06-24-workflow-mcp-auth.md §3/§9(a).
 fn build_interpreter(sandbox: &sema_core::Sandbox) -> Interpreter {
     let interpreter = Interpreter::new_with_sandbox(sandbox);
     sema_mcp::register_mcp_builtins(&interpreter.global_env, sandbox);
+    sema::workflow_mcp::register_real_resolver();
     interpreter
 }
 

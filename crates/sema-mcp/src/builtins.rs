@@ -792,6 +792,24 @@ fn schema_to_params(schema: &serde_json::Value) -> (Value, Vec<String>) {
     (Value::map(params), ordered)
 }
 
+/// Best-effort close of a connection by its opaque handle `Value`, same
+/// semantics as the `mcp/close` builtin but NEVER errors (a missing/already-closed
+/// handle, or a close-protocol failure, is silently ignored). For callers outside
+/// Sema code that need "close everything, and don't let a close failure mask the
+/// real outcome" — namely the workflow `:mcp` auth-resolution seam's
+/// `WorkflowMcpResolver::close`, which `workflow/run` calls from its
+/// failure/cleanup paths (`docs/plans/2026-06-24-workflow-mcp-auth.md` §3).
+pub fn close_handle(handle: &Value) {
+    let Some(handle_str) = handle.as_str() else {
+        return;
+    };
+    let connection = CONNECTIONS.with(|connections| connections.borrow_mut().remove(handle_str));
+    if let Some(connection) = connection {
+        let mut connection = connection.borrow_mut();
+        let _ = block_on(connection.client.close());
+    }
+}
+
 pub fn register_mcp_builtins(env: &Env, sandbox: &Sandbox) {
     // Capture the sandbox so the OAuth browser launch can honor the PROCESS cap.
     SANDBOX.with(|s| *s.borrow_mut() = sandbox.clone());

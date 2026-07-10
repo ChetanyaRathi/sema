@@ -14,6 +14,8 @@
 
 use std::rc::Rc;
 
+pub mod workflow_mcp;
+
 // Re-export core types.
 pub use sema_core::{intern, resolve, with_resolved, Caps, Env, Sandbox, SemaError, Value};
 /// Result of evaluating a Sema expression.

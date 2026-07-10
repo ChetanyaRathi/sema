@@ -34,6 +34,7 @@ sema-docs.workspace = true
 sema-notebook.workspace = true
 sema-mcp.workspace = true
 sema-otel.workspace = true
+sema-io.workspace = true
 tokio.workspace = true
 reedline = "0.48"
 nu-ansi-term = "0.50"
@@ -59,7 +60,6 @@ zip = { version = "8", default-features = false, features = ["deflate"] }
 libc = "0.2"
 
 [dev-dependencies]
-sema-io.workspace = true
 paste = "1"
 pio = "0.3"
 sema-otel = { workspace = true, features = ["testing"] }
