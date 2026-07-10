@@ -189,6 +189,10 @@ pub fn reranker_span(_query: &str, _model: &str, _top_k: Option<usize>) -> Reran
     RerankerSpan
 }
 
+pub fn reranker_span_detached(_query: &str, _model: &str, _top_k: Option<usize>) -> RerankerSpan {
+    RerankerSpan
+}
+
 impl RerankerSpan {
     pub fn set_input(&self, _docs: &[String]) {}
     pub fn set_output(&self, _docs: &[(String, f64)]) {}

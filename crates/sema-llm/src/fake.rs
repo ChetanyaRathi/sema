@@ -97,6 +97,11 @@ pub struct FakeProvider {
     /// the chunks are emitted from a pool worker, so a real thread sleep is what
     /// spaces the deltas out in wall time. 0 = no delay (default).
     stream_chunk_delay_ms: u64,
+    /// Fixed wall-clock delay injected into `rerank()` (and only `rerank()`), so a
+    /// test can prove an `llm/rerank` offloaded onto the shared runtime doesn't
+    /// stall a sibling scheduler task (the rerank counterpart of `embed_delay_ms`).
+    /// 0 = no delay (default).
+    rerank_delay_ms: u64,
     /// When set, `complete()` ignores the scripted queue and echoes the request's
     /// last user-message text as the response content. This correlates each reply
     /// to its prompt deterministically regardless of which `spawn_blocking` worker
@@ -140,6 +145,7 @@ impl FakeProvider {
             embed_delay_ms: 0,
             chat_delay_ms: 0,
             stream_chunk_delay_ms: 0,
+            rerank_delay_ms: 0,
             echo: false,
             tool_loop: None,
         }
@@ -160,6 +166,7 @@ pub struct FakeProviderBuilder {
     embed_delay_ms: u64,
     chat_delay_ms: u64,
     stream_chunk_delay_ms: u64,
+    rerank_delay_ms: u64,
     echo: bool,
     tool_loop: Option<ToolLoopSpec>,
 }
@@ -348,6 +355,16 @@ impl FakeProviderBuilder {
         self
     }
 
+    /// Inject a fixed wall-clock delay into `rerank()` (only `rerank()`), so a test
+    /// can prove an offloaded `llm/rerank` doesn't stall a sibling scheduler task
+    /// (the rerank counterpart of [`embed_delay`]).
+    ///
+    /// [`embed_delay`]: Self::embed_delay
+    pub fn rerank_delay(mut self, ms: u64) -> Self {
+        self.rerank_delay_ms = ms;
+        self
+    }
+
     /// Script a rerank reply: `results` is `(original_index, relevance_score)` pairs,
     /// already ordered highest-relevance-first.
     pub fn rerank(mut self, results: &[(usize, f64)]) -> Self {
@@ -378,6 +395,7 @@ impl FakeProviderBuilder {
             embed_delay_ms: self.embed_delay_ms,
             chat_delay_ms: self.chat_delay_ms,
             stream_chunk_delay_ms: self.stream_chunk_delay_ms,
+            rerank_delay_ms: self.rerank_delay_ms,
             echo: self.echo,
             tool_loop: self.tool_loop,
         }
@@ -572,6 +590,12 @@ impl LlmProvider for FakeProvider {
 
     fn rerank(&self, request: RerankRequest) -> Result<RerankResponse, LlmError> {
         self.recorder.reranks.lock().unwrap().push(request);
+        // Injected latency: on the async path this runs on a spawn_blocking
+        // worker (FakeProvider has no `rerank_future` override), so a real thread
+        // sleep is what lets a sibling task run while this rerank is in flight.
+        if self.rerank_delay_ms > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(self.rerank_delay_ms));
+        }
         match self.next() {
             Some(FakeReply::Rerank(r)) => Ok(r),
             Some(FakeReply::Error(e)) => Err(e),

@@ -19,7 +19,7 @@ use crate::pricing;
 use crate::provider::{LlmProvider, ProviderRegistry};
 use crate::types::{
     ChatMessage, ChatRequest, ChatResponse, ContentBlock, EmbedRequest, EmbedResponse, LlmError,
-    RerankRequest, ToolCall, ToolSchema, Usage,
+    RerankRequest, RerankResponse, ToolCall, ToolSchema, Usage,
 };
 use crate::vector_store::{VectorDocument, VectorStore};
 
@@ -3178,6 +3178,12 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
 
     // (llm/batch ["prompt1" "prompt2" "prompt3"] {:max-tokens 100})
     register_fn(env, "llm/batch", |args| {
+        // On resume from the async yield the scheduler re-runs the bytecode AFTER
+        // this CALL via `replace_stack_top`, so this native is not re-invoked.
+        // Drain any stray resume value defensively (mirrors llm/embed).
+        if let Some(v) = sema_core::take_resume_value() {
+            return Ok(v);
+        }
         if args.is_empty() || args.len() > 2 {
             return Err(SemaError::arity("llm/batch", "1-2", args.len()));
         }
@@ -3216,6 +3222,106 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
             })
             .collect();
 
+        // ── ASYNC path: offload the whole batch + yield (native targets only) ──
+        //
+        // `batch_complete`'s provider impls (anthropic/openai/gemini/ollama) drive
+        // their own concurrency internally via `sema_io::io_block_on(join_all(..))`
+        // — legal from a `spawn_blocking` closure, illegal from an async worker (see
+        // the sema-io threading contract) — so the WHOLE call is offloaded to the
+        // blocking tier as ONE unit rather than re-driven as a `spawn`ed future; the
+        // provider's own internal join_all runs unchanged inside it, occupying one
+        // admission-control permit for its entire duration (by design, same as a
+        // long retry backoff — see the sema-io module docs).
+        #[cfg(not(target_arch = "wasm32"))]
+        if sema_core::in_async_context() {
+            let provider = PROVIDER_REGISTRY.with(|reg| reg.borrow().default_provider());
+            let Some(provider) = provider else {
+                return Err(SemaError::Llm(
+                    "no LLM provider configured. Use (llm/configure :anthropic {:api-key ...}) \
+                     first"
+                        .to_string(),
+                ));
+            };
+            let reqs: Vec<ChatRequest> = requests
+                .into_iter()
+                .map(|mut r| {
+                    if r.model.is_empty() {
+                        r.model = provider.default_model().to_string();
+                    }
+                    r
+                })
+                .collect();
+
+            // Capture the dispatch-time budget + leaf-usage frames (ASYNC-1), so the
+            // poller charges the frames active NOW — not whatever scope is installed
+            // when the future lands. Mirrors do_complete_async_yield/llm/embed.
+            let usage_accum_slot = current_usage_accum();
+            let budget_slot = active_budget();
+
+            let (tx, mut rx) =
+                tokio::sync::oneshot::channel::<Vec<Result<ChatResponse, LlmError>>>();
+            let p2 = provider.clone();
+            // Blocking-tier offload (no native `spawn`-based future here — see the
+            // comment above): abort is best-effort, the batch call runs to
+            // completion on the worker and its result is simply discarded.
+            sema_io::io_spawn_blocking(move || {
+                let responses = p2.batch_complete(reqs);
+                let _ = tx.send(responses);
+                sema_core::notify_io_complete();
+            });
+
+            let handle = Rc::new(sema_core::IoHandle::new(move || {
+                use tokio::sync::oneshot::error::TryRecvError;
+                match rx.try_recv() {
+                    Err(TryRecvError::Empty) => sema_core::IoPoll::Pending,
+                    Ok(responses) => {
+                        let mut results = Vec::with_capacity(responses.len());
+                        for resp_result in responses {
+                            let resp = match resp_result {
+                                Ok(r) => r,
+                                Err(e) => return sema_core::IoPoll::Ready(Err(e.to_string())),
+                            };
+                            // Fold into THIS call's captured accumulator frame, then
+                            // suppress `track_usage`'s own fold and re-install the
+                            // captured budget frame around it — the poller runs
+                            // outside the per-task install boundary, so the live
+                            // thread-locals may belong to a sibling task. Priced
+                            // with an empty provider, matching the sync path (which
+                            // never stamps a serving provider for `llm/batch`).
+                            if let Some(slot) = &usage_accum_slot {
+                                let cost = pricing::calculate_cost_for("", &resp.usage);
+                                accumulate_into(slot, &resp.usage, cost);
+                            }
+                            let track_result = {
+                                let prev_budget = ACTIVE_BUDGET.with(|b| {
+                                    std::mem::replace(&mut *b.borrow_mut(), budget_slot.clone())
+                                });
+                                let r = USAGE_ACCUM_SUPPRESS.with(|s| {
+                                    s.set(true);
+                                    let r = track_usage(&resp.usage);
+                                    s.set(false);
+                                    r
+                                });
+                                ACTIVE_BUDGET.with(|b| *b.borrow_mut() = prev_budget);
+                                r
+                            };
+                            if let Err(e) = track_result {
+                                return sema_core::IoPoll::Ready(Err(e.to_string()));
+                            }
+                            results.push(Value::string(&resp.content));
+                        }
+                        sema_core::IoPoll::Ready(Ok(Value::list(results)))
+                    }
+                    Err(TryRecvError::Closed) => {
+                        sema_core::IoPoll::Ready(Err("batch: worker dropped".to_string()))
+                    }
+                }
+            }));
+            sema_core::set_yield_signal(sema_core::YieldReason::AwaitIo(handle));
+            return Ok(Value::nil());
+        }
+
+        // ── SYNC path: inline provider call (byte-identical to before) ─────
         let responses = with_provider(|p| {
             let reqs: Vec<ChatRequest> = requests
                 .into_iter()
@@ -3652,6 +3758,12 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
     // Cross-encoder reranking. Returns a list of {:index :score :document}, highest
     // relevance first. `documents` is a list of strings.
     register_fn(env, "llm/rerank", |args| {
+        // On resume from the async yield the scheduler re-runs the bytecode AFTER
+        // this CALL via `replace_stack_top`, so this native is not re-invoked.
+        // Drain any stray resume value defensively (mirrors llm/embed).
+        if let Some(v) = sema_core::take_resume_value() {
+            return Ok(v);
+        }
         if args.len() < 2 || args.len() > 3 {
             return Err(SemaError::arity("llm/rerank", "2-3", args.len()));
         }
@@ -3684,16 +3796,118 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
                 .and_then(|p| p.as_keyword().or_else(|| p.as_str().map(|s| s.to_string())));
         }
 
+        let request = RerankRequest {
+            query: query.clone(),
+            documents: documents.clone(),
+            top_k,
+            model: model.clone(),
+        };
+
+        // ── ASYNC path: offload + yield (native targets only) ──────────────
+        //
+        // The concurrent rerank path is native-only (no shared tokio runtime on
+        // wasm), so wasm always falls through to the synchronous path below.
+        #[cfg(not(target_arch = "wasm32"))]
+        if sema_core::in_async_context() {
+            // DETACHED reranker span: parent captured now, finalized in the
+            // poller after the yield (where the active-span stack may hold a
+            // sibling task's span, so the span must not pop the stack on drop).
+            let span =
+                sema_otel::reranker_span_detached(&query, model.as_deref().unwrap_or(""), top_k);
+            span.set_input(&documents);
+
+            // Clone an Arc<provider> off the thread-local registry on THIS thread,
+            // release the borrow, and move it into the offloaded future.
+            let resolved_provider = PROVIDER_REGISTRY.with(|reg| {
+                let reg = reg.borrow();
+                match provider.as_deref() {
+                    Some(n) => reg
+                        .get(n)
+                        .ok_or_else(|| SemaError::Llm(format!("rerank provider '{n}' not found"))),
+                    None => reg
+                        .rerank_provider()
+                        .or_else(|| reg.default_provider())
+                        .ok_or_else(|| {
+                            SemaError::Llm(
+                            "no rerank provider configured — set COHERE_API_KEY, JINA_API_KEY, or \
+                             VOYAGE_API_KEY (or pass {:provider ...})"
+                                .to_string(),
+                        )
+                        }),
+                }
+            })?;
+
+            let (tx, mut rx) = tokio::sync::oneshot::channel::<Result<RerankResponse, LlmError>>();
+            let req2 = request.clone();
+            // Spawned pool future (the http/shell abort tier): providers with a
+            // native async rerank path (`rerank_future`) are dropped mid-flight on
+            // abort — true cancellation; sync-only providers fall back to the
+            // admission-controlled blocking tier, where cancel stays best-effort
+            // (result discarded, call runs to completion).
+            let abort = sema_io::io_spawn(async move {
+                let r = match resolved_provider.rerank_future(req2.clone()) {
+                    Some(fut) => fut.await,
+                    None => {
+                        let p = resolved_provider.clone();
+                        sema_io::io_offload_blocking(move || p.rerank(req2)).await
+                    }
+                };
+                let _ = tx.send(r);
+                sema_core::notify_io_complete();
+            });
+
+            // Move the span + documents INTO the poller closure so the reordered
+            // output and the final Value are built on the VM thread when the
+            // future lands — never as a native-frame local (those drop at yield).
+            let mut span_slot = Some(span);
+            let documents_for_poller = documents;
+            // On cancel/timeout the scheduler runs the abort hook, aborting the
+            // spawned wire future. Never called on normal completion.
+            let handle = Rc::new(sema_core::IoHandle::with_abort(
+                move || {
+                    use tokio::sync::oneshot::error::TryRecvError;
+                    match rx.try_recv() {
+                        Err(TryRecvError::Empty) => sema_core::IoPoll::Pending,
+                        Ok(Ok(resp)) => {
+                            if let Some(span) = span_slot.take() {
+                                let out_docs: Vec<(String, f64)> = resp
+                                    .results
+                                    .iter()
+                                    .filter_map(|r| {
+                                        documents_for_poller
+                                            .get(r.index)
+                                            .map(|d| (d.clone(), r.score))
+                                    })
+                                    .collect();
+                                span.set_output(&out_docs);
+                                // span drops here → ends the span.
+                            }
+                            let value = rerank_value_from_response(&resp, &documents_for_poller);
+                            sema_core::IoPoll::Ready(Ok(value))
+                        }
+                        Ok(Err(e)) => {
+                            if let Some(span) = span_slot.take() {
+                                span.record_error(llm_error_kind(&e), &e.to_string());
+                            }
+                            sema_core::IoPoll::Ready(Err(e.to_string()))
+                        }
+                        Err(TryRecvError::Closed) => {
+                            span_slot.take();
+                            sema_core::IoPoll::Ready(Err("rerank: io worker dropped".to_string()))
+                        }
+                    }
+                },
+                abort,
+            ));
+            sema_core::set_yield_signal(sema_core::YieldReason::AwaitIo(handle));
+            return Ok(Value::nil());
+        }
+
+        // ── SYNC path: inline provider call (byte-identical to before) ─────
         // OpenInference RERANKER span (no-op unless telemetry + compat are on).
         let span = sema_otel::reranker_span(&query, model.as_deref().unwrap_or(""), top_k);
         span.set_input(&documents);
 
-        let request = RerankRequest {
-            query,
-            documents: documents.clone(),
-            top_k,
-            model,
-        };
         let resp = with_rerank_provider(provider.as_deref(), |p| {
             p.rerank(request).map_err(|e| {
                 span.record_error(llm_error_kind(&e), &e.to_string());
@@ -3709,21 +3923,7 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
             .collect();
         span.set_output(&out_docs);
 
-        let out: Vec<Value> = resp
-            .results
-            .iter()
-            .map(|r| {
-                let mut m = BTreeMap::new();
-                m.insert(Value::keyword("index"), Value::int(r.index as i64));
-                m.insert(Value::keyword("score"), Value::float(r.score));
-                m.insert(
-                    Value::keyword("document"),
-                    Value::string(documents.get(r.index).map(|s| s.as_str()).unwrap_or("")),
-                );
-                Value::map(m)
-            })
-            .collect();
-        Ok(Value::list(out))
+        Ok(rerank_value_from_response(&resp, &documents))
     });
 
     // (llm/similarity vec1 vec2) — cosine similarity
@@ -6810,6 +7010,28 @@ fn embed_value_from_response(resp: &EmbedResponse, single: bool) -> Value {
                 .collect(),
         )
     }
+}
+
+/// Encode a `RerankResponse`'s reordered results into the SAME `Value` the
+/// synchronous `llm/rerank` returns (a list of `{:index :score :document}`, highest
+/// relevance first), so the concurrent (async) and sync paths are byte-identical:
+/// both decode through here.
+fn rerank_value_from_response(resp: &RerankResponse, documents: &[String]) -> Value {
+    Value::list(
+        resp.results
+            .iter()
+            .map(|r| {
+                let mut m = BTreeMap::new();
+                m.insert(Value::keyword("index"), Value::int(r.index as i64));
+                m.insert(Value::keyword("score"), Value::float(r.score));
+                m.insert(
+                    Value::keyword("document"),
+                    Value::string(documents.get(r.index).map(|s| s.as_str()).unwrap_or("")),
+                );
+                Value::map(m)
+            })
+            .collect(),
+    )
 }
 
 /// Resolve the model id used for the cache key when the caller pinned none. With an
