@@ -1,10 +1,7 @@
 //! The browser runtime `sema web` serves: the WASM VM glue + JS bundle a
-//! sema-web app needs to boot with no bundler. Vendored under `assets/` by
-//! `jake wasm.web-runtime` and embedded via `include_bytes!`. The assets are
-//! gitignored (built, multi-MB), so everything here is gated behind the
-//! `web_runtime` cfg that build.rs emits only when they are present.
+//! sema-web app needs to boot with no bundler. The generated assets are tracked
+//! package inputs and embedded in every Sema binary via `include_bytes!`.
 
-#[cfg(web_runtime)]
 mod embedded {
     /// (served-relative path, bytes) for each vendored file. The set mirrors the
     /// import map the dev server generates: sema-web → sema → sema-wasm, plus the
@@ -48,16 +45,10 @@ mod embedded {
     ];
 }
 
-/// Whether this binary was built with the browser runtime embedded.
-pub fn is_available() -> bool {
-    cfg!(web_runtime)
-}
-
 /// Extract the embedded runtime to a versioned temp dir and return its path, so
 /// the dev server can serve it as static files. Idempotent: a file is rewritten
 /// only when missing or size-mismatched, keeping the ~3 MB wasm write off the
 /// hot path on repeat launches.
-#[cfg(web_runtime)]
 pub fn extract() -> std::io::Result<std::path::PathBuf> {
     let dir = std::env::temp_dir().join(concat!("sema-web-runtime-", env!("CARGO_PKG_VERSION")));
     for (rel, bytes) in embedded::ASSETS {
@@ -73,12 +64,4 @@ pub fn extract() -> std::io::Result<std::path::PathBuf> {
         }
     }
     Ok(dir)
-}
-
-#[cfg(not(web_runtime))]
-pub fn extract() -> std::io::Result<std::path::PathBuf> {
-    Err(std::io::Error::new(
-        std::io::ErrorKind::NotFound,
-        "web runtime not embedded in this build",
-    ))
 }

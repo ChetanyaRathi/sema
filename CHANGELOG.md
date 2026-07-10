@@ -25,6 +25,11 @@
 
 ### Fixed
 
+- **Installed `sema web` builds now contain their browser runtime.** The
+  crates.io package, GitHub release archives, shell installer, and Homebrew
+  formula embed the WASM VM and JavaScript runtime and work offline. Version
+  1.30.0 exposed `sema web` but silently built every public artifact without
+  these assets; installed users must upgrade to the next patch release.
 - **Re-raising a caught error preserves it** (#80). `(catch e ... (throw e))`
   re-raises the condition as itself — same `:type`, `:message`, and
   `:stack-trace` — instead of wrapping it in a fresh `{:type :user}` envelope

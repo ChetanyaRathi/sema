@@ -58,6 +58,9 @@ jobs:
       - name: Run tests
         run: cargo nextest run --workspace --profile ci
 
+      - name: Smoke test packaged web runtime
+        run: ./scripts/test-packaged-sema-web.sh
+
       - name: Smoke test examples
         run: jake examples
 
