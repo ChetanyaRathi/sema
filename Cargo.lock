@@ -3977,6 +3977,7 @@ dependencies = [
  "sema-docs",
  "sema-eval",
  "sema-fmt",
+ "sema-io",
  "sema-notebook",
  "sema-vm",
  "serde",

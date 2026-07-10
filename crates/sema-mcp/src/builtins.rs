@@ -14,25 +14,64 @@
 //! connections, and the other builtins only ever act on a handle that connect
 //! already vetted. MCP tools then run with the *server's* authority, not Sema's
 //! sandbox: connecting to an untrusted server is like running untrusted code.
+//!
+//! ## Async offload (MCP-4 / issue #96)
+//!
+//! Inside an `async/spawn`'d task (`sema_core::in_async_context()`), all four
+//! builtins — and therefore every `mcp/tools->sema` handler, which routes
+//! through the same [`call_tool`] core — offload their JSON-RPC round trip onto
+//! the shared `sema-io` pool and yield `AwaitIo`, so a slow `mcp/call` no
+//! longer stalls sibling scheduler tasks. At top level (no scheduler) every
+//! builtin keeps today's fully synchronous, blocking behavior byte-for-byte —
+//! see [`block_on`].
+//!
+//! **Registry / checkout.** `CONNECTIONS` maps a handle to an [`Rc<ConnEntry>`],
+//! where [`ConnEntry`] separates the connection's stable, always-readable
+//! metadata ([`ConnMeta`] — identity, auth mode, tool allowlist) from its
+//! checkout state ([`Slot`]). MCP is serial per connection (one JSON-RPC pipe):
+//! `Slot::Available` <-> `Slot::CheckedOut` enforces that only one in-flight
+//! operation ever holds a connection's transport, while `Slot::Tombstone`
+//! is a one-way trapdoor entered when a checked-out connection is abandoned
+//! mid-call (cancellation) or after `mcp/close` finishes. The win is
+//! *cross-connection* concurrency and never stalling non-MCP tasks — a single
+//! connection's own calls still queue, exactly as the underlying protocol
+//! requires.
+//!
+//! **Cancellation semantics.** If a task is cancelled (`async/cancel`,
+//! `async/timeout` expiry) while it holds a connection's checkout, the slot is
+//! tombstoned (see [`checkout_offload`]'s abort hook): the in-flight worker's
+//! eventual reply is discarded (its channel send fails harmlessly), and the
+//! connection itself — the `McpClient`, hence any child process/socket — drops
+//! on the worker thread. Any *later* use of that handle fails fast with a
+//! `SemaError` naming the reason and a reconnect hint; a task that was merely
+//! *queued* (never actually held the checkout) when cancelled leaves the slot
+//! untouched (a no-op abort) so the connection remains usable by others.
+//!
+//! **Lost-wakeup guard.** When a checked-out connection is returned
+//! (`mcp/call`/`mcp/tools` succeed) or removed (`mcp/close`), the finishing
+//! poller calls `sema_core::notify_io_complete()` — mandatory, because a
+//! sibling task queued on the same slot may already have been polled `Pending`
+//! earlier in the same `wake_blocked_tasks` sweep; without this poke its
+//! next acquisition attempt could miss the wakeup and park until the next
+//! scheduler timeout instead of promptly.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::Future;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use sema_core::{check_arity, Caps, Env, NativeFn, Sandbox, SemaError, ToolDefinition, Value};
-use tokio::runtime::Runtime;
+use tokio::sync::oneshot;
 
 use crate::client::{McpClient, McpClientConfig, McpHttpConfig};
+use crate::protocol::Tool;
 
 thread_local! {
     // Keep MCP connections in a thread-local map so each Sema evaluator can own its own
     // client state without introducing cross-thread sharing.
-    static CONNECTIONS: RefCell<HashMap<String, Rc<RefCell<McpConnection>>>> =
-        RefCell::new(HashMap::new());
-    // Reuse one current-thread Tokio runtime for all MCP builtins in this evaluator context.
-    static TOKIO_RT: RefCell<Option<Runtime>> = const { RefCell::new(None) };
+    static CONNECTIONS: RefCell<HashMap<String, Rc<ConnEntry>>> = RefCell::new(HashMap::new());
     // The evaluator's sandbox, captured at registration, so the OAuth browser
     // launch (connect-time or mid-session re-auth) can be denied when `PROCESS`
     // is — opening the system browser spawns a process.
@@ -45,6 +84,10 @@ thread_local! {
 /// interactive-auth path (`crates/sema/src/workflow_mcp.rs`) reuses this exact
 /// opener so a run-start browser login is gated identically to `mcp/connect`'s
 /// own interactive path — never a separate, laxer gate.
+///
+/// SYNC-PATH USE ONLY: this reads the `SANDBOX` thread-local at INVOCATION
+/// time (not construction time). The async-offload path must never use this —
+/// see [`resolved_browser_opener`] and [`OpenerSource`].
 pub fn gated_browser_opener() -> crate::oauth::loopback::BrowserOpener {
     Box::new(|url: &str| {
         if let Some(err) = SANDBOX.with(|s| {
@@ -69,6 +112,9 @@ pub fn gated_browser_opener() -> crate::oauth::loopback::BrowserOpener {
 /// so a denied opener alone would silently sit waiting for a redirect that can
 /// never arrive, until the full login timeout elapses. Checking here lets a
 /// denied sandbox degrade immediately to the headless `NeedsAuth` path.
+///
+/// Also the seam the async-offload path uses to resolve the browser-open
+/// decision on the VM thread BEFORE offloading (see [`OpenerSource`]).
 pub fn browser_open_allowed() -> bool {
     SANDBOX.with(|s| {
         let sb = s.borrow();
@@ -79,18 +125,89 @@ pub fn browser_open_allowed() -> bool {
     })
 }
 
+/// A browser opener for the OFFLOADED reauth/connect path: the sandbox
+/// decision is resolved ONCE, on the VM thread (via [`browser_open_allowed`])
+/// BEFORE any thread hop, and baked into the returned closure as a plain
+/// `bool`. It must NEVER read the `SANDBOX` thread-local itself — the
+/// offloaded reauth code (and, one layer further in, `LoopbackDriver::drive`'s
+/// own spawned thread) runs on background threads where that thread-local is
+/// unpopulated (defaults to unrestricted), which would silently defeat the
+/// gate. Mirrors the `TestOpenerFn` pattern in
+/// `crates/sema/src/workflow_view/connect.rs`, which resolves its opener
+/// choice on the calling thread for the identical reason.
+fn resolved_browser_opener(allowed: bool) -> crate::oauth::loopback::BrowserOpener {
+    Box::new(move |url: &str| {
+        if !allowed {
+            return Err(SemaError::PermissionDenied {
+                function: "mcp/connect (open browser)".to_string(),
+                capability: Caps::PROCESS.name().to_string(),
+            }
+            .to_string());
+        }
+        crate::oauth::loopback::open_browser(url)
+    })
+}
+
+/// Where an OAuth login/reauth attempt's browser-open decision comes from.
+/// `Live` (sync path, unchanged): read live off `SANDBOX` at the moment a
+/// browser is actually needed — today's behavior. `Resolved` (async-offload
+/// path): the decision was already made on the VM thread; the offloaded code
+/// must never touch `SANDBOX` itself.
+#[derive(Clone, Copy)]
+enum OpenerSource {
+    Live,
+    Resolved(bool),
+}
+
+impl OpenerSource {
+    fn opener(self) -> crate::oauth::loopback::BrowserOpener {
+        match self {
+            OpenerSource::Live => gated_browser_opener(),
+            OpenerSource::Resolved(allowed) => resolved_browser_opener(allowed),
+        }
+    }
+}
+
 static HANDLE_COUNTER: AtomicU64 = AtomicU64::new(1);
 
+/// A live MCP client connection. Holds only the transport — the identity/
+/// auth-mode/tool-allowlist facts that must be readable WITHOUT a checkout
+/// live in [`ConnMeta`] instead (see `ConnEntry`).
 struct McpConnection {
     client: McpClient,
+}
+
+// ── Step 0 (task brief): compile-time Send gate ─────────────────────────────
+//
+// The async-offload design moves `McpConnection` values onto a background
+// thread (`sema_io::io_spawn_blocking`) and back via a `tokio::sync::oneshot`
+// channel. This assertion is the hard gate: if `McpConnection` (transitively,
+// `McpClient` — the reqwest client, the stdio `Child`/pipes, the legacy-SSE
+// transport's boxed `Stream`) ever stops being `Send`, this fails to compile
+// loudly here instead of manifesting as a mysterious error deep in the
+// offload plumbing.
+#[allow(dead_code)]
+fn _assert_send<T: Send>() {}
+#[allow(dead_code)]
+fn _assert_mcp_connection_is_send() {
+    _assert_send::<McpConnection>();
+}
+
+/// Stable, cheap-to-clone facts about a connection that must be readable
+/// WITHOUT checking it out — needed by `mcp/call`'s pre-offload step (tool
+/// allowlist check, cassette identity) even while the connection itself is
+/// checked out by another in-flight call. Set once at connect time, never
+/// mutated afterward.
+#[derive(Clone)]
+struct ConnMeta {
     /// Stable server identity (url, or `stdio\0command args`) used to key the
     /// cassette so tool calls record/replay deterministically across runs.
     identity: String,
     /// From [`ConnectOpts::interactive_auth`]. `mcp/connect` always connects
     /// with `true`; a connection made via [`connect_from_config`] with
     /// `interactive_auth: false` stays non-interactive for its whole
-    /// lifetime — a mid-session 401/403 in `reauthorize` may still refresh
-    /// silently, but never falls back to a browser login (see
+    /// lifetime — a mid-session 401/403 in `reauthorize_async` may still
+    /// refresh silently, but never falls back to a browser login (see
     /// [`NoInteractiveDriver`]).
     interactive_auth: bool,
     /// From [`ConnectOpts::allowed_tools`]. `None` is unrestricted (today's
@@ -99,22 +216,115 @@ struct McpConnection {
     allowed_tools: Option<Vec<String>>,
 }
 
-fn block_on<F: Future>(future: F) -> F::Output {
-    TOKIO_RT.with(|runtime| {
-        let mut runtime = runtime.borrow_mut();
-        if runtime.is_none() {
-            *runtime = Some(
-                tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .expect("failed to create Tokio runtime for MCP builtin"),
-            );
+/// Checkout state for a connection's transport. MCP is serial-per-connection
+/// (one JSON-RPC pipe): only one call may hold the transport at a time.
+/// `Available` <-> `CheckedOut` under normal operation; `Tombstone` is a
+/// one-way trapdoor entered when a checked-out connection's holder is
+/// cancelled mid-call, or once `mcp/close` finishes — any further use errors
+/// with the reason, naming a reconnect hint (see [`tombstone_error`]).
+enum Slot {
+    // Boxed: `McpConnection` (an `McpClient`, which nests a transport enum
+    // wide enough to trip clippy's large-enum-variant lint against the unit
+    // `CheckedOut` variant) shouldn't inflate every `Slot` on the stack.
+    Available(Box<McpConnection>),
+    CheckedOut,
+    Tombstone(String),
+}
+
+/// One registry entry: metadata that's always readable, plus the checkout
+/// state. Behind an `Rc` so a queued async call can hold its own reference
+/// across many scheduler polls even if the handle is looked up again (or
+/// closed) elsewhere on the VM thread in the meantime.
+struct ConnEntry {
+    meta: ConnMeta,
+    slot: RefCell<Slot>,
+}
+
+/// A `SemaError` naming why a tombstoned handle can no longer be used, with a
+/// reconnect hint. Constructed fresh from the stored reason string each time
+/// (never itself stored — `SemaError` must never cross a thread boundary).
+fn tombstone_error(reason: &str) -> SemaError {
+    SemaError::eval(format!("mcp connection lost: {reason}"))
+        .with_hint("reconnect with mcp/connect (or the workflow's :mcp manifest) and retry")
+}
+
+/// Attempt to take exclusive ownership of a connection's transport.
+/// `Ok(Some(conn))` — acquired; the slot is now `CheckedOut`.
+/// `Ok(None)` — busy (another call holds it); the caller should retry later.
+/// `Err` — the slot is tombstoned (a prior cancellation/close orphaned it).
+fn try_checkout(entry: &ConnEntry) -> Result<Option<McpConnection>, SemaError> {
+    let mut slot = entry.slot.borrow_mut();
+    match &*slot {
+        Slot::Available(_) => {
+            let Slot::Available(conn) = std::mem::replace(&mut *slot, Slot::CheckedOut) else {
+                unreachable!("just matched Available")
+            };
+            Ok(Some(*conn))
         }
-        runtime
-            .as_mut()
-            .expect("initialized Tokio runtime for MCP builtin")
-            .block_on(future)
-    })
+        Slot::CheckedOut => Ok(None),
+        Slot::Tombstone(reason) => Err(tombstone_error(reason)),
+    }
+}
+
+/// Return a connection to `Available` after a call completes (success OR
+/// failure — a failed tool call doesn't mean the transport itself is broken).
+fn checkin(entry: &ConnEntry, conn: McpConnection) {
+    *entry.slot.borrow_mut() = Slot::Available(Box::new(conn));
+}
+
+/// Tombstone a connection's slot: cancellation mid-call, or a completed
+/// `mcp/close`. Always called on the VM thread.
+fn tombstone_slot(entry: &ConnEntry, reason: impl Into<String>) {
+    *entry.slot.borrow_mut() = Slot::Tombstone(reason.into());
+}
+
+/// A connection's slot is `CheckedOut` when a SYNCHRONOUS (non-async-context)
+/// call reaches it. This should be unreachable in practice: the cooperative
+/// scheduler never runs concurrently with top-level code (a plain top-level
+/// call blocks the one VM thread until it returns), so nothing else can be
+/// mid-checkout when synchronous code touches a handle. Errors cleanly rather
+/// than panicking/deadlocking if that invariant is ever violated by a bug.
+fn busy_sync_error(handle: &str, label: &str) -> SemaError {
+    SemaError::eval(format!(
+        "{label}: mcp connection {handle} is unexpectedly busy (checked out by an in-flight \
+         async call); this should not happen outside async context"
+    ))
+}
+
+/// Drive a future to completion on the CALLING thread — the SYNC (top-level,
+/// non-async-context) path. Routes through `sema_io::io_block_on`, the ADR
+/// #69 sanctioned mechanism, rather than a private per-thread runtime.
+///
+/// This is a DELIBERATE, brief-sanctioned deviation from keeping the
+/// pre-existing private `TOKIO_RT` thread-local (the brief's own wording
+/// offered both: "keep TOKIO_RT/block_on... or route through the sanctioned
+/// sema-io equivalent"). It is not optional, though: `tokio::process::Child`/
+/// `ChildStdin`/`ChildStdout` (and a `reqwest::Client`'s pooled connections)
+/// are permanently bound to the runtime that created them — a resource
+/// created under a PRIVATE runtime (the old `TOKIO_RT`) can never be polled to
+/// completion under a DIFFERENT one (the `sema-io` pool the async-offload path
+/// uses) without hanging forever (verified empirically while implementing
+/// MCP-4: a connection made via a synchronous `mcp/connect` and then called
+/// from inside `async/spawn` parked on `AwaitIo` indefinitely). Routing every
+/// MCP connection's entire lifecycle — connect AND every later call, sync or
+/// offloaded — through the ONE shared pool is what makes "connect once
+/// (sync), call from async tasks later" (the common/expected pattern, and
+/// exactly what the workflow `:mcp` pre-phase does) actually work. Observable
+/// behavior is unchanged: `io_block_on` blocks the calling thread until the
+/// future resolves, exactly like the old private runtime did.
+fn block_on<F: Future>(future: F) -> F::Output {
+    sema_io::io_block_on(future)
+}
+
+/// Render `SemaError::eval(msg)`'s exact `Display` text as a plain `String` —
+/// used to hand a poller `finish` step's failure to `IoPoll::Ready(Err(_))`
+/// (which only ever carries `String`, never `SemaError`/`Value`/`Rc`) while
+/// keeping the async rejection's text byte-identical to what the sync path's
+/// `SemaError::eval(msg).to_string()` would show. The throwaway `SemaError` is
+/// constructed and consumed within this one call, on the VM thread — it never
+/// crosses a thread boundary.
+fn sema_err_msg(msg: String) -> String {
+    SemaError::eval(msg).to_string()
 }
 
 fn next_handle() -> String {
@@ -133,30 +343,46 @@ fn gate(sandbox: &Sandbox, cap: Caps) -> Result<(), SemaError> {
     Ok(())
 }
 
-/// Register a live connection under a fresh opaque handle and return the handle.
-fn register_connection(
-    client: McpClient,
-    identity: String,
-    opts: &ConnectOpts,
-) -> Result<Value, SemaError> {
-    let handle = next_handle();
-    let connection = Rc::new(RefCell::new(McpConnection {
-        client,
-        identity,
-        interactive_auth: opts.interactive_auth,
-        allowed_tools: opts.allowed_tools.clone(),
-    }));
-    CONNECTIONS.with(|connections| {
-        connections.borrow_mut().insert(handle.clone(), connection);
-    });
-    Ok(Value::string(&handle))
+/// The capability a connect needs, from the config's transport: `:url` is
+/// network I/O, `:command` spawns a process. Shared by the sync and
+/// async-offload entry points so both gate identically, on the VM thread,
+/// BEFORE any offload is spawned.
+fn connect_capability(config_json: &serde_json::Value) -> Caps {
+    if config_json.get("url").and_then(|v| v.as_str()).is_some() {
+        Caps::NETWORK
+    } else {
+        Caps::PROCESS
+    }
 }
 
-/// Connect to a stdio MCP server (`:command` + optional `:args`/`:env`/`:cwd`),
-/// run the handshake, and register the connection. Stdio servers never speak
-/// OAuth, so `opts.interactive_auth` is only carried through for `mcp/call`'s
-/// bookkeeping (it is meaningless here); `opts.allowed_tools` applies as usual.
-fn connect_stdio(config_json: &serde_json::Value, opts: &ConnectOpts) -> Result<Value, SemaError> {
+/// Register a live connection under a fresh opaque handle and return the
+/// handle. Always called on the VM thread (touches the `CONNECTIONS`
+/// thread-local) — for the async-offload connect path that means from the
+/// poller's finish step, never from inside the offloaded closure.
+fn register_connection(client: McpClient, identity: String, opts: &ConnectOpts) -> Value {
+    let handle = next_handle();
+    let entry = Rc::new(ConnEntry {
+        meta: ConnMeta {
+            identity,
+            interactive_auth: opts.interactive_auth,
+            allowed_tools: opts.allowed_tools.clone(),
+        },
+        slot: RefCell::new(Slot::Available(Box::new(McpConnection { client }))),
+    });
+    CONNECTIONS.with(|connections| {
+        connections.borrow_mut().insert(handle.clone(), entry);
+    });
+    Value::string(&handle)
+}
+
+// ── Connect: async core (no thread-local access; safe under either driver) ──
+
+/// Connect to a stdio MCP server (`:command` + optional `:args`/`:env`/`:cwd`)
+/// and run the handshake. Stdio servers never speak OAuth. No thread-local
+/// access — legal to drive via the sync `block_on` or `sema_io::io_block_on`.
+async fn connect_stdio_async(
+    config_json: &serde_json::Value,
+) -> Result<(McpClient, String), SemaError> {
     let command = config_json
         .get("command")
         .and_then(|value| value.as_str())
@@ -212,35 +438,37 @@ fn connect_stdio(config_json: &serde_json::Value, opts: &ConnectOpts) -> Result<
         "cwd": cwd.as_ref().map(|p| p.display().to_string()),
     })
     .to_string();
-    let mut client = block_on(McpClient::connect(McpClientConfig {
+    let mut client = McpClient::connect(McpClientConfig {
         command: command.to_string(),
         args: args_vec,
         env: (!env_map.is_empty()).then_some(env_map),
         cwd,
-    }))
+    })
+    .await
     .map_err(|err| SemaError::eval(format!("mcp/connect: {err}")))?;
-    if let Err(err) = block_on(client.initialize()) {
-        let _ = block_on(client.close());
+    if let Err(err) = client.initialize().await {
+        let _ = client.close().await;
         return Err(SemaError::eval(format!("mcp/connect: {err}")));
     }
-    register_connection(client, identity, opts)
+    Ok((client, identity))
 }
 
 /// Connect to a remote Streamable-HTTP MCP server (`:url` + optional
-/// `:headers`), run the handshake, and register the connection.
+/// `:headers`) and run the handshake.
 ///
 /// When `opts.interactive_auth` is `false`, a `401`/`403` OAuth challenge is
-/// never chased: [`obtain_access_token`] (and therefore the browser opener and
-/// loopback listener it drives) is never called, and the connect fails with
-/// [`ConnectOutcome::NeedsAuth`] instead. A caller that wants a silent
-/// reconnect from a cached token should inject it directly via
+/// never chased: [`obtain_access_token_async`] (and therefore the browser
+/// opener and loopback listener it drives) is never called, and the connect
+/// fails with [`ConnectOutcome::NeedsAuth`] instead. A caller that wants a
+/// silent reconnect from a cached token should inject it directly via
 /// `:headers {"Authorization" "Bearer …"}` before calling — that value already
 /// flows straight into `McpHttpConfig.headers` below, so no new surface is
 /// needed for token injection.
-fn connect_http(
+async fn connect_http_async(
     config_json: &serde_json::Value,
     opts: &ConnectOpts,
-) -> Result<Value, ConnectOutcome> {
+    opener_source: OpenerSource,
+) -> Result<(McpClient, String), ConnectOutcome> {
     let url = config_json
         .get("url")
         .and_then(|value| value.as_str())
@@ -264,18 +492,19 @@ fn connect_http(
         .and_then(|value| value.as_str())
         .map(str::to_string);
 
-    let mut client = block_on(McpClient::connect_http(McpHttpConfig {
+    let mut client = McpClient::connect_http(McpHttpConfig {
         url: url.to_string(),
         headers: headers.clone(),
-    }))
+    })
+    .await
     .map_err(|err| ConnectOutcome::Sema(SemaError::eval(format!("mcp/connect: {err}"))))?;
 
-    if let Err(err) = block_on(client.initialize()) {
+    if let Err(err) = client.initialize().await {
         if let Some(challenge) = client.http_challenge() {
             if !opts.interactive_auth {
                 // Non-interactive: report the auth requirement instead of
                 // chasing it — no discovery, no browser, no loopback bind.
-                let _ = block_on(client.close());
+                let _ = client.close().await;
                 return Err(ConnectOutcome::NeedsAuth(url.to_string()));
             }
             // A `401` means the server requires OAuth; run the login flow, attach
@@ -284,15 +513,21 @@ fn connect_http(
             // the legacy HTTP+SSE transport once authorized — so a `404`/`405` on
             // the authenticated Streamable POST means "retry over legacy SSE with
             // the token attached", not a hard failure.
-            let token = obtain_access_token(url, &challenge, preconfigured_client_id.as_deref())
-                .map_err(ConnectOutcome::Sema)?;
+            let token = obtain_access_token_async(
+                url,
+                &challenge,
+                preconfigured_client_id.as_deref(),
+                opener_source,
+            )
+            .await
+            .map_err(ConnectOutcome::Sema)?;
             headers.insert("Authorization".to_string(), format!("Bearer {token}"));
             client.set_bearer_token(&token);
-            if let Err(err2) = block_on(client.initialize()) {
+            if let Err(err2) = client.initialize().await {
                 let status = client.http_last_status();
-                let _ = block_on(client.close());
+                let _ = client.close().await;
                 if matches!(status, Some(404) | Some(405)) {
-                    return connect_legacy(url, headers, opts);
+                    return connect_legacy_async(url, headers).await;
                 }
                 return Err(ConnectOutcome::Sema(SemaError::eval(format!(
                     "mcp/connect: handshake failed after authorization: {err2}"
@@ -301,44 +536,45 @@ fn connect_http(
         } else if matches!(client.http_last_status(), Some(404) | Some(405)) {
             // Unauthenticated server that only speaks the deprecated 2024-11-05
             // HTTP+SSE transport (POST→4xx→GET-`endpoint`).
-            let _ = block_on(client.close());
-            return connect_legacy(url, headers, opts);
+            let _ = client.close().await;
+            return connect_legacy_async(url, headers).await;
         } else {
-            let _ = block_on(client.close());
+            let _ = client.close().await;
             return Err(ConnectOutcome::Sema(SemaError::eval(format!(
                 "mcp/connect: {err}"
             ))));
         }
     }
-    register_connection(client, url.to_string(), opts).map_err(ConnectOutcome::Sema)
+    Ok((client, url.to_string()))
 }
 
 /// Connect over the deprecated 2024-11-05 HTTP+SSE transport. `headers` carries
 /// any bearer token obtained during the OAuth flow, so authenticated legacy
 /// servers (e.g. Asana) work.
-fn connect_legacy(
+async fn connect_legacy_async(
     url: &str,
     headers: HashMap<String, String>,
-    opts: &ConnectOpts,
-) -> Result<Value, ConnectOutcome> {
-    let mut legacy = block_on(McpClient::connect_legacy_sse(McpHttpConfig {
+) -> Result<(McpClient, String), ConnectOutcome> {
+    let mut legacy = McpClient::connect_legacy_sse(McpHttpConfig {
         url: url.to_string(),
         headers,
-    }))
+    })
+    .await
     .map_err(|e| ConnectOutcome::Sema(SemaError::eval(format!("mcp/connect: {e}"))))?;
-    block_on(legacy.initialize()).map_err(|e| {
+    legacy.initialize().await.map_err(|e| {
         ConnectOutcome::Sema(SemaError::eval(format!("mcp/connect (legacy SSE): {e}")))
     })?;
-    register_connection(legacy, url.to_string(), opts).map_err(ConnectOutcome::Sema)
+    Ok((legacy, url.to_string()))
 }
 
 /// Run (or reuse) the OAuth login for a remote server that answered `401`, and
 /// return an access token. Uses the default credential store (keychain or file)
 /// and a real loopback + system-browser flow.
-fn obtain_access_token(
+async fn obtain_access_token_async(
     url: &str,
     challenge_header: &str,
     preconfigured_client_id: Option<&str>,
+    opener_source: OpenerSource,
 ) -> Result<String, SemaError> {
     use crate::oauth::{discovery, login, loopback, store};
 
@@ -347,7 +583,7 @@ fn obtain_access_token(
     let credential_store = store::default_store();
     let driver = loopback::LoopbackDriver::with_opener(
         std::time::Duration::from_secs(300),
-        gated_browser_opener(),
+        opener_source.opener(),
     )
     .map_err(|e| SemaError::eval(format!("mcp/connect: {e}")))?;
 
@@ -358,18 +594,31 @@ fn obtain_access_token(
         preconfigured_client_id,
     };
 
-    block_on(login::ensure_access_token(
-        &http,
-        credential_store.as_ref(),
-        &config,
-        &driver,
-    ))
-    .map_err(|e| {
-        SemaError::eval(format!("mcp/connect: OAuth login failed: {e}")).with_hint(
-            "a browser should have opened to complete login; or pass a token via \
-             :headers {\"Authorization\" \"Bearer …\"}",
-        )
-    })
+    login::ensure_access_token(&http, credential_store.as_ref(), &config, &driver)
+        .await
+        .map_err(|e| {
+            SemaError::eval(format!("mcp/connect: OAuth login failed: {e}")).with_hint(
+                "a browser should have opened to complete login; or pass a token via \
+                 :headers {\"Authorization\" \"Bearer …\"}",
+            )
+        })
+}
+
+/// Dispatch on transport and connect (no sandbox gate — the caller runs
+/// [`gate`] itself, on the VM thread, BEFORE calling this so a denied sandbox
+/// fails fast without ever spawning an offload).
+async fn connect_dispatch_async(
+    config_json: serde_json::Value,
+    opts: ConnectOpts,
+    opener_source: OpenerSource,
+) -> Result<(McpClient, String), ConnectOutcome> {
+    if config_json.get("url").and_then(|v| v.as_str()).is_some() {
+        connect_http_async(&config_json, &opts, opener_source).await
+    } else {
+        connect_stdio_async(&config_json)
+            .await
+            .map_err(ConnectOutcome::Sema)
+    }
 }
 
 /// Convert a Sema config map — `mcp/connect`'s single argument, or a config
@@ -456,20 +705,63 @@ enum ConnectOutcome {
 
 /// Gate on the sandbox captured by the most recent [`register_mcp_builtins`]
 /// call on this thread (unrestricted if that was never called), dispatch on
-/// transport, and connect. Shared by `mcp/connect` and [`connect_from_config`]
-/// so the two can never drift.
+/// transport, and connect. SYNC PATH ONLY (drives [`connect_dispatch_async`]
+/// via the blocking [`block_on`]) — shared by `mcp/connect`'s synchronous
+/// branch and [`connect_from_config`] so the two can never drift. The
+/// async-offload branch is [`connect_offload`], below.
 fn connect_with_opts(
     config_json: &serde_json::Value,
     opts: &ConnectOpts,
 ) -> Result<Value, ConnectOutcome> {
     let sandbox = SANDBOX.with(|s| s.borrow().clone());
-    if config_json.get("url").and_then(|v| v.as_str()).is_some() {
-        gate(&sandbox, Caps::NETWORK).map_err(ConnectOutcome::Sema)?;
-        connect_http(config_json, opts)
-    } else {
-        gate(&sandbox, Caps::PROCESS).map_err(ConnectOutcome::Sema)?;
-        connect_stdio(config_json, opts).map_err(ConnectOutcome::Sema)
-    }
+    gate(&sandbox, connect_capability(config_json)).map_err(ConnectOutcome::Sema)?;
+    let (client, identity) = block_on(connect_dispatch_async(
+        config_json.clone(),
+        opts.clone(),
+        OpenerSource::Live,
+    ))?;
+    Ok(register_connection(client, identity, opts))
+}
+
+/// Async-context `mcp/connect`: gate synchronously on the VM thread (a denied
+/// sandbox fails fast, no offload spawned), hoist the browser-open decision
+/// (never touch `SANDBOX` from the background thread), then offload the whole
+/// connect+handshake (+ any interactive OAuth — the loopback driver already
+/// runs its own threads for that) onto the `sema-io` pool. No checkout is
+/// involved (there is no existing connection yet); the poller registers the
+/// returned connection as a brand new `Available` slot.
+fn connect_offload(config_json: serde_json::Value, opts: ConnectOpts) -> Result<Value, SemaError> {
+    let sandbox = SANDBOX.with(|s| s.borrow().clone());
+    gate(&sandbox, connect_capability(&config_json))?;
+    let browser_allowed = browser_open_allowed();
+    let opts_for_register = opts.clone();
+
+    let (tx, mut rx) = oneshot::channel::<Result<(McpClient, String), String>>();
+    sema_io::io_spawn_blocking(move || {
+        let outcome = sema_io::io_block_on(connect_dispatch_async(
+            config_json,
+            opts,
+            OpenerSource::Resolved(browser_allowed),
+        ));
+        let sendable = outcome.map_err(connect_outcome_msg);
+        let _ = tx.send(sendable);
+        sema_core::notify_io_complete();
+    });
+
+    let handle = Rc::new(sema_core::IoHandle::new(move || match rx.try_recv() {
+        Err(oneshot::error::TryRecvError::Empty) => sema_core::IoPoll::Pending,
+        Ok(Ok((client, identity))) => sema_core::IoPoll::Ready(Ok(register_connection(
+            client,
+            identity,
+            &opts_for_register,
+        ))),
+        Ok(Err(msg)) => sema_core::IoPoll::Ready(Err(msg)),
+        Err(oneshot::error::TryRecvError::Closed) => sema_core::IoPoll::Ready(Err(
+            "mcp/connect: internal error — connect worker dropped".to_string(),
+        )),
+    }));
+    sema_core::set_yield_signal(sema_core::YieldReason::AwaitIo(handle));
+    Ok(Value::nil())
 }
 
 /// Connect to an MCP server from a config map (the same shape `mcp/connect`
@@ -486,6 +778,10 @@ fn connect_with_opts(
 /// came from `(mcp/connect ...)`, as long as those builtins are evaluated on
 /// the same thread. Sandbox gates (`Caps::NETWORK` for `:url`, `Caps::PROCESS`
 /// for `:command`) apply exactly as they do for `mcp/connect`.
+///
+/// Always synchronous (the pre-phase workflow auth-resolution step that calls
+/// this runs before any concurrent fan-out starts, never inside
+/// `async/spawn`) — see `docs/plans/2026-06-24-workflow-mcp-auth.md` §3.
 pub fn connect_from_config(config: &Value, opts: ConnectOpts) -> Result<Value, ConnectFailure> {
     let outcome = value_to_config_json(config)
         .map_err(ConnectOutcome::Sema)
@@ -526,6 +822,15 @@ fn connect_outcome_to_sema_error(outcome: ConnectOutcome) -> SemaError {
     }
 }
 
+/// Render a [`ConnectOutcome`] as a plain `String` (via
+/// [`connect_outcome_to_sema_error`]'s `Display` text) — used at the
+/// async-offload boundary, where only `String` may cross the oneshot channel.
+/// The throwaway `SemaError` is constructed and consumed on the SAME
+/// (background) thread that produced the outcome; it never crosses.
+fn connect_outcome_msg(outcome: ConnectOutcome) -> String {
+    connect_outcome_to_sema_error(outcome).to_string()
+}
+
 fn require_handle<'a>(args: &'a [Value], fn_name: &str) -> Result<&'a str, SemaError> {
     args[0].as_str().ok_or_else(|| {
         SemaError::type_error("string", args[0].type_name()).with_hint(format!(
@@ -534,14 +839,14 @@ fn require_handle<'a>(args: &'a [Value], fn_name: &str) -> Result<&'a str, SemaE
     })
 }
 
-fn lookup_connection(handle: &str) -> Result<Rc<RefCell<McpConnection>>, SemaError> {
-    CONNECTIONS.with(|connections| {
-        connections.borrow().get(handle).cloned().ok_or_else(|| {
+fn lookup_entry(handle: &str) -> Result<Rc<ConnEntry>, SemaError> {
+    CONNECTIONS
+        .with(|connections| connections.borrow().get(handle).cloned())
+        .ok_or_else(|| {
             SemaError::eval(format!(
                 "mcp connection {handle} is not registered; it may have been closed"
             ))
         })
-    })
 }
 
 /// Cassette key for one MCP `tools/call`: a hash of the server identity + tool +
@@ -573,12 +878,15 @@ fn tool_is_allowed(allowed_tools: &Option<Vec<String>>, tool_name: &str) -> bool
 /// Enforce a connection's `:tools` manifest before any cassette lookup or
 /// network call: an undeclared tool never reaches the wire, even in cassette
 /// record mode.
-fn check_tool_allowed(connection: &McpConnection, tool_name: &str) -> Result<(), SemaError> {
-    if tool_is_allowed(&connection.allowed_tools, tool_name) {
+fn check_tool_allowed(
+    allowed_tools: &Option<Vec<String>>,
+    tool_name: &str,
+) -> Result<(), SemaError> {
+    if tool_is_allowed(allowed_tools, tool_name) {
         return Ok(());
     }
     // `tool_is_allowed` only returns `false` for `Some(list)`, so this is populated.
-    let allowed = connection.allowed_tools.as_deref().unwrap_or_default();
+    let allowed = allowed_tools.as_deref().unwrap_or_default();
     let manifest = if allowed.is_empty() {
         "(none)".to_string()
     } else {
@@ -590,83 +898,12 @@ fn check_tool_allowed(connection: &McpConnection, tool_name: &str) -> Result<(),
     .with_hint("declared in the workflow's :mcp :tools manifest; add it there to allow it"))
 }
 
-/// Invoke a tool, routing through the cassette when one is active: a replay hit
-/// returns the recorded result without touching the network; otherwise the real
-/// call runs and its result is recorded.
-fn call_tool_via_connection(
-    handle: &str,
-    tool_name: &str,
-    arguments_json: serde_json::Value,
-) -> Result<serde_json::Value, SemaError> {
-    let connection = lookup_connection(handle)?;
-    check_tool_allowed(&connection.borrow(), tool_name)?;
-    let key = cassette_key(&connection.borrow().identity, tool_name, &arguments_json);
-
-    match sema_core::mcp_cassette_decide(&key) {
-        Some(sema_core::McpCassetteDecision::Replay(recorded)) => return Ok(recorded),
-        Some(sema_core::McpCassetteDecision::Miss) => {
-            return Err(SemaError::eval(
-                "mcp/call: no cassette recording for this call (replay miss)".to_string(),
-            )
-            .with_hint(
-                "re-record the tape with SEMA_LLM_CASSETTE_MODE=record, or the call arguments \
-                 drifted from what was recorded",
-            ));
-        }
-        // Record mode or no cassette → perform the real call, then record it.
-        _ => {}
-    }
-
-    let result = call_tool_real(&connection, tool_name, arguments_json)?;
-    sema_core::mcp_cassette_record(&key, &result);
-    Ok(result)
-}
-
-/// The real (network) tool call, with one mid-session re-auth retry.
-fn call_tool_real(
-    connection: &Rc<RefCell<McpConnection>>,
-    tool_name: &str,
-    arguments_json: serde_json::Value,
-) -> Result<serde_json::Value, SemaError> {
-    let first = {
-        let mut conn = connection.borrow_mut();
-        block_on(conn.client.call_tool(tool_name, arguments_json.clone()))
-    };
-    let err = match first {
-        Ok(value) => return Ok(value),
-        Err(err) => err,
-    };
-
-    // A mid-session `401` (token expired) or `403 insufficient_scope` (needs
-    // step-up) on a remote HTTP server means "re-authorize and retry once".
-    let (status, challenge, url) = {
-        let conn = connection.borrow();
-        (
-            conn.client.http_last_status(),
-            conn.client.http_challenge(),
-            conn.client.http_url(),
+fn replay_miss_error() -> SemaError {
+    SemaError::eval("mcp/call: no cassette recording for this call (replay miss)".to_string())
+        .with_hint(
+            "re-record the tape with SEMA_LLM_CASSETTE_MODE=record, or the call arguments \
+             drifted from what was recorded",
         )
-    };
-    if !matches!(status, Some(401) | Some(403)) {
-        return Err(SemaError::eval(format!("mcp/call: {err}")));
-    }
-    let Some(url) = url else {
-        return Err(SemaError::eval(format!("mcp/call: {err}")));
-    };
-    let interactive_auth = connection.borrow().interactive_auth;
-    let token = match reauthorize(&url, status, challenge.as_deref(), interactive_auth) {
-        Ok(Some(token)) => token,
-        // Not an auth challenge we handle, or re-auth failed — surface the
-        // original error.
-        _ => return Err(SemaError::eval(format!("mcp/call: {err}"))),
-    };
-
-    let mut conn = connection.borrow_mut();
-    // Streamable HTTP swaps the header; legacy SSE reconnects its stream.
-    block_on(conn.client.reauthorize_bearer(&token))
-        .map_err(|e| SemaError::eval(format!("mcp/call: {e}")))?;
-    block_on(conn.client.call_tool(tool_name, arguments_json))
-        .map_err(|err| SemaError::eval(format!("mcp/call: {err}")))
 }
 
 /// A [`RedirectDriver`](crate::oauth::loopback::RedirectDriver) for
@@ -695,24 +932,27 @@ impl crate::oauth::loopback::RedirectDriver for NoInteractiveDriver {
 
 /// React to a mid-session auth challenge (refresh on `401`, step-up re-scope on
 /// `403 insufficient_scope`) and return a fresh access token to retry with.
-/// `interactive_auth` (from the connection's [`ConnectOpts`]) selects the
-/// redirect driver: the real loopback+browser flow, or [`NoInteractiveDriver`]
-/// so a login fallback fails cleanly instead of popping a browser mid-run.
-fn reauthorize(
+/// `interactive_auth` selects the redirect driver: the real loopback+browser
+/// flow, or [`NoInteractiveDriver`] so a login fallback fails cleanly instead
+/// of popping a browser mid-run. `opener_source` resolves the browser opener
+/// (see [`OpenerSource`]) — never touches `SANDBOX` when offloaded. No
+/// thread-local access otherwise: legal under either driver.
+async fn reauthorize_async(
     url: &str,
     status: Option<u16>,
     challenge: Option<&str>,
     interactive_auth: bool,
-) -> Result<Option<String>, SemaError> {
+    opener_source: OpenerSource,
+) -> Result<Option<String>, String> {
     let http = reqwest::Client::new();
     let store = crate::oauth::store::default_store();
     let result = if interactive_auth {
         let driver = crate::oauth::loopback::LoopbackDriver::with_opener(
-            std::time::Duration::from_secs(300),
-            gated_browser_opener(),
+            Duration::from_secs(300),
+            opener_source.opener(),
         )
-        .map_err(|e| SemaError::eval(format!("mcp/call: {e}")))?;
-        block_on(crate::oauth::login::reauth_on_challenge(
+        .map_err(|e| format!("mcp/call: {e}"))?;
+        crate::oauth::login::reauth_on_challenge(
             &http,
             store.as_ref(),
             url,
@@ -720,9 +960,10 @@ fn reauthorize(
             challenge,
             None,
             &driver,
-        ))
+        )
+        .await
     } else {
-        block_on(crate::oauth::login::reauth_on_challenge(
+        crate::oauth::login::reauth_on_challenge(
             &http,
             store.as_ref(),
             url,
@@ -730,10 +971,298 @@ fn reauthorize(
             challenge,
             None,
             &NoInteractiveDriver,
-        ))
+        )
+        .await
     };
-    result.map_err(|e| SemaError::eval(format!("mcp/call: re-authorization failed: {e}")))
+    result.map_err(|e| format!("mcp/call: re-authorization failed: {e}"))
 }
+
+/// Async core of one `tools/call`, including the mid-session reauth-on-401/403
+/// retry. No thread-local access: `interactive_auth`/`opener_source` are
+/// resolved by the caller (see the module doc on browser-opener hoisting).
+/// Returns the RAW (unprefixed) error string on failure — every branch below
+/// mirrors the pre-offload implementation's `"mcp/call: {err}"` prefix, added
+/// uniformly by callers (see [`call_tool`]/[`call_tool_offload`]) since every
+/// path used that exact literal prefix.
+async fn call_tool_async(
+    conn: &mut McpConnection,
+    tool_name: &str,
+    arguments_json: serde_json::Value,
+    interactive_auth: bool,
+    opener_source: OpenerSource,
+) -> Result<serde_json::Value, String> {
+    let err = match conn
+        .client
+        .call_tool(tool_name, arguments_json.clone())
+        .await
+    {
+        Ok(value) => return Ok(value),
+        Err(err) => err,
+    };
+
+    // A mid-session `401` (token expired) or `403 insufficient_scope` (needs
+    // step-up) on a remote HTTP server means "re-authorize and retry once".
+    let status = conn.client.http_last_status();
+    let challenge = conn.client.http_challenge();
+    let url = conn.client.http_url();
+    if !matches!(status, Some(401) | Some(403)) {
+        return Err(err);
+    }
+    let Some(url) = url else {
+        return Err(err);
+    };
+    let token = match reauthorize_async(
+        &url,
+        status,
+        challenge.as_deref(),
+        interactive_auth,
+        opener_source,
+    )
+    .await
+    {
+        Ok(Some(token)) => token,
+        // Not an auth challenge we handle, or re-auth failed — surface the
+        // original error.
+        _ => return Err(err),
+    };
+
+    // Streamable HTTP swaps the header; legacy SSE reconnects its stream.
+    conn.client.reauthorize_bearer(&token).await?;
+    conn.client.call_tool(tool_name, arguments_json).await
+}
+
+async fn list_tools_async(conn: &mut McpConnection) -> Result<Vec<Tool>, String> {
+    conn.client.list_tools().await
+}
+
+async fn close_async(conn: &mut McpConnection) -> Result<(), String> {
+    conn.client.close().await
+}
+
+// ── Checkout + offload machinery shared by `mcp/call`, `mcp/tools`, `mcp/close` ──
+
+/// Result of the offloaded work: the connection handed back (so it can be
+/// checked in / tombstoned / dropped) plus the operation's own result.
+type CheckoutOpResult<T> = (McpConnection, Result<T, String>);
+
+/// Build the `AwaitIo` handle for one exclusive checkout-then-offload
+/// operation against `entry`'s connection — the machinery shared by
+/// `mcp/call`, `mcp/tools`(`->sema`), and `mcp/close`'s async paths.
+///
+/// Tries the checkout SYNCHRONOUSLY first (on the VM thread, before this
+/// function returns): if the slot is `Available`, checks it out immediately
+/// and starts the offload right away (the "fast path" — the common,
+/// uncontended case starts real I/O without waiting a scheduler tick). If the
+/// slot is `CheckedOut`, returns a handle whose poller retries the checkout on
+/// every subsequent `wake_blocked_tasks` sweep (the "queue path") — this does
+/// NOT arm a second `AwaitIo`; the same handle just transitions phase
+/// internally once it acquires. If the slot is already `Tombstone`d, returns
+/// `Err` synchronously — no handle is ever built, matching the cassette-miss/
+/// tool-not-allowed style of failing fast with no offload spawned.
+///
+/// `start`: called exactly once, the moment the checkout is acquired. Moves
+/// the checked-out connection onto `sema_io::io_spawn_blocking` and returns
+/// the oneshot receiver the Running phase polls. MUST call
+/// `sema_core::notify_io_complete()` after sending, from the background
+/// thread — the lost-wakeup guard: a sibling queued on this same slot may
+/// already have been polled `Pending` earlier in the same scheduler sweep,
+/// and without this poke its next acquisition attempt could miss the wakeup.
+///
+/// `finish`: called once, on the VM thread, when the offloaded op completes.
+/// Decides the connection's fate ([`checkin`], [`tombstone_slot`], or simply
+/// dropping it for `mcp/close`) and converts the raw `Result<T, String>` into
+/// the native's `Value`/error string. **MUST** leave the slot in a terminal
+/// state (`Available` or `Tombstone`) — never `CheckedOut` — or a queued
+/// sibling parks forever.
+fn checkout_offload<T: Send + 'static>(
+    entry: Rc<ConnEntry>,
+    start: impl FnOnce(McpConnection) -> oneshot::Receiver<CheckoutOpResult<T>> + 'static,
+    finish: impl FnOnce(&Rc<ConnEntry>, McpConnection, Result<T, String>) -> Result<Value, String>
+        + 'static,
+) -> Result<Rc<sema_core::IoHandle>, SemaError> {
+    enum Phase<T> {
+        Acquire,
+        Running(oneshot::Receiver<CheckoutOpResult<T>>),
+    }
+
+    let checked_out_ever = Rc::new(Cell::new(false));
+    let mut start = Some(start);
+    let mut finish = Some(finish);
+
+    // Fast path: try the checkout NOW, before any yield.
+    let mut phase = match try_checkout(&entry)? {
+        Some(conn) => {
+            checked_out_ever.set(true);
+            let start_fn = start.take().expect("start not yet used");
+            Phase::Running(start_fn(conn))
+        }
+        None => Phase::Acquire,
+    };
+
+    let poll_entry = entry.clone();
+    let poll_checked_out = checked_out_ever.clone();
+    let poll = move || -> sema_core::IoPoll {
+        loop {
+            match &mut phase {
+                Phase::Acquire => match try_checkout(&poll_entry) {
+                    Err(e) => return sema_core::IoPoll::Ready(Err(e.to_string())),
+                    Ok(None) => return sema_core::IoPoll::Pending,
+                    Ok(Some(conn)) => {
+                        poll_checked_out.set(true);
+                        let start_fn = start.take().expect("checkout_offload: start runs once");
+                        phase = Phase::Running(start_fn(conn));
+                        // Loop again immediately: give the just-started Running
+                        // phase one poll this same tick rather than waiting a
+                        // whole scheduler sweep — the poller "transitions phase
+                        // internally," never arming a second `AwaitIo`.
+                    }
+                },
+                Phase::Running(rx) => {
+                    return match rx.try_recv() {
+                        Err(oneshot::error::TryRecvError::Empty) => sema_core::IoPoll::Pending,
+                        Err(oneshot::error::TryRecvError::Closed) => {
+                            // The worker never sent — treat the connection as
+                            // lost rather than leaving the slot `CheckedOut`
+                            // forever (mirrors the cancellation tombstone).
+                            tombstone_slot(&poll_entry, "connection worker dropped");
+                            sema_core::IoPoll::Ready(Err(
+                                "mcp: internal error — offload worker dropped".to_string(),
+                            ))
+                        }
+                        Ok((conn, result)) => {
+                            let finish_fn =
+                                finish.take().expect("checkout_offload: finish runs once");
+                            sema_core::IoPoll::Ready(finish_fn(&poll_entry, conn, result))
+                        }
+                    };
+                }
+            }
+        }
+    };
+
+    Ok(Rc::new(sema_core::IoHandle::with_abort(poll, move || {
+        // Abort hook: fires ONLY on cancellation (async/cancel, async/timeout
+        // expiry, interrupt) — never on normal completion. If this task had
+        // the connection checked out, tombstone the slot: the background
+        // worker's eventual `tx.send` fails harmlessly (the receiver, owned by
+        // the `phase` this closure drops, is gone), and the connection itself
+        // drops on the worker thread (a stdio child is killed by `Drop`).
+        // Acquire-phase abort (never checked out) is a documented no-op — the
+        // slot is untouched, so whoever holds it (or whoever else is queued)
+        // is unaffected.
+        if checked_out_ever.get() {
+            tombstone_slot(&entry, "connection lost: cancelled mid-call");
+        }
+    })))
+}
+
+// ── `mcp/call` (+ `mcp/tools->sema` handlers): shared entry point ──────────
+
+/// Shared entry point for one `tools/call`, used by BOTH the plain `mcp/call`
+/// builtin and each `mcp/tools->sema` handler. `materialize` turns the raw
+/// JSON-RPC result into the native's return value: `mcp/call` just converts
+/// it; the tool-adapter handler additionally treats `isError: true` as a Sema
+/// error so the agent loop feeds the failure back to the model. This is what
+/// lets the adapter handlers "inherit the async behavior with no extra work"
+/// (task brief) — `materialize` runs inside the offload's `finish` step (VM
+/// thread), so a handler never needs its own post-processing after a
+/// synchronous return that, in async context, wouldn't have happened yet.
+///
+/// Handles both the sync (blocking) and async-offload paths. Pre-offload,
+/// on the VM thread, always: the tool-allowlist check and the cassette
+/// decide — a replay hit returns synchronously (no offload spawned), a
+/// record-miss in replay mode errors synchronously.
+fn call_tool(
+    handle: &str,
+    tool_name: &str,
+    arguments_json: serde_json::Value,
+    materialize: impl FnOnce(serde_json::Value) -> Result<Value, String> + 'static,
+) -> Result<Value, SemaError> {
+    let entry = lookup_entry(handle)?;
+    check_tool_allowed(&entry.meta.allowed_tools, tool_name)?;
+    let key = cassette_key(&entry.meta.identity, tool_name, &arguments_json);
+
+    match sema_core::mcp_cassette_decide(&key) {
+        Some(sema_core::McpCassetteDecision::Replay(recorded)) => {
+            return materialize(recorded).map_err(|e| SemaError::eval(format!("mcp/call: {e}")));
+        }
+        Some(sema_core::McpCassetteDecision::Miss) => return Err(replay_miss_error()),
+        // Record mode or no cassette → perform the real call, then record it.
+        _ => {}
+    }
+
+    if sema_core::in_async_context() {
+        return call_tool_offload(
+            entry,
+            key,
+            tool_name.to_string(),
+            arguments_json,
+            materialize,
+        );
+    }
+
+    let mut conn = try_checkout(&entry)?.ok_or_else(|| busy_sync_error(handle, "mcp/call"))?;
+    let result = block_on(call_tool_async(
+        &mut conn,
+        tool_name,
+        arguments_json,
+        entry.meta.interactive_auth,
+        OpenerSource::Live,
+    ));
+    checkin(&entry, conn);
+    let raw = result.map_err(|e| SemaError::eval(format!("mcp/call: {e}")))?;
+    sema_core::mcp_cassette_record(&key, &raw);
+    materialize(raw).map_err(|e| SemaError::eval(format!("mcp/call: {e}")))
+}
+
+/// Cancellation semantics (documented here per the task brief): a task
+/// cancelled while its `mcp/call` holds the connection tombstones the slot —
+/// see [`checkout_offload`]'s abort hook. A task cancelled while merely
+/// QUEUED (never acquired the checkout) leaves the connection untouched. Any
+/// later use of a tombstoned handle fails with a `SemaError` naming the
+/// reason and a reconnect hint.
+fn call_tool_offload(
+    entry: Rc<ConnEntry>,
+    cassette_key: String,
+    tool_name: String,
+    arguments_json: serde_json::Value,
+    materialize: impl FnOnce(serde_json::Value) -> Result<Value, String> + 'static,
+) -> Result<Value, SemaError> {
+    let interactive_auth = entry.meta.interactive_auth;
+    let browser_allowed = browser_open_allowed();
+
+    let start = move |conn: McpConnection| {
+        let (tx, rx) = oneshot::channel();
+        sema_io::io_spawn_blocking(move || {
+            let mut conn = conn;
+            let out = sema_io::io_block_on(call_tool_async(
+                &mut conn,
+                &tool_name,
+                arguments_json,
+                interactive_auth,
+                OpenerSource::Resolved(browser_allowed),
+            ));
+            let _ = tx.send((conn, out));
+            sema_core::notify_io_complete();
+        });
+        rx
+    };
+    let finish = move |entry: &Rc<ConnEntry>,
+                       conn: McpConnection,
+                       result: Result<serde_json::Value, String>|
+          -> Result<Value, String> {
+        checkin(entry, conn);
+        let raw = result.map_err(|e| sema_err_msg(format!("mcp/call: {e}")))?;
+        sema_core::mcp_cassette_record(&cassette_key, &raw);
+        materialize(raw)
+    };
+
+    let handle = checkout_offload(entry, start, finish)?;
+    sema_core::set_yield_signal(sema_core::YieldReason::AwaitIo(handle));
+    Ok(Value::nil())
+}
+
+// ── `mcp/tools` / `mcp/tools->sema`: shared listing entry point ────────────
 
 /// Concatenate the `text` blocks of a `tools/call` result, if any.
 fn result_text(result: &serde_json::Value) -> Option<String> {
@@ -812,22 +1341,200 @@ fn schema_to_params(schema: &serde_json::Value) -> (Value, Vec<String>) {
     (Value::map(params), ordered)
 }
 
+/// Build `mcp/tools`' plain `{:name :description :input-schema}` list,
+/// filtered to the connection's `:tools` manifest.
+fn tools_to_value(tools: Vec<Tool>, allowed_tools: &Option<Vec<String>>) -> Value {
+    let items = tools
+        .into_iter()
+        .filter(|tool| tool_is_allowed(allowed_tools, &tool.name))
+        .map(|tool| {
+            let mut entry = BTreeMap::new();
+            entry.insert(Value::keyword("name"), Value::string(&tool.name));
+            entry.insert(
+                Value::keyword("description"),
+                Value::string(&tool.description),
+            );
+            entry.insert(
+                Value::keyword("input-schema"),
+                sema_core::json_to_value(&tool.input_schema),
+            );
+            Value::map(entry)
+        })
+        .collect();
+    Value::list(items)
+}
+
+/// Build `mcp/tools->sema`'s `deftool`-shaped list: each entry's handler
+/// routes through [`call_tool`] (the shared, offload-aware call path), so it
+/// automatically offloads when invoked from inside an async task — no extra
+/// work in the handler itself.
+fn tool_defs_to_value(
+    tools: Vec<Tool>,
+    allowed_tools: &Option<Vec<String>>,
+    connection_handle: &str,
+) -> Value {
+    let mut items = Vec::new();
+    for tool in tools {
+        if !tool_is_allowed(allowed_tools, &tool.name) {
+            // Not in the connection's :tools manifest — an agent given
+            // this connection's tools must never even see it.
+            continue;
+        }
+        let (parameters, ordered) = schema_to_params(&tool.input_schema);
+        let tool_name = tool.name.clone();
+        let connection_handle = connection_handle.to_string();
+        let handler_name = format!("mcp/{tool_name}");
+        let handler = Value::native_fn(NativeFn::simple(&handler_name, move |args| {
+            // The agent loop passes arguments positionally in `ordered` order
+            // (see `json_args_to_sema`); rebuild the named arguments object,
+            // dropping the ones the model left unset (nil).
+            let mut arguments = serde_json::Map::new();
+            for (name, value) in ordered.iter().zip(args.iter()) {
+                if value.is_nil() {
+                    continue;
+                }
+                arguments.insert(name.clone(), sema_core::value_to_json_lossy(value));
+            }
+            let tool_name_for_err = tool_name.clone();
+            call_tool(
+                &connection_handle,
+                &tool_name,
+                serde_json::Value::Object(arguments),
+                move |raw| {
+                    // Surface a tool-reported failure as an error so the agent
+                    // loop feeds it back to the model instead of treating it
+                    // as success.
+                    if result_is_error(&raw) {
+                        let detail = result_text(&raw).unwrap_or_else(|| raw.to_string());
+                        return Err(format!(
+                            "mcp tool `{tool_name_for_err}` returned an error: {detail}"
+                        ));
+                    }
+                    Ok(result_to_value(&raw))
+                },
+            )
+        }));
+        items.push(Value::tool_def(ToolDefinition {
+            name: tool.name,
+            description: tool.description,
+            parameters,
+            handler,
+        }));
+    }
+    Value::list(items)
+}
+
+/// Shared `mcp/tools` / `mcp/tools->sema` entry: checkout+offload-aware
+/// `tools/list`, then `on_ready` (VM thread) shapes the raw tools into either
+/// builtin's Sema value.
+fn fetch_tools(
+    handle: &str,
+    label: &'static str,
+    on_ready: impl FnOnce(Vec<Tool>, &ConnMeta) -> Value + 'static,
+) -> Result<Value, SemaError> {
+    let entry = lookup_entry(handle)?;
+    if sema_core::in_async_context() {
+        return fetch_tools_offload(entry, label, on_ready);
+    }
+    let mut conn = try_checkout(&entry)?.ok_or_else(|| busy_sync_error(handle, label))?;
+    let result = block_on(list_tools_async(&mut conn));
+    checkin(&entry, conn);
+    let tools = result.map_err(|err| SemaError::eval(format!("{label}: {err}")))?;
+    Ok(on_ready(tools, &entry.meta))
+}
+
+fn fetch_tools_offload(
+    entry: Rc<ConnEntry>,
+    label: &'static str,
+    on_ready: impl FnOnce(Vec<Tool>, &ConnMeta) -> Value + 'static,
+) -> Result<Value, SemaError> {
+    let start = move |conn: McpConnection| {
+        let (tx, rx) = oneshot::channel();
+        sema_io::io_spawn_blocking(move || {
+            let mut conn = conn;
+            let out = sema_io::io_block_on(list_tools_async(&mut conn));
+            let _ = tx.send((conn, out));
+            sema_core::notify_io_complete();
+        });
+        rx
+    };
+    let finish = move |entry: &Rc<ConnEntry>,
+                       conn: McpConnection,
+                       result: Result<Vec<Tool>, String>|
+          -> Result<Value, String> {
+        checkin(entry, conn);
+        let tools = result.map_err(|e| sema_err_msg(format!("{label}: {e}")))?;
+        Ok(on_ready(tools, &entry.meta))
+    };
+
+    let handle = checkout_offload(entry, start, finish)?;
+    sema_core::set_yield_signal(sema_core::YieldReason::AwaitIo(handle));
+    Ok(Value::nil())
+}
+
+// ── `mcp/close` ─────────────────────────────────────────────────────────────
+
 /// Best-effort close of a connection by its opaque handle `Value`, same
 /// semantics as the `mcp/close` builtin but NEVER errors (a missing/already-closed
-/// handle, or a close-protocol failure, is silently ignored). For callers outside
-/// Sema code that need "close everything, and don't let a close failure mask the
-/// real outcome" — namely the workflow `:mcp` auth-resolution seam's
-/// `WorkflowMcpResolver::close`, which `workflow/run` calls from its
-/// failure/cleanup paths (`docs/plans/2026-06-24-workflow-mcp-auth.md` §3).
+/// handle, a busy/tombstoned slot, or a close-protocol failure, is silently
+/// ignored). For callers outside Sema code that need "close everything, and
+/// don't let a close failure mask the real outcome" — namely the workflow
+/// `:mcp` auth-resolution seam's `WorkflowMcpResolver::close`, which
+/// `workflow/run` calls from its failure/cleanup paths
+/// (`docs/plans/2026-06-24-workflow-mcp-auth.md` §3). Always synchronous, like
+/// the rest of that pre-phase resolution path.
 pub fn close_handle(handle: &Value) {
     let Some(handle_str) = handle.as_str() else {
         return;
     };
-    let connection = CONNECTIONS.with(|connections| connections.borrow_mut().remove(handle_str));
-    if let Some(connection) = connection {
-        let mut connection = connection.borrow_mut();
-        let _ = block_on(connection.client.close());
+    let entry = CONNECTIONS.with(|connections| connections.borrow_mut().remove(handle_str));
+    let Some(entry) = entry else {
+        return;
+    };
+    if let Ok(Some(mut conn)) = try_checkout(&entry) {
+        let _ = block_on(close_async(&mut conn));
     }
+}
+
+fn close_offload(handle: String, entry: Rc<ConnEntry>) -> Result<Value, SemaError> {
+    // Remove from the map immediately (VM thread) — matches the sync path: a
+    // subsequent `mcp/call`/`mcp/tools`/`mcp/close` on this handle fails fast
+    // with "not registered" rather than silently queueing behind this close.
+    // The queue/checkout machinery below still operates correctly for any
+    // call that already captured this exact `Rc<ConnEntry>` before removal.
+    CONNECTIONS.with(|connections| {
+        connections.borrow_mut().remove(&handle);
+    });
+
+    let start = move |conn: McpConnection| {
+        let (tx, rx) = oneshot::channel();
+        sema_io::io_spawn_blocking(move || {
+            let mut conn = conn;
+            let out = sema_io::io_block_on(close_async(&mut conn));
+            let _ = tx.send((conn, out));
+            sema_core::notify_io_complete();
+        });
+        rx
+    };
+    let finish = move |entry: &Rc<ConnEntry>,
+                       conn: McpConnection,
+                       result: Result<(), String>|
+          -> Result<Value, String> {
+        // Never reinstalled — the connection is dropped here regardless of
+        // whether the close protocol call itself succeeded (matches the sync
+        // path's unconditional removal). Tombstone so any straggling
+        // reference (e.g. a call that queued on this slot before the close
+        // was issued) errors cleanly instead of parking forever.
+        drop(conn);
+        tombstone_slot(entry, "connection closed via mcp/close");
+        result
+            .map(|_| Value::nil())
+            .map_err(|e| sema_err_msg(format!("mcp/close: {e}")))
+    };
+
+    let handle_io = checkout_offload(entry, start, finish)?;
+    sema_core::set_yield_signal(sema_core::YieldReason::AwaitIo(handle_io));
+    Ok(Value::nil())
 }
 
 pub fn register_mcp_builtins(env: &Env, sandbox: &Sandbox) {
@@ -837,98 +1544,36 @@ pub fn register_mcp_builtins(env: &Env, sandbox: &Sandbox) {
     // `mcp/connect` picks its transport from the config map at runtime, so the
     // capability it needs is not fixed: a `:url` server is network I/O
     // (`NETWORK`), a `:command` server spawns a process (`PROCESS`). Gating and
-    // dispatch live in `connect_with_opts`, shared with `connect_from_config`;
-    // this just supplies the interactive, unrestricted options `mcp/connect`
-    // has always used and unwraps the outcome back to the original `SemaError`.
+    // dispatch live in `connect_with_opts`/`connect_offload`, shared with
+    // `connect_from_config`; this just supplies the interactive, unrestricted
+    // options `mcp/connect` has always used.
     register_fn(env, "mcp/connect", |args| {
         let config_json = config_to_json(args)?;
         let opts = ConnectOpts {
             interactive_auth: true,
             allowed_tools: None,
         };
+        if sema_core::in_async_context() {
+            return connect_offload(config_json, opts);
+        }
         connect_with_opts(&config_json, &opts).map_err(connect_outcome_to_sema_error)
     });
 
     register_fn(env, "mcp/tools", |args| {
         check_arity!(args, "mcp/tools", 1);
         let handle = require_handle(args, "mcp/tools")?;
-        let connection = lookup_connection(handle)?;
-        let mut connection = connection.borrow_mut();
-        let tools = block_on(connection.client.list_tools())
-            .map_err(|err| SemaError::eval(format!("mcp/tools: {err}")))?;
-        let items = tools
-            .into_iter()
-            .filter(|tool| tool_is_allowed(&connection.allowed_tools, &tool.name))
-            .map(|tool| {
-                let mut entry = BTreeMap::new();
-                entry.insert(Value::keyword("name"), Value::string(&tool.name));
-                entry.insert(
-                    Value::keyword("description"),
-                    Value::string(&tool.description),
-                );
-                entry.insert(
-                    Value::keyword("input-schema"),
-                    sema_core::json_to_value(&tool.input_schema),
-                );
-                Value::map(entry)
-            })
-            .collect();
-        Ok(Value::list(items))
+        fetch_tools(handle, "mcp/tools", |tools, meta| {
+            tools_to_value(tools, &meta.allowed_tools)
+        })
     });
 
     register_fn(env, "mcp/tools->sema", |args| {
         check_arity!(args, "mcp/tools->sema", 1);
         let handle = require_handle(args, "mcp/tools->sema")?;
-        let connection = lookup_connection(handle)?;
-        let mut connection = connection.borrow_mut();
-        let tools = block_on(connection.client.list_tools())
-            .map_err(|err| SemaError::eval(format!("mcp/tools->sema: {err}")))?;
-
-        let mut items = Vec::new();
-        for tool in tools {
-            if !tool_is_allowed(&connection.allowed_tools, &tool.name) {
-                // Not in the connection's :tools manifest — an agent given
-                // this connection's tools must never even see it.
-                continue;
-            }
-            let (parameters, ordered) = schema_to_params(&tool.input_schema);
-            let tool_name = tool.name.clone();
-            let connection_handle = handle.to_string();
-            let handler_name = format!("mcp/{tool_name}");
-            let handler = Value::native_fn(NativeFn::simple(&handler_name, move |args| {
-                // The agent loop passes arguments positionally in `ordered` order
-                // (see `json_args_to_sema`); rebuild the named arguments object,
-                // dropping the ones the model left unset (nil).
-                let mut arguments = serde_json::Map::new();
-                for (name, value) in ordered.iter().zip(args.iter()) {
-                    if value.is_nil() {
-                        continue;
-                    }
-                    arguments.insert(name.clone(), sema_core::value_to_json_lossy(value));
-                }
-                let result = call_tool_via_connection(
-                    &connection_handle,
-                    &tool_name,
-                    serde_json::Value::Object(arguments),
-                )?;
-                // Surface a tool-reported failure as an error so the agent loop
-                // feeds it back to the model instead of treating it as success.
-                if result_is_error(&result) {
-                    let detail = result_text(&result).unwrap_or_else(|| result.to_string());
-                    return Err(SemaError::eval(format!(
-                        "mcp tool `{tool_name}` returned an error: {detail}"
-                    )));
-                }
-                Ok(result_to_value(&result))
-            }));
-            items.push(Value::tool_def(ToolDefinition {
-                name: tool.name,
-                description: tool.description,
-                parameters,
-                handler,
-            }));
-        }
-        Ok(Value::list(items))
+        let connection_handle = handle.to_string();
+        fetch_tools(handle, "mcp/tools->sema", move |tools, meta| {
+            tool_defs_to_value(tools, &meta.allowed_tools, &connection_handle)
+        })
     });
 
     register_fn(env, "mcp/call", |args| {
@@ -939,22 +1584,27 @@ pub fn register_mcp_builtins(env: &Env, sandbox: &Sandbox) {
                 .with_hint("mcp/call expects the tool name as a string")
         })?;
         let arguments_json = sema_core::value_to_json_lossy(&args[2]);
-        let result = call_tool_via_connection(handle, tool_name, arguments_json)?;
-        Ok(result_to_value(&result))
+        call_tool(handle, tool_name, arguments_json, |raw| {
+            Ok(result_to_value(&raw))
+        })
     });
 
     register_fn(env, "mcp/close", |args| {
         check_arity!(args, "mcp/close", 1);
         let handle = require_handle(args, "mcp/close")?;
-        let connection = CONNECTIONS.with(|connections| connections.borrow_mut().remove(handle));
-        let Some(connection) = connection else {
+        if sema_core::in_async_context() {
+            let entry = lookup_entry(handle)?;
+            return close_offload(handle.to_string(), entry);
+        }
+        let entry = CONNECTIONS.with(|connections| connections.borrow_mut().remove(handle));
+        let Some(entry) = entry else {
             return Err(SemaError::eval(format!(
                 "mcp connection {handle} is not registered; it may have already been closed"
             )));
         };
-        let mut connection = connection.borrow_mut();
-        block_on(connection.client.close())
-            .map_err(|err| SemaError::eval(format!("mcp/close: {err}")))?;
+        let mut conn = try_checkout(&entry)?.ok_or_else(|| busy_sync_error(handle, "mcp/close"))?;
+        let result = block_on(close_async(&mut conn));
+        result.map_err(|err| SemaError::eval(format!("mcp/close: {err}")))?;
         Ok(Value::nil())
     });
 }
@@ -994,5 +1644,32 @@ mod tests {
     #[test]
     fn tool_is_allowed_empty_list_allows_nothing() {
         assert!(!tool_is_allowed(&Some(Vec::new()), "anything"));
+    }
+
+    #[test]
+    fn mcp_connection_is_send() {
+        _assert_mcp_connection_is_send();
+    }
+
+    #[test]
+    fn checkout_busy_then_tombstoned() {
+        let entry = Rc::new(ConnEntry {
+            meta: ConnMeta {
+                identity: "test".to_string(),
+                interactive_auth: false,
+                allowed_tools: None,
+            },
+            slot: RefCell::new(Slot::CheckedOut),
+        });
+        // Busy: nothing to check out yet.
+        assert!(matches!(try_checkout(&entry), Ok(None)));
+        // Tombstoned: errors, names the reason.
+        tombstone_slot(&entry, "connection lost: cancelled mid-call");
+        let err = match try_checkout(&entry) {
+            Err(e) => e,
+            Ok(_) => panic!("tombstoned slot must error"),
+        };
+        assert!(err.to_string().contains("connection lost"));
+        assert!(err.to_string().contains("cancelled mid-call"));
     }
 }
