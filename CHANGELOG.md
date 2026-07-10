@@ -1,5 +1,57 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- **`examples/sema-coder` moved to its own repo** (like the editor plugins) —
+  the in-repo copy is removed.
+- **The game-of-life example is a full TUI** — altscreen rendering with mouse
+  support, built on the raw-mode/altscreen/mouse guard macros.
+
+### Performance
+
+- **Perf wave 3 — call dispatch** (cumulative, plain-release M2 Max: tak −3.7%,
+  1BRC-optimized −3.5% on 1M rows / −5.8% on 10M, 1BRC-simple −3.6%; nqueens
+  and deriv unchanged):
+  - **Decoded-callee inline cache.** `CALL_GLOBAL` cache slots store the callee
+    pre-decoded (`Plain` / `VmClosure` / `Native`), resolved once on miss — a
+    hit dispatches with no `Value` clone and no downcast. Cache geometry and
+    `(spur, env-version)` invalidation are unchanged.
+  - **Native calls stay in the dispatch loop.** A successful, non-yielding
+    native call no longer exits and re-enters the interpreter loop (each exit
+    paid an interrupt check plus a full frame/code/pc reload); exceptions,
+    async yields, and debug hooks still take the re-entry path.
+
+### Fixed
+
+- **Re-raising a caught error preserves it** (#80). `(catch e ... (throw e))`
+  re-raises the condition as itself — same `:type`, `:message`, and
+  `:stack-trace` — instead of wrapping it in a fresh `{:type :user}` envelope
+  per layer. Errors propagating through nested cleanup guards
+  (`io/with-raw-mode` → `term/with-alt-screen` → `term/with-mouse`) now surface
+  as the original message instead of an escaped map-in-a-string blob. Raw
+  values still wrap as user exceptions; `guard`'s semantics are unchanged.
+- **Prelude macro names are usable as ordinary identifiers.** Macro expansion
+  is now scope-aware: binding positions (define-sugar heads, params, `let`
+  names, `match` patterns, `catch` vars) never expand, lexical bindings shadow
+  same-named macros over exactly their scopes, and a program's top-level
+  `define`s shadow macros across sibling forms. `(define (step n) n)` no longer
+  dies with "define: expected a symbol", and `(define (phase n) n)` no longer
+  silently clobbers `workflow/phase`.
+- **Tool-call JSON arguments bind by declaration order** (#79). A `deftool`
+  handler written as `(fn (path content) ...)` receives named JSON args in its
+  declared parameter order; previously VM-compiled handlers fell back to the
+  parameter map's alphabetical key order, silently swapping same-typed
+  arguments. Parameter names are carried on the compiled function and shared
+  refcount-only, so closure creation cost is unchanged.
+- **`.semac` loading rejects empty chunks** (no terminator) at validation time
+  — the one `pc`-bounds gap the load-time verifier had.
+- **crates.io publishing can no longer half-publish a release.** The publish
+  order missed that `sema-stdlib` now depends on `sema-fmt` (v1.30.0's publish
+  needed a manual recovery run); the order is fixed and the CI guard now
+  verifies dependency *order*, not just crate presence.
+
 ## 1.30.0 — 2026-07-09
 
 ### Added
