@@ -445,6 +445,38 @@ pub fn install_scope(ctx: Rc<WorkflowCtx>) -> WorkflowGuard {
     WorkflowGuard { prev }
 }
 
+/// Redact secret-bearing values out of the workflow meta map's lossy-JSON form
+/// before it is written to `metadata.json`. `:mcp` declarations may carry bearer
+/// tokens or API keys in `:headers` (http servers) or `:env` (stdio servers) — see
+/// `docs/plans/2026-06-24-workflow-mcp-auth.md` §4 "redaction everywhere": secrets
+/// must never land in the journal, `result.json`, `metadata.json`, or OTel spans.
+/// Every value under `meta.mcp.<alias>.headers` and `meta.mcp.<alias>.env` is
+/// replaced with the literal string `"<redacted>"`; the keys (header/env-var
+/// names) are kept so the manifest still documents WHAT was configured, just not
+/// its value. Everything else in `meta` — including a `meta` with no `:mcp` key at
+/// all — passes through unchanged. Pure JSON shaping, no MCP semantics, which is
+/// why it lives here rather than requiring a `sema-mcp` dependency (a leaf crate
+/// must not gain one).
+fn redact_meta_secrets(mut meta_json: serde_json::Value) -> serde_json::Value {
+    let Some(mcp) = meta_json.get_mut("mcp").and_then(|v| v.as_object_mut()) else {
+        return meta_json;
+    };
+    for spec in mcp.values_mut() {
+        let Some(spec_obj) = spec.as_object_mut() else {
+            continue;
+        };
+        for field in ["headers", "env"] {
+            let Some(values) = spec_obj.get_mut(field).and_then(|v| v.as_object_mut()) else {
+                continue;
+            };
+            for value in values.values_mut() {
+                *value = serde_json::Value::String("<redacted>".to_string());
+            }
+        }
+    }
+    meta_json
+}
+
 /// High-level entry the `workflow/run` builtin calls: resolve the run id + run-dir,
 /// open the journal, build the `WorkflowCtx`, write `metadata.json`, install the
 /// scope, and return the guard. The journal-open error propagates so the runtime can
@@ -473,7 +505,7 @@ pub fn set_workflow_scope(name: &str, doc: &str, meta: &Value) -> io::Result<Wor
         "doc": doc,
         "run_id": run_id,
         "code_version": code_version,
-        "meta": sema_core::json::value_to_json_lossy(meta),
+        "meta": redact_meta_secrets(sema_core::json::value_to_json_lossy(meta)),
     });
     let _ = journal.write_metadata(&metadata);
     // The `:budget` submap of meta becomes the run's enforced spend caps.
@@ -795,5 +827,80 @@ mod tests {
         assert_eq!(civil_from_days(0), (1970, 1, 1));
         // 2026-06-24 is 20628 days after epoch.
         assert_eq!(civil_from_days(20_628), (2026, 6, 24));
+    }
+
+    // ── redact_meta_secrets ──────────────────────────────────────────────
+
+    #[test]
+    fn redacts_mcp_headers_and_env_values() {
+        let meta = serde_json::json!({
+            "budget": {"usd": 1.0},
+            "mcp": {
+                "asana": {
+                    "url": "https://mcp.asana.com/mcp",
+                    "headers": {"Authorization": "Bearer secret-token"},
+                    "persist": "workflow"
+                },
+                "fs": {
+                    "command": "npx",
+                    "env": {"API_TOKEN": "supersecret", "PLAIN": "not-a-secret-name"}
+                }
+            }
+        });
+        let redacted = redact_meta_secrets(meta);
+        assert_eq!(
+            redacted["mcp"]["asana"]["headers"]["Authorization"],
+            "<redacted>"
+        );
+        assert_eq!(redacted["mcp"]["fs"]["env"]["API_TOKEN"], "<redacted>");
+        assert_eq!(redacted["mcp"]["fs"]["env"]["PLAIN"], "<redacted>");
+    }
+
+    #[test]
+    fn redaction_keeps_header_and_env_keys_and_sibling_fields() {
+        let meta = serde_json::json!({
+            "mcp": {
+                "asana": {
+                    "url": "https://mcp.asana.com/mcp",
+                    "headers": {"Authorization": "Bearer secret-token", "X-Trace": "abc"},
+                    "tools": ["create_task"],
+                    "persist": "workflow"
+                }
+            }
+        });
+        let redacted = redact_meta_secrets(meta);
+        // Keys survive.
+        assert!(redacted["mcp"]["asana"]["headers"]
+            .as_object()
+            .unwrap()
+            .contains_key("Authorization"));
+        assert!(redacted["mcp"]["asana"]["headers"]
+            .as_object()
+            .unwrap()
+            .contains_key("X-Trace"));
+        // Sibling fields untouched.
+        assert_eq!(redacted["mcp"]["asana"]["url"], "https://mcp.asana.com/mcp");
+        assert_eq!(redacted["mcp"]["asana"]["tools"][0], "create_task");
+        assert_eq!(redacted["mcp"]["asana"]["persist"], "workflow");
+    }
+
+    #[test]
+    fn meta_without_mcp_passes_through_unchanged() {
+        let meta = serde_json::json!({
+            "budget": {"usd": 1.0},
+            "args": {"repo": "sema-lisp/sema"},
+            "phases": ["Triage"],
+        });
+        let redacted = redact_meta_secrets(meta.clone());
+        assert_eq!(redacted, meta);
+    }
+
+    #[test]
+    fn mcp_alias_without_headers_or_env_passes_through_unchanged() {
+        let meta = serde_json::json!({
+            "mcp": {"asana": {"url": "https://mcp.asana.com/mcp", "persist": "workflow"}}
+        });
+        let redacted = redact_meta_secrets(meta.clone());
+        assert_eq!(redacted, meta);
     }
 }
