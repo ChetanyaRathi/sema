@@ -6,10 +6,10 @@ syntax: "(shell/quote s)"
 returns: "string"
 ---
 
-POSIX single-quote a string so it survives `sh -c` (the single-string form of
-`shell`) as one literal word — no metacharacter is special inside single
-quotes, so this defuses command injection. Wraps the value in single quotes and
-rewrites each embedded `'` as `'\''`; the empty string becomes `''`.
+POSIX single-quote a string so it survives a POSIX shell (e.g. `sh -c`) as one literal word —
+no metacharacter is special inside single quotes, so this defuses command injection. Wraps the
+value in single quotes and rewrites each embedded `'` as `\'\''`; the empty string becomes `''`.
+Note: the single-string form of `shell` uses `sh -c` on Unix but `cmd /C` on Windows.
 
 ```sema
 (shell/quote "a b")            ; => "'a b'"
