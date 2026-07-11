@@ -1444,8 +1444,15 @@ impl Formatter {
             }
         }
 
-        // Multi-line: each key-value pair on its own line, with comments preserved
+        // Multi-line: align map values when possible, otherwise preserve comments.
         let pair_indent = indent + open.len();
+        if self.align
+            && !has_comments
+            && self.try_format_aligned_map_pairs(&semantic, pair_indent, open, close)
+        {
+            return;
+        }
+
         self.output.push_str(open);
 
         // Iterate through all children, tracking pair state
@@ -1628,6 +1635,55 @@ impl Formatter {
             }
             self.output.push_str(right);
         }
+        true
+    }
+
+    /// Format map entries with their values aligned to the widest key.
+    fn try_format_aligned_map_pairs(
+        &mut self,
+        semantic: &[&Node],
+        indent: usize,
+        open: &str,
+        close: &str,
+    ) -> bool {
+        if semantic.len() < 4 || !semantic.len().is_multiple_of(2) {
+            return false;
+        }
+
+        let mut pairs = Vec::with_capacity(semantic.len() / 2);
+        for pair in semantic.chunks_exact(2) {
+            if has_any_newlines(pair[0])
+                || has_any_newlines(pair[1])
+                || has_any_comments(pair[0])
+                || has_any_comments(pair[1])
+            {
+                return false;
+            }
+            pairs.push((node_to_flat_string(pair[0]), node_to_flat_string(pair[1])));
+        }
+
+        let max_key = pairs.iter().map(|(key, _)| key.len()).max().unwrap_or(0);
+        let min_key = pairs.iter().map(|(key, _)| key.len()).min().unwrap_or(0);
+        if max_key == min_key
+            || pairs
+                .iter()
+                .any(|(_, value)| indent + max_key + 2 + value.len() > self.width)
+        {
+            return false;
+        }
+
+        self.output.push_str(open);
+        for (index, (key, value)) in pairs.iter().enumerate() {
+            if index > 0 {
+                self.output.push('\n');
+                self.push_indent(indent);
+            }
+            self.output.push_str(key);
+            self.output
+                .extend(std::iter::repeat_n(' ', max_key - key.len() + 2));
+            self.output.push_str(value);
+        }
+        self.output.push_str(close);
         true
     }
 

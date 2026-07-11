@@ -782,6 +782,27 @@ fn test_aligned_let_bindings() {
 }
 
 #[test]
+fn test_aligned_map_values() {
+    let input = "(define default-keymap\n  {:mcp \"ctrl-o\"\n   :resume \"ctrl-r\"\n   :palette \"ctrl-k\"\n   :interrupt \"ctrl-c\"})";
+    let result = fmt_aligned(input);
+    assert_eq!(
+        result,
+        "(define default-keymap\n  {:mcp        \"ctrl-o\"\n   :resume     \"ctrl-r\"\n   :palette    \"ctrl-k\"\n   :interrupt  \"ctrl-c\"})\n"
+    );
+    assert_eq!(
+        fmt_aligned(&result),
+        result,
+        "aligned map should be idempotent"
+    );
+}
+
+#[test]
+fn test_map_values_not_aligned_without_flag() {
+    let input = "{:mcp \"ctrl-o\"\n :interrupt \"ctrl-c\"}";
+    assert_eq!(fmt(input), "{:mcp \"ctrl-o\"\n :interrupt \"ctrl-c\"}\n");
+}
+
+#[test]
 fn test_define_group_broken_by_blank_line() {
     let input = "(define x 1)\n\n(define y 2)";
     let result = fmt_aligned(input);
