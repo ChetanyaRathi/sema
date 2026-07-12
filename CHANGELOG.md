@@ -4,6 +4,69 @@
 
 ### Added
 
+- **Authenticated MCP servers in workflow runs — headless precursor** (per
+  `docs/plans/2026-06-24-workflow-mcp-auth.md`, §9 items a–c). A `defworkflow`
+  can declare the MCP servers its leaves need in a new `:mcp` meta key
+  (alias → the same spec `mcp/connect` accepts, plus `:auth`, a least-privilege
+  `:tools` manifest, and a `:persist` store scope); the runtime resolves and
+  connects them all **before any phase runs**:
+  - Declared aliases are bound in the workflow body as live, connected handles —
+    leaves never call `mcp/connect` themselves. Calls to tools outside the
+    declared `:tools` manifest fail fast before touching the wire, and agents
+    built from the connection only ever see declared tools.
+  - A server whose OAuth session can't be satisfied from the token store gates
+    the run: it exits `{:status :needs-auth :servers […]}` (CLI exit code 2)
+    with per-server `sema mcp login <url>` guidance instead of burning compute.
+    Authenticate once, re-run, and the persisted session is reused — and
+    refreshed — silently on every later run.
+  - Scoped, encrypted token stores via `:persist`: `:keyring` (OS keychain),
+    `:workflow` (`.sema/auth/<workflow>/`), `:run`
+    (`.sema/runs/<run-id>/auth/`), `:none` (in-memory). File-backed scopes are
+    ChaCha20-Poly1305-encrypted at rest with a keyring-held (or
+    `SEMA_MCP_AUTH_KEY`) key, written `0600`, and refuse to write a token under
+    a directory git would track.
+  - The journal gains additive `auth.required` / `auth.granted` / `auth.failed`
+    events (alias + scopes + expiry only — never token material), the `:mcp`
+    manifest lands in `metadata.json` with header/env values redacted, and
+    `sema workflow view` shows a `needs-auth` pill plus a read-only per-server
+    auth panel (`GET /api/run/:id/auth`).
+  - `sema mcp login` accepts `--token` (and `--expires-in`) to install a
+    pre-issued token on headless/CI machines without a browser flow.
+  - The dashboard's one-click Connect/Forget write endpoints (plan's §9 item
+    (d)) shipped separately — see below.
+- **Interactive MCP auth inline on `sema workflow run`**. On a real terminal
+  (stdin AND stderr both TTYs, no `CI`, and `--no-auth-prompt` not passed), a
+  needs-auth gate now logs in right there — the same browser/loopback flow
+  `sema mcp login` runs — instead of exiting 2. Success persists to the
+  declared server's `:persist` store (`:none` uses the session for this
+  connection only) and continues the run with `auth.granted` `source:
+  "consented"`; a declined/failed/timed-out login prints one line and falls
+  back to the existing exit-2 guidance. Headless runs, CI, and
+  `--no-auth-prompt` are unaffected — byte-for-byte the same exit-2 contract
+  as before.
+- **Dashboard one-click Connect/Forget for MCP auth** (plan's §9 item (d)).
+  `sema workflow view`'s Auth panel gains `POST /api/run/:id/auth/:alias/connect`
+  and `.../forget`: `[Connect]` runs the same browser/loopback OAuth flow
+  `sema mcp login` does, in the background, and persists the session to the
+  declared server's `:persist` store; `[Forget]` deletes it from both the
+  scoped and default stores. Every write route requires a random per-process
+  session token (`X-Sema-View-Token`, minted at startup and embedded in the
+  served page) — missing or wrong is a `403` with no side effects, and the
+  custom header alone defeats cross-origin CSRF (no preflight response, ever).
+  `GET /api/run/:id/auth` now merges in-memory flow state over the journal-
+  derived status, so the panel reflects a pending/just-finished dashboard login
+  immediately (`"connecting"`, then `"authorized"`/`"failed"` + reason) without
+  waiting on a new run.
+- **MCP builtins offload under the cooperative scheduler** (issue #96).
+  `mcp/connect`, `mcp/call`, `mcp/tools`, and `mcp/close` — and every
+  `mcp/tools->sema` wrapped tool handler — now offload their JSON-RPC round
+  trip and yield `AwaitIo` when called inside `async/spawn`, so a slow
+  `mcp/call` in a `parallel`/`pipeline` fan-out no longer freezes sibling
+  tasks. A connection's own calls still queue (MCP is one JSON-RPC pipe per
+  server), but unrelated connections and non-MCP work now overlap freely. The
+  top-level (non-async) path is unchanged. A task cancelled mid-call
+  (`async/timeout`/`async/cancel`) tombstones the connection immediately; any
+  later use of that handle fails fast with a reconnect hint.
 - **`map-indexed` and `enumerate` builtins** (#90). `(map-indexed f xs)` calls
   `f` with each element's 0-based index and value (`(f i x)`), collecting
   results into a list; `(enumerate xs)` pairs each element with its index as

@@ -106,6 +106,19 @@ pub struct WorkflowCtx {
     /// Cached fixed-ts override (read once at construction). `Some` ⇒ deterministic
     /// seam: `ts()` returns this string and `dur_ms()` returns 0.
     fixed_ts: Option<String>,
+    /// Aliases declared in this run's `:mcp` meta (set once, right after the meta
+    /// map's `:mcp` key parses successfully — BEFORE auth-resolution runs), so
+    /// `workflow/mcp-handle` can tell "not declared" apart from "declared but this
+    /// run hasn't resolved its MCP servers yet" (docs/plans/2026-06-24-workflow-mcp-auth.md
+    /// §3). Empty for a workflow with no `:mcp`.
+    mcp_declared: RefCell<Vec<String>>,
+    /// Opaque, resolved MCP connection handles, keyed by declared alias. Populated
+    /// ONCE by `workflow/run`'s auth-resolution step, after every declared server
+    /// resolves to `Connected` (never partially — a `NeedsAuth`/`Failed` outcome
+    /// ends the run before the body runs at all). Values are `Value`s the resolver
+    /// handed back; this crate stays MCP-ignorant and never interprets them —
+    /// see `crates/sema-stdlib/src/workflow_mcp.rs`'s resolver seam.
+    mcp_handles: RefCell<BTreeMap<String, Value>>,
 }
 
 impl WorkflowCtx {
@@ -162,6 +175,8 @@ impl WorkflowCtx {
             args_json,
             args_fingerprint,
             fixed_ts,
+            mcp_declared: RefCell::new(Vec::new()),
+            mcp_handles: RefCell::new(BTreeMap::new()),
         })
     }
 
@@ -421,6 +436,32 @@ impl WorkflowCtx {
     pub fn flush(&self) {
         self.journal.borrow_mut().flush();
     }
+
+    // ── MCP handle registry (docs/plans/2026-06-24-workflow-mcp-auth.md §3) ────
+
+    /// Record the aliases declared in this run's `:mcp` meta, BEFORE
+    /// auth-resolution runs. `workflow/mcp-handle` uses this to distinguish an
+    /// undeclared alias from one that's declared but not resolved yet.
+    pub fn set_mcp_declared(&self, aliases: Vec<String>) {
+        *self.mcp_declared.borrow_mut() = aliases;
+    }
+
+    /// Whether `alias` appears in this run's `:mcp` declarations.
+    pub fn is_mcp_declared(&self, alias: &str) -> bool {
+        self.mcp_declared.borrow().iter().any(|a| a == alias)
+    }
+
+    /// Install the resolved MCP handles for this run — called once, after every
+    /// declared server resolves to `Connected` and before the body thunk runs.
+    pub fn set_mcp_handles(&self, handles: BTreeMap<String, Value>) {
+        *self.mcp_handles.borrow_mut() = handles;
+    }
+
+    /// The resolved handle for a declared alias, if any (`None` before
+    /// resolution completes, or if `alias` was never declared).
+    pub fn mcp_handle(&self, alias: &str) -> Option<Value> {
+        self.mcp_handles.borrow().get(alias).cloned()
+    }
 }
 
 /// Panic-safe RAII guard that restores the PREVIOUS workflow context on drop. Copied
@@ -443,6 +484,38 @@ impl Drop for WorkflowGuard {
 pub fn install_scope(ctx: Rc<WorkflowCtx>) -> WorkflowGuard {
     let prev = WORKFLOW.with(|c| c.borrow_mut().replace(ctx));
     WorkflowGuard { prev }
+}
+
+/// Redact secret-bearing values out of the workflow meta map's lossy-JSON form
+/// before it is written to `metadata.json`. `:mcp` declarations may carry bearer
+/// tokens or API keys in `:headers` (http servers) or `:env` (stdio servers) — see
+/// `docs/plans/2026-06-24-workflow-mcp-auth.md` §4 "redaction everywhere": secrets
+/// must never land in the journal, `result.json`, `metadata.json`, or OTel spans.
+/// Every value under `meta.mcp.<alias>.headers` and `meta.mcp.<alias>.env` is
+/// replaced with the literal string `"<redacted>"`; the keys (header/env-var
+/// names) are kept so the manifest still documents WHAT was configured, just not
+/// its value. Everything else in `meta` — including a `meta` with no `:mcp` key at
+/// all — passes through unchanged. Pure JSON shaping, no MCP semantics, which is
+/// why it lives here rather than requiring a `sema-mcp` dependency (a leaf crate
+/// must not gain one).
+fn redact_meta_secrets(mut meta_json: serde_json::Value) -> serde_json::Value {
+    let Some(mcp) = meta_json.get_mut("mcp").and_then(|v| v.as_object_mut()) else {
+        return meta_json;
+    };
+    for spec in mcp.values_mut() {
+        let Some(spec_obj) = spec.as_object_mut() else {
+            continue;
+        };
+        for field in ["headers", "env"] {
+            let Some(values) = spec_obj.get_mut(field).and_then(|v| v.as_object_mut()) else {
+                continue;
+            };
+            for value in values.values_mut() {
+                *value = serde_json::Value::String("<redacted>".to_string());
+            }
+        }
+    }
+    meta_json
 }
 
 /// High-level entry the `workflow/run` builtin calls: resolve the run id + run-dir,
@@ -473,7 +546,7 @@ pub fn set_workflow_scope(name: &str, doc: &str, meta: &Value) -> io::Result<Wor
         "doc": doc,
         "run_id": run_id,
         "code_version": code_version,
-        "meta": sema_core::json::value_to_json_lossy(meta),
+        "meta": redact_meta_secrets(sema_core::json::value_to_json_lossy(meta)),
     });
     let _ = journal.write_metadata(&metadata);
     // The `:budget` submap of meta becomes the run's enforced spend caps.
@@ -764,6 +837,38 @@ mod tests {
         assert_eq!(ctx.read_checkpoint("files"), Some(Value::int(3)));
     }
 
+    // ── MCP handle registry ──────────────────────────────────────────────
+
+    #[test]
+    fn mcp_handle_registry_starts_empty_and_undeclared() {
+        let ctx = WorkflowCtx::new("wf_t".into(), Journal::null(), BTreeMap::new());
+        assert_eq!(ctx.mcp_handle("asana"), None);
+        assert!(!ctx.is_mcp_declared("asana"));
+    }
+
+    #[test]
+    fn mcp_declared_tracks_aliases_before_handles_resolve() {
+        let ctx = WorkflowCtx::new("wf_t".into(), Journal::null(), BTreeMap::new());
+        ctx.set_mcp_declared(vec!["asana".to_string(), "fs".to_string()]);
+        // Declared, but resolution hasn't populated a handle yet.
+        assert!(ctx.is_mcp_declared("asana"));
+        assert_eq!(ctx.mcp_handle("asana"), None);
+        assert!(!ctx.is_mcp_declared("zebra"));
+    }
+
+    #[test]
+    fn mcp_handle_returns_resolved_handle_by_alias() {
+        let ctx = WorkflowCtx::new("wf_t".into(), Journal::null(), BTreeMap::new());
+        ctx.set_mcp_declared(vec!["asana".to_string(), "fs".to_string()]);
+        let mut handles = BTreeMap::new();
+        handles.insert("asana".to_string(), Value::string("mcp-1"));
+        handles.insert("fs".to_string(), Value::string("mcp-2"));
+        ctx.set_mcp_handles(handles);
+        assert_eq!(ctx.mcp_handle("asana"), Some(Value::string("mcp-1")));
+        assert_eq!(ctx.mcp_handle("fs"), Some(Value::string("mcp-2")));
+        assert_eq!(ctx.mcp_handle("nope"), None);
+    }
+
     #[test]
     fn scope_restores_previous_on_drop() {
         assert!(current().is_none());
@@ -795,5 +900,80 @@ mod tests {
         assert_eq!(civil_from_days(0), (1970, 1, 1));
         // 2026-06-24 is 20628 days after epoch.
         assert_eq!(civil_from_days(20_628), (2026, 6, 24));
+    }
+
+    // ── redact_meta_secrets ──────────────────────────────────────────────
+
+    #[test]
+    fn redacts_mcp_headers_and_env_values() {
+        let meta = serde_json::json!({
+            "budget": {"usd": 1.0},
+            "mcp": {
+                "asana": {
+                    "url": "https://mcp.asana.com/mcp",
+                    "headers": {"Authorization": "Bearer secret-token"},
+                    "persist": "workflow"
+                },
+                "fs": {
+                    "command": "npx",
+                    "env": {"API_TOKEN": "supersecret", "PLAIN": "not-a-secret-name"}
+                }
+            }
+        });
+        let redacted = redact_meta_secrets(meta);
+        assert_eq!(
+            redacted["mcp"]["asana"]["headers"]["Authorization"],
+            "<redacted>"
+        );
+        assert_eq!(redacted["mcp"]["fs"]["env"]["API_TOKEN"], "<redacted>");
+        assert_eq!(redacted["mcp"]["fs"]["env"]["PLAIN"], "<redacted>");
+    }
+
+    #[test]
+    fn redaction_keeps_header_and_env_keys_and_sibling_fields() {
+        let meta = serde_json::json!({
+            "mcp": {
+                "asana": {
+                    "url": "https://mcp.asana.com/mcp",
+                    "headers": {"Authorization": "Bearer secret-token", "X-Trace": "abc"},
+                    "tools": ["create_task"],
+                    "persist": "workflow"
+                }
+            }
+        });
+        let redacted = redact_meta_secrets(meta);
+        // Keys survive.
+        assert!(redacted["mcp"]["asana"]["headers"]
+            .as_object()
+            .unwrap()
+            .contains_key("Authorization"));
+        assert!(redacted["mcp"]["asana"]["headers"]
+            .as_object()
+            .unwrap()
+            .contains_key("X-Trace"));
+        // Sibling fields untouched.
+        assert_eq!(redacted["mcp"]["asana"]["url"], "https://mcp.asana.com/mcp");
+        assert_eq!(redacted["mcp"]["asana"]["tools"][0], "create_task");
+        assert_eq!(redacted["mcp"]["asana"]["persist"], "workflow");
+    }
+
+    #[test]
+    fn meta_without_mcp_passes_through_unchanged() {
+        let meta = serde_json::json!({
+            "budget": {"usd": 1.0},
+            "args": {"repo": "sema-lisp/sema"},
+            "phases": ["Triage"],
+        });
+        let redacted = redact_meta_secrets(meta.clone());
+        assert_eq!(redacted, meta);
+    }
+
+    #[test]
+    fn mcp_alias_without_headers_or_env_passes_through_unchanged() {
+        let meta = serde_json::json!({
+            "mcp": {"asana": {"url": "https://mcp.asana.com/mcp", "persist": "workflow"}}
+        });
+        let redacted = redact_meta_secrets(meta.clone());
+        assert_eq!(redacted, meta);
     }
 }

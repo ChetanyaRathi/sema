@@ -255,8 +255,41 @@ pub const PRELUDE: &str = r#"
 ;; result.json, and returns the {:status :success :value ...} / {:status :failed ...}
 ;; envelope. Keeping defworkflow a macro leaves the VM untouched (deftool/defagent are
 ;; special forms, but this matches the ->/when-let prelude family).
+;;
+;; :mcp {alias {...spec...} ...} declares MCP servers workflow/run auth-resolves +
+;; connects BEFORE the body thunk runs (docs/plans/2026-06-24-workflow-mcp-auth.md
+;; §2/§3). The surface syntax binds each declared alias as an ORDINARY VARIABLE in
+;; the body — `(mcp/call asana "create_task" ...)`, not `(mcp/call (workflow/mcp-handle
+;; 'asana) ...)`. `:mcp`'s alias keys are bare symbols (`{asana {...}}`, not `{:asana
+;; {...}}` or `{"asana" {...}}`), so evaluating that submap AS ORDINARY CODE would try
+;; to look up `asana` as a variable and fail (map literals evaluate both keys and
+;; values — see lower.rs's MakeMap). `:mcp` is meant to be fully static anyway (the
+;; plan's "declared, checked before any user code runs" design), so when `meta` is a
+;; LITERAL map with a LITERAL `:mcp` submap, this macro (a) re-quotes that submap in
+;; the spliced meta, so it evaluates to itself (symbol keys intact) rather than being
+;; evaluated as code, and (b) wraps the body in a `let` binding each alias to
+;; `(workflow/mcp-handle (quote alias))`, one per declared alias, in the map's own
+;; (BTreeMap/Value::Ord) key order. A non-literal `meta`, or a `meta` with no literal
+;; `:mcp` key, leaves the expansion unchanged — `:mcp` MUST be inspectable at
+;; macro-expansion time; a computed meta expression can't declare it.
+;;
+;; Safety of calling workflow/mcp-handle from these bindings: the `let` wrapping only
+;; wraps `body`, and `body` is the workflow/run THUNK — workflow/run doesn't invoke
+;; the thunk until after its auth-resolution step has resolved every declared server
+;; (or the run has already exited via the needs-auth/failed gate without running the
+;; thunk at all). So by the time these bindings are ever evaluated, workflow/mcp-handle
+;; always has a resolved handle to return.
 (defmacro defworkflow (name doc meta . body)
-  `(workflow/run (symbol->string (quote ,name)) ,doc ,meta (lambda () ,@body)))
+  (let* ((mcp-decl (if (map? meta) (get meta :mcp) nil))
+         (has-mcp? (map? mcp-decl)))
+    (if has-mcp?
+      (let* ((aliases (keys mcp-decl))
+             (quoted-meta (assoc meta :mcp (list (quote quote) mcp-decl)))
+             (bindings (map (fn (a) (list a (list (quote workflow/mcp-handle) (list (quote quote) a))))
+                          aliases)))
+        `(workflow/run (symbol->string (quote ,name)) ,doc ,quoted-meta
+           (lambda () (let ,bindings ,@body))))
+      `(workflow/run (symbol->string (quote ,name)) ,doc ,meta (lambda () ,@body)))))
 
 ;; phase: a journaled MARKER inside a workflow body (workflow.js semantics) — not a
 ;; wrapper, not control flow. `(phase "Audit")` closes the previously-open phase and

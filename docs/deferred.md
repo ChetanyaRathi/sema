@@ -388,3 +388,46 @@ run, surfaced as a per-cell badge and a session-cumulative status bar. Scoped
 - Headless `notebook run` should print the same summary line at the end.
 
 Deferred: feature work, not async-runtime scope. Filed as a GitHub issue.
+
+## MCP-4 — `mcp/call` blocks the cooperative scheduler (RESOLVED 2026-07-10)
+
+**Found 2026-07-10 during the workflow `:mcp` work; resolved the same day**
+(issue #96). All four MCP builtins (`mcp/connect`, `mcp/tools`, `mcp/call`,
+`mcp/close`) — and every `mcp/tools->sema` wrapped handler, which routes
+through the same shared call path — now offload their JSON-RPC round trip onto
+the `sema-io` pool and yield `AwaitIo` when called inside an `async/spawn`'d
+task, exactly like `llm/*`/`http/*`/`shell`. A slow `mcp/call` inside a
+`parallel`/`pipeline` fan-out no longer stalls sibling tasks. The top-level
+(non-async) path is untouched — same blocking semantics as before.
+
+**How:** `crates/sema-mcp/src/builtins.rs`'s connection registry became
+checkout-able (`Slot::Available`/`CheckedOut`/`Tombstone`, keyed off a stable
+`ConnMeta` so tool-allowlist/cassette-identity checks don't need a checkout).
+MCP is serial-per-connection by nature (one JSON-RPC pipe) — the checkout
+enforces that per handle, while unrelated connections and non-MCP tasks
+overlap freely. The offload closure body is genuinely the shared core: the
+same `async fn`s the sync path drives via `sema_io::io_block_on` run,
+unmodified, inside `sema_io::io_spawn_blocking` for the async path.
+
+**A real bug found along the way, not just a stall:** the pre-existing sync
+path drove every MCP operation on a private per-thread `TOKIO_RT` runtime.
+Simply adding an offload path that drove the SAME connection's later calls via
+the `sema-io` pool's *different* runtime instance hung forever — a
+`tokio::process::Child`'s stdio pipes (and a `reqwest::Client`'s pooled
+connections) are permanently bound to the runtime that created them, and can
+never be polled to completion under a different one. The fix routes the sync
+path through `sema_io::io_block_on` too (still a single blocking call on the
+calling thread — no observable behavior change), so a connection made via a
+synchronous `mcp/connect` and later called from inside `async/spawn` (the
+common pattern, and exactly what the workflow `:mcp` pre-phase does) actually
+works instead of parking indefinitely.
+
+**Residual nuance, consciously left:** cancellation of an in-flight `mcp/call`
+(`async/timeout`/`async/cancel`) is best-effort at the wire level — the
+abandoned checkout tombstones the connection immediately (any further use
+fails fast with a reconnect hint) but the background worker's own JSON-RPC
+read keeps running until its own protocol timeout (120s) elapses, same policy
+as the LLM completion offload's `spawn_blocking` tier. Acceptable: Sema-level
+behavior (the task cancels, the handle is unusable) is correct and immediate;
+only the underlying OS process/socket teardown is delayed. Pinned by
+`crates/sema/tests/mcp_async_test.rs`.

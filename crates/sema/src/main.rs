@@ -1,4 +1,5 @@
 use std::cell::RefCell;
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
@@ -66,7 +67,11 @@ mod repl;
 mod update;
 mod web;
 mod workflow_check;
-mod workflow_view;
+// The dashboard server itself lives in the `sema` LIBRARY crate
+// (`crates/sema/src/lib.rs` → `pub mod workflow_view;`), not here, so
+// `crates/sema/tests/*.rs` integration tests can drive it in-process. Referenced
+// below as `sema::workflow_view::…`.
+use sema::workflow_view;
 
 /// Read a source file with consistent, friendly error messages.
 ///
@@ -410,11 +415,18 @@ enum McpAuthCommands {
         /// The MCP server URL (e.g. https://mcp.example.com/mcp)
         url: String,
         /// Use the device-authorization flow instead of opening a browser
-        #[arg(long)]
+        #[arg(long, conflicts_with = "token")]
         device: bool,
         /// A pre-registered OAuth client id (when the server has no dynamic registration)
         #[arg(long = "client-id", value_name = "ID")]
         client_id: Option<String>,
+        /// Store a pre-issued access token directly, skipping discovery/DCR/OAuth
+        /// entirely — the headless/CI escape hatch (no browser, no device flow).
+        #[arg(long, conflicts_with = "device", value_name = "TOKEN")]
+        token: Option<String>,
+        /// Seconds until the pre-issued --token expires (omit for a non-expiring token)
+        #[arg(long, requires = "token", value_name = "SECS")]
+        expires_in: Option<u64>,
     },
     /// Remove cached credentials for a remote MCP server
     Logout {
@@ -513,6 +525,12 @@ enum PkgCommands {
 enum WorkflowCommands {
     /// Run a workflow file (a `.sema` program that `defworkflow`s and runs it),
     /// journaling a frozen run-directory and writing `result.json`.
+    ///
+    /// Exit codes: 0 success, 1 failed, 2 the run needs MCP authentication (see
+    /// stderr for which server(s) and the `sema mcp login` command to run, then
+    /// re-run this workflow). On an interactive terminal, a needs-auth gate logs
+    /// in inline (the browser/loopback flow) instead of exiting 2; `--no-auth-prompt`
+    /// forces the headless exit-2 behavior even on a TTY.
     Run {
         /// Path to the `.sema` workflow file.
         file: String,
@@ -541,6 +559,13 @@ enum WorkflowCommands {
         /// version and re-runs everything.
         #[arg(long)]
         resume: Option<String>,
+
+        /// Never log in inline on a needs-auth gate, even on an interactive
+        /// terminal — always exit 2 with `sema mcp login` guidance instead. No
+        /// effect when running headlessly (no TTY, or `CI` set): that already
+        /// gets the exit-2 behavior.
+        #[arg(long)]
+        no_auth_prompt: bool,
     },
     /// Backfill the cross-run SQLite index (`<run-dir>/index.db`) from every run's
     /// journal — for offline/CI use; the viewer also syncs lazily on request.
@@ -635,9 +660,14 @@ enum NotebookCommands {
 /// plus the MCP *client* builtins (`mcp/connect`, `mcp/tools`, `mcp/tools->sema`,
 /// …). The MCP builtins live in `sema-mcp`, which depends on `sema-eval`, so they
 /// can't be registered inside `sema-eval` itself — the binary wires them in here.
+/// The real `WorkflowMcpResolver` (`sema::workflow_mcp`) is registered right
+/// alongside them, so every CLI path built through this function (REPL, `sema
+/// run`, `sema workflow run`, …) can resolve a workflow's declared `:mcp`
+/// servers — see docs/plans/2026-06-24-workflow-mcp-auth.md §3/§9(a).
 fn build_interpreter(sandbox: &sema_core::Sandbox) -> Interpreter {
     let interpreter = Interpreter::new_with_sandbox(sandbox);
     sema_mcp::register_mcp_builtins(&interpreter.global_env, sandbox);
+    sema::workflow_mcp::register_real_resolver();
     interpreter
 }
 
@@ -830,8 +860,16 @@ fn main() {
                     let result = match auth {
                         McpAuthCommands::Login {
                             url,
+                            token: Some(token),
+                            expires_in,
+                            ..
+                        } => sema_mcp::mcp_login_token(&url, &token, expires_in),
+                        McpAuthCommands::Login {
+                            url,
                             device,
                             client_id,
+                            token: None,
+                            ..
                         } => sema_mcp::mcp_login(&url, device, client_id.as_deref()),
                         McpAuthCommands::Logout { url } => sema_mcp::mcp_logout(&url),
                     };
@@ -1096,7 +1134,7 @@ fn main() {
 /// `defworkflow`s and runs it) with the run-directory + args seams wired, then
 /// exit non-zero if the run's `{:status …}` envelope reports failure.
 fn run_workflow_command(command: WorkflowCommands, sandbox: &sema_core::Sandbox) {
-    let (file, args, run_dir, view, view_port, resume) = match command {
+    let (file, args, run_dir, view, view_port, resume, no_auth_prompt) = match command {
         WorkflowCommands::Run {
             file,
             args,
@@ -1104,7 +1142,8 @@ fn run_workflow_command(command: WorkflowCommands, sandbox: &sema_core::Sandbox)
             view,
             port,
             resume,
-        } => (file, args, run_dir, view, port, resume),
+            no_auth_prompt,
+        } => (file, args, run_dir, view, port, resume, no_auth_prompt),
         WorkflowCommands::View {
             run_dir,
             host,
@@ -1150,6 +1189,17 @@ fn run_workflow_command(command: WorkflowCommands, sandbox: &sema_core::Sandbox)
             std::process::exit(workflow_check::report(&file, &diags, strict, json));
         }
     };
+
+    // Interactive MCP auth (docs/plans/2026-06-24-workflow-mcp-auth.md §3): on a
+    // real terminal, a needs-auth gate logs in inline instead of exiting 2. See
+    // `should_enable_interactive_auth` for the exact decision and
+    // `sema::workflow_mcp::set_interactive_auth` for what enabling it does.
+    sema::workflow_mcp::set_interactive_auth(should_enable_interactive_auth(
+        std::io::stdin().is_terminal(),
+        std::io::stderr().is_terminal(),
+        std::env::var("CI").ok().as_deref(),
+        no_auth_prompt,
+    ));
 
     // The workflow runtime (sema-workflow) reads this seam to choose the run-dir
     // base; the run lands in `<run-dir>/<run-id>/`.
@@ -1269,16 +1319,24 @@ fn run_workflow_command(command: WorkflowCommands, sandbox: &sema_core::Sandbox)
     let exit_code = match interpreter.eval_str_compiled(&content) {
         Ok(envelope) => {
             drain_async_scheduler(&interpreter);
-            let failed = envelope
+            let status = envelope
                 .as_map_rc()
                 .and_then(|m| m.get(&Value::keyword("status")).cloned())
-                .and_then(|s| s.as_keyword())
-                .is_some_and(|s| s == "failed");
-            if failed {
-                eprintln!("workflow failed: {}", pretty_print(&envelope, 80));
-                1
-            } else {
-                0
+                .and_then(|s| s.as_keyword());
+            match status.as_deref() {
+                Some("failed") => {
+                    eprintln!("workflow failed: {}", pretty_print(&envelope, 80));
+                    1
+                }
+                // The headless-precursor gate (docs/plans/2026-06-24-workflow-mcp-auth.md
+                // §3/§5): a declared `:mcp` server had no usable session. Distinct exit
+                // code so a CI/orchestrator script can branch on "needs a human to log
+                // in" vs. a genuine failure.
+                Some("needs-auth") => {
+                    eprint!("{}", format_needs_auth_guidance(&envelope));
+                    2
+                }
+                _ => 0,
             }
         }
         Err(e) => {
@@ -1296,6 +1354,71 @@ fn run_workflow_command(command: WorkflowCommands, sandbox: &sema_core::Sandbox)
         }
     }
     std::process::exit(exit_code);
+}
+
+/// Render the stderr guidance for a `{:status :needs-auth :auth [{:server :url
+/// :persist} …]}` run envelope: terse, terminal-quiet (no banners), one `sema mcp
+/// login` line per server, aliases column-aligned. A malformed/missing `:auth`
+/// vector degrades to a 0-server header rather than panicking — the exit code
+/// alone (2) is still meaningful to a script even if the guidance text is thin.
+fn format_needs_auth_guidance(envelope: &Value) -> String {
+    let entries: Vec<(String, String)> = envelope
+        .as_map_rc()
+        .and_then(|m| m.get(&Value::keyword("auth")).cloned())
+        .and_then(|a| a.as_list_rc().or_else(|| a.as_vector_rc()))
+        .map(|list| {
+            list.iter()
+                .filter_map(|entry| {
+                    let m = entry.as_map_rc()?;
+                    let server = m.get(&Value::keyword("server"))?.as_str()?.to_string();
+                    let url = m.get(&Value::keyword("url"))?.as_str()?.to_string();
+                    Some((server, url))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let width = entries.iter().map(|(s, _)| s.len()).max().unwrap_or(0);
+    let mut out = format!(
+        "run needs authentication for {} MCP server(s):\n",
+        entries.len()
+    );
+    for (server, url) in &entries {
+        out.push_str(&format!("  {server:<width$}  sema mcp login {url}\n"));
+    }
+    out.push_str("then re-run this workflow. (or authenticate from `sema workflow view`)\n");
+    out
+}
+
+/// Whether `run_workflow_command` should enable inline interactive MCP auth
+/// (`sema::workflow_mcp::set_interactive_auth`) for this run: a needs-auth
+/// gate logs in right there instead of exiting 2. Pure over its inputs — no
+/// direct `IsTerminal`/`env::var` calls here — so this is unit-testable
+/// without a real TTY; the caller supplies `std::io::stdin().is_terminal()`,
+/// `std::io::stderr().is_terminal()`, `std::env::var("CI").ok()`, and the
+/// `--no-auth-prompt` flag.
+///
+/// Both stdin AND stderr must be TTYs: stdin implies a human is actually at
+/// the keyboard to complete a browser (or, if this run were headless, a
+/// device-code) flow; stderr is where the "opening browser…" line and any
+/// failure reason land, so it must be a place a human will actually see them
+/// — an interactive stdin with redirected stderr (e.g. `sema workflow run x
+/// 2>log.txt`) is exactly the case that should NOT pop a browser unannounced.
+/// `--no-auth-prompt` and a non-empty `CI` both force the headless path
+/// unconditionally, regardless of the TTY checks.
+fn should_enable_interactive_auth(
+    stdin_is_tty: bool,
+    stderr_is_tty: bool,
+    ci_env: Option<&str>,
+    no_auth_prompt: bool,
+) -> bool {
+    if no_auth_prompt {
+        return false;
+    }
+    if ci_env.is_some_and(|v| !v.is_empty()) {
+        return false;
+    }
+    stdin_is_tty && stderr_is_tty
 }
 
 /// Best-effort: open `url` in the default browser via the platform opener. Silent
@@ -3713,5 +3836,87 @@ mod tests {
 
         assert_eq!(doubled, Value::string("computed-ok"));
         assert_eq!(batched, Value::string("batch-ok"));
+    }
+
+    // ── format_needs_auth_guidance ─────────────────────────────────────────
+
+    #[test]
+    fn needs_auth_guidance_matches_the_brief_verbatim() {
+        let envelope = sema_reader::read(
+            r#"{:status :needs-auth
+                :servers ["asana" "linear"]
+                :auth [{:server "asana" :url "https://mcp.asana.com/mcp" :persist "workflow"}
+                       {:server "linear" :url "https://mcp.linear.app/mcp" :persist "workflow"}]}"#,
+        )
+        .expect("valid sema literal");
+
+        let expected = concat!(
+            "run needs authentication for 2 MCP server(s):\n",
+            "  asana   sema mcp login https://mcp.asana.com/mcp\n",
+            "  linear  sema mcp login https://mcp.linear.app/mcp\n",
+            "then re-run this workflow. (or authenticate from `sema workflow view`)\n",
+        );
+        assert_eq!(format_needs_auth_guidance(&envelope), expected);
+    }
+
+    #[test]
+    fn needs_auth_guidance_single_server() {
+        let envelope = sema_reader::read(
+            r#"{:status :needs-auth
+                :servers ["gated"]
+                :auth [{:server "gated" :url "http://127.0.0.1:1/mcp" :persist "run"}]}"#,
+        )
+        .expect("valid sema literal");
+
+        let out = format_needs_auth_guidance(&envelope);
+        assert!(out.starts_with("run needs authentication for 1 MCP server(s):\n"));
+        assert!(out.contains("  gated  sema mcp login http://127.0.0.1:1/mcp\n"));
+        assert!(out
+            .ends_with("then re-run this workflow. (or authenticate from `sema workflow view`)\n"));
+    }
+
+    #[test]
+    fn needs_auth_guidance_missing_auth_vector_degrades_to_zero_servers() {
+        let envelope = sema_reader::read(r#"{:status :needs-auth}"#).expect("valid sema literal");
+        let out = format_needs_auth_guidance(&envelope);
+        assert!(out.starts_with("run needs authentication for 0 MCP server(s):\n"));
+    }
+
+    // ── should_enable_interactive_auth ─────────────────────────────────────
+
+    #[test]
+    fn interactive_auth_enabled_only_when_both_streams_are_ttys() {
+        assert!(should_enable_interactive_auth(true, true, None, false));
+        assert!(!should_enable_interactive_auth(false, true, None, false));
+        assert!(!should_enable_interactive_auth(true, false, None, false));
+        assert!(!should_enable_interactive_auth(false, false, None, false));
+    }
+
+    #[test]
+    fn interactive_auth_disabled_by_no_auth_prompt_even_on_a_tty() {
+        assert!(!should_enable_interactive_auth(true, true, None, true));
+    }
+
+    #[test]
+    fn interactive_auth_disabled_by_nonempty_ci_even_on_a_tty() {
+        assert!(!should_enable_interactive_auth(
+            true,
+            true,
+            Some("true"),
+            false
+        ));
+        assert!(!should_enable_interactive_auth(
+            true,
+            true,
+            Some("1"),
+            false
+        ));
+    }
+
+    #[test]
+    fn interactive_auth_ignores_an_empty_ci_value() {
+        // `CI=` (set but empty) is treated the same as unset — matches the
+        // brief's "env CI is unset/empty" wording exactly.
+        assert!(should_enable_interactive_auth(true, true, Some(""), false));
     }
 }
