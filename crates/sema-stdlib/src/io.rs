@@ -542,7 +542,7 @@ fn resolved_path(p: &str) -> std::path::PathBuf {
 ///
 /// Returns `Ok(nil)` after arming the yield signal; the scheduler delivers the
 /// real value on resume.
-fn fs_offload<T: Send + 'static>(
+pub(crate) fn fs_offload<T: Send + 'static>(
     work: impl FnOnce() -> Result<T, String> + Send + 'static,
     decode: impl Fn(T) -> Value + 'static,
 ) -> Result<Value, SemaError> {
