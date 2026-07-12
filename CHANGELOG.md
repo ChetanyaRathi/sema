@@ -57,16 +57,17 @@
   derived status, so the panel reflects a pending/just-finished dashboard login
   immediately (`"connecting"`, then `"authorized"`/`"failed"` + reason) without
   waiting on a new run.
-- **MCP builtins offload under the cooperative scheduler** (issue #96).
-  `mcp/connect`, `mcp/call`, `mcp/tools`, and `mcp/close` — and every
-  `mcp/tools->sema` wrapped tool handler — now offload their JSON-RPC round
-  trip and yield `AwaitIo` when called inside `async/spawn`, so a slow
-  `mcp/call` in a `parallel`/`pipeline` fan-out no longer freezes sibling
-  tasks. A connection's own calls still queue (MCP is one JSON-RPC pipe per
-  server), but unrelated connections and non-MCP work now overlap freely. The
-  top-level (non-async) path is unchanged. A task cancelled mid-call
-  (`async/timeout`/`async/cancel`) tombstones the connection immediately; any
-  later use of that handle fails fast with a reconnect hint.
+- **`shell/quote` and a `shell` `:cwd`/`:env` options map** (#89, PR #100).
+  `shell/quote` POSIX-single-quotes a string so it survives interpolation into
+  a `sh -c` command line untouched by shell metacharacters (pure
+  string→string, ungated like other string helpers; the single-string form of
+  `shell` still runs through `cmd /C` on Windows, unaffected). `shell` now
+  accepts an optional trailing options map — `{:cwd "path" :env {"KEY"
+  "val" ...}}` — to run the command in a working directory and/or with extra
+  environment variables; only the *last* argument qualifies, and only when
+  it's actually a map, so the positional argv form is unchanged. Honored
+  identically on the synchronous and `async/spawn`-offloaded paths, via the
+  same `command_opts` helper `proc/spawn` already used.
 - **`map-indexed` and `enumerate` builtins** (#90). `(map-indexed f xs)` calls
   `f` with each element's 0-based index and value (`(f i x)`), collecting
   results into a list; `(enumerate xs)` pairs each element with its index as
@@ -142,9 +143,6 @@
   order missed that `sema-stdlib` now depends on `sema-fmt` (v1.30.0's publish
   needed a manual recovery run); the order is fixed and the CI guard now
   verifies dependency *order*, not just crate presence.
-
-### Fixed
-
 - **Every remaining blocking native now yields to the cooperative scheduler
   instead of freezing sibling tasks.** 1.27.0 converted the first wave
   (`http/*`, `shell`, `llm/embed`/`complete`/`classify`/`extract`); this pass
@@ -209,6 +207,24 @@
   - Every conversion keeps the synchronous/top-level path byte-identical;
     only code running inside `async/spawn` behaves differently, and only for
     the better.
+- **MCP builtins offload under the cooperative scheduler** (issue #96).
+  `mcp/connect`, `mcp/call`, `mcp/tools`, and `mcp/close` — and every
+  `mcp/tools->sema` wrapped tool handler — now offload their JSON-RPC round
+  trip and yield `AwaitIo` when called inside `async/spawn`, so a slow
+  `mcp/call` in a `parallel`/`pipeline` fan-out no longer freezes sibling
+  tasks. A connection's own calls still queue (MCP is one JSON-RPC pipe per
+  server), but unrelated connections and non-MCP work now overlap freely. The
+  top-level (non-async) path is unchanged. A task cancelled mid-call
+  (`async/timeout`/`async/cancel`) tombstones the connection immediately; any
+  later use of that handle fails fast with a reconnect hint.
+- **`event/select` and `io/read-key-timeout` yield `AwaitIo` instead of
+  blocking the scheduler in async context** (#88, PR #99). Both used to poll
+  for readiness with a real blocking wait, so a "wait for input OR agent
+  progress" loop parked inside `async/spawn` froze every sibling task for up
+  to the whole timeout. They now arm the same `AwaitIo` yield the
+  file/http/shell offloads use, re-checking readiness on every scheduler tick
+  instead of blocking the OS thread (`await_io_until` in
+  `sema-stdlib/src/io.rs`); the synchronous/top-level path is unchanged.
 - **`http/serve` fails fast instead of silently freezing the scheduler when
   started inside `async/spawn`.** That thread IS the VM thread the
   cooperative scheduler drives every task on, so the blocking accept loop
@@ -221,6 +237,13 @@
   (one WebSocket handler idling in `ws/recv` blocks the loop from picking up
   any other connection's next request) is now documented at the call site
   and in `docs/limitations.md`.
+- **`async/spawn` keeps a captured local live across the spawn boundary**
+  (#104, PR #106). A `set!` to a captured local that runs *after* `async/spawn`
+  but *before* the task's first read of it is now observed by the task;
+  previously the detach snapshotted the upvalue cell's value at spawn time and
+  severed it from the defining frame, so the task saw the stale spawn-time
+  value instead of the later write. The detached cell now stays tracked to the
+  still-live defining frame so subsequent writes flow into it.
 
 ## 1.30.0 — 2026-07-09
 

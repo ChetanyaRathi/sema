@@ -157,11 +157,24 @@ loop freezes every sibling task for the timeout. Needs an offload+yield
 and `async/sleep` between polls. **New runtime work, on the critical path for any
 interactive event loop.**
 
+**Status update (2026-07-12): SHIPPED (PR #99).** `io/read-key-timeout`'s
+async-context path now offloads via the generic `AwaitIo` yield instead of a
+blocking OS poll, armed the same way the file/http/shell leaves are — no
+separate `io/read-key-async` or dedicated input task was needed. See
+`await_io_until` (`sema-stdlib/src/io.rs:608-642`) and the regression coverage
+at `crates/sema/tests/vm_async_test.rs:1514`.
+
 ### 3d. `event/select` (optional convenience)
 
 A stdlib selector over `:key` / `:timer` / `:proc` / task sources, built on the
 async-aware leaves above. Nice for single-loop apps; keep it off the critical
 path for animation (which needs only `async/spawn` + `async/sleep`).
+
+**Status update (2026-07-12): SHIPPED (PR #99).** `event/select` now yields
+`AwaitIo` in async context via the same `await_io_until` helper
+(`sema-stdlib/src/io.rs:608-642`) instead of blocking the scheduler thread for
+the whole timeout — a task selecting on a source that never fires no longer
+stalls its siblings. Regression coverage: `crates/sema/tests/vm_async_test.rs:1514`.
 
 ## 4. Hard constraints & honest limits
 
@@ -192,10 +205,18 @@ path for animation (which needs only `async/spawn` + `async/sleep`).
   native cannot loop-yield). See §3a and `docs/plans/2026-07-02-nonblocking-agent-run.md`.
 - **M2 — async input:** `io/read-key-async` (offload+yield) or the sub-frame
   input-task pattern; quantify residual per-poll block.
+
+  **Status update (2026-07-12): SHIPPED (PR #99).** Delivered via the
+  offload+yield pattern, not a separate `io/read-key-async` entry point — see
+  §3c and `sema-stdlib/src/io.rs:608-642` /
+  `crates/sema/tests/vm_async_test.rs:1514`.
 - **M3 — cancellation completeness:** race a spawned turn against interrupt; wire
   the abort seam end-to-end; document the LLM-tier best-effort split.
 - **M4 — `event/select`** (convenience): multiplex `:key`/`:timer`/task; document
   the inline-tool suspension.
+
+  **Status update (2026-07-12): SHIPPED (PR #99).** See §3d and
+  `sema-stdlib/src/io.rs:608-642` / `crates/sema/tests/vm_async_test.rs:1514`.
 - **M5 — workflows on top:** `workflow/foreach |parallel` and `async/pool-map`
   ride the same leaves; confirm no starvation under fan-out.
 
