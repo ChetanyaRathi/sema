@@ -58,6 +58,85 @@
   immediately (`"connecting"`, then `"authorized"`/`"failed"` + reason) without
   waiting on a new run.
 
+### Fixed
+
+- **Every remaining blocking native now yields to the cooperative scheduler
+  instead of freezing sibling tasks.** 1.27.0 converted the first wave
+  (`http/*`, `shell`, `llm/embed`/`complete`/`classify`/`extract`); this pass
+  closes out the rest of the fan-out surface so a slow call inside
+  `async/spawn`/`parallel`/`pipeline` no longer stalls every other task on the
+  process for its whole duration:
+  - `sleep` and the `retry` combinator now yield instead of blocking. `retry`
+    can't sleep-then-resume mid-native across a scheduler yield, so its
+    backoff loop moves to a prelude-level Sema driver (`async/sleep` between
+    attempts) in async context, sharing option parsing with the unchanged
+    blocking native; the Sema-visible contract (args, return value, error on
+    exhaustion) is unchanged.
+  - `llm/with-rate-limit` reserves the caller's pacing slot synchronously
+    before the offload starts, then spends the wait itself inside the
+    already-offloaded call — never on the VM thread — so a burst of
+    concurrent dispatches stays correctly staggered instead of racing to
+    send the instant their independent waits elapse.
+  - The remaining single-shot LLM entry points — `llm/chat` (without
+    `:tools`), `llm/send`, `conversation/say`/`say-as`, `llm/summarize`, and
+    `llm/compare` — route through the same `do_complete_async_yield`
+    machinery `llm/complete` already used, preserving caching, usage
+    tracking, budget gates, and retry semantics exactly.
+  - `llm/chat` **with** `:tools` is now a non-blocking dispatcher: instead of
+    the blocking `run_tool_loop`, it drives the same
+    `__agent-begin/step/exec-tools/finish` machinery that powers `agent/run`,
+    closing the gap where a multi-round tool conversation froze every
+    sibling task for up to `max-tool-rounds × completions` — the drift the
+    original non-blocking-`agent/run` plan had documented as already fixed.
+    The workflow `step` macro's `:tools` branch (which just calls
+    `llm/chat`) is non-blocking transitively, no changes needed. `llm/chat`'s
+    args, return shape, error behavior, and tool-result correlation are
+    unchanged.
+  - `llm/batch` offloads the whole concurrent-provider call as one
+    blocking-tier unit (its internal `join_all` across providers runs
+    unchanged inside the offload); `llm/rerank` gets a new `rerank_future`
+    provider hook mirroring `embed_future`, with a best-effort blocking-tier
+    fallback for providers that don't implement it.
+  - `git/*` offloads its subprocess like `shell` — all 8 builtins, including
+    `git/ignore-matches?`'s inline call.
+  - `proc/wait` and `pty/wait` offload via a registry checkout: a second wait
+    on the same handle now queues behind the first (both resolve to the same
+    exit code) instead of racing the child process; every other `proc/*`/
+    `pty/*` op on a handle mid-wait errors clearly rather than racing it.
+  - `db/*` (SQLite) offloads through a connection checkout; row→value
+    conversion happens on the VM thread from an owned intermediate, never
+    inside the offload. `db/last-insert-id` stays synchronous (no I/O) but
+    is checkout-aware, so it reports a clear "busy" error instead of racing
+    a concurrent op on the same handle.
+  - File-backed `stream/*` offloads via a per-stream checkout; in-memory
+    streams (`stream/from-string`, `stream/byte-buffer`, …) stay synchronous
+    everywhere — nothing to offload. A `stream/copy` between two file-backed
+    streams keeps its synchronous loop even in async context (avoiding a
+    two-resource checkout that could deadlock against a reverse copy) — a
+    narrow, documented exception; a copy with only one file-backed side
+    offloads normally.
+  - `kv/*`'s disk flush (the whole-store rewrite behind `kv/set`/`kv/delete`)
+    offloads too, but the call still doesn't resolve until the flush
+    completes — the write-through durability contract (a crash right after
+    `kv/set` returns must not lose the write) holds unchanged.
+  - `zip/*`, `tar/*`, `pdf/*`, and `patch/apply-file` offload their
+    whole-file read/write plus CPU-bound (de)compression/parsing.
+  - Every conversion keeps the synchronous/top-level path byte-identical;
+    only code running inside `async/spawn` behaves differently, and only for
+    the better.
+- **`http/serve` fails fast instead of silently freezing the scheduler when
+  started inside `async/spawn`.** That thread IS the VM thread the
+  cooperative scheduler drives every task on, so the blocking accept loop
+  used to freeze every sibling task forever with no error and nothing to
+  debug. A full non-blocking rearchitecture (yield-aware dispatch loop + a
+  handler task per connection) is real design work, deliberately deferred —
+  see `docs/deferred.md` (SRV-1). Until it lands, `http/serve` now checks
+  `in_async_context()` up front and raises a clear error with a hint instead
+  of hanging. The dispatch loop's pre-existing single-consumer limitation
+  (one WebSocket handler idling in `ws/recv` blocks the loop from picking up
+  any other connection's next request) is now documented at the call site
+  and in `docs/limitations.md`.
+
 ## 1.30.0 — 2026-07-09
 
 ### Added

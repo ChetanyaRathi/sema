@@ -426,3 +426,58 @@ servers SEQUENTIALLY, before any concurrent fan-out starts — it never runs
 inside a `parallel`/`pipeline` batch, so it is unaffected. Only a workflow body
 that calls `mcp/call` concurrently (e.g. `(parallel (list (fn () (mcp/call …))
 …))`) hits the stall, and only for the duration of that one call.
+
+## SRV-1 — async `http/serve` + concurrent connection handlers
+
+**Found 2026-07-10, during the scheduler-blocking-natives sweep.** `http/serve`'s
+dispatch loop (`crates/sema-stdlib/src/server.rs`) parks on `rx.blocking_recv()`
+for the life of the server — correct at top level, where that's the only thing
+the thread will ever do, but catastrophic inside `async/spawn`: that thread IS
+the VM thread the cooperative scheduler drives every task on, so the loop never
+returns control and every sibling task freezes forever with no error. As of
+2026-07-12, `http/serve` (and any sibling serve entry points in the file) now
+detects `in_async_context()` up front and fails fast with an explained
+`SemaError` instead of hanging silently — see the CHANGELOG `## Unreleased`
+entry and `docs/limitations.md`. That guard is the whole fix shipped so far;
+this entry tracks the real rearchitecture it stands in for.
+
+**Why deferred:** a genuinely non-blocking server needs a yield-aware dispatch
+loop (the evaluator-thread `while let Some(req) = rx.blocking_recv()` loop
+replaced with an `AwaitIo`-parking equivalent) plus a handler task per
+connection, so one connection's handler can park (e.g. on `llm/stream`, a
+slow tool call, or `ws/recv`) without stalling every other connection — real
+design work (concurrent access to the shared Sema env/handler closure across
+tasks, backpressure, per-connection cancellation), not a quick fix. The guard
+that shipped instead turns the failure mode from "silent, permanent freeze"
+into "immediate, explained error," which is enough to stop the bleeding
+without committing to the rearchitecture's design under this pass.
+
+**Related, already documented:** the dispatch loop is also single-consumer by
+construction even at top level — one `ws/recv` idling on a quiet WebSocket
+client blocks the loop from picking up any other connection's next request.
+See `docs/limitations.md`. The same rearchitecture that fixes SRV-1 (a handler
+task per connection) would fix this too.
+
+## Consciously-not-converted blocking natives
+
+**Found 2026-07-10, during the scheduler-blocking-natives sweep.** Two more
+blocking-on-the-VM-thread spots were found and deliberately left as-is (not
+tracked as bugs to fix later — the audit checked them and closed them):
+
+- **`serial/*`** (`crates/sema-stdlib/src/serial.rs`) — `serial/read-line` and
+  `serial/send` block up to the configured port timeout. Hardware-niche
+  (`Caps::SERIAL`-gated, a real physical/virtual serial port must be attached)
+  and low-traffic by nature — a script driving a serial device is not the
+  concurrent-fan-out shape this wave targets. Revisit only if someone actually
+  reports a serial script wanting to run concurrently with other async work.
+- **Cold `import`/`load` and `sema/check-file`'s first-load read** (`import`:
+  `crates/sema-eval/src/special_forms.rs`; `sema/check-file`:
+  `crates/sema-stdlib/src/reflect.rs`) — the first time a module is imported,
+  loaded, or checked, its source is read from disk and compiled synchronously.
+  Narrow window (one file read, amortized by the module cache on every later
+  reference) and not offload-able the way a leaf builtin is: compilation must
+  run on the VM thread regardless (it calls back into the compiler/macro
+  expander), so there is no simple "do the blocking part off-thread, resume
+  with a `Value`" shape here — offloading only the file read would still leave
+  the (usually larger) compile step blocking. Not worth the complexity for a
+  one-shot, per-module cost.

@@ -266,6 +266,16 @@ The last line is the footgun: `and` in head position is the special form, not th
 
 ---
 
+### 37. `http/serve`'s dispatch loop is single-consumer (updated 2026-07-12)
+
+`crates/sema-stdlib/src/server.rs`'s dispatch loop pulls one `ServerRequest` off a shared channel at a time and runs the Sema handler to completion — including a WebSocket handler idling in `(:recv conn)` (`ws/recv`) — before looping back for the next connection's request. axum itself is fully concurrent (every connection gets its own task and queues on the bounded channel), but the single evaluator thread draining that queue serially is the actual concurrency ceiling: a WS client that goes quiet stalls every *other* HTTP/WS request on the same server until that client sends something or disconnects.
+
+**Fix (not done):** a yield-aware dispatch loop with a handler task per connection, so an idle handler parks instead of holding the loop. Real design work, tracked as SRV-1 in `docs/deferred.md`.
+
+**Separately guarded:** calling `http/serve` from inside `async/spawn` used to freeze the whole cooperative scheduler forever (that thread IS the VM thread every task runs on) with no error at all. It now fails fast with an explained error instead — `http/serve` still must be started from the top level; see SRV-1.
+
+---
+
 ## Gap Analysis — Remaining Items
 
 | #   | Gap                                      | Priority | Effort    | Notes                                                                        |

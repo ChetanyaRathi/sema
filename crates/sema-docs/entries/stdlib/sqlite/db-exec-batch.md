@@ -8,6 +8,8 @@ Execute several SQL statements in one call, separated by semicolons. STATIC SQL 
 
 **Security:** never interpolate user-controlled input into the SQL string passed to `db/exec-batch` — doing so is a SQL injection vulnerability. For any value that comes from outside the program, use the parameterized `db/exec` (with `?` placeholders) instead, one statement at a time.
 
+Concurrent calls against the same handle serialize: inside `async/spawn`, a call queues automatically behind any other `db/*` call already in flight on that handle instead of racing the connection.
+
 ```sema
 (db/exec-batch "mydb" "
   CREATE TABLE posts (id INTEGER PRIMARY KEY, user_id INTEGER, title TEXT);

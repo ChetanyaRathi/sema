@@ -6,6 +6,8 @@ section: "Serving"
 
 Start an HTTP server. Takes a handler function and an optional options map. The handler receives a request map and returns a response map. This function blocks — it becomes the server's run loop.
 
+Must be started from the top level: calling it from inside `async/spawn` (or any other async context) raises an error immediately instead of hanging — that thread is the VM thread the cooperative scheduler drives every task on, so a blocking accept loop there would otherwise freeze every sibling task forever with no error. Async, non-blocking serving is tracked as deferred work (`docs/deferred.md`, SRV-1). The dispatch loop is also single-consumer even at top level: a WebSocket handler idling in `(:recv conn)` blocks the loop from picking up any other connection's next request until that client sends something or disconnects (`docs/limitations.md`).
+
 ```sema
 (http/serve handler)
 (http/serve handler {:port 3000})

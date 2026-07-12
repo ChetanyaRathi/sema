@@ -111,6 +111,23 @@ Original two-mechanism framing (kept for the record):
   Sema. More flexible (Sema owns history/cancel); tool execution moves to the task
   layer; the invariants below are preserved in the Rust-owned handle.
 
+**Status update (2026-07-12):** the paragraph above was written when only
+`agent/run` had actually shipped the dispatcher — `llm/chat` with `:tools`
+still called the blocking `run_tool_loop` unconditionally, silently
+reintroducing the same sibling-freezing loop for a multi-round tool
+conversation. That gap is now closed: `llm/chat` is a prelude dispatcher over
+the identical `__agent-begin/step/exec-tools/finish` machinery (a new
+`__chat-begin` native adapts raw messages/opts into an `AgentLoopState`, and
+`__agent-finish` returns the bare completion string `llm/chat` promises
+instead of the agent `{:response …}` envelope; the synchronous/no-tools entry
+point is `__llm-chat-blocking`). The workflow `step` macro's `:tools` branch
+needed no changes — it already just calls `llm/chat`, so it is non-blocking
+transitively. See the CHANGELOG `## Unreleased` entry for the rest of that
+sweep (which also closed `llm/batch`/`llm/rerank`, the remaining single-shot
+LLM entry points, `sleep`/`retry`, `llm/with-rate-limit`, `git/*`,
+`proc/pty` wait, `db/*`, `stream/*`, `kv/*`, archive/pdf/patch, and guarded
+`http/serve`).
+
 **Invariants either mechanism must keep** (learned the hard way):
 - `track_usage` fires exactly once per round, in the poller/finalize, so the
   cache-hit-zero-usage accounting invariant holds.
@@ -194,5 +211,10 @@ counter advanced during the wait → proves independent interleaving).
 - `AwaitIo` / `IoHandle`: `sema-core` (handle + abort seam), `sema-vm` (wake arm,
   park-on-IO branch).
 - LLM async: `sema-llm/src/builtins.rs` (`do_complete_async_yield`,
-  `run_tool_loop`, `agent/run`).
+  `run_tool_loop`, `agent/run`, `__chat-begin`/`llm/chat`).
+- Checkout-pattern offloads (registry-held/stateful handles, not stateless
+  leaves): `sema-stdlib/src/proc.rs` / `pty.rs` (`proc/wait`/`pty/wait`),
+  `sqlite.rs` (`db/*`), `stream.rs` (file-backed `stream/*`), `kv.rs` (the
+  `kv/set`/`kv/delete` flush) — each has an `Available`/`CheckedOut`/
+  `Tombstone` slot and its own module doc comment explaining the pattern.
 - Input: `sema-stdlib/src/io.rs` (`io/read-key*`, `unix_stdin_ready`).
