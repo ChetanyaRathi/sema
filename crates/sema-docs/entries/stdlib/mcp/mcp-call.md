@@ -15,6 +15,13 @@ a Sema value: a plain text result collapses to a string; a richer result (images
 resources, `structuredContent`) is returned as the full map. A tool that reports
 `isError` surfaces as a `SemaError`.
 
+Inside `async/spawn`, `mcp/call` offloads the round trip and yields so sibling
+tasks keep running. A connection handles one call at a time (MCP is a single
+JSON-RPC pipe): concurrent calls on the *same* handle queue and run in turn;
+calls on different handles overlap freely. Cancelling a call in flight
+(`async/timeout`/`async/cancel`) drops the connection — any later call on that
+handle errors with a reconnect hint; reconnect with `mcp/connect` to continue.
+
 ```sema
 (define fs (mcp/connect {:command "npx"
                          :args ["-y" "@modelcontextprotocol/server-filesystem" "/tmp"]}))

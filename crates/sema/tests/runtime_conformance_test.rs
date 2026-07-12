@@ -51,12 +51,6 @@ const ALLOWLIST: &[(&str, usize, &str)] = &[
         "subcommand entry-point drivers (lsp/dap/mcp/workflow/notebook) ARE main()",
     ),
     (
-        "sema-mcp/src/builtins.rs",
-        1,
-        "out of Slice A: private current-thread reactor with progress-only-during-\
-         block_on semantics; consolidation is a behavior change — own follow-up slice",
-    ),
-    (
         "sema-mcp/src/client_auth.rs",
         1,
         "out of Slice A: same as sema-mcp builtins",

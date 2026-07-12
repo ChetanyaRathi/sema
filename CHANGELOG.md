@@ -57,6 +57,16 @@
   derived status, so the panel reflects a pending/just-finished dashboard login
   immediately (`"connecting"`, then `"authorized"`/`"failed"` + reason) without
   waiting on a new run.
+- **MCP builtins offload under the cooperative scheduler** (issue #96).
+  `mcp/connect`, `mcp/call`, `mcp/tools`, and `mcp/close` — and every
+  `mcp/tools->sema` wrapped tool handler — now offload their JSON-RPC round
+  trip and yield `AwaitIo` when called inside `async/spawn`, so a slow
+  `mcp/call` in a `parallel`/`pipeline` fan-out no longer freezes sibling
+  tasks. A connection's own calls still queue (MCP is one JSON-RPC pipe per
+  server), but unrelated connections and non-MCP work now overlap freely. The
+  top-level (non-async) path is unchanged. A task cancelled mid-call
+  (`async/timeout`/`async/cancel`) tombstones the connection immediately; any
+  later use of that handle fails fast with a reconnect hint.
 
 ### Fixed
 
