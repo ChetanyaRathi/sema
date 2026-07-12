@@ -1506,6 +1506,25 @@ pub fn reranker_span(query: &str, model: &str, top_k: Option<usize>) -> Reranker
     RerankerSpan { inner }
 }
 
+/// Start a DETACHED reranker span: parented to the current TL-stack top (captured
+/// now) but NOT pushed onto the stack, and whose `Drop` does not pop. For the async
+/// rerank offload, whose `RerankerSpan` is moved into the IO-poller closure and
+/// finalized on the VM thread after the task yields (when the stack may hold a
+/// sibling task's span) — mirrors [`llm_span_detached`] for the reranker leaf.
+pub fn reranker_span_detached(query: &str, model: &str, top_k: Option<usize>) -> RerankerSpan {
+    let inner = start_detached("rerank".to_string(), SpanKind::Internal, Vec::new());
+    if let Some(c) = &inner {
+        c.set_attrs(compat::span_kind(compat::Kind::Reranker));
+        c.set_attrs(compat::reranker_meta(
+            query,
+            model,
+            top_k,
+            capture_content(),
+        ));
+    }
+    RerankerSpan { inner }
+}
+
 impl RerankerSpan {
     /// Candidate documents fed to the reranker (content-gated).
     pub fn set_input(&self, docs: &[String]) {

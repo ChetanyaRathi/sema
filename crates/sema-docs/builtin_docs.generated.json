@@ -3051,7 +3051,7 @@
       "examples": [
         "(kv/close \"config\")"
       ],
-      "body": "Close a store, flushing data and freeing the handle. Returns `nil`.\n\n```sema\n(kv/close \"config\")\n```\n\nData is safe even without calling `kv/close` (every write already flushes), but closing frees memory and releases the store name."
+      "body": "Close a store, flushing data and freeing the handle. Returns `nil`.\n\n```sema\n(kv/close \"config\")\n```\n\nData is safe even without calling `kv/close` (every write already flushes), but closing frees memory and releases the store name.\n\nClosing a store with a `kv/set`/`kv/delete` flush in flight (a concurrent `async/spawn` call) fails with a busy error instead of racing the write — wait for it to resolve first. Closing a tombstoned store (one whose flush was cancelled mid-flight) is a no-op that frees the handle, so the same name can be `kv/open`ed again."
     },
     {
       "name": "kv/delete",
@@ -3061,7 +3061,7 @@
       "examples": [
         "(kv/delete \"config\" \"api-key\")  ; => #t\n(kv/delete \"config\" \"api-key\")  ; => #f (already deleted)"
       ],
-      "body": "Delete a key. Returns `#t` if the key existed, `#f` otherwise. Flushes to disk immediately.\n\n```sema\n(kv/delete \"config\" \"api-key\")  ; => #t\n(kv/delete \"config\" \"api-key\")  ; => #f (already deleted)\n```"
+      "body": "Delete a key. Returns `#t` if the key existed, `#f` otherwise. Flushes to disk immediately.\n\nConcurrent calls against the same store serialize: inside `async/spawn`, a call queues automatically behind any other `kv/set`/`kv/delete` flush already in flight on that store instead of racing the write-through. If a queued flush is cancelled before it completes, the store handle is tombstoned — every later `kv/*` call on it fails until `kv/close` frees the handle and it's reopened with `kv/open`.\n\n```sema\n(kv/delete \"config\" \"api-key\")  ; => #t\n(kv/delete \"config\" \"api-key\")  ; => #f (already deleted)\n```"
     },
     {
       "name": "kv/get",
@@ -3082,7 +3082,7 @@
       "examples": [
         "(kv/get \"config\" \"api-key\")  ; => \"sk-...\" or nil"
       ],
-      "body": "Get a value by key. Returns `nil` if the key doesn't exist.\n\n```sema\n(kv/get \"config\" \"api-key\")  ; => \"sk-...\" or nil\n```"
+      "body": "Get a value by key. Returns `nil` if the key doesn't exist.\n\nThis reads an in-memory field with no I/O, so it never offloads or queues — if the store has a `kv/set`/`kv/delete` flush in flight (e.g. a concurrent `async/spawn` call), it fails immediately with a busy error rather than waiting for it.\n\n```sema\n(kv/get \"config\" \"api-key\")  ; => \"sk-...\" or nil\n```"
     },
     {
       "name": "kv/keys",
@@ -3092,7 +3092,7 @@
       "examples": [
         "(kv/keys \"config\")  ; => (\"api-key\" \"retries\" \"tags\")"
       ],
-      "body": "List all keys in the store. Returns a list of strings.\n\n```sema\n(kv/keys \"config\")  ; => (\"api-key\" \"retries\" \"tags\")\n```"
+      "body": "List all keys in the store. Returns a list of strings.\n\nThis reads an in-memory field with no I/O, so it never offloads or queues — if the store has a `kv/set`/`kv/delete` flush in flight (e.g. a concurrent `async/spawn` call), it fails immediately with a busy error rather than waiting for it.\n\n```sema\n(kv/keys \"config\")  ; => (\"api-key\" \"retries\" \"tags\")\n```"
     },
     {
       "name": "kv/open",
@@ -3112,7 +3112,7 @@
       "examples": [
         "(kv/set \"config\" \"api-key\" \"sk-...\")\n(kv/set \"config\" \"retries\" 3)\n(kv/set \"config\" \"tags\" '(\"a\" \"b\" \"c\"))\n(kv/set \"config\" \"user\" {:name \"Alice\" :role \"admin\"})"
       ],
-      "body": "Set a key-value pair. The value is serialized as JSON. Returns the value. Flushes to disk immediately.\n\n```sema\n(kv/set \"config\" \"api-key\" \"sk-...\")\n(kv/set \"config\" \"retries\" 3)\n(kv/set \"config\" \"tags\" '(\"a\" \"b\" \"c\"))\n(kv/set \"config\" \"user\" {:name \"Alice\" :role \"admin\"})\n```"
+      "body": "Set a key-value pair. The value is serialized as JSON. Returns the value. Flushes to disk immediately.\n\nConcurrent calls against the same store serialize: inside `async/spawn`, a call queues automatically behind any other `kv/set`/`kv/delete` flush already in flight on that store instead of racing the write-through. If a queued flush is cancelled before it completes, the store handle is tombstoned — every later `kv/*` call on it fails until `kv/close` frees the handle and it's reopened with `kv/open`.\n\n```sema\n(kv/set \"config\" \"api-key\" \"sk-...\")\n(kv/set \"config\" \"retries\" 3)\n(kv/set \"config\" \"tags\" '(\"a\" \"b\" \"c\"))\n(kv/set \"config\" \"user\" {:name \"Alice\" :role \"admin\"})\n```"
     },
     {
       "name": "any",
@@ -7177,7 +7177,7 @@
       "examples": [
         "(define fs (mcp/connect {:command \"npx\"\n                         :args [\"-y\" \"@modelcontextprotocol/server-filesystem\" \"/tmp\"]}))\n\n(mcp/call fs \"read_file\" {:path \"/tmp/notes.txt\"})\n; => \"…file contents…\""
       ],
-      "body": "```\n(mcp/call handle tool args)\n```\n\nInvoke a tool on an MCP server (`tools/call`) and return its result normalized to\na Sema value: a plain text result collapses to a string; a richer result (images,\nresources, `structuredContent`) is returned as the full map. A tool that reports\n`isError` surfaces as a `SemaError`.\n\n```sema\n(define fs (mcp/connect {:command \"npx\"\n                         :args [\"-y\" \"@modelcontextprotocol/server-filesystem\" \"/tmp\"]}))\n\n(mcp/call fs \"read_file\" {:path \"/tmp/notes.txt\"})\n; => \"…file contents…\"\n```\n\nFor agent use, prefer `mcp/tools->sema` so the model drives the calls; use\n`mcp/call` directly for scripted, non-agent access."
+      "body": "```\n(mcp/call handle tool args)\n```\n\nInvoke a tool on an MCP server (`tools/call`) and return its result normalized to\na Sema value: a plain text result collapses to a string; a richer result (images,\nresources, `structuredContent`) is returned as the full map. A tool that reports\n`isError` surfaces as a `SemaError`.\n\nInside `async/spawn`, `mcp/call` offloads the round trip and yields so sibling\ntasks keep running. A connection handles one call at a time (MCP is a single\nJSON-RPC pipe): concurrent calls on the *same* handle queue and run in turn;\ncalls on different handles overlap freely. Cancelling a call in flight\n(`async/timeout`/`async/cancel`) drops the connection — any later call on that\nhandle errors with a reconnect hint; reconnect with `mcp/connect` to continue.\n\n```sema\n(define fs (mcp/connect {:command \"npx\"\n                         :args [\"-y\" \"@modelcontextprotocol/server-filesystem\" \"/tmp\"]}))\n\n(mcp/call fs \"read_file\" {:path \"/tmp/notes.txt\"})\n; => \"…file contents…\"\n```\n\nFor agent use, prefer `mcp/tools->sema` so the model drives the calls; use\n`mcp/call` directly for scripted, non-agent access."
     },
     {
       "name": "mcp/close",
@@ -8746,7 +8746,7 @@
       "module": "process",
       "section": "Processes",
       "summary": "Block until the process exits and return its exit code (`-1` if killed by a signal). Reader threads finish flushing first, so a subsequent `proc/read-stdout` returns the tail.",
-      "body": "Block until the process exits and return its exit code (`-1` if killed by a signal). Reader threads finish flushing first, so a subsequent `proc/read-stdout` returns the tail."
+      "body": "Block until the process exits and return its exit code (`-1` if killed by a signal). Reader threads finish flushing first, so a subsequent `proc/read-stdout` returns the tail.\n\nCalling `proc/wait` again on the same handle while the first call is still in flight (e.g. two `async/spawn` tasks waiting on the same process) queues rather than racing the child — both calls resolve to the same exit code once it exits. Every other `proc/*` op on a handle that's mid-wait errors clearly instead of racing it."
     },
     {
       "name": "proc/write-stdin",
@@ -8994,7 +8994,7 @@
       "module": "pty",
       "section": "Pseudo-Terminals",
       "summary": "Block until the child exits and return its exit code. All output is buffered first, so a following `pty/read` returns the tail.",
-      "body": "Block until the child exits and return its exit code. All output is buffered first, so a following `pty/read` returns the tail."
+      "body": "Block until the child exits and return its exit code. All output is buffered first, so a following `pty/read` returns the tail.\n\nCalling `pty/wait` again on the same handle while the first call is still in flight (e.g. two `async/spawn` tasks waiting on the same child) queues rather than racing it — both calls resolve to the same exit code once it exits. Every other `pty/*` op on a handle that's mid-wait errors clearly instead of racing it."
     },
     {
       "name": "pty/write",
@@ -10151,7 +10151,7 @@
       "examples": [
         "(db/exec \"mydb\" \"CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, age INTEGER)\")\n; => 0  (DDL affects no rows)\n\n(db/exec \"mydb\" \"INSERT INTO users (name, age) VALUES (?, ?)\" \"Alice\" 30)\n; => 1\n\n(db/exec \"mydb\" \"UPDATE users SET age = ? WHERE name = ?\" 31 \"Alice\")\n; => 1  (one row matched)"
       ],
-      "body": "Run a SQL statement that changes the database (INSERT, UPDATE, DELETE, CREATE TABLE, …) and return the number of rows affected as an integer (0 for DDL like CREATE).\n\nAlways pass user data as `?` **placeholders** with the values as trailing arguments rather than building the SQL string yourself — the driver binds them safely, which prevents SQL injection and handles quoting/escaping for you. Use `db/query` / `db/query-one` for SELECTs, and `db/exec-batch` for multi-statement schema scripts.\n\n```sema\n(db/exec \"mydb\" \"CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, age INTEGER)\")\n; => 0  (DDL affects no rows)\n\n(db/exec \"mydb\" \"INSERT INTO users (name, age) VALUES (?, ?)\" \"Alice\" 30)\n; => 1\n\n(db/exec \"mydb\" \"UPDATE users SET age = ? WHERE name = ?\" 31 \"Alice\")\n; => 1  (one row matched)\n```"
+      "body": "Run a SQL statement that changes the database (INSERT, UPDATE, DELETE, CREATE TABLE, …) and return the number of rows affected as an integer (0 for DDL like CREATE).\n\nAlways pass user data as `?` **placeholders** with the values as trailing arguments rather than building the SQL string yourself — the driver binds them safely, which prevents SQL injection and handles quoting/escaping for you. Use `db/query` / `db/query-one` for SELECTs, and `db/exec-batch` for multi-statement schema scripts.\n\nConcurrent calls against the same handle serialize: inside `async/spawn`, a call queues automatically behind any other `db/*` call already in flight on that handle instead of racing the connection.\n\n```sema\n(db/exec \"mydb\" \"CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, age INTEGER)\")\n; => 0  (DDL affects no rows)\n\n(db/exec \"mydb\" \"INSERT INTO users (name, age) VALUES (?, ?)\" \"Alice\" 30)\n; => 1\n\n(db/exec \"mydb\" \"UPDATE users SET age = ? WHERE name = ?\" 31 \"Alice\")\n; => 1  (one row matched)\n```"
     },
     {
       "name": "db/exec-batch",
@@ -10161,7 +10161,7 @@
       "examples": [
         "(db/exec-batch \"mydb\" \"\n  CREATE TABLE posts (id INTEGER PRIMARY KEY, user_id INTEGER, title TEXT);\n  CREATE TABLE tags (id INTEGER PRIMARY KEY, name TEXT);\n  CREATE INDEX idx_posts_user ON posts(user_id);\n\")\n; => nil"
       ],
-      "body": "Execute several SQL statements in one call, separated by semicolons. STATIC SQL ONLY — there is **no** parameter binding, so the whole string runs verbatim. This is the right tool for schema setup and migrations (many `CREATE`/`ALTER`/`CREATE INDEX` in one shot). Returns `nil`.\n\n**Security:** never interpolate user-controlled input into the SQL string passed to `db/exec-batch` — doing so is a SQL injection vulnerability. For any value that comes from outside the program, use the parameterized `db/exec` (with `?` placeholders) instead, one statement at a time.\n\n```sema\n(db/exec-batch \"mydb\" \"\n  CREATE TABLE posts (id INTEGER PRIMARY KEY, user_id INTEGER, title TEXT);\n  CREATE TABLE tags (id INTEGER PRIMARY KEY, name TEXT);\n  CREATE INDEX idx_posts_user ON posts(user_id);\n\")\n; => nil\n```"
+      "body": "Execute several SQL statements in one call, separated by semicolons. STATIC SQL ONLY — there is **no** parameter binding, so the whole string runs verbatim. This is the right tool for schema setup and migrations (many `CREATE`/`ALTER`/`CREATE INDEX` in one shot). Returns `nil`.\n\n**Security:** never interpolate user-controlled input into the SQL string passed to `db/exec-batch` — doing so is a SQL injection vulnerability. For any value that comes from outside the program, use the parameterized `db/exec` (with `?` placeholders) instead, one statement at a time.\n\nConcurrent calls against the same handle serialize: inside `async/spawn`, a call queues automatically behind any other `db/*` call already in flight on that handle instead of racing the connection.\n\n```sema\n(db/exec-batch \"mydb\" \"\n  CREATE TABLE posts (id INTEGER PRIMARY KEY, user_id INTEGER, title TEXT);\n  CREATE TABLE tags (id INTEGER PRIMARY KEY, name TEXT);\n  CREATE INDEX idx_posts_user ON posts(user_id);\n\")\n; => nil\n```"
     },
     {
       "name": "db/last-insert-id",
@@ -10171,7 +10171,7 @@
       "examples": [
         "(db/exec \"mydb\" \"CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)\")\n(db/exec \"mydb\" \"INSERT INTO users (name) VALUES (?)\" \"Alice\")\n(db/last-insert-id \"mydb\")   ; => 1"
       ],
-      "body": "Return the rowid (integer primary key) of the most recent successful INSERT on this connection. Call it immediately after the insert to capture the generated id.\n\n```sema\n(db/exec \"mydb\" \"CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)\")\n(db/exec \"mydb\" \"INSERT INTO users (name) VALUES (?)\" \"Alice\")\n(db/last-insert-id \"mydb\")   ; => 1\n```"
+      "body": "Return the rowid (integer primary key) of the most recent successful INSERT on this connection. Call it immediately after the insert to capture the generated id.\n\nThis reads an in-memory field with no I/O, so it never offloads or queues — if another `db/*` call on the same handle is mid-flight (e.g. a concurrent `async/spawn` offload), it fails immediately with a \"database is busy\" error rather than waiting for it.\n\n```sema\n(db/exec \"mydb\" \"CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)\")\n(db/exec \"mydb\" \"INSERT INTO users (name) VALUES (?)\" \"Alice\")\n(db/last-insert-id \"mydb\")   ; => 1\n```"
     },
     {
       "name": "db/open",
@@ -10201,7 +10201,7 @@
       "examples": [
         "(db/query \"mydb\" \"SELECT * FROM users\")\n; => ({:age 31 :id 1 :name \"Alice\"})\n\n(db/query \"mydb\" \"SELECT name, age FROM users WHERE age > ?\" 25)\n; => ({:age 31 :name \"Alice\"})"
       ],
-      "body": "Run a SELECT and return **all** matching rows as a list of maps, one map per row, with column names as keyword keys. Returns the empty list `()` when nothing matches. Use `db/query-one` when you only need the first row.\n\nPass parameters as `?` placeholders with trailing values (safe binding, no injection risk). Note each row map is an ordered map, so its keys print sorted alphabetically — not in the SELECT column order.\n\n```sema\n(db/query \"mydb\" \"SELECT * FROM users\")\n; => ({:age 31 :id 1 :name \"Alice\"})\n\n(db/query \"mydb\" \"SELECT name, age FROM users WHERE age > ?\" 25)\n; => ({:age 31 :name \"Alice\"})\n```"
+      "body": "Run a SELECT and return **all** matching rows as a list of maps, one map per row, with column names as keyword keys. Returns the empty list `()` when nothing matches. Use `db/query-one` when you only need the first row.\n\nPass parameters as `?` placeholders with trailing values (safe binding, no injection risk). Note each row map is an ordered map, so its keys print sorted alphabetically — not in the SELECT column order.\n\nConcurrent calls against the same handle serialize: inside `async/spawn`, a call queues automatically behind any other `db/*` call already in flight on that handle instead of racing the connection.\n\n```sema\n(db/query \"mydb\" \"SELECT * FROM users\")\n; => ({:age 31 :id 1 :name \"Alice\"})\n\n(db/query \"mydb\" \"SELECT name, age FROM users WHERE age > ?\" 25)\n; => ({:age 31 :name \"Alice\"})\n```"
     },
     {
       "name": "db/query-one",
@@ -10211,7 +10211,7 @@
       "examples": [
         "(db/query-one \"mydb\" \"SELECT * FROM users WHERE name = ?\" \"Alice\")\n; => {:age 31 :id 1 :name \"Alice\"}\n\n(db/query-one \"mydb\" \"SELECT * FROM users WHERE name = ?\" \"Nobody\")\n; => nil"
       ],
-      "body": "Run a SELECT and return only the **first** row as a map, or `nil` when no row matches. The convenient form for primary-key / unique lookups. For multiple rows use `db/query`.\n\n```sema\n(db/query-one \"mydb\" \"SELECT * FROM users WHERE name = ?\" \"Alice\")\n; => {:age 31 :id 1 :name \"Alice\"}\n\n(db/query-one \"mydb\" \"SELECT * FROM users WHERE name = ?\" \"Nobody\")\n; => nil\n```"
+      "body": "Run a SELECT and return only the **first** row as a map, or `nil` when no row matches. The convenient form for primary-key / unique lookups. For multiple rows use `db/query`.\n\nConcurrent calls against the same handle serialize: inside `async/spawn`, a call queues automatically behind any other `db/*` call already in flight on that handle instead of racing the connection.\n\n```sema\n(db/query-one \"mydb\" \"SELECT * FROM users WHERE name = ?\" \"Alice\")\n; => {:age 31 :id 1 :name \"Alice\"}\n\n(db/query-one \"mydb\" \"SELECT * FROM users WHERE name = ?\" \"Nobody\")\n; => nil\n```"
     },
     {
       "name": "db/tables",
@@ -10294,7 +10294,7 @@
       "examples": [
         ";; Stream a file to another file without loading it fully\n(with-stream (in (stream/open-input \"src.bin\"))\n  (with-stream (out (stream/open-output \"dst.bin\"))\n    (stream/copy in out)))   ;; => bytes copied\n\n;; Drain a string source into an in-memory buffer\n(let ((in (stream/from-string \"hello\"))\n      (out (stream/byte-buffer)))\n  (stream/copy in out))      ;; => 5"
       ],
-      "body": "Copy all bytes from a readable stream to a writable one, streaming through an internal buffer (no need to hold the whole payload in memory). Returns the total bytes copied.\n\n```sema\n;; Stream a file to another file without loading it fully\n(with-stream (in (stream/open-input \"src.bin\"))\n  (with-stream (out (stream/open-output \"dst.bin\"))\n    (stream/copy in out)))   ;; => bytes copied\n\n;; Drain a string source into an in-memory buffer\n(let ((in (stream/from-string \"hello\"))\n      (out (stream/byte-buffer)))\n  (stream/copy in out))      ;; => 5\n```"
+      "body": "Copy all bytes from a readable stream to a writable one, streaming through an internal buffer (no need to hold the whole payload in memory). Returns the total bytes copied.\n\nWhen BOTH streams are file-backed, `stream/copy` runs its ordinary synchronous loop even inside `async/spawn` — a narrow, documented exception (avoids a two-resource checkout that could deadlock against a concurrent reverse copy). A copy with only one file-backed side (the other in-memory or stdio) offloads normally and doesn't stall siblings.\n\n```sema\n;; Stream a file to another file without loading it fully\n(with-stream (in (stream/open-input \"src.bin\"))\n  (with-stream (out (stream/open-output \"dst.bin\"))\n    (stream/copy in out)))   ;; => bytes copied\n\n;; Drain a string source into an in-memory buffer\n(let ((in (stream/from-string \"hello\"))\n      (out (stream/byte-buffer)))\n  (stream/copy in out))      ;; => 5\n```"
     },
     {
       "name": "stream/flush",
@@ -10354,7 +10354,7 @@
       "examples": [
         "(stream/read s 1024)   ;; => bytevector (up to 1024 bytes)"
       ],
-      "body": "Read up to `n` bytes, returning a bytevector. Returns fewer bytes at EOF.\n\n```sema\n(stream/read s 1024)   ;; => bytevector (up to 1024 bytes)\n```"
+      "body": "Read up to `n` bytes, returning a bytevector. Returns fewer bytes at EOF.\n\nOn a file-backed stream, calling `stream/read`, `stream/write`, `stream/read-line`, `stream/flush`, or `stream/close` again on the SAME stream object while one is already in flight (e.g. from a sibling `async/spawn` task) queues rather than racing the underlying file. In-memory streams (`stream/from-string`, `stream/byte-buffer`, …) are always synchronous and never queue.\n\n```sema\n(stream/read s 1024)   ;; => bytevector (up to 1024 bytes)\n```"
     },
     {
       "name": "stream/read-all",
@@ -13532,7 +13532,7 @@
         "(http/serve handler)\n(http/serve handler {:port 3000})\n(http/serve handler {:port 8080 :host \"127.0.0.1\"})",
         "(http/serve handler\n  {:port 3000\n   :port-fallback true\n   :on-listen (fn (info)\n     (println (string-append \"Ready at \" (:url info))))})"
       ],
-      "body": "Start an HTTP server. Takes a handler function and an optional options map. The handler receives a request map and returns a response map. This function blocks — it becomes the server's run loop.\n\n```sema\n(http/serve handler)\n(http/serve handler {:port 3000})\n(http/serve handler {:port 8080 :host \"127.0.0.1\"})\n```\n\n| Option           | Default     | Description                                                         |\n| ---------------- | ----------- | ------------------------------------------------------------------- |\n| `:port`          | `3000`      | TCP port to bind                                                    |\n| `:host`          | `\"0.0.0.0\"` | Address to bind to                                                  |\n| `:port-fallback` | `false`     | If the port is taken, bind the next free port instead of failing    |\n| `:on-listen`     | —           | Function called once bound with `{:host :port :url}`                |\n\nThe handler is any function `(request-map -> response-map)`. This can be a plain function, a router, or a middleware-wrapped stack.\n\n### Automatic port fallback\n\nBy default `http/serve` fails fast when the port is already in use. Pass\n`:port-fallback true` to walk to the next free port instead — handy for dev\nservers and multiple instances. Because the actual port may then differ from the\none requested, use `:on-listen` to learn where the server ended up:\n\n```sema\n(http/serve handler\n  {:port 3000\n   :port-fallback true\n   :on-listen (fn (info)\n     (println (string-append \"Ready at \" (:url info))))})\n```\n\n`:on-listen` runs once, on the main thread, right after the socket binds and\nbefore the request loop starts."
+      "body": "Start an HTTP server. Takes a handler function and an optional options map. The handler receives a request map and returns a response map. This function blocks — it becomes the server's run loop.\n\nMust be started from the top level: calling it from inside `async/spawn` (or any other async context) raises an error immediately instead of hanging — that thread is the VM thread the cooperative scheduler drives every task on, so a blocking accept loop there would otherwise freeze every sibling task forever with no error. Async, non-blocking serving is tracked as deferred work (`docs/deferred.md`, SRV-1). The dispatch loop is also single-consumer even at top level: a WebSocket handler idling in `(:recv conn)` blocks the loop from picking up any other connection's next request until that client sends something or disconnects (`docs/limitations.md`).\n\n```sema\n(http/serve handler)\n(http/serve handler {:port 3000})\n(http/serve handler {:port 8080 :host \"127.0.0.1\"})\n```\n\n| Option           | Default     | Description                                                         |\n| ---------------- | ----------- | ------------------------------------------------------------------- |\n| `:port`          | `3000`      | TCP port to bind                                                    |\n| `:host`          | `\"0.0.0.0\"` | Address to bind to                                                  |\n| `:port-fallback` | `false`     | If the port is taken, bind the next free port instead of failing    |\n| `:on-listen`     | —           | Function called once bound with `{:host :port :url}`                |\n\nThe handler is any function `(request-map -> response-map)`. This can be a plain function, a router, or a middleware-wrapped stack.\n\n### Automatic port fallback\n\nBy default `http/serve` fails fast when the port is already in use. Pass\n`:port-fallback true` to walk to the next free port instead — handy for dev\nservers and multiple instances. Because the actual port may then differ from the\none requested, use `:on-listen` to learn where the server ended up:\n\n```sema\n(http/serve handler\n  {:port 3000\n   :port-fallback true\n   :on-listen (fn (info)\n     (println (string-append \"Ready at \" (:url info))))})\n```\n\n`:on-listen` runs once, on the main thread, right after the socket binds and\nbefore the request loop starts."
     },
     {
       "name": "http/stream",

@@ -19,7 +19,7 @@ use crate::pricing;
 use crate::provider::{LlmProvider, ProviderRegistry};
 use crate::types::{
     ChatMessage, ChatRequest, ChatResponse, ContentBlock, EmbedRequest, EmbedResponse, LlmError,
-    RerankRequest, ToolCall, ToolSchema, Usage,
+    RerankRequest, RerankResponse, ToolCall, ToolSchema, Usage,
 };
 use crate::vector_store::{VectorDocument, VectorStore};
 
@@ -1245,6 +1245,40 @@ fn register_fn_ctx_gated(
     }
 }
 
+/// Like [`register_fn_ctx_gated`], but binds the native under a different ENV SYMBOL
+/// (`reg_name`) than the name used for the capability-check error / `NativeFn`
+/// display (`display_name`). Used to split a Sema-visible entry point (e.g.
+/// `llm/chat`) into several internal native entry points (a blocking twin, an
+/// async-loop `-begin`) that must all deny with the SAME `PermissionDenied {
+/// function: "llm/chat", .. }` a sandboxed caller saw before the split — the
+/// prelude dispatcher decides at runtime which internal native actually runs, but
+/// every one of them gates identically under the public name.
+fn register_fn_ctx_gated_as(
+    env: &Env,
+    sandbox: &sema_core::Sandbox,
+    cap: sema_core::Caps,
+    reg_name: &str,
+    display_name: &str,
+    f: impl Fn(&sema_core::EvalContext, &[Value]) -> Result<Value, SemaError> + 'static,
+) {
+    if sandbox.is_unrestricted() {
+        env.set(
+            sema_core::intern(reg_name),
+            Value::native_fn(NativeFn::with_ctx(display_name, f)),
+        );
+    } else {
+        let sandbox = sandbox.clone();
+        let fn_name = display_name.to_string();
+        env.set(
+            sema_core::intern(reg_name),
+            Value::native_fn(NativeFn::with_ctx(display_name, move |ctx, args| {
+                sandbox.check(cap, &fn_name)?;
+                f(ctx, args)
+            })),
+        );
+    }
+}
+
 /// Extract the host from a provider `base-url`/`host` string without pulling in
 /// a URL-parsing dependency. Handles `scheme://`, userinfo, `[ipv6]`, and ports.
 fn url_host(url: &str) -> Option<String> {
@@ -2026,10 +2060,21 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
     });
 
     // (llm/chat messages {:model "..." :tools [...] :tool-mode :auto ...})
-    register_fn_ctx_gated(
+    // Synchronous / no-tools-needed twin. The Sema-visible `llm/chat` is a prelude
+    // dispatcher (mirrors `agent/run`): in async context WITH a configured tool
+    // loop it drives `__chat-begin` + the shared `__agent-*` step natives instead
+    // (a native can't loop-yield across multiple provider rounds); every other
+    // case — top level, or async with no `:tools`/`:tool-mode :none` — reaches
+    // this native, which is otherwise byte-identical to the pre-split `llm/chat`
+    // (its own `in_async_context()` branch below already offloads the no-tools
+    // completion — WP-LLM-SIMPLE). Gated as "llm/chat" (not this native's own
+    // registration name) so a sandboxed caller sees the same `PermissionDenied`
+    // regardless of which internal entry point actually runs.
+    register_fn_ctx_gated_as(
         env,
         sandbox,
         sema_core::Caps::LLM,
+        "__llm-chat-blocking",
         "llm/chat",
         |ctx, args| {
             if args.is_empty() || args.len() > 2 {
@@ -2090,11 +2135,30 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
                 request.reasoning_effort = reasoning_effort;
                 request.timeout_ms = opt_timeout_ms(args.get(1));
                 let _conv = conv_scope.open();
+
+                // Inside a scheduler task: offload + yield so siblings overlap; the
+                // poller accounts and shapes the value. Sync branch below is
+                // byte-identical to before. Mirrors `llm/complete`.
+                #[cfg(not(target_arch = "wasm32"))]
+                if sema_core::in_async_context() {
+                    return do_complete_async_yield(
+                        request,
+                        Box::new(|resp| Ok(Value::string(&resp.content))),
+                    );
+                }
+
                 let response = do_complete(request)?;
                 track_usage(&response.usage)?;
                 Ok(Value::string(&response.content))
             } else {
-                // Chat with tool execution loop
+                // Chat with tool execution loop, synchronously — `run_tool_loop` is a
+                // Rust `for` over rounds that blocks the VM thread per round. Reached
+                // from top level (this IS "the" tool loop there) and, in principle,
+                // from async context too, but the prelude dispatcher never routes an
+                // async call with a configured tool loop here: `__chat-begin` returns
+                // a token (not nil) whenever `tools`/`tool-mode` would take this
+                // branch, so the dispatcher drives `__agent-step`/`__agent-exec-tools`
+                // instead (see the `llm/chat` prelude entry, sema-eval/prelude.rs).
                 let tool_schemas = build_tool_schemas(&tools)?;
                 let (result, _msgs) = run_tool_loop(
                     ctx,
@@ -2497,29 +2561,42 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
         request.max_tokens = max_tokens.or(Some(4096));
         request.system = system;
 
+        // Build the new conversation (user message + assistant reply appended).
+        // Shared by the sync and async paths — conversation state mutation (the
+        // history append) happens here, AFTER the response lands (on the VM
+        // thread in the async case), never inside the offload.
+        let finalize = move |response: ChatResponse| -> Result<Value, SemaError> {
+            let mut new_messages = conv.messages.clone();
+            new_messages.push(Message {
+                role: Role::User,
+                content: user_msg,
+                images: Vec::new(),
+            });
+            new_messages.push(Message {
+                role: Role::Assistant,
+                content: response.content,
+                images: Vec::new(),
+            });
+
+            let mut metadata = conv.metadata.clone();
+            accumulate_usage(&mut metadata, &response.usage);
+            Ok(Value::conversation(Conversation {
+                messages: new_messages,
+                model: conv.model.clone(),
+                metadata,
+            }))
+        };
+
+        // Inside a scheduler task: offload + yield so siblings overlap. Sync
+        // branch below is byte-identical to before. Mirrors `llm/complete`.
+        #[cfg(not(target_arch = "wasm32"))]
+        if sema_core::in_async_context() {
+            return do_complete_async_yield(request, Box::new(finalize));
+        }
+
         let response = do_complete(request)?;
         track_usage(&response.usage)?;
-
-        // Build new conversation with user message + assistant reply
-        let mut new_messages = conv.messages.clone();
-        new_messages.push(Message {
-            role: Role::User,
-            content: user_msg,
-            images: Vec::new(),
-        });
-        new_messages.push(Message {
-            role: Role::Assistant,
-            content: response.content,
-            images: Vec::new(),
-        });
-
-        let mut metadata = conv.metadata.clone();
-        accumulate_usage(&mut metadata, &response.usage);
-        Ok(Value::conversation(Conversation {
-            messages: new_messages,
-            model: conv.model.clone(),
-            metadata,
-        }))
+        finalize(response)
     });
 
     // (conversation/messages conv)
@@ -2953,6 +3030,23 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
         agent_finish(token)
     });
 
+    // `llm/chat`'s `:tools` twin of `__agent-begin`: builds an ordinary agent-loop
+    // handle directly from raw messages + an options map (llm/chat has no
+    // session/memory/agent-object surface to unpack), so the SAME `__agent-step` /
+    // `__agent-exec-tools` / `__agent-finish` / `__agent-drive` machinery above
+    // drives it. Returns nil (not a token) when no tool loop is needed, so the
+    // prelude dispatcher falls through to `__llm-chat-blocking`, which already
+    // offloads the plain-completion case (WP-LLM-SIMPLE). Gated as "llm/chat" —
+    // see `register_fn_ctx_gated_as`.
+    register_fn_ctx_gated_as(
+        env,
+        sandbox,
+        sema_core::Caps::LLM,
+        "__chat-begin",
+        "llm/chat",
+        |_ctx, args| chat_begin(args),
+    );
+
     // Non-blocking streaming natives (the `__stream-drive` prelude loop's
     // primitives; same bytecode-driven shape as the `__agent-*` loop above).
     register_fn(env, "__stream-begin", |args| {
@@ -3084,6 +3178,12 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
 
     // (llm/batch ["prompt1" "prompt2" "prompt3"] {:max-tokens 100})
     register_fn(env, "llm/batch", |args| {
+        // On resume from the async yield the scheduler re-runs the bytecode AFTER
+        // this CALL via `replace_stack_top`, so this native is not re-invoked.
+        // Drain any stray resume value defensively (mirrors llm/embed).
+        if let Some(v) = sema_core::take_resume_value() {
+            return Ok(v);
+        }
         if args.is_empty() || args.len() > 2 {
             return Err(SemaError::arity("llm/batch", "1-2", args.len()));
         }
@@ -3122,6 +3222,106 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
             })
             .collect();
 
+        // ── ASYNC path: offload the whole batch + yield (native targets only) ──
+        //
+        // `batch_complete`'s provider impls (anthropic/openai/gemini/ollama) drive
+        // their own concurrency internally via `sema_io::io_block_on(join_all(..))`
+        // — legal from a `spawn_blocking` closure, illegal from an async worker (see
+        // the sema-io threading contract) — so the WHOLE call is offloaded to the
+        // blocking tier as ONE unit rather than re-driven as a `spawn`ed future; the
+        // provider's own internal join_all runs unchanged inside it, occupying one
+        // admission-control permit for its entire duration (by design, same as a
+        // long retry backoff — see the sema-io module docs).
+        #[cfg(not(target_arch = "wasm32"))]
+        if sema_core::in_async_context() {
+            let provider = PROVIDER_REGISTRY.with(|reg| reg.borrow().default_provider());
+            let Some(provider) = provider else {
+                return Err(SemaError::Llm(
+                    "no LLM provider configured. Use (llm/configure :anthropic {:api-key ...}) \
+                     first"
+                        .to_string(),
+                ));
+            };
+            let reqs: Vec<ChatRequest> = requests
+                .into_iter()
+                .map(|mut r| {
+                    if r.model.is_empty() {
+                        r.model = provider.default_model().to_string();
+                    }
+                    r
+                })
+                .collect();
+
+            // Capture the dispatch-time budget + leaf-usage frames (ASYNC-1), so the
+            // poller charges the frames active NOW — not whatever scope is installed
+            // when the future lands. Mirrors do_complete_async_yield/llm/embed.
+            let usage_accum_slot = current_usage_accum();
+            let budget_slot = active_budget();
+
+            let (tx, mut rx) =
+                tokio::sync::oneshot::channel::<Vec<Result<ChatResponse, LlmError>>>();
+            let p2 = provider.clone();
+            // Blocking-tier offload (no native `spawn`-based future here — see the
+            // comment above): abort is best-effort, the batch call runs to
+            // completion on the worker and its result is simply discarded.
+            sema_io::io_spawn_blocking(move || {
+                let responses = p2.batch_complete(reqs);
+                let _ = tx.send(responses);
+                sema_core::notify_io_complete();
+            });
+
+            let handle = Rc::new(sema_core::IoHandle::new(move || {
+                use tokio::sync::oneshot::error::TryRecvError;
+                match rx.try_recv() {
+                    Err(TryRecvError::Empty) => sema_core::IoPoll::Pending,
+                    Ok(responses) => {
+                        let mut results = Vec::with_capacity(responses.len());
+                        for resp_result in responses {
+                            let resp = match resp_result {
+                                Ok(r) => r,
+                                Err(e) => return sema_core::IoPoll::Ready(Err(e.to_string())),
+                            };
+                            // Fold into THIS call's captured accumulator frame, then
+                            // suppress `track_usage`'s own fold and re-install the
+                            // captured budget frame around it — the poller runs
+                            // outside the per-task install boundary, so the live
+                            // thread-locals may belong to a sibling task. Priced
+                            // with an empty provider, matching the sync path (which
+                            // never stamps a serving provider for `llm/batch`).
+                            if let Some(slot) = &usage_accum_slot {
+                                let cost = pricing::calculate_cost_for("", &resp.usage);
+                                accumulate_into(slot, &resp.usage, cost);
+                            }
+                            let track_result = {
+                                let prev_budget = ACTIVE_BUDGET.with(|b| {
+                                    std::mem::replace(&mut *b.borrow_mut(), budget_slot.clone())
+                                });
+                                let r = USAGE_ACCUM_SUPPRESS.with(|s| {
+                                    s.set(true);
+                                    let r = track_usage(&resp.usage);
+                                    s.set(false);
+                                    r
+                                });
+                                ACTIVE_BUDGET.with(|b| *b.borrow_mut() = prev_budget);
+                                r
+                            };
+                            if let Err(e) = track_result {
+                                return sema_core::IoPoll::Ready(Err(e.to_string()));
+                            }
+                            results.push(Value::string(&resp.content));
+                        }
+                        sema_core::IoPoll::Ready(Ok(Value::list(results)))
+                    }
+                    Err(TryRecvError::Closed) => {
+                        sema_core::IoPoll::Ready(Err("batch: worker dropped".to_string()))
+                    }
+                }
+            }));
+            sema_core::set_yield_signal(sema_core::YieldReason::AwaitIo(handle));
+            return Ok(Value::nil());
+        }
+
+        // ── SYNC path: inline provider call (byte-identical to before) ─────
         let responses = with_provider(|p| {
             let reqs: Vec<ChatRequest> = requests
                 .into_iter()
@@ -3558,6 +3758,12 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
     // Cross-encoder reranking. Returns a list of {:index :score :document}, highest
     // relevance first. `documents` is a list of strings.
     register_fn(env, "llm/rerank", |args| {
+        // On resume from the async yield the scheduler re-runs the bytecode AFTER
+        // this CALL via `replace_stack_top`, so this native is not re-invoked.
+        // Drain any stray resume value defensively (mirrors llm/embed).
+        if let Some(v) = sema_core::take_resume_value() {
+            return Ok(v);
+        }
         if args.len() < 2 || args.len() > 3 {
             return Err(SemaError::arity("llm/rerank", "2-3", args.len()));
         }
@@ -3590,16 +3796,118 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
                 .and_then(|p| p.as_keyword().or_else(|| p.as_str().map(|s| s.to_string())));
         }
 
+        let request = RerankRequest {
+            query: query.clone(),
+            documents: documents.clone(),
+            top_k,
+            model: model.clone(),
+        };
+
+        // ── ASYNC path: offload + yield (native targets only) ──────────────
+        //
+        // The concurrent rerank path is native-only (no shared tokio runtime on
+        // wasm), so wasm always falls through to the synchronous path below.
+        #[cfg(not(target_arch = "wasm32"))]
+        if sema_core::in_async_context() {
+            // DETACHED reranker span: parent captured now, finalized in the
+            // poller after the yield (where the active-span stack may hold a
+            // sibling task's span, so the span must not pop the stack on drop).
+            let span =
+                sema_otel::reranker_span_detached(&query, model.as_deref().unwrap_or(""), top_k);
+            span.set_input(&documents);
+
+            // Clone an Arc<provider> off the thread-local registry on THIS thread,
+            // release the borrow, and move it into the offloaded future.
+            let resolved_provider = PROVIDER_REGISTRY.with(|reg| {
+                let reg = reg.borrow();
+                match provider.as_deref() {
+                    Some(n) => reg
+                        .get(n)
+                        .ok_or_else(|| SemaError::Llm(format!("rerank provider '{n}' not found"))),
+                    None => reg
+                        .rerank_provider()
+                        .or_else(|| reg.default_provider())
+                        .ok_or_else(|| {
+                            SemaError::Llm(
+                            "no rerank provider configured — set COHERE_API_KEY, JINA_API_KEY, or \
+                             VOYAGE_API_KEY (or pass {:provider ...})"
+                                .to_string(),
+                        )
+                        }),
+                }
+            })?;
+
+            let (tx, mut rx) = tokio::sync::oneshot::channel::<Result<RerankResponse, LlmError>>();
+            let req2 = request.clone();
+            // Spawned pool future (the http/shell abort tier): providers with a
+            // native async rerank path (`rerank_future`) are dropped mid-flight on
+            // abort — true cancellation; sync-only providers fall back to the
+            // admission-controlled blocking tier, where cancel stays best-effort
+            // (result discarded, call runs to completion).
+            let abort = sema_io::io_spawn(async move {
+                let r = match resolved_provider.rerank_future(req2.clone()) {
+                    Some(fut) => fut.await,
+                    None => {
+                        let p = resolved_provider.clone();
+                        sema_io::io_offload_blocking(move || p.rerank(req2)).await
+                    }
+                };
+                let _ = tx.send(r);
+                sema_core::notify_io_complete();
+            });
+
+            // Move the span + documents INTO the poller closure so the reordered
+            // output and the final Value are built on the VM thread when the
+            // future lands — never as a native-frame local (those drop at yield).
+            let mut span_slot = Some(span);
+            let documents_for_poller = documents;
+            // On cancel/timeout the scheduler runs the abort hook, aborting the
+            // spawned wire future. Never called on normal completion.
+            let handle = Rc::new(sema_core::IoHandle::with_abort(
+                move || {
+                    use tokio::sync::oneshot::error::TryRecvError;
+                    match rx.try_recv() {
+                        Err(TryRecvError::Empty) => sema_core::IoPoll::Pending,
+                        Ok(Ok(resp)) => {
+                            if let Some(span) = span_slot.take() {
+                                let out_docs: Vec<(String, f64)> = resp
+                                    .results
+                                    .iter()
+                                    .filter_map(|r| {
+                                        documents_for_poller
+                                            .get(r.index)
+                                            .map(|d| (d.clone(), r.score))
+                                    })
+                                    .collect();
+                                span.set_output(&out_docs);
+                                // span drops here → ends the span.
+                            }
+                            let value = rerank_value_from_response(&resp, &documents_for_poller);
+                            sema_core::IoPoll::Ready(Ok(value))
+                        }
+                        Ok(Err(e)) => {
+                            if let Some(span) = span_slot.take() {
+                                span.record_error(llm_error_kind(&e), &e.to_string());
+                            }
+                            sema_core::IoPoll::Ready(Err(e.to_string()))
+                        }
+                        Err(TryRecvError::Closed) => {
+                            span_slot.take();
+                            sema_core::IoPoll::Ready(Err("rerank: io worker dropped".to_string()))
+                        }
+                    }
+                },
+                abort,
+            ));
+            sema_core::set_yield_signal(sema_core::YieldReason::AwaitIo(handle));
+            return Ok(Value::nil());
+        }
+
+        // ── SYNC path: inline provider call (byte-identical to before) ─────
         // OpenInference RERANKER span (no-op unless telemetry + compat are on).
         let span = sema_otel::reranker_span(&query, model.as_deref().unwrap_or(""), top_k);
         span.set_input(&documents);
 
-        let request = RerankRequest {
-            query,
-            documents: documents.clone(),
-            top_k,
-            model,
-        };
         let resp = with_rerank_provider(provider.as_deref(), |p| {
             p.rerank(request).map_err(|e| {
                 span.record_error(llm_error_kind(&e), &e.to_string());
@@ -3615,21 +3923,7 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
             .collect();
         span.set_output(&out_docs);
 
-        let out: Vec<Value> = resp
-            .results
-            .iter()
-            .map(|r| {
-                let mut m = BTreeMap::new();
-                m.insert(Value::keyword("index"), Value::int(r.index as i64));
-                m.insert(Value::keyword("score"), Value::float(r.score));
-                m.insert(
-                    Value::keyword("document"),
-                    Value::string(documents.get(r.index).map(|s| s.as_str()).unwrap_or("")),
-                );
-                Value::map(m)
-            })
-            .collect();
-        Ok(Value::list(out))
+        Ok(rerank_value_from_response(&resp, &documents))
     });
 
     // (llm/similarity vec1 vec2) — cosine similarity
@@ -4227,29 +4521,42 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
         request.max_tokens = max_tokens.or(Some(4096));
         request.system = Some(system_override);
 
+        // Build new conversation preserving the original system message (not the
+        // override). Shared by the sync and async paths — conversation state
+        // mutation (the history append) happens here, AFTER the response lands
+        // (on the VM thread in the async case), never inside the offload.
+        let finalize = move |response: ChatResponse| -> Result<Value, SemaError> {
+            let mut new_messages = conv.messages.clone();
+            new_messages.push(Message {
+                role: Role::User,
+                content: user_msg,
+                images: Vec::new(),
+            });
+            new_messages.push(Message {
+                role: Role::Assistant,
+                content: response.content,
+                images: Vec::new(),
+            });
+
+            let mut metadata = conv.metadata.clone();
+            accumulate_usage(&mut metadata, &response.usage);
+            Ok(Value::conversation(Conversation {
+                messages: new_messages,
+                model: conv.model.clone(),
+                metadata,
+            }))
+        };
+
+        // Inside a scheduler task: offload + yield so siblings overlap. Sync
+        // branch below is byte-identical to before. Mirrors `llm/complete`.
+        #[cfg(not(target_arch = "wasm32"))]
+        if sema_core::in_async_context() {
+            return do_complete_async_yield(request, Box::new(finalize));
+        }
+
         let response = do_complete(request)?;
         track_usage(&response.usage)?;
-
-        // Build new conversation preserving the original system message (not the override)
-        let mut new_messages = conv.messages.clone();
-        new_messages.push(Message {
-            role: Role::User,
-            content: user_msg,
-            images: Vec::new(),
-        });
-        new_messages.push(Message {
-            role: Role::Assistant,
-            content: response.content,
-            images: Vec::new(),
-        });
-
-        let mut metadata = conv.metadata.clone();
-        accumulate_usage(&mut metadata, &response.usage);
-        Ok(Value::conversation(Conversation {
-            messages: new_messages,
-            model: conv.model.clone(),
-            metadata,
-        }))
+        finalize(response)
     });
 
     // (conversation/token-count conv) — count total tokens in conversation messages
@@ -5425,6 +5732,16 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
         request.system = Some(system);
         request.max_tokens = Some(4096);
 
+        // Inside a scheduler task: offload + yield so siblings overlap. Sync
+        // branch below is byte-identical to before. Mirrors `llm/complete`.
+        #[cfg(not(target_arch = "wasm32"))]
+        if sema_core::in_async_context() {
+            return do_complete_async_yield(
+                request,
+                Box::new(|resp| Ok(Value::string(&resp.content))),
+            );
+        }
+
         let response = do_complete(request)?;
         track_usage(&response.usage)?;
         Ok(Value::string(&response.content))
@@ -5459,25 +5776,37 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
         let mut request = ChatRequest::new(model, messages);
         request.system = Some(system);
 
+        // Parse the comparison JSON out of the reply. Shared by the sync and
+        // async paths.
+        let parse_comparison = |response: ChatResponse| -> Result<Value, SemaError> {
+            let content = response.content.trim();
+            let json_str = if content.starts_with("```") {
+                content
+                    .trim_start_matches("```json")
+                    .trim_start_matches("```")
+                    .trim_end_matches("```")
+                    .trim()
+            } else {
+                content
+            };
+            let json: serde_json::Value = serde_json::from_str(json_str).map_err(|e| {
+                SemaError::Llm(format!(
+                    "failed to parse comparison JSON: {e}\nResponse: {content}"
+                ))
+            })?;
+            Ok(sema_core::json_to_value(&json))
+        };
+
+        // Inside a scheduler task: offload + yield so siblings overlap. Sync
+        // branch below is byte-identical to before. Mirrors `llm/complete`.
+        #[cfg(not(target_arch = "wasm32"))]
+        if sema_core::in_async_context() {
+            return do_complete_async_yield(request, Box::new(parse_comparison));
+        }
+
         let response = do_complete(request)?;
         track_usage(&response.usage)?;
-
-        let content = response.content.trim();
-        let json_str = if content.starts_with("```") {
-            content
-                .trim_start_matches("```json")
-                .trim_start_matches("```")
-                .trim_end_matches("```")
-                .trim()
-        } else {
-            content
-        };
-        let json: serde_json::Value = serde_json::from_str(json_str).map_err(|e| {
-            SemaError::Llm(format!(
-                "failed to parse comparison JSON: {e}\nResponse: {content}"
-            ))
-        })?;
-        Ok(sema_core::json_to_value(&json))
+        parse_comparison(response)
     });
 
     // (llm/io-sleep-once id [ms]) — AwaitIo spike leaf (NOT for production use).
@@ -5600,6 +5929,15 @@ fn complete_with_prompt(prompt: &Prompt, opts: Option<&Value>) -> Result<Value, 
 
     // Per-call observability tags/metadata (read inside do_complete's span).
     let _tele = install_call_telemetry(opts.and_then(|v| v.as_map_rc()).as_ref());
+
+    // Inside a scheduler task: offload + yield so siblings overlap (shared by
+    // `llm/send` and the Prompt-arg branch of `llm/complete`). Sync branch below
+    // is byte-identical to before. Mirrors `llm/complete`.
+    #[cfg(not(target_arch = "wasm32"))]
+    if sema_core::in_async_context() {
+        return do_complete_async_yield(request, Box::new(|resp| Ok(Value::string(&resp.content))));
+    }
+
     let response = do_complete(request)?;
     track_usage(&response.usage)?;
     Ok(Value::string(&response.content))
@@ -6305,7 +6643,10 @@ fn do_complete_async_yield(
 
     // ── Resolve the fallback chain (or default provider) into Arc clones ──
     // Done on the VM thread so the offloaded worker touches no thread-locals.
-    enforce_rate_limit();
+    // Reserve this call's rate-limit slot HERE, synchronously, before the
+    // offload starts (see `reserve_rate_limit_wait_ms`); the wait itself (if
+    // any) is spent inside the spawned future below, never on the VM thread.
+    let rate_limit_wait_ms = reserve_rate_limit_wait_ms();
     let max_retries = NETWORK_MAX_RETRIES.with(|c| c.get());
     // Capture the retry-backoff base on the VM thread so the offloaded wire
     // stage honors it (pool workers have their own RETRY_BASE_MS TLS copies) —
@@ -6383,6 +6724,13 @@ fn do_complete_async_yield(
     let abort = sema_io::io_spawn(async move {
         // Balance in-flight on EVERY exit — normal completion or abort-drop.
         let _inflight = inflight;
+        // Spend the reserved rate-limit pacing gap HERE, on the pool worker —
+        // never on the VM thread — so sibling tasks keep running while it
+        // elapses. An abort during this wait drops the whole future (dropping
+        // the sleep with it), same as an abort mid-request.
+        if rate_limit_wait_ms > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(rate_limit_wait_ms)).await;
+        }
         let r = run_fallback_retry_async(chain, req2, max_retries, retry_base_ms).await;
         let _ = tx.send(r);
         sema_core::notify_io_complete();
@@ -6662,6 +7010,28 @@ fn embed_value_from_response(resp: &EmbedResponse, single: bool) -> Value {
                 .collect(),
         )
     }
+}
+
+/// Encode a `RerankResponse`'s reordered results into the SAME `Value` the
+/// synchronous `llm/rerank` returns (a list of `{:index :score :document}`, highest
+/// relevance first), so the concurrent (async) and sync paths are byte-identical:
+/// both decode through here.
+fn rerank_value_from_response(resp: &RerankResponse, documents: &[String]) -> Value {
+    Value::list(
+        resp.results
+            .iter()
+            .map(|r| {
+                let mut m = BTreeMap::new();
+                m.insert(Value::keyword("index"), Value::int(r.index as i64));
+                m.insert(Value::keyword("score"), Value::float(r.score));
+                m.insert(
+                    Value::keyword("document"),
+                    Value::string(documents.get(r.index).map(|s| s.as_str()).unwrap_or("")),
+                );
+                Value::map(m)
+            })
+            .collect(),
+    )
 }
 
 /// Resolve the model id used for the cache key when the caller pinned none. With an
@@ -7356,6 +7726,68 @@ fn enforce_rate_limit() {
     }
 }
 
+/// Non-blocking counterpart to `enforce_rate_limit`, for the two async-path
+/// callers (`do_complete_async_yield`, `stream_run_begin`). Runs on the VM
+/// thread, synchronously, BEFORE the offload is dispatched — it never sleeps
+/// itself. It returns how many milliseconds THIS call's send must be delayed
+/// (0 if the gate is clear), and the caller is responsible for spending that
+/// delay somewhere that isn't the VM thread (a `tokio::time::sleep` inside the
+/// offloaded future, or a `std::thread::sleep` on a pool worker) so sibling
+/// tasks keep running while the pacing gap elapses.
+///
+/// Reserve-then-go: unlike `enforce_rate_limit` (which stamps `RATE_LIMIT_LAST`
+/// to the actual wall-clock time AFTER it wakes from its own blocking sleep),
+/// this stamps it to the RESERVED slot — which may be in the future — before
+/// returning. The scheduler is single-threaded, so a burst of async calls each
+/// run this function to completion, one at a time, in dispatch order; a later
+/// call in the same burst sees the earlier one's reservation already advanced
+/// and queues one interval further out. Without reserving up front, every call
+/// in the burst would read the same stale `RATE_LIMIT_LAST` (none of them have
+/// sent yet — their waits run on background workers) and compute the same
+/// wait, so they'd all fire together the instant it elapses instead of staying
+/// paced.
+fn reserve_rate_limit_wait_ms() -> u64 {
+    let rps = RATE_LIMIT_RPS.with(|r| r.get());
+    let Some(rps) = rps else {
+        return 0;
+    };
+    let min_interval_ms = (1000.0 / rps) as u64;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let last = RATE_LIMIT_LAST.with(|l| l.get());
+    // A `last` slot more than this far ahead of `now` cannot be a legitimate
+    // reservation queue — the wall clock jumped backward since it was
+    // stamped. Discard it, exactly like `enforce_rate_limit`'s
+    // `saturating_sub` guard for the same condition (see
+    // `enforce_rate_limit_survives_backward_clock`), so a corrupted `last`
+    // cannot wedge a call behind a real multi-minute wait. Scaled to
+    // `min_interval_ms` (floored at 60s) rather than a bare constant: a very
+    // low configured rps can legitimately reserve slots far ahead of `now`
+    // after just a few concurrent dispatches (e.g. 0.05 rps ⇒ 20s apart), and
+    // a fixed cap too close to one interval would misclassify that as clock
+    // skew and silently under-pace it.
+    const MIN_TRUSTED_RESERVATION_AHEAD_MS: u64 = 60_000;
+    let max_trusted_ahead_ms = min_interval_ms
+        .saturating_mul(4)
+        .max(MIN_TRUSTED_RESERVATION_AHEAD_MS);
+    let last = if last > now.saturating_add(max_trusted_ahead_ms) {
+        0
+    } else {
+        last
+    };
+    // No prior dispatch/reservation (or the stale value just discarded above):
+    // this call's slot is now — no wait, nothing to reserve ahead of `now`.
+    let slot = if last == 0 {
+        now
+    } else {
+        now.max(last.saturating_add(min_interval_ms))
+    };
+    RATE_LIMIT_LAST.with(|l| l.set(slot));
+    slot.saturating_sub(now)
+}
+
 /// Build ToolSchema list from Sema ToolDef values.
 fn build_tool_schemas(tools: &[Value]) -> Result<Vec<ToolSchema>, SemaError> {
     let mut schemas = Vec::new();
@@ -7910,6 +8342,140 @@ fn agent_begin(args: &[Value]) -> Result<Value, SemaError> {
     Ok(Value::int(token as i64))
 }
 
+/// `__chat-begin(messages, opts?) → token-int | nil`. The `:tools` twin of
+/// `__agent-begin`: `llm/chat` takes the full message list + tools/model/system
+/// inline per call — no defagent to unpack, no `:session`/`:memory` surface — so
+/// this builds the SAME `AgentLoopState` shape directly from the parsed args,
+/// mirroring `run_tool_loop`'s own setup (a caller-id-or-fresh conversation scope +
+/// a nameless agent span) rather than `agent_begin`'s (which threads a defagent's
+/// identity + `:session`/`:memory` resolution through). The options parsing below
+/// is intentionally byte-identical to `__llm-chat-blocking`'s.
+///
+/// Returns nil when no tool loop is needed — the same `tools.is_empty() ||
+/// tool_mode == "none"` condition `__llm-chat-blocking` checks — so the prelude
+/// dispatcher falls through to that native, which already offloads the
+/// plain-completion case in async context (WP-LLM-SIMPLE); nothing agent-loop
+/// specific (span, conversation scope, slab entry) is created on that path.
+/// `has_opts: false` unconditionally, so `__agent-finish` returns llm/chat's
+/// bare-string contract, never the `{:response ...}` agent envelope.
+fn chat_begin(args: &[Value]) -> Result<Value, SemaError> {
+    if args.is_empty() || args.len() > 2 {
+        return Err(SemaError::arity("llm/chat", "1-2", args.len()));
+    }
+    let messages = extract_messages(&args[0])?;
+
+    let mut model = String::new();
+    let mut max_tokens = None;
+    let mut temperature = None;
+    let mut system = None;
+    let mut reasoning_effort = None;
+    let mut tools: Vec<Value> = Vec::new();
+    let mut tool_mode = "auto".to_string();
+    let mut max_tool_rounds = 10usize;
+    let mut on_tool_call: Option<Value> = None;
+    let mut conv_scope = ConvScope::default();
+
+    let opts = args.get(1).and_then(|v| v.as_map_rc());
+    if let Some(ref o) = opts {
+        conv_scope = ConvScope::from_opts(Some(o));
+        model = get_opt_string(o, "model").unwrap_or_default();
+        max_tokens = get_opt_u32(o, "max-tokens");
+        temperature = get_opt_f64(o, "temperature");
+        system = get_opt_string(o, "system");
+        reasoning_effort = get_opt_effort(o, "reasoning-effort");
+        on_tool_call = o.get(&Value::keyword("on-tool-call")).cloned();
+        if let Some(t) = o.get(&Value::keyword("tools")).and_then(|v| v.as_seq()) {
+            tools = t.to_vec();
+        }
+        if let Some(mode) = o.get(&Value::keyword("tool-mode")) {
+            if let Some(s) = mode.as_keyword() {
+                tool_mode = s;
+            }
+        }
+        if let Some(rounds) = o.get(&Value::keyword("max-tool-rounds")) {
+            if let Some(n) = rounds.as_int() {
+                max_tool_rounds = n as usize;
+            }
+        }
+    }
+
+    if tools.is_empty() || tool_mode == "none" {
+        return Ok(Value::nil());
+    }
+
+    let tool_schemas = build_tool_schemas(&tools)?;
+    let first_input = messages
+        .iter()
+        .find(|m| m.role == "user")
+        .map(|m| m.content.to_text())
+        .unwrap_or_default();
+
+    // `run_tool_loop`'s own scope resolution (a caller-supplied id wins; otherwise
+    // a fresh one) — not `agent_begin`'s :session/:memory-aware precedence, which
+    // llm/chat has neither of.
+    let output_conv_id = conv_scope
+        .conversation
+        .clone()
+        .unwrap_or_else(sema_otel::new_conversation_id);
+    let conv_guard = Some(sema_otel::set_conversation_scope(
+        &output_conv_id,
+        conv_scope.session.as_deref(),
+        conv_scope.user.as_deref(),
+    ));
+    // Nameless agent span — matches `run_tool_loop`'s `agent_span(None)` call for
+    // llm/chat (only `agent/run` names the span after its defagent).
+    let agent_span = sema_otel::agent_span(None);
+    if let Some(o) = opts.as_ref() {
+        let tags = get_opt_string_list(o, "tags");
+        let meta = get_opt_str_map(o, "metadata");
+        if !tags.is_empty() {
+            agent_span.set_tags(&tags);
+        }
+        if !meta.is_empty() {
+            agent_span.set_metadata(&meta);
+        }
+    }
+
+    let agent_model = model.clone();
+    let state = AgentLoopState {
+        messages,
+        tools,
+        tool_schemas,
+        model,
+        max_tokens,
+        temperature,
+        system,
+        reasoning_effort,
+        on_tool_call,
+        on_text: None, // llm/chat doesn't stream
+        round: 0,
+        max_rounds: max_tool_rounds,
+        consecutive_errors: 0,
+        pending_tool_calls: Vec::new(),
+        last_content: String::new(),
+        first_input,
+        done: false,
+        abort_error: None,
+        final_pushed: false,
+        output_conv_id,
+        has_opts: false, // llm/chat always returns the bare completion string
+        memory_handle: None,
+        pre_user_count: 0,
+        agent_model,
+        agent_span: Some(agent_span),
+        conv_guard,
+        owning_task_id: sema_core::current_task_id(),
+    };
+
+    let token = AGENT_RUN_NEXT_ID.with(|c| {
+        let id = c.get();
+        c.set(id + 1);
+        id
+    });
+    AGENT_RUNS.with(|r| r.borrow_mut().insert(token, state));
+    Ok(Value::int(token as i64))
+}
+
 /// Apply one provider round's response to the loop state and return the driver's
 /// `{:done bool :has-tools bool}` map. Runs on the VM thread (either the poller after
 /// an async round, or inline for the synchronous fallback). Short-borrows the slab.
@@ -8419,16 +8985,22 @@ fn resolve_stream_chain() -> Result<Vec<ResolvedProvider>, SemaError> {
     })
 }
 
-/// Start a non-blocking stream run: budget pre-gate + rate limit, cassette
-/// decision on the VM thread (replay pre-fills the run — drained without
-/// parking; recording captures the key for finalize), chain resolution into
-/// `Arc` clones, then the wire walk offloaded onto the I/O pool with
-/// `notify_io_complete` after every send so the parked scheduler wakes per
-/// delta. `span` is the caller's DETACHED chat span (attributes already set);
-/// it is finalized when `Done` lands. Returns the slab token.
+/// Start a non-blocking stream run: budget pre-gate, cassette decision on the
+/// VM thread (replay pre-fills the run — drained without parking; recording
+/// captures the key for finalize), then — for a real dispatch only — the
+/// rate-limit gate, chain resolution into `Arc` clones, and the wire walk
+/// offloaded onto the I/O pool with `notify_io_complete` after every send so
+/// the parked scheduler wakes per delta. `span` is the caller's DETACHED chat
+/// span (attributes already set); it is finalized when `Done` lands. Returns
+/// the slab token.
+///
+/// The rate-limit gate sits AFTER the cassette decision (unlike the sync
+/// `stream_with_dispatch`, which always calls `enforce_rate_limit` up front):
+/// a replay makes no provider call, so — mirroring `do_complete_async_yield`'s
+/// cache/cassette-hit paths, which skip the gate entirely — it doesn't
+/// consume a pacing slot either.
 fn stream_run_begin(request: ChatRequest, span: sema_otel::LlmSpan) -> Result<Value, SemaError> {
     stream_budget_pregate()?;
-    enforce_rate_limit();
 
     // Keyed by the request as-is (no default-model resolution), matching the
     // synchronous `stream_with_cassette` so record/replay agree across paths.
@@ -8460,11 +9032,18 @@ fn stream_run_begin(request: ChatRequest, span: sema_otel::LlmSpan) -> Result<Va
     let rx = if prefilled {
         None
     } else {
+        // Reserve this dispatch's rate-limit slot HERE, synchronously, before
+        // the offload starts (see `reserve_rate_limit_wait_ms`). The wait
+        // itself is spent on the I/O pool worker below, never the VM thread.
+        let rate_limit_wait_ms = reserve_rate_limit_wait_ms();
         let chain = resolve_stream_chain()?;
         let (tx, rx) = std::sync::mpsc::channel::<StreamEvent>();
         #[cfg(not(target_arch = "wasm32"))]
         {
             sema_io::io_spawn_blocking(move || {
+                if rate_limit_wait_ms > 0 {
+                    std::thread::sleep(std::time::Duration::from_millis(rate_limit_wait_ms));
+                }
                 let mut emit = |ev: StreamEvent| {
                     let _ = tx.send(ev);
                     sema_core::notify_io_complete();
@@ -8476,6 +9055,11 @@ fn stream_run_begin(request: ChatRequest, span: sema_otel::LlmSpan) -> Result<Va
         {
             // No I/O pool on wasm: run the walk inline (blocking) — deltas are
             // delivered after the stream completes, in order, exactly once.
+            // Single-threaded (no siblings to stall), so the reserved wait is
+            // spent inline too, unlike the pool-offloaded path above.
+            if rate_limit_wait_ms > 0 {
+                sema_core::blocking_sleep_ms(rate_limit_wait_ms);
+            }
             let mut emit = |ev: StreamEvent| {
                 let _ = tx.send(ev);
             };
@@ -9223,6 +9807,58 @@ mod tests {
         assert!(
             start.elapsed() < std::time::Duration::from_secs(1),
             "backward clock should not cause a long sleep"
+        );
+        RATE_LIMIT_RPS.with(|r| r.set(None));
+        RATE_LIMIT_LAST.with(|l| l.set(0));
+    }
+
+    #[test]
+    fn reserve_rate_limit_wait_ms_stays_zero_with_no_gate() {
+        RATE_LIMIT_RPS.with(|r| r.set(None));
+        RATE_LIMIT_LAST.with(|l| l.set(0));
+        assert_eq!(reserve_rate_limit_wait_ms(), 0);
+    }
+
+    #[test]
+    fn reserve_rate_limit_wait_ms_stages_a_concurrent_burst() {
+        // Three back-to-back reservations at rps=10 (100ms interval) with no
+        // real time elapsing between them: the first is free, and each next
+        // one is pushed exactly one interval further out than the last —
+        // proving concurrent async dispatches get staggered instead of all
+        // computing the same wait against a stale `RATE_LIMIT_LAST`.
+        RATE_LIMIT_RPS.with(|r| r.set(Some(10.0)));
+        RATE_LIMIT_LAST.with(|l| l.set(0));
+        let first = reserve_rate_limit_wait_ms();
+        let second = reserve_rate_limit_wait_ms();
+        let third = reserve_rate_limit_wait_ms();
+        assert_eq!(first, 0, "no prior reservation: the gate is clear");
+        assert!(
+            (90..=110).contains(&second),
+            "second reservation should land ~100ms out, got {second}"
+        );
+        assert!(
+            (190..=210).contains(&third),
+            "third reservation should land ~200ms out, got {third}"
+        );
+        RATE_LIMIT_RPS.with(|r| r.set(None));
+        RATE_LIMIT_LAST.with(|l| l.set(0));
+    }
+
+    #[test]
+    fn reserve_rate_limit_wait_ms_survives_backward_clock() {
+        // Mirrors `enforce_rate_limit_survives_backward_clock`: a reserved slot
+        // far in the future (wall clock jumped backward since it was stamped)
+        // must not wedge this call behind a real multi-minute wait.
+        RATE_LIMIT_RPS.with(|r| r.set(Some(10.0)));
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        RATE_LIMIT_LAST.with(|l| l.set(now + 1_000_000));
+        let wait = reserve_rate_limit_wait_ms();
+        assert!(
+            wait < 1_000,
+            "backward clock should not produce a huge reserved wait, got {wait}ms"
         );
         RATE_LIMIT_RPS.with(|r| r.set(None));
         RATE_LIMIT_LAST.with(|l| l.set(0));

@@ -16,6 +16,12 @@ pub type BoxEmbedFuture<'a> = std::pin::Pin<
     Box<dyn std::future::Future<Output = Result<EmbedResponse, LlmError>> + Send + 'a>,
 >;
 
+/// The boxed future shape of [`LlmProvider::rerank_future`].
+#[cfg(not(target_arch = "wasm32"))]
+pub type BoxRerankFuture<'a> = std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<RerankResponse, LlmError>> + Send + 'a>,
+>;
+
 /// The core LLM provider trait. Sync interface — async internals are hidden —
 /// plus optional future-returning hooks (`complete_future` / `embed_future`)
 /// the async offload path uses to make cancellation REAL: an aborted spawned
@@ -48,6 +54,15 @@ pub trait LlmProvider: Send + Sync {
     /// `Some` = true-cancel / `None` = best-effort-blocking-fallback contract.
     #[cfg(not(target_arch = "wasm32"))]
     fn embed_future(&self, _request: EmbedRequest) -> Option<BoxEmbedFuture<'_>> {
+        None
+    }
+
+    /// Async reranking hook — the reranking counterpart of
+    /// [`complete_future`](Self::complete_future)/[`embed_future`](Self::embed_future),
+    /// with the same `Some` = true-cancel / `None` = best-effort-blocking-fallback
+    /// contract.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn rerank_future(&self, _request: RerankRequest) -> Option<BoxRerankFuture<'_>> {
         None
     }
 

@@ -251,6 +251,15 @@ impl LlmProvider for OpenAiCompatEmbeddingProvider {
             ))),
         }
     }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn rerank_future(
+        &self,
+        request: RerankRequest,
+    ) -> Option<crate::provider::BoxRerankFuture<'_>> {
+        let dialect = self.rerank?;
+        Some(Box::pin(self.rerank_async(request, dialect)))
+    }
 }
 
 /// Cohere embedding provider — unique API format.
@@ -390,5 +399,13 @@ impl LlmProvider for CohereEmbeddingProvider {
 
     fn rerank(&self, request: RerankRequest) -> Result<RerankResponse, LlmError> {
         sema_io::io_block_on(self.rerank_async(request))
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn rerank_future(
+        &self,
+        request: RerankRequest,
+    ) -> Option<crate::provider::BoxRerankFuture<'_>> {
+        Some(Box::pin(self.rerank_async(request)))
     }
 }

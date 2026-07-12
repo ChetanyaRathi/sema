@@ -198,3 +198,18 @@ sub-agent-reentrancy test (a tool that itself calls `agent/run`).
   offload's dispatch-time budget-frame `Rc` snapshot — enforcement crosses
   spawn+yield. Pinned by `budget_enforced_across_spawn_and_yield`
   (complete_async_test.rs); Step 7 is done, no separate PR needed.
+- ~~`llm/chat`-with-tools still calls the blocking `run_tool_loop`
+  unconditionally~~ **CLOSED 2026-07-12**: at archival time only `agent/run`
+  had actually shipped this dispatcher — Step 5's "`agent/run`/`llm/chat`
+  dispatch on `in_async_context()`" line above described `llm/chat` as done
+  ahead of the code landing, and a scheduler-blocking-natives audit (found
+  2026-07-10) confirmed the drift: `llm/chat`'s `:tools` branch still drove
+  the synchronous `run_tool_loop` for real, silently refreezing every sibling
+  task for a multi-round tool conversation. It now shares the identical
+  `__agent-begin/step/exec-tools/finish` machinery via a new `__chat-begin`
+  native (adapts raw messages/opts into an `AgentLoopState`, and
+  `__agent-finish` returns the bare completion string `llm/chat` promises
+  instead of the agent envelope); the synchronous/no-tools entry point was
+  renamed `__llm-chat-blocking`. The Sema-visible contract of `llm/chat`
+  (args, return shape, error behavior, tool-result correlation) is
+  unchanged. See the CHANGELOG `## Unreleased` entry.
