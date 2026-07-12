@@ -3051,7 +3051,7 @@
       "examples": [
         "(kv/close \"config\")"
       ],
-      "body": "Close a store, flushing data and freeing the handle. Returns `nil`.\n\n```sema\n(kv/close \"config\")\n```\n\nData is safe even without calling `kv/close` (every write already flushes), but closing frees memory and releases the store name."
+      "body": "Close a store, flushing data and freeing the handle. Returns `nil`.\n\n```sema\n(kv/close \"config\")\n```\n\nData is safe even without calling `kv/close` (every write already flushes), but closing frees memory and releases the store name.\n\nClosing a store with a `kv/set`/`kv/delete` flush in flight (a concurrent `async/spawn` call) fails with a busy error instead of racing the write — wait for it to resolve first. Closing a tombstoned store (one whose flush was cancelled mid-flight) is a no-op that frees the handle, so the same name can be `kv/open`ed again."
     },
     {
       "name": "kv/delete",
@@ -3061,7 +3061,7 @@
       "examples": [
         "(kv/delete \"config\" \"api-key\")  ; => #t\n(kv/delete \"config\" \"api-key\")  ; => #f (already deleted)"
       ],
-      "body": "Delete a key. Returns `#t` if the key existed, `#f` otherwise. Flushes to disk immediately.\n\n```sema\n(kv/delete \"config\" \"api-key\")  ; => #t\n(kv/delete \"config\" \"api-key\")  ; => #f (already deleted)\n```"
+      "body": "Delete a key. Returns `#t` if the key existed, `#f` otherwise. Flushes to disk immediately.\n\nConcurrent calls against the same store serialize: inside `async/spawn`, a call queues automatically behind any other `kv/set`/`kv/delete` flush already in flight on that store instead of racing the write-through. If a queued flush is cancelled before it completes, the store handle is tombstoned — every later `kv/*` call on it fails until `kv/close` frees the handle and it's reopened with `kv/open`.\n\n```sema\n(kv/delete \"config\" \"api-key\")  ; => #t\n(kv/delete \"config\" \"api-key\")  ; => #f (already deleted)\n```"
     },
     {
       "name": "kv/get",
@@ -3082,7 +3082,7 @@
       "examples": [
         "(kv/get \"config\" \"api-key\")  ; => \"sk-...\" or nil"
       ],
-      "body": "Get a value by key. Returns `nil` if the key doesn't exist.\n\n```sema\n(kv/get \"config\" \"api-key\")  ; => \"sk-...\" or nil\n```"
+      "body": "Get a value by key. Returns `nil` if the key doesn't exist.\n\nThis reads an in-memory field with no I/O, so it never offloads or queues — if the store has a `kv/set`/`kv/delete` flush in flight (e.g. a concurrent `async/spawn` call), it fails immediately with a busy error rather than waiting for it.\n\n```sema\n(kv/get \"config\" \"api-key\")  ; => \"sk-...\" or nil\n```"
     },
     {
       "name": "kv/keys",
@@ -3092,7 +3092,7 @@
       "examples": [
         "(kv/keys \"config\")  ; => (\"api-key\" \"retries\" \"tags\")"
       ],
-      "body": "List all keys in the store. Returns a list of strings.\n\n```sema\n(kv/keys \"config\")  ; => (\"api-key\" \"retries\" \"tags\")\n```"
+      "body": "List all keys in the store. Returns a list of strings.\n\nThis reads an in-memory field with no I/O, so it never offloads or queues — if the store has a `kv/set`/`kv/delete` flush in flight (e.g. a concurrent `async/spawn` call), it fails immediately with a busy error rather than waiting for it.\n\n```sema\n(kv/keys \"config\")  ; => (\"api-key\" \"retries\" \"tags\")\n```"
     },
     {
       "name": "kv/open",
@@ -3112,7 +3112,7 @@
       "examples": [
         "(kv/set \"config\" \"api-key\" \"sk-...\")\n(kv/set \"config\" \"retries\" 3)\n(kv/set \"config\" \"tags\" '(\"a\" \"b\" \"c\"))\n(kv/set \"config\" \"user\" {:name \"Alice\" :role \"admin\"})"
       ],
-      "body": "Set a key-value pair. The value is serialized as JSON. Returns the value. Flushes to disk immediately.\n\n```sema\n(kv/set \"config\" \"api-key\" \"sk-...\")\n(kv/set \"config\" \"retries\" 3)\n(kv/set \"config\" \"tags\" '(\"a\" \"b\" \"c\"))\n(kv/set \"config\" \"user\" {:name \"Alice\" :role \"admin\"})\n```"
+      "body": "Set a key-value pair. The value is serialized as JSON. Returns the value. Flushes to disk immediately.\n\nConcurrent calls against the same store serialize: inside `async/spawn`, a call queues automatically behind any other `kv/set`/`kv/delete` flush already in flight on that store instead of racing the write-through. If a queued flush is cancelled before it completes, the store handle is tombstoned — every later `kv/*` call on it fails until `kv/close` frees the handle and it's reopened with `kv/open`.\n\n```sema\n(kv/set \"config\" \"api-key\" \"sk-...\")\n(kv/set \"config\" \"retries\" 3)\n(kv/set \"config\" \"tags\" '(\"a\" \"b\" \"c\"))\n(kv/set \"config\" \"user\" {:name \"Alice\" :role \"admin\"})\n```"
     },
     {
       "name": "any",
