@@ -15,6 +15,15 @@ thread_local! {
     /// response, then omitted on subsequent requests so portable Sema code that
     /// sets `:temperature` keeps working without any change. See Phase 4 compat.
     static DROP_TEMPERATURE: RefCell<HashSet<String>> = RefCell::new(HashSet::new());
+
+    /// Models that reject a non-`none` `reasoning_effort` when function tools are
+    /// present on `/chat/completions` (gpt-5.6 and newer: "Function tools with
+    /// reasoning_effort are not supported … use /v1/responses or set
+    /// reasoning_effort to 'none'"). Learned at runtime from that 400, after
+    /// which we pin `reasoning_effort` to `none` for the model so a tool-using
+    /// agent keeps working. Reasoning + tools *and* a higher effort needs the
+    /// Responses API, which this provider does not yet speak.
+    static FORCE_EFFORT_NONE: RefCell<HashSet<String>> = RefCell::new(HashSet::new());
 }
 
 /// The official OpenAI API and Azure OpenAI require the gpt-5/o-series parameter
@@ -34,6 +43,28 @@ fn mentions_unsupported_temperature(body: &str) -> bool {
         && (lower.contains("not supported")
             || lower.contains("does not support")
             || lower.contains("unsupported"))
+}
+
+/// Detect the OpenAI 400 that rejects `reasoning_effort` alongside function
+/// tools on `/chat/completions` — e.g. "Function tools with reasoning_effort
+/// are not supported for gpt-5.6-luna in /v1/chat/completions. To use function
+/// tools, use /v1/responses or set reasoning_effort to 'none'."
+fn mentions_reasoning_effort_tools_conflict(body: &str) -> bool {
+    let lower = body.to_lowercase();
+    lower.contains("reasoning_effort")
+        && lower.contains("tool")
+        && (lower.contains("not supported") || lower.contains("/v1/responses"))
+}
+
+/// A request is a candidate for the reasoning_effort/tools retry only when it
+/// set a non-`none` effort against the official OpenAI endpoint — compat
+/// endpoints (Ollama/OpenRouter/…) don't raise this 400.
+fn wants_effort_retry(request: &ChatRequest, base_url: &str) -> bool {
+    is_official_openai_url(base_url)
+        && request
+            .reasoning_effort
+            .as_deref()
+            .is_some_and(|e| e != "none")
 }
 
 pub struct OpenAiProvider {
@@ -180,13 +211,20 @@ impl OpenAiProvider {
         } else {
             request.temperature
         };
+        // Pin reasoning_effort to `none` for models we've learned reject a
+        // non-none effort with tools on /chat/completions (see FORCE_EFFORT_NONE).
+        let reasoning_effort = if FORCE_EFFORT_NONE.with(|s| s.borrow().contains(&model)) {
+            Some("none".to_string())
+        } else {
+            request.reasoning_effort.clone()
+        };
 
         OpenAiRequest {
             model,
             messages,
             max_tokens,
             max_completion_tokens,
-            reasoning_effort: request.reasoning_effort.clone(),
+            reasoning_effort,
             temperature,
             tools,
             stop: request.stop_sequences.clone(),
@@ -652,6 +690,23 @@ impl LlmProvider for OpenAiProvider {
                 }
             }
         }
+        // Compat backstop: gpt-5.6+ reject a non-none reasoning_effort with tools
+        // on /chat/completions. Learn it per-model, pin effort to none, retry once.
+        if wants_effort_retry(&request, &self.base_url) {
+            if let Err(LlmError::Api {
+                status: 400,
+                message,
+            }) = &result
+            {
+                if mentions_reasoning_effort_tools_conflict(message) {
+                    let model = self.resolve_model(&request.model);
+                    FORCE_EFFORT_NONE.with(|s| s.borrow_mut().insert(model));
+                    let mut retry = request;
+                    retry.reasoning_effort = Some("none".to_string());
+                    return sema_io::io_block_on(self.complete_async(retry));
+                }
+            }
+        }
         result
     }
 
@@ -684,6 +739,24 @@ impl LlmProvider for OpenAiProvider {
                     }
                 }
             }
+            // Same reasoning_effort/tools backstop as `complete()`; the retried
+            // request pins effort to `none` itself (the future may resume on a
+            // different worker than the thread-local learn).
+            if wants_effort_retry(&request, &self.base_url) {
+                if let Err(LlmError::Api {
+                    status: 400,
+                    message,
+                }) = &result
+                {
+                    if mentions_reasoning_effort_tools_conflict(message) {
+                        let model = self.resolve_model(&request.model);
+                        FORCE_EFFORT_NONE.with(|s| s.borrow_mut().insert(model));
+                        let mut retry = request;
+                        retry.reasoning_effort = Some("none".to_string());
+                        return self.complete_async(retry).await;
+                    }
+                }
+            }
             result
         }))
     }
@@ -699,8 +772,28 @@ impl LlmProvider for OpenAiProvider {
         on_chunk: &mut dyn FnMut(&str) -> Result<(), LlmError>,
     ) -> Result<ChatResponse, LlmError> {
         // io_block_on drives ON THIS thread: `on_chunk` may touch non-Send Sema
-        // values and must never migrate to a pool worker.
-        sema_io::io_block_on(self.stream_complete_async(request, on_chunk))
+        // values and must never migrate to a pool worker. Two io_block_on calls
+        // below are STRICTLY SEQUENTIAL and NEVER NESTED (see `complete`).
+        let result = sema_io::io_block_on(self.stream_complete_async(request.clone(), on_chunk));
+        // Compat backstop: gpt-5.6+ reject a non-none reasoning_effort with tools
+        // on /chat/completions. The 400 lands before any chunk is emitted, so a
+        // retry with effort pinned to `none` can't double up on `on_chunk`.
+        if wants_effort_retry(&request, &self.base_url) {
+            if let Err(LlmError::Api {
+                status: 400,
+                message,
+            }) = &result
+            {
+                if mentions_reasoning_effort_tools_conflict(message) {
+                    let model = self.resolve_model(&request.model);
+                    FORCE_EFFORT_NONE.with(|s| s.borrow_mut().insert(model));
+                    let mut retry = request;
+                    retry.reasoning_effort = Some("none".to_string());
+                    return sema_io::io_block_on(self.stream_complete_async(retry, on_chunk));
+                }
+            }
+        }
+        result
     }
 
     fn batch_complete(&self, requests: Vec<ChatRequest>) -> Vec<Result<ChatResponse, LlmError>> {
@@ -804,6 +897,55 @@ mod tests {
             p.build_request_body(&r).reasoning_effort.as_deref(),
             Some("high")
         );
+    }
+
+    #[test]
+    fn detects_reasoning_effort_tools_400() {
+        assert!(mentions_reasoning_effort_tools_conflict(
+            "Function tools with reasoning_effort are not supported for gpt-5.6-luna in \
+             /v1/chat/completions. To use function tools, use /v1/responses or set \
+             reasoning_effort to 'none'."
+        ));
+        // Unrelated 400s must not trip it.
+        assert!(!mentions_reasoning_effort_tools_conflict(
+            "Unsupported parameter: 'temperature' is not supported with this model."
+        ));
+    }
+
+    #[test]
+    fn memoized_model_pins_effort_to_none() {
+        let p = OpenAiProvider::new("k".into(), None, None).unwrap();
+        let mut r = ChatRequest::new("gpt-5.6-luna".into(), vec![ChatMessage::new("user", "hi")]);
+        r.reasoning_effort = Some("high".into());
+        // Before learning: the requested effort is sent as-is.
+        assert_eq!(
+            p.build_request_body(&r).reasoning_effort.as_deref(),
+            Some("high")
+        );
+        // After learning the model rejects effort with tools: pinned to none.
+        FORCE_EFFORT_NONE.with(|s| s.borrow_mut().insert("gpt-5.6-luna".to_string()));
+        assert_eq!(
+            p.build_request_body(&r).reasoning_effort.as_deref(),
+            Some("none")
+        );
+        FORCE_EFFORT_NONE.with(|s| s.borrow_mut().clear());
+    }
+
+    #[test]
+    fn effort_retry_only_for_official_non_none() {
+        let official = OpenAiProvider::new("k".into(), None, None).unwrap();
+        let compat =
+            OpenAiProvider::new("k".into(), Some("http://localhost:1234/v1".into()), None).unwrap();
+        let mut r = ChatRequest::new("gpt-5.6-luna".into(), vec![ChatMessage::new("user", "hi")]);
+        r.reasoning_effort = Some("high".into());
+        assert!(wants_effort_retry(&r, &official.base_url));
+        // Compat endpoints don't raise this 400 — never retry there.
+        assert!(!wants_effort_retry(&r, &compat.base_url));
+        // Already `none`, or unset: nothing to retry.
+        r.reasoning_effort = Some("none".into());
+        assert!(!wants_effort_retry(&r, &official.base_url));
+        r.reasoning_effort = None;
+        assert!(!wants_effort_retry(&r, &official.base_url));
     }
 
     #[test]
