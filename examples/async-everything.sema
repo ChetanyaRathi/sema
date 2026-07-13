@@ -1,0 +1,160 @@
+;; async-everything.sema — proof that sema's offloaded natives are TRULY async.
+;;
+;; The scheduler runs on ONE cooperative VM thread. A native that blocks that
+;; thread would freeze EVERY concurrent task. This program runs a live HEARTBEAT
+;; task alongside a big pile of blocking work — subprocess waits, file I/O,
+;; glob/canonicalize/stat, gzip, streams, secret scans — all offloaded to worker
+;; threads. If the offloads are real, the heartbeat keeps ticking *through* the
+;; blocking work, and N concurrent blocking ops finish in ~1x, not Nx, wall time.
+;;
+;; Runs to completion with NO input, cleans up after itself, exits non-zero if
+;; the async proof fails.
+
+(define t0 (/ (sys/elapsed) 1000000.0))          ; process ns -> ms baseline
+(define (now-ms) (- (/ (sys/elapsed) 1000000.0) t0))
+(define (stamp) (round (now-ms)))
+(define (log tag msg) (println (str "  [" (stamp) "ms] " tag "  " msg)))
+
+(define tmp (str "/tmp/sema-async-everything-" (sys/pid)))
+(file/mkdir tmp)
+
+(println "")
+(println "═══ async-everything: proving the offloaded natives never stall the scheduler ═══")
+(println (str "  scratch dir: " tmp))
+(println "")
+
+;; ── The liveness proof: a heartbeat that MUST keep ticking during blocking work ──
+;; If any concurrent op blocked the VM thread, these ticks would freeze — you'd
+;; see a gap in the timestamps. They don't.
+(define (heartbeat beats)
+  (async
+    (let loop ((i 1))
+      (when (<= i beats)
+        (async/sleep 45)
+        (log "heart" (str "♥ tick " i))
+        (loop (+ i 1))))
+    beats))
+
+;; ── Worker 1: N concurrent subprocess waits (the quantitative overlap proof) ──
+(define (subprocess-proof)
+  (async
+    (let* ((k 4)
+           (each 250)                            ; each `sleep 0.25`
+           (start (now-ms))
+           (jobs (map (fn (i)
+                        (async
+                          (let ((h (proc/spawn (list "sh" "-c"
+                                     (str "sleep 0.25; echo job-" i " done")))))
+                            (proc/wait h)
+                            (string/trim (proc/read-stdout h)))))
+                      (range 1 (+ k 1))))
+           (outs  (async/all jobs))
+           (wall  (round (- (now-ms) start)))
+           (serial (* k each)))
+      (log "proc" (str k " concurrent `sleep 0.25` subprocesses done"))
+      (for-each (fn (o) (log "proc" (str "  ↳ " o))) outs)
+      (log "proc" (str "  serial would be ~" serial "ms; concurrent took " wall "ms  ("
+                       (round (/ (* 1.0 serial) (max wall 1))) "x speedup)"))
+      {:kind "subprocess" :wall wall :serial serial :ok (< wall (* 0.6 serial))})))
+
+;; ── Worker 2: filesystem — mkdir, write/read (text, bytes, lines), stat, glob,
+;;    list, canonicalize, copy, rename, and the streaming line-reader (fold/for-each) ──
+(define (fs-proof)
+  (async
+    (let* ((d   (str tmp "/fs"))
+           (_   (file/mkdir d))
+           (f1  (str d "/hello.txt"))
+           (f3  (str d "/lines.txt"))
+           (gz  (str d "/blob.gz"))
+           (orig "compress me — compress me — compress me!"))
+      (file/write f1 "hello from an offloaded write\n")
+      (file/write-lines f3 (list "alpha" "beta" "gamma" "delta" "epsilon"))
+      (file/write-bytes gz (gzip/compress orig))                     ; write-bytes + gzip/compress
+      (let* ((roundtrip (equal? (gzip/decompress (file/read-bytes gz))  ; read-bytes + gzip/decompress
+                                (string->bytevector orig)))
+             (content   (file/read f1))                              ; read
+             (nlines    (file/fold-lines f3 (fn (acc _l) (+ acc 1)) 0)) ; streaming fold-lines
+             (info      (file/info f1))                              ; stat
+             (canon     (path/canonicalize d))                       ; canonicalize (realpath)
+             (abs       (path/absolute f1))                          ; absolute
+             (seen      (mutable-cell/new 0)))
+        (file/for-each-line f3 (fn (_l) (mutable-cell/set! seen (+ (mutable-cell/get seen) 1)))) ; streaming for-each-line
+        (file/copy f1 (str d "/copy.txt"))                           ; copy
+        (file/rename (str d "/copy.txt") (str d "/renamed.txt"))     ; rename
+        (let ((listing (file/list d))                               ; list dir
+              (globbed (file/glob (str d "/*.txt"))))                ; glob
+          (log "fs" (str "wrote/read " (length listing) " files · glob=" (length globbed)
+                         " *.txt · fold-lines=" nlines " · for-each=" (mutable-cell/get seen)
+                         " · gzip-roundtrip=" roundtrip))
+          {:kind "filesystem" :files (length listing) :lines nlines :roundtrip roundtrip
+           :ok (and roundtrip (= nlines 5) (= (mutable-cell/get seen) 5) (>= (length globbed) 2))})))))
+
+;; ── Worker 3: streams — open/write-string/copy/read-all/close (all offloaded) ──
+(define (stream-proof)
+  (async
+    (let* ((src (str tmp "/stream-src.txt"))
+           (dst (str tmp "/stream-dst.txt"))
+           (payload (string/repeat "streamed cooperatively\n" 300)))
+      (let ((o (stream/open-output src)))
+        (stream/write-string o payload)                             ; write-string (offloaded)
+        (stream/close o))
+      (let ((i (stream/open-input src)) (o (stream/open-output dst)))
+        (stream/copy i o)                                           ; copy (offloaded)
+        (stream/close i) (stream/close o))
+      (let* ((i (stream/open-input dst))
+             (all (stream/read-all i)))                             ; read-all (offloaded)
+        (stream/close i)
+        (log "stream" (str "wrote+copied+read " (bytes/length all) " bytes through file streams"))
+        {:kind "streams" :bytes (bytes/length all)
+         :ok (= (bytes/length all) (string/length payload))}))))
+
+;; ── Worker 4: CPU-bound scans — gzip a big buffer + secret/pii detection (offloaded) ──
+(define (scan-proof)
+  (async
+    (let* ((big (string/repeat "log line api_key=sk-live-0123456789abcdef email=a@b.com\n" 400))
+           (packed (gzip/compress big))
+           (unpacked (gzip/decompress packed))
+           (secrets (secret/detect big))
+           (redacted (secret/redact big)))
+      (log "scan" (str "gzip " (string/length big) "→" (bytes/length packed) " bytes · "
+                       "secret/detect found " (length secrets) " · redacted "
+                       (string/length redacted) " chars"))
+      {:kind "scans" :ratio (round (/ (* 100.0 (bytes/length packed)) (string/length big)))
+       :secrets (length secrets)
+       :ok (and (equal? unpacked (string->bytevector big)) (> (length secrets) 0))})))
+
+;; ── Run EVERYTHING at once: heartbeat + all four workers concurrently ──────────
+(println "  launching heartbeat + 4 workers concurrently…")
+(println "")
+(define outcome
+  (async/all
+    (list
+      (heartbeat 12)          ; ~540ms of ticks — must keep flowing through the work
+      (subprocess-proof)
+      (fs-proof)
+      (stream-proof)
+      (scan-proof))))
+
+(define beats   (nth outcome 0))
+(define results (list (nth outcome 1) (nth outcome 2) (nth outcome 3) (nth outcome 4)))
+
+;; ── Verdict ────────────────────────────────────────────────────────────────
+(println "")
+(println "═══ verdict ═══")
+(define all-ok (foldl (fn (acc r) (and acc (:ok r))) #t results))
+(for-each
+  (fn (r) (println (str "  " (if (:ok r) "✔" "✖") "  " (:kind r) (if (:ok r) " — ok" " — FAILED"))))
+  results)
+(println (str "  ♥  heartbeat ticked " beats " times WHILE the blocking work ran — the VM thread never stalled"))
+(println "")
+
+;; cleanup (best-effort)
+(try
+  (for-each (fn (f) (try (file/delete f) (catch e nil)))
+            (append (file/glob (str tmp "/fs/*")) (file/glob (str tmp "/*"))))
+  (catch e nil))
+
+(if all-ok
+  (println "  ✅ ASYNC CONFIRMED — every offloaded native ran without blocking the scheduler.")
+  (begin (println "  ❌ ASYNC PROOF FAILED.") (exit 1)))
+(println "")

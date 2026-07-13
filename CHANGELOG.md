@@ -112,6 +112,28 @@
 
 ### Fixed
 
+- **Many more blocking natives are now scheduler-compatible under `async`.** A
+  native that ran a blocking syscall on the cooperative VM thread would freeze
+  every concurrent task; the offload pass (PR #119) is now extended to the
+  stragglers: `io/read-key` (was an untimed blocking stdin read), the serial
+  port ops (`serial/read-line`/`send`/`write`/`open`), `proc/write-stdin`,
+  `proc/close`, `pty/write`, `pty/close`, `stream/read-all`/`read-byte`/
+  `write-string`/`write-byte`, `gzip/compress`/`decompress`, the `secret`/`pii`
+  scanners, `term/spinner-stop`, and the `file/*` stat/`glob`/`list`/`mkdir`/
+  `rename`/`canonicalize`/`write-bytes`/`write-lines`/`load` family. Each gates
+  on `in_async_context()` and offloads the blocking work to a worker; top-level
+  (no scheduler) behavior is byte-for-byte unchanged.
+- **`file/for-each-line` / `file/fold-lines` / `file/fold-lines-bytes` stream
+  their file in offloaded chunks under `async`** (instead of blocking the VM
+  thread on the read), running the per-line callback back on the VM thread
+  between chunks. Landing this exposed and fixed two VM-level bugs in the
+  deferred-callback path: (1) a callback capturing a lexical **upvalue** read
+  `nil`, because it ran from an I/O poll after its owning task had suspended —
+  now the callback's open upvalues are snapshotted up front (while the owning VM
+  is current, as `async/spawn` already does); (2) invoking the callback tried to
+  `take` the async scheduler while it was already driving the poll (reproducible
+  under a concurrent nested `async/all`) — the callback now runs synchronously on
+  a foreign VM, never touching the scheduler.
 - **OpenAI `reasoning_effort` compat is smarter and no longer over-broad.**
   gpt-5.6+ reject a non-`none` `reasoning_effort` alongside function tools on
   `/chat/completions` ("use /v1/responses or set reasoning_effort to 'none'");

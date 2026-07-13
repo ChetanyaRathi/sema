@@ -22,6 +22,18 @@
 //! frees up, then spawns its own offload and switches to `Running` — all
 //! under the one `IoHandle` the yield armed. At top level (no scheduler) the
 //! sync path is unchanged: it blocks, exactly as before.
+//!
+//! `proc/write-stdin` and `proc/close` reuse the same `ProcSlot` CHECKOUT.
+//! `proc/write-stdin` mirrors `proc/wait`'s `Acquire`/`Running` shape
+//! exactly (see `WriteStdinPhase`/`poll_write_stdin`), offloading
+//! `sin.write_all(text) + flush()` — a large write to a child that isn't
+//! draining its stdin blocks in-kernel on the pipe buffer. `proc/close`
+//! checks its handle out synchronously (`kill()` is a signal send, not a
+//! wait, so that step stays on the VM thread — and a busy handle is a hard,
+//! immediate error, never a queue, matching the sync path), then reuses
+//! `spawn_proc_wait` itself to offload `child.wait()` + the pump-thread
+//! joins, discarding the reaped `Proc` on completion instead of
+//! reinstalling it (`proc/close` frees the slot).
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -393,6 +405,267 @@ fn proc_wait_async(id: i64) -> Result<Value, SemaError> {
     Ok(Value::nil())
 }
 
+/// What crosses the thread boundary from the offloaded `sin.write_all` +
+/// `flush` back to the poller: the reinstalled `Proc` plus the write
+/// outcome. Only `Send` data ever crosses — the bytes to write are copied
+/// into an owned `Vec<u8>` before the offload starts, never a `Value`.
+struct WriteOutcome {
+    proc: Proc,
+    result: Result<(), String>,
+}
+
+/// Move `proc`'s blocking `sin.write_all(text) + flush()` onto the I/O
+/// pool's blocking tier — a large write to a child that isn't draining its
+/// stdin blocks in-kernel on the pipe buffer, same tradeoff as
+/// `spawn_proc_wait`. `text` is a plain owned `Vec<u8>` so the closure stays
+/// `Send + 'static`.
+fn spawn_proc_write_stdin(
+    mut proc: Proc,
+    text: Vec<u8>,
+) -> tokio::sync::oneshot::Receiver<WriteOutcome> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    sema_io::io_spawn_blocking(move || {
+        let result = match proc.stdin.as_mut() {
+            Some(sin) => sin
+                .write_all(&text)
+                .and_then(|_| sin.flush())
+                .map_err(|e| format!("proc/write-stdin: {e}")),
+            None => Err("proc/write-stdin: stdin already closed".to_string()),
+        };
+        let _ = tx.send(WriteOutcome { proc, result });
+        // Wake the parked VM thread so it re-polls promptly.
+        sema_core::notify_io_complete();
+    });
+    rx
+}
+
+/// The two phases a `proc/write-stdin` `IoHandle` cycles through — same
+/// Acquire/Running shape as `WaitPhase` (see `poll_wait`), except `Acquire`
+/// also carries the pending bytes so they can be moved into the offload
+/// exactly once, on the transition into `Running`.
+enum WriteStdinPhase {
+    Acquire(Vec<u8>),
+    Running(tokio::sync::oneshot::Receiver<WriteOutcome>),
+}
+
+/// Poll (and drive) one `proc/write-stdin`'s `Acquire` → `Running` state
+/// machine. Mirrors `poll_wait` field-for-field.
+fn poll_write_stdin(id: i64, phase: &mut WriteStdinPhase) -> IoPoll {
+    use tokio::sync::oneshot::error::TryRecvError;
+    loop {
+        match phase {
+            WriteStdinPhase::Acquire(_) => {
+                enum Acquired {
+                    Not,
+                    Proc(Proc),
+                    Err(String),
+                }
+                let acquired = PROCS.with(|p| {
+                    let mut procs = p.borrow_mut();
+                    match procs.get_mut(&id) {
+                        Some(slot @ ProcSlot::Available(_)) => {
+                            let ProcSlot::Available(pr) =
+                                std::mem::replace(slot, ProcSlot::CheckedOut)
+                            else {
+                                unreachable!("just matched Available")
+                            };
+                            Acquired::Proc(pr)
+                        }
+                        Some(ProcSlot::CheckedOut) => Acquired::Not,
+                        Some(ProcSlot::Tombstone(msg)) => {
+                            Acquired::Err(tombstone_err("proc/write-stdin", id, msg).to_string())
+                        }
+                        None => Acquired::Err(missing_err("proc/write-stdin", id).to_string()),
+                    }
+                });
+                match acquired {
+                    Acquired::Not => return IoPoll::Pending,
+                    Acquired::Err(msg) => return IoPoll::Ready(Err(msg)),
+                    Acquired::Proc(pr) => {
+                        let WriteStdinPhase::Acquire(text) = phase else {
+                            unreachable!("just matched Acquire")
+                        };
+                        let text = std::mem::take(text);
+                        *phase = WriteStdinPhase::Running(spawn_proc_write_stdin(pr, text));
+                        // Fall through: poll the freshly spawned receiver
+                        // immediately instead of wasting a scheduler tick.
+                    }
+                }
+            }
+            WriteStdinPhase::Running(rx) => {
+                return match rx.try_recv() {
+                    Err(TryRecvError::Empty) => IoPoll::Pending,
+                    Ok(outcome) => {
+                        PROCS
+                            .with(|p| p.borrow_mut().insert(id, ProcSlot::Available(outcome.proc)));
+                        // MANDATORY lost-wakeup guard: a sibling queued on this
+                        // same handle (still in `Acquire`) may have polled
+                        // Pending earlier in this scheduler sweep — without
+                        // this it would park until an unrelated wakeup.
+                        sema_core::notify_io_complete();
+                        match outcome.result {
+                            Ok(()) => IoPoll::Ready(Ok(Value::nil())),
+                            Err(msg) => IoPoll::Ready(Err(SemaError::Io(msg).to_string())),
+                        }
+                    }
+                    Err(TryRecvError::Closed) => {
+                        PROCS.with(|p| {
+                            p.borrow_mut().insert(
+                                id,
+                                ProcSlot::Tombstone(
+                                    "the write-stdin worker terminated unexpectedly".to_string(),
+                                ),
+                            )
+                        });
+                        IoPoll::Ready(Err(
+                            "proc/write-stdin: subprocess write worker dropped".to_string()
+                        ))
+                    }
+                };
+            }
+        }
+    }
+}
+
+/// The async-context `proc/write-stdin` entry point: yields `AwaitIo` and
+/// lets the scheduler drive `poll_write_stdin` to completion instead of
+/// blocking the VM thread on `sin.write_all`.
+fn proc_write_stdin_async(id: i64, text: Vec<u8>) -> Result<Value, SemaError> {
+    if let Some(v) = sema_core::take_resume_value() {
+        return Ok(v);
+    }
+
+    let phase = Rc::new(RefCell::new(WriteStdinPhase::Acquire(text)));
+    let phase_for_poll = phase.clone();
+    let handle = Rc::new(IoHandle::with_abort(
+        move || poll_write_stdin(id, &mut phase_for_poll.borrow_mut()),
+        move || {
+            // Acquire-phase abort: no-op, nothing was checked out yet.
+            // Running-phase abort: best-effort, same tradeoff as
+            // `proc/wait`'s abort (see `spawn_proc_wait`'s doc comment) — the
+            // write may still be landing on the worker with no way to
+            // interrupt it.
+            if matches!(*phase.borrow(), WriteStdinPhase::Running(_)) {
+                PROCS.with(|p| {
+                    p.borrow_mut().insert(
+                        id,
+                        ProcSlot::Tombstone(
+                            "proc/write-stdin was cancelled while the write was in flight; \
+                             the write may have partially landed but this handle can no \
+                             longer reach it — proc/close frees the slot"
+                                .to_string(),
+                        ),
+                    );
+                });
+            }
+        },
+    ));
+    sema_core::set_yield_signal(sema_core::YieldReason::AwaitIo(handle));
+    Ok(Value::nil())
+}
+
+/// The state `proc/close`'s async offload passes through while its
+/// `spawn_proc_wait` offload (started right after the synchronous, non-
+/// blocking `kill()`) runs on the I/O pool. Unlike `proc/wait`'s
+/// `WaitPhase`, there is no `Acquire` retry here: `proc/close` never queues
+/// behind a busy handle — a handle a `proc/wait` already has checked out is
+/// a hard, immediate `busy_err`, exactly like the sync path.
+struct ClosePhase(tokio::sync::oneshot::Receiver<WaitOutcome>);
+
+/// Poll `proc/close`'s in-flight `spawn_proc_wait` offload to completion.
+fn poll_close(id: i64, phase: &mut ClosePhase) -> IoPoll {
+    use tokio::sync::oneshot::error::TryRecvError;
+    match phase.0.try_recv() {
+        Err(TryRecvError::Empty) => IoPoll::Pending,
+        Ok(_outcome) => {
+            // Unlike `proc/wait`, `proc/close` frees the slot instead of
+            // reinstalling it — the reaped `Proc` (pump threads already
+            // joined inside the offload) is simply dropped here, exactly
+            // like the sync path drops it after `procs.remove(&id)`.
+            PROCS.with(|p| {
+                p.borrow_mut().remove(&id);
+            });
+            sema_core::notify_io_complete();
+            IoPoll::Ready(Ok(Value::nil()))
+        }
+        Err(TryRecvError::Closed) => {
+            PROCS.with(|p| {
+                p.borrow_mut().insert(
+                    id,
+                    ProcSlot::Tombstone("the close worker terminated unexpectedly".to_string()),
+                )
+            });
+            IoPoll::Ready(Err("proc/close: subprocess wait worker dropped".to_string()))
+        }
+    }
+}
+
+/// The async-context `proc/close` entry point. Mirrors the sync path exactly
+/// up through `kill()` — checked out synchronously on the VM thread (`kill`
+/// is a signal send, not a wait, so this stays cheap), `busy_err` on a
+/// handle a `proc/wait` already has checked out, silent no-op on a
+/// `Tombstone`/missing handle — then offloads only the blocking
+/// `child.wait()` + pump-thread joins, reusing `spawn_proc_wait` exactly as
+/// `proc/wait` does instead of duplicating it.
+fn proc_close_async(id: i64) -> Result<Value, SemaError> {
+    if let Some(v) = sema_core::take_resume_value() {
+        return Ok(v);
+    }
+
+    let taken: Option<Proc> = PROCS.with(|p| -> Result<Option<Proc>, SemaError> {
+        let mut procs = p.borrow_mut();
+        if matches!(procs.get(&id), Some(ProcSlot::CheckedOut)) {
+            return Err(busy_err("proc/close", id));
+        }
+        Ok(match procs.remove(&id) {
+            Some(ProcSlot::Available(pr)) => Some(pr),
+            // Tombstone or missing: already unusable/gone — the sync path
+            // treats both as a silent no-op via the same unconditional
+            // `procs.remove(&id)`, so does this one.
+            _ => None,
+        })
+    })?;
+
+    let Some(mut pr) = taken else {
+        return Ok(Value::nil());
+    };
+
+    let _ = pr.child.kill(); // a signal send — cheap and non-blocking, not a wait
+
+    // Mark the slot busy for the offloaded wait+join's duration so a
+    // concurrent proc/* op on this id sees a clear "busy" error instead of
+    // racing the pump-thread join or seeing "missing handle" mid-reap.
+    PROCS.with(|p| {
+        p.borrow_mut().insert(id, ProcSlot::CheckedOut);
+    });
+
+    let phase = Rc::new(RefCell::new(ClosePhase(spawn_proc_wait(pr))));
+    let phase_for_poll = phase.clone();
+    let handle = Rc::new(IoHandle::with_abort(
+        move || poll_close(id, &mut phase_for_poll.borrow_mut()),
+        move || {
+            // Best-effort, same tradeoff as `proc/wait`'s abort (see
+            // `spawn_proc_wait`'s doc comment): the child is already killed,
+            // but its wait+join keeps running unattended inside
+            // `spawn_blocking` with no abort hook, so the slot is
+            // tombstoned rather than left `CheckedOut` forever.
+            PROCS.with(|p| {
+                p.borrow_mut().insert(
+                    id,
+                    ProcSlot::Tombstone(
+                        "proc/close was cancelled while reaping the killed process; the \
+                         process was already killed but this handle can no longer reach \
+                         it"
+                            .to_string(),
+                    ),
+                );
+            });
+        },
+    ));
+    sema_core::set_yield_signal(sema_core::YieldReason::AwaitIo(handle));
+    Ok(Value::nil())
+}
+
 pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
     crate::register_fn_gated(env, sandbox, Caps::PROCESS, "proc/spawn", spawn);
 
@@ -418,6 +691,9 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
         let text = args[1]
             .as_str()
             .ok_or_else(|| SemaError::type_error("string", args[1].type_name()))?;
+        if in_async_context() {
+            return proc_write_stdin_async(id, text.as_bytes().to_vec());
+        }
         with_proc("proc/write-stdin", id, |pr| match pr.stdin.as_mut() {
             Some(sin) => {
                 sin.write_all(text.as_bytes())
@@ -533,6 +809,9 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
     crate::register_fn_gated(env, sandbox, Caps::PROCESS, "proc/close", |args| {
         check_arity!(args, "proc/close", 1);
         let id = handle(args, 0)?;
+        if in_async_context() {
+            return proc_close_async(id);
+        }
         PROCS.with(|p| {
             let mut procs = p.borrow_mut();
             if matches!(procs.get(&id), Some(ProcSlot::CheckedOut)) {
@@ -630,5 +909,234 @@ mod tests {
         assert_eq!(first.as_int(), Some(7));
         assert_eq!(second.as_int(), Some(7));
         call(&e, "proc/close", &[h]);
+    }
+}
+
+/// Async-context coverage for the `proc/write-stdin` / `proc/close`
+/// scheduler offloads added to this file. `sema-stdlib` doesn't depend on
+/// `sema-vm`/`sema-eval` (the real scheduler + interpreter live there), so
+/// these tests stand in for the scheduler by hand: force
+/// `sema_core::in_async_context()` on, call the native, then poll the
+/// `AwaitIo` handle it arms to completion — exactly what the scheduler does
+/// in production, just single-threaded and synchronous here. Mirrors
+/// `io.rs`'s `async_offload_tests` module.
+#[cfg(test)]
+mod async_offload_tests {
+    use super::*;
+    use sema_core::{EvalContext, Sandbox};
+    use std::time::{Duration, Instant};
+
+    /// Forces `in_async_context()` on for the guard's lifetime, resetting it
+    /// (even on panic/early return) so a failure can't leak the flag into
+    /// whichever test the harness runs next on the same worker thread —
+    /// mirrors `io.rs`'s `AsyncCtxGuard`.
+    struct AsyncCtxGuard;
+    impl Drop for AsyncCtxGuard {
+        fn drop(&mut self) {
+            sema_core::set_async_context(false);
+        }
+    }
+
+    fn env() -> sema_core::Env {
+        let e = sema_core::Env::new();
+        register(&e, &Sandbox::allow_all());
+        e
+    }
+
+    fn call_sync(env: &sema_core::Env, name: &str, args: &[Value]) -> Value {
+        let f = env.get_str(name).expect("fn registered");
+        let nf = f.as_native_fn_ref().expect("native fn");
+        (nf.func)(&EvalContext::default(), args).expect("sync call ok")
+    }
+
+    /// Call a native fn with the async-context gate forced on, then drive
+    /// the `AwaitIo` handle it arms to completion by polling. Panics if the
+    /// native didn't yield at all (e.g. it silently took the sync fallback)
+    /// or the offload rejects.
+    fn drive_async(env: &sema_core::Env, name: &str, args: &[Value]) -> Value {
+        let _guard = AsyncCtxGuard;
+        sema_core::set_async_context(true);
+        let f = env.get_str(name).expect("fn registered");
+        let nf = f.as_native_fn_ref().expect("native fn");
+        let armed = (nf.func)(&EvalContext::default(), args)
+            .expect("native call should arm a yield, not error synchronously");
+        assert_eq!(
+            armed,
+            Value::nil(),
+            "an offloading native returns nil immediately after arming its yield signal"
+        );
+        let reason = sema_core::take_yield_signal()
+            .expect("expected a yield signal to be armed — did the native take the sync path?");
+        let handle = match reason {
+            sema_core::YieldReason::AwaitIo(h) => h,
+            other => panic!("expected an AwaitIo yield, got {other:?}"),
+        };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            match handle.poll() {
+                sema_core::IoPoll::Ready(Ok(v)) => return v,
+                sema_core::IoPoll::Ready(Err(e)) => panic!("offload rejected: {e}"),
+                sema_core::IoPoll::Pending => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "offload never completed within 10s"
+                    );
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+            }
+        }
+    }
+
+    /// `proc/write-stdin` offloads in async context and the write still
+    /// lands: a `cat` child echoes back exactly what was written, round-
+    /// tripped entirely through the async path (write, then — back at top
+    /// level — close-stdin/wait/read to observe the result).
+    #[test]
+    fn write_stdin_offloads_and_echoes_async() {
+        let e = env();
+        let h = call_sync(&e, "proc/spawn", &[Value::list(vec![Value::string("cat")])]);
+
+        let result = drive_async(
+            &e,
+            "proc/write-stdin",
+            &[h.clone(), Value::string("ping\n")],
+        );
+        assert_eq!(result, Value::nil());
+
+        // Back at top level: close stdin to send EOF, wait, then read —
+        // proving the offloaded write actually reached the child.
+        call_sync(&e, "proc/close-stdin", &[h.clone()]);
+        let code = call_sync(&e, "proc/wait", &[h.clone()]);
+        assert_eq!(code.as_int(), Some(0));
+        assert_eq!(
+            call_sync(&e, "proc/read-stdout", &[h.clone()]).as_str(),
+            Some("ping\n")
+        );
+        call_sync(&e, "proc/close", &[h]);
+    }
+
+    /// `proc/write-stdin` in async context on a handle with stdin already
+    /// closed rejects with the same message the sync path uses, just
+    /// delivered through the offload's `Ready(Err(..))` instead of a
+    /// direct `Result::Err`.
+    #[test]
+    fn write_stdin_after_close_stdin_errors_async() {
+        let e = env();
+        let h = call_sync(&e, "proc/spawn", &[Value::list(vec![Value::string("cat")])]);
+        call_sync(&e, "proc/close-stdin", &[h.clone()]);
+
+        let _guard = AsyncCtxGuard;
+        sema_core::set_async_context(true);
+        let f = e.get_str("proc/write-stdin").expect("fn registered");
+        let nf = f.as_native_fn_ref().expect("native fn");
+        let armed = (nf.func)(
+            &EvalContext::default(),
+            &[h.clone(), Value::string("nope")],
+        )
+        .expect("arms a yield");
+        assert_eq!(armed, Value::nil());
+        let reason = sema_core::take_yield_signal().expect("yield armed");
+        let handle = match reason {
+            sema_core::YieldReason::AwaitIo(h) => h,
+            other => panic!("expected AwaitIo, got {other:?}"),
+        };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let err = loop {
+            match handle.poll() {
+                sema_core::IoPoll::Ready(Err(e)) => break e,
+                sema_core::IoPoll::Ready(Ok(v)) => panic!("expected an error, got {v:?}"),
+                sema_core::IoPoll::Pending => {
+                    assert!(Instant::now() < deadline, "never completed within 10s");
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+            }
+        };
+        assert!(
+            err.contains("stdin already closed"),
+            "unexpected error: {err}"
+        );
+        sema_core::set_async_context(false);
+        call_sync(&e, "proc/kill", &[h.clone()]);
+        call_sync(&e, "proc/close", &[h]);
+    }
+
+    /// `proc/close` offloads `child.kill()` + `child.wait()` in async
+    /// context and still frees the registry slot: a follow-up `proc/*` op
+    /// on the same handle sees "no such handle", exactly like the sync
+    /// path leaves it.
+    #[test]
+    fn close_offloads_kill_and_wait_async() {
+        let e = env();
+        let h = call_sync(
+            &e,
+            "proc/spawn",
+            &[Value::list(vec![
+                Value::string("sh"),
+                Value::string("-c"),
+                Value::string("sleep 30"),
+            ])],
+        );
+
+        let result = drive_async(&e, "proc/close", &[h.clone()]);
+        assert_eq!(result, Value::nil());
+
+        // The slot is freed — a following sync op errors "no such handle",
+        // same as the sync `proc/close` path leaves it.
+        let f = e.get_str("proc/read-stdout").expect("fn registered");
+        let nf = f.as_native_fn_ref().expect("native fn");
+        let err = (nf.func)(&EvalContext::default(), &[h])
+            .expect_err("handle should be freed after close");
+        assert!(
+            err.to_string().contains("no such handle"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// `proc/close` in async context on a handle a `proc/wait` already has
+    /// checked out is a hard, immediate `busy` error — never a queue —
+    /// exactly matching the sync path (see the module doc comment).
+    #[test]
+    fn close_on_checked_out_handle_errors_immediately_async() {
+        let e = env();
+        let h = call_sync(
+            &e,
+            "proc/spawn",
+            &[Value::list(vec![
+                Value::string("sh"),
+                Value::string("-c"),
+                Value::string("sleep 30"),
+            ])],
+        );
+        let id = h.as_int().expect("int handle");
+
+        // Simulate a proc/wait offload in flight by hand: check the real
+        // Proc out (keeping it alive locally, not dropped) and leave
+        // `CheckedOut` behind, exactly like `poll_wait`'s Acquire phase
+        // does mid-offload.
+        let checked_out = PROCS.with(|p| {
+            let mut procs = p.borrow_mut();
+            match procs.insert(id, ProcSlot::CheckedOut) {
+                Some(ProcSlot::Available(pr)) => pr,
+                _ => panic!("expected a freshly spawned Available slot"),
+            }
+        });
+
+        let _guard = AsyncCtxGuard;
+        sema_core::set_async_context(true);
+        let f = e.get_str("proc/close").expect("fn registered");
+        let nf = f.as_native_fn_ref().expect("native fn");
+        let err = (nf.func)(&EvalContext::default(), &[h.clone()])
+            .expect_err("busy handle should error immediately, not yield");
+        assert!(
+            err.to_string().contains("busy"),
+            "unexpected error: {err}"
+        );
+        sema_core::set_async_context(false);
+
+        // Reinstall the real Proc and clean up through the normal sync path.
+        PROCS.with(|p| {
+            p.borrow_mut().insert(id, ProcSlot::Available(checked_out));
+        });
+        call_sync(&e, "proc/close", &[h]);
     }
 }
