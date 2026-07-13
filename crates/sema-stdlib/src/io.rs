@@ -86,6 +86,19 @@ fn mods_list(bits: u32) -> Option<Value> {
     if bits & 8 != 0 {
         v.push(Value::keyword("super"));
     }
+    // Extended kitty modifiers (only reported under the kitty protocol).
+    if bits & 16 != 0 {
+        v.push(Value::keyword("hyper"));
+    }
+    if bits & 32 != 0 {
+        v.push(Value::keyword("meta"));
+    }
+    if bits & 64 != 0 {
+        v.push(Value::keyword("caps-lock"));
+    }
+    if bits & 128 != 0 {
+        v.push(Value::keyword("num-lock"));
+    }
     if v.is_empty() {
         None
     } else {
@@ -162,15 +175,23 @@ fn decode_kitty(csi: &[u8]) -> Value {
     let mods_sec = sections.next().unwrap_or("");
     let text_sec = sections.next().unwrap_or("");
 
-    let cp: u32 = key_sec.split(':').next().unwrap_or("").parse().unwrap_or(0);
-    // kitty encodes modifiers as (bitmask + 1); subtract before decoding.
-    let mbits = mods_sec
-        .split(':')
+    // key section: unicode-codepoint[:shifted-codepoint[:base-layout-codepoint]]
+    // (the alternates arrive only under the "report alternate keys" flag).
+    let mut key_parts = key_sec.split(':');
+    let cp: u32 = key_parts.next().unwrap_or("").parse().unwrap_or(0);
+    let shifted_cp = key_parts.next().and_then(|s| s.parse::<u32>().ok());
+    let base_cp = key_parts.next().and_then(|s| s.parse::<u32>().ok());
+    // mods section: modifiers[:event-type]. kitty encodes modifiers as (bitmask+1).
+    let mut mod_parts = mods_sec.split(':');
+    let mbits = mod_parts
         .next()
         .unwrap_or("")
         .parse::<u32>()
         .unwrap_or(0)
         .saturating_sub(1);
+    // event-type 1=press (default), 2=repeat, 3=release — present only under the
+    // "report event types" flag (bit 2).
+    let event_type = mod_parts.next().and_then(|s| s.parse::<u32>().ok());
     // Associated text (flag 16): the definitive character when present.
     let text: Option<String> = {
         let s: String = text_sec
@@ -223,6 +244,25 @@ fn decode_kitty(csi: &[u8]) -> Value {
         m.insert(Value::keyword("kind"), Value::keyword("char"));
         m.insert(Value::keyword("char"), Value::string(&ch));
     }
+    if let Some(et) = event_type {
+        m.insert(
+            Value::keyword("event"),
+            Value::keyword(match et {
+                2 => "repeat",
+                3 => "release",
+                _ => "press",
+            }),
+        );
+    }
+    if let Some(sc) = shifted_cp.and_then(char::from_u32) {
+        m.insert(
+            Value::keyword("shifted-key"),
+            Value::string(&sc.to_string()),
+        );
+    }
+    if let Some(bc) = base_cp.and_then(char::from_u32) {
+        m.insert(Value::keyword("base-key"), Value::string(&bc.to_string()));
+    }
     if let Some(mods) = mods_list(mbits) {
         m.insert(Value::keyword("mods"), mods);
     }
@@ -254,10 +294,30 @@ fn parse_legacy_csi(csi: &[u8]) -> (&'static str, u32) {
         b'H' => "home",
         b'F' => "end",
         b'Z' => "shift-tab",
+        // Modified F1/F2/F4 arrive as CSI `1;<mod>P/Q/S`. (F3's `…R` form is
+        // ambiguous with the cursor-position report, which is decoded upstream.)
+        b'P' => "f1",
+        b'Q' => "f2",
+        b'S' => "f4",
         b'~' => match first {
+            b"1" | b"7" => "home",
+            b"2" => "insert",
             b"3" => "delete",
+            b"4" | b"8" => "end",
             b"5" => "page-up",
             b"6" => "page-down",
+            b"11" => "f1",
+            b"12" => "f2",
+            b"13" => "f3",
+            b"14" => "f4",
+            b"15" => "f5",
+            b"17" => "f6",
+            b"18" => "f7",
+            b"19" => "f8",
+            b"20" => "f9",
+            b"21" => "f10",
+            b"23" => "f11",
+            b"24" => "f12",
             _ => "unknown",
         },
         _ => "unknown",
@@ -286,6 +346,372 @@ mod legacy_csi_tests {
         assert_eq!(parse_legacy_csi(b"1;5C"), ("right", 4)); // ctrl
         assert_eq!(parse_legacy_csi(b"3;3~"), ("delete", 2)); // alt+delete
     }
+
+    #[test]
+    fn function_and_nav_keys() {
+        assert_eq!(parse_legacy_csi(b"2~"), ("insert", 0));
+        assert_eq!(parse_legacy_csi(b"1~"), ("home", 0));
+        assert_eq!(parse_legacy_csi(b"7~"), ("home", 0));
+        assert_eq!(parse_legacy_csi(b"4~"), ("end", 0));
+        assert_eq!(parse_legacy_csi(b"8~"), ("end", 0));
+        assert_eq!(parse_legacy_csi(b"15~"), ("f5", 0));
+        assert_eq!(parse_legacy_csi(b"21~"), ("f10", 0));
+        assert_eq!(parse_legacy_csi(b"24~"), ("f12", 0));
+        assert_eq!(parse_legacy_csi(b"1;2P"), ("f1", 1)); // shift+F1
+        assert_eq!(parse_legacy_csi(b"15;5~"), ("f5", 4)); // ctrl+F5
+    }
+}
+
+#[cfg(all(test, unix))]
+mod terminal_response_tests {
+    use super::*;
+
+    fn kw(m: &Value, k: &str) -> Option<Value> {
+        m.as_map_ref()
+            .and_then(|mm| mm.get(&Value::keyword(k)).cloned())
+    }
+    fn is_kw(m: &Value, k: &str, want: &str) -> bool {
+        kw(m, k) == Some(Value::keyword(want))
+    }
+    fn mods_of(m: &Value) -> Vec<String> {
+        kw(m, "mods")
+            .and_then(|v| v.as_list().map(|l| l.to_vec()))
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|k| k.as_keyword().map(|s| s.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn cursor_position_report() {
+        let m = decode_cpr(b"12;40R");
+        assert!(is_kw(&m, "kind", "cpr"));
+        assert_eq!(kw(&m, "row"), Some(Value::int(12)));
+        assert_eq!(kw(&m, "col"), Some(Value::int(40)));
+    }
+
+    #[test]
+    fn device_attributes_primary_and_secondary() {
+        let p = decode_device_attributes(b"?1;2c", b'?');
+        assert!(is_kw(&p, "kind", "device-attributes"));
+        assert!(is_kw(&p, "device", "primary"));
+        assert!(is_kw(
+            &decode_device_attributes(b">0;95;0c", b'>'),
+            "device",
+            "secondary"
+        ));
+    }
+
+    #[test]
+    fn kitty_flags_reply() {
+        let m = decode_kitty_flags(b"?15u");
+        assert!(is_kw(&m, "kind", "kitty-flags"));
+        assert_eq!(kw(&m, "flags"), Some(Value::int(15)));
+    }
+
+    #[test]
+    fn modify_other_keys_ctrl_tab() {
+        let m = decode_modify_other_keys(b"27;5;9~"); // ctrl + tab(9)
+        assert!(is_kw(&m, "kind", "key"));
+        assert!(is_kw(&m, "name", "tab"));
+        assert_eq!(mods_of(&m), vec!["ctrl"]);
+    }
+
+    #[test]
+    fn kitty_event_type_and_extended_mods() {
+        let rel = decode_kitty(b"97;1:3u"); // 'a', no mods, event 3 = release
+        assert!(is_kw(&rel, "kind", "char"));
+        assert_eq!(kw(&rel, "char"), Some(Value::string("a")));
+        assert!(is_kw(&rel, "event", "release"));
+        let sup = decode_kitty(b"97;9u"); // 'a', mods raw9-1=8 = super
+        assert_eq!(mods_of(&sup), vec!["super"]);
+    }
+
+    #[test]
+    fn focus_events() {
+        assert!(is_kw(&focus_event(true), "kind", "focus"));
+        assert_eq!(kw(&focus_event(true), "focused"), Some(Value::bool(true)));
+        assert_eq!(kw(&focus_event(false), "focused"), Some(Value::bool(false)));
+    }
+}
+
+/// Read the continuation bytes of a UTF-8 character whose lead byte is `lead`,
+/// returning the decoded string ("?" on invalid UTF-8). A single-byte ASCII
+/// lead returns that char unchanged, so this also covers Alt+ASCII.
+#[cfg(unix)]
+fn read_utf8_char(lead: u8) -> Result<String, SemaError> {
+    let extra = if lead & 0xe0 == 0xc0 {
+        1usize
+    } else if lead & 0xf0 == 0xe0 {
+        2
+    } else if lead & 0xf8 == 0xf0 {
+        3
+    } else {
+        0
+    };
+    let mut bytes = vec![lead];
+    for _ in 0..extra {
+        // Wait up to 20ms for continuation bytes (handles slow pipes / heavy load).
+        if !unix_stdin_ready(20) {
+            break;
+        }
+        match read_one_byte().map_err(|e| SemaError::Io(format!("io/read-key: {e}")))? {
+            None => break,
+            Some(ch) => bytes.push(ch),
+        }
+    }
+    Ok(std::str::from_utf8(&bytes)
+        .map(|s| s.to_string())
+        .unwrap_or_else(|_| "?".to_string()))
+}
+
+/// `{:kind :focus :focused <bool>}` — a terminal focus in/out report (enabled
+/// via `term/enable-focus-events`).
+#[cfg(unix)]
+fn focus_event(focused: bool) -> Value {
+    let mut m = std::collections::BTreeMap::new();
+    m.insert(Value::keyword("kind"), Value::keyword("focus"));
+    m.insert(Value::keyword("focused"), Value::bool(focused));
+    Value::map(m)
+}
+
+/// Split a CSI body (minus the final byte, with an optional leading marker
+/// stripped) into its `;`-separated integer parameters.
+#[cfg(unix)]
+fn csi_params(body: &[u8]) -> Vec<u32> {
+    std::str::from_utf8(body)
+        .unwrap_or("")
+        .split(';')
+        .map(|s| s.parse::<u32>().unwrap_or(0))
+        .collect()
+}
+
+/// `{:kind :cpr :row R :col C}` — a cursor-position report (`ESC[row;colR`),
+/// the reply to a DSR `ESC[6n` query.
+#[cfg(unix)]
+fn decode_cpr(csi: &[u8]) -> Value {
+    let p = csi_params(&csi[..csi.len().saturating_sub(1)]);
+    let mut m = std::collections::BTreeMap::new();
+    m.insert(Value::keyword("kind"), Value::keyword("cpr"));
+    m.insert(
+        Value::keyword("row"),
+        Value::int(p.first().copied().unwrap_or(0) as i64),
+    );
+    m.insert(
+        Value::keyword("col"),
+        Value::int(p.get(1).copied().unwrap_or(0) as i64),
+    );
+    Value::map(m)
+}
+
+/// `{:kind :device-attributes :device :primary|:secondary :params (…)}` — a DA1
+/// (`ESC[?…c`) or DA2 (`ESC[>…c`) reply.
+#[cfg(unix)]
+fn decode_device_attributes(csi: &[u8], first: u8) -> Value {
+    // strip the leading marker (`?` or `>`) and the final `c`.
+    let body = &csi[1..csi.len().saturating_sub(1)];
+    let params: Vec<Value> = csi_params(body)
+        .into_iter()
+        .map(|n| Value::int(n as i64))
+        .collect();
+    let mut m = std::collections::BTreeMap::new();
+    m.insert(Value::keyword("kind"), Value::keyword("device-attributes"));
+    m.insert(
+        Value::keyword("device"),
+        Value::keyword(if first == b'>' {
+            "secondary"
+        } else {
+            "primary"
+        }),
+    );
+    m.insert(Value::keyword("params"), Value::list(params));
+    Value::map(m)
+}
+
+/// `{:kind :kitty-flags :flags N}` — the reply to a `CSI ?u` progressive-
+/// enhancement query (`ESC[?<flags>u`).
+#[cfg(unix)]
+fn decode_kitty_flags(csi: &[u8]) -> Value {
+    // strip leading `?` and final `u`.
+    let body = &csi[1..csi.len().saturating_sub(1)];
+    let flags = csi_params(body).first().copied().unwrap_or(0);
+    let mut m = std::collections::BTreeMap::new();
+    m.insert(Value::keyword("kind"), Value::keyword("kitty-flags"));
+    m.insert(Value::keyword("flags"), Value::int(flags as i64));
+    Value::map(m)
+}
+
+/// xterm modifyOtherKeys: `ESC[27;<mod>;<code>~` → the base key `<code>` with
+/// its modifiers, normalized to the same shapes the legacy path emits.
+#[cfg(unix)]
+fn decode_modify_other_keys(csi: &[u8]) -> Value {
+    let p = csi_params(&csi[..csi.len().saturating_sub(1)]);
+    let mbits = p.get(1).copied().unwrap_or(1).saturating_sub(1);
+    let cp = p.get(2).copied().unwrap_or(0);
+    let cp_char = char::from_u32(cp);
+    let mut m = std::collections::BTreeMap::new();
+    match cp {
+        27 => {
+            m.insert(Value::keyword("kind"), Value::keyword("key"));
+            m.insert(Value::keyword("name"), Value::keyword("esc"));
+        }
+        13 | 10 => {
+            m.insert(Value::keyword("kind"), Value::keyword("key"));
+            m.insert(Value::keyword("name"), Value::keyword("enter"));
+        }
+        9 => {
+            m.insert(Value::keyword("kind"), Value::keyword("key"));
+            m.insert(Value::keyword("name"), Value::keyword("tab"));
+        }
+        127 | 8 => {
+            m.insert(Value::keyword("kind"), Value::keyword("key"));
+            m.insert(Value::keyword("name"), Value::keyword("backspace"));
+        }
+        _ if mbits & 4 != 0 && cp_char.is_some_and(|c| c.is_ascii_alphabetic()) => {
+            let lower = cp_char.unwrap().to_ascii_lowercase();
+            m.insert(Value::keyword("kind"), Value::keyword("ctrl"));
+            m.insert(Value::keyword("char"), Value::string(&lower.to_string()));
+        }
+        _ => {
+            m.insert(Value::keyword("kind"), Value::keyword("char"));
+            m.insert(
+                Value::keyword("char"),
+                Value::string(&cp_char.map(|c| c.to_string()).unwrap_or_default()),
+            );
+        }
+    }
+    if let Some(mods) = mods_list(mbits) {
+        m.insert(Value::keyword("mods"), mods);
+    }
+    Value::map(m)
+}
+
+/// Collect a bracketed-paste payload: the literal bytes after `ESC[200~` up to
+/// the `ESC[201~` terminator, as `{:kind :paste :text …}`. Pasted content
+/// bypasses key dispatch entirely, so control bytes in a paste can't be
+/// misread as live keystrokes.
+#[cfg(unix)]
+fn read_bracketed_paste() -> Result<Value, SemaError> {
+    const TERMINATOR: &[u8] = b"\x1b[201~";
+    let mut buf: Vec<u8> = Vec::new();
+    loop {
+        match read_one_byte().map_err(|e| SemaError::Io(format!("io/read-key: {e}")))? {
+            None => break,
+            Some(ch) => {
+                buf.push(ch);
+                if buf.ends_with(TERMINATOR) {
+                    buf.truncate(buf.len() - TERMINATOR.len());
+                    break;
+                }
+            }
+        }
+    }
+    let text = String::from_utf8_lossy(&buf).to_string();
+    let mut m = std::collections::BTreeMap::new();
+    m.insert(Value::keyword("kind"), Value::keyword("paste"));
+    m.insert(Value::keyword("text"), Value::string(&text));
+    Ok(Value::map(m))
+}
+
+/// True when stdin is a real terminal (probes are meaningless otherwise).
+#[cfg(unix)]
+fn stdin_is_tty() -> bool {
+    unsafe { libc::isatty(libc::STDIN_FILENO) == 1 }
+}
+
+/// Write a control sequence to stdout and flush (for query round-trips).
+#[cfg(unix)]
+fn write_stdout(seq: &str) -> Result<(), SemaError> {
+    use std::io::Write;
+    let mut out = std::io::stdout();
+    out.write_all(seq.as_bytes())
+        .and_then(|_| out.flush())
+        .map_err(|e| SemaError::Io(format!("term: {e}")))
+}
+
+/// Scan stdin for the next complete CSI sequence (`ESC [ … final`), returning
+/// its body (params + final byte) — or None on a `budget_ms` idle timeout.
+/// Non-CSI bytes are skipped; used only by the capability probes below.
+#[cfg(unix)]
+fn read_one_csi(budget_ms: u64) -> Result<Option<Vec<u8>>, SemaError> {
+    loop {
+        if !unix_stdin_ready(budget_ms) {
+            return Ok(None);
+        }
+        match read_one_byte().map_err(|e| SemaError::Io(format!("io/read-key: {e}")))? {
+            None => return Ok(None),
+            Some(0x1b) => {}
+            Some(_) => continue,
+        }
+        if !unix_stdin_ready(50) {
+            return Ok(None);
+        }
+        match read_one_byte().map_err(|e| SemaError::Io(format!("io/read-key: {e}")))? {
+            Some(b'[') => {}
+            _ => continue,
+        }
+        let mut csi: Vec<u8> = Vec::new();
+        loop {
+            match read_one_byte().map_err(|e| SemaError::Io(format!("io/read-key: {e}")))? {
+                None => return Ok(None),
+                Some(ch) => {
+                    csi.push(ch);
+                    if (0x40..=0x7e).contains(&ch) {
+                        break;
+                    }
+                }
+            }
+        }
+        return Ok(Some(csi));
+    }
+}
+
+/// Detect kitty-keyboard support: send `CSI ?u` followed by a DSR barrier
+/// (`CSI 6n`). A supporting terminal answers the flags query (`ESC[?…u`) before
+/// the cursor-position reply; a non-supporting one only answers the DSR. Must be
+/// called in raw mode; returns false when stdin is not a TTY or nothing replies.
+#[cfg(unix)]
+fn probe_kitty_support() -> Result<bool, SemaError> {
+    if !stdin_is_tty() {
+        return Ok(false);
+    }
+    write_stdout("\x1b[?u\x1b[6n")?;
+    while let Some(csi) = read_one_csi(200)? {
+        let last = *csi.last().unwrap_or(&0);
+        if last == b'u' && csi.first() == Some(&b'?') {
+            return Ok(true);
+        }
+        if last == b'R' {
+            return Ok(false); // barrier reached with no kitty reply
+        }
+    }
+    Ok(false)
+}
+
+/// Round-trip the cursor position: send DSR (`CSI 6n`) and return `{:row :col}`
+/// from the reply, or nil (not a TTY / no reply). Must be called in raw mode.
+#[cfg(unix)]
+fn query_cursor_position() -> Result<Value, SemaError> {
+    if !stdin_is_tty() {
+        return Ok(Value::nil());
+    }
+    write_stdout("\x1b[6n")?;
+    while let Some(csi) = read_one_csi(200)? {
+        if *csi.last().unwrap_or(&0) == b'R' {
+            let p = csi_params(&csi[..csi.len().saturating_sub(1)]);
+            let mut m = std::collections::BTreeMap::new();
+            m.insert(
+                Value::keyword("row"),
+                Value::int(p.first().copied().unwrap_or(0) as i64),
+            );
+            m.insert(
+                Value::keyword("col"),
+                Value::int(p.get(1).copied().unwrap_or(0) as i64),
+            );
+            return Ok(Value::map(m));
+        }
+    }
+    Ok(Value::nil())
 }
 
 // Parse a key event from stdin (assuming raw mode).
@@ -331,19 +757,40 @@ fn parse_key_input() -> Result<Option<Value>, SemaError> {
                 }
             }
             let last = *csi.last().unwrap_or(&0);
-            // Dispatch by shape. Only these two are new; everything else falls
-            // through to the legacy table below (byte-identical behavior), since
-            // no legacy sequence starts with `<` or ends in `u`.
-            //   ESC [ < b;x;y (M|m)  → SGR mouse (only sent when mouse enabled)
-            //   ESC [ … u            → kitty keyboard event (only when enabled)
-            if csi.first() == Some(&b'<') {
+            let first = *csi.first().unwrap_or(&0);
+            // Dispatch by shape (each form is unambiguous by its marker/final byte):
+            //   ESC[<b;x;y M|m  → SGR mouse            ESC[…u        → kitty key
+            //   ESC[?…u         → kitty flags reply    ESC[200~      → bracketed paste
+            //   ESC[I | ESC[O   → focus in/out         ESC[?…c/>…c   → device attrs
+            //   ESC[r;cR        → cursor-position rpt   ESC[27;m;c~   → modifyOtherKeys
+            //   else            → legacy keys + xterm modifier forms + function keys
+            if first == b'<' {
                 return Ok(Some(decode_sgr_mouse(&csi, last)));
             }
             if last == b'u' {
+                if first == b'?' {
+                    return Ok(Some(decode_kitty_flags(&csi)));
+                }
                 return Ok(Some(decode_kitty(&csi)));
             }
-            // Parse the bare table plus the xterm `1;<mod><final>` / `<n>;<mod>~`
-            // modifier forms, so Ctrl/Alt(Option)+arrow reach Sema with :mods.
+            if csi.as_slice() == b"200~" {
+                return read_bracketed_paste().map(Some);
+            }
+            if csi.as_slice() == b"I" {
+                return Ok(Some(focus_event(true)));
+            }
+            if csi.as_slice() == b"O" {
+                return Ok(Some(focus_event(false)));
+            }
+            if last == b'c' && (first == b'?' || first == b'>') {
+                return Ok(Some(decode_device_attributes(&csi, first)));
+            }
+            if last == b'R' {
+                return Ok(Some(decode_cpr(&csi)));
+            }
+            if last == b'~' && csi.starts_with(b"27;") {
+                return Ok(Some(decode_modify_other_keys(&csi)));
+            }
             let (name, mbits) = parse_legacy_csi(&csi);
             let mut m = std::collections::BTreeMap::new();
             m.insert(Value::keyword("kind"), Value::keyword("key"));
@@ -378,11 +825,11 @@ fn parse_key_input() -> Result<Option<Value>, SemaError> {
             return Ok(Some(Value::map(m)));
         }
 
-        // Alt + char  (ESC followed by a regular character)
-        let alt_char = char::from(b2);
+        // Alt + char (ESC followed by a character; may be multi-byte UTF-8).
+        let alt_str = read_utf8_char(b2)?;
         let mut m = std::collections::BTreeMap::new();
         m.insert(Value::keyword("kind"), Value::keyword("alt"));
-        m.insert(Value::keyword("char"), Value::string(&alt_char.to_string()));
+        m.insert(Value::keyword("char"), Value::string(&alt_str));
         return Ok(Some(Value::map(m)));
     }
 
@@ -440,29 +887,7 @@ fn parse_key_input() -> Result<Option<Value>, SemaError> {
     }
 
     // Multi-byte UTF-8 character (b >= 0x80)
-    let extra = if b & 0xe0 == 0xc0 {
-        1usize
-    } else if b & 0xf0 == 0xe0 {
-        2
-    } else if b & 0xf8 == 0xf0 {
-        3
-    } else {
-        0
-    };
-    let mut bytes = vec![b];
-    for _ in 0..extra {
-        // Wait up to 20ms for continuation bytes (handles slow pipes and heavy load)
-        if !unix_stdin_ready(20) {
-            break;
-        }
-        match read_one_byte().map_err(|e| SemaError::Io(format!("io/read-key: {e}")))? {
-            None => break,
-            Some(ch) => bytes.push(ch),
-        }
-    }
-    let ch_str = std::str::from_utf8(&bytes)
-        .map(|s| s.to_string())
-        .unwrap_or_else(|_| "?".to_string());
+    let ch_str = read_utf8_char(b)?;
     let mut m = std::collections::BTreeMap::new();
     m.insert(Value::keyword("kind"), Value::keyword("char"));
     m.insert(Value::keyword("char"), Value::string(&ch_str));
@@ -2115,6 +2540,18 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
                 }
                 Some(v) => Ok(v),
             }
+        });
+
+        // Capability probes (raw mode required; they round-trip a query + reply).
+        // term/supports-kitty-keys? → bool via `CSI ?u` + DSR barrier.
+        register_fn(env, "term/supports-kitty-keys?", |args| {
+            check_arity!(args, "term/supports-kitty-keys?", 0);
+            Ok(Value::bool(probe_kitty_support()?))
+        });
+        // term/cursor-position → {:row :col} (or nil) via a DSR round-trip.
+        register_fn(env, "term/cursor-position", |args| {
+            check_arity!(args, "term/cursor-position", 0);
+            query_cursor_position()
         });
     }
 

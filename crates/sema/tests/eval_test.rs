@@ -357,7 +357,11 @@ eval_tests! {
     guard_alt_screen_returns_body: "(term/with-alt-screen 1 2 3)" => Value::int(3),
     guard_raw_mode_returns_body: "(io/with-raw-mode 42)" => Value::int(42),
     guard_mouse_returns_body: "(term/with-mouse 7)" => Value::int(7),
+    guard_bracketed_paste_returns_body: "(term/with-bracketed-paste 1 2 3)" => Value::int(3),
+    guard_focus_events_returns_body: "(term/with-focus-events 7)" => Value::int(7),
+    guard_kitty_keys_returns_body: "(term/with-kitty-keys 9)" => Value::int(9),
     guard_reraises_after_teardown: r#"(try (term/with-alt-screen (error "x")) (catch e "caught"))"# => Value::string("caught"),
+    guard_paste_reraises_after_teardown: r#"(try (term/with-bracketed-paste (error "x")) (catch e "caught"))"# => Value::string("caught"),
     // string->bytevector: intuitive alias for string->utf8 (UTF-8 encode).
     string_to_bytevector_alias: r#"(bytevector->string (string->bytevector "héllo"))"# => Value::string("héllo"),
     // sema/check-string classifies a wrapped reader error as :syntax with a :span

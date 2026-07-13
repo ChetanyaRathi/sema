@@ -168,6 +168,14 @@ pub const PRELUDE: &str = r#"
 ;; with-stream's try/catch-rethrow-then-cleanup shape and return BODY's value.
 ;; Compose them (outermost restores last): typically
 ;;   (io/with-raw-mode (term/with-alt-screen (term/with-mouse ...body...)))
+;;
+;; TODO: these enable/disable guards are pure boilerplate. One option is a
+;; compile-time Rust helper (macro_rules! or a codegen fn) that emits the guard
+;; Sema source from a (name, enable, disable) table and appends it to this
+;; prelude string. Deferred — and maybe not worth it: it trades the prelude's
+;; "just readable Sema" property for DRY, `io/with-raw-mode` doesn't fit the
+;; shape (it threads a restore token from setup into teardown), and it needs its
+;; own thorough test pass. Left explicit for now.
 
 ;; Enter the alternate screen + hide the cursor; restore both on exit.
 (defmacro term/with-alt-screen (. body)
@@ -205,6 +213,43 @@ pub const PRELUDE: &str = r#"
                      (term/disable-mouse)
                      (throw e#)))))
        (term/disable-mouse)
+       res#)))
+
+;; Enable bracketed paste; disable on exit so paste markers can't leak to the
+;; shell. io/read-key returns pasted text as {:kind :paste :text …}.
+(defmacro term/with-bracketed-paste (. body)
+  `(begin
+     (term/enable-bracketed-paste)
+     (let ((res# (try (begin ,@body)
+                   (catch e#
+                     (term/disable-bracketed-paste)
+                     (throw e#)))))
+       (term/disable-bracketed-paste)
+       res#)))
+
+;; Enable focus reporting; disable on exit. io/read-key returns focus in/out as
+;; {:kind :focus :focused #t|#f}.
+(defmacro term/with-focus-events (. body)
+  `(begin
+     (term/enable-focus-events)
+     (let ((res# (try (begin ,@body)
+                   (catch e#
+                     (term/disable-focus-events)
+                     (throw e#)))))
+       (term/disable-focus-events)
+       res#)))
+
+;; Push kitty keyboard flags (default 17 = disambiguate + associated-text) and
+;; pop them on exit. Terminals without kitty support ignore it, so this is safe
+;; to wrap unconditionally.
+(defmacro term/with-kitty-keys (. body)
+  `(begin
+     (term/enable-kitty-keys!)
+     (let ((res# (try (begin ,@body)
+                   (catch e#
+                     (term/disable-kitty-keys!)
+                     (throw e#)))))
+       (term/disable-kitty-keys!)
        res#)))
 
 ;; dotimes: execute body n times with a counter variable

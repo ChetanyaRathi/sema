@@ -355,14 +355,48 @@ fn register_screen_control(env: &sema_core::Env) {
         "\x1b[?1000l\x1b[?1002l\x1b[?1006l",
     );
 
-    // Kitty keyboard protocol (opt-in): push flags 17 = disambiguate (1) +
-    // report-associated-text (16). No event-types flag, so no repeat/release
-    // events (which would double-fire as key presses). Terminals without kitty
-    // support silently ignore this, and keys keep coming through the legacy path.
-    // io/read-key decodes `ESC [ … u` events, normalizing to the usual key maps
-    // plus an optional :mods list. Restore with the stack pop on exit.
-    make_emit_fn(env, "term/enable-kitty-keys!", "\x1b[>17u");
+    // Kitty keyboard protocol (opt-in). Default flags 17 = disambiguate (1) +
+    // report-associated-text (16); pass a bitmask to request more (add 2 for
+    // event types, 4 for alternate keys — see the kitty spec). Terminals without
+    // support silently ignore this and keys keep coming through the legacy path.
+    // io/read-key decodes `ESC [ … u` events into the usual key maps (+ :mods,
+    // and :event when event types are enabled). Restore with the stack pop on exit.
+    register_fn(env, "term/enable-kitty-keys!", |args| {
+        if args.len() > 1 {
+            return Err(SemaError::arity(
+                "term/enable-kitty-keys!",
+                "0-1",
+                args.len(),
+            ));
+        }
+        let flags = match args.first() {
+            None => 17,
+            Some(v) => v
+                .as_int()
+                .ok_or_else(|| SemaError::type_error("integer", v.type_name()))?,
+        };
+        emit(&format!("\x1b[>{flags}u"))
+    });
     make_emit_fn(env, "term/disable-kitty-keys!", "\x1b[<u");
+    // Query the terminal's active kitty flags (`CSI ?u`); the reply arrives via
+    // io/read-key as {:kind :kitty-flags :flags N} (nothing if unsupported).
+    make_emit_fn(env, "term/query-kitty-keys", "\x1b[?u");
+
+    // Bracketed paste (opt-in): the terminal wraps pasted text in ESC[200~ … 201~,
+    // which io/read-key returns as {:kind :paste :text …} instead of live keys.
+    make_emit_fn(env, "term/enable-bracketed-paste", "\x1b[?2004h");
+    make_emit_fn(env, "term/disable-bracketed-paste", "\x1b[?2004l");
+
+    // Focus reporting (opt-in): ESC[I / ESC[O on focus in/out → {:kind :focus …}.
+    make_emit_fn(env, "term/enable-focus-events", "\x1b[?1004h");
+    make_emit_fn(env, "term/disable-focus-events", "\x1b[?1004l");
+
+    // Terminal queries — each writes a request whose reply arrives via io/read-key:
+    //   query-cursor-position (DSR)  → {:kind :cpr :row :col}
+    //   query-primary/secondary-da   → {:kind :device-attributes :device …}
+    make_emit_fn(env, "term/query-cursor-position", "\x1b[6n");
+    make_emit_fn(env, "term/query-primary-da", "\x1b[c");
+    make_emit_fn(env, "term/query-secondary-da", "\x1b[>c");
 
     make_emit_fn(env, "term/bell", "\x07");
 
