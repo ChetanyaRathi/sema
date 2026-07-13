@@ -12,6 +12,23 @@ use sema_core::{
 
 use crate::register_fn;
 
+/// Parse a duration-in-milliseconds argument for `async/sleep` / `async/timeout`.
+/// Accepts an int OR a float (rounded to the nearest whole ms): a duration is
+/// naturally a number, and being strict about int-vs-float here is a papercut —
+/// `(round …)`, `(math/random)` and ordinary arithmetic routinely yield floats.
+fn duration_ms(value: &Value, who: &str) -> Result<i64, SemaError> {
+    if let Some(i) = value.as_int() {
+        Ok(i)
+    } else if let Some(f) = value.as_float() {
+        if !f.is_finite() {
+            return Err(SemaError::eval(format!("{who}: duration must be a finite number")));
+        }
+        Ok(f.round() as i64)
+    } else {
+        Err(SemaError::type_error("number", value.type_name()))
+    }
+}
+
 /// Format a normal task rejection as an `async/await` error, stripping
 /// any already-present `async/await: task rejected:` prefix so that
 /// chained awaits don't quadratically nest the prefix.
@@ -373,9 +390,7 @@ fn register_promise_ops(env: &Env) {
     // async/timeout — race a promise against a deadline
     register_fn_ctx(env, "async/timeout", |ctx, args| {
         check_arity!(args, "async/timeout", 2);
-        let ms = args[0]
-            .as_int()
-            .ok_or_else(|| SemaError::type_error("int", args[0].type_name()))?;
+        let ms = duration_ms(&args[0], "async/timeout")?;
         if ms < 0 {
             return Err(SemaError::eval(
                 "async/timeout: duration must be non-negative",
@@ -449,9 +464,7 @@ fn register_promise_ops(env: &Env) {
     // async/sleep — yield for a duration in milliseconds
     register_fn(env, "async/sleep", |args| {
         check_arity!(args, "async/sleep", 1);
-        let ms = args[0]
-            .as_int()
-            .ok_or_else(|| SemaError::type_error("int", args[0].type_name()))?;
+        let ms = duration_ms(&args[0], "async/sleep")?;
         if ms < 0 {
             return Err(SemaError::eval(
                 "async/sleep: duration must be non-negative",
@@ -609,4 +622,20 @@ fn register_channel_ops(env: &Env) {
         let buf = ch.buffer.borrow();
         Ok(Value::bool(buf.len() >= ch.capacity))
     });
+}
+
+#[cfg(test)]
+mod duration_tests {
+    use super::*;
+
+    #[test]
+    fn duration_ms_accepts_int_and_float_rejects_others() {
+        assert_eq!(duration_ms(&Value::int(5), "t").unwrap(), 5); // int passes through
+        assert_eq!(duration_ms(&Value::float(2.4), "t").unwrap(), 2); // float rounds down
+        assert_eq!(duration_ms(&Value::float(2.6), "t").unwrap(), 3); // float rounds up
+        assert_eq!(duration_ms(&Value::float(0.0), "t").unwrap(), 0);
+        assert!(duration_ms(&Value::float(f64::INFINITY), "t").is_err()); // non-finite rejected
+        assert!(duration_ms(&Value::float(f64::NAN), "t").is_err());
+        assert!(duration_ms(&Value::string("nope"), "t").is_err()); // non-number rejected
+    }
 }

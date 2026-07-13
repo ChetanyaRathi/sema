@@ -91,6 +91,17 @@
 
 ### Changed
 
+- **`async/sleep` and `async/timeout` accept a float duration**, not just an
+  int — a duration is naturally a number, and `(round …)` / `(math/random)` /
+  ordinary arithmetic routinely yield floats. A float is rounded to the nearest
+  whole millisecond; non-finite or non-number values are still rejected.
+- **`examples/async-everything.sema`** is a comprehensive async regression
+  canary: it exercises every async-offloaded native family (files, streams,
+  archives, pdf, sqlite, kv, subprocess, pty, git, cpu scans, opt-in http+llm)
+  under deep nesting with upvalue-capturing callbacks that cross nesting levels,
+  driven by 3 concurrent loops using distinct async strategies (`async/all`,
+  `spawn`+`await`, `race`), with a live heartbeat proving the VM thread never
+  stalls. Loop it with `SEMA_ASYNC_EVERYTHING_LOOPS=N`.
 - **`examples/sema-coder` moved to its own repo** (like the editor plugins) —
   the in-repo copy is removed.
 - **The game-of-life example is a full TUI** — altscreen rendering with mouse
@@ -133,7 +144,11 @@
   is current, as `async/spawn` already does); (2) invoking the callback tried to
   `take` the async scheduler while it was already driving the poll (reproducible
   under a concurrent nested `async/all`) — the callback now runs synchronously on
-  a foreign VM, never touching the scheduler.
+  a foreign VM, never touching the scheduler; (3) the upvalue snapshot is now
+  **transitive** — a closure captured *as data* into an async task (e.g. a
+  path-builder or callback passed as an argument) has its own open upvalues
+  snapshotted too, with cycle-safe termination, so it no longer errors with
+  "captured variable's stack slot is not on this VM".
 - **OpenAI `reasoning_effort` compat is smarter and no longer over-broad.**
   gpt-5.6+ reject a non-`none` `reasoning_effort` alongside function tools on
   `/chat/completions` ("use /v1/responses or set reasoning_effort to 'none'");

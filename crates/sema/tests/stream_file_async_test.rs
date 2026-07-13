@@ -460,3 +460,43 @@ fn streaming_line_callback_captures_upvalue_under_nested_async() {
         "fold-lines callback read its captured `tag` upvalue"
     );
 }
+
+/// Regression (VM transitive upvalue snapshot): a closure capturing a lexical
+/// upvalue, passed as DATA into an async task, must read that upvalue when it is
+/// finally invoked on the task's (foreign) VM. The task-closure snapshot didn't
+/// recurse into closures reachable *through* its captured values, so the inner
+/// closure's still-`Open` upvalue dereferenced a stack slot not on the task VM
+/// ("captured variable's stack slot is not on this VM"). Fixed by recursing in
+/// `close_closure_upvalues_for_foreign_run`.
+#[test]
+fn closure_with_upvalue_passed_as_data_into_async_task_survives() {
+    let interp = Interpreter::new();
+    let program = r#"
+        (defun run-thunk (f) (async (f)))          ; wraps a PASSED closure in a task
+        (let ((tmp "SCRATCH") (n 41))
+          (async/all (list
+            (run-thunk (fn () tmp))                ; captured string upvalue
+            (run-thunk (fn () (+ n 1))))))         ; captured int upvalue
+    "#;
+    let result = interp.eval_str_compiled(program).expect("program evaluated");
+    let items = result.as_list().expect("async/all list");
+    assert_eq!(items[0].as_str(), Some("SCRATCH"), "string upvalue survived escape into task");
+    assert_eq!(items[1].as_int(), Some(42), "int upvalue survived escape into task");
+}
+
+/// Regression: a CYCLIC closure graph (a→b→n, passed into a task) must snapshot
+/// transitively AND terminate — each visited cell becomes `Tracked`, so the
+/// back-edge finds nothing to do (no infinite recursion).
+#[test]
+fn cyclic_closures_passed_into_async_task_terminate() {
+    let interp = Interpreter::new();
+    let program = r#"
+        (defun run-thunk (f) (async (f)))
+        (let ((n 7))
+          (letrec ((a (fn () (if (> n 0) (str "a" (b)) "")))
+                   (b (fn () (str "b" n))))
+            (async/all (list (run-thunk a)))))
+    "#;
+    let result = interp.eval_str_compiled(program).expect("cyclic-closure program evaluated");
+    assert_eq!(result.as_list().unwrap()[0].as_str(), Some("ab7"));
+}

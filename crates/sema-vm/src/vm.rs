@@ -891,6 +891,11 @@ pub fn close_closure_upvalues_for_foreign_run(closure: &Closure) {
             if frame_base + slot < vm.stack.len() && vm.frames.iter().any(|f| f.base == frame_base)
             {
                 let value = vm.stack[frame_base + slot].clone();
+                // A closure captured HERE may carry its OWN open upvalues into a
+                // frame that will be inactive when it is later invoked on the
+                // foreign stack — e.g. a path-builder or callback closure passed
+                // as DATA into an async task. Snapshot it transitively.
+                let nested = extract_vm_closure(&value).map(|(c, _)| c);
                 // Tracked, not Closed: keep the cell bound to the still-live
                 // defining frame so post-spawn `StoreLocal`/`StoreUpvalue`
                 // writes keep flowing into it (issue #104). The frame's
@@ -902,6 +907,13 @@ pub fn close_closure_upvalues_for_foreign_run(closure: &Closure) {
                     slot,
                     value,
                 };
+                // Recurse AFTER marking this cell `Tracked`, so a cyclic closure
+                // graph terminates: the back-edge finds this cell already Tracked
+                // (skipped at the top of the loop). The owning VM(s) are still on
+                // `CURRENT_VM`, so the nested closure's frames remain reachable.
+                if let Some(nested) = nested {
+                    close_closure_upvalues_for_foreign_run(&nested);
+                }
                 break;
             }
         }
