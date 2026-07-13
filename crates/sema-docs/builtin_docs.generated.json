@@ -12219,7 +12219,7 @@
       "examples": [
         "(io/read-key)\n;; => {:kind :char :char \"a\"}"
       ],
-      "body": "Block until a single keypress arrives, then return a map describing it. Returns `nil` on EOF (after which `io/eof?` returns `#t`).\n\n```sema\n(io/read-key)\n;; => {:kind :char :char \"a\"}\n```\n\nThe map's `:kind` field is one of:\n\n| `:kind`   | Other keys              | Meaning                                         |\n|-----------|-------------------------|-------------------------------------------------|\n| `:char`   | `:char` (string)        | A printable character (UTF-8 multi-byte handled) |\n| `:ctrl`   | `:char` (string)        | Ctrl + letter (e.g., Ctrl-C → `{:kind :ctrl :char \"c\"}`) |\n| `:alt`    | `:char` (string)        | Alt/Meta + character (ESC + char sequence)      |\n| `:key`    | `:name` (keyword)       | Named key — see table below                     |\n| `:mouse`  | `:action` `:x` `:y` `:button` `:mods` | A mouse event (only after `term/enable-mouse`)  |\n\nNamed keys (`:kind :key`) currently emitted:\n\n`:enter` `:tab` `:backspace` `:esc` `:up` `:down` `:left` `:right` `:home` `:end` `:delete` `:page-up` `:page-down` `:f1` `:f2` `:f3` `:f4`\n\nCSI/SS3 escape sequences (arrow keys, F1–F4, Page Up/Down, Delete) and UTF-8 continuation bytes are decoded for you. F5–F12 and Insert use longer escape sequences that aren't decoded yet — they fall through as raw characters.\n\n**Mouse** (after `term/enable-mouse`): SGR mouse reports decode to\n`{:kind :mouse :action A :x col :y row :button N :mods (…)}`, where `A` is one of\n`:press` `:release` `:move` `:wheel-up` `:wheel-down` `:wheel-left` `:wheel-right`,\ncoordinates are 1-based, and `:mods` (omitted when empty) lists `:shift`/`:alt`/`:ctrl`.\n\n**Kitty keyboard** (after `term/enable-kitty-keys!`): richer key events decode to\nthe *same* `:char`/`:ctrl`/`:alt`/`:key` shapes above — so existing code is\nunaffected — plus an optional `:mods` list (e.g. Shift+A →\n`{:kind :char :char \"A\" :mods (:shift)}`). Terminals without kitty support keep\nthe legacy encoding. Both mouse and kitty decoding are opt-in; plain keys are\nbyte-identical whether or not they're enabled."
+      "body": "Block until a single keypress arrives, then return a map describing it. Returns `nil` on EOF (after which `io/eof?` returns `#t`).\n\n```sema\n(io/read-key)\n;; => {:kind :char :char \"a\"}\n```\n\nThe map's `:kind` field is one of:\n\n| `:kind`   | Other keys              | Meaning                                         |\n|-----------|-------------------------|-------------------------------------------------|\n| `:char`   | `:char` (string)        | A printable character (UTF-8 multi-byte handled) |\n| `:ctrl`   | `:char` (string)        | Ctrl + letter (e.g., Ctrl-C → `{:kind :ctrl :char \"c\"}`) |\n| `:alt`    | `:char` (string)        | Alt/Meta + character (ESC + char; UTF-8 aware)  |\n| `:key`    | `:name` (keyword), optional `:mods` | Named key — see table below         |\n| `:mouse`  | `:action` `:x` `:y` `:button` `:mods` | A mouse event (after `term/enable-mouse`) |\n| `:paste`  | `:text` (string)        | A bracketed paste (after `term/enable-bracketed-paste`) — pasted text delivered whole, so its newlines/control bytes aren't read as keystrokes |\n| `:focus`  | `:focused` (bool)       | Window focus gained/lost (after `term/enable-focus-events`) |\n| `:cpr`    | `:row` `:col`           | Cursor-position report — reply to `term/query-cursor-position` |\n| `:device-attributes` | `:device` (`:primary`/`:secondary`) `:params` | Reply to `term/query-primary-da` / `term/query-secondary-da` |\n| `:kitty-flags` | `:flags` (int)     | Reply to `term/query-kitty-keys` |\n\nNamed keys (`:kind :key`):\n\n`:enter` `:tab` `:backspace` `:esc` `:up` `:down` `:left` `:right` `:home` `:end` `:insert` `:delete` `:page-up` `:page-down` `:shift-tab` `:f1`–`:f12`\n\nCSI/SS3 escape sequences (arrows, F1–F12, Insert, Home/End, Page Up/Down, Delete) and UTF-8 continuation bytes are decoded for you. **Modifier-carrying keys** include an optional `:mods` list — e.g. Ctrl+Right → `{:kind :key :name :right :mods (:ctrl)}`, Shift+F5 → `{:kind :key :name :f5 :mods (:shift)}` (xterm modifier form and `modifyOtherKeys` are both decoded).\n\n**Mouse** (after `term/enable-mouse`): SGR mouse reports decode to\n`{:kind :mouse :action A :x col :y row :button N :mods (…)}`, where `A` is one of\n`:press` `:release` `:move` `:wheel-up` `:wheel-down` `:wheel-left` `:wheel-right`,\ncoordinates are 1-based, and `:mods` (omitted when empty) lists `:shift`/`:alt`/`:ctrl`.\n\n**Kitty keyboard** (after `term/enable-kitty-keys!`): richer key events decode to\nthe *same* `:char`/`:ctrl`/`:alt`/`:key` shapes above — so existing code is\nunaffected — plus an optional `:mods` list (full set: `:shift` `:alt` `:ctrl`\n`:super` `:hyper` `:meta` `:caps-lock` `:num-lock`). When event types are enabled\n(flag `2`), events carry `:event :press|:repeat|:release`; with alternate keys\n(flag `4`) they carry `:shifted-key`/`:base-key`. Terminals without kitty support\nkeep the legacy encoding. All of mouse, kitty, paste, and focus decoding are\nopt-in; plain keys are byte-identical whether or not they're enabled."
     },
     {
       "name": "io/read-key-timeout",
@@ -12342,6 +12342,16 @@
       "body": "Move the cursor to the top-left corner (row 1, column 1) without clearing. Takes no arguments."
     },
     {
+      "name": "term/cursor-position",
+      "module": "terminal",
+      "section": "Raw-Mode Input",
+      "summary": "Round-trip the cursor position: send a DSR request (`CSI 6n`) and read the reply, returning `{:row R :col C}` (1-based) or `nil` when stdin is not a TTY or no reply arrives. **Must be called in raw mode.** Unlike `term/query-cursor-position` (which writes the request and lets the reply come back through `io/read-key`), this blocks briefly and returns the position directly.",
+      "examples": [
+        "(io/with-raw-mode (term/cursor-position))   ; => {:row 12 :col 40}"
+      ],
+      "body": "Round-trip the cursor position: send a DSR request (`CSI 6n`) and read the reply, returning `{:row R :col C}` (1-based) or `nil` when stdin is not a TTY or no reply arrives. **Must be called in raw mode.** Unlike `term/query-cursor-position` (which writes the request and lets the reply come back through `io/read-key`), this blocks briefly and returns the position directly.\n\n```sema\n(io/with-raw-mode (term/cursor-position))   ; => {:row 12 :col 40}\n```"
+    },
+    {
       "name": "term/cyan",
       "module": "terminal",
       "section": "Colors",
@@ -12376,6 +12386,20 @@
       "body": "Render text with decreased intensity.\n\n```sema\n(term/dim \"less important\")\n```"
     },
     {
+      "name": "term/disable-bracketed-paste",
+      "module": "terminal",
+      "section": "Screen Control",
+      "summary": "Disable bracketed paste mode (`CSI ?2004l`), undoing `term/enable-bracketed-paste`. Call on exit so paste markers don't leak into the shell afterward. Takes no arguments.",
+      "body": "Disable bracketed paste mode (`CSI ?2004l`), undoing `term/enable-bracketed-paste`. Call on exit so paste markers don't leak into the shell afterward. Takes no arguments."
+    },
+    {
+      "name": "term/disable-focus-events",
+      "module": "terminal",
+      "section": "Screen Control",
+      "summary": "Disable focus reporting (`CSI ?1004l`), undoing `term/enable-focus-events`. Call on exit. Takes no arguments.",
+      "body": "Disable focus reporting (`CSI ?1004l`), undoing `term/enable-focus-events`. Call on exit. Takes no arguments."
+    },
+    {
       "name": "term/disable-kitty-keys!",
       "module": "terminal",
       "section": "Screen Control",
@@ -12390,11 +12414,28 @@
       "body": "Disable mouse event reporting previously turned on with `term/enable-mouse`. Takes no arguments."
     },
     {
+      "name": "term/enable-bracketed-paste",
+      "module": "terminal",
+      "section": "Screen Control",
+      "summary": "Enable bracketed paste mode (`CSI ?2004h`). The terminal then wraps pasted text in markers, so `io/read-key` returns a whole paste as `{:kind :paste :text \"…\"}` instead of interpreting its newlines and control bytes as live keystrokes (a real injection vector otherwise). Pair with `term/disable-bracketed-paste`, or use the `term/with-bracketed-paste` guard to disable automatically on exit. Takes no arguments.",
+      "body": "Enable bracketed paste mode (`CSI ?2004h`). The terminal then wraps pasted text in markers, so `io/read-key` returns a whole paste as `{:kind :paste :text \"…\"}` instead of interpreting its newlines and control bytes as live keystrokes (a real injection vector otherwise). Pair with `term/disable-bracketed-paste`, or use the `term/with-bracketed-paste` guard to disable automatically on exit. Takes no arguments."
+    },
+    {
+      "name": "term/enable-focus-events",
+      "module": "terminal",
+      "section": "Screen Control",
+      "summary": "Enable focus reporting (`CSI ?1004h`). The terminal then sends an event when the window gains or loses focus, which `io/read-key` decodes as `{:kind :focus :focused #t|#f}` — useful to pause a spinner or repaint when the user tabs away. Pair with `term/disable-focus-events`, or use the `term/with-focus-events` guard. Support is inconsistent (e.g. macOS Terminal.app); treat it as a nice-to-have. Takes no arguments.",
+      "body": "Enable focus reporting (`CSI ?1004h`). The terminal then sends an event when the window gains or loses focus, which `io/read-key` decodes as `{:kind :focus :focused #t|#f}` — useful to pause a spinner or repaint when the user tabs away. Pair with `term/disable-focus-events`, or use the `term/with-focus-events` guard. Support is inconsistent (e.g. macOS Terminal.app); treat it as a nice-to-have. Takes no arguments."
+    },
+    {
       "name": "term/enable-kitty-keys!",
       "module": "terminal",
       "section": "Screen Control",
-      "summary": "Opt into the kitty keyboard protocol (progressive-enhancement flags: disambiguate + report-associated-text). While enabled, `io/read-key` decodes richer key events — reliable modifier reporting (an optional `:mods` list of `:shift`/`:alt`/`:ctrl`/`:super`) and unambiguous key identification — normalized to the same `{:kind :char/:ctrl/:alt/:key}` shapes as the legacy path, so existing consumers keep working. Terminals without kitty support silently ignore this and keys keep arriving via the legacy encoding. Restore with `term/disable-kitty-keys!` before leaving raw mode. Takes no arguments.",
-      "body": "Opt into the kitty keyboard protocol (progressive-enhancement flags: disambiguate + report-associated-text). While enabled, `io/read-key` decodes richer key events — reliable modifier reporting (an optional `:mods` list of `:shift`/`:alt`/`:ctrl`/`:super`) and unambiguous key identification — normalized to the same `{:kind :char/:ctrl/:alt/:key}` shapes as the legacy path, so existing consumers keep working. Terminals without kitty support silently ignore this and keys keep arriving via the legacy encoding. Restore with `term/disable-kitty-keys!` before leaving raw mode. Takes no arguments."
+      "summary": "Opt into the kitty keyboard protocol. While enabled, `io/read-key` decodes richer key events — reliable modifier reporting (an optional `:mods` list of `:shift`/`:alt`/`:ctrl`/`:super`/`:hyper`/`:meta`/`:caps-lock`/`:num-lock`) and unambiguous key identification — normalized to the same `{:kind :char/:ctrl/:alt/:key}` shapes as the legacy path, so existing consumers keep working. Terminals without kitty support silently ignore this and keys keep arriving via the legacy encoding. Restore with `term/disable-kitty-keys!` before leaving raw mode (or use the `term/with-kitty-keys` guard).",
+      "examples": [
+        "(term/enable-kitty-keys!)      ; default flags 17\n(term/enable-kitty-keys! 19)   ; 17 + event types"
+      ],
+      "body": "Opt into the kitty keyboard protocol. While enabled, `io/read-key` decodes richer key events — reliable modifier reporting (an optional `:mods` list of `:shift`/`:alt`/`:ctrl`/`:super`/`:hyper`/`:meta`/`:caps-lock`/`:num-lock`) and unambiguous key identification — normalized to the same `{:kind :char/:ctrl/:alt/:key}` shapes as the legacy path, so existing consumers keep working. Terminals without kitty support silently ignore this and keys keep arriving via the legacy encoding. Restore with `term/disable-kitty-keys!` before leaving raw mode (or use the `term/with-kitty-keys` guard).\n\nTakes an optional flags bitmask (default `17` = disambiguate `1` + report-associated-text `16`) — the conservative default omits event types, so no repeat/release events double-fire. Pass a larger mask to request more, e.g. add `2` for event types (surfaced as `:event :press|:repeat|:release`) or `4` for alternate keys (`:shifted-key`/`:base-key`):\n\n```sema\n(term/enable-kitty-keys!)      ; default flags 17\n(term/enable-kitty-keys! 19)   ; 17 + event types\n```\n\nUse `term/supports-kitty-keys?` to detect support first, and `term/query-kitty-keys` to read the terminal's active flags."
     },
     {
       "name": "term/enable-mouse",
@@ -12513,6 +12554,34 @@
       ],
       "body": "Move the cursor to a 1-based `row` and `col`. Coordinates below 1 are clamped to 1.\n\n```sema\n(term/move-to 1 1)      ; top-left\n(term/move-to 10 20)    ; row 10, column 20\n```",
       "syntax": "(term/move-to row col)"
+    },
+    {
+      "name": "term/query-cursor-position",
+      "module": "terminal",
+      "section": "Screen Control",
+      "summary": "Request a cursor-position report (DSR, `CSI 6n`) and arm the reply decoder. The reply arrives through `io/read-key` as `{:kind :cpr :row R :col C}` (1-based). Arming matters: a `CSI…R` is otherwise byte-identical to modified-F3 (`CSI 1;<mod>R`), so `io/read-key` only reports `:cpr` when a query is outstanding. For a synchronous result, use `term/cursor-position`. Takes no arguments.",
+      "body": "Request a cursor-position report (DSR, `CSI 6n`) and arm the reply decoder. The reply arrives through `io/read-key` as `{:kind :cpr :row R :col C}` (1-based). Arming matters: a `CSI…R` is otherwise byte-identical to modified-F3 (`CSI 1;<mod>R`), so `io/read-key` only reports `:cpr` when a query is outstanding. For a synchronous result, use `term/cursor-position`. Takes no arguments."
+    },
+    {
+      "name": "term/query-kitty-keys",
+      "module": "terminal",
+      "section": "Screen Control",
+      "summary": "Query the terminal's active kitty keyboard protocol flags (`CSI ?u`). The reply arrives asynchronously through `io/read-key` as `{:kind :kitty-flags :flags N}`; a terminal without kitty support sends nothing. For a synchronous yes/no answer, use `term/supports-kitty-keys?` instead. Takes no arguments.",
+      "body": "Query the terminal's active kitty keyboard protocol flags (`CSI ?u`). The reply arrives asynchronously through `io/read-key` as `{:kind :kitty-flags :flags N}`; a terminal without kitty support sends nothing. For a synchronous yes/no answer, use `term/supports-kitty-keys?` instead. Takes no arguments."
+    },
+    {
+      "name": "term/query-primary-da",
+      "module": "terminal",
+      "section": "Screen Control",
+      "summary": "Request Primary Device Attributes (`CSI c`). The reply arrives through `io/read-key` as `{:kind :device-attributes :device :primary :params (…)}` — a rough \"what kind of terminal is this\" capability list. Takes no arguments.",
+      "body": "Request Primary Device Attributes (`CSI c`). The reply arrives through `io/read-key` as `{:kind :device-attributes :device :primary :params (…)}` — a rough \"what kind of terminal is this\" capability list. Takes no arguments."
+    },
+    {
+      "name": "term/query-secondary-da",
+      "module": "terminal",
+      "section": "Screen Control",
+      "summary": "Request Secondary Device Attributes (`CSI >c`). The reply arrives through `io/read-key` as `{:kind :device-attributes :device :secondary :params (…)}`, whose params commonly encode the terminal's type id and version — a more reliable fingerprint than `$TERM` over SSH/tmux. Takes no arguments.",
+      "body": "Request Secondary Device Attributes (`CSI >c`). The reply arrives through `io/read-key` as `{:kind :device-attributes :device :secondary :params (…)}`, whose params commonly encode the terminal's type id and version — a more reliable fingerprint than `$TERM` over SSH/tmux. Takes no arguments."
     },
     {
       "name": "term/red",
@@ -12642,6 +12711,16 @@
       "syntax": "(term/style text style ...)"
     },
     {
+      "name": "term/supports-kitty-keys?",
+      "module": "terminal",
+      "section": "Raw-Mode Input",
+      "summary": "Return `#t` if the terminal supports the kitty keyboard protocol. Sends the flags query (`CSI ?u`) followed by a Primary Device Attributes barrier and checks which reply arrives first (the kitty-spec-recommended detection). **Must be called in raw mode** (it reads the reply from stdin); returns `#f` when stdin is not a TTY or nothing replies within a short timeout.",
+      "examples": [
+        "(io/with-raw-mode\n  (when (term/supports-kitty-keys?)\n    (term/enable-kitty-keys!)))"
+      ],
+      "body": "Return `#t` if the terminal supports the kitty keyboard protocol. Sends the flags query (`CSI ?u`) followed by a Primary Device Attributes barrier and checks which reply arrives first (the kitty-spec-recommended detection). **Must be called in raw mode** (it reads the reply from stdin); returns `#f` when stdin is not a TTY or nothing replies within a short timeout.\n\n```sema\n(io/with-raw-mode\n  (when (term/supports-kitty-keys?)\n    (term/enable-kitty-keys!)))\n```\n\nDetection is unreliable inside tmux (kitty forwarding is off by default), so prefer letting the user force-enable when `$TMUX` is set."
+    },
+    {
       "name": "term/underline",
       "module": "terminal",
       "section": "Modifiers",
@@ -12677,6 +12756,33 @@
         "(io/with-raw-mode\n  (term/with-alt-screen\n    (term/with-mouse\n      (run-tui))))   ; terminal is fully restored however this exits"
       ],
       "body": "Guard macro: enter the alternate screen and hide the cursor, run `body`, and\n**always** restore both (show cursor, leave alt screen) on exit — even if `body`\nthrows (the error is re-raised after restoring). Returns `body`'s value. Prevents\na crash from leaving the terminal stuck in the alt buffer with a hidden cursor.\nCompose with `io/with-raw-mode` / `term/with-mouse` (outermost restores last).\n\n```sema\n(io/with-raw-mode\n  (term/with-alt-screen\n    (term/with-mouse\n      (run-tui))))   ; terminal is fully restored however this exits\n```"
+    },
+    {
+      "name": "term/with-bracketed-paste",
+      "module": "terminal",
+      "section": "Screen Control",
+      "summary": "Guard macro: enable bracketed paste, run `body`, and **always** disable it on exit — even if `body` throws (the error is re-raised after restoring). Returns `body`'s value. Inside, `io/read-key` returns pasted text as `{:kind :paste :text …}`. Compose with `io/with-raw-mode` / `term/with-alt-screen`.",
+      "examples": [
+        "(io/with-raw-mode\n  (term/with-bracketed-paste\n    (run-editor)))"
+      ],
+      "body": "Guard macro: enable bracketed paste, run `body`, and **always** disable it on exit — even if `body` throws (the error is re-raised after restoring). Returns `body`'s value. Inside, `io/read-key` returns pasted text as `{:kind :paste :text …}`. Compose with `io/with-raw-mode` / `term/with-alt-screen`.\n\n```sema\n(io/with-raw-mode\n  (term/with-bracketed-paste\n    (run-editor)))\n```"
+    },
+    {
+      "name": "term/with-focus-events",
+      "module": "terminal",
+      "section": "Screen Control",
+      "summary": "Guard macro: enable focus reporting, run `body`, and **always** disable it on exit — even if `body` throws. Returns `body`'s value. Inside, `io/read-key` returns focus changes as `{:kind :focus :focused #t|#f}`.",
+      "body": "Guard macro: enable focus reporting, run `body`, and **always** disable it on exit — even if `body` throws. Returns `body`'s value. Inside, `io/read-key` returns focus changes as `{:kind :focus :focused #t|#f}`."
+    },
+    {
+      "name": "term/with-kitty-keys",
+      "module": "terminal",
+      "section": "Screen Control",
+      "summary": "Guard macro: push the kitty keyboard protocol flags (default 17 = disambiguate + associated-text), run `body`, and **always** pop them on exit — even if `body` throws. Returns `body`'s value. Terminals without kitty support ignore it, so this is safe to wrap unconditionally.",
+      "examples": [
+        "(io/with-raw-mode\n  (term/with-kitty-keys\n    (run-tui)))"
+      ],
+      "body": "Guard macro: push the kitty keyboard protocol flags (default 17 = disambiguate + associated-text), run `body`, and **always** pop them on exit — even if `body` throws. Returns `body`'s value. Terminals without kitty support ignore it, so this is safe to wrap unconditionally.\n\n```sema\n(io/with-raw-mode\n  (term/with-kitty-keys\n    (run-tui)))\n```"
     },
     {
       "name": "term/with-mouse",
