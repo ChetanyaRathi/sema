@@ -409,3 +409,94 @@ fn stream_file_async_read_closed_file_errors() {
         "expected a closed-stream error, got: {err}"
     );
 }
+
+/// Regression (VM closure/scheduler): a `file/for-each-line` / `file/fold-lines`
+/// callback that CAPTURES a lexical upvalue must read the correct value when the
+/// reader runs in async context — even alongside a NESTED `async/all` on a
+/// sibling task. Two bugs made this fail before:
+///   1. the per-line callback runs from a deferred I/O poll AFTER the owning task
+///      suspends, so its still-`Open` upvalue read `nil` — fixed by snapshotting
+///      the callback's upvalues (`snapshot_escaping_closure`) up front, while the
+///      owning task VM is still current (exactly as `async/spawn` does);
+///   2. routing that call through the inline-task path `take_scheduler()`'d while
+///      the scheduler was already borrowed to drive the poll (reproducible under a
+///      nested `async/all`) — fixed by running the callback synchronously on a
+///      foreign VM (`run_closure_foreign_sync`), which never touches the scheduler.
+#[test]
+fn streaming_line_callback_captures_upvalue_under_nested_async() {
+    let f = TempFile::with_contents("upvalue-stream", "a\nb\nc\nd\ne\n");
+    let interp = Interpreter::new();
+    let program = format!(
+        r#"
+        (defun count-lines ()            ; for-each-line with int + mutable-cell upvalues
+          (async
+            (let ((seen (mutable-cell/new 0))
+                  (base 100))
+              (file/for-each-line "{path}"
+                (fn (l) (mutable-cell/set! seen (+ (mutable-cell/get seen) base))))
+              (mutable-cell/get seen))))
+        (defun join-lines ()             ; fold-lines with a captured string upvalue
+          (async
+            (let ((tag "L:"))
+              (file/fold-lines "{path}" (fn (acc l) (str acc tag l)) "start"))))
+        (defun busy ()                   ; sibling task running a NESTED async/all
+          (async (async/all (map (fn (i) (async (async/sleep 3) i)) (range 1 5)))))
+        (async/all (list (count-lines) (join-lines) (busy)))
+        "#,
+        path = f.path()
+    );
+    let result = interp
+        .eval_str_compiled(&program)
+        .expect("upvalue-under-nested-async program evaluated");
+    let items = result.as_list().expect("async/all returns a list");
+    assert_eq!(
+        items[0].as_int(),
+        Some(500),
+        "for-each-line callback read its captured `base` upvalue (5 lines * 100)"
+    );
+    assert_eq!(
+        items[1].as_str(),
+        Some("startL:aL:bL:cL:dL:e"),
+        "fold-lines callback read its captured `tag` upvalue"
+    );
+}
+
+/// Regression (VM transitive upvalue snapshot): a closure capturing a lexical
+/// upvalue, passed as DATA into an async task, must read that upvalue when it is
+/// finally invoked on the task's (foreign) VM. The task-closure snapshot didn't
+/// recurse into closures reachable *through* its captured values, so the inner
+/// closure's still-`Open` upvalue dereferenced a stack slot not on the task VM
+/// ("captured variable's stack slot is not on this VM"). Fixed by recursing in
+/// `close_closure_upvalues_for_foreign_run`.
+#[test]
+fn closure_with_upvalue_passed_as_data_into_async_task_survives() {
+    let interp = Interpreter::new();
+    let program = r#"
+        (defun run-thunk (f) (async (f)))          ; wraps a PASSED closure in a task
+        (let ((tmp "SCRATCH") (n 41))
+          (async/all (list
+            (run-thunk (fn () tmp))                ; captured string upvalue
+            (run-thunk (fn () (+ n 1))))))         ; captured int upvalue
+    "#;
+    let result = interp.eval_str_compiled(program).expect("program evaluated");
+    let items = result.as_list().expect("async/all list");
+    assert_eq!(items[0].as_str(), Some("SCRATCH"), "string upvalue survived escape into task");
+    assert_eq!(items[1].as_int(), Some(42), "int upvalue survived escape into task");
+}
+
+/// Regression: a CYCLIC closure graph (a→b→n, passed into a task) must snapshot
+/// transitively AND terminate — each visited cell becomes `Tracked`, so the
+/// back-edge finds nothing to do (no infinite recursion).
+#[test]
+fn cyclic_closures_passed_into_async_task_terminate() {
+    let interp = Interpreter::new();
+    let program = r#"
+        (defun run-thunk (f) (async (f)))
+        (let ((n 7))
+          (letrec ((a (fn () (if (> n 0) (str "a" (b)) "")))
+                   (b (fn () (str "b" n))))
+            (async/all (list (run-thunk a)))))
+    "#;
+    let result = interp.eval_str_compiled(program).expect("cyclic-closure program evaluated");
+    assert_eq!(result.as_list().unwrap()[0].as_str(), Some("ab7"));
+}

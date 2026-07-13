@@ -600,6 +600,41 @@ pub fn call_closure_owned(
     Some(vm.run(ctx))
 }
 
+/// Run a VM closure SYNCHRONOUSLY on a fresh foreign VM, WITHOUT touching the
+/// async scheduler (no inline task, no `take_scheduler`).
+///
+/// This is the invocation path for a per-item callback fired from inside an I/O
+/// poll — e.g. the streaming file line readers (`file/for-each-line` /
+/// `fold-lines` / `fold-lines-bytes`), whose callback runs while the scheduler
+/// is already borrowed to drive that very poll. Routing through the normal
+/// `call_callback` → `run_closure_as_inline_task` path would `take_scheduler()`
+/// and fail with "scheduler not initialized" (the scheduler is out, running the
+/// poll), and a *nested* `async/all` on a sibling task makes it reproducible.
+/// Running synchronously on a fresh VM sidesteps the scheduler entirely.
+///
+/// The callback's upvalues must have been snapshotted earlier via
+/// [`snapshot_escaping_closure`] (while the owning task VM was current) — here
+/// they are already `Tracked`, so the fresh VM reads them correctly. The
+/// callback must not itself yield (await/sleep/spawn) — the same constraint the
+/// synchronous non-async line-reader path imposes on its callback. Non-VM-closure
+/// callables (e.g. a builtin passed directly) fall back to the ordinary call.
+pub fn run_closure_foreign_sync(
+    func: &Value,
+    ctx: &EvalContext,
+    args: &[Value],
+) -> Result<Value, SemaError> {
+    let Some((closure, functions)) = extract_vm_closure(func) else {
+        return sema_core::call_callback(ctx, func, args);
+    };
+    let Some(globals) = closure.globals.as_ref().map(|g| g.clone()) else {
+        return sema_core::call_callback(ctx, func, args);
+    };
+    close_closure_upvalues_for_foreign_run(&closure);
+    let mut vm = VM::new_with_rc_functions(globals, functions);
+    vm.setup_for_call_args(closure, CallArgs::Borrowed(args))?;
+    vm.run(ctx)
+}
+
 /// The home globals env of the VM currently executing a native call on this
 /// thread (the innermost `CURRENT_VM`), if any. A native invoked from a running
 /// VM uses this to act on the *current* environment — e.g. a nested `import`/
@@ -818,6 +853,21 @@ pub fn with_active_debug<R>(f: impl FnOnce(&mut crate::debug::DebugState) -> R) 
 ///
 /// A no-op for cells that are already Closed/Tracked or whose owning frame is no
 /// longer on any registered VM's stack.
+/// Snapshot an escaping VM closure's still-open upvalues (`Open` → `Tracked`)
+/// while its defining frame is CURRENT, so it can be safely invoked later on a
+/// foreign or suspended-task VM. This is the seam a streaming stdlib native
+/// (`file/for-each-line` / `fold-lines` / `fold-lines-bytes`) uses: it yields,
+/// then invokes the caller's per-line callback from a deferred I/O poll — by
+/// which point the owning task has suspended and is no longer on `CURRENT_VM`,
+/// too late to read the stack slot. Calling this from inside the native (while
+/// the owning VM is still current, exactly like `async/spawn` at spawn time)
+/// captures the values up front. No-op for non-closures / already-detached cells.
+pub fn snapshot_escaping_closure(func: &Value) {
+    if let Some((closure, _functions)) = extract_vm_closure(func) {
+        close_closure_upvalues_for_foreign_run(&closure);
+    }
+}
+
 pub fn close_closure_upvalues_for_foreign_run(closure: &Closure) {
     // Snapshot the registered VM pointers, then operate through them. The
     // pointers are valid for the duration of this call (see CURRENT_VM docs).
@@ -841,6 +891,11 @@ pub fn close_closure_upvalues_for_foreign_run(closure: &Closure) {
             if frame_base + slot < vm.stack.len() && vm.frames.iter().any(|f| f.base == frame_base)
             {
                 let value = vm.stack[frame_base + slot].clone();
+                // A closure captured HERE may carry its OWN open upvalues into a
+                // frame that will be inactive when it is later invoked on the
+                // foreign stack — e.g. a path-builder or callback closure passed
+                // as DATA into an async task. Snapshot it transitively.
+                let nested = extract_vm_closure(&value).map(|(c, _)| c);
                 // Tracked, not Closed: keep the cell bound to the still-live
                 // defining frame so post-spawn `StoreLocal`/`StoreUpvalue`
                 // writes keep flowing into it (issue #104). The frame's
@@ -852,6 +907,13 @@ pub fn close_closure_upvalues_for_foreign_run(closure: &Closure) {
                     slot,
                     value,
                 };
+                // Recurse AFTER marking this cell `Tracked`, so a cyclic closure
+                // graph terminates: the back-edge finds this cell already Tracked
+                // (skipped at the top of the loop). The owning VM(s) are still on
+                // `CURRENT_VM`, so the nested closure's frames remain reachable.
+                if let Some(nested) = nested {
+                    close_closure_upvalues_for_foreign_run(&nested);
+                }
                 break;
             }
         }

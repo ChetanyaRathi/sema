@@ -5,7 +5,7 @@ use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use sema_core::{check_arity, SemaError, Value, ValueView};
+use sema_core::{check_arity, in_async_context, SemaError, Value, ValueView};
 
 use crate::register_fn;
 
@@ -37,6 +37,20 @@ struct SpinnerHandle {
 thread_local! {
     static SPINNERS: RefCell<HashMap<i64, SpinnerHandle>> = RefCell::new(HashMap::new());
     static SPINNER_COUNTER: Cell<i64> = const { Cell::new(0) };
+}
+
+/// Clear the spinner's line and, if a non-empty symbol/text was given, print
+/// the final status. Shared by `term/spinner-stop`'s sync path and its async
+/// offload's `decode` step (both run this on the VM thread — it's the same
+/// stderr write either way, just reached after a blocking join that may have
+/// been offloaded).
+fn spinner_finish(symbol: &str, text: &str) {
+    let mut stderr = std::io::stderr().lock();
+    let _ = write!(stderr, "\r\x1b[K");
+    if !symbol.is_empty() || !text.is_empty() {
+        let _ = writeln!(stderr, "{symbol} {text}");
+    }
+    let _ = stderr.flush();
 }
 
 pub fn register(env: &sema_core::Env) {
@@ -194,40 +208,61 @@ pub fn register(env: &sema_core::Env) {
             .as_int()
             .ok_or_else(|| SemaError::type_error("integer", args[0].type_name()))?;
 
-        // Signal stop and wait for thread
-        SPINNERS.with(|spinners| {
-            let mut map = spinners.borrow_mut();
-            if let Some(mut handle) = map.remove(&id) {
-                handle.stop_flag.store(true, Ordering::Relaxed);
-                if let Some(thread) = handle.thread.take() {
-                    let _ = thread.join();
-                }
-
-                // Clear the spinner line
-                let mut stderr = std::io::stderr().lock();
-                let _ = write!(stderr, "\r\x1b[K");
-
-                // Print final status if options provided
-                if args.len() == 2 {
-                    if let ValueView::Map(opts) = args[1].view() {
-                        let symbol = opts
-                            .get(&Value::keyword("symbol"))
-                            .and_then(|v| v.as_str().map(|s| s.to_string()))
-                            .unwrap_or_default();
-                        let text = opts
-                            .get(&Value::keyword("text"))
-                            .and_then(|v| v.as_str().map(|s| s.to_string()))
-                            .unwrap_or_default();
-                        if !symbol.is_empty() || !text.is_empty() {
-                            let _ = writeln!(stderr, "{symbol} {text}");
-                        }
-                    }
-                }
-                let _ = stderr.flush();
+        // Pull the final-status strings out of `args[1]` now, on the VM
+        // thread — a Sema `Value` (the options map) can't cross into the
+        // offloaded worker closure below, so only the plain `String`s it
+        // decodes to are captured.
+        let (symbol, text) = if args.len() == 2 {
+            if let ValueView::Map(opts) = args[1].view() {
+                let symbol = opts
+                    .get(&Value::keyword("symbol"))
+                    .and_then(|v| v.as_str().map(|s| s.to_string()))
+                    .unwrap_or_default();
+                let text = opts
+                    .get(&Value::keyword("text"))
+                    .and_then(|v| v.as_str().map(|s| s.to_string()))
+                    .unwrap_or_default();
+                (symbol, text)
+            } else {
+                (String::new(), String::new())
             }
-        });
+        } else {
+            (String::new(), String::new())
+        };
 
-        Ok(Value::nil())
+        let removed = SPINNERS.with(|spinners| spinners.borrow_mut().remove(&id));
+        let Some(mut handle) = removed else {
+            return Ok(Value::nil());
+        };
+        handle.stop_flag.store(true, Ordering::Relaxed);
+        let thread = handle.thread.take();
+
+        if in_async_context() {
+            // `thread.join()` blocks the caller up to ~`SPINNER_INTERVAL_MS`
+            // waiting for the spinner loop to notice the stop flag on its
+            // next wake-up. Offload the join so it doesn't stall the single
+            // cooperative VM thread; the final-line write (which touches no
+            // Sema `Value`s) runs back on the VM thread once the join
+            // completes, via `decode`.
+            crate::io::fs_offload(
+                move || {
+                    if let Some(t) = thread {
+                        let _ = t.join();
+                    }
+                    Ok(())
+                },
+                move |()| {
+                    spinner_finish(&symbol, &text);
+                    Value::nil()
+                },
+            )
+        } else {
+            if let Some(t) = thread {
+                let _ = t.join();
+            }
+            spinner_finish(&symbol, &text);
+            Ok(Value::nil())
+        }
     });
 
     // (term/spinner-update id "new message")
@@ -320,14 +355,48 @@ fn register_screen_control(env: &sema_core::Env) {
         "\x1b[?1000l\x1b[?1002l\x1b[?1006l",
     );
 
-    // Kitty keyboard protocol (opt-in): push flags 17 = disambiguate (1) +
-    // report-associated-text (16). No event-types flag, so no repeat/release
-    // events (which would double-fire as key presses). Terminals without kitty
-    // support silently ignore this, and keys keep coming through the legacy path.
-    // io/read-key decodes `ESC [ … u` events, normalizing to the usual key maps
-    // plus an optional :mods list. Restore with the stack pop on exit.
-    make_emit_fn(env, "term/enable-kitty-keys!", "\x1b[>17u");
+    // Kitty keyboard protocol (opt-in). Default flags 17 = disambiguate (1) +
+    // report-associated-text (16); pass a bitmask to request more (add 2 for
+    // event types, 4 for alternate keys — see the kitty spec). Terminals without
+    // support silently ignore this and keys keep coming through the legacy path.
+    // io/read-key decodes `ESC [ … u` events into the usual key maps (+ :mods,
+    // and :event when event types are enabled). Restore with the stack pop on exit.
+    register_fn(env, "term/enable-kitty-keys!", |args| {
+        if args.len() > 1 {
+            return Err(SemaError::arity(
+                "term/enable-kitty-keys!",
+                "0-1",
+                args.len(),
+            ));
+        }
+        let flags = match args.first() {
+            None => 17,
+            Some(v) => v
+                .as_int()
+                .ok_or_else(|| SemaError::type_error("integer", v.type_name()))?,
+        };
+        emit(&format!("\x1b[>{flags}u"))
+    });
     make_emit_fn(env, "term/disable-kitty-keys!", "\x1b[<u");
+    // Query the terminal's active kitty flags (`CSI ?u`); the reply arrives via
+    // io/read-key as {:kind :kitty-flags :flags N} (nothing if unsupported).
+    make_emit_fn(env, "term/query-kitty-keys", "\x1b[?u");
+
+    // Bracketed paste (opt-in): the terminal wraps pasted text in ESC[200~ … 201~,
+    // which io/read-key returns as {:kind :paste :text …} instead of live keys.
+    make_emit_fn(env, "term/enable-bracketed-paste", "\x1b[?2004h");
+    make_emit_fn(env, "term/disable-bracketed-paste", "\x1b[?2004l");
+
+    // Focus reporting (opt-in): ESC[I / ESC[O on focus in/out → {:kind :focus …}.
+    make_emit_fn(env, "term/enable-focus-events", "\x1b[?1004h");
+    make_emit_fn(env, "term/disable-focus-events", "\x1b[?1004l");
+
+    // Terminal queries — each writes a request whose reply arrives via io/read-key:
+    //   query-primary/secondary-da   → {:kind :device-attributes :device …}
+    // (query-cursor-position lives in io.rs — it must also arm the CPR flag so a
+    //  reply is told apart from modified-F3, which is byte-identical.)
+    make_emit_fn(env, "term/query-primary-da", "\x1b[c");
+    make_emit_fn(env, "term/query-secondary-da", "\x1b[>c");
 
     make_emit_fn(env, "term/bell", "\x07");
 
@@ -366,4 +435,138 @@ fn register_screen_control(env: &sema_core::Env) {
             .map_err(|e| SemaError::Io(format!("term/flush: {e}")))?;
         Ok(Value::nil())
     });
+}
+
+/// `term/spinner-stop`'s async-offload coverage, mirroring the pattern in
+/// `proc.rs`'s `async_offload_tests` / `io.rs`'s `async_offload_tests`:
+/// `sema-stdlib` has no scheduler of its own (that's `sema-vm`/`sema-eval`),
+/// so these tests stand in for it by hand — force
+/// `sema_core::in_async_context()` on, call the native, then poll the
+/// `AwaitIo` handle it arms to completion, exactly what the real scheduler
+/// does in production.
+#[cfg(test)]
+mod async_offload_tests {
+    use super::*;
+    use sema_core::EvalContext;
+    use std::time::{Duration, Instant};
+
+    /// Forces `in_async_context()` on for the guard's lifetime, resetting it
+    /// (even on panic/early return) so a failure can't leak the flag into
+    /// whichever test the harness runs next on the same worker thread.
+    struct AsyncCtxGuard;
+    impl Drop for AsyncCtxGuard {
+        fn drop(&mut self) {
+            sema_core::set_async_context(false);
+        }
+    }
+
+    fn env() -> sema_core::Env {
+        let e = sema_core::Env::new();
+        register(&e);
+        e
+    }
+
+    fn call_sync(env: &sema_core::Env, name: &str, args: &[Value]) -> Value {
+        let f = env.get_str(name).expect("fn registered");
+        let nf = f.as_native_fn_ref().expect("native fn");
+        (nf.func)(&EvalContext::default(), args).expect("sync call ok")
+    }
+
+    /// Call a native fn with the async-context gate forced on, then drive
+    /// the `AwaitIo` handle it arms to completion by polling. Panics if the
+    /// native didn't yield at all (e.g. it silently took the sync fallback).
+    fn drive_async(env: &sema_core::Env, name: &str, args: &[Value]) -> Value {
+        let _guard = AsyncCtxGuard;
+        sema_core::set_async_context(true);
+        let f = env.get_str(name).expect("fn registered");
+        let nf = f.as_native_fn_ref().expect("native fn");
+        let armed = (nf.func)(&EvalContext::default(), args)
+            .expect("native call should arm a yield, not error synchronously");
+        assert_eq!(
+            armed,
+            Value::nil(),
+            "an offloading native returns nil immediately after arming its yield signal"
+        );
+        let reason = sema_core::take_yield_signal()
+            .expect("expected a yield signal to be armed — did the native take the sync path?");
+        let handle = match reason {
+            sema_core::YieldReason::AwaitIo(h) => h,
+            other => panic!("expected an AwaitIo yield, got {other:?}"),
+        };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            match handle.poll() {
+                sema_core::IoPoll::Ready(Ok(v)) => return v,
+                sema_core::IoPoll::Ready(Err(e)) => panic!("offload rejected: {e}"),
+                sema_core::IoPoll::Pending => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "offload never completed within 10s"
+                    );
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+            }
+        }
+    }
+
+    /// Sync path (top level, no scheduler): `term/spinner-stop` blocks and
+    /// returns `nil` directly, unchanged from before the offload was added.
+    #[test]
+    fn spinner_stop_sync_roundtrip() {
+        let e = env();
+        let id = call_sync(&e, "term/spinner-start", &[Value::string("working")]);
+        let result = call_sync(&e, "term/spinner-stop", &[id]);
+        assert_eq!(result, Value::nil());
+    }
+
+    /// In async context, `term/spinner-stop` offloads the spinner thread's
+    /// `join()` instead of blocking the VM thread on it: the native must arm
+    /// an `AwaitIo` yield (not resolve synchronously), and once that offload
+    /// completes the result is the same `nil` the sync path returns.
+    #[test]
+    fn spinner_stop_offloads_join_in_async_context() {
+        let e = env();
+        let id = call_sync(&e, "term/spinner-start", &[Value::string("working")]);
+        let result = drive_async(&e, "term/spinner-stop", &[id]);
+        assert_eq!(result, Value::nil());
+    }
+
+    /// The final-status options map (`{:symbol .. :text ..}`) still works
+    /// once its two strings have to survive the trip through the offloaded
+    /// join's `decode` step.
+    #[test]
+    fn spinner_stop_with_final_status_offloads_async() {
+        let e = env();
+        let id = call_sync(&e, "term/spinner-start", &[Value::string("working")]);
+        let opts = Value::map(
+            [
+                (Value::keyword("symbol"), Value::string("✔")),
+                (Value::keyword("text"), Value::string("Done")),
+            ]
+            .into_iter()
+            .collect::<std::collections::BTreeMap<_, _>>(),
+        );
+        let result = drive_async(&e, "term/spinner-stop", &[id, opts]);
+        assert_eq!(result, Value::nil());
+    }
+
+    /// Stopping an unknown/already-stopped spinner id is a harmless no-op on
+    /// both paths — in particular the async path must NOT arm a yield (there
+    /// is nothing to offload), so it should resolve immediately to `nil`
+    /// rather than parking the caller.
+    #[test]
+    fn spinner_stop_unknown_id_is_noop_in_async_context() {
+        let e = env();
+        let _guard = AsyncCtxGuard;
+        sema_core::set_async_context(true);
+        let f = e.get_str("term/spinner-stop").expect("fn registered");
+        let nf = f.as_native_fn_ref().expect("native fn");
+        let result = (nf.func)(&EvalContext::default(), &[Value::int(999_999)])
+            .expect("unknown id is a no-op, not an error");
+        assert_eq!(result, Value::nil());
+        assert!(
+            sema_core::take_yield_signal().is_none(),
+            "no spinner to join means no offload should be armed"
+        );
+    }
 }

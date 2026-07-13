@@ -17,7 +17,9 @@
 //! `Send` result (`i64` counts, `Vec<String>` entry names) does. The final
 //! `Value` is built back on the VM thread when the scheduler polls the
 //! completed offload. `gzip/compress`/`gzip/decompress` are pure in-memory
-//! transforms and stay synchronous always — nothing to offload.
+//! transforms (no file I/O) but their DEFLATE pass is still CPU-bound, so they
+//! follow the same `in_async_context()` gate and offload through `fs_offload`
+//! with an owned `Vec<u8>` in, `Vec<u8>` out (both `Send`).
 
 use std::io::{Read as _, Write as _};
 use std::path::{Component, Path, PathBuf};
@@ -308,6 +310,30 @@ fn tar_extract_work(tar_path: &str, dest_dir: &str) -> Result<i64, SemaError> {
 /// Extract a list of string paths out of a Sema list `Value`, for builtins
 /// that need the owned `Vec<String>` up front (both to validate before doing
 /// any work, and because the offloaded-async path needs `Send` owned data).
+/// The CPU-bound half of `gzip/compress`: DEFLATE `data` into a gzip byte
+/// stream. Touches nothing but its own argument, so it's safe to run on an
+/// I/O-pool worker via `fs_offload` when called from async context.
+fn gzip_compress_work(data: &[u8]) -> Result<Vec<u8>, SemaError> {
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder
+        .write_all(data)
+        .map_err(|e| SemaError::eval(format!("gzip/compress: {e}")))?;
+    encoder
+        .finish()
+        .map_err(|e| SemaError::eval(format!("gzip/compress: {e}")))
+}
+
+/// The CPU-bound half of `gzip/decompress`: inflate a gzip byte stream. Same
+/// offload rationale as `gzip_compress_work`.
+fn gzip_decompress_work(data: &[u8]) -> Result<Vec<u8>, SemaError> {
+    let mut decoder = flate2::read::GzDecoder::new(data);
+    let mut out = Vec::new();
+    decoder
+        .read_to_end(&mut out)
+        .map_err(|e| SemaError::eval(format!("gzip/decompress: {e}")))?;
+    Ok(out)
+}
+
 fn string_list_arg(list: &[Value], fn_name: &str) -> Result<Vec<String>, SemaError> {
     list.iter()
         .map(|f| {
@@ -320,30 +346,33 @@ fn string_list_arg(list: &[Value], fn_name: &str) -> Result<Vec<String>, SemaErr
 }
 
 pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
-    // (gzip/compress bytes-or-string) -> gzip-compressed bytevector. Pure.
+    // (gzip/compress bytes-or-string) -> gzip-compressed bytevector. The
+    // DEFLATE pass is CPU-bound; inside async/spawn it's offloaded to the I/O
+    // pool (fs_offload) so it doesn't stall the VM thread for a large payload.
     register_fn(env, "gzip/compress", |args| {
         check_arity!(args, "gzip/compress", 1);
         let data = arg_bytes(&args[0], "gzip/compress")?;
-        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
-        encoder
-            .write_all(&data)
-            .map_err(|e| SemaError::eval(format!("gzip/compress: {e}")))?;
-        let compressed = encoder
-            .finish()
-            .map_err(|e| SemaError::eval(format!("gzip/compress: {e}")))?;
-        Ok(Value::bytevector(compressed))
+        if in_async_context() {
+            return crate::io::fs_offload(
+                move || gzip_compress_work(&data).map_err(|e| e.to_string()),
+                Value::bytevector,
+            );
+        }
+        Ok(Value::bytevector(gzip_compress_work(&data)?))
     });
 
-    // (gzip/decompress bytes) -> decompressed bytevector. Pure.
+    // (gzip/decompress bytes) -> decompressed bytevector. Same offload gate
+    // as gzip/compress.
     register_fn(env, "gzip/decompress", |args| {
         check_arity!(args, "gzip/decompress", 1);
         let data = arg_bytes(&args[0], "gzip/decompress")?;
-        let mut decoder = flate2::read::GzDecoder::new(&data[..]);
-        let mut out = Vec::new();
-        decoder
-            .read_to_end(&mut out)
-            .map_err(|e| SemaError::eval(format!("gzip/decompress: {e}")))?;
-        Ok(Value::bytevector(out))
+        if in_async_context() {
+            return crate::io::fs_offload(
+                move || gzip_decompress_work(&data).map_err(|e| e.to_string()),
+                Value::bytevector,
+            );
+        }
+        Ok(Value::bytevector(gzip_decompress_work(&data)?))
     });
 
     // (zip/create out-path files) -> entry count. Each file added under its basename.
@@ -571,5 +600,104 @@ mod tests {
             .collect();
         names.sort();
         assert_eq!(names, vec!["one.txt".to_string(), "two.txt".to_string()]);
+    }
+}
+
+/// Async-context coverage for `gzip/compress`/`gzip/decompress`'s
+/// `in_async_context()` offload gate. `sema-stdlib` doesn't depend on
+/// `sema-vm`/`sema-eval` (the real scheduler lives there), so this stands in
+/// for the scheduler by hand: force `sema_core::in_async_context()` on, call
+/// the native, then poll the `AwaitIo` handle it arms to completion — same
+/// harness shape as `io.rs`'s `async_offload_tests`.
+#[cfg(test)]
+mod async_offload_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    /// Forces `in_async_context()` on for the guard's lifetime, resetting it
+    /// (even on panic/early return) so a failure can't leak the flag into
+    /// whichever test the harness runs next on the same worker thread.
+    struct AsyncCtxGuard;
+    impl Drop for AsyncCtxGuard {
+        fn drop(&mut self) {
+            sema_core::set_async_context(false);
+        }
+    }
+
+    fn make_env() -> sema_core::Env {
+        let env = sema_core::Env::new();
+        register(&env, &sema_core::Sandbox::allow_all());
+        env
+    }
+
+    fn native(env: &sema_core::Env, name: &str) -> impl Fn(&[Value]) -> Result<Value, SemaError> {
+        let f = env
+            .get(sema_core::intern(name))
+            .unwrap_or_else(|| panic!("{name} not registered"));
+        move |args: &[Value]| {
+            let nf = f.as_native_fn_ref().expect("native fn");
+            let ctx = sema_core::EvalContext::new();
+            (nf.func)(&ctx, args)
+        }
+    }
+
+    /// Call a native fn with the async-context gate forced on, then drive the
+    /// `AwaitIo` handle it arms to completion by polling. Panics if the
+    /// native didn't yield at all (e.g. it silently took the sync fallback)
+    /// or the offload rejects.
+    fn drive_async(call: impl FnOnce() -> Result<Value, SemaError>) -> Value {
+        let _guard = AsyncCtxGuard;
+        sema_core::set_async_context(true);
+        let armed = call().expect("native call should arm a yield, not error synchronously");
+        assert_eq!(
+            armed,
+            Value::nil(),
+            "an offloading native returns nil immediately after arming its yield signal"
+        );
+        let reason = sema_core::take_yield_signal()
+            .expect("expected a yield signal to be armed — did the native take the sync path?");
+        let handle = match reason {
+            sema_core::YieldReason::AwaitIo(h) => h,
+            other => panic!("expected an AwaitIo yield, got {other:?}"),
+        };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            match handle.poll() {
+                sema_core::IoPoll::Ready(Ok(v)) => return v,
+                sema_core::IoPoll::Ready(Err(e)) => panic!("offload rejected: {e}"),
+                sema_core::IoPoll::Pending => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "offload never completed within 10s"
+                    );
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn gzip_round_trip_offloads_async() {
+        let env = make_env();
+        let original = b"hello, sema gzip async round-trip \x00\x01\x02 payload".to_vec();
+        let compressed =
+            drive_async(|| native(&env, "gzip/compress")(&[Value::bytevector(original.clone())]));
+        assert!(compressed.as_bytevector().is_some());
+        let decompressed = drive_async(|| native(&env, "gzip/decompress")(&[compressed.clone()]));
+        assert_eq!(decompressed.as_bytevector().unwrap(), &original[..]);
+    }
+
+    /// Same natives, sync path — confirms the added async gate left the
+    /// default (non-async) behavior byte-for-byte unchanged.
+    #[test]
+    fn gzip_round_trip_sync_path_unchanged() {
+        let env = make_env();
+        let original = b"hello, sema gzip sync round-trip \x00\x01\x02 payload".to_vec();
+        let compressed = native(&env, "gzip/compress")(&[Value::bytevector(original.clone())])
+            .expect("sync compress ok");
+        assert!(compressed.as_bytevector().is_some());
+        let decompressed =
+            native(&env, "gzip/decompress")(&[compressed]).expect("sync decompress ok");
+        assert_eq!(decompressed.as_bytevector().unwrap(), &original[..]);
     }
 }

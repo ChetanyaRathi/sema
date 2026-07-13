@@ -372,15 +372,20 @@ The map's `:kind` field is one of:
 |-----------|-------------------------|-------------------------------------------------|
 | `:char`   | `:char` (string)        | A printable character (UTF-8 multi-byte handled) |
 | `:ctrl`   | `:char` (string)        | Ctrl + letter (e.g., Ctrl-C → `{:kind :ctrl :char "c"}`) |
-| `:alt`    | `:char` (string)        | Alt/Meta + character (ESC + char sequence)      |
-| `:key`    | `:name` (keyword)       | Named key — see table below                     |
-| `:mouse`  | `:action` `:x` `:y` `:button` `:mods` | A mouse event (only after `term/enable-mouse`)  |
+| `:alt`    | `:char` (string)        | Alt/Meta + character (ESC + char; UTF-8 aware)  |
+| `:key`    | `:name` (keyword), optional `:mods` | Named key — see below               |
+| `:mouse`  | `:action` `:x` `:y` `:button` `:mods` | A mouse event (after `term/enable-mouse`) |
+| `:paste`  | `:text` (string)        | A bracketed paste (after `term/enable-bracketed-paste`) |
+| `:focus`  | `:focused` (bool)       | Focus gained/lost (after `term/enable-focus-events`) |
+| `:cpr`    | `:row` `:col`           | Cursor-position report (reply to `term/query-cursor-position`) |
+| `:device-attributes` | `:device` `:params` | Reply to `term/query-primary-da` / `-secondary-da` |
+| `:kitty-flags` | `:flags` (int)     | Reply to `term/query-kitty-keys`                |
 
-Named keys (`:kind :key`) currently emitted:
+Named keys (`:kind :key`):
 
-`:enter` `:tab` `:backspace` `:esc` `:up` `:down` `:left` `:right` `:home` `:end` `:delete` `:page-up` `:page-down` `:f1` `:f2` `:f3` `:f4`
+`:enter` `:tab` `:backspace` `:esc` `:up` `:down` `:left` `:right` `:home` `:end` `:insert` `:delete` `:page-up` `:page-down` `:shift-tab` `:f1`–`:f12`
 
-CSI/SS3 escape sequences (arrow keys, F1–F4, Page Up/Down, Delete) and UTF-8 continuation bytes are decoded for you. F5–F12 and Insert use longer escape sequences that aren't decoded yet — they fall through as raw characters.
+CSI/SS3 escape sequences (arrows, F1–F12, Insert, Home/End, Page Up/Down, Delete) and UTF-8 continuation bytes are decoded for you. Modifier-carrying keys include an optional `:mods` list — e.g. Ctrl+Right → `{:kind :key :name :right :mods (:ctrl)}`, Shift+F5 → `{:kind :key :name :f5 :mods (:shift)}`.
 
 **Mouse** (after `term/enable-mouse`): SGR reports decode to
 `{:kind :mouse :action A :x col :y row :button N :mods (…)}`, where `A` is one of
@@ -390,8 +395,10 @@ coordinates are 1-based, and `:mods` (omitted when empty) lists `:shift`/`:alt`/
 **Kitty keyboard** (after `term/enable-kitty-keys!`, restore with
 `term/disable-kitty-keys!`): richer key events decode to the *same*
 `:char`/`:ctrl`/`:alt`/`:key` shapes above — so existing code is unaffected — plus
-an optional `:mods` list (e.g. Shift+A → `{:kind :char :char "A" :mods (:shift)}`).
-Both mouse and kitty decoding are opt-in; plain keys are byte-identical either way.
+an optional full `:mods` list (`:shift` `:alt` `:ctrl` `:super` `:hyper` `:meta`
+`:caps-lock` `:num-lock`), and, when the matching flags are enabled,
+`:event :press|:repeat|:release` and `:shifted-key`/`:base-key`. Mouse, kitty,
+paste, and focus decoding are all opt-in; plain keys are byte-identical either way.
 
 ### `io/read-key-timeout`
 
@@ -410,6 +417,62 @@ Use this to drive an animation loop or to poll signals between renders:
     (when key (handle-key key))
     (loop)))
 ```
+
+### Terminal modes, paste, focus & queries
+
+Opt-in terminal features. Enabling a mode makes the terminal send extra reports
+that `io/read-key` decodes into the `:paste`/`:focus`/`:cpr`/`:device-attributes`/
+`:kitty-flags` events above. Each has an `enable`/`disable` pair plus a `with-`
+guard that restores automatically on exit (even if the body throws).
+
+| Feature | Enable / disable | Guard | `io/read-key` event |
+|---------|------------------|-------|---------------------|
+| Mouse | `term/enable-mouse` / `term/disable-mouse` | `term/with-mouse` | `:mouse` |
+| Bracketed paste | `term/enable-bracketed-paste` / `term/disable-bracketed-paste` | `term/with-bracketed-paste` | `:paste` |
+| Focus events | `term/enable-focus-events` / `term/disable-focus-events` | `term/with-focus-events` | `:focus` |
+| Kitty keyboard | `term/enable-kitty-keys!` `[flags]` / `term/disable-kitty-keys!` | `term/with-kitty-keys` | richer `:key`/`:char` (+ `:mods`, `:event`) |
+
+**Bracketed paste** matters most for a prompt: without it, pasting multi-line
+text feeds the newlines in as Enter keys. With it, the whole paste arrives as one
+`{:kind :paste :text "…"}`.
+
+```sema
+(io/with-raw-mode
+  (term/with-bracketed-paste
+    (let loop ()
+      (let ((ev (io/read-key)))
+        (when ev
+          (match (:kind ev)
+            (:paste (insert-text (:text ev)))
+            (:key   (handle-key ev))
+            (_      nil))
+          (loop))))))
+```
+
+**Queries and capability detection.** Some requests get a reply from the
+terminal that arrives as a later `io/read-key` event; others round-trip
+synchronously (they read the reply themselves, so call them in raw mode):
+
+| Function | Result |
+|----------|--------|
+| `term/query-cursor-position` | writes DSR; reply arrives as `{:kind :cpr :row :col}` |
+| `term/cursor-position` | round-trips synchronously → `{:row :col}` or `nil` |
+| `term/query-primary-da` / `term/query-secondary-da` | reply as `{:kind :device-attributes …}` |
+| `term/query-kitty-keys` | reply as `{:kind :kitty-flags :flags N}` |
+| `term/supports-kitty-keys?` | synchronous `#t`/`#f` (spec-recommended detection) |
+
+```sema
+(io/with-raw-mode
+  (when (term/supports-kitty-keys?)
+    (term/enable-kitty-keys!))
+  (term/cursor-position))   ; => {:row 12 :col 40}
+```
+
+::: warning tmux
+Inside tmux, kitty forwarding, focus events, mouse, and paste passthrough are all
+off by default, so auto-detection can silently fail. Prefer letting the user
+force-enable when `$TMUX` is set.
+:::
 
 ### Minimal TUI skeleton
 

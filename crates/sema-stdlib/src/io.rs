@@ -18,6 +18,10 @@ thread_local! {
     static TTY_STORE: RefCell<std::collections::BTreeMap<i64, libc::termios>> =
         const { RefCell::new(std::collections::BTreeMap::new()) };
     static TTY_COUNTER: Cell<i64> = const { Cell::new(0) };
+    // Count of outstanding DSR (cursor-position) queries. A `CSI…R` is a cursor
+    // report only when one is pending; otherwise it's modified-F3 keyboard input
+    // (`CSI 1;<mod>R`), which is byte-identical to a CPR reply.
+    static EXPECT_CPR: Cell<u32> = const { Cell::new(0) };
 }
 
 // Returns true if stdin has data ready to read within `timeout_ms` milliseconds (0 = non-blocking).
@@ -85,6 +89,19 @@ fn mods_list(bits: u32) -> Option<Value> {
     }
     if bits & 8 != 0 {
         v.push(Value::keyword("super"));
+    }
+    // Extended kitty modifiers (only reported under the kitty protocol).
+    if bits & 16 != 0 {
+        v.push(Value::keyword("hyper"));
+    }
+    if bits & 32 != 0 {
+        v.push(Value::keyword("meta"));
+    }
+    if bits & 64 != 0 {
+        v.push(Value::keyword("caps-lock"));
+    }
+    if bits & 128 != 0 {
+        v.push(Value::keyword("num-lock"));
     }
     if v.is_empty() {
         None
@@ -162,15 +179,23 @@ fn decode_kitty(csi: &[u8]) -> Value {
     let mods_sec = sections.next().unwrap_or("");
     let text_sec = sections.next().unwrap_or("");
 
-    let cp: u32 = key_sec.split(':').next().unwrap_or("").parse().unwrap_or(0);
-    // kitty encodes modifiers as (bitmask + 1); subtract before decoding.
-    let mbits = mods_sec
-        .split(':')
+    // key section: unicode-codepoint[:shifted-codepoint[:base-layout-codepoint]]
+    // (the alternates arrive only under the "report alternate keys" flag).
+    let mut key_parts = key_sec.split(':');
+    let cp: u32 = key_parts.next().unwrap_or("").parse().unwrap_or(0);
+    let shifted_cp = key_parts.next().and_then(|s| s.parse::<u32>().ok());
+    let base_cp = key_parts.next().and_then(|s| s.parse::<u32>().ok());
+    // mods section: modifiers[:event-type]. kitty encodes modifiers as (bitmask+1).
+    let mut mod_parts = mods_sec.split(':');
+    let mbits = mod_parts
         .next()
         .unwrap_or("")
         .parse::<u32>()
         .unwrap_or(0)
         .saturating_sub(1);
+    // event-type 1=press (default), 2=repeat, 3=release — present only under the
+    // "report event types" flag (bit 2).
+    let event_type = mod_parts.next().and_then(|s| s.parse::<u32>().ok());
     // Associated text (flag 16): the definitive character when present.
     let text: Option<String> = {
         let s: String = text_sec
@@ -223,10 +248,491 @@ fn decode_kitty(csi: &[u8]) -> Value {
         m.insert(Value::keyword("kind"), Value::keyword("char"));
         m.insert(Value::keyword("char"), Value::string(&ch));
     }
+    if let Some(et) = event_type {
+        m.insert(
+            Value::keyword("event"),
+            Value::keyword(match et {
+                2 => "repeat",
+                3 => "release",
+                _ => "press",
+            }),
+        );
+    }
+    if let Some(sc) = shifted_cp.and_then(char::from_u32) {
+        m.insert(
+            Value::keyword("shifted-key"),
+            Value::string(&sc.to_string()),
+        );
+    }
+    if let Some(bc) = base_cp.and_then(char::from_u32) {
+        m.insert(Value::keyword("base-key"), Value::string(&bc.to_string()));
+    }
     if let Some(mods) = mods_list(mbits) {
         m.insert(Value::keyword("mods"), mods);
     }
     Value::map(m)
+}
+
+/// Parse a legacy CSI body (the bytes after `ESC [`, including the final byte)
+/// into a key name and an xterm modifier bitmask. Handles the bare forms
+/// (`A`, `3~`, …) and the modified forms `1;<mod><final>` and `<n>;<mod>~`,
+/// where `<mod>` is `1 + bitmask` (shift=1, alt=2, ctrl=4, super=8). mbits is 0
+/// when no modifier is present, keeping bare keys byte-identical to before.
+#[cfg(unix)]
+fn parse_legacy_csi(csi: &[u8]) -> (&'static str, u32) {
+    let last = *csi.last().unwrap_or(&0);
+    let params = &csi[..csi.len().saturating_sub(1)];
+    let mut fields = params.split(|&b| b == b';');
+    let first = fields.next().unwrap_or(b"");
+    let mbits = fields
+        .next()
+        .and_then(|f| std::str::from_utf8(f).ok())
+        .and_then(|s| s.parse::<u32>().ok())
+        .map(|m| m.saturating_sub(1))
+        .unwrap_or(0);
+    let name = match last {
+        b'A' => "up",
+        b'B' => "down",
+        b'C' => "right",
+        b'D' => "left",
+        b'H' => "home",
+        b'F' => "end",
+        b'Z' => "shift-tab",
+        // Modified F1-F4 arrive as CSI `1;<mod>P/Q/R/S`. F3's `…R` is byte-shaped
+        // like a cursor-position report; the dispatcher only reaches here for `R`
+        // when no DSR reply is outstanding, so it's genuinely modified-F3.
+        b'P' => "f1",
+        b'Q' => "f2",
+        b'R' => "f3",
+        b'S' => "f4",
+        b'~' => match first {
+            b"1" | b"7" => "home",
+            b"2" => "insert",
+            b"3" => "delete",
+            b"4" | b"8" => "end",
+            b"5" => "page-up",
+            b"6" => "page-down",
+            b"11" => "f1",
+            b"12" => "f2",
+            b"13" => "f3",
+            b"14" => "f4",
+            b"15" => "f5",
+            b"17" => "f6",
+            b"18" => "f7",
+            b"19" => "f8",
+            b"20" => "f9",
+            b"21" => "f10",
+            b"23" => "f11",
+            b"24" => "f12",
+            _ => "unknown",
+        },
+        _ => "unknown",
+    };
+    (name, mbits)
+}
+
+#[cfg(all(test, unix))]
+mod legacy_csi_tests {
+    use super::parse_legacy_csi;
+
+    #[test]
+    fn bare_sequences_are_unmodified() {
+        assert_eq!(parse_legacy_csi(b"C"), ("right", 0));
+        assert_eq!(parse_legacy_csi(b"D"), ("left", 0));
+        assert_eq!(parse_legacy_csi(b"3~"), ("delete", 0));
+        assert_eq!(parse_legacy_csi(b"5~"), ("page-up", 0));
+        assert_eq!(parse_legacy_csi(b"Z"), ("shift-tab", 0));
+    }
+
+    #[test]
+    fn modified_arrows_carry_the_modifier_bitmask() {
+        // xterm modparam = 1 + bitmask (shift=1, alt=2, ctrl=4).
+        assert_eq!(parse_legacy_csi(b"1;3C"), ("right", 2)); // alt (Option)
+        assert_eq!(parse_legacy_csi(b"1;3D"), ("left", 2)); // alt (Option)
+        assert_eq!(parse_legacy_csi(b"1;5C"), ("right", 4)); // ctrl
+        assert_eq!(parse_legacy_csi(b"3;3~"), ("delete", 2)); // alt+delete
+    }
+
+    #[test]
+    fn function_and_nav_keys() {
+        assert_eq!(parse_legacy_csi(b"2~"), ("insert", 0));
+        assert_eq!(parse_legacy_csi(b"1~"), ("home", 0));
+        assert_eq!(parse_legacy_csi(b"7~"), ("home", 0));
+        assert_eq!(parse_legacy_csi(b"4~"), ("end", 0));
+        assert_eq!(parse_legacy_csi(b"8~"), ("end", 0));
+        assert_eq!(parse_legacy_csi(b"15~"), ("f5", 0));
+        assert_eq!(parse_legacy_csi(b"21~"), ("f10", 0));
+        assert_eq!(parse_legacy_csi(b"24~"), ("f12", 0));
+        assert_eq!(parse_legacy_csi(b"1;2P"), ("f1", 1)); // shift+F1
+        assert_eq!(parse_legacy_csi(b"15;5~"), ("f5", 4)); // ctrl+F5
+                                                           // Unsolicited CSI…R reaches parse_legacy_csi as modified-F3 (the
+                                                           // dispatcher only routes R to CPR when a DSR reply is outstanding).
+        assert_eq!(parse_legacy_csi(b"1;2R"), ("f3", 1)); // shift+F3
+    }
+}
+
+#[cfg(all(test, unix))]
+mod terminal_response_tests {
+    use super::*;
+
+    fn kw(m: &Value, k: &str) -> Option<Value> {
+        m.as_map_ref()
+            .and_then(|mm| mm.get(&Value::keyword(k)).cloned())
+    }
+    fn is_kw(m: &Value, k: &str, want: &str) -> bool {
+        kw(m, k) == Some(Value::keyword(want))
+    }
+    fn mods_of(m: &Value) -> Vec<String> {
+        kw(m, "mods")
+            .and_then(|v| v.as_list().map(|l| l.to_vec()))
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|k| k.as_keyword().map(|s| s.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn cursor_position_report() {
+        let m = decode_cpr(b"12;40R");
+        assert!(is_kw(&m, "kind", "cpr"));
+        assert_eq!(kw(&m, "row"), Some(Value::int(12)));
+        assert_eq!(kw(&m, "col"), Some(Value::int(40)));
+        // DECXCPR form `CSI ? row;col R` (leading ? stripped).
+        let d = decode_cpr(b"?12;40R");
+        assert_eq!(kw(&d, "row"), Some(Value::int(12)));
+        assert_eq!(kw(&d, "col"), Some(Value::int(40)));
+    }
+
+    #[test]
+    fn device_attributes_primary_and_secondary() {
+        let p = decode_device_attributes(b"?1;2c", b'?');
+        assert!(is_kw(&p, "kind", "device-attributes"));
+        assert!(is_kw(&p, "device", "primary"));
+        assert!(is_kw(
+            &decode_device_attributes(b">0;95;0c", b'>'),
+            "device",
+            "secondary"
+        ));
+    }
+
+    #[test]
+    fn kitty_flags_reply() {
+        let m = decode_kitty_flags(b"?15u");
+        assert!(is_kw(&m, "kind", "kitty-flags"));
+        assert_eq!(kw(&m, "flags"), Some(Value::int(15)));
+    }
+
+    #[test]
+    fn modify_other_keys_ctrl_tab() {
+        let m = decode_modify_other_keys(b"27;5;9~"); // ctrl + tab(9)
+        assert!(is_kw(&m, "kind", "key"));
+        assert!(is_kw(&m, "name", "tab"));
+        assert_eq!(mods_of(&m), vec!["ctrl"]);
+    }
+
+    #[test]
+    fn kitty_event_type_and_extended_mods() {
+        let rel = decode_kitty(b"97;1:3u"); // 'a', no mods, event 3 = release
+        assert!(is_kw(&rel, "kind", "char"));
+        assert_eq!(kw(&rel, "char"), Some(Value::string("a")));
+        assert!(is_kw(&rel, "event", "release"));
+        let sup = decode_kitty(b"97;9u"); // 'a', mods raw9-1=8 = super
+        assert_eq!(mods_of(&sup), vec!["super"]);
+    }
+
+    #[test]
+    fn focus_events() {
+        assert!(is_kw(&focus_event(true), "kind", "focus"));
+        assert_eq!(kw(&focus_event(true), "focused"), Some(Value::bool(true)));
+        assert_eq!(kw(&focus_event(false), "focused"), Some(Value::bool(false)));
+    }
+}
+
+/// Read the continuation bytes of a UTF-8 character whose lead byte is `lead`,
+/// returning the decoded string ("?" on invalid UTF-8). A single-byte ASCII
+/// lead returns that char unchanged, so this also covers Alt+ASCII.
+#[cfg(unix)]
+fn read_utf8_char(lead: u8) -> Result<String, SemaError> {
+    let extra = if lead & 0xe0 == 0xc0 {
+        1usize
+    } else if lead & 0xf0 == 0xe0 {
+        2
+    } else if lead & 0xf8 == 0xf0 {
+        3
+    } else {
+        0
+    };
+    let mut bytes = vec![lead];
+    for _ in 0..extra {
+        // Wait up to 20ms for continuation bytes (handles slow pipes / heavy load).
+        if !unix_stdin_ready(20) {
+            break;
+        }
+        match read_one_byte().map_err(|e| SemaError::Io(format!("io/read-key: {e}")))? {
+            None => break,
+            Some(ch) => bytes.push(ch),
+        }
+    }
+    Ok(std::str::from_utf8(&bytes)
+        .map(|s| s.to_string())
+        .unwrap_or_else(|_| "?".to_string()))
+}
+
+/// `{:kind :focus :focused <bool>}` — a terminal focus in/out report (enabled
+/// via `term/enable-focus-events`).
+#[cfg(unix)]
+fn focus_event(focused: bool) -> Value {
+    let mut m = std::collections::BTreeMap::new();
+    m.insert(Value::keyword("kind"), Value::keyword("focus"));
+    m.insert(Value::keyword("focused"), Value::bool(focused));
+    Value::map(m)
+}
+
+/// Split a CSI body (minus the final byte, with an optional leading marker
+/// stripped) into its `;`-separated integer parameters.
+#[cfg(unix)]
+fn csi_params(body: &[u8]) -> Vec<u32> {
+    std::str::from_utf8(body)
+        .unwrap_or("")
+        .split(';')
+        .map(|s| s.parse::<u32>().unwrap_or(0))
+        .collect()
+}
+
+/// `{:kind :cpr :row R :col C}` — a cursor-position report (`ESC[row;colR`),
+/// the reply to a DSR `ESC[6n` query.
+#[cfg(unix)]
+fn decode_cpr(csi: &[u8]) -> Value {
+    // Strip the final `R` and an optional leading `?` (DECXCPR: `CSI ? row;col R`).
+    let mut body = &csi[..csi.len().saturating_sub(1)];
+    if body.first() == Some(&b'?') {
+        body = &body[1..];
+    }
+    let p = csi_params(body);
+    let mut m = std::collections::BTreeMap::new();
+    m.insert(Value::keyword("kind"), Value::keyword("cpr"));
+    m.insert(
+        Value::keyword("row"),
+        Value::int(p.first().copied().unwrap_or(0) as i64),
+    );
+    m.insert(
+        Value::keyword("col"),
+        Value::int(p.get(1).copied().unwrap_or(0) as i64),
+    );
+    Value::map(m)
+}
+
+/// `{:kind :device-attributes :device :primary|:secondary :params (…)}` — a DA1
+/// (`ESC[?…c`) or DA2 (`ESC[>…c`) reply.
+#[cfg(unix)]
+fn decode_device_attributes(csi: &[u8], first: u8) -> Value {
+    // strip the leading marker (`?` or `>`) and the final `c`.
+    let body = &csi[1..csi.len().saturating_sub(1)];
+    let params: Vec<Value> = csi_params(body)
+        .into_iter()
+        .map(|n| Value::int(n as i64))
+        .collect();
+    let mut m = std::collections::BTreeMap::new();
+    m.insert(Value::keyword("kind"), Value::keyword("device-attributes"));
+    m.insert(
+        Value::keyword("device"),
+        Value::keyword(if first == b'>' {
+            "secondary"
+        } else {
+            "primary"
+        }),
+    );
+    m.insert(Value::keyword("params"), Value::list(params));
+    Value::map(m)
+}
+
+/// `{:kind :kitty-flags :flags N}` — the reply to a `CSI ?u` progressive-
+/// enhancement query (`ESC[?<flags>u`).
+#[cfg(unix)]
+fn decode_kitty_flags(csi: &[u8]) -> Value {
+    // strip leading `?` and final `u`.
+    let body = &csi[1..csi.len().saturating_sub(1)];
+    let flags = csi_params(body).first().copied().unwrap_or(0);
+    let mut m = std::collections::BTreeMap::new();
+    m.insert(Value::keyword("kind"), Value::keyword("kitty-flags"));
+    m.insert(Value::keyword("flags"), Value::int(flags as i64));
+    Value::map(m)
+}
+
+/// xterm modifyOtherKeys: `ESC[27;<mod>;<code>~` → the base key `<code>` with
+/// its modifiers, normalized to the same shapes the legacy path emits.
+#[cfg(unix)]
+fn decode_modify_other_keys(csi: &[u8]) -> Value {
+    let p = csi_params(&csi[..csi.len().saturating_sub(1)]);
+    let mbits = p.get(1).copied().unwrap_or(1).saturating_sub(1);
+    let cp = p.get(2).copied().unwrap_or(0);
+    let cp_char = char::from_u32(cp);
+    let mut m = std::collections::BTreeMap::new();
+    match cp {
+        27 => {
+            m.insert(Value::keyword("kind"), Value::keyword("key"));
+            m.insert(Value::keyword("name"), Value::keyword("esc"));
+        }
+        13 | 10 => {
+            m.insert(Value::keyword("kind"), Value::keyword("key"));
+            m.insert(Value::keyword("name"), Value::keyword("enter"));
+        }
+        9 => {
+            m.insert(Value::keyword("kind"), Value::keyword("key"));
+            m.insert(Value::keyword("name"), Value::keyword("tab"));
+        }
+        127 | 8 => {
+            m.insert(Value::keyword("kind"), Value::keyword("key"));
+            m.insert(Value::keyword("name"), Value::keyword("backspace"));
+        }
+        _ if mbits & 4 != 0 && cp_char.is_some_and(|c| c.is_ascii_alphabetic()) => {
+            let lower = cp_char.unwrap().to_ascii_lowercase();
+            m.insert(Value::keyword("kind"), Value::keyword("ctrl"));
+            m.insert(Value::keyword("char"), Value::string(&lower.to_string()));
+        }
+        _ => {
+            m.insert(Value::keyword("kind"), Value::keyword("char"));
+            m.insert(
+                Value::keyword("char"),
+                Value::string(&cp_char.map(|c| c.to_string()).unwrap_or_default()),
+            );
+        }
+    }
+    if let Some(mods) = mods_list(mbits) {
+        m.insert(Value::keyword("mods"), mods);
+    }
+    Value::map(m)
+}
+
+/// Collect a bracketed-paste payload: the literal bytes after `ESC[200~` up to
+/// the `ESC[201~` terminator, as `{:kind :paste :text …}`. Pasted content
+/// bypasses key dispatch entirely, so control bytes in a paste can't be
+/// misread as live keystrokes.
+#[cfg(unix)]
+fn read_bracketed_paste() -> Result<Value, SemaError> {
+    const TERMINATOR: &[u8] = b"\x1b[201~";
+    let mut buf: Vec<u8> = Vec::new();
+    loop {
+        match read_one_byte().map_err(|e| SemaError::Io(format!("io/read-key: {e}")))? {
+            None => break,
+            Some(ch) => {
+                buf.push(ch);
+                if buf.ends_with(TERMINATOR) {
+                    buf.truncate(buf.len() - TERMINATOR.len());
+                    break;
+                }
+            }
+        }
+    }
+    let text = String::from_utf8_lossy(&buf).to_string();
+    let mut m = std::collections::BTreeMap::new();
+    m.insert(Value::keyword("kind"), Value::keyword("paste"));
+    m.insert(Value::keyword("text"), Value::string(&text));
+    Ok(Value::map(m))
+}
+
+/// True when stdin is a real terminal (probes are meaningless otherwise).
+#[cfg(unix)]
+fn stdin_is_tty() -> bool {
+    unsafe { libc::isatty(libc::STDIN_FILENO) == 1 }
+}
+
+/// Write a control sequence to stdout and flush (for query round-trips).
+#[cfg(unix)]
+fn write_stdout(seq: &str) -> Result<(), SemaError> {
+    use std::io::Write;
+    let mut out = std::io::stdout();
+    out.write_all(seq.as_bytes())
+        .and_then(|_| out.flush())
+        .map_err(|e| SemaError::Io(format!("term: {e}")))
+}
+
+/// Scan stdin for the next complete CSI sequence (`ESC [ … final`), returning
+/// its body (params + final byte) — or None on a `budget_ms` idle timeout.
+/// Non-CSI bytes are skipped; used only by the capability probes below.
+#[cfg(unix)]
+fn read_one_csi(budget_ms: u64) -> Result<Option<Vec<u8>>, SemaError> {
+    loop {
+        if !unix_stdin_ready(budget_ms) {
+            return Ok(None);
+        }
+        match read_one_byte().map_err(|e| SemaError::Io(format!("io/read-key: {e}")))? {
+            None => return Ok(None),
+            Some(0x1b) => {}
+            Some(_) => continue,
+        }
+        if !unix_stdin_ready(50) {
+            return Ok(None);
+        }
+        match read_one_byte().map_err(|e| SemaError::Io(format!("io/read-key: {e}")))? {
+            Some(b'[') => {}
+            _ => continue,
+        }
+        let mut csi: Vec<u8> = Vec::new();
+        loop {
+            match read_one_byte().map_err(|e| SemaError::Io(format!("io/read-key: {e}")))? {
+                None => return Ok(None),
+                Some(ch) => {
+                    csi.push(ch);
+                    if (0x40..=0x7e).contains(&ch) {
+                        break;
+                    }
+                }
+            }
+        }
+        return Ok(Some(csi));
+    }
+}
+
+/// Detect kitty-keyboard support: send the flags query `CSI ?u` followed by a
+/// Primary Device Attributes barrier `CSI c` (the method the kitty spec
+/// recommends). A supporting terminal answers the flags query (`ESC[?…u`) before
+/// the DA reply (`ESC[?…c`); a non-supporting one answers only DA. Must be called
+/// in raw mode; returns false when stdin is not a TTY or nothing replies.
+/// NOTE: inside tmux, kitty forwarding is off by default and detection may
+/// silently fail — prefer letting the user force-enable when `$TMUX` is set.
+#[cfg(unix)]
+fn probe_kitty_support() -> Result<bool, SemaError> {
+    if !stdin_is_tty() {
+        return Ok(false);
+    }
+    write_stdout("\x1b[?u\x1b[c")?;
+    while let Some(csi) = read_one_csi(200)? {
+        let last = *csi.last().unwrap_or(&0);
+        if last == b'u' && csi.first() == Some(&b'?') {
+            return Ok(true);
+        }
+        if last == b'c' {
+            return Ok(false); // DA barrier reached with no kitty reply
+        }
+    }
+    Ok(false)
+}
+
+/// Round-trip the cursor position: send DSR (`CSI 6n`) and return `{:row :col}`
+/// from the reply, or nil (not a TTY / no reply). Must be called in raw mode.
+#[cfg(unix)]
+fn query_cursor_position() -> Result<Value, SemaError> {
+    if !stdin_is_tty() {
+        return Ok(Value::nil());
+    }
+    write_stdout("\x1b[6n")?;
+    while let Some(csi) = read_one_csi(200)? {
+        if *csi.last().unwrap_or(&0) == b'R' {
+            let p = csi_params(&csi[..csi.len().saturating_sub(1)]);
+            let mut m = std::collections::BTreeMap::new();
+            m.insert(
+                Value::keyword("row"),
+                Value::int(p.first().copied().unwrap_or(0) as i64),
+            );
+            m.insert(
+                Value::keyword("col"),
+                Value::int(p.get(1).copied().unwrap_or(0) as i64),
+            );
+            return Ok(Value::map(m));
+        }
+    }
+    Ok(Value::nil())
 }
 
 // Parse a key event from stdin (assuming raw mode).
@@ -272,33 +778,59 @@ fn parse_key_input() -> Result<Option<Value>, SemaError> {
                 }
             }
             let last = *csi.last().unwrap_or(&0);
-            // Dispatch by shape. Only these two are new; everything else falls
-            // through to the legacy table below (byte-identical behavior), since
-            // no legacy sequence starts with `<` or ends in `u`.
-            //   ESC [ < b;x;y (M|m)  → SGR mouse (only sent when mouse enabled)
-            //   ESC [ … u            → kitty keyboard event (only when enabled)
-            if csi.first() == Some(&b'<') {
+            let first = *csi.first().unwrap_or(&0);
+            // Dispatch by shape (each form is unambiguous by its marker/final byte):
+            //   ESC[<b;x;y M|m  → SGR mouse            ESC[…u        → kitty key
+            //   ESC[?…u         → kitty flags reply    ESC[200~      → bracketed paste
+            //   ESC[I | ESC[O   → focus in/out         ESC[?…c/>…c   → device attrs
+            //   ESC[r;cR        → cursor-position rpt   ESC[27;m;c~   → modifyOtherKeys
+            //   else            → legacy keys + xterm modifier forms + function keys
+            if first == b'<' {
                 return Ok(Some(decode_sgr_mouse(&csi, last)));
             }
             if last == b'u' {
+                if first == b'?' {
+                    return Ok(Some(decode_kitty_flags(&csi)));
+                }
                 return Ok(Some(decode_kitty(&csi)));
             }
-            let name = match csi.as_slice() {
-                b"A" => "up",
-                b"B" => "down",
-                b"C" => "right",
-                b"D" => "left",
-                b"H" => "home",
-                b"F" => "end",
-                b"Z" => "shift-tab",
-                b"3~" => "delete",
-                b"5~" => "page-up",
-                b"6~" => "page-down",
-                _ => "unknown",
-            };
+            if csi.as_slice() == b"200~" {
+                return read_bracketed_paste().map(Some);
+            }
+            if csi.as_slice() == b"I" {
+                return Ok(Some(focus_event(true)));
+            }
+            if csi.as_slice() == b"O" {
+                return Ok(Some(focus_event(false)));
+            }
+            if last == b'c' && (first == b'?' || first == b'>') {
+                return Ok(Some(decode_device_attributes(&csi, first)));
+            }
+            // A `CSI…R` is a cursor-position report only when we solicited one;
+            // otherwise it's modified-F3 (`CSI 1;<mod>R`) → fall through to keys.
+            if last == b'R'
+                && EXPECT_CPR.with(|c| {
+                    let n = c.get();
+                    if n > 0 {
+                        c.set(n - 1);
+                        true
+                    } else {
+                        false
+                    }
+                })
+            {
+                return Ok(Some(decode_cpr(&csi)));
+            }
+            if last == b'~' && csi.starts_with(b"27;") {
+                return Ok(Some(decode_modify_other_keys(&csi)));
+            }
+            let (name, mbits) = parse_legacy_csi(&csi);
             let mut m = std::collections::BTreeMap::new();
             m.insert(Value::keyword("kind"), Value::keyword("key"));
             m.insert(Value::keyword("name"), Value::keyword(name));
+            if let Some(mods) = mods_list(mbits) {
+                m.insert(Value::keyword("mods"), mods);
+            }
             return Ok(Some(Value::map(m)));
         }
 
@@ -326,11 +858,11 @@ fn parse_key_input() -> Result<Option<Value>, SemaError> {
             return Ok(Some(Value::map(m)));
         }
 
-        // Alt + char  (ESC followed by a regular character)
-        let alt_char = char::from(b2);
+        // Alt + char (ESC followed by a character; may be multi-byte UTF-8).
+        let alt_str = read_utf8_char(b2)?;
         let mut m = std::collections::BTreeMap::new();
         m.insert(Value::keyword("kind"), Value::keyword("alt"));
-        m.insert(Value::keyword("char"), Value::string(&alt_char.to_string()));
+        m.insert(Value::keyword("char"), Value::string(&alt_str));
         return Ok(Some(Value::map(m)));
     }
 
@@ -388,29 +920,7 @@ fn parse_key_input() -> Result<Option<Value>, SemaError> {
     }
 
     // Multi-byte UTF-8 character (b >= 0x80)
-    let extra = if b & 0xe0 == 0xc0 {
-        1usize
-    } else if b & 0xf0 == 0xe0 {
-        2
-    } else if b & 0xf8 == 0xf0 {
-        3
-    } else {
-        0
-    };
-    let mut bytes = vec![b];
-    for _ in 0..extra {
-        // Wait up to 20ms for continuation bytes (handles slow pipes and heavy load)
-        if !unix_stdin_ready(20) {
-            break;
-        }
-        match read_one_byte().map_err(|e| SemaError::Io(format!("io/read-key: {e}")))? {
-            None => break,
-            Some(ch) => bytes.push(ch),
-        }
-    }
-    let ch_str = std::str::from_utf8(&bytes)
-        .map(|s| s.to_string())
-        .unwrap_or_else(|_| "?".to_string());
+    let ch_str = read_utf8_char(b)?;
     let mut m = std::collections::BTreeMap::new();
     m.insert(Value::keyword("kind"), Value::keyword("char"));
     m.insert(Value::keyword("char"), Value::string(&ch_str));
@@ -581,6 +1091,233 @@ pub(crate) fn fs_offload<T: Send + 'static>(
 /// pre-render the same form for sync/async rejections to be byte-identical.
 fn fs_io_msg(msg: String) -> String {
     SemaError::Io(msg).to_string()
+}
+
+/// Like [`fs_offload`], but `decode` may itself fail. Needed where the fetched
+/// `T` requires further VM-thread-only processing that can reject — e.g.
+/// `load`'s `sema_reader::read_many`, which interns symbols (not `Send`, so it
+/// can't run on the worker) and can itself return a `SemaError` on a parse
+/// error. `fs_offload`'s `decode: Fn(T) -> Value` has no way to signal that;
+/// this sibling thread the `Result` through instead. Same drop-safety and
+/// no-abort-hook rationale as `fs_offload` (see its doc comment) — a file read
+/// finishes in bounded time, so cancellation is best-effort.
+pub(crate) fn fs_offload_parse<T: Send + 'static>(
+    work: impl FnOnce() -> Result<T, String> + Send + 'static,
+    decode: impl Fn(T) -> Result<Value, SemaError> + 'static,
+) -> Result<Value, SemaError> {
+    use std::rc::Rc;
+    use tokio::sync::oneshot::error::TryRecvError;
+
+    if let Some(v) = sema_core::take_resume_value() {
+        return Ok(v);
+    }
+
+    let (tx, mut rx) = tokio::sync::oneshot::channel::<Result<T, String>>();
+    sema_io::io_spawn_blocking(move || {
+        let _ = tx.send(work());
+        sema_core::notify_io_complete();
+    });
+
+    let handle = Rc::new(sema_core::IoHandle::new(move || match rx.try_recv() {
+        Err(TryRecvError::Empty) => sema_core::IoPoll::Pending,
+        Ok(Ok(t)) => match decode(t) {
+            Ok(v) => sema_core::IoPoll::Ready(Ok(v)),
+            Err(e) => sema_core::IoPoll::Ready(Err(e.to_string())),
+        },
+        Ok(Err(msg)) => sema_core::IoPoll::Ready(Err(msg)),
+        Err(TryRecvError::Closed) => {
+            sema_core::IoPoll::Ready(Err("file: worker dropped".to_string()))
+        }
+    }));
+    sema_core::set_yield_signal(sema_core::YieldReason::AwaitIo(handle));
+    Ok(Value::nil())
+}
+
+// ── Async line-streaming (file/for-each-line, file/fold-lines[-bytes]) ────
+//
+// These natives run a Sema callback (`!Send`, touches `Value`s — cannot cross
+// the thread boundary) once per line, so the whole read loop can't just be
+// handed to `fs_offload` like a stateless read/write. Nor can the file be
+// read to completion up front — an unbounded `fs_offload` slurp would defeat
+// the "huge file" case these iterators exist for. Instead each offloaded
+// round-trip reads a BOUNDED chunk of lines on the worker; the chunk is
+// handed back and the callback runs per-line on the VM thread; then the next
+// chunk is offloaded — repeating via a hand-rolled `IoHandle` poll closure
+// (the same "poll immediately re-arms the next stage" shape as
+// `stream.rs`'s `checkout_offload`, minus the checkout: the `BufReader` here
+// is owned solely by this call, never shared, so there's nothing to
+// reinstall/tombstone — an abandoned in-flight chunk read just finishes on
+// the worker and is dropped, exactly like `fs_offload`'s own no-abort-hook
+// rationale).
+
+/// Bounded chunk size for the async line-streaming natives: read up to this
+/// many lines OR this many bytes per offloaded round-trip — large enough to
+/// amortize the worker hop, small enough that a huge file is never pulled
+/// wholly into memory.
+const ASYNC_LINE_CHUNK_MAX_LINES: usize = 256;
+const ASYNC_LINE_CHUNK_MAX_BYTES: usize = 256 * 1024;
+
+/// One bounded chunk read of newline-stripped `String` lines (the
+/// `file/for-each-line` / `file/fold-lines` element type). Runs entirely on
+/// the worker thread; `reader` and its `File` are `Send`.
+fn read_line_chunk_str(
+    reader: &mut std::io::BufReader<std::fs::File>,
+    path: &str,
+    op: &str,
+) -> Result<(Vec<String>, bool), String> {
+    let mut lines = Vec::new();
+    let mut budget = 0usize;
+    let mut eof = false;
+    let mut line_buf = String::with_capacity(64);
+    loop {
+        line_buf.clear();
+        let n = reader
+            .read_line(&mut line_buf)
+            .map_err(|e| fs_io_msg(format!("{op} {path}: {e}")))?;
+        if n == 0 {
+            eof = true;
+            break;
+        }
+        if line_buf.ends_with('\n') {
+            line_buf.pop();
+            if line_buf.ends_with('\r') {
+                line_buf.pop();
+            }
+        }
+        budget += n;
+        lines.push(std::mem::take(&mut line_buf));
+        if lines.len() >= ASYNC_LINE_CHUNK_MAX_LINES || budget >= ASYNC_LINE_CHUNK_MAX_BYTES {
+            break;
+        }
+    }
+    Ok((lines, eof))
+}
+
+/// Byte-oriented sibling of [`read_line_chunk_str`] for `file/fold-lines-bytes`
+/// — no UTF-8 validation, same `\r\n`/`\n` stripping rule.
+fn read_line_chunk_bytes(
+    reader: &mut std::io::BufReader<std::fs::File>,
+    path: &str,
+    op: &str,
+) -> Result<(Vec<Vec<u8>>, bool), String> {
+    let mut lines = Vec::new();
+    let mut budget = 0usize;
+    let mut eof = false;
+    let mut line_buf: Vec<u8> = Vec::with_capacity(128);
+    loop {
+        line_buf.clear();
+        let n = reader
+            .read_until(b'\n', &mut line_buf)
+            .map_err(|e| fs_io_msg(format!("{op} {path}: {e}")))?;
+        if n == 0 {
+            eof = true;
+            break;
+        }
+        let mut end = line_buf.len();
+        if end > 0 && line_buf[end - 1] == b'\n' {
+            end -= 1;
+            if end > 0 && line_buf[end - 1] == b'\r' {
+                end -= 1;
+            }
+        }
+        budget += n;
+        lines.push(line_buf[..end].to_vec());
+        if lines.len() >= ASYNC_LINE_CHUNK_MAX_LINES || budget >= ASYNC_LINE_CHUNK_MAX_BYTES {
+            break;
+        }
+    }
+    Ok((lines, eof))
+}
+
+/// A bounded chunk-read function for the async line streamers: reads at most
+/// [`ASYNC_LINE_CHUNK_MAX_LINES`]/[`ASYNC_LINE_CHUNK_MAX_BYTES`] worth of `L`
+/// items from `reader`, returning `(items, eof)`. Implemented by
+/// [`read_line_chunk_str`] and [`read_line_chunk_bytes`]; always a plain `fn`
+/// item (no captures), so it's trivially `Send` to move into the worker
+/// closure alongside the reader.
+type LineChunkReader<L> =
+    fn(&mut std::io::BufReader<std::fs::File>, &str, &str) -> Result<(Vec<L>, bool), String>;
+
+/// One offloaded chunk read's outcome: the reinstalled (still-open) reader,
+/// the chunk of items read, and whether EOF was hit.
+type LineChunkResult<L> = Result<(std::io::BufReader<std::fs::File>, Vec<L>, bool), String>;
+
+/// Spawn one offloaded chunk read: opens `path` first if `reader` is `None`
+/// (the first round-trip), otherwise resumes the given (still-open) reader.
+/// Sends back the reinstalled reader alongside the chunk so the poller can
+/// kick off the next round without reopening the file.
+fn spawn_line_chunk<L: Send + 'static>(
+    reader: Option<std::io::BufReader<std::fs::File>>,
+    path: String,
+    op: &'static str,
+    read_chunk: LineChunkReader<L>,
+) -> tokio::sync::oneshot::Receiver<LineChunkResult<L>> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    sema_io::io_spawn_blocking(move || {
+        let result = (|| {
+            let mut reader = match reader {
+                Some(r) => r,
+                None => {
+                    let file = std::fs::File::open(&path)
+                        .map_err(|e| fs_io_msg(format!("{op} {path}: {e}")))?;
+                    std::io::BufReader::with_capacity(ASYNC_LINE_CHUNK_MAX_BYTES, file)
+                }
+            };
+            let (items, eof) = read_chunk(&mut reader, &path, op)?;
+            Ok((reader, items, eof))
+        })();
+        let _ = tx.send(result);
+        sema_core::notify_io_complete();
+    });
+    rx
+}
+
+/// Drive the bounded-chunk read/callback loop described above to completion,
+/// arming a fresh `AwaitIo` yield for each chunk in flight. `on_chunk` runs
+/// ON THE VM THREAD once per chunk (it's where the Sema callback is invoked —
+/// may hold `Value`s, e.g. a fold accumulator); `finish` builds the final
+/// return value once EOF is reached. Returns `Ok(nil)` after arming the first
+/// yield signal, like `fs_offload`.
+fn async_stream_lines<L: Send + 'static>(
+    op: &'static str,
+    path: String,
+    read_chunk: LineChunkReader<L>,
+    mut on_chunk: impl FnMut(Vec<L>) -> Result<(), SemaError> + 'static,
+    mut finish: impl FnMut() -> Value + 'static,
+) -> Result<Value, SemaError> {
+    use tokio::sync::oneshot::error::TryRecvError;
+
+    if let Some(v) = sema_core::take_resume_value() {
+        return Ok(v);
+    }
+
+    let rx0 = spawn_line_chunk(None, path.clone(), op, read_chunk);
+    let rx = std::rc::Rc::new(std::cell::RefCell::new(rx0));
+
+    let poll = move || -> sema_core::IoPoll {
+        let recv = rx.borrow_mut().try_recv();
+        match recv {
+            Err(TryRecvError::Empty) => sema_core::IoPoll::Pending,
+            Err(TryRecvError::Closed) => {
+                sema_core::IoPoll::Ready(Err(format!("{op}: I/O worker dropped")))
+            }
+            Ok(Err(msg)) => sema_core::IoPoll::Ready(Err(msg)),
+            Ok(Ok((reader, items, eof))) => {
+                if let Err(e) = on_chunk(items) {
+                    return sema_core::IoPoll::Ready(Err(e.to_string()));
+                }
+                if eof {
+                    return sema_core::IoPoll::Ready(Ok(finish()));
+                }
+                *rx.borrow_mut() = spawn_line_chunk(Some(reader), path.clone(), op, read_chunk);
+                sema_core::IoPoll::Pending
+            }
+        }
+    };
+
+    let handle = std::rc::Rc::new(sema_core::IoHandle::new(poll));
+    sema_core::set_yield_signal(sema_core::YieldReason::AwaitIo(handle));
+    Ok(Value::nil())
 }
 
 /// Crate-internal: poll stdin for a key within `ms` and decode it, for
@@ -796,6 +1533,17 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
             let bv = args[1]
                 .as_bytevector()
                 .ok_or_else(|| SemaError::type_error("bytevector", args[1].type_name()))?;
+            if sema_core::in_async_context() {
+                let path = path.to_string();
+                let bv = bv.to_vec();
+                return fs_offload(
+                    move || {
+                        std::fs::write(&path, &bv)
+                            .map_err(|e| fs_io_msg(format!("file/write-bytes {path}: {e}")))
+                    },
+                    |()| Value::nil(),
+                );
+            }
             std::fs::write(path, bv)
                 .map_err(|e| SemaError::Io(format!("file/write-bytes {path}: {e}")))?;
             Ok(Value::nil())
@@ -811,6 +1559,13 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
             if exists {
                 return Ok(Value::bool(true));
             }
+        }
+        if sema_core::in_async_context() {
+            let path = path.to_string();
+            return fs_offload(
+                move || Ok(std::path::Path::new(&path).exists()),
+                Value::bool,
+            );
         }
         Ok(Value::bool(std::path::Path::new(path).exists()))
     });
@@ -939,6 +1694,17 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
             let to = args[1]
                 .as_str()
                 .ok_or_else(|| SemaError::type_error("string", args[1].type_name()))?;
+            if sema_core::in_async_context() {
+                let from = from.to_string();
+                let to = to.to_string();
+                return fs_offload(
+                    move || {
+                        std::fs::rename(&from, &to)
+                            .map_err(|e| fs_io_msg(format!("file/rename {from} -> {to}: {e}")))
+                    },
+                    |()| Value::nil(),
+                );
+            }
             std::fs::rename(from, to)
                 .map_err(|e| SemaError::Io(format!("file/rename {from} -> {to}: {e}")))?;
             Ok(Value::nil())
@@ -950,14 +1716,27 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
         let path = args[0]
             .as_str()
             .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
-        let mut entries = Vec::new();
-        for entry in
-            std::fs::read_dir(path).map_err(|e| SemaError::Io(format!("file/list {path}: {e}")))?
-        {
-            let entry = entry.map_err(|e| SemaError::Io(format!("file/list {path}: {e}")))?;
-            entries.push(Value::string(&entry.file_name().to_string_lossy()));
+        fn list_impl(path: &str) -> Result<Vec<String>, String> {
+            let mut entries = Vec::new();
+            for entry in std::fs::read_dir(path).map_err(|e| format!("file/list {path}: {e}"))? {
+                let entry = entry.map_err(|e| format!("file/list {path}: {e}"))?;
+                entries.push(entry.file_name().to_string_lossy().into_owned());
+            }
+            Ok(entries)
         }
-        Ok(Value::list(entries))
+        if sema_core::in_async_context() {
+            let path = path.to_string();
+            return fs_offload(
+                move || list_impl(&path).map_err(fs_io_msg),
+                |entries: Vec<String>| {
+                    Value::list(entries.into_iter().map(|s| Value::string(&s)).collect())
+                },
+            );
+        }
+        let entries = list_impl(path).map_err(SemaError::Io)?;
+        Ok(Value::list(
+            entries.into_iter().map(|s| Value::string(&s)).collect(),
+        ))
     });
 
     crate::register_fn_path_gated(env, sandbox, Caps::FS_WRITE, "file/mkdir", &[0], |args| {
@@ -965,6 +1744,16 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
         let path = args[0]
             .as_str()
             .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
+        if sema_core::in_async_context() {
+            let path = path.to_string();
+            return fs_offload(
+                move || {
+                    std::fs::create_dir_all(&path)
+                        .map_err(|e| fs_io_msg(format!("file/mkdir {path}: {e}")))
+                },
+                |()| Value::nil(),
+            );
+        }
         std::fs::create_dir_all(path)
             .map_err(|e| SemaError::Io(format!("file/mkdir {path}: {e}")))?;
         Ok(Value::nil())
@@ -981,6 +1770,13 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
             let path = args[0]
                 .as_str()
                 .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
+            if sema_core::in_async_context() {
+                let path = path.to_string();
+                return fs_offload(
+                    move || Ok(std::path::Path::new(&path).is_dir()),
+                    Value::bool,
+                );
+            }
             Ok(Value::bool(std::path::Path::new(path).is_dir()))
         },
     );
@@ -990,6 +1786,13 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
         let path = args[0]
             .as_str()
             .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
+        if sema_core::in_async_context() {
+            let path = path.to_string();
+            return fs_offload(
+                move || Ok(std::path::Path::new(&path).is_file()),
+                Value::bool,
+            );
+        }
         Ok(Value::bool(std::path::Path::new(path).is_file()))
     });
 
@@ -1004,6 +1807,13 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
             let path = args[0]
                 .as_str()
                 .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
+            if sema_core::in_async_context() {
+                let path = path.to_string();
+                return fs_offload(
+                    move || Ok(std::path::Path::new(&path).is_symlink()),
+                    Value::bool,
+                );
+            }
             Ok(Value::bool(std::path::Path::new(path).is_symlink()))
         },
     );
@@ -1013,21 +1823,36 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
         let path = args[0]
             .as_str()
             .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
-        let meta =
-            std::fs::metadata(path).map_err(|e| SemaError::Io(format!("file/info {path}: {e}")))?;
-        let mut map = std::collections::BTreeMap::new();
-        map.insert(Value::keyword("size"), Value::int(meta.len() as i64));
-        map.insert(Value::keyword("is-dir"), Value::bool(meta.is_dir()));
-        map.insert(Value::keyword("is-file"), Value::bool(meta.is_file()));
-        if let Ok(modified) = meta.modified() {
-            if let Ok(duration) = modified.duration_since(std::time::UNIX_EPOCH) {
-                map.insert(
-                    Value::keyword("modified"),
-                    Value::int(duration.as_millis() as i64),
-                );
-            }
+        // (size, is_dir, is_file, modified_millis) — plain Send data extracted from
+        // `std::fs::Metadata` on the worker; the `Value` map is only built back on
+        // the VM thread by `decode`/below.
+        fn info_impl(path: &str) -> Result<(u64, bool, bool, Option<i64>), String> {
+            let meta = std::fs::metadata(path).map_err(|e| format!("file/info {path}: {e}"))?;
+            let modified = meta.modified().ok().and_then(|m| {
+                m.duration_since(std::time::UNIX_EPOCH)
+                    .ok()
+                    .map(|d| d.as_millis() as i64)
+            });
+            Ok((meta.len(), meta.is_dir(), meta.is_file(), modified))
         }
-        Ok(Value::map(map))
+        fn info_to_value(
+            (size, is_dir, is_file, modified): (u64, bool, bool, Option<i64>),
+        ) -> Value {
+            let mut map = std::collections::BTreeMap::new();
+            map.insert(Value::keyword("size"), Value::int(size as i64));
+            map.insert(Value::keyword("is-dir"), Value::bool(is_dir));
+            map.insert(Value::keyword("is-file"), Value::bool(is_file));
+            if let Some(modified) = modified {
+                map.insert(Value::keyword("modified"), Value::int(modified));
+            }
+            Value::map(map)
+        }
+        if sema_core::in_async_context() {
+            let path = path.to_string();
+            return fs_offload(move || info_impl(&path).map_err(fs_io_msg), info_to_value);
+        }
+        let info = info_impl(path).map_err(SemaError::Io)?;
+        Ok(info_to_value(info))
     });
 
     register_fn(env, "path/join", |args| {
@@ -1051,6 +1876,17 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
         let s = args[0]
             .as_str()
             .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
+        if sema_core::in_async_context() {
+            let s = s.to_string();
+            return fs_offload(
+                move || {
+                    std::fs::canonicalize(&s)
+                        .map(|p| p.to_string_lossy().into_owned())
+                        .map_err(|e| fs_io_msg(format!("path/absolute {s}: {e}")))
+                },
+                Value::string_owned,
+            );
+        }
         let abs = std::fs::canonicalize(s)
             .map_err(|e| SemaError::Io(format!("path/absolute {s}: {e}")))?;
         Ok(Value::string(&abs.to_string_lossy()))
@@ -1061,13 +1897,37 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
         let pattern = args[0]
             .as_str()
             .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
-        let paths = glob::glob(pattern)
+        // Validate the pattern up front (sandbox-side, cheap, and the error is a
+        // `SemaError::eval` not `::Io` — keep it on the VM thread in both paths).
+        glob::glob(pattern)
             .map_err(|e| SemaError::eval(format!("file/glob: invalid pattern: {e}")))?;
-        let mut items = Vec::new();
-        for entry in paths {
-            let path = entry.map_err(|e| SemaError::Io(format!("file/glob: {e}")))?;
-            items.push(Value::string(path.to_str().unwrap_or("")));
+        fn glob_impl(pattern: &str) -> Result<Vec<String>, String> {
+            let paths =
+                glob::glob(pattern).map_err(|e| format!("file/glob: invalid pattern: {e}"))?;
+            paths
+                .collect::<Result<Vec<_>, _>>()
+                .map(|entries| {
+                    entries
+                        .into_iter()
+                        .map(|p| p.to_string_lossy().into_owned())
+                        .collect()
+                })
+                .map_err(|e| format!("file/glob: {e}"))
         }
+        if sema_core::in_async_context() {
+            let pattern = pattern.to_string();
+            return fs_offload(
+                move || glob_impl(&pattern).map_err(fs_io_msg),
+                |entries: Vec<String>| {
+                    Value::list(entries.into_iter().map(|s| Value::string(&s)).collect())
+                },
+            );
+        }
+        let items = glob_impl(pattern)
+            .map_err(SemaError::Io)?
+            .into_iter()
+            .map(|s| Value::string(&s))
+            .collect();
         Ok(Value::list(items))
     });
 
@@ -1117,6 +1977,17 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
             let s = args[0]
                 .as_str()
                 .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
+            if sema_core::in_async_context() {
+                let s = s.to_string();
+                return fs_offload(
+                    move || {
+                        std::fs::canonicalize(&s)
+                            .map(|p| p.to_string_lossy().into_owned())
+                            .map_err(|e| fs_io_msg(format!("path/canonicalize {s}: {e}")))
+                    },
+                    Value::string_owned,
+                );
+            }
             let c = std::fs::canonicalize(s)
                 .map_err(|e| SemaError::Io(format!("path/canonicalize {s}: {e}")))?;
             Ok(Value::string(&c.to_string_lossy()))
@@ -1216,6 +2087,35 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
                 .as_str()
                 .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
             let func = args[1].clone();
+            if sema_core::in_async_context() {
+                let path_s = path.to_string();
+                let func_async = func.clone();
+                // Snapshot the callback's captured upvalues NOW, while this
+                // native's task VM is still current: the per-line callback runs
+                // from a deferred I/O poll AFTER this task suspends, by which
+                // point its stack is inactive and the upvalues would read nil.
+                sema_vm::snapshot_escaping_closure(&func_async);
+                return async_stream_lines::<String>(
+                    "file/for-each-line",
+                    path_s,
+                    read_line_chunk_str,
+                    move |lines| {
+                        sema_core::with_stdlib_ctx(|ctx| {
+                            for line in &lines {
+                                // Run synchronously on a foreign VM (NOT the inline-task
+                                // path): the scheduler is already taken driving this poll.
+                                sema_vm::run_closure_foreign_sync(
+                                    &func_async,
+                                    ctx,
+                                    &[Value::string(line)],
+                                )?;
+                            }
+                            Ok(())
+                        })
+                    },
+                    Value::nil,
+                );
+            }
             let file = std::fs::File::open(path)
                 .map_err(|e| SemaError::Io(format!("file/for-each-line {path}: {e}")))?;
             let mut reader = std::io::BufReader::new(file);
@@ -1256,6 +2156,35 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
                 .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
             let func = args[1].clone();
             let mut acc = args[2].clone();
+            if sema_core::in_async_context() {
+                let path_s = path.to_string();
+                let func_async = func.clone();
+                // See file/for-each-line: snapshot upvalues before yielding.
+                sema_vm::snapshot_escaping_closure(&func_async);
+                let acc_cell = std::rc::Rc::new(std::cell::RefCell::new(acc.clone()));
+                let acc_for_finish = acc_cell.clone();
+                return async_stream_lines::<String>(
+                    "file/fold-lines",
+                    path_s,
+                    read_line_chunk_str,
+                    move |lines| {
+                        sema_core::with_stdlib_ctx(|ctx| {
+                            for line in lines {
+                                let acc = acc_cell.borrow().clone();
+                                // Synchronous foreign-VM call (see for-each-line).
+                                let new_acc = sema_vm::run_closure_foreign_sync(
+                                    &func_async,
+                                    ctx,
+                                    &[acc, Value::string(&line)],
+                                )?;
+                                *acc_cell.borrow_mut() = new_acc;
+                            }
+                            Ok(())
+                        })
+                    },
+                    move || acc_for_finish.borrow().clone(),
+                );
+            }
             let file = std::fs::File::open(path)
                 .map_err(|e| SemaError::Io(format!("file/fold-lines {path}: {e}")))?;
             // 256KB buffer (vs default 8KB) improves throughput for large file reads.
@@ -1304,6 +2233,35 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
                 .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
             let func = args[1].clone();
             let mut acc = args[2].clone();
+            if sema_core::in_async_context() {
+                let path_s = path.to_string();
+                let func_async = func.clone();
+                // See file/for-each-line: snapshot upvalues before yielding.
+                sema_vm::snapshot_escaping_closure(&func_async);
+                let acc_cell = std::rc::Rc::new(std::cell::RefCell::new(acc.clone()));
+                let acc_for_finish = acc_cell.clone();
+                return async_stream_lines::<Vec<u8>>(
+                    "file/fold-lines-bytes",
+                    path_s,
+                    read_line_chunk_bytes,
+                    move |lines| {
+                        sema_core::with_stdlib_ctx(|ctx| {
+                            for line in lines {
+                                let acc = acc_cell.borrow().clone();
+                                // Synchronous foreign-VM call (see for-each-line).
+                                let new_acc = sema_vm::run_closure_foreign_sync(
+                                    &func_async,
+                                    ctx,
+                                    &[acc, Value::bytevector(line)],
+                                )?;
+                                *acc_cell.borrow_mut() = new_acc;
+                            }
+                            Ok(())
+                        })
+                    },
+                    move || acc_for_finish.borrow().clone(),
+                );
+            }
             let file = std::fs::File::open(path)
                 .map_err(|e| SemaError::Io(format!("file/fold-lines-bytes {path}: {e}")))?;
             // 256KB buffer (vs default 8KB) improves throughput for large file reads.
@@ -1370,6 +2328,16 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
                 })
                 .collect();
             let content = strs.join("\n");
+            if sema_core::in_async_context() {
+                let path = path.to_string();
+                return fs_offload(
+                    move || {
+                        std::fs::write(&path, &content)
+                            .map_err(|e| fs_io_msg(format!("file/write-lines {path}: {e}")))
+                    },
+                    |()| Value::nil(),
+                );
+            }
             std::fs::write(path, content)
                 .map_err(|e| SemaError::Io(format!("file/write-lines {path}: {e}")))?;
             Ok(Value::nil())
@@ -1523,6 +2491,34 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
         //   {:kind :alt    :char "x"}         Alt + character
         register_fn(env, "io/read-key", |args| {
             check_arity!(args, "io/read-key", 0);
+
+            // In an async task, the raw `libc::read(STDIN)` below blocks the
+            // single cooperative VM thread with no timeout — worse than
+            // `io/read-key-timeout`, which at least bounds the stall. Reuse the
+            // same cooperative park (`await_io_until` + `unix_stdin_ready(0)`
+            // polling), just with an effectively unbounded timeout so it waits
+            // for a key exactly like the sync path, without blocking siblings.
+            // The sync path below is byte-identical to before.
+            if sema_core::in_async_context() {
+                if let Some(v) = sema_core::take_resume_value() {
+                    return Ok(v);
+                }
+                let started = std::time::Instant::now();
+                return await_io_until(started, u64::MAX, || {
+                    if !unix_stdin_ready(0) {
+                        return None;
+                    }
+                    match parse_key_input() {
+                        Ok(Some(v)) => Some(Ok(v)),
+                        Ok(None) => {
+                            STDIN_EOF.with(|f| f.set(true));
+                            Some(Ok(Value::nil()))
+                        }
+                        Err(e) => Some(Err(e.to_string())),
+                    }
+                });
+            }
+
             match parse_key_input()? {
                 None => {
                     STDIN_EOF.with(|f| f.set(true));
@@ -1578,6 +2574,27 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
                 Some(v) => Ok(v),
             }
         });
+
+        // Capability probes (raw mode required; they round-trip a query + reply).
+        // term/supports-kitty-keys? → bool via `CSI ?u` + DSR barrier.
+        register_fn(env, "term/supports-kitty-keys?", |args| {
+            check_arity!(args, "term/supports-kitty-keys?", 0);
+            Ok(Value::bool(probe_kitty_support()?))
+        });
+        // term/cursor-position → {:row :col} (or nil) via a DSR round-trip.
+        register_fn(env, "term/cursor-position", |args| {
+            check_arity!(args, "term/cursor-position", 0);
+            query_cursor_position()
+        });
+        // term/query-cursor-position → write DSR and arm the CPR flag, so the
+        // reply (arriving later via io/read-key) is decoded as :cpr rather than
+        // being mistaken for modified-F3 (`CSI 1;<mod>R`).
+        register_fn(env, "term/query-cursor-position", |args| {
+            check_arity!(args, "term/query-cursor-position", 0);
+            EXPECT_CPR.with(|c| c.set(c.get().saturating_add(1)));
+            write_stdout("\x1b[6n")?;
+            Ok(Value::nil())
+        });
     }
 
     // module/function aliases for legacy names
@@ -1607,6 +2624,20 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
         let path = args[0]
             .as_str()
             .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
+        if sema_core::in_async_context() {
+            let path = path.to_string();
+            return fs_offload_parse(
+                move || {
+                    std::fs::read_to_string(&path)
+                        .map_err(|e| fs_io_msg(format!("load {path}: {e}")))
+                },
+                |content| {
+                    // Parsing/interning isn't `Send` — runs back on the VM thread.
+                    let exprs = sema_reader::read_many(&content)?;
+                    Ok(Value::list(exprs))
+                },
+            );
+        }
         let content = std::fs::read_to_string(path)
             .map_err(|e| SemaError::Io(format!("load {path}: {e}")))?;
         // Parse and return as a list of expressions for the caller to eval
@@ -1793,5 +2824,494 @@ mod input_decode_tests {
         assert!(is_kw(&plain, "kind", "char"));
         assert_eq!(kw(&plain, "char"), Some(Value::string("q")));
         assert_eq!(kw(&plain, "mods"), None); // bare key: no :mods key
+    }
+}
+
+/// Async-context coverage for the `file/*`/`path/*`/`load`/`io/read-key`
+/// scheduler-offload gates added to this file. `sema-stdlib` doesn't depend
+/// on `sema-vm`/`sema-eval` (the real scheduler + interpreter live there), so
+/// these tests stand in for the scheduler by hand: force
+/// `sema_core::in_async_context()` on, call the native, then poll the
+/// `AwaitIo` handle it arms to completion — exactly what the scheduler does
+/// in production, just single-threaded and synchronous here.
+#[cfg(test)]
+mod async_offload_tests {
+    use super::*;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    use std::time::{Duration, Instant};
+
+    /// Forces `in_async_context()` on for the guard's lifetime, resetting it
+    /// (even on panic/early return) so a failure can't leak the flag into
+    /// whichever test the harness runs next on the same worker thread —
+    /// mirrors `server.rs`'s `ResetAsyncContext` test guard.
+    struct AsyncCtxGuard;
+    impl Drop for AsyncCtxGuard {
+        fn drop(&mut self) {
+            sema_core::set_async_context(false);
+        }
+    }
+
+    /// A minimal `CallCallbackFn`: invokes a `Value` that must be a native
+    /// fn directly. Stands in for the full interpreter's call dispatch
+    /// (`sema-vm`/`sema-eval`) so the async path of `file/for-each-line` /
+    /// `file/fold-lines*` — which threads the Sema callback through
+    /// `sema_core::call_callback` on the VM thread — has something to call
+    /// in a unit test that has no interpreter.
+    fn invoke_native_value(
+        ctx: &sema_core::EvalContext,
+        func: &Value,
+        args: &[Value],
+    ) -> Result<Value, SemaError> {
+        let nf = func
+            .as_native_fn_ref()
+            .ok_or_else(|| SemaError::eval("test harness: callback must be a native fn"))?;
+        (nf.func)(ctx, args)
+    }
+
+    fn make_env() -> sema_core::Env {
+        let env = sema_core::Env::new();
+        register(&env, &sema_core::Sandbox::allow_all());
+        env
+    }
+
+    fn tmp_path(tag: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("sema-io-async-test-{tag}-{nanos}"))
+    }
+
+    /// Look up a registered native by name, returning a callable closure that
+    /// invokes it with a fresh `EvalContext` each time (mirroring how the VM
+    /// calls a native).
+    fn native(env: &sema_core::Env, name: &str) -> impl Fn(&[Value]) -> Result<Value, SemaError> {
+        let f = env
+            .get(sema_core::intern(name))
+            .unwrap_or_else(|| panic!("{name} not registered"));
+        move |args: &[Value]| {
+            let nf = f.as_native_fn_ref().expect("native fn");
+            let ctx = sema_core::EvalContext::new();
+            (nf.func)(&ctx, args)
+        }
+    }
+
+    fn call_sync(env: &sema_core::Env, name: &str, args: &[Value]) -> Value {
+        native(env, name)(args).expect("sync call ok")
+    }
+
+    /// Call a native fn with the async-context gate forced on, then drive the
+    /// `AwaitIo` handle it arms to completion by polling. Panics if the
+    /// native didn't yield at all (e.g. it silently took the sync fallback)
+    /// or the offload rejects.
+    fn drive_async(call: impl FnOnce() -> Result<Value, SemaError>) -> Value {
+        let _guard = AsyncCtxGuard;
+        sema_core::set_async_context(true);
+        let armed = call().expect("native call should arm a yield, not error synchronously");
+        assert_eq!(
+            armed,
+            Value::nil(),
+            "an offloading native returns nil immediately after arming its yield signal"
+        );
+        let reason = sema_core::take_yield_signal()
+            .expect("expected a yield signal to be armed — did the native take the sync path?");
+        let handle = match reason {
+            sema_core::YieldReason::AwaitIo(h) => h,
+            other => panic!("expected an AwaitIo yield, got {other:?}"),
+        };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            match handle.poll() {
+                sema_core::IoPoll::Ready(Ok(v)) => return v,
+                sema_core::IoPoll::Ready(Err(e)) => panic!("offload rejected: {e}"),
+                sema_core::IoPoll::Pending => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "offload never completed within 10s"
+                    );
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+            }
+        }
+    }
+
+    // ── Stateless fs_offload gates ─────────────────────────────────────
+
+    #[test]
+    fn file_mkdir_offloads_and_creates_dir_async() {
+        let env = make_env();
+        let dir = tmp_path("mkdir");
+        let dir_s = dir.to_string_lossy().to_string();
+        let result = drive_async(|| native(&env, "file/mkdir")(&[Value::string(&dir_s)]));
+        assert_eq!(result, Value::nil());
+        assert!(dir.is_dir());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Same native, sync path — confirms the added async gate left the
+    /// default (non-async) behavior byte-for-byte unchanged.
+    #[test]
+    fn file_mkdir_sync_path_unchanged() {
+        let env = make_env();
+        let dir = tmp_path("mkdir-sync");
+        let dir_s = dir.to_string_lossy().to_string();
+        let result = call_sync(&env, "file/mkdir", &[Value::string(&dir_s)]);
+        assert_eq!(result, Value::nil());
+        assert!(dir.is_dir());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn file_write_bytes_offloads_and_writes_async() {
+        let env = make_env();
+        let path = tmp_path("write-bytes.bin");
+        let path_s = path.to_string_lossy().to_string();
+        let content = b"hello async bytes".to_vec();
+        let result = drive_async(|| {
+            native(&env, "file/write-bytes")(&[
+                Value::string(&path_s),
+                Value::bytevector(content.clone()),
+            ])
+        });
+        assert_eq!(result, Value::nil());
+        assert_eq!(std::fs::read(&path).unwrap(), content);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn file_rename_offloads_async() {
+        let env = make_env();
+        let from = tmp_path("rename-from.txt");
+        let to = tmp_path("rename-to.txt");
+        std::fs::write(&from, "payload").unwrap();
+        let (from_s, to_s) = (
+            from.to_string_lossy().to_string(),
+            to.to_string_lossy().to_string(),
+        );
+        let result = drive_async(|| {
+            native(&env, "file/rename")(&[Value::string(&from_s), Value::string(&to_s)])
+        });
+        assert_eq!(result, Value::nil());
+        assert!(!from.exists());
+        assert_eq!(std::fs::read_to_string(&to).unwrap(), "payload");
+        let _ = std::fs::remove_file(&to);
+    }
+
+    #[test]
+    fn file_list_offloads_async() {
+        let env = make_env();
+        let dir = tmp_path("list");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.txt"), "a").unwrap();
+        std::fs::write(dir.join("b.txt"), "b").unwrap();
+        let dir_s = dir.to_string_lossy().to_string();
+        let result = drive_async(|| native(&env, "file/list")(&[Value::string(&dir_s)]));
+        let mut names: Vec<String> = result
+            .as_list()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        names.sort();
+        assert_eq!(names, vec!["a.txt".to_string(), "b.txt".to_string()]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn file_glob_offloads_async() {
+        let env = make_env();
+        let dir = tmp_path("glob");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.txt"), "a").unwrap();
+        std::fs::write(dir.join("b.log"), "b").unwrap();
+        let pattern = format!("{}/*.txt", dir.to_string_lossy());
+        let result = drive_async(|| native(&env, "file/glob")(&[Value::string(&pattern)]));
+        let list = result.as_list().unwrap();
+        assert_eq!(list.len(), 1);
+        assert!(list[0].as_str().unwrap().ends_with("a.txt"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn path_canonicalize_offloads_async_matches_sync() {
+        let env = make_env();
+        let dir = tmp_path("canon");
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir_s = dir.to_string_lossy().to_string();
+        let async_result =
+            drive_async(|| native(&env, "path/canonicalize")(&[Value::string(&dir_s)]));
+        let sync_result = call_sync(&env, "path/canonicalize", &[Value::string(&dir_s)]);
+        assert_eq!(async_result, sync_result);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn path_absolute_offloads_async_matches_sync() {
+        let env = make_env();
+        let dir = tmp_path("abs");
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir_s = dir.to_string_lossy().to_string();
+        let async_result = drive_async(|| native(&env, "path/absolute")(&[Value::string(&dir_s)]));
+        let sync_result = call_sync(&env, "path/absolute", &[Value::string(&dir_s)]);
+        assert_eq!(async_result, sync_result);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stat_predicates_offload_async() {
+        let env = make_env();
+        let dir = tmp_path("stat");
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("f.txt");
+        std::fs::write(&file, "content").unwrap();
+        let dir_s = dir.to_string_lossy().to_string();
+        let file_s = file.to_string_lossy().to_string();
+
+        assert_eq!(
+            drive_async(|| native(&env, "file/is-directory?")(&[Value::string(&dir_s)])),
+            Value::bool(true)
+        );
+        assert_eq!(
+            drive_async(|| native(&env, "file/is-file?")(&[Value::string(&file_s)])),
+            Value::bool(true)
+        );
+        assert_eq!(
+            drive_async(|| native(&env, "file/is-symlink?")(&[Value::string(&file_s)])),
+            Value::bool(false)
+        );
+        assert_eq!(
+            drive_async(|| native(&env, "file/exists?")(&[Value::string(&file_s)])),
+            Value::bool(true)
+        );
+        let info = drive_async(|| native(&env, "file/info")(&[Value::string(&file_s)]));
+        let bt = info.as_map_ref().expect("map");
+        assert_eq!(
+            bt.get(&Value::keyword("size")).cloned(),
+            Some(Value::int(7))
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn file_write_lines_offloads_async() {
+        let env = make_env();
+        let path = tmp_path("write-lines.txt");
+        let path_s = path.to_string_lossy().to_string();
+        let lines = Value::list(vec![Value::string("a"), Value::string("b")]);
+        let result = drive_async(|| {
+            native(&env, "file/write-lines")(&[Value::string(&path_s), lines.clone()])
+        });
+        assert_eq!(result, Value::nil());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "a\nb");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn load_offloads_read_and_parses_on_vm_thread_async() {
+        let env = make_env();
+        let path = tmp_path("load.sema");
+        std::fs::write(&path, "(+ 1 2) (list 3 4)").unwrap();
+        let path_s = path.to_string_lossy().to_string();
+        let result = drive_async(|| native(&env, "load")(&[Value::string(&path_s)]));
+        let exprs = result.as_list().expect("list of parsed exprs");
+        assert_eq!(exprs.len(), 2);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn load_offload_rejects_missing_file_like_sync() {
+        let env = make_env();
+        let path = tmp_path("does-not-exist.sema");
+        let path_s = path.to_string_lossy().to_string();
+        let _guard = AsyncCtxGuard;
+        sema_core::set_async_context(true);
+        let armed = native(&env, "load")(&[Value::string(&path_s)]).expect("arms a yield");
+        assert_eq!(armed, Value::nil());
+        let reason = sema_core::take_yield_signal().expect("yield armed");
+        let handle = match reason {
+            sema_core::YieldReason::AwaitIo(h) => h,
+            other => panic!("expected AwaitIo, got {other:?}"),
+        };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            match handle.poll() {
+                sema_core::IoPoll::Ready(Err(msg)) => {
+                    assert!(msg.contains("load"), "error should name the op: {msg}");
+                    break;
+                }
+                sema_core::IoPoll::Ready(Ok(v)) => panic!("expected a rejection, got {v:?}"),
+                sema_core::IoPoll::Pending => {
+                    assert!(Instant::now() < deadline, "never completed within 10s");
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+            }
+        }
+    }
+
+    // ── io/read-key: must yield, never block, in async context ─────────
+
+    /// No real/interactive stdin is available in a test process, so this only
+    /// asserts the property the offload exists to guarantee: the native
+    /// returns immediately with a yield ARMED (an `AwaitIo` the scheduler can
+    /// poll) instead of blocking the calling thread in the raw
+    /// `libc::read(STDIN)` forever.
+    #[cfg(unix)]
+    #[test]
+    fn io_read_key_arms_await_io_instead_of_blocking_in_async_context() {
+        let _guard = AsyncCtxGuard;
+        sema_core::set_async_context(true);
+        let env = make_env();
+        let result =
+            native(&env, "io/read-key")(&[]).expect("should return immediately (armed yield)");
+        assert_eq!(result, Value::nil());
+        let reason = sema_core::take_yield_signal().expect("expected an AwaitIo yield to be armed");
+        assert!(matches!(reason, sema_core::YieldReason::AwaitIo(_)));
+    }
+
+    // ── Line-streaming natives (chunked offload + VM-thread callback) ──
+
+    #[test]
+    fn read_line_chunk_str_strips_crlf_and_respects_line_budget() {
+        let path = tmp_path("chunk-str.txt");
+        let mut content = String::new();
+        for i in 0..(ASYNC_LINE_CHUNK_MAX_LINES + 5) {
+            content.push_str(&format!("l{i}\r\n"));
+        }
+        std::fs::write(&path, &content).unwrap();
+        let file = std::fs::File::open(&path).unwrap();
+        let mut reader = std::io::BufReader::new(file);
+
+        let (chunk1, eof1) = read_line_chunk_str(&mut reader, "path", "test").unwrap();
+        assert_eq!(chunk1.len(), ASYNC_LINE_CHUNK_MAX_LINES);
+        assert!(!eof1, "budget-bounded chunk must not report eof early");
+        assert_eq!(chunk1[0], "l0");
+        assert!(!chunk1[0].contains('\r') && !chunk1[0].contains('\n'));
+
+        let (chunk2, eof2) = read_line_chunk_str(&mut reader, "path", "test").unwrap();
+        assert_eq!(chunk2.len(), 5);
+        assert!(eof2);
+        assert_eq!(chunk2[4], format!("l{}", ASYNC_LINE_CHUNK_MAX_LINES + 4));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn read_line_chunk_bytes_strips_crlf_no_utf8_check() {
+        let path = tmp_path("chunk-bytes.bin");
+        let mut content: Vec<u8> = Vec::new();
+        content.extend_from_slice(b"a\r\n");
+        content.extend_from_slice(&[0xff, 0xfe, b'\n']); // invalid UTF-8, must survive untouched
+        content.extend_from_slice(b"tail-no-newline");
+        std::fs::write(&path, &content).unwrap();
+        let file = std::fs::File::open(&path).unwrap();
+        let mut reader = std::io::BufReader::new(file);
+
+        let (chunk, eof) = read_line_chunk_bytes(&mut reader, "path", "test").unwrap();
+        assert_eq!(chunk.len(), 3);
+        assert_eq!(chunk[0], b"a".to_vec());
+        assert_eq!(chunk[1], vec![0xff, 0xfe]);
+        assert_eq!(chunk[2], b"tail-no-newline".to_vec());
+        assert!(eof);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn file_for_each_line_streams_multiple_chunks_async() {
+        let env = make_env();
+        let cb_ctx = sema_core::EvalContext::new();
+        sema_core::set_call_callback(&cb_ctx, invoke_native_value);
+
+        let path = tmp_path("for-each-line.txt");
+        // More lines than one chunk holds, so the offload must round-trip
+        // more than once through the worker.
+        let n = ASYNC_LINE_CHUNK_MAX_LINES * 2 + 3;
+        let content: String = (0..n).map(|i| format!("line-{i}\n")).collect();
+        std::fs::write(&path, &content).unwrap();
+        let path_s = path.to_string_lossy().to_string();
+
+        let seen = Rc::new(RefCell::new(Vec::new()));
+        let seen_for_cb = seen.clone();
+        let collector =
+            Value::native_fn(sema_core::NativeFn::simple("test-collect", move |args| {
+                if let Some(s) = args.first().and_then(|v| v.as_str()) {
+                    seen_for_cb.borrow_mut().push(s.to_string());
+                }
+                Ok(Value::nil())
+            }));
+
+        let result = drive_async(|| {
+            native(&env, "file/for-each-line")(&[Value::string(&path_s), collector.clone()])
+        });
+        assert_eq!(result, Value::nil());
+        let seen = seen.borrow();
+        assert_eq!(seen.len(), n);
+        assert_eq!(seen[0], "line-0");
+        assert_eq!(seen[n - 1], format!("line-{}", n - 1));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn file_fold_lines_accumulates_across_chunks_async() {
+        let env = make_env();
+        let cb_ctx = sema_core::EvalContext::new();
+        sema_core::set_call_callback(&cb_ctx, invoke_native_value);
+
+        let path = tmp_path("fold-lines.txt");
+        let n = ASYNC_LINE_CHUNK_MAX_LINES + 10;
+        let content: String = (0..n).map(|_| "x\n".to_string()).collect();
+        std::fs::write(&path, &content).unwrap();
+        let path_s = path.to_string_lossy().to_string();
+
+        let counter = Value::native_fn(sema_core::NativeFn::simple("test-count", |args| {
+            let acc = args[0].as_int().unwrap_or(0);
+            Ok(Value::int(acc + 1))
+        }));
+
+        let result = drive_async(|| {
+            native(&env, "file/fold-lines")(&[
+                Value::string(&path_s),
+                counter.clone(),
+                Value::int(0),
+            ])
+        });
+        assert_eq!(result.as_int(), Some(n as i64));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn file_fold_lines_bytes_accumulates_across_chunks_async() {
+        let env = make_env();
+        let cb_ctx = sema_core::EvalContext::new();
+        sema_core::set_call_callback(&cb_ctx, invoke_native_value);
+
+        let path = tmp_path("fold-lines-bytes.bin");
+        let n = ASYNC_LINE_CHUNK_MAX_LINES + 7;
+        let mut content = Vec::new();
+        for _ in 0..n {
+            content.extend_from_slice(b"y\n");
+        }
+        std::fs::write(&path, &content).unwrap();
+        let path_s = path.to_string_lossy().to_string();
+
+        let counter = Value::native_fn(sema_core::NativeFn::simple("test-count-bytes", |args| {
+            let acc = args[0].as_int().unwrap_or(0);
+            Ok(Value::int(acc + 1))
+        }));
+
+        let result = drive_async(|| {
+            native(&env, "file/fold-lines-bytes")(&[
+                Value::string(&path_s),
+                counter.clone(),
+                Value::int(0),
+            ])
+        });
+        assert_eq!(result.as_int(), Some(n as i64));
+
+        let _ = std::fs::remove_file(&path);
     }
 }

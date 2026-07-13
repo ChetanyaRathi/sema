@@ -27,8 +27,9 @@
 //! deadlocking against it) — that combination falls through to the existing
 //! synchronous loop even inside async context: still correct, just a narrow,
 //! documented blocking window for that one call. A copy with exactly one
-//! file-backed side checks out only that side; the memory/stdio side is
-//! read/written on the VM thread (fast, no I/O).
+//! file-backed side checks out only that side; an in-memory counterpart is
+//! read/written on the VM thread (fast, no real I/O), while a *stdin* source is
+//! offloaded to a worker (it can block waiting on real input).
 //!
 //! At top level (no scheduler) every builtin keeps today's synchronous shape
 //! byte-for-byte.
@@ -217,6 +218,12 @@ pub fn register(env: &sema_core::Env) {
     register_fn(env, "stream/read-byte", |args| {
         check_arity!(args, "stream/read-byte", 1);
         let s = expect_stream(args, "stream/read-byte", 0)?;
+
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(v) = io_streams::maybe_async_read_byte(&s)? {
+            return Ok(v);
+        }
+
         let mut buf = [0u8; 1];
         let n = s.read(&mut buf)?;
         if n == 0 {
@@ -237,6 +244,12 @@ pub fn register(env: &sema_core::Env) {
                 "stream/write-byte: value {b} out of range 0..255"
             )));
         }
+
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(v) = io_streams::maybe_async_write_byte(&s, b as u8)? {
+            return Ok(v);
+        }
+
         s.write(&[b as u8])?;
         Ok(Value::nil())
     });
@@ -348,6 +361,12 @@ pub fn register(env: &sema_core::Env) {
     register_fn(env, "stream/read-all", |args| {
         check_arity!(args, "stream/read-all", 1);
         let s = expect_stream(args, "stream/read-all", 0)?;
+
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(v) = io_streams::maybe_async_read_all(&s)? {
+            return Ok(v);
+        }
+
         let mut result = Vec::new();
         let mut buf = [0u8; 8192];
         loop {
@@ -400,6 +419,12 @@ pub fn register(env: &sema_core::Env) {
         let text = args[1]
             .as_str()
             .ok_or_else(|| SemaError::type_error("string", args[1].type_name()))?;
+
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(v) = io_streams::maybe_async_write(&s, text.as_bytes())? {
+            return Ok(v);
+        }
+
         let n = s.write(text.as_bytes())?;
         Ok(Value::int(n as i64))
     });
@@ -876,7 +901,56 @@ mod io_streams {
         stream: &Rc<StreamBox>,
         n: usize,
     ) -> Result<Option<Value>, SemaError> {
-        if !in_async_context() || stream.stream_type() != "file-input" {
+        maybe_async_read_decoded(stream, n, Value::bytevector)
+    }
+
+    /// `stream/read-byte`'s async dispatch: same stdin/file-input offload
+    /// shape as `maybe_async_read` (even the error text — `SemaStream::read`
+    /// itself doesn't distinguish caller, so the sync path's error message
+    /// for a failing `stream/read-byte` already reads "stream/read: ...")
+    /// but with a 1-byte read and a byte-or-nil decode instead of a
+    /// bytevector one.
+    pub(super) fn maybe_async_read_byte(
+        stream: &Rc<StreamBox>,
+    ) -> Result<Option<Value>, SemaError> {
+        maybe_async_read_decoded(stream, 1, |bytes| match bytes.first() {
+            Some(&b) => Value::int(b as i64),
+            None => Value::nil(),
+        })
+    }
+
+    /// Shared offload body for `stream/read` and `stream/read-byte`: reads up
+    /// to `n` bytes (stdin via `fs_offload`, file-input via the CHECKOUT
+    /// pattern) and hands the raw bytes to `decode` to build the final
+    /// `Value` on the VM thread once the offload completes.
+    fn maybe_async_read_decoded(
+        stream: &Rc<StreamBox>,
+        n: usize,
+        decode: impl Fn(Vec<u8>) -> Value + 'static,
+    ) -> Result<Option<Value>, SemaError> {
+        if !in_async_context() {
+            return Ok(None);
+        }
+        // *stdin* does real, potentially-blocking I/O (unlike in-memory byte
+        // streams): offload the read so a waiting-for-input read can't stall the
+        // cooperative scheduler. stdin is process-global and stateless, so we
+        // read it directly on the worker instead of checking out the (VM-thread-
+        // bound) stream box.
+        if stream.stream_type() == "stdin" {
+            let v = crate::io::fs_offload(
+                move || {
+                    let mut buf = vec![0u8; n];
+                    let read = std::io::stdin()
+                        .read(&mut buf)
+                        .map_err(|e| render(format!("stream/read: stdin: {e}")))?;
+                    buf.truncate(read);
+                    Ok(buf)
+                },
+                decode,
+            )?;
+            return Ok(Some(v));
+        }
+        if stream.stream_type() != "file-input" {
             return Ok(None);
         }
         if stream.is_closed() {
@@ -898,6 +972,67 @@ mod io_streams {
                 buf.truncate(read);
                 Ok(buf)
             },
+            move |bytes: Vec<u8>| -> Result<Value, SemaError> { Ok(decode(bytes)) },
+        )?;
+        Ok(Some(v))
+    }
+
+    /// `stream/read-all`'s async dispatch: loops the same offloaded read
+    /// (stdin via `fs_offload`, file-input via CHECKOUT) inside the worker
+    /// closure until EOF, accumulating everything into one buffer, so a
+    /// multi-chunk read-to-EOF never re-enters the scheduler per chunk.
+    pub(super) fn maybe_async_read_all(stream: &Rc<StreamBox>) -> Result<Option<Value>, SemaError> {
+        if !in_async_context() {
+            return Ok(None);
+        }
+        if stream.stream_type() == "stdin" {
+            let v = crate::io::fs_offload(
+                move || {
+                    let mut result = Vec::new();
+                    let mut chunk = [0u8; 8192];
+                    loop {
+                        let n = std::io::stdin()
+                            .read(&mut chunk)
+                            .map_err(|e| render(format!("stream/read: stdin: {e}")))?;
+                        if n == 0 {
+                            break;
+                        }
+                        result.extend_from_slice(&chunk[..n]);
+                    }
+                    Ok(result)
+                },
+                |bytes: Vec<u8>| Value::bytevector(bytes),
+            )?;
+            return Ok(Some(v));
+        }
+        if stream.stream_type() != "file-input" {
+            return Ok(None);
+        }
+        if stream.is_closed() {
+            return Err(SemaError::eval("stream/read: stream is closed"));
+        }
+        let s1 = stream.clone();
+        let s2 = stream.clone();
+        let s3 = stream.clone();
+        let v = checkout_offload(
+            "stream/read-all",
+            move || try_checkout_input(&s1, "stream/read"),
+            move |r| reinstall_input(&s2, r),
+            move |msg| tombstone_input(&s3, msg),
+            move |reader: &mut BufReader<std::fs::File>| -> Result<Vec<u8>, String> {
+                let mut result = Vec::new();
+                let mut chunk = [0u8; 8192];
+                loop {
+                    let n = reader
+                        .read(&mut chunk)
+                        .map_err(|e| render(format!("stream/read: I/O error: {e}")))?;
+                    if n == 0 {
+                        break;
+                    }
+                    result.extend_from_slice(&chunk[..n]);
+                }
+                Ok(result)
+            },
             |bytes: Vec<u8>| -> Result<Value, SemaError> { Ok(Value::bytevector(bytes)) },
         )?;
         Ok(Some(v))
@@ -906,7 +1041,36 @@ mod io_streams {
     pub(super) fn maybe_async_read_line(
         stream: &Rc<StreamBox>,
     ) -> Result<Option<Value>, SemaError> {
-        if !in_async_context() || stream.stream_type() != "file-input" {
+        if !in_async_context() {
+            return Ok(None);
+        }
+        // *stdin* — see maybe_async_read: offload the blocking line read.
+        if stream.stream_type() == "stdin" {
+            let v = crate::io::fs_offload(
+                move || {
+                    let mut line = String::new();
+                    let n = std::io::stdin()
+                        .read_line(&mut line)
+                        .map_err(|e| render(format!("stream/read-line: stdin: {e}")))?;
+                    if n == 0 {
+                        return Ok(None); // EOF, nothing read at all
+                    }
+                    if line.ends_with('\n') {
+                        line.pop();
+                        if line.ends_with('\r') {
+                            line.pop();
+                        }
+                    }
+                    Ok(Some(line))
+                },
+                |line: Option<String>| match line {
+                    None => Value::nil(),
+                    Some(s) => Value::string(&s),
+                },
+            )?;
+            return Ok(Some(v));
+        }
+        if stream.stream_type() != "file-input" {
             return Ok(None);
         }
         if stream.is_closed() {
@@ -952,6 +1116,26 @@ mod io_streams {
         stream: &Rc<StreamBox>,
         data: &[u8],
     ) -> Result<Option<Value>, SemaError> {
+        maybe_async_write_decoded(stream, data, |n| Ok(Value::int(n as i64)))
+    }
+
+    /// `stream/write-byte`'s async dispatch: same file-output CHECKOUT
+    /// offload as `maybe_async_write`, but the decode always yields `nil` —
+    /// matching the sync path, which (unlike `stream/write`) ignores the
+    /// byte count `SemaStream::write` returns.
+    pub(super) fn maybe_async_write_byte(
+        stream: &Rc<StreamBox>,
+        byte: u8,
+    ) -> Result<Option<Value>, SemaError> {
+        maybe_async_write_decoded(stream, &[byte], |_n| Ok(Value::nil()))
+    }
+
+    /// Shared offload body for `stream/write` and `stream/write-byte`.
+    fn maybe_async_write_decoded(
+        stream: &Rc<StreamBox>,
+        data: &[u8],
+        decode: impl Fn(usize) -> Result<Value, SemaError> + 'static,
+    ) -> Result<Option<Value>, SemaError> {
         if !in_async_context() || stream.stream_type() != "file-output" {
             return Ok(None);
         }
@@ -972,7 +1156,7 @@ mod io_streams {
                     .write(&data)
                     .map_err(|e| render(format!("stream/write: I/O error: {e}")))
             },
-            |n: usize| -> Result<Value, SemaError> { Ok(Value::int(n as i64)) },
+            decode,
         )?;
         Ok(Some(v))
     }
@@ -1097,8 +1281,46 @@ mod io_streams {
             return Ok(Some(v));
         }
 
-        // dst_file: src is memory/stdio. Read everything from src NOW (fast,
-        // sync, on the VM thread — never real I/O), then offload the write.
+        // dst_file: src is an in-memory or *stdin* source.
+        //
+        // *stdin* does real, potentially-blocking I/O, so read AND write run on
+        // the worker: check out the file writer and stream stdin straight into it
+        // there. Keeps `(stream/copy *stdin* file-out)` from stalling the
+        // cooperative scheduler while it waits on input.
+        if src.stream_type() == "stdin" {
+            let s1 = dst.clone();
+            let s2 = dst.clone();
+            let s3 = dst.clone();
+            let v = checkout_offload(
+                "stream/copy",
+                move || try_checkout_output(&s1, "stream/write"),
+                move |w| reinstall_output(&s2, w),
+                move |msg| tombstone_output(&s3, msg),
+                move |writer: &mut BufWriter<std::fs::File>| -> Result<usize, String> {
+                    let mut stdin = std::io::stdin();
+                    let mut chunk = [0u8; 8192];
+                    let mut total = 0usize;
+                    loop {
+                        let n = stdin
+                            .read(&mut chunk)
+                            .map_err(|e| render(format!("stream/copy: stdin: {e}")))?;
+                        if n == 0 {
+                            break;
+                        }
+                        writer
+                            .write_all(&chunk[..n])
+                            .map_err(|e| render(format!("stream/copy: I/O error: {e}")))?;
+                        total += n;
+                    }
+                    Ok(total)
+                },
+                move |total: usize| -> Result<Value, SemaError> { Ok(Value::int(total as i64)) },
+            )?;
+            return Ok(Some(v));
+        }
+
+        // In-memory source: reading is a fast in-process copy (no real I/O), so
+        // do it on the VM thread now, then offload the file write.
         let mut buf = Vec::new();
         let mut chunk = [0u8; 8192];
         loop {
@@ -1302,4 +1524,215 @@ pub fn register_io(env: &Env, sandbox: &Sandbox) {
     env.set(sema_core::intern("*stdin*"), Value::stream(StdinStream));
     env.set(sema_core::intern("*stdout*"), Value::stream(StdoutStream));
     env.set(sema_core::intern("*stderr*"), Value::stream(StderrStream));
+}
+
+/// Async-context coverage for the `stream/read-byte`, `stream/write-byte`,
+/// `stream/read-all`, and `stream/write-string` offload gates added to this
+/// file (`stream/read`, `stream/write`, `stream/read-line`, `stream/flush`,
+/// `stream/close`, and `stream/copy` already had coverage in
+/// `crates/sema/tests/stream_file_async_test.rs`, which exercises them
+/// through the real interpreter/scheduler). `sema-stdlib` doesn't depend on
+/// `sema-vm`/`sema-eval`, so these tests stand in for the scheduler by hand —
+/// force `sema_core::in_async_context()` on, call the native, then poll the
+/// `AwaitIo` handle it arms to completion — mirroring `io.rs`'s
+/// `async_offload_tests`.
+#[cfg(not(target_arch = "wasm32"))]
+#[cfg(test)]
+mod async_offload_tests {
+    use super::io_streams::{FileInputStream, FileOutputStream};
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    /// Forces `in_async_context()` on for the guard's lifetime, resetting it
+    /// (even on panic/early return) — mirrors `io.rs`'s `AsyncCtxGuard`.
+    struct AsyncCtxGuard;
+    impl Drop for AsyncCtxGuard {
+        fn drop(&mut self) {
+            sema_core::set_async_context(false);
+        }
+    }
+
+    fn make_env() -> sema_core::Env {
+        let env = sema_core::Env::new();
+        register(&env);
+        env
+    }
+
+    fn tmp_path(tag: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("sema-stream-async-test-{tag}-{nanos}.txt"))
+    }
+
+    /// Look up a registered native by name, returning a callable closure —
+    /// mirrors `io.rs`'s `native`.
+    fn native(env: &sema_core::Env, name: &str) -> impl Fn(&[Value]) -> Result<Value, SemaError> {
+        let f = env
+            .get(sema_core::intern(name))
+            .unwrap_or_else(|| panic!("{name} not registered"));
+        move |args: &[Value]| {
+            let nf = f.as_native_fn_ref().expect("native fn");
+            let ctx = sema_core::EvalContext::new();
+            (nf.func)(&ctx, args)
+        }
+    }
+
+    /// Call a native fn with the async-context gate forced on, then drive the
+    /// `AwaitIo` handle it arms to completion by polling — mirrors `io.rs`'s
+    /// `drive_async`. Panics if the native didn't yield at all (e.g. it
+    /// silently took the sync fallback).
+    fn drive_async(call: impl FnOnce() -> Result<Value, SemaError>) -> Value {
+        let _guard = AsyncCtxGuard;
+        sema_core::set_async_context(true);
+        let armed = call().expect("native call should arm a yield, not error synchronously");
+        assert_eq!(
+            armed,
+            Value::nil(),
+            "an offloading native returns nil immediately after arming its yield signal"
+        );
+        let reason = sema_core::take_yield_signal()
+            .expect("expected a yield signal to be armed — did the native take the sync path?");
+        let handle = match reason {
+            sema_core::YieldReason::AwaitIo(h) => h,
+            other => panic!("expected an AwaitIo yield, got {other:?}"),
+        };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            match handle.poll() {
+                sema_core::IoPoll::Ready(Ok(v)) => return v,
+                sema_core::IoPoll::Ready(Err(e)) => panic!("offload rejected: {e}"),
+                sema_core::IoPoll::Pending => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "offload never completed within 10s"
+                    );
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn stream_read_byte_offloads_and_matches_sync() {
+        let path = tmp_path("read-byte");
+        std::fs::write(&path, b"AB").unwrap();
+        let path_s = path.to_string_lossy().to_string();
+        let env = make_env();
+
+        let sync_stream = Value::stream(FileInputStream::open(&path_s).unwrap());
+        let sync_first = native(&env, "stream/read-byte")(&[sync_stream.clone()])
+            .expect("sync stream/read-byte");
+        assert_eq!(sync_first, Value::int(b'A' as i64));
+
+        let async_stream = Value::stream(FileInputStream::open(&path_s).unwrap());
+        let async_first = drive_async(|| native(&env, "stream/read-byte")(&[async_stream.clone()]));
+        let async_second =
+            drive_async(|| native(&env, "stream/read-byte")(&[async_stream.clone()]));
+        let async_eof = drive_async(|| native(&env, "stream/read-byte")(&[async_stream.clone()]));
+        assert_eq!(async_first, Value::int(b'A' as i64));
+        assert_eq!(async_second, Value::int(b'B' as i64));
+        assert_eq!(
+            async_eof,
+            Value::nil(),
+            "EOF must decode to nil, not an empty bytevector"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn stream_write_byte_offloads_and_matches_sync() {
+        let sync_path = tmp_path("write-byte-sync");
+        let async_path = tmp_path("write-byte-async");
+        let env = make_env();
+
+        let sync_stream =
+            Value::stream(FileOutputStream::create(&sync_path.to_string_lossy()).unwrap());
+        let sync_ret = native(&env, "stream/write-byte")(&[sync_stream.clone(), Value::int(65)])
+            .expect("sync stream/write-byte");
+        native(&env, "stream/flush")(&[sync_stream]).expect("sync flush");
+        assert_eq!(
+            sync_ret,
+            Value::nil(),
+            "stream/write-byte returns nil, unlike stream/write"
+        );
+
+        let async_stream =
+            Value::stream(FileOutputStream::create(&async_path.to_string_lossy()).unwrap());
+        let async_ret = drive_async(|| {
+            native(&env, "stream/write-byte")(&[async_stream.clone(), Value::int(65)])
+        });
+        drive_async(|| native(&env, "stream/flush")(&[async_stream.clone()]));
+        assert_eq!(
+            async_ret,
+            Value::nil(),
+            "offloaded stream/write-byte must also decode to nil, matching sync"
+        );
+
+        assert_eq!(std::fs::read(&sync_path).unwrap(), vec![65u8]);
+        assert_eq!(std::fs::read(&async_path).unwrap(), vec![65u8]);
+        let _ = std::fs::remove_file(&sync_path);
+        let _ = std::fs::remove_file(&async_path);
+    }
+
+    #[test]
+    fn stream_read_all_offloads_and_matches_sync() {
+        let path = tmp_path("read-all");
+        std::fs::write(&path, b"hello streams, read to EOF").unwrap();
+        let path_s = path.to_string_lossy().to_string();
+        let env = make_env();
+
+        let sync_stream = Value::stream(FileInputStream::open(&path_s).unwrap());
+        let sync_v = native(&env, "stream/read-all")(&[sync_stream]).expect("sync stream/read-all");
+
+        let async_stream = Value::stream(FileInputStream::open(&path_s).unwrap());
+        let async_v = drive_async(|| native(&env, "stream/read-all")(&[async_stream.clone()]));
+
+        assert_eq!(sync_v, async_v);
+        assert_eq!(
+            sync_v.as_bytevector().unwrap(),
+            b"hello streams, read to EOF"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn stream_write_string_offloads_and_matches_sync() {
+        let sync_path = tmp_path("write-string-sync");
+        let async_path = tmp_path("write-string-async");
+        let env = make_env();
+
+        let sync_stream =
+            Value::stream(FileOutputStream::create(&sync_path.to_string_lossy()).unwrap());
+        let sync_n = native(&env, "stream/write-string")(&[
+            sync_stream.clone(),
+            Value::string("hello world"),
+        ])
+        .expect("sync stream/write-string");
+        native(&env, "stream/flush")(&[sync_stream]).expect("sync flush");
+        assert_eq!(sync_n, Value::int(11));
+
+        let async_stream =
+            Value::stream(FileOutputStream::create(&async_path.to_string_lossy()).unwrap());
+        let async_n = drive_async(|| {
+            native(&env, "stream/write-string")(&[
+                async_stream.clone(),
+                Value::string("hello world"),
+            ])
+        });
+        drive_async(|| native(&env, "stream/flush")(&[async_stream.clone()]));
+        assert_eq!(
+            async_n,
+            Value::int(11),
+            "offloaded stream/write-string must decode the byte count, matching sync"
+        );
+
+        assert_eq!(std::fs::read_to_string(&sync_path).unwrap(), "hello world");
+        assert_eq!(std::fs::read_to_string(&async_path).unwrap(), "hello world");
+        let _ = std::fs::remove_file(&sync_path);
+        let _ = std::fs::remove_file(&async_path);
+    }
 }

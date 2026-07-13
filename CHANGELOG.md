@@ -91,6 +91,17 @@
 
 ### Changed
 
+- **`async/sleep` and `async/timeout` accept a float duration**, not just an
+  int — a duration is naturally a number, and `(round …)` / `(math/random)` /
+  ordinary arithmetic routinely yield floats. A float is rounded to the nearest
+  whole millisecond; non-finite or non-number values are still rejected.
+- **`examples/async-everything.sema`** is a comprehensive async regression
+  canary: it exercises every async-offloaded native family (files, streams,
+  archives, pdf, sqlite, kv, subprocess, pty, git, cpu scans, opt-in http+llm)
+  under deep nesting with upvalue-capturing callbacks that cross nesting levels,
+  driven by 3 concurrent loops using distinct async strategies (`async/all`,
+  `spawn`+`await`, `race`), with a live heartbeat proving the VM thread never
+  stalls. Loop it with `SEMA_ASYNC_EVERYTHING_LOOPS=N`.
 - **`examples/sema-coder` moved to its own repo** (like the editor plugins) —
   the in-repo copy is removed.
 - **The game-of-life example is a full TUI** — altscreen rendering with mouse
@@ -112,8 +123,54 @@
 
 ### Fixed
 
+<<<<<<< HEAD
 - **Short lambdas `#(…)` inside nested lambdas** — `%`, `%1`…`%N`, and `%&` appearing inside a nested `(lambda …)` or `(fn …)` form within a short lambda `#()` now correctly belong to the enclosing short lambda (matching Clojure semantics), fixing a silent arity-0 issue. Nesting a short lambda `#()` directly inside another short lambda `#()` is now explicitly rejected with a clear read-time error (fixes #116).
 
+=======
+- **Many more blocking natives are now scheduler-compatible under `async`.** A
+  native that ran a blocking syscall on the cooperative VM thread would freeze
+  every concurrent task; the offload pass (PR #119) is now extended to the
+  stragglers: `io/read-key` (was an untimed blocking stdin read), the serial
+  port ops (`serial/read-line`/`send`/`write`/`open`), `proc/write-stdin`,
+  `proc/close`, `pty/write`, `pty/close`, `stream/read-all`/`read-byte`/
+  `write-string`/`write-byte`, `gzip/compress`/`decompress`, the `secret`/`pii`
+  scanners, `term/spinner-stop`, and the `file/*` stat/`glob`/`list`/`mkdir`/
+  `rename`/`canonicalize`/`write-bytes`/`write-lines`/`load` family. Each gates
+  on `in_async_context()` and offloads the blocking work to a worker; top-level
+  (no scheduler) behavior is byte-for-byte unchanged.
+- **`file/for-each-line` / `file/fold-lines` / `file/fold-lines-bytes` stream
+  their file in offloaded chunks under `async`** (instead of blocking the VM
+  thread on the read), running the per-line callback back on the VM thread
+  between chunks. Landing this exposed and fixed two VM-level bugs in the
+  deferred-callback path: (1) a callback capturing a lexical **upvalue** read
+  `nil`, because it ran from an I/O poll after its owning task had suspended —
+  now the callback's open upvalues are snapshotted up front (while the owning VM
+  is current, as `async/spawn` already does); (2) invoking the callback tried to
+  `take` the async scheduler while it was already driving the poll (reproducible
+  under a concurrent nested `async/all`) — the callback now runs synchronously on
+  a foreign VM, never touching the scheduler; (3) the upvalue snapshot is now
+  **transitive** — a closure captured *as data* into an async task (e.g. a
+  path-builder or callback passed as an argument) has its own open upvalues
+  snapshotted too, with cycle-safe termination, so it no longer errors with
+  "captured variable's stack slot is not on this VM".
+- **OpenAI `reasoning_effort` compat is smarter and no longer over-broad.**
+  gpt-5.6+ reject a non-`none` `reasoning_effort` alongside function tools on
+  `/chat/completions` ("use /v1/responses or set reasoning_effort to 'none'");
+  the self-heal that learns this (`FORCE_EFFORT_NONE`) now pins effort to `none`
+  **only when tools are present**, so a tool-free call to the same model keeps
+  the caller's effort instead of being silently downgraded. Reasoning models
+  (gpt-5 series / o-series) now drop a custom `temperature` **proactively**
+  (no doomed first request), an unsupported effort **value** (`minimal`/`max`
+  on gpt-5.6) is clamped to the nearest accepted tier by reading the "Supported
+  values are: …" list out of the 400, and the temperature / effort-tools /
+  effort-value backstops now **chain** through one bounded retry loop so a
+  request tripping several at once recovers in a single turn.
+- **`stream/copy`, `stream/read`, and `stream/read-line` on `*stdin*` no longer
+  block the async scheduler.** Inside `async`, a blocking stdin read is now
+  offloaded to a worker (matching the file-backed path) instead of running
+  synchronously on the VM thread, so a `(stream/copy *stdin* out)` can't stall
+  cooperative scheduling while it waits on input.
+>>>>>>> upstream/main
 - **Installed `sema web` builds now contain their browser runtime.** The
   crates.io package, GitHub release archives, shell installer, and Homebrew
   formula embed the WASM VM and JavaScript runtime and work offline. Version
