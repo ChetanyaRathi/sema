@@ -121,8 +121,8 @@ prominently:
 (sort xs #(- (get %2 1) (get %1 1)))   ;; just needs docs + examples
 ```
 
-**Implementation**: No code change needed — documentation + example updates. Optionally add
-`%&` rest-arg support in `crates/sema-reader/src/reader.rs` (`rewrite_percent_args`).
+**Implementation**: No code change needed - documentation + example updates. The
+`%&` rest-arg support and nested `#()` error handling was implemented in #116 in `crates/sema-reader/src/reader.rs`.
 
 > **Verified**: `rg '%[12]' --glob '*.sema'` returns zero results — confirmed that multi-arg
 > short lambdas are never used in examples despite being supported by the reader.
