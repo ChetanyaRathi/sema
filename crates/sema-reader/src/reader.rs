@@ -638,7 +638,7 @@ fn token_display(tok: &Token) -> &'static str {
 
 /// Recursively scan a Value AST for `%`, `%1`, `%2`, etc. symbols.
 /// Rewrites bare `%` to `%1`. Tracks the highest numbered arg in `max_arg`.
-/// Skips recursion into nested `(lambda ...)` / `(fn ...)` forms.
+/// Recurses into nested `(lambda ...)` / `(fn ...)` bodies so their placeholders bind to the enclosing `#()`. Sets `has_rest` when `%&` appears.
 fn rewrite_percent_args(expr: &Value, max_arg: &mut usize, has_rest: &mut bool) -> Value {
     match expr.view() {
         ValueView::Symbol(spur) => {
