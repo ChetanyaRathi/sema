@@ -803,6 +803,102 @@ fn test_map_values_not_aligned_without_flag() {
 }
 
 #[test]
+fn test_aligned_map_two_pairs_minimum() {
+    // Two pairs is the smallest map eligible for alignment.
+    let input = "{:a 1\n :longer 2}";
+    assert_eq!(fmt_aligned(input), "{:a       1\n :longer  2}\n");
+}
+
+#[test]
+fn test_aligned_map_comment_falls_back() {
+    let input = "{:a 1 ;; note\n :bb 2\n :ccc 3}";
+    assert_eq!(fmt_aligned(input), "{:a 1\n ;; note\n :bb 2\n :ccc 3}\n");
+}
+
+#[test]
+fn test_aligned_map_equal_width_keys_not_aligned() {
+    // All keys the same width: nothing to align, normal spacing.
+    let input = "{:aa 1\n :bb 2\n :cc 3}";
+    assert_eq!(fmt_aligned(input), "{:aa 1\n :bb 2\n :cc 3}\n");
+}
+
+#[test]
+fn test_aligned_map_odd_entries_fall_back() {
+    let input = "{:a 1\n :bb 2\n :ccc}";
+    assert_eq!(fmt_aligned(input), "{:a 1\n :bb 2\n :ccc}\n");
+}
+
+#[test]
+fn test_aligned_map_width_overflow_falls_back() {
+    let input = "{:k 1\n :key \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"\n :kk 2}";
+    let result = format_source(input, &opts(30, 2, true)).unwrap();
+    assert_eq!(
+        result,
+        "{:k 1\n :key \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"\n :kk 2}\n"
+    );
+}
+
+#[test]
+fn test_aligned_map_close_delimiter_counts_toward_width() {
+    // The last aligned line carries the closing `}`; it must fit too.
+    // Aligned, the last line would be ` :k      "1234567890123456789"}`
+    // = 31 columns: aligns at width 31, falls back at width 30.
+    let input = "{:short 1\n :k \"1234567890123456789\"}";
+    let aligned = format_source(input, &opts(31, 2, true)).unwrap();
+    assert_eq!(aligned, "{:short  1\n :k      \"1234567890123456789\"}\n");
+    let fallback = format_source(input, &opts(30, 2, true)).unwrap();
+    assert_eq!(fallback, "{:short 1\n :k \"1234567890123456789\"}\n");
+}
+
+#[test]
+fn test_aligned_map_multiline_string_value_falls_back() {
+    // A raw newline inside a string literal would break the value column.
+    let input = "{:a \"line1\nline2\"\n :bb 2\n :ccc 3}";
+    assert_eq!(
+        fmt_aligned(input),
+        "{:a \"line1\nline2\"\n :bb 2\n :ccc 3}\n"
+    );
+}
+
+#[test]
+fn test_aligned_map_multiline_nested_value_falls_back() {
+    // A value that was already multi-line keeps its layout instead of
+    // being flattened into an aligned column.
+    let input = "{:a {:x 1\n     :yy 2}\n :bb 2\n :ccc 3}";
+    let result = fmt_aligned(input);
+    assert!(
+        !result.contains(":a    "),
+        "multi-line nested value should not be aligned:\n{result}"
+    );
+    assert_eq!(fmt_aligned(&result), result, "should be idempotent");
+}
+
+#[test]
+fn test_aligned_map_unicode_keys_align_by_chars() {
+    // `:naïve` is 7 bytes but 6 chars; padding must use display columns.
+    let input = "{:naïve 1\n :bb 22\n :ccccc 3}";
+    let result = fmt_aligned(input);
+    assert_eq!(result, "{:naïve  1\n :bb     22\n :ccccc  3}\n");
+    assert_eq!(fmt_aligned(&result), result, "should be idempotent");
+}
+
+#[test]
+fn test_aligned_let_multiline_string_falls_back() {
+    // Same raw-newline hazard in the aligned binding-group path.
+    let input = "(let ((x \"a\nb\")\n      (longer 2))\n  x)";
+    let result = fmt_aligned(input);
+    assert_eq!(result, "(let ((x \"a\nb\")\n      (longer 2))\n  x)\n");
+}
+
+#[test]
+fn test_aligned_map_prefixed_values() {
+    let input = "{:a 'foo\n :bb \"x\"\n :ccc 3}";
+    let result = fmt_aligned(input);
+    assert_eq!(result, "{:a    'foo\n :bb   \"x\"\n :ccc  3}\n");
+    assert_eq!(fmt_aligned(&result), result, "should be idempotent");
+}
+
+#[test]
 fn test_define_group_broken_by_blank_line() {
     let input = "(define x 1)\n\n(define y 2)";
     let result = fmt_aligned(input);

@@ -1598,25 +1598,40 @@ impl Formatter {
             };
             let semantic = semantic_children(children);
             match split_fn(&semantic) {
-                Some(pair) => splits.push(pair),
+                Some(pair) => {
+                    // A string literal can carry a raw newline that would break
+                    // the aligned column — bail to normal formatting.
+                    if pair.0.contains('\n') || pair.1.contains('\n') {
+                        return false;
+                    }
+                    splits.push(pair)
+                }
                 None => return false,
             }
         }
 
         // Find the max left width to determine the alignment column
-        let max_left = splits.iter().map(|(l, _)| l.len()).max().unwrap_or(0);
+        let max_left = splits
+            .iter()
+            .map(|(l, _)| display_width(l))
+            .max()
+            .unwrap_or(0);
 
         // Check that all aligned lines fit within width
         let min_gap = 2;
         for (_left, right) in &splits {
-            if indent + max_left + min_gap + right.len() > self.width {
+            if indent + max_left + min_gap + display_width(right) > self.width {
                 return false;
             }
         }
 
         // Also verify that the alignment actually matters — if all lefts are the
         // same width, there's nothing to align (just normal spacing)
-        let min_left = splits.iter().map(|(l, _)| l.len()).min().unwrap_or(0);
+        let min_left = splits
+            .iter()
+            .map(|(l, _)| display_width(l))
+            .min()
+            .unwrap_or(0);
         if max_left == min_left {
             return false;
         }
@@ -1629,7 +1644,7 @@ impl Formatter {
             }
             self.output.push_str(left);
             // Pad to align
-            let pad = max_left - left.len() + min_gap;
+            let pad = max_left - display_width(left) + min_gap;
             for _ in 0..pad {
                 self.output.push(' ');
             }
@@ -1659,15 +1674,32 @@ impl Formatter {
             {
                 return false;
             }
-            pairs.push((node_to_flat_string(pair[0]), node_to_flat_string(pair[1])));
+            let key = node_to_flat_string(pair[0]);
+            let value = node_to_flat_string(pair[1]);
+            // A string literal can carry a raw newline that node-level newline
+            // detection can't see; an embedded newline would break the column.
+            if key.contains('\n') || value.contains('\n') {
+                return false;
+            }
+            pairs.push((key, value));
         }
 
-        let max_key = pairs.iter().map(|(key, _)| key.len()).max().unwrap_or(0);
-        let min_key = pairs.iter().map(|(key, _)| key.len()).min().unwrap_or(0);
+        let max_key = pairs
+            .iter()
+            .map(|(key, _)| display_width(key))
+            .max()
+            .unwrap_or(0);
+        let min_key = pairs
+            .iter()
+            .map(|(key, _)| display_width(key))
+            .min()
+            .unwrap_or(0);
+        let last = pairs.len() - 1;
         if max_key == min_key
-            || pairs
-                .iter()
-                .any(|(_, value)| indent + max_key + 2 + value.len() > self.width)
+            || pairs.iter().enumerate().any(|(index, (_, value))| {
+                let closer = if index == last { close.len() } else { 0 };
+                indent + max_key + 2 + display_width(value) + closer > self.width
+            })
         {
             return false;
         }
@@ -1680,7 +1712,7 @@ impl Formatter {
             }
             self.output.push_str(key);
             self.output
-                .extend(std::iter::repeat_n(' ', max_key - key.len() + 2));
+                .extend(std::iter::repeat_n(' ', max_key - display_width(key) + 2));
             self.output.push_str(value);
         }
         self.output.push_str(close);
@@ -1779,6 +1811,13 @@ impl Formatter {
     fn push_indent(&mut self, n: usize) {
         self.output.extend(std::iter::repeat_n(' ', n));
     }
+}
+
+/// Column width of a rendered fragment: characters, not bytes, so non-ASCII
+/// symbols and strings don't skew alignment padding. (An approximation —
+/// combining marks and wide CJK glyphs still count as one column each.)
+fn display_width(s: &str) -> usize {
+    s.chars().count()
 }
 
 /// Render a single node as a flat (single-line) string.
