@@ -811,8 +811,10 @@ fn test_aligned_map_two_pairs_minimum() {
 
 #[test]
 fn test_aligned_map_comment_falls_back() {
+    // A comment disables value alignment, but the trailing comment stays
+    // on its own pair's line.
     let input = "{:a 1 ;; note\n :bb 2\n :ccc 3}";
-    assert_eq!(fmt_aligned(input), "{:a 1\n ;; note\n :bb 2\n :ccc 3}\n");
+    assert_eq!(fmt_aligned(input), "{:a 1 ;; note\n :bb 2\n :ccc 3}\n");
 }
 
 #[test]
@@ -888,6 +890,105 @@ fn test_aligned_let_multiline_string_falls_back() {
     let input = "(let ((x \"a\nb\")\n      (longer 2))\n  x)";
     let result = fmt_aligned(input);
     assert_eq!(result, "(let ((x \"a\nb\")\n      (longer 2))\n  x)\n");
+}
+
+// Issue #114: a trailing comment must stay on its form's line — detaching it
+// to a standalone line below silently re-attaches it to the NEXT form.
+
+#[test]
+fn test_trailing_comment_stays_in_aligned_define_group() {
+    let input = "(define *rows* 24)\n(define *cols* 80)\n(define *cursor* 0)         ;; caret index\n(define *scroll* 0)         ;; lines scrolled";
+    let result = fmt_aligned(input);
+    assert_eq!(
+        result,
+        "(define *rows*    24)\n(define *cols*    80)\n(define *cursor*  0)   ;; caret index\n(define *scroll*  0)   ;; lines scrolled\n"
+    );
+    assert_eq!(fmt_aligned(&result), result, "should be idempotent");
+}
+
+#[test]
+fn test_trailing_comment_mid_aligned_define_group() {
+    // A trailing comment on an earlier define must not break the group
+    // or migrate to another line.
+    let input = "(define a 1) ;; first\n(define bb 2)\n(define ccc 3)";
+    let result = fmt_aligned(input);
+    assert_eq!(
+        result,
+        "(define a    1)  ;; first\n(define bb   2)\n(define ccc  3)\n"
+    );
+    assert_eq!(fmt_aligned(&result), result, "should be idempotent");
+}
+
+#[test]
+fn test_trailing_comment_stays_on_map_pair() {
+    let input = "(define default-config\n  {:model \"\"        ;; auto-detect\n   :max-turns 50})";
+    let result = fmt(input);
+    assert_eq!(
+        result,
+        "(define default-config\n  {:model \"\" ;; auto-detect\n   :max-turns 50})\n"
+    );
+    assert_eq!(fmt(&result), result, "should be idempotent");
+}
+
+#[test]
+fn test_standalone_comment_in_map_keeps_own_line() {
+    // A comment on its own line documents the pair below — leave it there.
+    let input = "{:a 1\n ;; note\n :b 2}";
+    assert_eq!(fmt(input), "{:a 1\n ;; note\n :b 2}\n");
+}
+
+#[test]
+fn test_trailing_comment_stays_in_list_body() {
+    let input = "(do\n  (foo) ;; hi\n  (bar))";
+    assert_eq!(fmt(input), "(do\n  (foo) ;; hi\n  (bar))\n");
+}
+
+#[test]
+fn test_trailing_comment_stays_on_let_binding() {
+    let input = "(let ((x 1) ;; the x\n      (longer 2))\n  x)";
+    assert_eq!(
+        fmt(input),
+        "(let ((x 1) ;; the x\n      (longer 2))\n  x)\n"
+    );
+}
+
+#[test]
+fn test_comment_between_map_key_and_value() {
+    // The value must not be emitted into the comment's line (it would be
+    // absorbed into the comment text and vanish from the map).
+    let input = "{:a ;; c\n 1\n :b 2}";
+    let result = fmt(input);
+    assert_eq!(result, "{:a ;; c\n   1\n :b 2}\n");
+    assert_eq!(fmt(&result), result, "should be idempotent");
+    assert!(
+        format_source(&result, &FormatOptions::default()).is_ok(),
+        "output should reparse"
+    );
+}
+
+#[test]
+fn test_comment_before_map_close_delimiter() {
+    // The closing brace must not be emitted into the comment's line (the
+    // output would no longer parse).
+    let input = "{:a 1\n :b 2 ;; last\n}";
+    let result = fmt(input);
+    assert_eq!(result, "{:a 1\n :b 2 ;; last\n }\n");
+    assert_eq!(fmt(&result), result, "should be idempotent");
+    assert!(
+        format_source(&result, &FormatOptions::default()).is_ok(),
+        "output should reparse"
+    );
+}
+
+#[test]
+fn test_comment_before_list_close_delimiter() {
+    let input = "(do\n  (foo)\n  ;; c\n  )";
+    let result = fmt(input);
+    assert_eq!(result, "(do\n  (foo)\n  ;; c\n  )\n");
+    assert!(
+        format_source(&result, &FormatOptions::default()).is_ok(),
+        "output should reparse"
+    );
 }
 
 #[test]

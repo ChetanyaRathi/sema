@@ -695,6 +695,14 @@ impl Formatter {
                                         break;
                                     }
                                 }
+                                // A comment here directly follows a define on
+                                // the same line (standalone comments sit after
+                                // a Newline, which the arm above intercepts):
+                                // it's the define's trailing comment — keep it
+                                // in the group instead of orphaning it below.
+                                Node::Comment(_) => {
+                                    group_end += 1;
+                                }
                                 _ if Self::is_alignable_define(&nodes[group_end]) => {
                                     group_end += 1;
                                 }
@@ -702,11 +710,32 @@ impl Formatter {
                             }
                         }
 
-                        // Collect the define nodes in this group
-                        let group = semantic_children(&nodes[group_start..group_end]);
+                        // Collect the define nodes in this group, each with its
+                        // trailing comment (if any).
+                        let mut group: Vec<&Node> = Vec::new();
+                        let mut trailing: Vec<Option<String>> = Vec::new();
+                        for node in &nodes[group_start..group_end] {
+                            match node {
+                                Node::Newline => {}
+                                Node::Comment(text) => {
+                                    if let Some(last) = trailing.last_mut() {
+                                        *last = Some(text.clone());
+                                    }
+                                }
+                                _ => {
+                                    group.push(node);
+                                    trailing.push(None);
+                                }
+                            }
+                        }
 
                         if group.len() >= 2
-                            && self.try_format_aligned_group(&group, 0, Self::split_define)
+                            && self.try_format_aligned_group(
+                                &group,
+                                &trailing,
+                                0,
+                                Self::split_define,
+                            )
                         {
                             if !self.output.ends_with('\n') {
                                 self.output.push('\n');
@@ -726,14 +755,24 @@ impl Formatter {
                                         pending_blank_lines += 1;
                                     }
                                     Node::Comment(text) => {
-                                        if pending_blank_lines > 1 {
+                                        if pending_blank_lines == 0
+                                            && !first_content
+                                            && !self.output.ends_with('\n')
+                                        {
+                                            // Trailing comment: stay on the
+                                            // define's line.
+                                            self.output.push(' ');
+                                            self.output.push_str(text);
+                                        } else {
+                                            if pending_blank_lines > 1 {
+                                                self.output.push('\n');
+                                            }
+                                            if !self.output.ends_with('\n') {
+                                                self.output.push('\n');
+                                            }
+                                            self.output.push_str(text);
                                             self.output.push('\n');
                                         }
-                                        if !self.output.ends_with('\n') {
-                                            self.output.push('\n');
-                                        }
-                                        self.output.push_str(text);
-                                        self.output.push('\n');
                                         pending_blank_lines = 0;
                                         first_content = false;
                                     }
@@ -1390,7 +1429,7 @@ impl Formatter {
                 .all(|n| matches!(n, Node::List(_) | Node::Vector(_)));
             if all_binding_pairs {
                 self.output.push_str(open);
-                if self.try_format_aligned_group(&semantic, elem_indent, Self::split_binding) {
+                if self.try_format_aligned_group(&semantic, &[], elem_indent, Self::split_binding) {
                     self.output.push_str(close);
                     return;
                 }
@@ -1459,14 +1498,27 @@ impl Formatter {
         // semantic_count: 0 = expecting key (start of pair), 1 = expecting value
         let mut semantic_count = 0;
         let mut first_pair = true;
+        // Newline seen since the last key/value/comment — distinguishes a
+        // trailing comment (stays on its pair's line) from a standalone one.
+        let mut saw_newline = false;
+        // A comment runs to end of line, so nothing may follow it inline.
+        let mut after_comment = false;
         for child in children.iter() {
             match child {
-                Node::Newline => {}
+                Node::Newline => saw_newline = true,
                 Node::Comment(text) => {
-                    self.output.push('\n');
-                    self.push_indent(pair_indent);
+                    if first_pair || saw_newline {
+                        // Standalone comment: own line
+                        self.output.push('\n');
+                        self.push_indent(pair_indent);
+                    } else {
+                        // Trailing comment: keep it on the line it annotates
+                        self.output.push(' ');
+                    }
                     self.output.push_str(text);
                     first_pair = false; // ensure next key gets a newline
+                    after_comment = true;
+                    saw_newline = false;
                 }
                 _ if is_trivia(child) => {}
                 _ => {
@@ -1478,16 +1530,30 @@ impl Formatter {
                         }
                         self.format_node(child, pair_indent);
                         first_pair = false;
+                    } else if after_comment {
+                        // Value position, but a comment owns the rest of the
+                        // key's line — the value gets its own indented line.
+                        let value_indent = pair_indent + self.indent_size;
+                        self.output.push('\n');
+                        self.push_indent(value_indent);
+                        self.format_node(child, value_indent);
                     } else {
                         // Value position — on same line as key
                         self.output.push(' ');
                         self.format_node(child, pair_indent);
                     }
                     semantic_count += 1;
+                    after_comment = false;
+                    saw_newline = false;
                 }
             }
         }
 
+        // The close delimiter must not land inside a trailing comment.
+        if after_comment {
+            self.output.push('\n');
+            self.push_indent(pair_indent);
+        }
         self.output.push_str(close);
     }
 
@@ -1532,8 +1598,12 @@ impl Formatter {
 
     /// Emit all children starting from `start_idx`, preserving comments inline.
     /// Semantic nodes are formatted on their own lines at `body_indent`.
-    /// Comments are emitted at `body_indent`. Blank lines (2+ consecutive
-    /// Newlines) are preserved as a single blank line.
+    /// A comment with no newline before it (a trailing comment) stays on the
+    /// line of the form it annotates; other comments get their own line at
+    /// `body_indent`. Blank lines (2+ consecutive Newlines) are preserved as a
+    /// single blank line. If the body ends with a comment, a final newline +
+    /// indent is emitted so the caller's closing delimiter isn't absorbed into
+    /// the comment.
     fn emit_body_with_comments(
         &mut self,
         all_children: &[Node],
@@ -1541,20 +1611,27 @@ impl Formatter {
         body_indent: usize,
     ) {
         let mut consecutive_newlines: usize = 0;
+        let mut ends_with_comment = false;
         for child in &all_children[start_idx..] {
             match child {
                 Node::Newline => {
                     consecutive_newlines += 1;
                 }
                 Node::Comment(text) => {
-                    // Preserve blank line if there were 2+ consecutive newlines
-                    if consecutive_newlines >= 2 {
+                    if consecutive_newlines == 0 && !self.output.ends_with('\n') {
+                        // Trailing comment: keep it on its form's line.
+                        self.output.push(' ');
+                    } else {
+                        // Preserve blank line if there were 2+ consecutive newlines
+                        if consecutive_newlines >= 2 {
+                            self.output.push('\n');
+                        }
                         self.output.push('\n');
+                        self.push_indent(body_indent);
                     }
-                    self.output.push('\n');
-                    self.push_indent(body_indent);
                     self.output.push_str(text);
                     consecutive_newlines = 0;
+                    ends_with_comment = true;
                 }
                 _ if is_trivia(child) => {}
                 _ => {
@@ -1566,8 +1643,15 @@ impl Formatter {
                     self.push_indent(body_indent);
                     self.format_node(child, body_indent);
                     consecutive_newlines = 0;
+                    ends_with_comment = false;
                 }
             }
+        }
+        // A comment runs to end of line — the caller's close delimiter must
+        // not land inside it.
+        if ends_with_comment {
+            self.output.push('\n');
+            self.push_indent(body_indent);
         }
     }
 
@@ -1579,9 +1663,19 @@ impl Formatter {
     /// Each form is split at `split_fn` into left and right parts.
     /// Returns true if alignment was applied, false if it fell back.
     ///
+    /// `trailing[i]` is form `i`'s trailing comment, if any; comments are
+    /// emitted after the right part, aligned to a shared column (pass `&[]`
+    /// when the group has no comments).
+    ///
     /// `split_fn(semantic_children) -> Option<(left_parts, right_parts)>`
     /// where both are rendered flat and padded to align.
-    fn try_format_aligned_group<F>(&mut self, forms: &[&Node], indent: usize, split_fn: F) -> bool
+    fn try_format_aligned_group<F>(
+        &mut self,
+        forms: &[&Node],
+        trailing: &[Option<String>],
+        indent: usize,
+        split_fn: F,
+    ) -> bool
     where
         F: Fn(&[&Node]) -> Option<(String, String)>,
     {
@@ -1636,6 +1730,13 @@ impl Formatter {
             return false;
         }
 
+        // Comments share a column past the widest right part
+        let max_right = splits
+            .iter()
+            .map(|(_, r)| display_width(r))
+            .max()
+            .unwrap_or(0);
+
         // Emit aligned lines
         for (idx, (left, right)) in splits.iter().enumerate() {
             if idx > 0 {
@@ -1649,6 +1750,11 @@ impl Formatter {
                 self.output.push(' ');
             }
             self.output.push_str(right);
+            if let Some(Some(comment)) = trailing.get(idx) {
+                let pad = max_right - display_width(right) + min_gap;
+                self.output.extend(std::iter::repeat_n(' ', pad));
+                self.output.push_str(comment);
+            }
         }
         true
     }
