@@ -111,13 +111,20 @@ fn build_one(
             Ok((Node::StringAtom(raw.to_string()), pos + 1))
         }
 
-        // Prefix tokens — attach to the following node
+        // Prefix tokens — attach to the following node. Newlines between the
+        // prefix and its target are skipped (the reader lets a quote apply
+        // across a line break); a comment still becomes the inner node so it
+        // is preserved, and emission keeps a space before it.
         Token::Quote | Token::Quasiquote | Token::Unquote | Token::UnquoteSplice | Token::Deref => {
             let prefix_tok = st.token.clone();
-            if pos + 1 >= tokens.len() {
+            let mut next_pos = pos + 1;
+            while next_pos < tokens.len() && matches!(tokens[next_pos].token, Token::Newline) {
+                next_pos += 1;
+            }
+            if next_pos >= tokens.len() {
                 return Err(SemaError::eval("prefix token at end of input"));
             }
-            let (inner, next) = build_one(tokens, pos + 1, source, depth + 1)?;
+            let (inner, next) = build_one(tokens, next_pos, source, depth + 1)?;
             Ok((Node::Prefix(prefix_tok, Box::new(inner)), next))
         }
 
@@ -896,6 +903,11 @@ impl Formatter {
             }
             Node::Prefix(tok, inner) => {
                 self.output.push_str(prefix_text(tok));
+                // A comment directly after a prefix must not fuse with it
+                // (`';; c` re-parses the same but flip-flops the spacing).
+                if matches!(**inner, Node::Comment(_)) {
+                    self.output.push(' ');
+                }
                 self.format_node(inner, indent);
             }
         }
@@ -907,9 +919,7 @@ impl Formatter {
 
         // Empty form
         if semantic.is_empty() {
-            self.output.push_str(open);
-            self.output.push_str(close);
-            return;
+            return self.format_empty_with_comments(children, indent, open, close);
         }
 
         // A comment before the head can't survive any specialized first-line
@@ -945,6 +955,29 @@ impl Formatter {
             FormKind::Import => self.format_import(children, indent, open, close),
             FormKind::Call => self.format_call(children, indent, open, close),
         }
+    }
+
+    /// Emit a form that has no semantic children but may contain comments:
+    /// `open`, each comment on the head line / its own line, then the close
+    /// delimiter on a fresh line so it isn't absorbed into a comment.
+    /// Empty-form early returns must use this instead of `open`+`close`, or
+    /// a comment-only form like `(f ;; c\n)`'s sibling `( ;; c\n)` silently
+    /// loses its comment.
+    fn format_empty_with_comments(
+        &mut self,
+        children: &[Node],
+        indent: usize,
+        open: &str,
+        close: &str,
+    ) {
+        self.output.push_str(open);
+        if children.iter().any(|c| matches!(c, Node::Comment(_))) {
+            let elem_indent = indent + open.len();
+            self.emit_leading_comments(children, elem_indent);
+            self.output.push('\n');
+            self.push_indent(elem_indent);
+        }
+        self.output.push_str(close);
     }
 
     /// Count the semantic nodes that precede the first direct comment child
@@ -1001,9 +1034,7 @@ impl Formatter {
             .collect();
 
         if semantic.is_empty() {
-            self.output.push_str(open);
-            self.output.push_str(close);
-            return;
+            return self.format_empty_with_comments(children, indent, open, close);
         }
 
         let head_name = match &semantic[0].1 {
@@ -1139,9 +1170,7 @@ impl Formatter {
         let semantic = semantic_children(children);
 
         if semantic.is_empty() {
-            self.output.push_str(open);
-            self.output.push_str(close);
-            return;
+            return self.format_empty_with_comments(children, indent, open, close);
         }
 
         // case/match/match* scrutinize a subject that belongs beside the head
@@ -1336,9 +1365,7 @@ impl Formatter {
         let semantic = semantic_children(children);
 
         if semantic.is_empty() {
-            self.output.push_str(open);
-            self.output.push_str(close);
-            return;
+            return self.format_empty_with_comments(children, indent, open, close);
         }
 
         // If children contain comments, force multi-line to preserve them
@@ -1376,9 +1403,7 @@ impl Formatter {
         let semantic = semantic_children(children);
 
         if semantic.is_empty() {
-            self.output.push_str(open);
-            self.output.push_str(close);
-            return;
+            return self.format_empty_with_comments(children, indent, open, close);
         }
 
         // Detect hash-map/assoc for key-value pair grouping
@@ -1395,6 +1420,10 @@ impl Formatter {
         self.format_node(semantic[0], indent + open.len());
 
         if semantic.len() == 1 {
+            // A trailing comment after the lone head must survive
+            // (`(f ;; c\n)` used to format as `(f)`).
+            let rest = Self::index_after_nth_semantic(children, 1);
+            self.emit_body_with_comments(children, rest, indent + self.indent_size);
             self.output.push_str(close);
             return;
         }
@@ -1565,9 +1594,7 @@ impl Formatter {
         let semantic = semantic_children(children);
 
         if semantic.is_empty() {
-            self.output.push_str(open);
-            self.output.push_str(close);
-            return;
+            return self.format_empty_with_comments(children, indent, open, close);
         }
 
         // If children contain comments, force multi-line to preserve them
@@ -1705,9 +1732,7 @@ impl Formatter {
         let semantic = semantic_children(children);
 
         if semantic.is_empty() {
-            self.output.push_str(open);
-            self.output.push_str(close);
-            return;
+            return self.format_empty_with_comments(children, indent, open, close);
         }
 
         // If children contain comments, force multi-line to preserve them
@@ -1972,6 +1997,20 @@ impl Formatter {
         true
     }
 
+    /// Render `node` at `indent` and return its text if it came out on a
+    /// single line; `None` otherwise. The output buffer is left unchanged.
+    fn render_if_single_line(&mut self, node: &Node, indent: usize) -> Option<String> {
+        let checkpoint = self.output.len();
+        self.format_node(node, indent);
+        let rendered = self.output[checkpoint..].to_string();
+        self.output.truncate(checkpoint);
+        if rendered.contains('\n') {
+            None
+        } else {
+            Some(rendered)
+        }
+    }
+
     /// Format map entries with their values aligned to the widest key.
     fn try_format_aligned_map_pairs(
         &mut self,
@@ -1986,20 +2025,22 @@ impl Formatter {
 
         let mut pairs = Vec::with_capacity(semantic.len() / 2);
         for pair in semantic.chunks_exact(2) {
-            if has_any_newlines(pair[0])
-                || has_any_newlines(pair[1])
-                || has_any_comments(pair[0])
-                || has_any_comments(pair[1])
-            {
+            if has_any_comments(pair[0]) || has_any_comments(pair[1]) {
                 return false;
             }
-            let key = node_to_flat_string(pair[0]);
-            let value = node_to_flat_string(pair[1]);
-            // A string literal can carry a raw newline that node-level newline
-            // detection can't see; an embedded newline would break the column.
-            if key.contains('\n') || value.contains('\n') {
+            // Judge eligibility by the node's REAL rendering, not its
+            // original newline structure: a node with internal newlines can
+            // still render on one line (a single-pair nested map does), and
+            // if eligibility disagrees with what the fallback layout emits,
+            // the second pass sees different structure and aligns what the
+            // first pass wouldn't — not idempotent. A rendering with a
+            // newline (multi-line value, raw newline in a string) bails.
+            let Some(key) = self.render_if_single_line(pair[0], indent) else {
                 return false;
-            }
+            };
+            let Some(value) = self.render_if_single_line(pair[1], indent) else {
+                return false;
+            };
             pairs.push((key, value));
         }
 

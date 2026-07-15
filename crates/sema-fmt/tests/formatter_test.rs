@@ -1729,3 +1729,59 @@ fn test_bytevector_with_comment_falls_back() {
     assert!(result.contains(";; c"), "comment deleted:\n{result}");
     assert_eq!(fmt(&result), result, "should be idempotent");
 }
+
+// ---------------------------------------------------------------------------
+// Fuzzer-found regressions (see fuzz_property_test.rs)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_comment_in_empty_form_kept() {
+    // Empty-form early returns used to emit bare `()`, deleting the comment.
+    for input in ["( ;; c\n)", "{ ;; c\n}", "[ ;; c\n]"] {
+        let result = fmt(input);
+        assert!(
+            result.contains(";; c"),
+            "comment deleted for {input:?}:\n{result}"
+        );
+        assert_eq!(fmt(&result), result, "not idempotent for {input:?}");
+        assert!(
+            format_source(&result, &FormatOptions::default()).is_ok(),
+            "unparseable for {input:?}:\n{result}"
+        );
+    }
+}
+
+#[test]
+fn test_comment_after_lone_head_kept() {
+    // `(f ;; c\n)` used to format as `(f)`.
+    let result = fmt("(f ;; c\n)");
+    assert!(result.contains(";; c"), "comment deleted:\n{result}");
+    assert_eq!(fmt(&result), result, "should be idempotent");
+    // Same for a special-form head with no args.
+    let result = fmt("(let* ;; tail\n)");
+    assert!(result.contains(";; tail"), "comment deleted:\n{result}");
+}
+
+#[test]
+fn test_quote_separated_from_target_by_comment() {
+    // A prefix reaches across trivia for its target; the comment must
+    // neither vanish nor fuse with the quote (`';; c` flip-flopped).
+    let input = "'\n;; c\nx";
+    let result = fmt(input);
+    assert_eq!(result, "' ;; c\nx\n");
+    assert_eq!(fmt(&result), result, "should be idempotent");
+}
+
+#[test]
+fn test_aligned_map_single_pair_nested_value_stable() {
+    // A nested single-pair map with internal newlines still RENDERS on one
+    // line, so alignment eligibility must use the rendering — otherwise the
+    // first pass declines, normalizes, and the second pass aligns (drift).
+    let input = "{:kkk 1\n :kk {:kk\n      2}}";
+    let first = fmt_aligned(input);
+    assert_eq!(fmt_aligned(&first), first, "should be idempotent");
+    assert!(
+        first.contains(":kkk  1"),
+        "single-pair nested value should not block alignment:\n{first}"
+    );
+}
