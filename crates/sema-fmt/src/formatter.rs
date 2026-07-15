@@ -1583,8 +1583,20 @@ impl Formatter {
             }
         }
 
-        // Multi-line: try aligned binding pairs if all children are 2-element lists/vectors
+        // Multi-line bytevector: hexdump-style grid — as many bytes per line
+        // as fit the width, each right-aligned in a uniform column.
         let elem_indent = indent + open.len();
+        if open == "#u8("
+            && !has_comments
+            && semantic
+                .iter()
+                .all(|n| matches!(n, Node::Atom(_) | Node::StringAtom(_)))
+        {
+            self.format_byte_grid(&semantic, elem_indent, open, close);
+            return;
+        }
+
+        // Multi-line: try aligned binding pairs if all children are 2-element lists/vectors
         if self.align && !has_comments && semantic.len() >= 2 {
             let all_binding_pairs = semantic
                 .iter()
@@ -1614,6 +1626,34 @@ impl Formatter {
         let rest_start = Self::index_after_nth_semantic(children, 1);
         self.emit_body_with_comments(children, rest_start, elem_indent);
 
+        self.output.push_str(close);
+    }
+
+    /// Grid layout for a multi-line `#u8(...)` literal: fill each line to the
+    /// configured width, right-aligning every byte in a uniform column (width
+    /// of the widest element) so the values line up hexdump-style.
+    fn format_byte_grid(&mut self, semantic: &[&Node], indent: usize, open: &str, close: &str) {
+        let cells: Vec<String> = semantic.iter().map(|n| node_to_flat_string(n)).collect();
+        let cell_width = cells.iter().map(|c| display_width(c)).max().unwrap_or(1);
+        // line length = indent + n*cell_width + (n-1) separators (+ close on
+        // the last line); keep at least one cell per line
+        let per_line =
+            ((self.width + 1).saturating_sub(indent + close.len()) / (cell_width + 1)).max(1);
+
+        self.output.push_str(open);
+        for (idx, cell) in cells.iter().enumerate() {
+            if idx > 0 {
+                if idx % per_line == 0 {
+                    self.output.push('\n');
+                    self.push_indent(indent);
+                } else {
+                    self.output.push(' ');
+                }
+            }
+            self.output
+                .extend(std::iter::repeat_n(' ', cell_width - display_width(cell)));
+            self.output.push_str(cell);
+        }
         self.output.push_str(close);
     }
 
