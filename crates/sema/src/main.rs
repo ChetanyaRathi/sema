@@ -24,6 +24,8 @@ struct FmtConfig {
     indent: usize,
     #[serde(default)]
     align: bool,
+    #[serde(default = "default_max_blank_lines", alias = "max_blank_lines", rename = "max-blank-lines")]
+    max_blank_lines: usize,
 }
 
 impl Default for FmtConfig {
@@ -32,6 +34,7 @@ impl Default for FmtConfig {
             width: 80,
             indent: 2,
             align: false,
+            max_blank_lines: 1,
         }
     }
 }
@@ -41,6 +44,9 @@ fn default_width() -> usize {
 }
 fn default_indent() -> usize {
     sema_fmt::FormatOptions::default().indent
+}
+fn default_max_blank_lines() -> usize {
+    sema_fmt::FormatOptions::default().max_blank_lines
 }
 
 /// Walk up from cwd to find sema.toml
@@ -285,6 +291,10 @@ enum Commands {
         /// Align consecutive similar forms (defines, cond clauses, let bindings)
         #[arg(long)]
         align: bool,
+
+        /// Max consecutive blank lines to keep (default: 1, or value from sema.toml)
+        #[arg(long)]
+        max_blank_lines: Option<usize>,
 
         /// Output result as JSON (useful for editor integrations)
         #[arg(long)]
@@ -825,6 +835,7 @@ fn main() {
                 width,
                 indent,
                 align,
+                max_blank_lines,
                 json,
             } => {
                 let config = find_config().unwrap_or_default();
@@ -832,6 +843,7 @@ fn main() {
                     width: width.unwrap_or(config.fmt.width),
                     indent: indent.unwrap_or(config.fmt.indent),
                     align: align || config.fmt.align,
+                    max_blank_lines: max_blank_lines.unwrap_or(config.fmt.max_blank_lines),
                 };
                 run_fmt(&files, check, diff, &opts, json);
             }

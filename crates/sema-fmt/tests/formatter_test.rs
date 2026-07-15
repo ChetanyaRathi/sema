@@ -6,6 +6,7 @@ fn opts(width: usize, indent: usize, align: bool) -> FormatOptions {
         width,
         indent,
         align,
+        ..Default::default()
     }
 }
 
@@ -1783,5 +1784,82 @@ fn test_aligned_map_single_pair_nested_value_stable() {
     assert!(
         first.contains(":kkk  1"),
         "single-pair nested value should not block alignment:\n{first}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Formatter fences: ; @formatter:off / ; @formatter:on
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_fence_preserves_region_verbatim() {
+    let input = "(define   a   1)\n\n; @formatter:off\n(define matrix\n  [1  0  0\n   0  1  0\n   0  0  1])\n; @formatter:on\n\n(define   b   2)";
+    let result = fmt(input);
+    assert_eq!(
+        result,
+        "(define a 1)\n\n; @formatter:off\n(define matrix\n  [1  0  0\n   0  1  0\n   0  0  1])\n; @formatter:on\n\n(define b 2)\n"
+    );
+    assert_eq!(fmt(&result), result, "should be idempotent");
+}
+
+#[test]
+fn test_fence_unmatched_off_runs_to_eof() {
+    let input = "(define  a  1)\n;; @formatter:off\n(weird     [1  2\n    3])";
+    let result = fmt(input);
+    assert_eq!(
+        result,
+        "(define a 1)\n;; @formatter:off\n(weird     [1  2\n    3])\n"
+    );
+}
+
+#[test]
+fn test_fence_stray_on_is_ordinary_comment() {
+    let input = "(define  a  1)\n; @formatter:on\n(define  b  2)";
+    assert_eq!(fmt(input), "(define a 1)\n; @formatter:on\n(define b 2)\n");
+}
+
+#[test]
+fn test_fence_inside_form_is_ignored() {
+    // Fences only work at top level; nested they are ordinary comments.
+    let input = "(define m\n  ; @formatter:off\n  [1  2])";
+    assert_eq!(fmt(input), "(define m\n  ; @formatter:off\n  [1 2])\n");
+}
+
+#[test]
+fn test_fence_multiple_regions_and_shebang() {
+    let input = "#!/usr/bin/env sema\n; @formatter:off\n(a  1)\n; @formatter:on\n(b   2)\n; @formatter:off\n(c  3)\n; @formatter:on";
+    let result = fmt(input);
+    assert_eq!(
+        result,
+        "#!/usr/bin/env sema\n; @formatter:off\n(a  1)\n; @formatter:on\n(b 2)\n; @formatter:off\n(c  3)\n; @formatter:on\n"
+    );
+    assert_eq!(fmt(&result), result, "should be idempotent");
+}
+
+// ---------------------------------------------------------------------------
+// max_blank_lines option
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_max_blank_lines() {
+    let input = "(define a 1)\n\n\n\n(define b 2)\n\n(define c 3)";
+    let zero = FormatOptions {
+        max_blank_lines: 0,
+        ..Default::default()
+    };
+    assert_eq!(
+        format_source(input, &zero).unwrap(),
+        "(define a 1)\n(define b 2)\n(define c 3)\n"
+    );
+    let two = FormatOptions {
+        max_blank_lines: 2,
+        ..Default::default()
+    };
+    let result = format_source(input, &two).unwrap();
+    assert_eq!(result, "(define a 1)\n\n\n(define b 2)\n\n(define c 3)\n");
+    assert_eq!(
+        format_source(&result, &two).unwrap(),
+        result,
+        "should be idempotent"
     );
 }

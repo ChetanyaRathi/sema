@@ -303,6 +303,10 @@ fn clause_subject_count(head_name: &str) -> usize {
     }
 }
 
+/// Gutter between the aligned left column and the right column (and between
+/// the right column and an aligned trailing comment).
+const ALIGN_GAP: usize = 2;
+
 fn is_trivia(n: &Node) -> bool {
     matches!(n, Node::Comment(_) | Node::Newline)
 }
@@ -702,18 +706,37 @@ struct Formatter {
     indent_size: usize,
     /// When true, column-align consecutive defines, cond clauses, and let bindings.
     align: bool,
+    /// Longest run of consecutive blank lines to preserve.
+    max_blank_lines: usize,
     /// The accumulated formatted source.
     output: String,
 }
 
 impl Formatter {
-    fn new(width: usize, indent_size: usize, align: bool) -> Self {
+    fn new(opts: &FormatOptions) -> Self {
         Self {
-            width,
-            indent_size,
-            align,
+            width: opts.width,
+            indent_size: opts.indent,
+            align: opts.align,
+            max_blank_lines: opts.max_blank_lines,
             output: String::new(),
         }
+    }
+
+    /// Column where the next character will land on the current output line.
+    fn current_col(&self) -> usize {
+        match self.output.rfind('\n') {
+            Some(pos) => self.output.len() - pos - 1,
+            None => self.output.len(),
+        }
+    }
+
+    /// Emit up to `max_blank_lines` blank lines for a run of `newlines`
+    /// consecutive newline tokens (N newlines = N-1 blank lines). Assumes the
+    /// current line is already terminated.
+    fn emit_blank_lines(&mut self, newlines: usize) {
+        let blanks = newlines.saturating_sub(1).min(self.max_blank_lines);
+        self.output.extend(std::iter::repeat_n('\n', blanks));
     }
 
     /// Format a sequence of top-level nodes: one form per line, blank-line
@@ -742,10 +765,7 @@ impl Formatter {
                         if !self.output.ends_with('\n') {
                             self.output.push('\n');
                         }
-                        if pending_blank_lines > 1 {
-                            // Collapse multiple blank lines to 1
-                            self.output.push('\n');
-                        }
+                        self.emit_blank_lines(pending_blank_lines);
                     }
                     pending_blank_lines = 0;
                     self.output.push_str(text);
@@ -759,10 +779,7 @@ impl Formatter {
                         if !self.output.ends_with('\n') {
                             self.output.push('\n');
                         }
-                        if pending_blank_lines > 1 {
-                            // There was at least one blank line between forms
-                            self.output.push('\n');
-                        }
+                        self.emit_blank_lines(pending_blank_lines);
                     }
                     pending_blank_lines = 0;
 
@@ -1059,10 +1076,7 @@ impl Formatter {
         let body_indent = indent + self.indent_size;
         for (j, (_orig_idx, node)) in semantic.iter().enumerate().skip(1).take(first_count - 1) {
             let w = flat_width(node);
-            let current_col = match self.output.rfind('\n') {
-                Some(pos) => self.output.len() - pos - 1,
-                None => self.output.len(),
-            };
+            let current_col = self.current_col();
 
             // Check if it fits flat on this line
             if current_col + 1 + w > self.width {
@@ -1250,7 +1264,7 @@ impl Formatter {
             .unwrap_or(0);
 
         // If all lefts are the same width, use normal spacing (no alignment needed)
-        let min_gap = if max_left == min_left { 1 } else { 2 };
+        let min_gap = if max_left == min_left { 1 } else { ALIGN_GAP };
 
         // Check all lines fit
         for (_left, right) in &splits {
@@ -1545,10 +1559,7 @@ impl Formatter {
                             self.format_node(child, node_indent);
                         } else {
                             // Try key + value on one line
-                            let key_col = match self.output.rfind('\n') {
-                                Some(pos) => self.output.len() - pos - 1,
-                                None => self.output.len(),
-                            };
+                            let key_col = self.current_col();
                             if key_col + 1 + flat_width(child) <= self.width {
                                 let checkpoint = self.output.len();
                                 self.output.push(' ');
@@ -1887,11 +1898,8 @@ impl Formatter {
                         // Trailing comment: keep it on its form's line.
                         self.output.push(' ');
                     } else {
-                        // Preserve blank line if there were 2+ consecutive newlines
-                        if consecutive_newlines >= 2 {
-                            self.output.push('\n');
-                        }
                         self.output.push('\n');
+                        self.emit_blank_lines(consecutive_newlines);
                         self.push_indent(body_indent);
                     }
                     self.output.push_str(text);
@@ -1900,11 +1908,8 @@ impl Formatter {
                 }
                 _ if is_trivia(child) => {}
                 _ => {
-                    // Preserve blank line if there were 2+ consecutive newlines
-                    if consecutive_newlines >= 2 {
-                        self.output.push('\n');
-                    }
                     self.output.push('\n');
+                    self.emit_blank_lines(consecutive_newlines);
                     self.push_indent(body_indent);
                     self.format_node(child, body_indent);
                     consecutive_newlines = 0;
@@ -1962,7 +1967,7 @@ impl Formatter {
             .unwrap_or(0);
 
         // Check that all aligned lines fit within width
-        let min_gap = 2;
+        let min_gap = ALIGN_GAP;
         for (_left, right) in &splits {
             if indent + max_left + min_gap + display_width(right) > self.width {
                 return false;
@@ -2058,7 +2063,7 @@ impl Formatter {
         if max_key == min_key
             || pairs.iter().enumerate().any(|(index, (_, value))| {
                 let closer = if index == last { close.len() } else { 0 };
-                indent + max_key + 2 + display_width(value) + closer > self.width
+                indent + max_key + ALIGN_GAP + display_width(value) + closer > self.width
             })
         {
             return false;
@@ -2071,8 +2076,10 @@ impl Formatter {
                 self.push_indent(indent);
             }
             self.output.push_str(key);
-            self.output
-                .extend(std::iter::repeat_n(' ', max_key - display_width(key) + 2));
+            self.output.extend(std::iter::repeat_n(
+                ' ',
+                max_key - display_width(key) + ALIGN_GAP,
+            ));
             self.output.push_str(value);
         }
         self.output.push_str(close);
@@ -2088,7 +2095,7 @@ impl Formatter {
     /// `trailing[i]` is member `i`'s trailing comment, if any; within an
     /// aligned run comments share a column past the widest value.
     fn format_define_group(&mut self, group: &[&Node], trailing: &[Option<String>]) {
-        let min_gap = 2;
+        let min_gap = ALIGN_GAP;
 
         // Split each define; None marks a member that can't be aligned
         // (unsplittable, embedded raw newline, or too wide at any column).
@@ -2374,6 +2381,9 @@ pub struct FormatOptions {
     /// Column-align consecutive similar forms (defines, cond clauses,
     /// let bindings) for readability.
     pub align: bool,
+    /// Maximum number of consecutive blank lines to preserve between forms;
+    /// longer runs are collapsed to this many.
+    pub max_blank_lines: usize,
 }
 
 impl Default for FormatOptions {
@@ -2382,6 +2392,7 @@ impl Default for FormatOptions {
             width: 80,
             indent: 2,
             align: false,
+            max_blank_lines: 1,
         }
     }
 }
@@ -2415,7 +2426,6 @@ pub fn format_source(input: &str, opts: &FormatOptions) -> Result<String, SemaEr
         (None, input)
     };
 
-    // 2. Tokenize the remaining source
     if rest.trim().is_empty() {
         let mut result = String::new();
         if let Some(shebang_line) = shebang {
@@ -2425,34 +2435,23 @@ pub fn format_source(input: &str, opts: &FormatOptions) -> Result<String, SemaEr
         return Ok(result);
     }
 
-    let tokens = tokenize(rest)?;
+    // 2. Format the body — through the fence splitter when `@formatter:off`
+    // regions are present, directly otherwise (the common, zero-cost path).
+    let body = if rest.contains(FENCE_OFF) {
+        format_with_fences(rest, opts)?
+    } else {
+        format_segment(rest, opts)?
+    };
 
-    // 3. Build node tree from tokens (passing source for string round-tripping)
-    let nodes = build_nodes(&tokens, rest)?;
-
-    // 4. Format node tree to string
-    let mut fmt = Formatter::new(opts.width, opts.indent, opts.align);
-    fmt.format_top_level(&nodes);
-
-    // 5. Assemble result
-    let mut result = String::new();
+    // 3. Assemble result
+    let mut final_result = String::new();
     if let Some(shebang_line) = shebang {
-        result.push_str(shebang_line);
-        result.push('\n');
+        final_result.push_str(shebang_line);
+        final_result.push('\n');
     }
-    result.push_str(&fmt.output);
+    final_result.push_str(&body);
 
-    // 6. Remove trailing whitespace on each line.
-    //
-    // We must NOT use `str::lines()`/`trim_end()` here: those treat `\r` as a
-    // line separator (and `trim_end` strips a trailing `\r`), which would
-    // silently mangle a CR that lives inside a preserved string/f-string/regex
-    // literal — e.g. `"foo\r\nbar"` would lose its `\r`, changing the program's
-    // string contents. Instead, strip only spaces/tabs that directly precede a
-    // real `\n` (or the end of input), leaving `\r` untouched in every context.
-    let mut final_result = strip_trailing_blanks(&result);
-
-    // 7. Ensure exactly one trailing newline
+    // 4. Ensure exactly one trailing newline
     while final_result.ends_with('\n') {
         final_result.pop();
     }
@@ -2461,6 +2460,142 @@ pub fn format_source(input: &str, opts: &FormatOptions) -> Result<String, SemaEr
     }
 
     Ok(final_result)
+}
+
+/// Format one fence-free stretch of source: tokenize, build the node tree,
+/// format, and strip trailing blanks.
+fn format_segment(src: &str, opts: &FormatOptions) -> Result<String, SemaError> {
+    if src.trim().is_empty() {
+        return Ok(String::new());
+    }
+    let tokens = tokenize(src)?;
+    let nodes = build_nodes(&tokens, src)?;
+    let mut fmt = Formatter::new(opts);
+    fmt.format_top_level(&nodes);
+
+    // Remove trailing whitespace on each line.
+    //
+    // We must NOT use `str::lines()`/`trim_end()` here: those treat `\r` as a
+    // line separator (and `trim_end` strips a trailing `\r`), which would
+    // silently mangle a CR that lives inside a preserved string/f-string/regex
+    // literal — e.g. `"foo\r\nbar"` would lose its `\r`, changing the program's
+    // string contents. Instead, strip only spaces/tabs that directly precede a
+    // real `\n` (or the end of input), leaving `\r` untouched in every context.
+    Ok(strip_trailing_blanks(&fmt.output))
+}
+
+/// Comment text (after `;`s and whitespace) that disables/re-enables the
+/// formatter for the region between the two markers.
+const FENCE_OFF: &str = "@formatter:off";
+const FENCE_ON: &str = "@formatter:on";
+
+/// Split the source at top-level `; @formatter:off` / `; @formatter:on`
+/// comments: the fenced region — from the start of the OFF-comment's line
+/// through the end of the ON-comment's line (or EOF when unmatched) — is
+/// emitted byte-for-byte; everything else formats normally. Fences nested
+/// inside a form are ignored (they are ordinary comments there).
+fn format_with_fences(src: &str, opts: &FormatOptions) -> Result<String, SemaError> {
+    let tokens = tokenize(src)?;
+
+    // Locate depth-0 fence comments
+    let mut fences: Vec<(bool, usize, usize)> = Vec::new(); // (is_off, start, end)
+    let mut depth = 0i64;
+    for st in &tokens {
+        match &st.token {
+            Token::LParen
+            | Token::LBracket
+            | Token::LBrace
+            | Token::ShortLambdaStart
+            | Token::BytevectorStart => depth += 1,
+            Token::RParen | Token::RBracket | Token::RBrace => depth -= 1,
+            Token::Comment(text) if depth == 0 => {
+                let t = text.trim_start_matches(';').trim();
+                if t == FENCE_OFF {
+                    fences.push((true, st.byte_start, st.byte_end));
+                } else if t == FENCE_ON {
+                    fences.push((false, st.byte_start, st.byte_end));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // Append `part`, separating it from previous content with a newline and
+    // (when the source had a blank line at the seam) one blank line.
+    fn push_part(out: &mut String, part: &str, blank_before: bool) {
+        if part.is_empty() {
+            return;
+        }
+        if !out.is_empty() {
+            if !out.ends_with('\n') {
+                out.push('\n');
+            }
+            if blank_before {
+                out.push('\n');
+            }
+        }
+        out.push_str(part);
+    }
+    // Whether a source stretch ends at a blank line (ignoring spaces/tabs/CR).
+    fn ends_with_blank_line(s: &str) -> bool {
+        let significant: Vec<char> = s
+            .chars()
+            .rev()
+            .filter(|c| !matches!(c, ' ' | '\t' | '\r'))
+            .take(2)
+            .collect();
+        significant == ['\n', '\n']
+    }
+    // Whether a source stretch starts with a blank line.
+    fn starts_with_blank_line(s: &str) -> bool {
+        s.trim_start_matches([' ', '\t', '\r']).starts_with('\n')
+    }
+
+    let mut out = String::new();
+    let mut cursor = 0usize;
+    let mut i = 0;
+    while i < fences.len() {
+        let (is_off, fence_start, _) = fences[i];
+        if !is_off {
+            // A stray `@formatter:on` with no active OFF region is an
+            // ordinary comment — leave it to normal formatting.
+            i += 1;
+            continue;
+        }
+        // Formatted stretch before the OFF-comment's line
+        let line_start = src[..fence_start].rfind('\n').map(|p| p + 1).unwrap_or(0);
+        let before = &src[cursor..line_start];
+        push_part(
+            &mut out,
+            &format_segment(before, opts)?,
+            starts_with_blank_line(before),
+        );
+        // Verbatim through the matching ON-comment's line (or EOF)
+        let mut j = i + 1;
+        while j < fences.len() && fences[j].0 {
+            j += 1;
+        }
+        let verbatim_end = if j < fences.len() {
+            let on_end = fences[j].2;
+            src[on_end..]
+                .find('\n')
+                .map(|p| on_end + p + 1)
+                .unwrap_or(src.len())
+        } else {
+            src.len()
+        };
+        let verbatim = src[line_start..verbatim_end].trim_end_matches('\n');
+        push_part(&mut out, verbatim, ends_with_blank_line(before));
+        cursor = verbatim_end;
+        i = j + 1;
+    }
+    let after = &src[cursor..];
+    push_part(
+        &mut out,
+        &format_segment(after, opts)?,
+        starts_with_blank_line(after),
+    );
+    Ok(out)
 }
 
 /// Strip trailing spaces/tabs that immediately precede a `\n` (or the end of
