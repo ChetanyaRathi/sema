@@ -6,6 +6,7 @@ fn opts(width: usize, indent: usize, align: bool) -> FormatOptions {
         width,
         indent,
         align,
+        ..Default::default()
     }
 }
 
@@ -782,6 +783,224 @@ fn test_aligned_let_bindings() {
 }
 
 #[test]
+fn test_aligned_map_values() {
+    let input = "(define default-keymap\n  {:mcp \"ctrl-o\"\n   :resume \"ctrl-r\"\n   :palette \"ctrl-k\"\n   :interrupt \"ctrl-c\"})";
+    let result = fmt_aligned(input);
+    assert_eq!(
+        result,
+        "(define default-keymap\n  {:mcp        \"ctrl-o\"\n   :resume     \"ctrl-r\"\n   :palette    \"ctrl-k\"\n   :interrupt  \"ctrl-c\"})\n"
+    );
+    assert_eq!(
+        fmt_aligned(&result),
+        result,
+        "aligned map should be idempotent"
+    );
+}
+
+#[test]
+fn test_map_values_not_aligned_without_flag() {
+    let input = "{:mcp \"ctrl-o\"\n :interrupt \"ctrl-c\"}";
+    assert_eq!(fmt(input), "{:mcp \"ctrl-o\"\n :interrupt \"ctrl-c\"}\n");
+}
+
+#[test]
+fn test_aligned_map_two_pairs_minimum() {
+    // Two pairs is the smallest map eligible for alignment.
+    let input = "{:a 1\n :longer 2}";
+    assert_eq!(fmt_aligned(input), "{:a       1\n :longer  2}\n");
+}
+
+#[test]
+fn test_aligned_map_comment_falls_back() {
+    // A comment disables value alignment, but the trailing comment stays
+    // on its own pair's line.
+    let input = "{:a 1 ;; note\n :bb 2\n :ccc 3}";
+    assert_eq!(fmt_aligned(input), "{:a 1 ;; note\n :bb 2\n :ccc 3}\n");
+}
+
+#[test]
+fn test_aligned_map_equal_width_keys_not_aligned() {
+    // All keys the same width: nothing to align, normal spacing.
+    let input = "{:aa 1\n :bb 2\n :cc 3}";
+    assert_eq!(fmt_aligned(input), "{:aa 1\n :bb 2\n :cc 3}\n");
+}
+
+#[test]
+fn test_aligned_map_odd_entries_fall_back() {
+    let input = "{:a 1\n :bb 2\n :ccc}";
+    assert_eq!(fmt_aligned(input), "{:a 1\n :bb 2\n :ccc}\n");
+}
+
+#[test]
+fn test_aligned_map_width_overflow_falls_back() {
+    let input = "{:k 1\n :key \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"\n :kk 2}";
+    let result = format_source(input, &opts(30, 2, true)).unwrap();
+    assert_eq!(
+        result,
+        "{:k 1\n :key \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"\n :kk 2}\n"
+    );
+}
+
+#[test]
+fn test_aligned_map_close_delimiter_counts_toward_width() {
+    // The last aligned line carries the closing `}`; it must fit too.
+    // Aligned, the last line would be ` :k      "1234567890123456789"}`
+    // = 31 columns: aligns at width 31, falls back at width 30.
+    let input = "{:short 1\n :k \"1234567890123456789\"}";
+    let aligned = format_source(input, &opts(31, 2, true)).unwrap();
+    assert_eq!(aligned, "{:short  1\n :k      \"1234567890123456789\"}\n");
+    let fallback = format_source(input, &opts(30, 2, true)).unwrap();
+    assert_eq!(fallback, "{:short 1\n :k \"1234567890123456789\"}\n");
+}
+
+#[test]
+fn test_aligned_map_multiline_string_value_falls_back() {
+    // A raw newline inside a string literal would break the value column.
+    let input = "{:a \"line1\nline2\"\n :bb 2\n :ccc 3}";
+    assert_eq!(
+        fmt_aligned(input),
+        "{:a \"line1\nline2\"\n :bb 2\n :ccc 3}\n"
+    );
+}
+
+#[test]
+fn test_aligned_map_multiline_nested_value_falls_back() {
+    // A value that was already multi-line keeps its layout instead of
+    // being flattened into an aligned column.
+    let input = "{:a {:x 1\n     :yy 2}\n :bb 2\n :ccc 3}";
+    let result = fmt_aligned(input);
+    assert!(
+        !result.contains(":a    "),
+        "multi-line nested value should not be aligned:\n{result}"
+    );
+    assert_eq!(fmt_aligned(&result), result, "should be idempotent");
+}
+
+#[test]
+fn test_aligned_map_unicode_keys_align_by_chars() {
+    // `:naïve` is 7 bytes but 6 chars; padding must use display columns.
+    let input = "{:naïve 1\n :bb 22\n :ccccc 3}";
+    let result = fmt_aligned(input);
+    assert_eq!(result, "{:naïve  1\n :bb     22\n :ccccc  3}\n");
+    assert_eq!(fmt_aligned(&result), result, "should be idempotent");
+}
+
+#[test]
+fn test_aligned_let_multiline_string_falls_back() {
+    // Same raw-newline hazard in the aligned binding-group path.
+    let input = "(let ((x \"a\nb\")\n      (longer 2))\n  x)";
+    let result = fmt_aligned(input);
+    assert_eq!(result, "(let ((x \"a\nb\")\n      (longer 2))\n  x)\n");
+}
+
+// Issue #114: a trailing comment must stay on its form's line — detaching it
+// to a standalone line below silently re-attaches it to the NEXT form.
+
+#[test]
+fn test_trailing_comment_stays_in_aligned_define_group() {
+    let input = "(define *rows* 24)\n(define *cols* 80)\n(define *cursor* 0)         ;; caret index\n(define *scroll* 0)         ;; lines scrolled";
+    let result = fmt_aligned(input);
+    assert_eq!(
+        result,
+        "(define *rows*    24)\n(define *cols*    80)\n(define *cursor*  0)   ;; caret index\n(define *scroll*  0)   ;; lines scrolled\n"
+    );
+    assert_eq!(fmt_aligned(&result), result, "should be idempotent");
+}
+
+#[test]
+fn test_trailing_comment_mid_aligned_define_group() {
+    // A trailing comment on an earlier define must not break the group
+    // or migrate to another line.
+    let input = "(define a 1) ;; first\n(define bb 2)\n(define ccc 3)";
+    let result = fmt_aligned(input);
+    assert_eq!(
+        result,
+        "(define a    1)  ;; first\n(define bb   2)\n(define ccc  3)\n"
+    );
+    assert_eq!(fmt_aligned(&result), result, "should be idempotent");
+}
+
+#[test]
+fn test_trailing_comment_stays_on_map_pair() {
+    let input = "(define default-config\n  {:model \"\"        ;; auto-detect\n   :max-turns 50})";
+    let result = fmt(input);
+    assert_eq!(
+        result,
+        "(define default-config\n  {:model \"\" ;; auto-detect\n   :max-turns 50})\n"
+    );
+    assert_eq!(fmt(&result), result, "should be idempotent");
+}
+
+#[test]
+fn test_standalone_comment_in_map_keeps_own_line() {
+    // A comment on its own line documents the pair below — leave it there.
+    let input = "{:a 1\n ;; note\n :b 2}";
+    assert_eq!(fmt(input), "{:a 1\n ;; note\n :b 2}\n");
+}
+
+#[test]
+fn test_trailing_comment_stays_in_list_body() {
+    let input = "(do\n  (foo) ;; hi\n  (bar))";
+    assert_eq!(fmt(input), "(do\n  (foo) ;; hi\n  (bar))\n");
+}
+
+#[test]
+fn test_trailing_comment_stays_on_let_binding() {
+    let input = "(let ((x 1) ;; the x\n      (longer 2))\n  x)";
+    assert_eq!(
+        fmt(input),
+        "(let ((x 1) ;; the x\n      (longer 2))\n  x)\n"
+    );
+}
+
+#[test]
+fn test_comment_between_map_key_and_value() {
+    // The value must not be emitted into the comment's line (it would be
+    // absorbed into the comment text and vanish from the map).
+    let input = "{:a ;; c\n 1\n :b 2}";
+    let result = fmt(input);
+    assert_eq!(result, "{:a ;; c\n   1\n :b 2}\n");
+    assert_eq!(fmt(&result), result, "should be idempotent");
+    assert!(
+        format_source(&result, &FormatOptions::default()).is_ok(),
+        "output should reparse"
+    );
+}
+
+#[test]
+fn test_comment_before_map_close_delimiter() {
+    // The closing brace must not be emitted into the comment's line (the
+    // output would no longer parse).
+    let input = "{:a 1\n :b 2 ;; last\n}";
+    let result = fmt(input);
+    assert_eq!(result, "{:a 1\n :b 2 ;; last\n }\n");
+    assert_eq!(fmt(&result), result, "should be idempotent");
+    assert!(
+        format_source(&result, &FormatOptions::default()).is_ok(),
+        "output should reparse"
+    );
+}
+
+#[test]
+fn test_comment_before_list_close_delimiter() {
+    let input = "(do\n  (foo)\n  ;; c\n  )";
+    let result = fmt(input);
+    assert_eq!(result, "(do\n  (foo)\n  ;; c\n  )\n");
+    assert!(
+        format_source(&result, &FormatOptions::default()).is_ok(),
+        "output should reparse"
+    );
+}
+
+#[test]
+fn test_aligned_map_prefixed_values() {
+    let input = "{:a 'foo\n :bb \"x\"\n :ccc 3}";
+    let result = fmt_aligned(input);
+    assert_eq!(result, "{:a    'foo\n :bb   \"x\"\n :ccc  3}\n");
+    assert_eq!(fmt_aligned(&result), result, "should be idempotent");
+}
+
+#[test]
 fn test_define_group_broken_by_blank_line() {
     let input = "(define x 1)\n\n(define y 2)";
     let result = fmt_aligned(input);
@@ -1099,5 +1318,548 @@ fn test_trailing_space_before_cr_in_string_preserved() {
     assert!(
         result.contains("foo \r\nbar"),
         "space before CRLF inside string must be preserved, got {result:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Comment preservation in "distinguished first line" regions: a comment
+// between a form's head and the elements a layout would flatten onto the
+// first line must never be deleted.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_comment_after_cond_clause_test_kept() {
+    // Real-world case (sema-coder): comment after a clause's test.
+    let input = "(cond\n  ((nil? x) ;; EOF\n   (a)\n   (b))\n  (else 2))";
+    let result = fmt(input);
+    assert!(result.contains(";; EOF"), "comment deleted:\n{result}");
+    assert_eq!(fmt(&result), result, "should be idempotent");
+}
+
+#[test]
+fn test_comment_after_unknown_head_kept() {
+    // Real-world case (async-everything.sema): comment after a call head.
+    let input = "(async ; fast\n  (sleep 10)\n  (send ch))";
+    let result = fmt(input);
+    assert_eq!(result, "(async ; fast\n  (sleep 10)\n  (send ch))\n");
+}
+
+#[test]
+fn test_comment_positions_never_dropped() {
+    // One probe per specialized layout's first-line region.
+    let cases = [
+        "( ;; before-head\n foo bar baz-long-enough-to-not-fit-the-line-with-all-of-this-here)",
+        "(let ;; c\n  ((x 1))\n  (body))",
+        "(define x ;; c\n  (some-value))",
+        "(if ;; c\n  (pred?)\n  1\n  2)",
+        "(-> ;; c\n  x\n  (f)\n  (g))",
+        "(hash-map ;; c\n  :a 1\n  :b 2)",
+        "(hash-map :a 1 ;; note\n  :b 2)",
+        "(assoc m ;; c\n  :a 1)",
+        "'( ;; c\n a b)",
+    ];
+    for input in cases {
+        for (name, out) in [("fmt", fmt(input)), ("fmt_aligned", fmt_aligned(input))] {
+            assert_eq!(
+                input.matches(';').count(),
+                out.matches(';').count(),
+                "{name} dropped a comment for {input:?}:\n{out}"
+            );
+            assert!(
+                format_source(&out, &FormatOptions::default()).is_ok(),
+                "{name} output unparseable for {input:?}:\n{out}"
+            );
+        }
+    }
+}
+
+#[test]
+fn test_aligned_clause_with_inner_comment_falls_back() {
+    // The aligned cond path flattens clauses — a comment INSIDE one must
+    // force the fallback, not vanish.
+    let input = "(cond\n  ((= x 1) ;; one\n   \"one\")\n  ((= x 100) \"hundred\"))";
+    let result = fmt_aligned(input);
+    assert!(result.contains(";; one"), "comment deleted:\n{result}");
+}
+
+#[test]
+fn test_aligned_define_with_inner_comment_not_grouped() {
+    let input = "(define a 1)\n(define x ;; why\n  2)\n(define ccc 3)";
+    let result = fmt_aligned(input);
+    assert!(result.contains(";; why"), "comment deleted:\n{result}");
+    assert_eq!(fmt_aligned(&result), result, "should be idempotent");
+}
+
+// ---------------------------------------------------------------------------
+// --align idempotency and layout preservation
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_blank_line_after_unaligned_define_group_kept() {
+    // Equal-width defines don't align; the batch path must still terminate
+    // its last line before the following blank line is emitted.
+    let input = "(define a 1)\n(define b 2)\n\n(define (f x)\n  (g x))";
+    let result = fmt_aligned(input);
+    assert_eq!(
+        result,
+        "(define a 1)\n(define b 2)\n\n(define (f x)\n  (g x))\n"
+    );
+    assert_eq!(fmt_aligned(&result), result, "should be idempotent");
+}
+
+#[test]
+fn test_align_does_not_collapse_multiline_fn_define() {
+    // A function define with its body on its own line keeps that layout.
+    let input = "(define a 1)\n(define bb 2)\n(define (f x)\n  (g x))";
+    let result = fmt_aligned(input);
+    assert_eq!(
+        result,
+        "(define a   1)\n(define bb  2)\n(define (f x)\n  (g x))\n"
+    );
+    assert_eq!(fmt_aligned(&result), result, "should be idempotent");
+}
+
+#[test]
+fn test_align_joins_multiline_value_define_once() {
+    // format_body joins (define name value) onto one line when it fits, so
+    // alignment must treat it as eligible on the FIRST pass.
+    let input = "(define hub (channel/new 64))\n(define senders\n  (map f (range 1 201)))";
+    let result = fmt_aligned(input);
+    assert_eq!(
+        result,
+        "(define hub      (channel/new 64))\n(define senders  (map f (range 1 201)))\n"
+    );
+    assert_eq!(fmt_aligned(&result), result, "should be idempotent");
+}
+
+#[test]
+fn test_aligned_define_subruns_split_at_wide_member() {
+    // A member too wide for the shared column is formatted normally and
+    // splits the alignment run instead of failing the whole group.
+    let input = "(define (gen/int lo hi) (fn () (rand lo hi)))\n(define (gen/nat) (gen/int 0 1000))\n(define (gen/char) (fn () (very-long-call-that-makes-this-line-exceed-eighty-columns 32 126)))\n(define (gen/bool) (fn () (rand 0 1)))\n(define (g) (h))";
+    let result = fmt_aligned(input);
+    let second = fmt_aligned(&result);
+    assert_eq!(result, second, "sub-run alignment should be idempotent");
+    // The two defines before the wide member align with each other...
+    assert!(
+        result.contains("(define (gen/int lo hi)  (fn () (rand lo hi)))"),
+        "first sub-run not aligned:\n{result}"
+    );
+    // ...and the two after it align with each other.
+    assert!(
+        result.contains("(define (gen/bool)  (fn () (rand 0 1)))"),
+        "second sub-run not aligned:\n{result}"
+    );
+}
+
+#[test]
+fn test_def_family_aligns() {
+    // `def` is part of the define family.
+    let input = "(def x 1)\n(def longer 2)";
+    assert_eq!(fmt_aligned(input), "(def x       1)\n(def longer  2)\n");
+    let input2 = "(defn f (x) (+ x 1))\n(defn gg (x) (* x 2))";
+    assert_eq!(
+        fmt_aligned(input2),
+        "(defn f (x)   (+ x 1))\n(defn gg (x)  (* x 2))\n"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Robustness
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_deep_nesting_errors_gracefully() {
+    // Must return an error, not overflow the stack.
+    let deep = format!("{}1{}", "(list ".repeat(2000), ")".repeat(2000));
+    let err = format_source(&deep, &FormatOptions::default()).unwrap_err();
+    assert!(err.to_string().contains("nested too deeply"), "{err}");
+}
+
+#[test]
+fn test_moderately_deep_nesting_formats() {
+    let deep = format!("{}1{}", "(list ".repeat(100), ")".repeat(100));
+    let result = fmt(&deep);
+    assert_eq!(fmt(&result), result, "should be idempotent");
+}
+
+// ---------------------------------------------------------------------------
+// Delimiter preservation in aligned pairs: a [..] pair must never be
+// re-emitted as (..) — that turns a vector literal into a call form.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_aligned_vector_pairs_keep_brackets() {
+    let input = "[[:a 1]\n [:bb 22]\n [:ccc 333]]";
+    let result = fmt_aligned(input);
+    assert_eq!(result, "[[:a    1]\n [:bb   22]\n [:ccc  333]]\n");
+    assert_eq!(fmt_aligned(&result), result, "should be idempotent");
+}
+
+#[test]
+fn test_aligned_let_vector_bindings_keep_brackets() {
+    let input = "(let [[x 1]\n      [longer 22]]\n  x)";
+    let result = fmt_aligned(input);
+    assert_eq!(result, "(let [[x       1]\n      [longer  22]]\n  x)\n");
+}
+
+#[test]
+fn test_aligned_case_vector_clauses_keep_brackets() {
+    let input = "(case x\n  [1 \"one\"]\n  [22 \"twotwo\"])";
+    let result = fmt_aligned(input);
+    assert_eq!(result, "(case x\n  [1   \"one\"]\n  [22  \"twotwo\"])\n");
+}
+
+// ---------------------------------------------------------------------------
+// Special-form coverage: every special form in the canonical list
+// (crates/sema-docs/entries/special-forms/) gets its intended layout.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_case_and_match_subject_on_head_line() {
+    let result =
+        fmt_narrow("(case x (1 \"one\") (2 \"two\") (else \"other\") (more-padding \"xx\"))");
+    assert!(
+        result.starts_with("(case x\n"),
+        "case subject should share the head line:\n{result}"
+    );
+    let result = fmt_narrow("(match value ((list a b) (+ a b)) (_ 0) (long-pattern \"yyy\"))");
+    assert!(
+        result.starts_with("(match value\n"),
+        "match subject should share the head line:\n{result}"
+    );
+}
+
+#[test]
+fn test_case_comment_before_subject_kept() {
+    let input = "(case ;; pick\n  x\n  (1 \"one\")\n  (2 \"two\"))";
+    let result = fmt(input);
+    assert!(result.contains(";; pick"), "comment deleted:\n{result}");
+    assert_eq!(fmt(&result), result, "should be idempotent");
+}
+
+#[test]
+fn test_progn_and_async_format_as_body_forms() {
+    // progn is an alias of begin, async wraps a body — both put every body
+    // expression on its own line instead of pulling the first beside the head.
+    assert_eq!(
+        fmt_narrow("(progn (step-one arg) (step-two arg) (step-three arg))"),
+        "(progn\n  (step-one arg)\n  (step-two arg)\n  (step-three arg))\n"
+    );
+    assert_eq!(
+        fmt_narrow("(async (do-something arg) (do-more arg) (do-even-more arg))"),
+        "(async\n  (do-something arg)\n  (do-more arg)\n  (do-even-more arg))\n"
+    );
+}
+
+#[test]
+fn test_special_form_first_line_shapes() {
+    // Each form keeps its spec/signature on the head line, body below.
+    let cases = [
+        (
+            "(dotimes (i 10) (print-a-thing i) (another-line i))",
+            "(dotimes (i 10)\n",
+        ),
+        (
+            "(for-range (i 0 100) (do-thing-with i) (and-another i))",
+            "(for-range (i 0 100)\n",
+        ),
+        (
+            "(for-fold (acc 0) (x xs) (+ acc (weight-of x)))",
+            "(for-fold (acc 0) (x xs)\n",
+        ),
+        (
+            "(guard (e (else (handle e))) (risky-thing arg) (more-risky arg))",
+            "(guard (e (else (handle e)))\n",
+        ),
+        (
+            "(defmethod area :circle (c) (* 3.14 (sq (radius-of c))))",
+            "(defmethod area :circle (c)\n",
+        ),
+        (
+            "(define-values (q r) (floor/ some-numerator some-denominator))",
+            "(define-values (q r)\n",
+        ),
+        (
+            "(parameterize ((param val)) (body-one arg) (body-two arg))",
+            "(parameterize ((param val))\n",
+        ),
+        (
+            "(with-open-file (f \"path.txt\") (read-line-from f) (another f))",
+            "(with-open-file (f \"path.txt\")\n",
+        ),
+        (
+            "(module my-module (export a b) (define aa 1) (define bb 2))",
+            "(module my-module\n",
+        ),
+    ];
+    for (input, expected_first_line) in cases {
+        let result = fmt_narrow(input);
+        assert!(
+            result.starts_with(expected_first_line),
+            "for {input:?}\nexpected start: {expected_first_line:?}\ngot:\n{result}"
+        );
+        assert_eq!(fmt_narrow(&result), result, "not idempotent: {input:?}");
+    }
+}
+
+#[test]
+fn test_special_forms_all_idempotent_and_comment_safe() {
+    // Canonical special-form list (from crates/sema-docs/entries/special-forms/),
+    // each with a comment in the body to exercise comment preservation.
+    let forms = [
+        "(and a b)",
+        "(or a b)",
+        "(if p 1 2)",
+        "(when p ;; c\n  (a))",
+        "(unless p ;; c\n  (a))",
+        "(cond (p 1) ;; c\n  (else 2))",
+        "(case x (1 \"a\") ;; c\n  (else \"b\"))",
+        "(match v (_ 0) ;; c\n  (p 1))",
+        "(match* (a b) ((1 2) \"x\"))",
+        "(let ((x 1)) ;; c\n  x)",
+        "(let* ((x 1)) x)",
+        "(letrec ((f (fn () 1))) (f))",
+        "(let-values (((a b) (two-values))) a)",
+        "(let*-values (((a b) (two-values))) a)",
+        "(when-let ((x (find))) x)",
+        "(if-let ((x (find))) x 0)",
+        "(define x 1)",
+        "(def x 1)",
+        "(defn f (x) x)",
+        "(defun f (x) x)",
+        "(defmacro m (x) x)",
+        "(defmulti area :shape)",
+        "(defmethod area :circle (c) 3.14)",
+        "(define-values (a b) (vals))",
+        "(fn (x) ;; c\n  x)",
+        "(lambda (x) x)",
+        "(do (a) ;; c\n  (b))",
+        "(begin (a) (b))",
+        "(progn (a) (b))",
+        "(async (a) ;; c\n  (b))",
+        "(await p)",
+        "(delay (compute))",
+        "(force p)",
+        "(while p ;; c\n  (a))",
+        "(dotimes (i 3) (p i))",
+        "(for (x xs) (p x))",
+        "(for-range (i 0 9) (p i))",
+        "(for-list (x xs) (f x))",
+        "(for-map (x xs) (f x))",
+        "(for-filter (x xs) (pred? x))",
+        "(for-fold (acc 0) (x xs) (+ acc x))",
+        "(guard (e (else 0)) (risky))",
+        "(parameterize ((p v)) (body))",
+        "(try (a) ;; c\n  (catch e (h e)))",
+        "(throw (make-error))",
+        "(quote (a b))",
+        "(quasiquote (a (unquote b)))",
+        "(set! x 2)",
+        "(eval '(+ 1 2))",
+        "(macroexpand '(when p 1))",
+        "(import \"mod\")",
+        "(load \"file.sema\")",
+        "(export a b)",
+        "(module m (export a) (define a 1))",
+        "(-> x (f) ;; c\n  (g))",
+        "(->> x (f) (g))",
+        "(as-> x it (f it))",
+        "(some-> x (f))",
+        "(prompt \"hi\")",
+        "(message :user \"hi\")",
+        "(deftool t \"doc\" {:a :string} (body))",
+        "(defagent a \"doc\" :tools [t] (body))",
+    ];
+    for input in forms {
+        for opts in [
+            FormatOptions::default(),
+            opts(80, 2, true),
+            opts(30, 2, false),
+        ] {
+            let first = format_source(input, &opts)
+                .unwrap_or_else(|e| panic!("format failed for {input:?}: {e}"));
+            let second = format_source(&first, &opts)
+                .unwrap_or_else(|e| panic!("reformat failed for {input:?}: {e}\n{first}"));
+            assert_eq!(second, first, "not idempotent for {input:?}");
+            assert_eq!(
+                input.matches(';').count(),
+                first.matches(';').count(),
+                "comment dropped for {input:?}:\n{first}"
+            );
+        }
+    }
+}
+
+#[test]
+fn test_bytevector_wraps_at_width() {
+    // A single-line literal too long for the width wraps greedily.
+    let input = format!(
+        "#u8({})",
+        (0..32).map(|i| i.to_string()).collect::<Vec<_>>().join(" ")
+    );
+    let result = fmt(&input);
+    assert_eq!(
+        result,
+        "#u8(0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28\n    29 30 31)\n"
+    );
+    assert_eq!(fmt(&result), result, "wrapping should be idempotent");
+}
+
+#[test]
+fn test_bytevector_preserves_user_rows() {
+    // A hand-arranged grid keeps its row structure; spacing is normalized.
+    let input = "#u8( 1  2  3  4\n     5  6  7  8\n     9 10 11 12\n    13 14 15 16)";
+    let result = fmt(input);
+    assert_eq!(
+        result,
+        "#u8(1 2 3 4\n    5 6 7 8\n    9 10 11 12\n    13 14 15 16)\n"
+    );
+    assert_eq!(fmt(&result), result, "should be idempotent");
+}
+
+#[test]
+fn test_bytevector_short_stays_one_line() {
+    assert_eq!(fmt("#u8(1 2 3 255)"), "#u8(1 2 3 255)\n");
+}
+
+#[test]
+fn test_bytevector_with_comment_falls_back() {
+    let input = "#u8(1 2 ;; c\n    3)";
+    let result = fmt(input);
+    assert!(result.contains(";; c"), "comment deleted:\n{result}");
+    assert_eq!(fmt(&result), result, "should be idempotent");
+}
+
+// ---------------------------------------------------------------------------
+// Fuzzer-found regressions (see fuzz_property_test.rs)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_comment_in_empty_form_kept() {
+    // Empty-form early returns used to emit bare `()`, deleting the comment.
+    for input in ["( ;; c\n)", "{ ;; c\n}", "[ ;; c\n]"] {
+        let result = fmt(input);
+        assert!(
+            result.contains(";; c"),
+            "comment deleted for {input:?}:\n{result}"
+        );
+        assert_eq!(fmt(&result), result, "not idempotent for {input:?}");
+        assert!(
+            format_source(&result, &FormatOptions::default()).is_ok(),
+            "unparseable for {input:?}:\n{result}"
+        );
+    }
+}
+
+#[test]
+fn test_comment_after_lone_head_kept() {
+    // `(f ;; c\n)` used to format as `(f)`.
+    let result = fmt("(f ;; c\n)");
+    assert!(result.contains(";; c"), "comment deleted:\n{result}");
+    assert_eq!(fmt(&result), result, "should be idempotent");
+    // Same for a special-form head with no args.
+    let result = fmt("(let* ;; tail\n)");
+    assert!(result.contains(";; tail"), "comment deleted:\n{result}");
+}
+
+#[test]
+fn test_quote_separated_from_target_by_comment() {
+    // A prefix reaches across trivia for its target; the comment must
+    // neither vanish nor fuse with the quote (`';; c` flip-flopped).
+    let input = "'\n;; c\nx";
+    let result = fmt(input);
+    assert_eq!(result, "' ;; c\nx\n");
+    assert_eq!(fmt(&result), result, "should be idempotent");
+}
+
+#[test]
+fn test_aligned_map_single_pair_nested_value_stable() {
+    // A nested single-pair map with internal newlines still RENDERS on one
+    // line, so alignment eligibility must use the rendering — otherwise the
+    // first pass declines, normalizes, and the second pass aligns (drift).
+    let input = "{:kkk 1\n :kk {:kk\n      2}}";
+    let first = fmt_aligned(input);
+    assert_eq!(fmt_aligned(&first), first, "should be idempotent");
+    assert!(
+        first.contains(":kkk  1"),
+        "single-pair nested value should not block alignment:\n{first}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Formatter fences: ; @formatter:off / ; @formatter:on
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_fence_preserves_region_verbatim() {
+    let input = "(define   a   1)\n\n; @formatter:off\n(define matrix\n  [1  0  0\n   0  1  0\n   0  0  1])\n; @formatter:on\n\n(define   b   2)";
+    let result = fmt(input);
+    assert_eq!(
+        result,
+        "(define a 1)\n\n; @formatter:off\n(define matrix\n  [1  0  0\n   0  1  0\n   0  0  1])\n; @formatter:on\n\n(define b 2)\n"
+    );
+    assert_eq!(fmt(&result), result, "should be idempotent");
+}
+
+#[test]
+fn test_fence_unmatched_off_runs_to_eof() {
+    let input = "(define  a  1)\n;; @formatter:off\n(weird     [1  2\n    3])";
+    let result = fmt(input);
+    assert_eq!(
+        result,
+        "(define a 1)\n;; @formatter:off\n(weird     [1  2\n    3])\n"
+    );
+}
+
+#[test]
+fn test_fence_stray_on_is_ordinary_comment() {
+    let input = "(define  a  1)\n; @formatter:on\n(define  b  2)";
+    assert_eq!(fmt(input), "(define a 1)\n; @formatter:on\n(define b 2)\n");
+}
+
+#[test]
+fn test_fence_inside_form_is_ignored() {
+    // Fences only work at top level; nested they are ordinary comments.
+    let input = "(define m\n  ; @formatter:off\n  [1  2])";
+    assert_eq!(fmt(input), "(define m\n  ; @formatter:off\n  [1 2])\n");
+}
+
+#[test]
+fn test_fence_multiple_regions_and_shebang() {
+    let input = "#!/usr/bin/env sema\n; @formatter:off\n(a  1)\n; @formatter:on\n(b   2)\n; @formatter:off\n(c  3)\n; @formatter:on";
+    let result = fmt(input);
+    assert_eq!(
+        result,
+        "#!/usr/bin/env sema\n; @formatter:off\n(a  1)\n; @formatter:on\n(b 2)\n; @formatter:off\n(c  3)\n; @formatter:on\n"
+    );
+    assert_eq!(fmt(&result), result, "should be idempotent");
+}
+
+// ---------------------------------------------------------------------------
+// max_blank_lines option
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_max_blank_lines() {
+    let input = "(define a 1)\n\n\n\n(define b 2)\n\n(define c 3)";
+    let zero = FormatOptions {
+        max_blank_lines: 0,
+        ..Default::default()
+    };
+    assert_eq!(
+        format_source(input, &zero).unwrap(),
+        "(define a 1)\n(define b 2)\n(define c 3)\n"
+    );
+    let two = FormatOptions {
+        max_blank_lines: 2,
+        ..Default::default()
+    };
+    let result = format_source(input, &two).unwrap();
+    assert_eq!(result, "(define a 1)\n\n\n(define b 2)\n\n(define c 3)\n");
+    assert_eq!(
+        format_source(&result, &two).unwrap(),
+        result,
+        "should be idempotent"
     );
 }

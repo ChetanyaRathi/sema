@@ -3409,6 +3409,7 @@ pub fn format_code(code: &str, width: usize, indent: usize, align: bool) -> JsVa
         width,
         indent,
         align,
+        ..Default::default()
     };
     match sema_fmt::format_source(code, &opts) {
         Ok(formatted) => {

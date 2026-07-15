@@ -23,6 +23,7 @@ With no arguments, `sema fmt` formats all `.sema` files in the current directory
 | `--width <N>` | Max line width (default: `80`) |
 | `--indent <N>` | Indentation width for body forms (default: `2`) |
 | `--align` | Align consecutive similar forms (defines, cond clauses, let bindings) |
+| `--max-blank-lines <N>` | Max consecutive blank lines to keep (default: `1`) |
 
 ### Examples
 
@@ -58,6 +59,7 @@ Create a `sema.toml` file in your project root to set persistent formatting opti
 width = 80
 indent = 2
 align = false
+max-blank-lines = 1
 ```
 
 ### Options
@@ -67,19 +69,46 @@ align = false
 | `width` | integer | `80` | Maximum line width |
 | `indent` | integer | `2` | Number of spaces for body indentation |
 | `align` | boolean | `false` | Enable decorative column alignment |
+| `max-blank-lines` | integer | `1` | Longest run of consecutive blank lines to preserve; longer runs are collapsed. `0` removes all blank lines |
 
 ### Precedence
 
 Settings are merged in this order (later wins):
 
-1. **Defaults** — `width=80`, `indent=2`, `align=false`
+1. **Defaults** — `width=80`, `indent=2`, `align=false`, `max-blank-lines=1`
 2. **`sema.toml`** — project-level configuration
-3. **CLI flags** — `--width`, `--indent`, `--align` override everything
+3. **CLI flags** — `--width`, `--indent`, `--align`, `--max-blank-lines` override everything
 
 ```bash
 # sema.toml sets width=100, but CLI overrides to 120
 sema fmt --width 120
 ```
+
+## Disabling the Formatter for a Region
+
+Sometimes hand-made layout carries meaning the formatter can't know about — a matrix written as a grid, a lookup table with meaningful columns, ASCII art in data. Fence such a region with `@formatter:off` / `@formatter:on` comments (the IntelliJ-family convention) and `sema fmt` passes it through byte-for-byte:
+
+```scheme
+(define scale 2.0)
+
+; @formatter:off
+(define identity-matrix
+  [1.0  0.0  0.0
+   0.0  1.0  0.0
+   0.0  0.0  1.0])
+; @formatter:on
+
+(define origin {:x 0 :y 0})
+```
+
+Everything from the start of the `@formatter:off` line through the end of the `@formatter:on` line is preserved exactly; the code before and after formats normally.
+
+Rules:
+
+- The fence is a line comment whose text (after the `;`s) is exactly `@formatter:off` or `@formatter:on` — any number of leading semicolons works (`;`, `;;`, `;;;`).
+- Fences only take effect **at the top level**. Inside a form they are ordinary comments and the form formats normally.
+- An `@formatter:off` with no matching `@formatter:on` disables formatting through the end of the file.
+- A stray `@formatter:on` with no active `off` region is an ordinary comment.
 
 ## Formatting Rules
 

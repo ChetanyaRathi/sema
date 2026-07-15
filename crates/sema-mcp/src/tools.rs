@@ -1043,11 +1043,7 @@ fn call_mcp_tool_inner(
                     Ok(c) => c,
                     Err(e) => return error_result(format!("Failed to read {file}: {e}")),
                 };
-                let fmt_opts = sema_fmt::FormatOptions {
-                    width: 80,
-                    indent: 2,
-                    align: false,
-                };
+                let fmt_opts = sema_fmt::FormatOptions::default();
                 let formatted = match sema_fmt::format_source(&content, &fmt_opts) {
                     Ok(f) => f,
                     Err(e) => return error_result(format!("Format error: {e}")),
@@ -1057,11 +1053,7 @@ fn call_mcp_tool_inner(
                 }
                 success_result(format!("Formatted file {file} in-place successfully."))
             } else if let Some(src) = code {
-                let fmt_opts = sema_fmt::FormatOptions {
-                    width: 80,
-                    indent: 2,
-                    align: false,
-                };
+                let fmt_opts = sema_fmt::FormatOptions::default();
                 match sema_fmt::format_source(src, &fmt_opts) {
                     Ok(formatted) => success_result(formatted),
                     Err(e) => error_result(format!("Format error: {e}")),
