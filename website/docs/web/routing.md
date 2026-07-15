@@ -8,7 +8,7 @@ The `router/*` namespace provides a hash-based SPA router built on signals. Rout
 
 Register routes and start listening for hash changes. The route map is a map from path patterns to handler names:
 
-```scheme
+```sema
 (router/init! {"/" "home-page"
                "/todos" "todo-list"
                "/todos/:id" "todo-detail"
@@ -23,7 +23,7 @@ This installs a `hashchange` listener and immediately matches the current URL.
 
 Navigate to a path by setting `location.hash`. This adds a history entry so the back button works.
 
-```scheme
+```sema
 (router/push! "/todos/42")
 ```
 
@@ -31,7 +31,7 @@ Navigate to a path by setting `location.hash`. This adds a history entry so the 
 
 Navigate to a path without adding a history entry. Useful for redirects.
 
-```scheme
+```sema
 (router/replace! "/login")
 ```
 
@@ -39,7 +39,7 @@ Navigate to a path without adding a history entry. Useful for redirects.
 
 Go back one entry in the browser history.
 
-```scheme
+```sema
 (router/back!)
 ```
 
@@ -53,7 +53,7 @@ Returns the signal ID for the current route match. Use with `deref` to read the 
 
 Convenience wrapper (defined in Sema) that dereferences the route signal. Returns a map with `:path`, `:params`, and `:handler`, or `nil` if no route matches.
 
-```scheme
+```sema
 (router/current-route)
 ;; => {:path "/todos/42" :params {:id "42"} :handler "todo-detail"}
 ```
@@ -72,7 +72,7 @@ Parameter names must match `[a-zA-Z_][a-zA-Z0-9_]*`.
 
 ## Example: Route-Based Rendering
 
-```scheme
+```sema
 (router/init! {"/" "home-page"
                "/about" "about-page"
                "/users/:id" "user-page"})

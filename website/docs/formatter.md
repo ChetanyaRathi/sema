@@ -105,7 +105,7 @@ sema fmt vendor/lib.sema
 
 Sometimes hand-made layout carries meaning the formatter can't know about — a matrix written as a grid, a lookup table with meaningful columns, ASCII art in data. Fence such a region with `@formatter:off` / `@formatter:on` comments (the IntelliJ-family convention) and `sema fmt` passes it through byte-for-byte:
 
-```scheme
+```sema
 (define scale 2.0)
 
 ; @formatter:off
@@ -133,7 +133,7 @@ Rules:
 
 The formatter uses a "try flat, then multi-line" strategy. If a form fits within the line width, it stays on one line. Otherwise, it breaks across multiple lines with appropriate indentation.
 
-```scheme
+```sema
 ;; Fits on one line
 (+ 1 2 3)
 
@@ -151,7 +151,7 @@ The formatter recognizes Sema's special forms and applies context-appropriate in
 
 **Body forms** (`define`, `defn`, `fn`, `lambda`, `do`, `when`, `unless`, etc.) place the head and key arguments on the first line, then indent the body:
 
-```scheme
+```sema
 (defn factorial (n)
   (if (< n 2)
     n
@@ -160,7 +160,7 @@ The formatter recognizes Sema's special forms and applies context-appropriate in
 
 **Binding forms** (`let`, `let*`, `letrec`, `when-let`, `if-let`) keep bindings aligned:
 
-```scheme
+```sema
 (let ((x 1)
       (y 2)
       (z 3))
@@ -169,7 +169,7 @@ The formatter recognizes Sema's special forms and applies context-appropriate in
 
 **Clause forms** (`cond`, `case`, `match`, `match*`) indent each clause. `case`/`match` keep their subject on the head line:
 
-```scheme
+```sema
 (cond
   ((= x 1) "one")
   ((= x 2) "two")
@@ -183,7 +183,7 @@ The formatter recognizes Sema's special forms and applies context-appropriate in
 
 **Threading macros** (`->`, `->>`, `as->`, `some->`) indent each step:
 
-```scheme
+```sema
 (-> data
   (filter even?)
   (map square)
@@ -192,7 +192,7 @@ The formatter recognizes Sema's special forms and applies context-appropriate in
 
 **Conditionals** (`if`) place condition, then-branch, and else-branch on separate lines when they don't fit:
 
-```scheme
+```sema
 (if (> x 0)
   "positive"
   "non-positive")
@@ -202,7 +202,7 @@ The formatter recognizes Sema's special forms and applies context-appropriate in
 
 All comments are preserved. A trailing comment stays on the line of the form it annotates; a standalone comment keeps its own line, above the form it documents:
 
-```scheme
+```sema
 ;; Module header comment
 (define x 42) ; stays on this line
 
@@ -214,7 +214,7 @@ All comments are preserved. A trailing comment stays on the line of the form it 
 
 A multi-line `#u8(...)` literal keeps the row breaks you wrote (with spacing normalized), so a hand-arranged grid keeps its shape. A single-line literal that exceeds the width wraps at the width:
 
-```scheme
+```sema
 ;; Hand-arranged rows are kept
 #u8(1 2 3 4
     5 6 7 8)
@@ -231,7 +231,7 @@ When `--align` is enabled (or `align = true` in `sema.toml`), the formatter colu
 
 **Defines** — consecutive one-liner defines (`define`, `def`, `defn`, `defun`, `defmacro`) align their values, and trailing comments share a column past the widest value:
 
-```scheme
+```sema
 (define *rows*    24)
 (define *cols*    80)
 (define *cursor*  0)   ;; caret index
@@ -240,7 +240,7 @@ When `--align` is enabled (or `align = true` in `sema.toml`), the formatter colu
 
 **Map literals** — the values of a multi-line map align to the widest key:
 
-```scheme
+```sema
 (define default-keymap
   {:mcp        "ctrl-o"
    :resume     "ctrl-r"
@@ -250,7 +250,7 @@ When `--align` is enabled (or `align = true` in `sema.toml`), the formatter colu
 
 **Let bindings and cond/case clauses:**
 
-```scheme
+```sema
 (let ((x       1)
       (longer  2))
   (+ x longer))

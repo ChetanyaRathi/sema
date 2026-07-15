@@ -10,7 +10,7 @@ Sema's grammar fuzzer (`fuzz/grammar-fuzz.sema`) leans on **homoiconicity** — 
 
 ### 1. Round-trip oracle (printer ⇄ reader)
 
-```scheme
+```sema
 (= form (read (str form)))
 ```
 
@@ -20,7 +20,7 @@ Generate arbitrary valid s-expression *data* (atoms of every kind, nested lists,
 
 For a generated *program*, compute its **expected** value bottom-up *while generating it* — applying the real primitive ops to the already-known sub-values — then `eval` the whole nested form through the full `macro-expand → lower → optimize → compile → bytecode-VM` pipeline and compare:
 
-```scheme
+```sema
 (= expected (eval form))
 ```
 
@@ -32,7 +32,7 @@ The value oracle has one blind spot, and it's a sharp one: it computes `expected
 
 To cover the rest, the fuzzer also generates **metamorphic laws** — theorems whose expected value is the literal `#t`, cross-checking an op against an *independent* computation:
 
-```scheme
+```sema
 (= (reverse L) (foldl (fn (a x) (cons x a)) (list) L))   ; reverse vs fold-cons
 (= (append (take n L) (drop n L)) L)                      ; take/drop partition
 (= (length L) (+ (length (filter even? L))                ; filter partition
@@ -78,7 +78,7 @@ Exit status: `0` all clear, `1` a deterministic value/round-trip mismatch (the p
 
 **1 — A crash (`try` in a `let` binding).** Expanding the grammar to cover `try`/`catch` immediately produced a crash. Minimized:
 
-```scheme
+```sema
 (let ((a 1) (b (try (throw 1) (catch e 2)))) b)   ; aborted instead of returning 2
 ```
 
@@ -86,7 +86,7 @@ A throwing `try`/`catch` used as a **non-first binding in a parallel `let`** cor
 
 **2 — Silent integer corruption (caught by a metamorphic law).** The distributivity law `(= (* a (+ b c)) (+ (* a b) (* a c)))` failed for some large operands. Minimized:
 
-```scheme
+```sema
 (let ((a 9000000000000)) (+ a a))   ; => -17184372088832, should be 18000000000000
 ```
 

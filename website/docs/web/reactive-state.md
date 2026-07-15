@@ -12,7 +12,7 @@ Sema Web's reactivity is built on `@preact/signals-core`. State is held in **sig
 
 Creates a new signal with the given initial value. Returns a signal reference (an opaque numeric ID).
 
-```scheme
+```sema
 (def count (state 0))
 (def name (state "Sema"))
 (def items (state '(1 2 3)))
@@ -25,7 +25,7 @@ Signals can hold any Sema value: numbers, strings, lists, maps, booleans, `nil`.
 
 The `@` reader macro dereferences a signal, returning its current value. Inside a component render function or `computed` expression, reading with `@` automatically subscribes to changes.
 
-```scheme
+```sema
 (def count (state 0))
 
 @count          ;; => 0
@@ -34,7 +34,7 @@ The `@` reader macro dereferences a signal, returning its current value. Inside 
 
 `@x` expands to `(deref x)` at read time. You can use `deref` directly if you prefer:
 
-```scheme
+```sema
 (deref count)   ;; same as @count
 ```
 
@@ -42,7 +42,7 @@ The `@` reader macro dereferences a signal, returning its current value. Inside 
 
 Replaces the signal's value. Triggers re-renders for any subscribed components or computed values.
 
-```scheme
+```sema
 (def count (state 0))
 (put! count 42)
 @count  ;; => 42
@@ -55,7 +55,7 @@ Replaces the signal's value. Triggers re-renders for any subscribed components o
 
 Reads the current value, applies the function with the current value as the first argument (plus any additional args), and writes the result back.
 
-```scheme
+```sema
 (def count (state 0))
 (update! count (fn (n) (+ n 1)))   ;; count is now 1
 (update! count (fn (n) (+ n 10)))  ;; count is now 11
@@ -72,7 +72,7 @@ Reads the current value, applies the function with the current value as the firs
 
 Creates a read-only signal whose value is computed from an expression. Dependencies are tracked automatically -- when any signal read inside the expression changes, the computed value updates.
 
-```scheme
+```sema
 (def count (state 0))
 (def doubled (computed (* @count 2)))
 (def message (computed (string-append "Count is " (number->string @count))))
@@ -93,7 +93,7 @@ Creates a read-only signal whose value is computed from an expression. Dependenc
 
 Groups multiple state mutations into a single update pass. Without `batch`, each `put!` triggers an immediate re-render. With `batch`, re-renders are deferred until the batch completes.
 
-```scheme
+```sema
 (def first-name (state ""))
 (def last-name (state ""))
 
@@ -115,7 +115,7 @@ Observes a signal and calls a function whenever the value changes. The function 
 
 `watch` returns a numeric watch handle. Call `unwatch!` with that handle to stop observing.
 
-```scheme
+```sema
 (def count (state 0))
 
 (define (log-change old new)
@@ -144,14 +144,14 @@ Do not use `watch` to update other signals that drive rendering -- use `computed
 
 Disposes a watch created by `watch`.
 
-```scheme
+```sema
 (def watch-id (watch count log-change))
 (unwatch! watch-id)
 ```
 
 ## Complete Example: Todo List
 
-```scheme
+```sema
 ;; --- State ---
 (def todos (state '()))
 (def next-id (state 1))
@@ -199,7 +199,7 @@ Disposes a watch created by `watch`.
 
 When a component renders or a `computed` expression evaluates, Sema Web runs the code inside a signals-core `effect()` or `computed()` context. Every `@` (deref) call inside that context registers a dependency on the underlying signal.
 
-```scheme
+```sema
 (def a (state 1))
 (def b (state 2))
 
@@ -213,7 +213,7 @@ When a component renders or a `computed` expression evaluates, Sema Web runs the
 
 Dependencies are tracked dynamically, not statically. If a branch is not taken, those signals are not subscribed:
 
-```scheme
+```sema
 (def show-detail (state false))
 (def detail (state "..."))
 
@@ -248,7 +248,7 @@ Key differences from React:
 
 ### Derived Filtered List
 
-```scheme
+```sema
 (def items (state '(1 2 3 4 5 6 7 8 9 10)))
 (def min-val (state 5))
 
@@ -261,7 +261,7 @@ Key differences from React:
 
 ### Form State
 
-```scheme
+```sema
 (def form-data (state {:name "" :email ""}))
 
 (define (set-field field value)
@@ -276,7 +276,7 @@ Key differences from React:
 
 ### Undo/Redo
 
-```scheme
+```sema
 (def history (state '()))
 (def future (state '()))
 (def current (state nil))
