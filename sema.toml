@@ -1,0 +1,4 @@
+# Project-wide formatter settings — picked up automatically by `sema fmt`
+# (the formatter walks up from the current directory to the nearest sema.toml).
+[fmt]
+align = true

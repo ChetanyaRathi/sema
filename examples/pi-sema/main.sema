@@ -90,13 +90,13 @@
     (show-welcome cwd model)
 
     (define current-state
-      {:session session
-       :messages '()
-       :model model
-       :cwd cwd
-       :agent agent
-       :mode :normal
-       :plan ""})
+      {:session   session
+       :messages  '()
+       :model     model
+       :cwd       cwd
+       :agent     agent
+       :mode      :normal
+       :plan      ""})
 
     (define eof-count 0)
 
@@ -104,7 +104,8 @@
       (cond
         ;; EOF (nil or repeated empty on closed stdin)
         ((or (nil? input)
-           (and (= input "") (> eof-count 0))) (io/println-error "")
+           (and (= input "") (> eof-count 0)))
+          (io/println-error "")
           (show-info "Goodbye!")
           (exit 0))
 

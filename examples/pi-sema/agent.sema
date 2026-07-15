@@ -171,10 +171,10 @@ Execute the next unfinished steps now."
          (skills-xml  (format-skills-xml skills))
          (prompt      (build-system-prompt cwd platform context skills-xml)))
     (defagent pi-sema-agent
-      {:system prompt
-       :tools (all-tools)
-       :max-turns 50
-       :model model})))
+      {:system     prompt
+       :tools      (all-tools)
+       :max-turns  50
+       :model      model})))
 
 (define (create-planning-agent cwd model goal)
   (set-workspace-root! cwd)
@@ -184,10 +184,10 @@ Execute the next unfinished steps now."
          (skills-xml (format-skills-xml skills))
          (prompt (build-planning-prompt cwd platform context skills-xml goal)))
     (defagent pi-sema-planner
-      {:system prompt
-       :tools (read-only-tools)
-       :max-turns 30
-       :model model})))
+      {:system     prompt
+       :tools      (read-only-tools)
+       :max-turns  30
+       :model      model})))
 
 ;; ============================================================
 ;; Section 3: Run Turn

@@ -103,10 +103,10 @@
           (loop (+ i 1))
           ;; Found a failure — try to shrink
           (let ((shrunk (if shrinker (find-minimal prop val shrinker) val)))
-            {:status :fail
-             :counterexample val
-             :shrunk shrunk
-             :after-tests (+ i 1)}))))))
+            {:status          :fail
+             :counterexample  val
+             :shrunk          shrunk
+             :after-tests     (+ i 1)}))))))
 
 ;; Multi-argument property checking
 (define (check-property-2 prop gen-a gen-b shrinker-a shrinker-b)
@@ -116,9 +116,9 @@
       (let ((a (gen-a)) (b (gen-b)))
         (if (prop a b)
           (loop (+ i 1))
-          {:status :fail
-           :counterexample (list a b)
-           :after-tests (+ i 1)})))))
+          {:status          :fail
+           :counterexample  (list a b)
+           :after-tests     (+ i 1)})))))
 
 ;; Nice formatting for test results
 (define (report name result)

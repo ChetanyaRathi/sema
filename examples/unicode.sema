@@ -41,8 +41,8 @@
 (println (format "  NFD of é:   length=~a (decomposed)" (string/length nfd)))
 
 ;; NFKC: compatibility decomposition + composition
-(define ligature "\uFB01") ;; ﬁ ligature
-(define compat (string/normalize ligature :nfkc))
+(define ligature  "\uFB01")                           ;; ﬁ ligature
+(define compat    (string/normalize ligature :nfkc))
 (println (format "  NFKC of ﬁ:  ~a (ligature → letters)" compat))
 
 ;; --- Case folding and case-insensitive comparison ---

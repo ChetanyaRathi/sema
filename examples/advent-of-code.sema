@@ -84,7 +84,9 @@
   (fn (s)
     (println
       (format "  ~a → ~a"
-        (if (> (string/length s) 40) (string/append (string/slice s 0 37) "...") s)
+        (if (> (string/length s) 40)
+          (string/append (string/slice s 0 37) "...")
+          s)
         (if (pangram? s) "✓ pangram" "✗ not a pangram"))))
   test-strings)
 
@@ -94,16 +96,16 @@
 (println "\n=== Puzzle 4: Number Word Sum ===\n")
 
 (define number-words
-  {:one 1
-   :two 2
-   :three 3
-   :four 4
-   :five 5
-   :six 6
-   :seven 7
-   :eight 8
-   :nine 9
-   :ten 10})
+  {:one    1
+   :two    2
+   :three  3
+   :four   4
+   :five   5
+   :six    6
+   :seven  7
+   :eight  8
+   :nine   9
+   :ten    10})
 
 (define words-input
   (list "three"

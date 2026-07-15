@@ -101,9 +101,9 @@
                          (extract-skill-description content)
                          "")))
                 (cons
-                  {:name name
-                   :description description
-                   :path skill-path}
+                  {:name         name
+                   :description  description
+                   :path         skill-path}
                   acc))
               acc))
           '()

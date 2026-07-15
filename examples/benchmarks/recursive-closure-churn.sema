@@ -16,14 +16,16 @@
   (loop 3))
 
 (define (run n acc)
-  (if (<= n 0) acc
-      (run (- n 1) (+ acc (churn)))))
+  (if (<= n 0)
+    acc
+    (run (- n 1) (+ acc (churn)))))
 
 (define iterations 300000)
 
-(define t0 (sys/elapsed))
-(define result (run iterations 0))
-(define elapsed-ms (/ (- (sys/elapsed) t0) 1000000.0))
+(define t0          (sys/elapsed))
+(define result      (run iterations 0))
+(define elapsed-ms  (/ (- (sys/elapsed) t0) 1000000.0))
 
 (println f"Result: ${result}")
-(println f"${iterations} recursive-local-closure create+drop in ${elapsed-ms} ms")
+(println
+  f"${iterations} recursive-local-closure create+drop in ${elapsed-ms} ms")

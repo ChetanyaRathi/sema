@@ -207,10 +207,10 @@
 ;; Trees as (value left right), leaves as (value () ())
 (define (make-leaf v) (list v '() '()))
 (define (make-node v left right) (list v left right))
-(define (tree-value t)  (car t))
-(define (tree-left t)   (cadr t))
-(define (tree-right t)  (caddr t))
-(define (tree-leaf? t)  (and (null? (tree-left t)) (null? (tree-right t))))
+(define (tree-value t) (car t))
+(define (tree-left t) (cadr t))
+(define (tree-right t) (caddr t))
+(define (tree-leaf? t) (and (null? (tree-left t)) (null? (tree-right t))))
 
 ;; Insert into BST
 (define (bst-insert tree val)

@@ -79,8 +79,8 @@
                     (let ((numstr (string/slice src pos p)))
                       (loop p
                         (cons
-                          {:type :number
-                           :value (string/to-number numstr)}
+                          {:type   :number
+                           :value  (string/to-number numstr)}
                           tokens)))))))
 
             ;; Booleans: #t #f
@@ -92,7 +92,8 @@
                       (loop (+ pos 2) (cons {:type :bool :value #t} tokens)))
                     ((char=? next #\f)
                       (loop (+ pos 2) (cons {:type :bool :value #f} tokens)))
-                    (else (error (format "unexpected #~a" (char/to-string next))))))
+                    (else
+                      (error (format "unexpected #~a" (char/to-string next))))))
                 (error "unexpected # at end of input")))
 
             ;; Symbols — anything else that's not a delimiter
@@ -257,8 +258,8 @@
       ((and (map? (car items))
          (equal? (get (car items) :ast) :symbol)
          (equal? (get (car items) :name) "."))
-        {:params (reverse params)
-         :rest (get (car (cdr items)) :name)})
+        {:params  (reverse params)
+         :rest    (get (car (cdr items)) :name)})
       (else
         (loop (cdr items)
           (cons (get (car items) :name) params))))))
@@ -324,11 +325,11 @@
                                :items (cons {:ast :symbol :name "begin"}
                                  (cdr args))})))
                       (let ((closure
-                              {:type :closure
-                               :params (get parsed :params)
-                               :rest-param (get parsed :rest)
-                               :body body
-                               :env env}))
+                              {:type        :closure
+                               :params      (get parsed :params)
+                               :rest-param  (get parsed :rest)
+                               :body        body
+                               :env         env}))
                         (env :define fname closure)
                         closure))
                     ;; Simple: (define name expr)
@@ -357,11 +358,11 @@
                             {:ast :list
                              :items (cons {:ast :symbol :name "begin"}
                                body-exprs)})))
-                    {:type :closure
-                     :params (get parsed :params)
-                     :rest-param (get parsed :rest)
-                     :body body
-                     :env env})))
+                    {:type        :closure
+                     :params      (get parsed :params)
+                     :rest-param  (get parsed :rest)
+                     :body        body
+                     :env         env})))
 
               ;; (begin <expr>...)
               ((sym-named? head "begin")
@@ -404,11 +405,11 @@
                               ;; Define the loop function
                               (let-env :define
                                 loop-name
-                                {:type :closure
-                                 :params params
-                                 :rest-param nil
-                                 :body body
-                                 :env let-env})
+                                {:type        :closure
+                                 :params      params
+                                 :rest-param  nil
+                                 :body        body
+                                 :env         let-env})
                               ;; Call it with initial values
                               (meta-apply (let-env :lookup loop-name) init-vals))
                             (let ((pair (get (car bs) :items)))

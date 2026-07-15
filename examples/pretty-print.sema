@@ -182,10 +182,10 @@
 ;; Map
 (println "\n--- Map ---")
 (pretty-print
-  {:name "Alice"
-   :age 30
-   :hobbies (list "reading" "hiking" "coding")
-   :address {:street "123 Main St" :city "Wonderland" :zip "00000"}})
+  {:name     "Alice"
+   :age      30
+   :hobbies  (list "reading" "hiking" "coding")
+   :address  {:street "123 Main St" :city "Wonderland" :zip "00000"}})
 
 ;; Vector of records
 (println "\n--- Complex data ---")

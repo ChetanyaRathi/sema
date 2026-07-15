@@ -17,12 +17,13 @@
 (println "\n--- 2. Chat ---")
 (println
   (llm/chat
-    (list (message
-            :system
-            "You are a helpful assistant. Be very concise.")
-          (message
-            :user
-            "What is Lisp? One sentence."))
+    (list
+      (message
+        :system
+        "You are a helpful assistant. Be very concise.")
+      (message
+        :user
+        "What is Lisp? One sentence."))
     {:max-tokens 100}))
 
 ;; --- 3. Prompts as Data ---
@@ -38,9 +39,9 @@
 (println "\n--- 4. Extraction ---")
 (define data
   (llm/extract
-    {:vendor {:type :string}
-     :amount {:type :number}
-     :date {:type :string}}
+    {:vendor  {:type :string}
+     :amount  {:type :number}
+     :date    {:type :string}}
     "I bought coffee for $4.50 at Blue Bottle on Jan 15, 2025"))
 (println data)
 
@@ -72,8 +73,8 @@
 
 (println
   (llm/chat (list (message :user "What is the capital of Norway?"))
-    {:tools (list lookup-capital)
-     :max-tokens 100}))
+    {:tools       (list lookup-capital)
+     :max-tokens  100}))
 
 ;; --- 8. Agent ---
 (println "\n--- 8. Agent ---")
@@ -84,9 +85,9 @@
     (json/encode {:city city :temp 18 :condition "partly cloudy"})))
 
 (defagent weather-bot
-  {:system "You are a weather assistant. Be concise. Use tools."
-   :tools (list get-weather)
-   :max-turns 3})
+  {:system     "You are a weather assistant. Be concise. Use tools."
+   :tools      (list get-weather)
+   :max-turns  3})
 
 (println (agent/run weather-bot "Weather in Tokyo?"))
 

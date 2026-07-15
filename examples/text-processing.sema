@@ -79,7 +79,8 @@
         (if (char/alphabetic? ch)
           (let ((base (if (char/upper-case? ch) 65 97))
                 (code (char/to-integer ch)))
-            (integer/to-char (+ base (math/remainder (- (+ code shift) base) 26))))
+            (integer/to-char
+              (+ base (math/remainder (- (+ code shift) base) 26))))
           ch))
       (string/chars text))))
 

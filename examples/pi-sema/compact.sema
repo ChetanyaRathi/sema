@@ -51,8 +51,8 @@
                {:system "Summarize the following conversation concisely. Focus on:\n- What files were read, edited, or created\n- What commands were run and their results\n- Key decisions and context the user provided\n- Current state of the task\nKeep it factual and brief. This summary will replace the old messages in the conversation context."
                 :model model})))
       (cons
-        {:role "user"
-         :content (string/append "[Conversation summary]: " summary)}
+        {:role     "user"
+         :content  (string/append "[Conversation summary]: " summary)}
         recent-messages))))
 
 ;; ============================================================
@@ -63,8 +63,8 @@
   (if (needs-compaction? messages max-tokens)
     (let ((compacted (compact-messages messages model)))
       (session/append session
-        {:type "compaction"
-         :summary (get (car compacted) :content)
-         :timestamp (timestamp)})
+        {:type       "compaction"
+         :summary    (get (car compacted) :content)
+         :timestamp  (timestamp)})
       compacted)
     messages))

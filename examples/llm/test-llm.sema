@@ -13,12 +13,13 @@
 (println "\n=== Test 2: llm/chat ===")
 (define reply
   (llm/chat
-    (list (message
-            :system
-            "Reply with exactly the word YES")
-          (message
-            :user
-            "Do you understand?"))
+    (list
+      (message
+        :system
+        "Reply with exactly the word YES")
+      (message
+        :user
+        "Do you understand?"))
     {:max-tokens 10}))
 (println reply)
 
@@ -35,8 +36,8 @@
 (println "\n=== Test 4: llm/extract ===")
 (define data
   (llm/extract
-    {:city {:type :string}
-     :temperature {:type :number}}
+    {:city         {:type :string}
+     :temperature  {:type :number}}
     "It's currently 72 degrees in San Francisco"))
 (println data)
 (println (format "City: ~a, Temp: ~a" (get data :city) (get data :temperature)))
@@ -77,14 +78,15 @@
 
 (define tool-result
   (llm/chat
-    (list (message
-            :system
-            "You are a helpful assistant. Use the calculator tool to answer math questions. After getting the result, tell the user.")
-          (message
-            :user
-            "What is 137 * 42?"))
-    {:tools (list calculator)
-     :max-tokens 200}))
+    (list
+      (message
+        :system
+        "You are a helpful assistant. Use the calculator tool to answer math questions. After getting the result, tell the user.")
+      (message
+        :user
+        "What is 137 * 42?"))
+    {:tools       (list calculator)
+     :max-tokens  200}))
 (println tool-result)
 
 ;; 8. Session usage

@@ -147,9 +147,9 @@
 
 ;; (3 + 4) * (10 - 2) = 56
 (define expr
-  {:op :mul
-   :left {:op :add :left 3 :right 4}
-   :right {:op :sub :left 10 :right 2}})
+  {:op     :mul
+   :left   {:op :add :left 3 :right 4}
+   :right  {:op :sub :left 10 :right 2}})
 
 (println (format "  (3 + 4) * (10 - 2) = ~a" (invoke eval-expr expr)))
 

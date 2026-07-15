@@ -242,7 +242,8 @@
           (format "  Plan:           ~a" (truncate-str (get state :plan "") 50)))))
     (io/println-error
       (term/dim (format "  Session ID:     ~a" (get session :id ""))))
-    (io/println-error (term/dim (format "  Messages:       ~a" (length messages))))
+    (io/println-error
+      (term/dim (format "  Messages:       ~a" (length messages))))
     (io/println-error (term/dim (format "  Est. tokens:    ~a" est-tokens)))
     (io/println-error
       (term/dim (format "  Working dir:    ~a" (get state :cwd ""))))
@@ -285,10 +286,10 @@
           ;; Save plan to session
           (try
             (session/append (get state :session)
-              {:type "plan"
-               :goal args
-               :content plan-text
-               :timestamp (timestamp)})
+              {:type       "plan"
+               :goal       args
+               :content    plan-text
+               :timestamp  (timestamp)})
             (catch e #f))
           (assoc (assoc state :mode :plan) :plan plan-text))
         (catch e
@@ -390,14 +391,14 @@
 ;; Provider configs — model names for each provider
 (define consensus-providers
   (list
-    {:provider :anthropic
-     :model "claude-sonnet-4-20250514"
-     :label "Claude Sonnet"}
+    {:provider  :anthropic
+     :model     "claude-sonnet-4-20250514"
+     :label     "Claude Sonnet"}
     {:provider :openai :model "gpt-4.1" :label "GPT-4.1"}
     {:provider :gemini :model "gemini-2.5-flash" :label "Gemini 2.5 Flash"}
-    {:provider :groq
-     :model "llama-3.3-70b-versatile"
-     :label "Llama 3.3 70B (Groq)"}
+    {:provider  :groq
+     :model     "llama-3.3-70b-versatile"
+     :label     "Llama 3.3 70B (Groq)"}
     {:provider :xai :model "grok-3-mini-fast" :label "Grok 3 Mini"}
     {:provider :mistral :model "mistral-small-latest" :label "Mistral Small"}))
 

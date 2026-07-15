@@ -120,13 +120,13 @@
   (string/from-codepoints cps))
 
 ;; People codepoints
-(define man (cp->str 128104)) ;; 👨
-(define woman (cp->str 128105)) ;; 👩
-(define boy (cp->str 128102)) ;; 👦
-(define girl (cp->str 128103)) ;; 👧
-(define baby (cp->str 128118)) ;; 👶
-(define heart (cp->str 10084)) ;; ❤
-(define kiss-mark (cp->str 128139)) ;; 💋
+(define man        (cp->str 128104))  ;; 👨
+(define woman      (cp->str 128105))  ;; 👩
+(define boy        (cp->str 128102))  ;; 👦
+(define girl       (cp->str 128103))  ;; 👧
+(define baby       (cp->str 128118))  ;; 👶
+(define heart      (cp->str 10084))   ;; ❤
+(define kiss-mark  (cp->str 128139))  ;; 💋
 
 ;; Build families by combining people
 (println "\n  👪 Families (person + ZWJ + person + ...)")

@@ -35,6 +35,6 @@
   ;; Final discriminated-union envelope. `workflow/run` (which `defworkflow`
   ;; expands to) returns this {:status …} map verbatim and emits run.ended; the
   ;; `defworkflow` form IS the run, so no separate invocation is needed.
-  {:status :success
-   :files (checkpoint :files)
-   :findings (checkpoint :findings)})
+  {:status    :success
+   :files     (checkpoint :files)
+   :findings  (checkpoint :findings)})

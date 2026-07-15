@@ -55,8 +55,8 @@
 
 (deftool write-file
   "Create or overwrite a file with the given content."
-  {:path {:type :string :description "Path to the file to write"}
-   :content {:type :string :description "Content to write"}}
+  {:path     {:type :string :description "Path to the file to write"}
+   :content  {:type :string :description "Content to write"}}
   (lambda (path content)
     (file/write path content)
     (format "Wrote ~a bytes to ~a" (string/length content) path)))
@@ -65,9 +65,9 @@
   "Edit a file by replacing an exact string match. You must read the file first.
 The old_string must match exactly (including whitespace and indentation).
 For creating new files, use write-file instead."
-  {:path {:type :string :description "Path to the file to edit"}
-   :old_string {:type :string :description "Exact string to find and replace"}
-   :new_string {:type :string :description "Replacement string"}}
+  {:path        {:type :string :description "Path to the file to edit"}
+   :old_string  {:type :string :description "Exact string to find and replace"}
+   :new_string  {:type :string :description "Replacement string"}}
   (lambda (path old_string new_string)
     (if (file/exists? path)
       (let ((content (file/read path)))
@@ -86,8 +86,8 @@ For creating new files, use write-file instead."
 (deftool search
   "Search for a pattern in files using grep. Returns matching lines with file paths and line numbers."
   {:pattern {:type :string :description "Search pattern (text to find)"}
-   :path {:type :string
-    :description "Directory or file to search in (default: current directory)"}}
+   :path {:type         :string
+    :description  "Directory or file to search in (default: current directory)"}}
   (lambda (pattern path)
     (define search-path (if (= path "") "." path))
     (define result
@@ -98,8 +98,8 @@ For creating new files, use write-file instead."
 
 (deftool list-files
   "List files and directories at the given path."
-  {:path {:type :string
-    :description "Directory path to list (default: current directory)"}}
+  {:path {:type         :string
+    :description  "Directory path to list (default: current directory)"}}
   (lambda (path)
     (define target (if (= path "") "." path))
     (if (file/exists? target)
@@ -186,8 +186,8 @@ Workflow: search → read → edit → verify"
         ;; Stop spinner with success
         (when active-spinner
           (term/spinner-stop active-spinner
-            {:symbol (term/green "✔")
-             :text (term/dim (format "~a (~ams)" tool (:duration-ms event)))})
+            {:symbol  (term/green "✔")
+             :text    (term/dim (format "~a (~ams)" tool (:duration-ms event)))})
           (set! active-spinner #f))
         (io/println-error "")))))
 

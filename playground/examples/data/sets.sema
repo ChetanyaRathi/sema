@@ -1,13 +1,13 @@
 ;;; Set data structure built on maps
 
-(define (set . elems) (foldl (fn (s e) (assoc s e #t)) {} elems))
-(define (list->set lst) (foldl (fn (s e) (assoc s e #t)) {} lst))
-(define (set->list s) (keys s))
-(define empty-set {})
-(define (set/size s) (length (keys s)))
-(define (set/member? s elem) (not (nil? (get s elem))))
-(define (set/add s elem) (assoc s elem #t))
-(define (set/remove s elem) (dissoc s elem))
+(define (set . elems)         (foldl (fn (s e) (assoc s e #t)) {} elems))
+(define (list->set lst)       (foldl (fn (s e) (assoc s e #t)) {} lst))
+(define (set->list s)         (keys s))
+(define empty-set             {})
+(define (set/size s)          (length (keys s)))
+(define (set/member? s elem)  (not (nil? (get s elem))))
+(define (set/add s elem)      (assoc s elem #t))
+(define (set/remove s elem)   (dissoc s elem))
 
 (define (set/union s1 s2)
   (foldl (fn (s e) (assoc s e #t)) s1 (keys s2)))
@@ -19,15 +19,18 @@
   (foldl (fn (acc e) (and acc (set/member? s2 e))) #t (keys s1)))
 (define (set/filter pred s)
   (foldl (fn (acc e) (if (pred e) (assoc acc e #t) acc)) {} (keys s)))
-(define (set/map f s) (list->set (map f (keys s))))
-(define (set/fold f init s) (foldl f init (keys s)))
-(define (set/display s) (str "#{" (string/join (map str (set->list s)) " ") "}"))
+(define (set/map f s)        (list->set (map f (keys s))))
+(define (set/fold f init s)  (foldl f init (keys s)))
+(define (set/display s)
+  (str "#{" (string/join (map str (set->list s)) " ") "}"))
 
 (define (set/power-set s)
   (let ((elems (set->list s)))
-    (foldl (fn (subsets elem)
-             (append subsets (map (fn (sub) (set/add sub elem)) subsets)))
-           (list empty-set) elems)))
+    (foldl
+      (fn (subsets elem)
+        (append subsets (map (fn (sub) (set/add sub elem)) subsets)))
+      (list empty-set)
+      elems)))
 
 (println "=== Sets ===\n")
 
@@ -46,5 +49,6 @@
 (println (format "sum:     ~a" (set/fold + 0 s1)))
 
 (println (format "\nPower set of ~a:" (set/display (set 1 2 3))))
-(for-each (fn (sub) (println (format "  ~a" (set/display sub))))
+(for-each
+  (fn (sub) (println (format "  ~a" (set/display sub))))
   (set/power-set (set 1 2 3)))

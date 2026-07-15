@@ -54,8 +54,8 @@
      :invoiceDate {:type :string :description "Invoice date in YYYY-MM-DD format"}
      :totalAmount {:type :string :description "Total amount with currency"}
      :summary {:type :string :description "Brief one-line summary"}
-     :proposedFileName {:type :string
-      :description "Suggested filename: YYYY.MM.DD - VendorName.pdf"}}
+     :proposedFileName {:type         :string
+      :description  "Suggested filename: YYYY.MM.DD - VendorName.pdf"}}
     text
     {:model "claude-haiku-4-5-20251001"}))
 
