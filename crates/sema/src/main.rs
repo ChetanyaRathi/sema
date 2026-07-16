@@ -24,7 +24,11 @@ struct FmtConfig {
     indent: usize,
     #[serde(default)]
     align: bool,
-    #[serde(default = "default_max_blank_lines", alias = "max_blank_lines", rename = "max-blank-lines")]
+    #[serde(
+        default = "default_max_blank_lines",
+        alias = "max_blank_lines",
+        rename = "max-blank-lines"
+    )]
     max_blank_lines: usize,
     /// Glob patterns (or literal path prefixes) excluded from formatting.
     /// Explicitly named files bypass this list.

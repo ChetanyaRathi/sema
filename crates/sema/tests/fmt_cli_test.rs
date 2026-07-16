@@ -54,7 +54,11 @@ fn fmt_ignore_list_skips_globs_and_prefixes() {
     assert_eq!(read(&dir, "main.sema"), PRETTY, "normal file formats");
     assert_eq!(read(&dir, "vendor/lib.sema"), UGLY, "prefix entry ignored");
     assert_eq!(read(&dir, "gen/deep/out.sema"), UGLY, "glob entry ignored");
-    assert_eq!(read(&dir, "api.generated.sema"), UGLY, "wildcard entry ignored");
+    assert_eq!(
+        read(&dir, "api.generated.sema"),
+        UGLY,
+        "wildcard entry ignored"
+    );
 }
 
 #[test]
@@ -82,7 +86,11 @@ fn fmt_ignore_applies_to_user_globs() {
     run_fmt(&dir, &["**/*.sema"]);
 
     assert_eq!(read(&dir, "src/a.sema"), PRETTY);
-    assert_eq!(read(&dir, "vendor/lib.sema"), UGLY, "ignore filters glob expansion");
+    assert_eq!(
+        read(&dir, "vendor/lib.sema"),
+        UGLY,
+        "ignore filters glob expansion"
+    );
 }
 
 #[test]
