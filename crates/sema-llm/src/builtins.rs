@@ -10196,6 +10196,42 @@ mod tests {
     }
 
     #[test]
+    fn test_validate_extraction_bare_keyword_spec_type_checked() {
+        // {:total :number} is shorthand for {:type :number} — a string value
+        // like "$10.00" must FAIL, not pass with key-presence-only checking.
+        let schema = {
+            let mut map = BTreeMap::new();
+            map.insert(Value::keyword("total"), Value::keyword("number"));
+            Value::map(map)
+        };
+        let bad = {
+            let mut map = BTreeMap::new();
+            map.insert(Value::keyword("total"), Value::string("$10.00"));
+            Value::map(map)
+        };
+        let err = validate_extraction(&bad, &schema).unwrap_err();
+        assert!(err.contains("expected number"), "got: {err}");
+
+        let good = {
+            let mut map = BTreeMap::new();
+            map.insert(Value::keyword("total"), Value::float(10.0));
+            Value::map(map)
+        };
+        assert!(validate_extraction(&good, &schema).is_ok());
+    }
+
+    #[test]
+    fn test_format_schema_bare_keyword_spec_renders_type() {
+        let schema = {
+            let mut map = BTreeMap::new();
+            map.insert(Value::keyword("total"), Value::keyword("number"));
+            Value::map(map)
+        };
+        let rendered = format_schema(&schema);
+        assert!(rendered.contains("\"total\": <number>"), "got: {rendered}");
+    }
+
+    #[test]
     fn test_format_reask_prompt() {
         let prev_response = r#"{"name": 42}"#;
         let errors = "key name: expected string, got integer";
