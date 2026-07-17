@@ -1,0 +1,31 @@
+# Build the single cross-platform Sema MCP Bundle (.mcpb) and attach it to the
+# release. Runs after cargo-dist's Release workflow publishes the release, on a
+# macOS host (lipo is macOS-only). See docs/plans/archive/2026-07-17-mcpb-bundle.md.
+name: MCPB Bundle
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to build the bundle from (e.g. v1.30.0)"
+        required: true
+
+permissions:
+  contents: write # upload the .mcpb asset to the release
+
+jobs:
+  bundle:
+    runs-on: macos-latest # lipo is macOS-only
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Build + upload sema.mcpb
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${{ github.event.release.tag_name || inputs.tag }}"
+          ./scripts/pack-mcpb.sh --tag "$TAG" --upload

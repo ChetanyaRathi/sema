@@ -1,0 +1,29 @@
+{
+  "$schema": "https://raw.githubusercontent.com/modelcontextprotocol/mcpb/main/schemas/manifest.schema.json",
+  "manifest_version": "0.2",
+  "name": "sema",
+  "display_name": "Sema",
+  "version": "__VERSION__",
+  "description": "MCP server for Sema — eval, compile, build, format, disasm, and docs tools for a Lisp with first-class LLM primitives.",
+  "author": { "name": "Helge Sverre", "url": "https://sema-lang.com" },
+  "repository": { "type": "git", "url": "https://github.com/sema-lisp/sema" },
+  "homepage": "https://sema-lang.com",
+  "documentation": "https://sema-lang.com/docs/mcp",
+  "license": "MIT",
+  "keywords": ["sema", "lisp", "llm", "eval", "repl", "mcp"],
+  "server": {
+    "type": "binary",
+    "entry_point": "server/bin/sema-linux",
+    "mcp_config": {
+      "command": "${__dirname}/server/bin/sema-linux",
+      "args": ["mcp"],
+      "platform_overrides": {
+        "darwin": { "command": "${__dirname}/server/bin/sema-macos-universal", "args": ["mcp"] },
+        "win32": { "command": "${__dirname}/server/bin/sema-windows-x64.exe", "args": ["mcp"] }
+      }
+    }
+  },
+  "compatibility": {
+    "platforms": ["darwin", "linux", "win32"]
+  }
+}
