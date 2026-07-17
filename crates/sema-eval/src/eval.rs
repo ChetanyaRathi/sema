@@ -181,12 +181,20 @@ impl Interpreter {
         let expanded = expand_for_vm_batch(&self.ctx, globals, exprs)?;
         let known_natives = collect_native_names(globals);
         let span_map = self.ctx.span_table.borrow().clone();
+        // This path passes no `source_file` to the compiler (stamping
+        // `Function::source_file` here would change runtime trace rendering),
+        // so lowering-error trace frames arrive with `file: None` — fill them
+        // from the module currently being evaluated.
         let prog = sema_vm::compile_program_with_spans_and_natives(
             &expanded,
             &span_map,
             None,
             Some(known_natives),
-        )?;
+        )
+        .map_err(|e| match self.ctx.current_file_path() {
+            Some(f) => e.fill_trace_file(&f),
+            None => e,
+        })?;
         let mut vm = sema_vm::VM::new(
             globals.clone(),
             prog.functions,

@@ -493,3 +493,4 @@ tracked as bugs to fix later — the audit checked them and closed them):
   with a `Value`" shape here — offloading only the file read would still leave
   the (usually larger) compile step blocking. Not worth the complexity for a
   one-shot, per-module cost.
+

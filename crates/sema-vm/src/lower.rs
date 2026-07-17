@@ -2,7 +2,9 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use sema_core::{intern, SemaError, Span, SpanMap, Spur, Value, ValueView};
+use sema_core::{
+    intern, resolve, CallFrame, SemaError, Span, SpanMap, Spur, StackTrace, Value, ValueView,
+};
 
 use crate::core_expr::{CoreExpr, DoLoop, DoVar, LambdaDef, PromptEntry};
 
@@ -46,6 +48,28 @@ fn lookup_span(val: &Value) -> Option<Span> {
     } else {
         None
     }
+}
+
+/// Attach a source location to a lowering error so the reporter can point at
+/// the offending form.
+///
+/// Lowering errors (arity, malformed special-form shape, …) are produced before
+/// the VM runs, so they carry no location on their own — and `SemaError`'s only
+/// location channel the CLI reads is a stack-trace frame's span. We synthesize a
+/// single frame, named after the form's head, carrying the whole form's span.
+/// `with_stack_trace` is a no-op once a trace exists, so when errors bubble
+/// through nested `lower_expr` calls the innermost (most specific) form wins.
+fn attach_form_span(e: SemaError, span: Option<Span>, head: &Value) -> SemaError {
+    let Some(s) = span else { return e };
+    let name = head
+        .as_symbol_spur()
+        .map(resolve)
+        .unwrap_or_else(|| "<expr>".to_string());
+    e.with_stack_trace(StackTrace(vec![CallFrame {
+        name,
+        file: None,
+        span: Some(s),
+    }]))
 }
 
 /// Lower a sequence of expressions, marking the last as tail position.
@@ -111,7 +135,10 @@ fn lower_expr_inner(expr: &Value, tail: bool) -> Result<CoreExpr, SemaError> {
                 return Ok(CoreExpr::Const(Value::nil()));
             }
             let span = lookup_span(expr);
-            let inner = lower_list(&items, tail)?;
+            let inner = match lower_list(&items, tail) {
+                Ok(inner) => inner,
+                Err(e) => return Err(attach_form_span(e, span, &items[0])),
+            };
             match span {
                 Some(s) => Ok(CoreExpr::Spanned(s, Box::new(inner))),
                 None => Ok(inner),
@@ -2730,6 +2757,35 @@ mod tests {
                 "SPAN_MAP should be None after lower() errors"
             );
         });
+    }
+
+    #[test]
+    fn test_lowering_error_carries_form_span() {
+        // A malformed `define` (3 args) errors during lowering. With a span_map,
+        // the error must carry a stack-trace frame pointing at the form so the
+        // CLI can report a line/col instead of a bare message.
+        let input = "(define x 1 2)";
+        let (vals, span_map) = sema_reader::read_many_with_spans(input).unwrap();
+        let err = lower(&vals[0], Some(&span_map)).expect_err("define with 3 args should fail");
+
+        // Message is unchanged (WithTrace displays its inner error).
+        assert!(err.to_string().contains("define expects 2 args, got 3"));
+
+        let trace = err.stack_trace().expect("error should carry a stack trace");
+        let frame = trace.0.first().expect("trace should have a frame");
+        assert_eq!(frame.name, "define");
+        let span = frame.span.expect("frame should carry the form span");
+        assert_eq!((span.line, span.col), (1, 1));
+    }
+
+    #[test]
+    fn test_lowering_error_without_span_map_has_no_trace() {
+        // Without a span_map there is no location to attach; the error stays bare.
+        let input = "(define x 1 2)";
+        let (vals, _span_map) = sema_reader::read_many_with_spans(input).unwrap();
+        let err = lower(&vals[0], None).expect_err("define with 3 args should fail");
+        assert!(err.stack_trace().is_none());
+        assert!(err.to_string().contains("define expects 2 args, got 3"));
     }
 
     #[test]

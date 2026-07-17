@@ -474,6 +474,31 @@ impl SemaError {
         }
     }
 
+    /// Fill in `file` on any trace frame that lacks one (no-op without a trace).
+    ///
+    /// Lowering errors synthesize frames with `file: None` because the lowering
+    /// pass doesn't know the source path; the compile entry points (which do)
+    /// stamp it here so traces render the real filename instead of `<input>`.
+    /// Frames that already carry a file are left untouched.
+    pub fn fill_trace_file(self, file: &std::path::Path) -> Self {
+        match self {
+            SemaError::WithTrace { inner, mut trace } => {
+                for frame in &mut trace.0 {
+                    if frame.file.is_none() {
+                        frame.file = Some(file.to_path_buf());
+                    }
+                }
+                SemaError::WithTrace { inner, trace }
+            }
+            SemaError::WithContext { inner, hint, note } => SemaError::WithContext {
+                inner: Box::new(inner.fill_trace_file(file)),
+                hint,
+                note,
+            },
+            other => other,
+        }
+    }
+
     pub fn stack_trace(&self) -> Option<&StackTrace> {
         match self {
             SemaError::WithTrace { trace, .. } => Some(trace),
@@ -673,6 +698,44 @@ mod tests {
         let st = e2.stack_trace().unwrap();
         assert_eq!(st.0.len(), 1);
         assert_eq!(st.0[0].name, "first");
+    }
+
+    // fill_trace_file fills only `file: None` frames, recurses through
+    // WithContext, and is a no-op without a trace.
+    #[test]
+    fn fill_trace_file_fills_missing_files() {
+        let e = SemaError::eval("err")
+            .with_stack_trace(StackTrace(vec![
+                CallFrame {
+                    name: "bare".into(),
+                    file: None,
+                    span: None,
+                },
+                CallFrame {
+                    name: "stamped".into(),
+                    file: Some("already.sema".into()),
+                    span: None,
+                },
+            ]))
+            .with_hint("h");
+        let e = e.fill_trace_file(std::path::Path::new("main.sema"));
+        assert_eq!(e.hint(), Some("h"));
+        let st = e.stack_trace().unwrap();
+        assert_eq!(
+            st.0[0].file.as_deref(),
+            Some(std::path::Path::new("main.sema"))
+        );
+        assert_eq!(
+            st.0[1].file.as_deref(),
+            Some(std::path::Path::new("already.sema"))
+        );
+    }
+
+    #[test]
+    fn fill_trace_file_noop_without_trace() {
+        let e = SemaError::eval("err").fill_trace_file(std::path::Path::new("main.sema"));
+        assert!(e.stack_trace().is_none());
+        assert!(matches!(e, SemaError::Eval(_)));
     }
 
     // 13. inner() unwraps through WithTrace and WithContext

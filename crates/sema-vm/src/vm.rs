@@ -5107,7 +5107,15 @@ pub fn compile_program_with_spans_and_natives(
     let source_file = source_file.map(|p| std::fs::canonicalize(&p).unwrap_or(p));
     let mut cores = Vec::with_capacity(vals.len());
     for val in vals {
-        cores.push(crate::lower::lower(val, Some(span_map))?);
+        // Lowering errors carry a synthesized trace frame with `file: None`
+        // (lowering doesn't know the source path); stamp it so the trace line
+        // renders the real filename instead of `<input>`.
+        cores.push(
+            crate::lower::lower(val, Some(span_map)).map_err(|e| match &source_file {
+                Some(f) => e.fill_trace_file(f),
+                None => e,
+            })?,
+        );
     }
     // Lower everything first: a sibling top-level form can redefine a
     // foldable builtin, and the folder must see the whole program (the
@@ -6248,6 +6256,23 @@ mod tests {
             result.is_err(),
             "out-of-bounds jump should return an error, not UB"
         );
+    }
+
+    #[test]
+    fn test_lowering_error_trace_frame_carries_source_file() {
+        // A lowering error's synthesized trace frame has `file: None` (the
+        // lowering pass doesn't know the path); compile_program_with_spans
+        // must stamp its `source_file` onto it so the trace line renders the
+        // real filename instead of `<input>`.
+        let input = "(define x 1 2)";
+        let (vals, span_map) = sema_reader::read_many_with_spans(input).unwrap();
+        let source_file = std::path::PathBuf::from("wip.sema");
+        let err = compile_program_with_spans(&vals, &span_map, Some(source_file.clone()))
+            .expect_err("define with 3 args should fail");
+        let trace = err.stack_trace().expect("error should carry a stack trace");
+        let frame = trace.0.first().expect("trace should have a frame");
+        assert_eq!(frame.name, "define");
+        assert_eq!(frame.file.as_deref(), Some(source_file.as_path()));
     }
 
     #[test]
