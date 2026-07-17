@@ -1038,7 +1038,9 @@ fn call_mcp_tool_inner(
                     } else if let Some(hint) = sema_core::error::veteran_hint(symbol) {
                         text.push_str(&format!("\nhint: {hint}"));
                     }
-                    text.push_str("\nTry docs_search with a plain-words query to discover the right name.");
+                    text.push_str(
+                        "\nTry docs_search with a plain-words query to discover the right name.",
+                    );
                     error_result(text)
                 }
             }

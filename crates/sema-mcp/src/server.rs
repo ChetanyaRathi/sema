@@ -61,7 +61,10 @@ pub fn run_mcp_server_sync(
         let line = match std::str::from_utf8(&buf) {
             Ok(s) => s.trim(),
             Err(_) => {
-                write_line(&mut writer, &parse_error_frame("request was not valid UTF-8"));
+                write_line(
+                    &mut writer,
+                    &parse_error_frame("request was not valid UTF-8"),
+                );
                 continue;
             }
         };

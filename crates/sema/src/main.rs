@@ -2738,14 +2738,20 @@ fn web_output_path(input: &std::path::Path, output: Option<&str>) -> std::path::
 pub(crate) fn build_web_archive(
     path: &std::path::Path,
     includes: &[String],
+    opts: BuildOutputOpts,
 ) -> Result<(Vec<u8>, usize), String> {
     let source =
         std::fs::read_to_string(path).map_err(|e| format!("reading {}: {e}", path.display()))?;
+    if opts.verbose {
+        eprintln!("[1/4] Compiling {} (web prelude)...", path.display());
+    }
     let entry_bytecode = compile_source_to_bytecode(&source)?;
 
+    if opts.verbose {
+        eprintln!("[2/4] Tracing imports...");
+    }
     let imports =
         import_tracer::trace_imports(path).map_err(|e| format!("tracing imports: {e}"))?;
-    let import_count = imports.len();
 
     let mut files = std::collections::HashMap::new();
     files.insert("__main__.semac".to_string(), entry_bytecode);
@@ -2768,6 +2774,9 @@ pub(crate) fn build_web_archive(
         files.insert(rel_path.clone(), bundled);
     }
 
+    if opts.verbose {
+        eprintln!("[3/4] Collecting assets...");
+    }
     for include in includes {
         let inc_path = std::path::Path::new(include);
         if inc_path.is_dir() {
@@ -2821,7 +2830,11 @@ pub(crate) fn build_web_archive(
         canonical_root.to_string_lossy().into_owned().into_bytes(),
     );
 
-    Ok((archive::serialize_archive(&metadata, &files), import_count))
+    if opts.verbose {
+        eprintln!("[4/4] Building archive ({} files)...", files.len());
+    }
+    let files_count = files.len();
+    Ok((archive::serialize_archive(&metadata, &files), files_count))
 }
 
 fn run_build_web(
@@ -2836,11 +2849,11 @@ fn run_build_web(
         return Err(format!("source file not found: {file}"));
     }
 
-    let (archive_bytes, import_count) = build_web_archive(path, includes)?;
+    let (archive_bytes, files_count) = build_web_archive(path, includes, opts)?;
     eprintln!(
-        "Compiled {file} → web archive ({} import{} bundled, {})",
-        import_count,
-        if import_count == 1 { "" } else { "s" },
+        "Compiled {file} → web archive ({} file{}, {})",
+        files_count,
+        if files_count == 1 { "" } else { "s" },
         human_size(archive_bytes.len() as u64)
     );
 
@@ -2865,7 +2878,7 @@ fn run_build_web(
         };
         print_build_json(
             file,
-            import_count,
+            files_count,
             archive_bytes.len(),
             std::slice::from_ref(&artifact),
             &[],
@@ -2873,11 +2886,11 @@ fn run_build_web(
         );
     } else {
         println!(
-            "Built {} ({}, {} import{} bundled) for web in {}",
+            "Built {} ({}, {} bundled file{}) for web in {}",
             abs.display(),
             human_size(archive_bytes.len() as u64),
-            import_count,
-            if import_count == 1 { "" } else { "s" },
+            files_count,
+            if files_count == 1 { "" } else { "s" },
             human_duration(started.elapsed())
         );
         eprintln!(

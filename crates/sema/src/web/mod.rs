@@ -123,7 +123,7 @@ fn web_prepare(entry: &std::path::Path, build_dir: &std::path::Path) -> sema_cor
     if imports.is_empty() {
         return web_mode_map("source", None);
     }
-    match crate::build_web_archive(entry, &[]) {
+    match crate::build_web_archive(entry, &[], crate::BuildOutputOpts::default()) {
         Ok((bytes, _)) => match std::fs::write(build_dir.join("app.vfs"), &bytes) {
             Ok(()) => web_mode_map("archive", None),
             Err(e) => web_mode_map("error", Some(&format!("writing archive: {e}"))),

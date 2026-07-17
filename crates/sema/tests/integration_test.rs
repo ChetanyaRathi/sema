@@ -13015,7 +13015,65 @@ fn test_sema_build_web_json_manifest() {
     assert_eq!(t["target"], "web");
     assert_eq!(t["ok"], true);
     assert!(t["runtime"].is_null());
+    // entry file is counted (was previously "0 imports" for single-file programs)
+    assert_eq!(manifest["bundled_files"], 1);
     assert!(std::path::Path::new(t["path"].as_str().unwrap()).exists());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_sema_build_web_output_matches_native_grammar() {
+    // Web builds use the same output shape as native ones: a "Compiled … →
+    // web archive (N file(s), size)" note on stderr, a "Built … (size, N
+    // bundled file(s)) for web in …" line on stdout, and [n/4] steps only
+    // under --verbose.
+    let dir = build_test_dir("webgrammar");
+    std::fs::write(dir.join("hello.sema"), r#"(println "hi")"#).unwrap();
+    let src = dir.join("hello.sema");
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_sema"))
+        .args([
+            "build",
+            src.to_str().unwrap(),
+            "--target",
+            "web",
+            "-o",
+            dir.join("hello").to_str().unwrap(),
+        ])
+        .output()
+        .expect("failed to run sema build");
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stdout.starts_with("Built "), "stdout: {stdout}");
+    assert!(
+        stdout.contains(", 1 bundled file) for web in "),
+        "stdout: {stdout}"
+    );
+    assert!(
+        stderr.contains("→ web archive (1 file, "),
+        "stderr: {stderr}"
+    );
+    assert!(!stderr.contains("[1/"), "no steps by default: {stderr}");
+
+    let verbose = std::process::Command::new(env!("CARGO_BIN_EXE_sema"))
+        .args([
+            "build",
+            src.to_str().unwrap(),
+            "--target",
+            "web",
+            "-o",
+            dir.join("hello").to_str().unwrap(),
+            "--verbose",
+        ])
+        .output()
+        .expect("failed to run sema build");
+    assert!(verbose.status.success());
+    let stderr = String::from_utf8_lossy(&verbose.stderr);
+    for step in ["[1/4]", "[2/4]", "[3/4]", "[4/4]"] {
+        assert!(stderr.contains(step), "missing {step}: {stderr}");
+    }
 
     let _ = std::fs::remove_dir_all(&dir);
 }
