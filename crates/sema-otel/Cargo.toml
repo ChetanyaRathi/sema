@@ -11,6 +11,18 @@ description = "OpenTelemetry GenAI tracing facade for the Sema runtime"
 # In-process span capture for deterministic tests (pulls the SDK's in-memory
 # exporter). Enabled by downstream crates as a dev-dependency feature.
 testing = ["opentelemetry_sdk/testing"]
+# OTLP over gRPC (tonic). Non-default: the tonic/h2/tower stack costs ~30s of serial
+# compile and OTLP's spec default is http/protobuf, which every mainstream backend
+# accepts (several, e.g. Grafana Cloud's gateway and Langfuse, are HTTP-only).
+# Release artifacts enable it via sema-lang's `otel-grpc` (see dist-workspace.toml);
+# a grpc-less build warns and falls back to http/protobuf at runtime.
+grpc = [
+    "dep:tokio",
+    "opentelemetry-otlp/grpc-tonic",
+    "opentelemetry_sdk/rt-tokio",
+    "opentelemetry_sdk/experimental_trace_batch_span_processor_with_async_runtime",
+    "opentelemetry_sdk/experimental_metrics_periodicreader_with_async_runtime",
+]
 
 [dependencies]
 sema-core = { workspace = true }
@@ -19,30 +31,23 @@ serde_json = { workspace = true }
 # OTel is native-only — mirrors the sema-llm wasm exclusion. On wasm32 the facade
 # compiles to no-op spans and links none of the export machinery (Decision #11).
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+rustls = { workspace = true }
 opentelemetry = "0.32"
-opentelemetry_sdk = { version = "0.32", features = [
-    "trace",
-    "metrics",
-    # Async-runtime span processor + metric reader, used ONLY for the gRPC (tonic)
-    # OTLP path (tonic needs a live tokio reactor; the thread-based processors used
-    # for HTTP do not). rt-tokio pulls in the runtime::Tokio glue.
-    "rt-tokio",
-    "experimental_trace_batch_span_processor_with_async_runtime",
-    "experimental_metrics_periodicreader_with_async_runtime",
-] }
+# The async-runtime processor/reader features used by the gRPC path live behind
+# this crate's `grpc` feature; the thread-based processors used for HTTP need none.
+opentelemetry_sdk = { version = "0.32", features = ["trace", "metrics"] }
 opentelemetry-otlp = { version = "0.32", default-features = false, features = [
     "trace",
     "metrics",
     "http-proto",
     "http-json",
     "reqwest-blocking-client",
-    "grpc-tonic",
 ] }
 opentelemetry-semantic-conventions = { version = "0.32", features = [
     "semconv_experimental",
 ] }
 # A live tokio reactor is needed ONLY to construct the gRPC (tonic) exporter.
-tokio = { workspace = true }
+tokio = { workspace = true, optional = true }
 # atexit hook so OTLP spans flush even on the CLI's std::process::exit paths.
 libc = { workspace = true }
 

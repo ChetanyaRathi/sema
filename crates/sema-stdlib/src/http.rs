@@ -9,10 +9,27 @@ use sema_core::{check_arity, Caps, SemaError, Value, ValueView};
 #[cfg(not(target_arch = "wasm32"))]
 static HTTP_SHARED_CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
 
+/// Install rustls's ring `CryptoProvider` once per process. reqwest and
+/// tokio-tungstenite are built without a compiled-in default provider (the aws-lc
+/// one costs ~43s of cold build); with none installed, client construction panics.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn ensure_crypto_provider() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        // Err(_) just means another provider is already installed — that's fine.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    });
+}
+
 /// Get (initializing on first use) the process-wide shared client.
 #[cfg(not(target_arch = "wasm32"))]
 fn http_shared_client() -> reqwest::Client {
-    HTTP_SHARED_CLIENT.get_or_init(reqwest::Client::new).clone()
+    HTTP_SHARED_CLIENT
+        .get_or_init(|| {
+            ensure_crypto_provider();
+            reqwest::Client::new()
+        })
+        .clone()
 }
 
 /// A decoded response body: text by default, or raw bytes when the caller asks

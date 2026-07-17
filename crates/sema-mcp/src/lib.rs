@@ -24,6 +24,17 @@ pub use server::{run_mcp_server, run_mcp_server_on};
 /// just a convenient 32-hex-char random token shape. Used by the workflow
 /// dashboard (`sema::workflow_view`) to mint its per-process session-hardening
 /// token (docs/plans/2026-06-24-workflow-mcp-auth.md §8).
+/// Install rustls's ring `CryptoProvider` once per process. reqwest is built with
+/// `rustls-no-provider` (workspace-wide, to avoid the aws-lc-sys build); without an
+/// installed provider every `reqwest::Client` construction panics.
+pub fn ensure_crypto_provider() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        // Err(_) just means another provider is already installed — that's fine.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    });
+}
+
 pub fn random_hex_token() -> String {
     uuid::Uuid::new_v4().simple().to_string()
 }

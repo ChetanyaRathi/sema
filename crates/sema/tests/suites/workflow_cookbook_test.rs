@@ -9,8 +9,7 @@
 //!
 //! Shared harness: `workflow_common` (`wc::run_once`, `wc::events_of`).
 
-mod workflow_common;
-use workflow_common as wc;
+use crate::workflow_common as wc;
 
 use sema_llm::fake::FakeProvider;
 
@@ -19,7 +18,7 @@ use sema_llm::fake::FakeProvider;
 // We embed the cookbook verbatim via include_str! relative to this file (the
 // standard Cargo path anchor).  The macros are then available in any src string
 // that prepends COOKBOOK_SRC.
-const COOKBOOK_SRC: &str = include_str!("../../../examples/workflows/cookbook.sema");
+const COOKBOOK_SRC: &str = include_str!("../../../../examples/workflows/cookbook.sema");
 
 // ---------------------------------------------------------------------------
 // 1. reflexion — short-circuits when the critic replies "OK"

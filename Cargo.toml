@@ -19,6 +19,32 @@ members = [
     "crates/sema-workflow",
 ]
 resolver = "2"
+# One-shot generator for the PIO golden fixture; deliberately outside the workspace
+# so its pio/lalrpop proc-macro stack never joins normal builds (see the tool's docs).
+exclude = ["tools/pio-golden"]
+
+# What a bare `cargo build` / `cargo test` builds. Excludes only sema-wasm: it is
+# wasm32-only in practice (built via jake wasm.* with --target wasm32-unknown-unknown),
+# and compiling it for the host drags js-sys/web-sys/wasm-bindgen (~25s of serial
+# compile) into every native build. Build it explicitly with -p sema-wasm.
+default-members = [
+    "crates/sema-core",
+    "crates/sema-io",
+    "crates/sema-reader",
+    "crates/sema-eval",
+    "crates/sema-llm",
+    "crates/sema-stdlib",
+    "crates/sema-vm",
+    "crates/sema",
+    "crates/sema-fmt",
+    "crates/sema-lsp",
+    "crates/sema-dap",
+    "crates/sema-notebook",
+    "crates/sema-docs",
+    "crates/sema-mcp",
+    "crates/sema-otel",
+    "crates/sema-workflow",
+]
 
 [workspace.package]
 version = "1.30.0"
@@ -52,7 +78,17 @@ thiserror = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["arbitrary_precision"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "net", "io-std", "io-util", "process", "time"] }
-reqwest = { version = "0.13", features = ["json", "stream", "blocking", "multipart"] }
+# rustls-no-provider instead of the default `rustls` feature: the default pins the
+# aws-lc-rs crypto provider, whose aws-lc-sys build script alone costs ~43s (the
+# single slowest unit in the whole graph). The pure-Rust ring provider is enabled
+# instead via the direct rustls dependency below (sema-llm/sema-stdlib): with
+# exactly one provider feature in the unified graph, rustls auto-selects it as the
+# process default, so no runtime install is required. If a second provider feature
+# ever sneaks into the graph, that auto-selection stops and reqwest Client
+# construction panics — sema_llm::http::ensure_crypto_provider() pins ring
+# explicitly on the LLM path, and `cargo tree -i aws-lc-sys` must stay empty.
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "charset", "http2", "system-proxy", "json", "stream", "blocking", "multipart"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 futures = "0.3"
 clap = { version = "4", features = ["derive"] }
 clap_complete = "4"
@@ -75,8 +111,10 @@ caseless = "0.2"
 glob = "0.3"
 hostname = "0.4"
 libc = "0.2"
-pdf-extract = "0.10"
-lopdf = "0.41"
+pdf-extract = "0.12"
+# default features off: drops jiff/chrono/time/rayon (~15s of transitive compile);
+# Document::load/get_pages/Info-dict need none of them.
+lopdf = { version = "0.42", default-features = false }
 axum = { version = "0.8", features = ["ws"] }
 tokio-stream = "0.1"
 mime_guess = "2"
@@ -87,7 +125,9 @@ semver = "1"
 tar = "0.4"
 flate2 = "1"
 crc32fast = "1"
-zip = "2"
+# minimal features: deflate covers ~all real zips, deflate64 the Windows-Explorer
+# variant. Trade-off: zstd/bzip2/AES-encrypted archives error at runtime.
+zip = { version = "8", default-features = false, features = ["deflate", "deflate64"] }
 similar = "2"
 pulldown-cmark = "0.12"
 scraper = "0.21"

@@ -6,8 +6,8 @@
 //! `FakeProvider`'s `call_count()` is the unambiguous "the body ran" signal. Shared
 //! harness in `workflow_common`.
 
-mod workflow_common;
-use workflow_common::{run_workflow, temp_run_dir, RunOpts};
+use crate::workflow_common;
+use crate::workflow_common::{run_workflow, temp_run_dir, RunOpts};
 
 use sema_llm::fake::FakeProvider;
 

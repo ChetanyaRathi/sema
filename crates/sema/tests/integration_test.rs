@@ -12726,6 +12726,7 @@ fn test_http_serve_basic() {
     std::thread::sleep(Duration::from_millis(1500));
 
     // Make request using reqwest
+    sema_llm::http::ensure_crypto_provider();
     let client = reqwest::blocking::Client::new();
     let resp = client
         .get("http://127.0.0.1:19876/test")
@@ -12765,6 +12766,7 @@ fn test_http_serve_with_router() {
 
     std::thread::sleep(Duration::from_millis(1500));
 
+    sema_llm::http::ensure_crypto_provider();
     let client = reqwest::blocking::Client::new();
 
     // Test parameterized route
@@ -12824,6 +12826,7 @@ fn test_http_serve_sse() {
 
     std::thread::sleep(Duration::from_millis(1500));
 
+    sema_llm::http::ensure_crypto_provider();
     let client = reqwest::blocking::Client::new();
     let resp = client
         .get("http://127.0.0.1:19878/stream")
@@ -12884,6 +12887,93 @@ fn build_test_dir(name: &str) -> std::path::PathBuf {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     dir
+}
+
+#[test]
+fn test_sema_build_output_into_existing_directory() {
+    // `-o <dir>` must mean "default filename inside <dir>", not File::create(dir).
+    let dir = build_test_dir("outdir");
+    std::fs::write(dir.join("hello.sema"), r#"(println "in dir")"#).unwrap();
+    let out_dir = dir.join("dist");
+    std::fs::create_dir_all(&out_dir).unwrap();
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_sema"))
+        .args([
+            "build",
+            dir.join("hello.sema").to_str().unwrap(),
+            "-o",
+            out_dir.to_str().unwrap(),
+        ])
+        .output()
+        .expect("failed to run sema build");
+    assert!(
+        output.status.success(),
+        "sema build failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let exe = out_dir.join("hello");
+    assert!(exe.exists(), "expected {} to exist", exe.display());
+    let run = std::process::Command::new(&exe).output().unwrap();
+    assert_eq!(String::from_utf8_lossy(&run.stdout).trim(), "in dir");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_sema_build_output_creates_missing_parent_directories() {
+    // A missing parent chain must be created (mkdir -p semantics), not silently
+    // skipped and not a hard error.
+    let dir = build_test_dir("outparents");
+    std::fs::write(dir.join("hello.sema"), r#"(println "deep")"#).unwrap();
+    let exe = dir.join("a/b/c/hello");
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_sema"))
+        .args([
+            "build",
+            dir.join("hello.sema").to_str().unwrap(),
+            "-o",
+            exe.to_str().unwrap(),
+        ])
+        .output()
+        .expect("failed to run sema build");
+    assert!(
+        output.status.success(),
+        "sema build failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(exe.exists(), "expected {} to exist", exe.display());
+    let run = std::process::Command::new(&exe).output().unwrap();
+    assert_eq!(String::from_utf8_lossy(&run.stdout).trim(), "deep");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_sema_build_output_trailing_slash_creates_directory() {
+    // `-o dir/that/does/not/exist/` (trailing slash) means "directory": create it
+    // and put the default filename inside.
+    let dir = build_test_dir("outslash");
+    std::fs::write(dir.join("hello.sema"), r#"(println "slash")"#).unwrap();
+    let out_dir = dir.join("nested/dist");
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_sema"))
+        .args([
+            "build",
+            dir.join("hello.sema").to_str().unwrap(),
+            "-o",
+            &format!("{}/", out_dir.display()),
+        ])
+        .output()
+        .expect("failed to run sema build");
+    assert!(
+        output.status.success(),
+        "sema build failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let exe = out_dir.join("hello");
+    assert!(exe.exists(), "expected {} to exist", exe.display());
+
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]

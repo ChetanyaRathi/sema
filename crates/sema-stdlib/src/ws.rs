@@ -269,6 +269,7 @@ async fn connect_with_retry(
     let mut attempt: u32 = 0;
     loop {
         let request = build_request(url, opts)?;
+        crate::http::ensure_crypto_provider();
         let fut = tokio_tungstenite::connect_async(request);
         let outcome: Result<_, String> = match opts.timeout_ms {
             Some(ms) => match tokio::time::timeout(std::time::Duration::from_millis(ms), fut).await

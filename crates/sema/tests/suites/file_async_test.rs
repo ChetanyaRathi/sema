@@ -7,7 +7,7 @@
 //! big read/write is in flight. At top level (no scheduler) they stay fully
 //! synchronous.
 
-mod common;
+use crate::common;
 
 use common::eval;
 use sema_core::Value;

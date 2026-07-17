@@ -190,6 +190,7 @@ async fn connect_with_auth(url: &str, store: &FileStore, opener: BrowserOpener) 
             requested_scope: parsed.scope.as_deref(),
             preconfigured_client_id: None,
         };
+        sema_mcp::ensure_crypto_provider();
         let token = ensure_access_token(&reqwest::Client::new(), store, &config, &driver)
             .await
             .expect("ensure_access_token");
@@ -201,6 +202,7 @@ async fn connect_with_auth(url: &str, store: &FileStore, opener: BrowserOpener) 
 
 fn browser_opener() -> BrowserOpener {
     Box::new(|url: &str| {
+        sema_mcp::ensure_crypto_provider();
         reqwest::blocking::Client::new()
             .get(url)
             .send()

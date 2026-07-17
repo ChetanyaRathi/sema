@@ -1,5 +1,3 @@
-mod common;
-
 use sema_core::Value;
 use std::collections::BTreeMap;
 

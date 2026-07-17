@@ -1465,6 +1465,7 @@ const HTTP_MAX_BACKOFF: std::time::Duration = std::time::Duration::from_secs(10)
 /// The registry may 302 to GitHub for meta-registry packages, so redirects are
 /// followed (capped) rather than surfaced.
 fn http_client() -> Result<reqwest::blocking::Client, String> {
+    sema_llm::http::ensure_crypto_provider();
     reqwest::blocking::Client::builder()
         .connect_timeout(HTTP_CONNECT_TIMEOUT)
         .timeout(HTTP_TIMEOUT)

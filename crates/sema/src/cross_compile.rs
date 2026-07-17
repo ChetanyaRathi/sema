@@ -177,6 +177,7 @@ pub fn ensure_runtime(target: &str, no_cache: bool) -> Result<PathBuf, Box<dyn s
 
 /// Build a reqwest client with timeouts and a user-agent.
 pub(crate) fn http_client() -> Result<reqwest::blocking::Client, reqwest::Error> {
+    sema_llm::http::ensure_crypto_provider();
     reqwest::blocking::Client::builder()
         .user_agent(format!("sema/{}", env!("CARGO_PKG_VERSION")))
         .connect_timeout(std::time::Duration::from_secs(10))

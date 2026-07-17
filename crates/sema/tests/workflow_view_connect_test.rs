@@ -224,6 +224,7 @@ fn temp_run_dir(tag: &str) -> PathBuf {
 /// without a real browser. A plain `fn` (not a closure), matching
 /// `sema::workflow_view::connect::TestOpenerFn`'s shape.
 fn visiting_opener(url: &str) -> Result<(), String> {
+    sema_llm::http::ensure_crypto_provider();
     reqwest::blocking::Client::new()
         .get(url)
         .send()
@@ -340,6 +341,7 @@ async fn connect_happy_path_populates_scoped_store_and_get_shows_authorized() {
         .await
         .expect("bind viewer server");
     let base = format!("http://{addr}");
+    sema_llm::http::ensure_crypto_provider();
     let client = reqwest::Client::new();
 
     // Baseline: needs-consent (no override yet).
@@ -394,6 +396,7 @@ async fn missing_or_wrong_token_is_403_and_starts_no_flow() {
         .await
         .expect("bind viewer server");
     let base = format!("http://{addr}");
+    sema_llm::http::ensure_crypto_provider();
     let client = reqwest::Client::new();
 
     // No header at all.
@@ -444,6 +447,7 @@ async fn undeclared_alias_is_404_and_stdio_alias_is_400() {
         .await
         .expect("bind viewer server");
     let base = format!("http://{addr}");
+    sema_llm::http::ensure_crypto_provider();
     let client = reqwest::Client::new();
 
     // Not declared in this run's manifest at all.
@@ -487,6 +491,7 @@ async fn double_connect_while_pending_starts_a_single_flow() {
         .await
         .expect("bind viewer server");
     let base = format!("http://{addr}");
+    sema_llm::http::ensure_crypto_provider();
     let client = reqwest::Client::new();
 
     let connect = |client: reqwest::Client,
@@ -542,6 +547,7 @@ async fn forget_empties_stores_and_get_reverts_to_needs_consent() {
         .await
         .expect("bind viewer server");
     let base = format!("http://{addr}");
+    sema_llm::http::ensure_crypto_provider();
     let client = reqwest::Client::new();
 
     // Connect first so there is something to forget.
@@ -617,6 +623,7 @@ async fn declined_consent_shows_failed_with_reason_never_a_secret() {
         .await
         .expect("bind viewer server");
     let base = format!("http://{addr}");
+    sema_llm::http::ensure_crypto_provider();
     let client = reqwest::Client::new();
 
     client

@@ -1,5 +1,5 @@
 #![allow(clippy::approx_constant)]
-mod common;
+use crate::common;
 
 use sema_core::Value;
 

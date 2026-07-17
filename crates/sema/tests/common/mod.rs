@@ -27,7 +27,7 @@ macro_rules! eval_tests {
         $(
             #[test]
             fn $name() {
-                let result = common::eval($input);
+                let result = $crate::common::eval($input);
                 assert_eq!(result, $expected, "VM: {}", $input);
             }
         )*

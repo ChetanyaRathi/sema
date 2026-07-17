@@ -414,6 +414,7 @@ fn resolve_authenticated_http(
             requested_scope: stored.tokens.scope.as_deref(),
             preconfigured_client_id: auth.client_id.as_deref(),
         };
+        sema_llm::http::ensure_crypto_provider();
         let http = reqwest::Client::new();
         match sema_io::io_block_on(login::refresh(&http, &login_config, &stored)) {
             Ok(tokens) => {

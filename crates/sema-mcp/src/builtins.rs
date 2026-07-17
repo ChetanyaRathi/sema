@@ -579,6 +579,7 @@ async fn obtain_access_token_async(
     use crate::oauth::{discovery, login, loopback, store};
 
     let challenge = discovery::parse_www_authenticate(challenge_header);
+    crate::ensure_crypto_provider();
     let http = reqwest::Client::new();
     let credential_store = store::default_store();
     let driver = loopback::LoopbackDriver::with_opener(
@@ -944,6 +945,7 @@ async fn reauthorize_async(
     interactive_auth: bool,
     opener_source: OpenerSource,
 ) -> Result<Option<String>, String> {
+    crate::ensure_crypto_provider();
     let http = reqwest::Client::new();
     let store = crate::oauth::store::default_store();
     let result = if interactive_auth {
