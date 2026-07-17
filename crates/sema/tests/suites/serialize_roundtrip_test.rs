@@ -2,7 +2,7 @@
 //!
 //! Each test: compile → serialize → deserialize → run in VM → compare to direct eval.
 
-mod common;
+use crate::common;
 
 use sema_core::Value;
 use sema_eval::Interpreter;

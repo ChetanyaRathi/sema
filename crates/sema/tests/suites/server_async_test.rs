@@ -152,6 +152,7 @@ fn http_serve_top_level_still_serves() {
 
     std::thread::sleep(Duration::from_millis(1500));
 
+    sema_llm::http::ensure_crypto_provider();
     let client = reqwest::blocking::Client::new();
     let resp = client
         .get("http://127.0.0.1:19938/guard-check")

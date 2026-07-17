@@ -81,7 +81,7 @@ The config map accepts:
 | --- | --- | --- |
 | `:endpoint` | `OTEL_EXPORTER_OTLP_ENDPOINT` | Backend address. **Setting it turns tracing on.** |
 | `:file` | `SEMA_OTEL_FILE` | Write JSONL spans to a path instead of the network. Also turns tracing on. |
-| `:protocol` | `OTEL_EXPORTER_OTLP_PROTOCOL` | `"http/protobuf"` (default) · `"http/json"` · `"grpc"`. |
+| `:protocol` | `OTEL_EXPORTER_OTLP_PROTOCOL` | `"http/protobuf"` (default) · `"http/json"` · `"grpc"` (release builds; see below). |
 | `:key` | `OTEL_EXPORTER_OTLP_HEADERS` | An API key, sent as `Authorization: Bearer <key>`. |
 | `:headers` | `OTEL_EXPORTER_OTLP_HEADERS` | Extra headers — a map (`{:x-project "app"}`) or a pre-formatted `"name=value,..."` string. |
 | `:service-name` | `OTEL_SERVICE_NAME` | The name runs appear under. |
@@ -140,7 +140,7 @@ OpenTelemetry itself; the `SEMA_OTEL_*` names are Sema conveniences.
 | Variable | What it does |
 | --- | --- |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | The address of your tracing backend, e.g. `http://localhost:4318`. **Setting this turns tracing on.** |
-| `OTEL_EXPORTER_OTLP_PROTOCOL` | How to talk to it: `http/protobuf` (default) · `http/json` · `grpc`. Keep the default unless your backend only accepts gRPC. |
+| `OTEL_EXPORTER_OTLP_PROTOCOL` | How to talk to it: `http/protobuf` (default) · `http/json` · `grpc`. Keep the default unless your backend only accepts gRPC. gRPC support is compiled into release binaries (installer, Homebrew, GitHub archives); a plain `cargo install sema-lang` or source build needs `--features otel-grpc`, otherwise `grpc` warns once and falls back to `http/protobuf`. |
 | `OTEL_EXPORTER_OTLP_HEADERS` | Extra HTTP headers, usually authentication — e.g. `Authorization=Bearer <token>`. Comma-separated `name=value` pairs; see [Authentication headers](#authentication-headers). |
 | `OTEL_EXPORTER_OTLP_TIMEOUT` | Per-export timeout in milliseconds. Keep it short (e.g. `3000`) so a dead backend never holds things up. |
 | `OTEL_SERVICE_NAME` | The name your runs appear under in the backend (default `sema`). |

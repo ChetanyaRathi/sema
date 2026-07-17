@@ -12726,6 +12726,7 @@ fn test_http_serve_basic() {
     std::thread::sleep(Duration::from_millis(1500));
 
     // Make request using reqwest
+    sema_llm::http::ensure_crypto_provider();
     let client = reqwest::blocking::Client::new();
     let resp = client
         .get("http://127.0.0.1:19876/test")
@@ -12765,6 +12766,7 @@ fn test_http_serve_with_router() {
 
     std::thread::sleep(Duration::from_millis(1500));
 
+    sema_llm::http::ensure_crypto_provider();
     let client = reqwest::blocking::Client::new();
 
     // Test parameterized route
@@ -12824,6 +12826,7 @@ fn test_http_serve_sse() {
 
     std::thread::sleep(Duration::from_millis(1500));
 
+    sema_llm::http::ensure_crypto_provider();
     let client = reqwest::blocking::Client::new();
     let resp = client
         .get("http://127.0.0.1:19878/stream")

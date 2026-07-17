@@ -7,8 +7,7 @@
 //! deterministically (a `:usd` cap would couple the test to the pricing table). The
 //! shared harness lives in `workflow_common`.
 
-mod workflow_common;
-use workflow_common as wc;
+use crate::workflow_common as wc;
 
 use sema_llm::fake::FakeProvider;
 use sema_llm::types::LlmError;

@@ -116,6 +116,7 @@ fn start_server() -> (ServerGuard, u16) {
 async fn test_device_flow_end_to_end() {
     let (_server, port) = start_server();
     let mcp_url = format!("http://127.0.0.1:{port}/mcp");
+    sema_mcp::ensure_crypto_provider();
     let http = reqwest::Client::new();
 
     let shown = Arc::new(Mutex::new(None));

@@ -1,4 +1,4 @@
-mod common;
+use crate::common;
 
 use common::eval;
 use sema_core::{Caps, Sandbox, Value};

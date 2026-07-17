@@ -691,6 +691,10 @@ fn build_interpreter(sandbox: &sema_core::Sandbox) -> Interpreter {
 }
 
 fn main() {
+    // reqwest is built with rustls-no-provider (see workspace Cargo.toml); install
+    // the ring provider before anything (OTLP exporter, pkg, LLM) builds a client.
+    sema_llm::http::ensure_crypto_provider();
+
     // Check for embedded archive before parsing CLI args
     if let Some(exit_code) = try_run_embedded() {
         std::process::exit(exit_code);

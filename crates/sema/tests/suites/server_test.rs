@@ -33,6 +33,7 @@ fn test_http_serve_json_body_parsing() {
 
     std::thread::sleep(Duration::from_millis(1500));
 
+    sema_llm::http::ensure_crypto_provider();
     let client = reqwest::blocking::Client::new();
 
     // POST with JSON body
@@ -80,6 +81,7 @@ fn test_http_serve_rejects_oversized_body() {
 
     std::thread::sleep(Duration::from_millis(1500));
 
+    sema_llm::http::ensure_crypto_provider();
     let client = reqwest::blocking::Client::new();
 
     // A small body is accepted.
@@ -186,6 +188,7 @@ fn test_http_serve_query_string() {
 
     std::thread::sleep(Duration::from_millis(1500));
 
+    sema_llm::http::ensure_crypto_provider();
     let client = reqwest::blocking::Client::new();
     let resp = client
         .get("http://127.0.0.1:19881/search?q=hello&page=2")
@@ -217,6 +220,7 @@ fn test_http_serve_handler_error() {
 
     std::thread::sleep(Duration::from_millis(1500));
 
+    sema_llm::http::ensure_crypto_provider();
     let client = reqwest::blocking::Client::new();
 
     // First request: handler errors, should get 500
@@ -263,6 +267,7 @@ fn test_http_serve_method_dispatch() {
 
     std::thread::sleep(Duration::from_millis(1500));
 
+    sema_llm::http::ensure_crypto_provider();
     let client = reqwest::blocking::Client::new();
 
     // GET /data
@@ -314,6 +319,7 @@ fn test_http_serve_custom_headers() {
 
     std::thread::sleep(Duration::from_millis(1500));
 
+    sema_llm::http::ensure_crypto_provider();
     let client = reqwest::blocking::Client::new();
     let resp = client
         .get("http://127.0.0.1:19884/test")
@@ -361,6 +367,7 @@ fn test_http_serve_wildcard_route() {
 
     std::thread::sleep(Duration::from_millis(1500));
 
+    sema_llm::http::ensure_crypto_provider();
     let client = reqwest::blocking::Client::new();
     let resp = client
         .get("http://127.0.0.1:19885/files/a/b/c.txt")
@@ -395,6 +402,7 @@ fn test_http_serve_concurrent_requests() {
     let handles: Vec<_> = (0..5)
         .map(|i| {
             std::thread::spawn(move || {
+                sema_llm::http::ensure_crypto_provider();
                 let client = reqwest::blocking::Client::new();
                 let resp = client
                     .get(format!("http://127.0.0.1:19886/item/{i}"))
@@ -444,6 +452,7 @@ fn test_http_serve_middleware() {
 
     std::thread::sleep(Duration::from_millis(1500));
 
+    sema_llm::http::ensure_crypto_provider();
     let client = reqwest::blocking::Client::new();
     let resp = client
         .get("http://127.0.0.1:19887/test")
@@ -979,6 +988,7 @@ fn test_http_serve_static_files() {
 
     std::thread::sleep(Duration::from_millis(1500));
 
+    sema_llm::http::ensure_crypto_provider();
     let client = reqwest::blocking::Client::new();
 
     // Serve HTML
@@ -1676,6 +1686,7 @@ fn test_sse_multiple_events() {
 
     std::thread::sleep(Duration::from_millis(1500));
 
+    sema_llm::http::ensure_crypto_provider();
     let client = reqwest::blocking::Client::new();
     let resp = client
         .get("http://127.0.0.1:19902/events")
@@ -1717,6 +1728,7 @@ fn test_sse_content_type() {
 
     std::thread::sleep(Duration::from_millis(1500));
 
+    sema_llm::http::ensure_crypto_provider();
     let client = reqwest::blocking::Client::new();
     let resp = client
         .get("http://127.0.0.1:19903/sse")
@@ -1767,6 +1779,7 @@ fn test_server_survives_handler_panic() {
 
     std::thread::sleep(Duration::from_millis(1500));
 
+    sema_llm::http::ensure_crypto_provider();
     let client = reqwest::blocking::Client::new();
 
     // Crash the handler
@@ -1838,6 +1851,7 @@ fn test_server_concurrent_requests() {
         .map(|i| {
             let count = success_count.clone();
             std::thread::spawn(move || {
+                sema_llm::http::ensure_crypto_provider();
                 let client = reqwest::blocking::Client::new();
                 let resp = client
                     .get(format!("http://127.0.0.1:19905/req/{i}"))
@@ -1888,6 +1902,7 @@ fn test_server_large_json_body() {
 
     std::thread::sleep(Duration::from_millis(1500));
 
+    sema_llm::http::ensure_crypto_provider();
     let client = reqwest::blocking::Client::new();
     let large_body = "x".repeat(100_000);
     let resp = client
@@ -1928,6 +1943,7 @@ fn test_server_custom_response_headers() {
 
     std::thread::sleep(Duration::from_millis(1500));
 
+    sema_llm::http::ensure_crypto_provider();
     let client = reqwest::blocking::Client::new();
     let resp = client
         .get("http://127.0.0.1:19907/test")
@@ -1989,6 +2005,7 @@ fn test_middleware_cors() {
 
     std::thread::sleep(Duration::from_millis(1500));
 
+    sema_llm::http::ensure_crypto_provider();
     let client = reqwest::blocking::Client::new();
     let resp = client
         .get("http://127.0.0.1:19908/api")
@@ -2036,6 +2053,7 @@ fn test_middleware_logging() {
 
     std::thread::sleep(Duration::from_millis(1500));
 
+    sema_llm::http::ensure_crypto_provider();
     let client = reqwest::blocking::Client::new();
     let resp = client
         .get("http://127.0.0.1:19909/test")
@@ -2103,6 +2121,7 @@ fn test_http_serve_port_fallback_and_on_listen() {
     );
 
     // Prove the fallback server actually serves on the new port.
+    sema_llm::http::ensure_crypto_provider();
     let client = reqwest::blocking::Client::new();
     let resp = client
         .get(format!("http://127.0.0.1:{bound_port}/"))

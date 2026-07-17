@@ -6,8 +6,7 @@
 //! scripted `FakeProvider` so the tool call is deterministic. Shared harness in
 //! `workflow_common`.
 
-mod workflow_common;
-use workflow_common as wc;
+use crate::workflow_common as wc;
 
 use sema_llm::fake::FakeProvider;
 

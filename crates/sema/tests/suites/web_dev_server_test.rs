@@ -41,6 +41,7 @@ fn test_web_dev_server_serves_runtime_shell_and_app() {
     let port = 19930;
     let mut child = spawn_dev_server("examples/web/counter.sema", port);
 
+    sema_llm::http::ensure_crypto_provider();
     let client = reqwest::blocking::Client::new();
     let base = format!("http://127.0.0.1:{port}");
 
@@ -128,6 +129,7 @@ fn test_web_dev_server_llm_proxy_complete_live() {
 
     // The proxy speaks the production llm-proxy protocol: POST /complete with a
     // prompt returns {content}. Uses a cheap model.
+    sema_llm::http::ensure_crypto_provider();
     let client = reqwest::blocking::Client::new();
     let resp = client
         .post(format!("http://127.0.0.1:{port}/complete"))

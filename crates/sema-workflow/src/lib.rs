@@ -7,7 +7,7 @@
 //! like the `.semac` bytecode format) — its layout and event vocabulary are FROZEN
 //! (append-only Option/skippable fields only).
 //!
-//! This crate is a leaf: it depends only on `sema-core` + `sema-otel` + serde.
+//! This crate is a leaf: it depends only on `sema-core` + serde.
 //! The builtins that invoke Sema thunks (`workflow/run`, `workflow/phase`,
 //! `checkpoint`, `workflow/agent`) live in `sema-stdlib`, which depends on this crate.
 

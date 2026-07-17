@@ -18,6 +18,14 @@ path = "src/main.rs"
 name = "sema"
 path = "src/lib.rs"
 
+[features]
+default = []
+# OTLP-over-gRPC (tonic) in sema-otel. Non-default because the tonic/h2 stack costs
+# ~30s of serial compile; release artifacts enable it (dist-workspace.toml) so
+# shipped binaries keep OTEL_EXPORTER_OTLP_PROTOCOL=grpc working. A build without it
+# warns once and falls back to http/protobuf.
+otel-grpc = ["sema-otel/grpc"]
+
 [dependencies]
 sema-core.workspace = true
 sema-reader.workspace = true
@@ -43,7 +51,7 @@ glob.workspace = true
 clap.workspace = true
 clap_complete.workspace = true
 serde_json.workspace = true
-libsui = "0.15"
+libsui = "0.16"
 toml.workspace = true
 toml_edit.workspace = true
 serde.workspace = true
@@ -54,7 +62,7 @@ tar.workspace = true
 flate2.workspace = true
 crc32fast = "1"
 xz2 = "0.1"
-zip = { version = "8", default-features = false, features = ["deflate"] }
+zip = { workspace = true }
 # Embeds the `sema web` browser runtime (src/web/assets/**) into the binary at
 # compile time. `debug-embed` forces embedding in every profile so a build never
 # reads the assets from the source tree at runtime — see src/web/runtime.rs.

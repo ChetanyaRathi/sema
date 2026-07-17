@@ -510,7 +510,7 @@ pub struct OtelConfig {
     pub endpoint: Option<String>,
     /// `SEMA_OTEL_FILE` — write JSONL spans to this path instead of the network.
     pub file: Option<String>,
-    /// `OTEL_EXPORTER_OTLP_PROTOCOL` — `http/protobuf` (default) · `http/json` · `grpc`.
+    /// `OTEL_EXPORTER_OTLP_PROTOCOL` — `http/protobuf` (default) · `http/json` · `grpc` (requires the `grpc` cargo feature; release builds have it, plain dev builds warn and fall back to http/protobuf).
     pub protocol: Option<String>,
     /// `OTEL_EXPORTER_OTLP_HEADERS` — already formatted as comma-separated `name=value`
     /// pairs (auth etc.). The builtin joins a header map / `:key` shorthand into this.
@@ -595,7 +595,9 @@ pub fn use_host_global() {
 /// the JSONL sink need none, so they never touch this. Never dropped (process-static)
 /// so flush/shutdown at exit can't deadlock. `None` if the runtime fails to build
 /// (degrade silently — never panic on the OTel path).
+#[cfg(feature = "grpc")]
 static OTEL_RT: OnceLock<Option<tokio::runtime::Runtime>> = OnceLock::new();
+#[cfg(feature = "grpc")]
 fn otel_runtime() -> Option<&'static tokio::runtime::Runtime> {
     OTEL_RT
         .get_or_init(|| {
@@ -607,6 +609,31 @@ fn otel_runtime() -> Option<&'static tokio::runtime::Runtime> {
                 .ok()
         })
         .as_ref()
+}
+
+/// Install rustls's ring `CryptoProvider` once per process before an OTLP exporter
+/// builds its reqwest client (reqwest is compiled with `rustls-no-provider`
+/// workspace-wide; construction panics with no installed provider).
+fn ensure_crypto_provider() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        // Err(_) just means another provider is already installed — that's fine.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    });
+}
+
+/// One-time stderr notice when `OTEL_EXPORTER_OTLP_PROTOCOL=grpc` is requested from a
+/// build without the `grpc` cargo feature. The action is end-user runnable (env var);
+/// http/protobuf is accepted by all mainstream OTLP backends.
+#[cfg(not(feature = "grpc"))]
+fn warn_grpc_unavailable() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        eprintln!(
+            "sema: this build has no OTLP/gRPC support; falling back to http/protobuf \
+             (set OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf to silence this notice)"
+        );
+    });
 }
 
 fn otlp_protocol() -> String {
@@ -648,8 +675,10 @@ fn build_provider() -> Option<SdkTracerProvider> {
 fn attach_otlp_span_exporter(
     builder: opentelemetry_sdk::trace::TracerProviderBuilder,
 ) -> opentelemetry_sdk::trace::TracerProviderBuilder {
+    ensure_crypto_provider();
     use opentelemetry_otlp::{Protocol, SpanExporter, WithExportConfig};
     match otlp_protocol().as_str() {
+        #[cfg(feature = "grpc")]
         "grpc" => {
             if let Some(rt) = otel_runtime() {
                 let _g = rt.enter();
@@ -663,6 +692,18 @@ fn attach_otlp_span_exporter(
                 }
             }
             builder
+        }
+        #[cfg(not(feature = "grpc"))]
+        "grpc" => {
+            warn_grpc_unavailable();
+            match SpanExporter::builder()
+                .with_http()
+                .with_protocol(Protocol::HttpBinary)
+                .build()
+            {
+                Ok(exp) => builder.with_batch_exporter(exp),
+                Err(_) => builder,
+            }
         }
         "http/json" => match SpanExporter::builder()
             .with_http()
@@ -686,6 +727,7 @@ fn attach_otlp_span_exporter(
 /// Build a meter provider (OTLP only — the JSONL sink is trace-only). `None` when no
 /// OTLP endpoint is configured or the exporter fails to build.
 fn build_meter_provider() -> Option<SdkMeterProvider> {
+    ensure_crypto_provider();
     let otlp = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
         .ok()
         .or_else(|| std::env::var("OTEL_EXPORTER_OTLP_METRICS_ENDPOINT").ok())
@@ -694,6 +736,7 @@ fn build_meter_provider() -> Option<SdkMeterProvider> {
 
     use opentelemetry_otlp::{MetricExporter, Protocol, WithExportConfig};
     match otlp_protocol().as_str() {
+        #[cfg(feature = "grpc")]
         "grpc" => {
             let rt = otel_runtime()?;
             let _g = rt.enter();
@@ -707,6 +750,21 @@ fn build_meter_provider() -> Option<SdkMeterProvider> {
             Some(
                 SdkMeterProvider::builder()
                     .with_reader(reader)
+                    .with_resource(build_resource())
+                    .build(),
+            )
+        }
+        #[cfg(not(feature = "grpc"))]
+        "grpc" => {
+            warn_grpc_unavailable();
+            let exp = MetricExporter::builder()
+                .with_http()
+                .with_protocol(Protocol::HttpBinary)
+                .build()
+                .ok()?;
+            Some(
+                SdkMeterProvider::builder()
+                    .with_reader(PeriodicReader::builder(exp).build())
                     .with_resource(build_resource())
                     .build(),
             )

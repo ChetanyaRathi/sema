@@ -8,8 +8,7 @@
 //! The first two tests are unit-style (Interpreter directly, no FakeProvider). The
 //! third is a full integration test through the FakeProvider workflow harness.
 
-mod workflow_common;
-use workflow_common as wc;
+use crate::workflow_common as wc;
 
 use sema_eval::Interpreter;
 use sema_llm::builtins::reset_runtime_state;

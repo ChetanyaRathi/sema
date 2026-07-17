@@ -386,6 +386,7 @@ fn events_of<'a>(events: &'a [serde_json::Value], name: &str) -> Vec<&'a serde_j
 /// its doc comment for why (the opener runs on a thread `LoopbackDriver`
 /// spawns, and thread-locals don't propagate to a spawned thread).
 fn visiting_opener(url: &str) -> Result<(), String> {
+    sema_llm::http::ensure_crypto_provider();
     reqwest::blocking::Client::new()
         .get(url)
         .send()

@@ -6,8 +6,7 @@
 //! close-called-exactly-once. The REAL resolver (over `sema-mcp`) is exercised
 //! end-to-end in `workflow_mcp_e2e_test.rs`.
 
-mod workflow_common;
-use workflow_common as wc;
+use crate::workflow_common as wc;
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
