@@ -27,6 +27,7 @@
 #   --upload    attach the built sema.mcpb to the --tag release (needs --tag)
 #
 # Requires: npx, plus gh/tar/unzip (download mode) and lipo (macOS-only host).
+
 set -euo pipefail
 
 log() { printf '== %s\n' "$*"; }

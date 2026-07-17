@@ -105,6 +105,7 @@ Dependency flow (arrows = "depends on"): `sema-core ← sema-reader ← sema-vm 
 - Native fns: `NativeFn` takes `(&EvalContext, &[Value])` → `Result<Value, SemaError>`. Use `NativeFn::simple()` (no context) or `NativeFn::with_ctx()`. Special forms return `Trampoline`.
 - Comments describe the code as it stands, not what changed. Drop change-narration ("now uses X instead of Y", "switched from", "previously", "fixed to"); keep the *why* (rationale, invariants, gotchas). Git tracks the story; the source shouldn't. Contrasting with a sibling (`unlike string/lower`) is fine; contrasting with a past version is not.
 - **Sema naming (Decision #24)**: slash-namespaced for all new functions (`file/read`, `path/join`, `regex/match?`, `http/get`, `json/encode`, `string/split`); legacy Scheme names kept (`string-append`, `string-length`, `string-ref`, `substring`); arrow conversions (`string->symbol`, `keyword->string`); predicates end in `?` (`null?`, `list?`, `file/exists?`).
+- **Shell scripts (`scripts/*.sh`)**: follow `docs/shell-style.md` (header block, `set -euo pipefail` with documented exceptions, `#!/usr/bin/env bash`). Run `jake scripts.check` (shellcheck + shfmt) before committing shell; `scripts/pack-mcpb.sh` is the exemplar.
 
 ## Bytecode File Format (.semac)
 

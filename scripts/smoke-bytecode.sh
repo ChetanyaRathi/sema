@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
-# Bytecode smoke test: compile, disassemble, and run all examples as .semac
+#
+# Bytecode smoke test: compile, disassemble, and run all examples as .semac.
+#
 # Usage: ./scripts/smoke-bytecode.sh [path-to-sema-binary]
+
 set -euo pipefail
 
 SEMA="${1:-./target/debug/sema}"

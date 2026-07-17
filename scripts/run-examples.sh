@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+#
 # Run all runnable Sema examples headless and report pass/skip/fail.
 #
 # "Runnable" = pure, self-contained programs that complete on their own. We
@@ -13,7 +14,8 @@
 # stray loop can't wedge the run. Exits non-zero if any *runnable* example fails.
 #
 # Usage: scripts/run-examples.sh [--timeout SECONDS]
-set -u
+
+set -u # no -e: run every example and tally pass/skip/fail, don't stop at the first
 
 TIMEOUT="${EXAMPLE_TIMEOUT:-30}"
 while [ $# -gt 0 ]; do

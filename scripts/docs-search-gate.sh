@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+#
 # Hermetic acceptance gate for the docs_search MCP tool.
 #
 # Builds a FROM-scratch image containing ONLY the compiled `sema` binary, then drives
@@ -8,6 +9,7 @@
 # binary and need no LLM/network at query time.
 #
 # Requires: docker, jq. Usage: scripts/docs-search-gate.sh
+
 set -euo pipefail
 
 IMG="sema-docs-search-gate:test"

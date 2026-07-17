@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 #
-# Benchmark runner for the `sema` binary: hyperfine-driven, grouped suites
+# Hyperfine-driven benchmark runner for the `sema` binary, grouped suites
 # (core/closure/data/…). Driven by `jake bench.*`; see jake/bench.jake.
+
 set -euo pipefail
 
 SEMA_BIN="${SEMA_BIN:-./target/release/sema}"

@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+#
 # Stress test: compile every runnable example into a STANDALONE BINARY with
 # `sema build`, then execute that binary and check it succeeds. This exercises
 # the whole release path — bytecode compile + serialize, import tracing, VFS
@@ -9,7 +10,8 @@
 # a per-binary run timeout. Exits non-zero if any example fails to build or run.
 #
 # Usage: scripts/build-examples.sh [--timeout SECONDS]
-set -u
+
+set -u # no -e: build/run every example and tally failures, don't stop at the first
 
 TIMEOUT="${EXAMPLE_TIMEOUT:-30}"
 while [ $# -gt 0 ]; do

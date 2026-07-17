@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+#
 # Profile-Guided Optimization build of the `sema` binary.
 #
 # Pipeline: instrument -> train (compute benches + a 1BRC sample) -> merge -> rebuild.
@@ -14,6 +15,7 @@
 #
 # Env knobs: PROFILE (release|dist, default release), TRAIN_ROWS (default 2000000),
 #            PGO_DIR (default target/pgo).
+
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

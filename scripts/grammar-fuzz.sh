@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# grammar-fuzz.sh — driver for the Sema grammar fuzzer (fuzz/grammar-fuzz.sema).
+# Driver for the Sema grammar fuzzer (fuzz/grammar-fuzz.sema).
 #
 # Runs the in-language fuzzer, which checks two correctness oracles over randomly
 # generated Sema programs:
@@ -24,7 +24,8 @@
 #   0  all checks passed
 #   1  a deterministic mismatch was found (round-trip or value oracle)
 #   2  a hard crash (VM panic) was found; reproducing seed is printed
-set -uo pipefail
+
+set -uo pipefail # no -e: inspect the fuzzer's 0/1/2 exit status instead of aborting
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT" || exit 1
