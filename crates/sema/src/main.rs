@@ -259,8 +259,11 @@ enum Commands {
         #[arg(long = "include", action = clap::ArgAction::Append)]
         includes: Vec<String>,
 
-        /// Sema binary to use as runtime base (default: current executable)
-        #[arg(long, conflicts_with = "target")]
+        /// Path to a sema executable to embed the program into, instead of this
+        /// executable (the default) or the release binary that --target downloads.
+        /// The output inherits its platform and version — pass e.g. a Windows
+        /// sema.exe to cross-build without a download. Conflicts with --target.
+        #[arg(long, value_name = "SEMA_BINARY", conflicts_with = "target")]
         runtime: Option<String>,
 
         /// Target platform triple or alias (e.g. linux, macos, windows, web, or a full triple).
@@ -2047,6 +2050,109 @@ fn try_run_embedded() -> Option<i32> {
     }
 }
 
+/// Expand a leading `~` to the user's home directory. Shells do not tilde-expand
+/// inside `--output=~/x` (the `~` follows `=`), so without this the path would be
+/// created literally as a directory named `~` in the cwd — a deletion hazard.
+fn expand_tilde(path: &str) -> std::path::PathBuf {
+    let home = || std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE"));
+    if path == "~" {
+        if let Ok(h) = home() {
+            return std::path::PathBuf::from(h);
+        }
+    } else if let Some(rest) = path.strip_prefix("~/") {
+        if let Ok(h) = home() {
+            return std::path::Path::new(&h).join(rest);
+        }
+    }
+    std::path::PathBuf::from(path)
+}
+
+/// The default output filename for a build: source stem, plus `.exe` for Windows
+/// targets (or a host build on Windows).
+fn default_output_name(source: &std::path::Path, target: Option<&str>) -> String {
+    let stem = source
+        .file_stem()
+        .unwrap_or(source.as_os_str())
+        .to_string_lossy();
+    let needs_exe = target
+        .and_then(|t| cross_compile::resolve_target(t).ok())
+        .is_some_and(cross_compile::is_windows_target)
+        || (target.is_none() && cfg!(windows));
+    if needs_exe {
+        format!("{stem}.exe")
+    } else {
+        stem.into_owned()
+    }
+}
+
+/// Resolve `--output` to the actual file path a single-target build writes.
+/// A path that IS a directory (or ends in a separator) means "default filename
+/// inside this directory"; anything else is the file path itself.
+fn resolve_output_path(
+    output: Option<&str>,
+    source: &std::path::Path,
+    target: Option<&str>,
+) -> std::path::PathBuf {
+    match output {
+        None => std::path::PathBuf::from(default_output_name(source, target)),
+        Some(o) => {
+            let p = expand_tilde(o);
+            if p.is_dir() || o.ends_with('/') || o.ends_with(std::path::MAIN_SEPARATOR) {
+                p.join(default_output_name(source, target))
+            } else {
+                p
+            }
+        }
+    }
+}
+
+/// Plan the per-target output paths for `--target all`, honoring `--output`:
+/// a directory output gets `<dir>/<stem>-<target>[.exe]`; a file-ish output is
+/// used as the base name, `<base>-<target>[.exe]` (a trailing `.exe` on the base
+/// is dropped first); no output means `<stem>-<target>[.exe]` in the cwd.
+fn plan_all_target_outputs(
+    output: Option<&str>,
+    source: &std::path::Path,
+) -> Vec<(&'static str, std::path::PathBuf)> {
+    let stem = source
+        .file_stem()
+        .unwrap_or(source.as_os_str())
+        .to_string_lossy()
+        .into_owned();
+    let (dir, base): (std::path::PathBuf, String) = match output {
+        None => (std::path::PathBuf::new(), stem),
+        Some(o) => {
+            let p = expand_tilde(o);
+            if p.is_dir() || o.ends_with('/') || o.ends_with(std::path::MAIN_SEPARATOR) {
+                (p, stem)
+            } else {
+                let base = p
+                    .file_name()
+                    .map(|f| {
+                        let f = f.to_string_lossy();
+                        f.strip_suffix(".exe").unwrap_or(&f).to_string()
+                    })
+                    .unwrap_or(stem);
+                (
+                    p.parent().map(|d| d.to_path_buf()).unwrap_or_default(),
+                    base,
+                )
+            }
+        }
+    };
+    cross_compile::SUPPORTED_TARGETS
+        .iter()
+        .map(|&t| {
+            let ext = if cross_compile::is_windows_target(t) {
+                ".exe"
+            } else {
+                ""
+            };
+            (t, dir.join(format!("{base}-{t}{ext}")))
+        })
+        .collect()
+}
+
 fn run_build(
     file: &str,
     output: Option<&str>,
@@ -2057,29 +2163,19 @@ fn run_build(
 ) -> Result<(), String> {
     // Handle --target all (build for every supported target)
     if target == Some("all") {
-        let stem = std::path::Path::new(file)
-            .file_stem()
-            .unwrap_or(std::ffi::OsStr::new(file))
-            .to_string_lossy();
         let mut failures = Vec::new();
-        for t in cross_compile::SUPPORTED_TARGETS {
-            let ext = if cross_compile::is_windows_target(t) {
-                ".exe"
-            } else {
-                ""
-            };
-            let target_output = format!("{stem}-{t}{ext}");
+        for (t, target_output) in plan_all_target_outputs(output, std::path::Path::new(file)) {
             eprintln!("\n━━━ Building for {t} ━━━");
             if let Err(e) = run_build(
                 file,
-                Some(&target_output),
+                Some(&target_output.to_string_lossy()),
                 includes,
                 None,
                 Some(t),
                 no_cache,
             ) {
                 eprintln!("Error: {e}");
-                failures.push(*t);
+                failures.push(t);
             }
         }
         if !failures.is_empty() {
@@ -2105,21 +2201,17 @@ fn run_build(
     // for writability before running any compilation steps. This avoids the
     // frustrating "failed at step 5 of 5" experience when the user gave an
     // unwritable -o path.
-    let output_path: std::path::PathBuf = match output {
-        Some(o) => std::path::PathBuf::from(o),
-        None => {
-            let stem = path.file_stem().unwrap_or(path.as_os_str());
-            let needs_exe = target
-                .and_then(|t| cross_compile::resolve_target(t).ok())
-                .is_some_and(cross_compile::is_windows_target)
-                || (target.is_none() && cfg!(windows));
-            if needs_exe {
-                std::path::PathBuf::from(format!("{}.exe", stem.to_string_lossy()))
-            } else {
-                std::path::PathBuf::from(stem)
-            }
+    let output_path = resolve_output_path(output, path, target);
+    // Refuse to clobber the source file itself (`-o hello.sema` would otherwise
+    // silently replace the program with its own binary).
+    if let (Ok(a), Ok(b)) = (path.canonicalize(), output_path.canonicalize()) {
+        if a == b {
+            return Err(format!(
+                "output path {} is the source file itself; pick a different -o",
+                output_path.display()
+            ));
         }
-    };
+    }
     probe_output_writable(&output_path)?;
 
     eprintln!("[1/5] Compiling {file}...");
@@ -2346,7 +2438,7 @@ fn web_output_path(input: &std::path::Path, output: Option<&str>) -> std::path::
 
     match output {
         Some(raw) => {
-            let path = std::path::PathBuf::from(raw);
+            let path = expand_tilde(raw);
             if path.is_dir() || raw.ends_with(std::path::MAIN_SEPARATOR) {
                 path.join(default_name)
             } else if path.extension().is_none() {
@@ -2498,10 +2590,8 @@ fn probe_output_writable(output_path: &Path) -> Result<(), String> {
         parent
     };
     if !parent.exists() {
-        return Err(format!(
-            "output directory does not exist: {}",
-            parent.display()
-        ));
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("cannot create output directory {}: {e}", parent.display()))?;
     }
     let probe_name = format!(
         ".sema-build-probe-{}-{}",
@@ -3867,6 +3957,119 @@ fn install_completions(shell: Shell) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn build_output_default_name_adds_exe_for_windows_targets() {
+        let src = std::path::Path::new("examples/game-of-life.sema");
+        assert_eq!(default_output_name(src, None), "game-of-life");
+        assert_eq!(
+            default_output_name(src, Some("windows")),
+            "game-of-life.exe"
+        );
+        assert_eq!(
+            default_output_name(src, Some("x86_64-pc-windows-msvc")),
+            "game-of-life.exe"
+        );
+        assert_eq!(default_output_name(src, Some("linux")), "game-of-life");
+    }
+
+    #[test]
+    fn build_output_into_existing_dir_uses_default_filename() {
+        let dir = std::env::temp_dir().join(format!("sema-out-dir-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = std::path::Path::new("hello.sema");
+        let out = resolve_output_path(Some(dir.to_str().unwrap()), src, None);
+        assert_eq!(out, dir.join("hello"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn build_output_trailing_slash_means_directory_even_if_missing() {
+        let src = std::path::Path::new("hello.sema");
+        let out = resolve_output_path(Some("no/such/dir/"), src, None);
+        assert_eq!(out, std::path::Path::new("no/such/dir/hello"));
+    }
+
+    #[test]
+    fn build_output_plain_path_is_the_file_itself() {
+        let src = std::path::Path::new("hello.sema");
+        let out = resolve_output_path(Some("dist/game"), src, None);
+        assert_eq!(out, std::path::Path::new("dist/game"));
+    }
+
+    #[test]
+    fn build_output_expands_leading_tilde() {
+        // `--output=~/x` reaches us unexpanded (the ~ follows `=`); it must never
+        // be treated as a literal `./~` directory.
+        if let Ok(home) = std::env::var("HOME") {
+            let src = std::path::Path::new("hello.sema");
+            let out = resolve_output_path(Some("~/sema-out/game"), src, None);
+            assert_eq!(out, std::path::Path::new(&home).join("sema-out/game"));
+        }
+    }
+
+    #[test]
+    fn build_all_targets_suffixes_filenames_and_honors_output_file_base() {
+        let src = std::path::Path::new("examples/game-of-life.sema");
+        // file-ish output: base name is taken from the output path
+        let plans = plan_all_target_outputs(Some("dist/game"), src);
+        assert_eq!(plans.len(), cross_compile::SUPPORTED_TARGETS.len());
+        for (t, path) in &plans {
+            let expect_ext = if cross_compile::is_windows_target(t) {
+                ".exe"
+            } else {
+                ""
+            };
+            assert_eq!(
+                path,
+                &std::path::PathBuf::from(format!("dist/game-{t}{expect_ext}")),
+                "unexpected plan for {t}"
+            );
+        }
+        // every planned path is distinct — this is the bug that motivated the plan
+        let unique: std::collections::HashSet<_> = plans.iter().map(|(_, p)| p).collect();
+        assert_eq!(unique.len(), plans.len());
+    }
+
+    #[test]
+    fn build_all_targets_strips_exe_from_output_base() {
+        let src = std::path::Path::new("hello.sema");
+        let plans = plan_all_target_outputs(Some("dist/game.exe"), src);
+        assert!(plans
+            .iter()
+            .all(|(_, p)| !p.to_string_lossy().contains(".exe-")));
+        assert!(plans
+            .iter()
+            .any(|(t, p)| cross_compile::is_windows_target(t)
+                && p.to_string_lossy().ends_with(".exe")));
+    }
+
+    #[test]
+    fn build_all_targets_into_directory_uses_source_stem() {
+        let dir = std::env::temp_dir().join(format!("sema-all-dir-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = std::path::Path::new("examples/game-of-life.sema");
+        let plans = plan_all_target_outputs(Some(dir.to_str().unwrap()), src);
+        for (t, path) in &plans {
+            assert!(path.starts_with(&dir));
+            assert!(path
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with(&format!("game-of-life-{t}")));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn build_all_targets_without_output_uses_cwd_stem() {
+        let src = std::path::Path::new("examples/game-of-life.sema");
+        let plans = plan_all_target_outputs(None, src);
+        assert_eq!(
+            plans[0].1,
+            std::path::PathBuf::from(format!("game-of-life-{}", plans[0].0))
+        );
+    }
 
     /// Pins the zsh-completion repair (`fix_zsh_root_completion`): position 1
     /// must dispatch subcommands (clap_complete emits the FILE/SCRIPT_ARGS
