@@ -2346,7 +2346,11 @@ fn build_archive(
     }
 
     if opts.verbose {
-        eprintln!("[4/4] Building archive ({} files)...", files.len());
+        eprintln!(
+            "[4/4] Building archive ({} file{})...",
+            files.len(),
+            if files.len() == 1 { "" } else { "s" }
+        );
     }
     let mut metadata = std::collections::HashMap::new();
     metadata.insert(
@@ -2831,7 +2835,11 @@ pub(crate) fn build_web_archive(
     );
 
     if opts.verbose {
-        eprintln!("[4/4] Building archive ({} files)...", files.len());
+        eprintln!(
+            "[4/4] Building archive ({} file{})...",
+            files.len(),
+            if files.len() == 1 { "" } else { "s" }
+        );
     }
     let files_count = files.len();
     Ok((archive::serialize_archive(&metadata, &files), files_count))
