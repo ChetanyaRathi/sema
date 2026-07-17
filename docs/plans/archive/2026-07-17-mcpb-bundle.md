@@ -115,14 +115,17 @@ see admin membership and falls back to the personal namespace. We used the
 DNS-verified **`com.sema-lang`** namespace instead (apex TXT on sema-lang.com,
 added via Vercel), which sidesteps GitHub org OAuth entirely.
 
-Re-publishing a new release:
-1. Bump `version` + the asset URL/`fileSha256` in `mcpb/server.json`.
-2. `mcp-publisher login dns --domain sema-lang.com --private-key <hex>` — needs
-   the ed25519 key that matches the live apex TXT record. **That key is not in
-   the repo.** Either preserve it (a GitHub Actions secret `MCP_PRIVATE_KEY` for
-   an automated publish step in `mcpb.yml`), or regenerate a key + update the TXT
-   record each time (the whole flow is scriptable).
-3. `mcp-publisher publish` from `mcpb/`.
+Re-publishing is **automated**: `.github/workflows/mcpb.yml` builds + uploads the
+bundle, then runs `scripts/publish-mcp-registry.sh --tag <tag>`, which patches
+`mcpb/server.json` (version + asset URL + fileSha256) and does `login dns` +
+`publish`. Auth uses the ed25519 key stored as the GitHub Actions secret
+`MCP_PRIVATE_KEY` (also in 1Password), which matches the live apex TXT record on
+sema-lang.com. Nothing to do at release time.
+
+Manual re-publish (or first-time from a new machine): build the bundle
+(`jake mcpb.pack tag=<tag>`), export `MCP_PRIVATE_KEY=<hex>`, then
+`jake mcpb.registry-publish tag=<tag>`. If the key is ever lost, generate a new
+ed25519 key, update the apex TXT record to its public key, and re-store it.
 
 ## Follow-ups / open questions
 

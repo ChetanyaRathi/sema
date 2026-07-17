@@ -36,6 +36,16 @@ task publish tag="":
     @end
 
 @group mcpb
+@desc "Publish the registry entry for a tag (needs MCP_PRIVATE_KEY; dist/sema.mcpb built)"
+@needs mcp-publisher "brew install mcp-publisher"
+task registry-publish tag="":
+    @if eq({{tag}}, "")
+        ./scripts/publish-mcp-registry.sh --tag "$(git describe --tags --abbrev=0)"
+    @else
+        ./scripts/publish-mcp-registry.sh --tag {{tag}}
+    @end
+
+@group mcpb
 @desc "Remove locally built .mcpb artifacts (dist/)"
 task clean:
     rm -rf dist

@@ -1,6 +1,7 @@
-# Build the single cross-platform Sema MCP Bundle (.mcpb) and attach it to the
-# release. Runs after cargo-dist's Release workflow publishes the release, on a
-# macOS host (lipo is macOS-only). See docs/plans/archive/2026-07-17-mcpb-bundle.md.
+# Build the single cross-platform Sema MCP Bundle (.mcpb), attach it to the
+# release, and publish the entry to the official MCP registry. Runs after
+# cargo-dist's Release workflow publishes the release, on a macOS host (lipo is
+# macOS-only). See docs/plans/archive/2026-07-17-mcpb-bundle.md.
 name: MCPB Bundle
 
 on:
@@ -29,3 +30,15 @@ jobs:
         run: |
           TAG="${{ github.event.release.tag_name || inputs.tag }}"
           ./scripts/pack-mcpb.sh --tag "$TAG" --upload
+
+      - name: Publish to MCP registry
+        env:
+          MCP_PRIVATE_KEY: ${{ secrets.MCP_PRIVATE_KEY }}
+        run: |
+          if [ -z "$MCP_PRIVATE_KEY" ]; then
+            echo "MCP_PRIVATE_KEY not set (fork / missing secret) — skipping registry publish"
+            exit 0
+          fi
+          brew install mcp-publisher
+          TAG="${{ github.event.release.tag_name || inputs.tag }}"
+          ./scripts/publish-mcp-registry.sh --tag "$TAG"
