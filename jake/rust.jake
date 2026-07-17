@@ -45,7 +45,7 @@ task clean:
 @group dev
 @desc "Start the REPL"
 task run:
-    cargo run
+    cargo run --bin sema
 
 # ── Install ──────────────────────────────────────────────────────────
 
