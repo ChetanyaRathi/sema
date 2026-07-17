@@ -15,7 +15,7 @@ pub use builtins::{
 };
 pub use client::{McpClient, McpClientConfig, McpHttpConfig};
 pub use client_auth::{login_interactive, mcp_login, mcp_login_token, mcp_logout};
-pub use server::{run_mcp_server, run_mcp_server_on};
+pub use server::{run_mcp_server, run_mcp_server_on, run_mcp_server_sync};
 
 /// A random 128-bit value as 32 lowercase hex characters (a UUID v4 with the
 /// dashes stripped — `crates/sema-mcp/src/notebook.rs` mints notebook ids the

@@ -503,7 +503,22 @@ where
     let captured = buf.lock().map(|b| b.clone()).unwrap_or_default();
 
     match result {
-        Ok(r) => (r.map_err(|e| format!("{e}")), captured),
+        // Keep structured hint/note: Display on WithContext is "{inner}" only,
+        // so plain "{e}" silently drops the VM's did-you-mean suggestions that
+        // the CLI prints — exactly the guidance an MCP client needs most.
+        Ok(r) => (
+            r.map_err(|e| {
+                let mut message = e.to_string();
+                if let Some(hint) = e.hint() {
+                    message.push_str(&format!("\nhint: {hint}"));
+                }
+                if let Some(note) = e.note() {
+                    message.push_str(&format!("\nnote: {note}"));
+                }
+                message
+            }),
+            captured,
+        ),
         Err(panic) => std::panic::resume_unwind(panic),
     }
 }
@@ -620,7 +635,7 @@ pub fn list_mcp_tools(
             "type": "object",
             "properties": {}
         })),
-        ("docs_search", "Search Sema documentation by natural-language query (e.g. 'reverse a list', 'read file lines'). Returns the most relevant builtins/special forms ranked by relevance, as a JSON array of {name, module, summary, score}. Use this to discover the right function or syntax when you don't already know its name; use `docs` for the full docs of a known symbol.", json!({
+        ("docs_search", "Search Sema documentation by natural-language query (e.g. 'reverse a list', 'read file lines'). Returns the most relevant builtins/special forms ranked by relevance, as a JSON array of {name, module, signature, summary, score} — the signature shows argument ORDER. Use this to discover the right function or syntax when you don't already know its name; use `docs` for the full docs of a known symbol.", json!({
             "type": "object",
             "properties": {
                 "query": { "type": "string", "description": "What you're looking for, in plain words (e.g. 'parse json string', 'spawn an async task')." },
@@ -1011,7 +1026,21 @@ fn call_mcp_tool_inner(
             // Fallback to builtin docs database
             match get_builtin_doc(symbol) {
                 Some(doc) => success_result(doc.clone()),
-                None => error_result(format!("No documentation found for symbol: {symbol}")),
+                None => {
+                    // A bare miss invites blind re-guessing (a real session
+                    // burned turns on string/concat, llm/generate). Suggest
+                    // near-misses the same way the CLI/REPL does.
+                    let mut text = format!("No documentation found for symbol: {symbol}");
+                    let map = BUILTIN_DOCS.get_or_init(crate::builtin_docs::build_builtin_docs);
+                    let names: Vec<&str> = map.keys().map(|s| s.as_str()).collect();
+                    if let Some(suggestion) = sema_core::error::suggest_similar(symbol, &names) {
+                        text.push_str(&format!("\nhint: {suggestion}"));
+                    } else if let Some(hint) = sema_core::error::veteran_hint(symbol) {
+                        text.push_str(&format!("\nhint: {hint}"));
+                    }
+                    text.push_str("\nTry docs_search with a plain-words query to discover the right name.");
+                    error_result(text)
+                }
             }
         }
         "docs_search" => {

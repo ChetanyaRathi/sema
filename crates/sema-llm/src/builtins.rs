@@ -6007,6 +6007,10 @@ fn format_schema(val: &Value) -> String {
                 } else {
                     "any".to_string()
                 }
+            } else if let Some(kw) = v.as_keyword() {
+                // Bare keyword spec ({:total :number}) is shorthand for
+                // {:type :number} — tell the model the type instead of <any>.
+                kw
             } else {
                 "any".to_string()
             };
@@ -6056,7 +6060,23 @@ fn validate_extraction(result: &Value, schema: &Value) -> Result<(), String> {
                 }
             }
             Some(val) => {
-                if let Some(spec) = field_spec.as_map_rc() {
+                // A bare keyword spec ({:total :number}) is shorthand for
+                // {:type :number} — it must be type-checked too, not skipped.
+                if let Some(type_name) = field_spec.as_keyword() {
+                    let ok = match type_name.as_str() {
+                        "string" => val.as_str().is_some(),
+                        "number" => val.as_float().is_some(),
+                        "boolean" | "bool" => val.as_bool().is_some(),
+                        "list" | "array" => val.as_seq().is_some(),
+                        _ => true,
+                    };
+                    if !ok {
+                        errors.push(format!(
+                            "key {key_name}: expected {type_name}, got {}",
+                            val.type_name()
+                        ));
+                    }
+                } else if let Some(spec) = field_spec.as_map_rc() {
                     // Type checking
                     if let Some(type_val) = spec.get(&Value::keyword("type")) {
                         let type_name = type_val

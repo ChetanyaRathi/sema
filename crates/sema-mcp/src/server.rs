@@ -21,6 +21,132 @@ pub async fn run_mcp_server(
     .await
 }
 
+/// Synchronous stdio server loop for the CLI entry point.
+///
+/// The server MUST NOT run inside a tokio runtime: tool bodies evaluate
+/// synchronously and LLM builtins reach `sema_io::io_block_on`, which panics
+/// ("Cannot start a runtime from within a runtime") when an ambient runtime
+/// exists — under `panic = "abort"` release builds that killed the whole
+/// server on the first `llm/*` call from an MCP client. Requests are handled
+/// serially anyway, so plain blocking std::io is the correct shape; the async
+/// `run_mcp_server_on` remains for in-memory duplex tests.
+pub fn run_mcp_server_sync(
+    interpreter: Interpreter,
+    include_tools: Option<Vec<String>>,
+    exclude_tools: Option<Vec<String>>,
+) -> Result<(), String> {
+    use std::io::BufRead;
+
+    let stdin = std::io::stdin();
+    let mut reader = stdin.lock();
+    let stdout = std::io::stdout();
+    let mut writer = stdout.lock();
+    // Same raw-bytes-per-line contract as the async loop: one non-UTF-8 byte
+    // must produce a JSON-RPC parse error, not tear down the server.
+    let mut buf: Vec<u8> = Vec::new();
+
+    let notebook_cache: NotebookCache = new_cache();
+
+    eprintln!("Sema MCP server starting stdio loop...");
+
+    loop {
+        buf.clear();
+        let bytes_read = reader
+            .read_until(b'\n', &mut buf)
+            .map_err(|e| format!("Failed to read stdin: {e}"))?;
+        if bytes_read == 0 {
+            break; // EOF
+        }
+
+        let line = match std::str::from_utf8(&buf) {
+            Ok(s) => s.trim(),
+            Err(_) => {
+                write_line(&mut writer, &parse_error_frame("request was not valid UTF-8"));
+                continue;
+            }
+        };
+        if line.is_empty() {
+            continue;
+        }
+
+        let request: JsonRpcRequest = match serde_json::from_str(line) {
+            Ok(req) => req,
+            Err(e) => {
+                write_line(&mut writer, &parse_error_frame(&format!("{e}")));
+                continue;
+            }
+        };
+
+        let response = handle_request(
+            request,
+            &interpreter,
+            &notebook_cache,
+            include_tools.as_deref(),
+            exclude_tools.as_deref(),
+        );
+
+        if let Some(resp) = response {
+            if !write_line(&mut writer, &serialize_response(&resp)) {
+                break;
+            }
+        }
+    }
+
+    eprintln!("Sema MCP server stdio loop exited.");
+    Ok(())
+}
+
+/// Write one already-serialized frame + flush; false = writer gone, stop loop.
+fn write_line(writer: &mut impl std::io::Write, frame: &str) -> bool {
+    if let Err(e) = writer.write_all(frame.as_bytes()) {
+        eprintln!("Error writing response to stdout: {e}");
+        return false;
+    }
+    if let Err(e) = writer.flush() {
+        eprintln!("Error flushing stdout: {e}");
+        return false;
+    }
+    true
+}
+
+fn parse_error_frame(message: &str) -> String {
+    let err_resp = JsonRpcResponse {
+        jsonrpc: "2.0".to_string(),
+        result: None,
+        error: Some(JsonRpcError::new(-32700, format!("Parse error: {message}"))),
+        id: None,
+        method: None,
+    };
+    serde_json::to_string(&err_resp)
+        .map(|s| format!("{s}\n"))
+        .unwrap_or_default()
+}
+
+/// Serialize a response without unwrapping: a serialization failure falls back
+/// to a -32603 frame carrying the original id (shared by both server loops).
+fn serialize_response(resp: &JsonRpcResponse) -> String {
+    match serde_json::to_string(resp) {
+        Ok(s) => format!("{s}\n"),
+        Err(e) => {
+            eprintln!("Failed to serialize response: {e}");
+            let fallback = JsonRpcResponse {
+                jsonrpc: "2.0".to_string(),
+                result: None,
+                error: Some(JsonRpcError::new(
+                    -32603,
+                    format!("Internal error: failed to serialize response: {e}"),
+                )),
+                id: resp.id.clone(),
+                method: None,
+            };
+            match serde_json::to_string(&fallback) {
+                Ok(s) => format!("{s}\n"),
+                Err(_) => "{\"jsonrpc\":\"2.0\",\"error\":{\"code\":-32603,\"message\":\"Internal error\"},\"id\":null}\n".to_string(),
+            }
+        }
+    }
+}
+
 pub async fn run_mcp_server_on<R, W>(
     reader: R,
     mut writer: W,
@@ -83,33 +209,9 @@ where
         );
 
         if let Some(resp) = response {
-            // Serialize on the hot path WITHOUT unwrapping: a serialization
-            // failure must not panic and tear down the whole server loop. Fall
-            // back to a generic -32603 internal-error response that still carries
-            // the original request id so the client can correlate it.
-            let resp_str = match serde_json::to_string(&resp) {
-                Ok(s) => format!("{s}\n"),
-                Err(e) => {
-                    eprintln!("Failed to serialize response: {e}");
-                    let fallback = JsonRpcResponse {
-                        jsonrpc: "2.0".to_string(),
-                        result: None,
-                        error: Some(JsonRpcError::new(
-                            -32603,
-                            format!("Internal error: failed to serialize response: {e}"),
-                        )),
-                        id: resp.id.clone(),
-                        method: None,
-                    };
-                    // The fallback is a tiny, statically-shaped struct that should
-                    // never fail to serialize; if it somehow does, emit a
-                    // hand-written minimal frame rather than panicking.
-                    match serde_json::to_string(&fallback) {
-                        Ok(s) => format!("{s}\n"),
-                        Err(_) => "{\"jsonrpc\":\"2.0\",\"error\":{\"code\":-32603,\"message\":\"Internal error\"},\"id\":null}\n".to_string(),
-                    }
-                }
-            };
+            // Shared with the sync loop: serialize without unwrapping, falling
+            // back to a -32603 frame that keeps the request id.
+            let resp_str = serialize_response(&resp);
             if let Err(e) = writer.write_all(resp_str.as_bytes()).await {
                 eprintln!("Error writing response to stdout: {e}");
                 break;

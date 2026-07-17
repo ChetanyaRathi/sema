@@ -965,18 +965,13 @@ fn main() {
                     }
                 }
 
-                tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .expect("Failed to create tokio runtime")
-                    .block_on(async {
-                        if let Err(e) =
-                            sema_mcp::run_mcp_server(interpreter, inc_tools, exc_tools).await
-                        {
-                            eprintln!("MCP server error: {e}");
-                            std::process::exit(1);
-                        }
-                    });
+                // Sync loop, deliberately NO tokio runtime: with an ambient
+                // runtime, llm/* builtins hit io_block_on's runtime-in-runtime
+                // panic and killed the server on the first LLM tool call.
+                if let Err(e) = sema_mcp::run_mcp_server_sync(interpreter, inc_tools, exc_tools) {
+                    eprintln!("MCP server error: {e}");
+                    std::process::exit(1);
+                }
             }
             Commands::Notebook { command } => {
                 run_notebook_command(command);
@@ -2055,16 +2050,11 @@ fn try_run_embedded() -> Option<i32> {
             return Some(1);
         }
 
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("Failed to create tokio runtime")
-            .block_on(async {
-                if let Err(e) = sema_mcp::run_mcp_server(interpreter, inc_tools, exc_tools).await {
-                    eprintln!("MCP server error: {e}");
-                    std::process::exit(1);
-                }
-            });
+        // Same no-ambient-runtime rule as the CLI mcp arm (llm/* + io_block_on).
+        if let Err(e) = sema_mcp::run_mcp_server_sync(interpreter, inc_tools, exc_tools) {
+            eprintln!("MCP server error: {e}");
+            std::process::exit(1);
+        }
         Some(0)
     } else {
         match run_bytecode_bytes(&interpreter, &bytecode) {
