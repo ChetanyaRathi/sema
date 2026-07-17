@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-#
+
 # Hermetic acceptance gate for the docs_search MCP tool.
 #
 # Builds a FROM-scratch image containing ONLY the compiled `sema` binary, then drives

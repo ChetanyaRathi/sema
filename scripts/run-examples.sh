@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-#
+
 # Run all runnable Sema examples headless and report pass/skip/fail.
 #
 # "Runnable" = pure, self-contained programs that complete on their own. We

@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
+
+# Prove the published sema-lang crate embeds the complete browser runtime.
 #
-# Prove the published sema-lang crate contains and embeds the complete browser
-# runtime; the build runs from the unpacked .crate, not the checkout. Targets
-# macOS stock Bash 3.2.
+# The build runs from the unpacked .crate, not the checkout, so it can't rely on
+# anything outside the packaged files. Targets macOS stock Bash 3.2.
 #
 # Usage: scripts/test-packaged-sema-web.sh
 

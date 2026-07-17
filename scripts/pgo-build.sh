@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-#
+
 # Profile-Guided Optimization build of the `sema` binary.
 #
 # Pipeline: instrument -> train (compute benches + a 1BRC sample) -> merge -> rebuild.

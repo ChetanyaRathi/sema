@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-#
+
 # Driver for the Sema grammar fuzzer (fuzz/grammar-fuzz.sema).
 #
 # Runs the in-language fuzzer, which checks two correctness oracles over randomly

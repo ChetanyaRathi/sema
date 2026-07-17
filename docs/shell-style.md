@@ -18,8 +18,8 @@ why, drop change-narration).
 
 ```bash
 #!/usr/bin/env bash
-#
-# One-line purpose: what it produces or proves.
+
+# One-line summary: what it produces or proves.
 #
 # Longer description: how it works and, crucially, WHY — the invariant it
 # guards, the incident it prevents, or the non-obvious constraint. Skip this
@@ -41,9 +41,10 @@ Rules:
 - **Shebang is always `#!/usr/bin/env bash`.** All our scripts already are. This
   deliberately overrides Google's `#!/bin/bash` — we run on macOS, where stock
   `/bin/bash` is an ancient 3.2 and Homebrew's bash lives elsewhere on `PATH`.
-- **First line after the shebang is a bare `#`**, then a one-line purpose in the
-  imperative ("Build the …", "Guard: …"). No filename line — the path already
-  names the file; a header line just drifts on rename.
+- **A blank line after the shebang** (not a `#` spacer), then a **single-line
+  summary** in the imperative ("Build the …", "Guard: …"), then a `#` gap and the
+  longer description. No filename line — the path already names the file; a header
+  line just drifts on rename.
 - **Breathing room:** a blank line between the header comment and `set`, and a
   blank line after `set` before the first statement. Give the code room.
 - Include `Usage:`/`Env:`/`Requires:` lines only when they apply. Keep any

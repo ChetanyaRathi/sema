@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-#
+
 # Regenerate the vendored LLM pricing snapshot from models.dev.
 #
 # Source:  https://models.dev/api.json  (data is MIT-licensed; see the snapshot header)

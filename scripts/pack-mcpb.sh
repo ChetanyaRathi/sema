@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-#
+
 # Build the single cross-platform Sema MCP Bundle (.mcpb).
 #
 # A .mcpb is a zip of `manifest.json` + the server binaries. We ship ONE bundle

@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
+
+# Stress test: build every runnable example to a standalone binary and run it.
 #
-# Stress test: compile every runnable example into a STANDALONE BINARY with
-# `sema build`, then execute that binary and check it succeeds. This exercises
-# the whole release path — bytecode compile + serialize, import tracing, VFS
-# bundling, runtime injection (libsui/ELF), and VM execution of a `.semac` from
-# an embedded archive — not just `sema <file>`.
+# Compiles each example with `sema build`, then executes that binary and checks it
+# succeeds — exercising the whole release path (bytecode compile + serialize,
+# import tracing, VFS bundling, runtime injection via libsui/ELF, and VM execution
+# of a `.semac` from an embedded archive), not just `sema <file>`.
 #
 # Same blacklist as scripts/run-examples.sh (interactive/server/hardware), plus
 # a per-binary run timeout. Exits non-zero if any example fails to build or run.

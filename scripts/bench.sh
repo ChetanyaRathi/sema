@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
+
+# Hyperfine-driven benchmark runner for the `sema` binary.
 #
-# Hyperfine-driven benchmark runner for the `sema` binary, grouped suites
-# (core/closure/data/…). Driven by `jake bench.*`; see jake/bench.jake.
+# Grouped suites (core/closure/data/…). Driven by `jake bench.*`; see
+# jake/bench.jake.
 
 set -euo pipefail
 

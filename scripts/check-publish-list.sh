@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
+
+# Guard: every publishable workspace crate appears in publish.yml's crates.io order.
 #
-# Guard: every publishable workspace crate must appear in the crates.io publish
-# order in .github/workflows/publish.yml. This catches the "added a new crate but
-# forgot to add it to the publish list" mistake — which once half-published a
-# release (sema-llm failed: "no matching package named sema-otel") because the new
-# sema-otel crate wasn't in the list. Run in CI so it fails BEFORE any publish.
+# Catches the "added a new crate but forgot the publish list" mistake — which once
+# half-published a release (sema-llm failed: "no matching package named sema-otel")
+# because the new sema-otel crate wasn't in the list. Run in CI so it fails BEFORE
+# any publish.
 
 set -euo pipefail
 
