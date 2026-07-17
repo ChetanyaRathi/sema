@@ -75,7 +75,12 @@ pub(crate) fn rendered_doc_entry(name: &str, entry: &DocEntry) -> String {
         )
     };
     let md = sema_lsp::builtin_docs::render_markdown(entry);
-    format!("{heading}\n{}\n", render_terminal_markdown(&md))
+    // Blank line between the heading and the body so the doc doesn't read as
+    // one cramped block (matches Julia/Elixir/Python REPL doc rendering).
+    // trim_start guards against a double gap if the rendered body already
+    // leads with whitespace.
+    let body = render_terminal_markdown(&md);
+    format!("{heading}\n\n{}\n", body.trim_start_matches('\n'))
 }
 
 pub(crate) fn print_rendered(text: &str, pager: PagerMode) -> io::Result<()> {
@@ -590,6 +595,23 @@ mod tests {
             "canonical name missing: {out:?}"
         );
         assert!(out.contains("builtin"), "kind label missing: {out:?}");
+    }
+
+    #[test]
+    fn rendered_doc_entry_separates_heading_from_body_with_blank_line() {
+        let entry = lookup("string-split").expect("entry");
+        let out = rendered_doc_entry("string-split", entry);
+        let heading_end = out.find('\n').expect("heading newline");
+        // A blank line must sit between the heading and the body, and there
+        // must be exactly one (no double gap).
+        assert!(
+            out[heading_end..].starts_with("\n\n"),
+            "expected blank line after heading: {out:?}"
+        );
+        assert!(
+            !out[heading_end..].starts_with("\n\n\n"),
+            "expected exactly one blank line, not a double gap: {out:?}"
+        );
     }
 
     #[test]
