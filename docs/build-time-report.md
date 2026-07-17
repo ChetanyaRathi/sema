@@ -258,6 +258,25 @@ win is dynamic: each edit→test iteration now rewrites ~4.4G of binaries instea
 ~8.6G, and the 5–9× faster loop means worktrees live (and are `jake wt-rm`'d)
 sooner. Sweep discipline (`jake sweep days=1` under pressure) still matters.
 
+### Follow-up round (same day)
+
+- **`pio` dev-dependency removed** (the RP2040 PIO reference assembler pulled
+  `pio-proc`, a 6MB lalrpop proc-macro stack, into every test build). Its
+  reference encodings are frozen into `crates/sema/tests/fixtures/pio_golden.json`,
+  generated once by `tools/pio-golden` — a tiny crate deliberately excluded from
+  the workspace. All 72 cross-validation tests pass against the fixture; the
+  oracle stays the real `pio` crate, just evaluated at regeneration time instead
+  of every build.
+- **`sema build` Windows executables are now branded**: the canonical
+  `sema-mark-rounded` icon (self-tiled, so it reads on light and dark themes —
+  PE icons cannot adapt to theme) is embedded via `libsui::set_icon`
+  (512px master → 256→16px ICO set), and a
+  `VERSIONINFO` resource (ProductName/FileDescription/FileVersion) is added via
+  `editpe` — the PE editor libsui already uses internally, so zero new compile
+  cost. This turns libsui's previously-dead `image` dependency into a feature.
+  Verified against a real v1.30.0 Windows runtime: icon set, version strings,
+  and the `semaexec` payload all read back correctly with `pefile`.
+
 Research verdicts for the rest (2026-07-17): keep `scraper` (nothing lighter
 parses messy HTML + CSS selectors; alternatives sit on the same html5ever
 stack), keep `indicatif` (one call site, tiny tree), keep `notify` (bump to v8

@@ -19,6 +19,9 @@ members = [
     "crates/sema-workflow",
 ]
 resolver = "2"
+# One-shot generator for the PIO golden fixture; deliberately outside the workspace
+# so its pio/lalrpop proc-macro stack never joins normal builds (see the tool's docs).
+exclude = ["tools/pio-golden"]
 
 # What a bare `cargo build` / `cargo test` builds. Excludes only sema-wasm: it is
 # wasm32-only in practice (built via jake wasm.* with --target wasm32-unknown-unknown),

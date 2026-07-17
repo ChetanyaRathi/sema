@@ -52,6 +52,9 @@ clap.workspace = true
 clap_complete.workspace = true
 serde_json.workspace = true
 libsui = "0.16"
+# Same PE resource editor libsui uses internally (zero extra compile cost): adds
+# the VERSIONINFO resource to `sema build` Windows executables.
+editpe = "0.1"
 toml.workspace = true
 toml_edit.workspace = true
 serde.workspace = true
@@ -75,7 +78,6 @@ libc = "0.2"
 
 [dev-dependencies]
 paste = "1"
-pio = "0.3"
 sema-otel = { workspace = true, features = ["testing"] }
 opentelemetry = "0.32"
 opentelemetry_sdk = { version = "0.32", features = ["trace", "testing"] }

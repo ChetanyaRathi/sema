@@ -2546,6 +2546,71 @@ fn strip_os_error(s: &str) -> String {
     s.to_string()
 }
 
+/// Add a `VERSIONINFO` resource to a `sema build` Windows executable so Explorer's
+/// Details tab shows the program name and the Sema runtime version. The resource
+/// directory already contains the payload + icons written by libsui; editpe rebuilds
+/// it in place, preserving them.
+fn set_windows_version_info(
+    pe_bytes: Vec<u8>,
+    output_path: &std::path::Path,
+) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    use editpe::types::{VersionU16, VersionU32};
+
+    let program = output_path
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "program".to_string());
+    let sema_version = env!("CARGO_PKG_VERSION");
+    let (maj, min, pat) = {
+        let mut it = sema_version
+            .split('.')
+            .map(|p| p.parse::<u16>().unwrap_or(0));
+        (
+            it.next().unwrap_or(0),
+            it.next().unwrap_or(0),
+            it.next().unwrap_or(0),
+        )
+    };
+    // VS_FIXEDFILEINFO packs each version as two dwords: MS = major<<16|minor,
+    // LS = patch<<16|build.
+    let version = VersionU32 {
+        major: ((maj as u32) << 16) | min as u32,
+        minor: (pat as u32) << 16,
+    };
+
+    let mut info = editpe::VersionInfo::default();
+    info.info.file_version = version;
+    info.info.product_version = version;
+    info.info.file_os = 0x0004_0004; // VOS_NT_WINDOWS32
+    info.info.file_type = 0x1; // VFT_APP
+
+    // en-US (0x0409), Unicode codepage (0x04B0) — key format Windows expects.
+    let mut table = editpe::VersionStringTable {
+        key: "040904b0".to_string(),
+        strings: Default::default(),
+    };
+    for (k, v) in [
+        ("ProductName", program.clone()),
+        ("FileDescription", format!("{program} (built with Sema)")),
+        ("FileVersion", sema_version.to_string()),
+        ("ProductVersion", sema_version.to_string()),
+        ("OriginalFilename", format!("{program}.exe")),
+    ] {
+        table.strings.insert(k.to_string(), v);
+    }
+    info.strings.push(table);
+    info.vars.push(VersionU16 {
+        major: 0x0409,
+        minor: 0x04B0,
+    });
+
+    let mut image = editpe::Image::parse(&pe_bytes[..])?;
+    let mut dir = image.resource_directory().cloned().unwrap_or_default();
+    dir.set_version_info(&info)?;
+    image.set_resource_directory(dir)?;
+    Ok(image.data().to_vec())
+}
+
 /// Write the executable using format-aware injection.
 ///
 /// Detects the binary format at runtime (not compile-time) so that
@@ -2596,10 +2661,21 @@ fn write_executable_platform(
                 .build_and_sign(&mut out)?;
         }
         cross_compile::BinaryFormat::Pe => {
-            let mut out = std::fs::File::create(output_path)?;
+            // libsui writes the payload + multi-resolution icon; a second editpe pass
+            // (same crate libsui uses internally) adds the VERSIONINFO resource that
+            // Explorer's Details tab reads. Both are branding — the payload embed
+            // above them is what makes the binary work.
+            let mut branded = Vec::with_capacity(runtime.len() + archive_bytes.len());
             libsui::PortableExecutable::from(&runtime)?
                 .write_resource("semaexec", archive_bytes.to_vec())?
-                .build(&mut out)?;
+                // The rounded mark carries its own dark tile, so it reads correctly on
+                // both light and dark backgrounds — PE icons cannot adapt to theme.
+                .set_icon(include_bytes!(
+                    "../../../assets/icons/png/sema-mark-rounded-512.png"
+                ))?
+                .build(&mut branded)?;
+            let branded = set_windows_version_info(branded, output_path)?;
+            std::fs::write(output_path, branded)?;
         }
         cross_compile::BinaryFormat::Elf => {
             archive::write_bundled_executable_from_bytes(&runtime, output_path, archive_bytes)?;
