@@ -1,4 +1,4 @@
-# Docs — builtin-doc index, LLM pricing snapshot, markdown link check.
+# Docs — builtin-doc index, LLM pricing snapshot.
 # Imported UNnamespaced (`jake docs`, `jake docs-check`).
 
 @group docs
@@ -21,12 +21,6 @@ task docs-check:
 @desc "Refresh the vendored LLM pricing snapshot (pricing-data.json)"
 task update-pricing:
     ./scripts/update-pricing.sh
-
-@group docs
-@desc "Check markdown links with lychee"
-@needs lychee "cargo install lychee"
-task lint-links:
-    lychee --config lychee.toml --no-progress '**/*.md'
 
 # Hermetic gate: docs_search must work from the binary alone in a from-scratch
 # container (no source, no uncompiled docs, --network none).
