@@ -42,3 +42,24 @@ jobs:
           brew install mcp-publisher
           TAG="${{ github.event.release.tag_name || inputs.tag }}"
           ./scripts/publish-mcp-registry.sh --tag "$TAG"
+
+      # publish-mcp-registry.sh rewrote mcpb/server.json (version + asset URL +
+      # sha) in the tag checkout; commit that bump onto the default branch so the
+      # repo mirrors what's live. No-ops if unchanged; never fails the run.
+      - name: Commit bumped server.json to the default branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git diff --quiet -- mcpb/server.json && { echo "server.json unchanged; nothing to commit"; exit 0; }
+          TAG="${{ github.event.release.tag_name || inputs.tag }}"
+          BR="${{ github.event.repository.default_branch }}"
+          tmp="$(mktemp)"; cp mcpb/server.json "$tmp"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git fetch --depth=1 origin "$BR"
+          git checkout -B "$BR" "origin/$BR"
+          cp "$tmp" mcpb/server.json
+          git diff --quiet -- mcpb/server.json && { echo "already current on $BR"; exit 0; }
+          git add mcpb/server.json
+          git commit -m "mcpb: server.json -> $TAG (automated registry publish) [skip ci]"
+          git push origin "HEAD:$BR" || echo "push failed (branch protection?); publish already succeeded"
