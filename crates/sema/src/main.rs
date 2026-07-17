@@ -340,6 +340,10 @@ enum Commands {
         /// Comma-separated list of tool names to explicitly exclude
         #[arg(long, value_name = "TOOLS")]
         exclude: Option<String>,
+        /// Sandbox mode for the server (e.g. "strict" or "no-fs-write,no-shell").
+        /// Defaults to the top-level --sandbox value, else allows everything.
+        #[arg(long, value_name = "MODE")]
+        sandbox: Option<String>,
     },
     /// Cell-based notebook with a browser UI
     Notebook {
@@ -895,6 +899,7 @@ fn main() {
                 files,
                 include,
                 exclude,
+                sandbox: mcp_sandbox,
             } => {
                 if let Some(auth) = auth {
                     let result = match auth {
@@ -930,7 +935,17 @@ fn main() {
                         .collect::<Vec<String>>()
                 });
 
-                let sandbox = sema_core::Sandbox::allow_all();
+                // --sandbox on the subcommand wins; else the top-level --sandbox
+                // (already parsed into `sandbox`, defaulting to allow-all). The
+                // server historically hardcoded allow_all, so absent flags keep
+                // exactly that behavior.
+                let sandbox = match mcp_sandbox.as_deref() {
+                    Some(value) => sema_core::Sandbox::parse_cli(value).unwrap_or_else(|e| {
+                        eprintln!("mcp: invalid --sandbox: {e}");
+                        std::process::exit(1);
+                    }),
+                    None => sandbox,
+                };
                 let interpreter = build_interpreter(&sandbox);
 
                 let _ = interpreter.eval_str("(llm/auto-configure)");

@@ -294,6 +294,25 @@ sema mcp tools/receipts.sema --include extract-receipt
 sema mcp tools/receipts.sema --exclude order-pineapple-pizza
 ```
 
+### 4. Sandboxing
+
+By default the server runs **unsandboxed** — its `eval` and user-defined tools have
+full shell/filesystem/network access. Restrict it with `--sandbox`, using the same
+grammar as the top-level flag (`strict`, or a comma-separated capability list):
+
+```bash
+# Deny shell, network, fs-write, env-write, process, and LLM calls
+sema mcp tools/receipts.sema --sandbox strict
+
+# Targeted: everything allowed except shell and filesystem writes
+sema mcp tools/receipts.sema --sandbox no-shell,no-fs-write
+```
+
+A denied capability surfaces to the client as a normal tool error
+(`Permission denied: shell requires 'shell' capability`). The subcommand flag wins
+over a top-level `--sandbox`; with neither, the historical allow-everything
+behavior is unchanged.
+
 ---
 
 ## Stateful Notebook Tools
