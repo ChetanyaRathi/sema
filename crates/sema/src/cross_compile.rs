@@ -32,9 +32,9 @@ pub fn resolve_target(target: &str) -> Result<&'static str, String> {
     match target {
         "linux" => Ok("x86_64-unknown-linux-gnu"),
         "linux-arm" | "linux-aarch64" => Ok("aarch64-unknown-linux-gnu"),
-        "macos" | "darwin" => Ok("aarch64-apple-darwin"),
+        "macos" | "darwin" | "mac" => Ok("aarch64-apple-darwin"),
         "macos-intel" | "darwin-intel" | "macos-x86_64" => Ok("x86_64-apple-darwin"),
-        "windows" | "win" => Ok("x86_64-pc-windows-msvc"),
+        "windows" | "win" | "win32" => Ok("x86_64-pc-windows-msvc"),
         _ => Err(format!(
             "unknown target '{target}'. Supported targets:\n{}",
             SUPPORTED_TARGETS
@@ -542,12 +542,12 @@ pub fn list_targets() {
     eprintln!("  web          → emits a .vfs archive for SemaWeb");
     eprintln!();
     eprintln!("Aliases:");
-    eprintln!("  linux        → x86_64-unknown-linux-gnu");
-    eprintln!("  linux-arm    → aarch64-unknown-linux-gnu");
-    eprintln!("  macos        → aarch64-apple-darwin");
-    eprintln!("  macos-intel  → x86_64-apple-darwin");
-    eprintln!("  windows      → x86_64-pc-windows-msvc");
-    eprintln!("  all          → all supported targets");
+    eprintln!("  linux                → x86_64-unknown-linux-gnu");
+    eprintln!("  linux-arm            → aarch64-unknown-linux-gnu");
+    eprintln!("  macos, mac           → aarch64-apple-darwin");
+    eprintln!("  macos-intel          → x86_64-apple-darwin");
+    eprintln!("  windows, win, win32  → x86_64-pc-windows-msvc");
+    eprintln!("  all                  → all supported targets");
 }
 
 #[cfg(test)]
@@ -569,9 +569,11 @@ mod tests {
     fn test_resolve_target_aliases() {
         assert_eq!(resolve_target("linux").unwrap(), "x86_64-unknown-linux-gnu");
         assert_eq!(resolve_target("macos").unwrap(), "aarch64-apple-darwin");
+        assert_eq!(resolve_target("mac").unwrap(), "aarch64-apple-darwin");
         assert_eq!(resolve_target("darwin").unwrap(), "aarch64-apple-darwin");
         assert_eq!(resolve_target("windows").unwrap(), "x86_64-pc-windows-msvc");
         assert_eq!(resolve_target("win").unwrap(), "x86_64-pc-windows-msvc");
+        assert_eq!(resolve_target("win32").unwrap(), "x86_64-pc-windows-msvc");
         assert_eq!(
             resolve_target("linux-arm").unwrap(),
             "aarch64-unknown-linux-gnu"
