@@ -1014,7 +1014,8 @@ pub async fn run_server() {
                     let client = client.clone();
                     let handle = handle.clone();
                     std::thread::spawn(move || {
-                        let tmp = BackendState::new_without_builtins(docs, sema_binary, run_sandbox_mode);
+                        let tmp =
+                            BackendState::new_without_builtins(docs, sema_binary, run_sandbox_mode);
                         tmp.handle_execute_command(&command, &arguments, &client, &handle);
                     });
                 }

@@ -1,5 +1,5 @@
 #[cfg(feature = "nono")]
-use nono::{CapabilitySet, AccessMode, Sandbox};
+use nono::{AccessMode, CapabilitySet, Sandbox};
 
 /// Applies an OS-level capability sandbox using `nono`.
 pub fn apply_os_sandbox(sandbox: &crate::sandbox::Sandbox) -> Result<(), String> {
@@ -22,11 +22,17 @@ pub fn apply_os_sandbox(sandbox: &crate::sandbox::Sandbox) -> Result<(), String>
         let network = !sandbox.denied.contains(crate::sandbox::Caps::NETWORK);
 
         if fs_read && fs_write {
-            os_caps = os_caps.allow_path("/", AccessMode::ReadWrite).map_err(|e| e.to_string())?;
+            os_caps = os_caps
+                .allow_path("/", AccessMode::ReadWrite)
+                .map_err(|e| e.to_string())?;
         } else if fs_read {
-            os_caps = os_caps.allow_path("/", AccessMode::Read).map_err(|e| e.to_string())?;
+            os_caps = os_caps
+                .allow_path("/", AccessMode::Read)
+                .map_err(|e| e.to_string())?;
         } else if fs_write {
-            os_caps = os_caps.allow_path("/", AccessMode::Write).map_err(|e| e.to_string())?;
+            os_caps = os_caps
+                .allow_path("/", AccessMode::Write)
+                .map_err(|e| e.to_string())?;
         }
 
         if !network {
@@ -34,7 +40,7 @@ pub fn apply_os_sandbox(sandbox: &crate::sandbox::Sandbox) -> Result<(), String>
         }
 
         Sandbox::apply_auto(&os_caps).map_err(|e| format!("Sandbox error: {}", e))?;
-        
+
         Ok(())
     }
 }
