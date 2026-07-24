@@ -37,6 +37,42 @@ pub struct NativeCallContext<'a> {
     pub task_context: TaskContextHandle,
     pub call_env: Option<Rc<Env>>,
     pub cancellation: CancellationView,
+    /// Synchronous-HOF capability, installed only by the VM's in-quantum native
+    /// dispatch. `None` everywhere else (drive-level dispatch, restricted runs,
+    /// host adapters) — a HOF then takes its cooperative `NativeOutcome::Call`
+    /// path unchanged.
+    pub hof_host: Option<&'a dyn SyncHofHost>,
+}
+
+/// Host capability for running a cooperative HOF's callback chain synchronously
+/// inside the active runtime quantum. Implemented by the VM and offered to
+/// natives through [`NativeCallContext::hof_host`].
+///
+/// [`run_sync_hof`](SyncHofHost::run_sync_hof) declines (`None`) unless
+/// `callable` is a VM closure whose call graph provably cannot suspend — the
+/// caller must then fall back to its cooperative path. When it accepts, it runs
+/// `driver` with a live [`SyncCallbackSession`] and returns the driver's result
+/// as the native's outcome.
+pub trait SyncHofHost {
+    fn run_sync_hof(
+        &self,
+        callable: &Value,
+        driver: &mut dyn FnMut(&mut dyn SyncCallbackSession) -> NativeResult,
+    ) -> Option<NativeResult>;
+}
+
+/// One accepted synchronous HOF run: per-element direct calls of the proven
+/// non-suspending callback on a scratch VM, no scheduler involvement.
+pub trait SyncCallbackSession {
+    /// Call the callback once. `args` is an owned buffer the caller will not
+    /// reuse — values are moved into the callee frame (nils left behind), so a
+    /// uniquely-owned fold accumulator stays uniquely owned across the call.
+    fn call_owned(&mut self, args: &mut [Value]) -> Result<Value, SemaError>;
+
+    /// True once this drive quantum's instruction budget is exhausted; the
+    /// driver must then hand its remaining elements back to the cooperative
+    /// path (typically as the HOF's ordinary mid-chain continuation).
+    fn should_yield(&self) -> bool;
 }
 
 pub type NativeResult = Result<NativeOutcome, SemaError>;
@@ -682,6 +718,7 @@ mod tests {
         let eval_context = EvalContext::new();
         let task_context = TaskContextHandle::default();
         let mut context = NativeCallContext {
+            hof_host: None,
             eval_context: &eval_context,
             task_context,
             call_env: None,
@@ -724,6 +761,7 @@ mod tests {
         let eval_context = EvalContext::new();
         let task_context = TaskContextHandle::default();
         let mut context = NativeCallContext {
+            hof_host: None,
             eval_context: &eval_context,
             task_context,
             call_env: None,
@@ -806,6 +844,7 @@ mod tests {
         let eval_context = EvalContext::new();
         let task_context = TaskContextHandle::default();
         let mut context = NativeCallContext {
+            hof_host: None,
             eval_context: &eval_context,
             task_context,
             call_env: None,
@@ -837,6 +876,7 @@ mod tests {
         });
         let task_context = TaskContextHandle::default();
         let mut runtime_context = NativeCallContext {
+            hof_host: None,
             eval_context: &embedded,
             task_context,
             call_env: None,
@@ -856,6 +896,7 @@ mod tests {
         let seen_eval = Rc::new(Cell::new(std::ptr::null::<EvalContext>()));
         let task_context = TaskContextHandle::default();
         let mut runtime = NativeCallContext {
+            hof_host: None,
             eval_context: &eval,
             task_context,
             call_env: None,
@@ -939,6 +980,7 @@ mod tests {
         let eval = EvalContext::new();
         let task_context = TaskContextHandle::default();
         let mut runtime = NativeCallContext {
+            hof_host: None,
             eval_context: &eval,
             task_context,
             call_env: None,

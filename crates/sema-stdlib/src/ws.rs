@@ -996,6 +996,7 @@ mod tests {
         let eval_context = sema_core::EvalContext::new();
         let task_context = TaskContextHandle::default();
         let mut native_context = NativeCallContext {
+            hof_host: None,
             eval_context: &eval_context,
             task_context,
             call_env: None,
@@ -1101,6 +1102,7 @@ mod tests {
         let eval_context = sema_core::EvalContext::new();
         let task_context = TaskContextHandle::default();
         let mut native_context = NativeCallContext {
+            hof_host: None,
             eval_context: &eval_context,
             task_context,
             call_env: None,

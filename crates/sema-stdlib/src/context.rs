@@ -235,6 +235,7 @@ mod tests {
         let task_a = TaskContextHandle::default();
         task_a.borrow_mut().insert(Rc::clone(&state_a));
         let mut call_a = NativeCallContext {
+            hof_host: None,
             eval_context: &eval_a,
             task_context: task_a,
             call_env: None,
@@ -253,6 +254,7 @@ mod tests {
         let task_b = TaskContextHandle::default();
         task_b.borrow_mut().insert(Rc::clone(&state_b));
         let mut call_b = NativeCallContext {
+            hof_host: None,
             eval_context: &eval_b,
             task_context: task_b,
             call_env: None,
@@ -276,6 +278,7 @@ mod tests {
         let task = TaskContextHandle::default();
         task.borrow_mut().insert(Rc::clone(&state));
         let mut call_context = NativeCallContext {
+            hof_host: None,
             eval_context: &eval,
             task_context: task.clone(),
             call_env: None,

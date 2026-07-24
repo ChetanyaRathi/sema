@@ -33,7 +33,8 @@ pub use native::{
     multimethod_call, CancellationView, ChannelOperation, ChannelQuery, ChannelReceive,
     ChannelSend, ChannelWait, NativeCall, NativeCallContext, NativeContinuation, NativeOutcome,
     NativeResult, NativeSuspend, PromiseSetMode, PromiseSetWait, ResourceGateCloseError,
-    ResourceGateHandle, ResumeInput, RuntimeRequest, RuntimeResponse, WaitKind,
+    ResourceGateHandle, ResumeInput, RuntimeRequest, RuntimeResponse, SyncCallbackSession,
+    SyncHofHost, WaitKind,
 };
 pub use resource::{
     CancelDisposition, CancelHook, CancelHookError, InterruptibleResource, InvalidQuarantineBound,

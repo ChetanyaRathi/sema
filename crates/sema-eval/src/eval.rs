@@ -1663,6 +1663,7 @@ fn compiled_program_from_result(result: sema_vm::CompileResult) -> sema_vm::Comp
             local_scopes: Vec::new(),
             source_file: None,
             cache_offset: 0,
+            suspend_cache: std::cell::Cell::new(None),
         }),
         upvalues: Vec::new(),
         globals: None,
@@ -4210,6 +4211,7 @@ mod runtime_eval_tests {
             .borrow_mut()
             .insert(Rc::new(sema_core::runtime::ModuleTaskState::default()));
         let mut context = NativeCallContext {
+            hof_host: None,
             eval_context: &interp.ctx,
             task_context,
             call_env: Some(call_env),
@@ -4920,6 +4922,7 @@ mod runtime_eval_tests {
             .expect("parse macro invocation")
             .remove(0);
         let native_context = NativeCallContext {
+            hof_host: None,
             eval_context: &eval_context,
             task_context: TaskContextHandle::default(),
             call_env: Some(Rc::clone(&delegate_env)),
@@ -4945,6 +4948,7 @@ mod runtime_eval_tests {
             .expect("parse macro invocation")
             .remove(0);
         let context = NativeCallContext {
+            hof_host: None,
             eval_context: &interp.ctx,
             task_context: TaskContextHandle::default(),
             call_env: Some(Rc::clone(&interp.global_env)),

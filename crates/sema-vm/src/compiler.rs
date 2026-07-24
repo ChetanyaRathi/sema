@@ -812,6 +812,7 @@ impl Compiler {
             local_scopes,
             source_file: None,
             cache_offset: 0,
+            suspend_cache: std::cell::Cell::new(None),
         };
         self.functions.push(func);
         self.functions.extend(child_functions);

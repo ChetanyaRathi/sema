@@ -3326,6 +3326,7 @@ impl Runtime {
         let eval_context = Rc::clone(&self.state.borrow()._context);
         let _installed = eval_context.scope_task_context(task.context.clone());
         let mut native_context = NativeCallContext {
+            hof_host: None,
             eval_context: &eval_context,
             task_context: task.context.clone(),
             call_env: Some(call_env),
@@ -3817,6 +3818,7 @@ impl Runtime {
                 }
                 let _installed = eval_context.scope_task_context(context.clone());
                 let mut native_context = NativeCallContext {
+                    hof_host: None,
                     eval_context: &eval_context,
                     task_context: context.clone(),
                     call_env,
@@ -4090,6 +4092,7 @@ impl Runtime {
         let outcome = loop {
             if let Some(cancel) = task.record.cancellation() {
                 let mut native_context = NativeCallContext {
+                    hof_host: None,
                     eval_context: &eval_context,
                     task_context: task.context.clone(),
                     call_env: call_env.clone(),
@@ -4107,6 +4110,7 @@ impl Runtime {
             };
             let Some(next_globals) = next_closure.globals.clone() else {
                 let mut native_context = NativeCallContext {
+                    hof_host: None,
                     eval_context: &eval_context,
                     task_context: task.context.clone(),
                     call_env: call_env.clone(),
@@ -4146,6 +4150,7 @@ impl Runtime {
             }
             if let Err(error) = vm.setup_for_call_owned(next_closure, &mut current_call.args) {
                 let mut native_context = NativeCallContext {
+                    hof_host: None,
                     eval_context: &eval_context,
                     task_context: task.context.clone(),
                     call_env: call_env.clone(),
@@ -4170,6 +4175,7 @@ impl Runtime {
             match quantum.outcome {
                 Ok(VmExecResult::Finished(value)) => {
                     let mut native_context = NativeCallContext {
+                        hof_host: None,
                         eval_context: &eval_context,
                         task_context: task.context.clone(),
                         call_env: call_env.clone(),
@@ -4188,6 +4194,7 @@ impl Runtime {
                 }
                 Err(error) => {
                     let mut native_context = NativeCallContext {
+                        hof_host: None,
                         eval_context: &eval_context,
                         task_context: task.context.clone(),
                         call_env: call_env.clone(),
@@ -4368,6 +4375,7 @@ impl Runtime {
         };
         let mut id_guard = QuantumIdGuard::install(published_task_id, root);
         let mut native_context = NativeCallContext {
+            hof_host: None,
             eval_context: &eval_context,
             task_context: context,
             call_env,

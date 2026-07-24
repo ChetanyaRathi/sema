@@ -293,3 +293,53 @@ hot path == candidate hot path; profile identical; main un-diverged from fork
 `3f111e83`). **Release gate**: tracked in `docs/deferred.md` PERF-RESIDUAL-1
 (REOPENED). Reproduce: `jake bench.save` on each side; compare
 `target/bench/bench-<sha>.json` min fields.
+
+## HOF fast-path recovery (2026-07-24, PERF-RESIDUAL-1 close-out)
+
+The non-suspending HOF direct-dispatch fast path
+(`docs/plans/archive/2026-07-24-hof-nonsuspending-fast-path.md`;
+`crates/sema-vm/src/hof_sync.rs`) closes the compute regression above. Same
+protocol: hyperfine (`--warmup 3 --runs 10` for the tightened rows, `--runs 5`
+elsewhere), macOS arm64 release builds, baseline binary identity re-verified at
+`3f111e83`.
+
+Compute suite (whole-program wall):
+
+| program | baseline | recovered | ratio | was |
+|---|---|---|---|---|
+| deriv | 663.8 ms | 781.8 ms | **1.18×** | 4.78× |
+| string-pipeline | 542.4 ms | 607.4 ms | **1.12×** | 3.92× |
+| higher-order-fold | 545.9 ms | 423.6 ms | **0.78× (faster)** | 3.25× |
+| mandelbrot (min) | 156.1 ms | 175.0 ms | 1.12× | 1.15× |
+| hashmap-bench | 3.252 s | 3.558 s | 1.09× | 1.10× |
+| tak (10-run) | 1.118 s | 1.128 s | 1.01× | ≤1.06× |
+| nqueens / closure-storm / throw-catch | — | — | ≤1.05× | ≤1.06× |
+
+Flat/nested map micros (10M trivial element calls, self-timed): flat 385→289 ms
+(**0.75×**, was 3.47×), nested 387→279 ms (**0.72×**, was 3.90×) — both now
+FASTER than the pre-flip engine (warm pooled scratch VM vs. a fresh VM per
+element).
+
+Async no-regress matrix (recreated six-program shape — the original scratchpad
+sources are gone, so both binaries ran identical fresh sources; ratios are
+apples-to-apples even though absolute values differ from the 0b tables):
+
+| benchmark | baseline | recovered | ratio |
+|---|---|---|---|
+| spawn-storm | 33.0 ms | 18.3 ms | **0.55× (faster)** |
+| sleep-storm | 16.0 ms | 9.7 ms | **0.61× (faster)** |
+| deep-await | 13.2 ms | 8.2 ms | **0.62× (faster)** |
+| primes (HOF, real callback) | 86.6 ms | 75.7 ms | **0.87× (faster)** |
+| cons-1m (small-list churn) | 86.0 ms | 88.5 ms | 1.03× |
+| channel-pingpong | 20.8 ms | 26.2 ms | 1.26× (accepted end-state was ~1.4×) |
+
+Mechanism: HOF natives consult `NativeCallContext::hof_host` (installed by
+`dispatch_native` inside a quantum). If the callback is a VM closure whose call
+graph provably cannot suspend — or an inert native — the element loop runs
+synchronously on a warm pooled scratch VM: no drive round-trip per HOF call, no
+per-element continuation rebuild, per-element escaping-args snapshots skipped
+when the parent has no open upvalue cells. Budget is honored between elements
+(tail handed back to the ordinary cooperative continuation); sync nesting is
+capped at 16 with a flat restricted-driver de-opt beyond (deep `map`-in-`map`
+recursion stays off the Rust stack). Suspending callbacks never enter the fast
+path; the `context.rs` callback guards are untouched.

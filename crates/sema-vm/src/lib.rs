@@ -5,6 +5,7 @@ mod core_expr;
 pub mod debug;
 mod disasm;
 mod emit;
+mod hof_sync;
 mod lower;
 mod opcodes;
 mod optimize;
@@ -27,6 +28,7 @@ pub use debug::{
 };
 pub use disasm::disassemble;
 pub use emit::Emitter;
+pub use hof_sync::sync_hof_runs;
 pub use lower::{is_special_form, lower};
 pub use opcodes::Op;
 pub use optimize::optimize as optimize_expr;

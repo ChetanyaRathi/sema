@@ -3566,6 +3566,7 @@ fn run_bytecode_bytes(
             local_scopes: Vec::new(),
             source_file: None,
             cache_offset: 0,
+            suspend_cache: std::cell::Cell::new(None),
         }),
         upvalues: Vec::new(),
         // Top-level main closure: uses the VM's own globals and function table.

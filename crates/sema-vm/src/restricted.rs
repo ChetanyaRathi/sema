@@ -122,6 +122,33 @@ pub fn run_program_restricted_with_budget(
     RestrictedVmDriver::new(ctx, task_context, policy, budget).run(program, globals)
 }
 
+/// Drive a VM parked on a structural `Pending` outcome to completion without
+/// the scheduler, continuation chains and callee VMs handled iteratively (flat
+/// Rust stack). Used by the synchronous HOF fast path when a proven
+/// non-suspending element run crosses its sync-nesting cap: the nested
+/// cooperative HOF chain settles here instead of recursing further into
+/// native dispatch. Any real suspension attempt fails with the policy's
+/// suspension error, exactly like a restricted program run.
+///
+/// The caller is already inside a runtime quantum and task scope; this entry
+/// deliberately installs neither.
+pub(crate) fn resume_pending_restricted(
+    ctx: &EvalContext,
+    task_context: TaskContextHandle,
+    policy: RestrictedRunPolicy,
+    vm: Box<VM>,
+    pending: crate::debug::VmPendingOutcome,
+) -> Result<Value, SemaError> {
+    let budget = RestrictedRunBudget::new(policy.instruction_limit, policy.transition_limit);
+    let driver = RestrictedVmDriver::new(ctx, task_context, policy, budget);
+    let mut owner = RestrictedOwner::default();
+    owner.push_vm(vm);
+    driver.drive(RestrictedWork::Apply {
+        owner,
+        result: Ok(pending.into_outcome()),
+    })
+}
+
 struct RestrictedVmDriver<'a> {
     ctx: &'a EvalContext,
     task_context: TaskContextHandle,
@@ -220,11 +247,13 @@ impl<'a> RestrictedVmDriver<'a> {
             program.main_cache_slots,
         )?;
         vm.seed_main_frame(program.closure);
-        let mut work = RestrictedWork::RunVm {
+        self.drive(RestrictedWork::RunVm {
             vm: Box::new(vm),
             owner: RestrictedOwner::default(),
-        };
+        })
+    }
 
+    fn drive(self, mut work: RestrictedWork) -> Result<Value, SemaError> {
         loop {
             work = match work {
                 RestrictedWork::RunVm { mut vm, owner } => {
@@ -333,6 +362,7 @@ impl<'a> RestrictedVmDriver<'a> {
                                 );
                             }
                             let mut native_context = NativeCallContext {
+                                hof_host: None,
                                 eval_context: self.ctx,
                                 task_context: self.task_context.clone(),
                                 call_env: owner.call_env(),
@@ -408,6 +438,7 @@ impl<'a> RestrictedVmDriver<'a> {
                 }
             }
             let mut native_context = NativeCallContext {
+                hof_host: None,
                 eval_context: self.ctx,
                 task_context: self.task_context.clone(),
                 call_env,
@@ -527,6 +558,7 @@ impl<'a> RestrictedVmDriver<'a> {
         original: &SemaError,
     ) {
         let mut native_context = NativeCallContext {
+            hof_host: None,
             eval_context: self.ctx,
             task_context: self.task_context.clone(),
             call_env,

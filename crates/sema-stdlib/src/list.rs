@@ -5,7 +5,7 @@ use sema_core::cycle::GcEdge;
 use sema_core::number::SemaNumber;
 use sema_core::runtime::{
     NativeCall, NativeCallContext, NativeContinuation, NativeOutcome, NativeResult, ResumeInput,
-    Trace,
+    SyncHofHost, Trace,
 };
 use sema_core::{check_arity, intern, Record, SemaError, Value, ValueViewRef};
 
@@ -76,6 +76,160 @@ impl NativeContinuation for MapContinuation {
             )))),
         }
     }
+}
+
+/// Run a single-list `map` synchronously when the host proves the callback
+/// non-suspending; `None` falls back to the cooperative path. If the drive
+/// quantum's budget runs out mid-sequence, the untouched tail is handed to the
+/// ordinary `MapContinuation`, so fairness matches the cooperative path at
+/// element granularity.
+fn sync_map(host: &dyn SyncHofHost, callback: &Value, items: &[Value]) -> Option<NativeResult> {
+    if items.is_empty() {
+        return None;
+    }
+    host.run_sync_hof(callback, &mut |session| {
+        let mut results = Vec::with_capacity(items.len());
+        for (index, item) in items.iter().enumerate() {
+            if session.should_yield() {
+                return Ok(NativeOutcome::Call(NativeCall {
+                    callable: callback.clone(),
+                    args: vec![item.clone()],
+                    continuation: Box::new(MapContinuation {
+                        callback: callback.clone(),
+                        remaining: items[index + 1..].iter().cloned().collect(),
+                        results: std::mem::take(&mut results),
+                    }),
+                }));
+            }
+            let mut call_args = [item.clone()];
+            results.push(session.call_owned(&mut call_args)?);
+        }
+        Ok(NativeOutcome::Return(Value::list(std::mem::take(
+            &mut results,
+        ))))
+    })
+}
+
+/// Synchronous `filter` twin of [`sync_map`]; the mid-sequence handoff resumes
+/// as an ordinary select-mode `PredicateContinuation`.
+fn sync_filter(host: &dyn SyncHofHost, predicate: &Value, items: &[Value]) -> Option<NativeResult> {
+    if items.is_empty() {
+        return None;
+    }
+    host.run_sync_hof(predicate, &mut |session| {
+        let mut results = Vec::new();
+        for (index, item) in items.iter().enumerate() {
+            if session.should_yield() {
+                return Ok(NativeOutcome::Call(NativeCall {
+                    callable: predicate.clone(),
+                    args: vec![item.clone()],
+                    continuation: Box::new(PredicateContinuation {
+                        hof: "filter",
+                        predicate: predicate.clone(),
+                        current: item.clone(),
+                        remaining: PredicateItems::Snapshot {
+                            items: items[index + 1..].to_vec(),
+                            next: 0,
+                        },
+                        mode: PredicateMode::Select {
+                            keep_when_truthy: true,
+                            results: std::mem::take(&mut results),
+                        },
+                    }),
+                }));
+            }
+            let mut call_args = [item.clone()];
+            if session.call_owned(&mut call_args)?.is_truthy() {
+                results.push(item.clone());
+            }
+        }
+        Ok(NativeOutcome::Return(Value::list(std::mem::take(
+            &mut results,
+        ))))
+    })
+}
+
+/// Synchronous forward fold over `items[skip..]` (shared by `foldl` and
+/// `reduce`). The accumulator moves through the owned-args buffer, preserving
+/// the uniqueness-gated in-place update fast paths. The mid-sequence handoff
+/// resumes as an ordinary `FoldContinuation` over a snapshot of the tail.
+fn sync_fold(
+    host: &dyn SyncHofHost,
+    combiner: &Value,
+    init: Value,
+    items: &[Value],
+    order: FoldOrder,
+    hof: &'static str,
+) -> Option<NativeResult> {
+    if items.is_empty() {
+        return None;
+    }
+    host.run_sync_hof(combiner, &mut |session| {
+        let mut acc = init.clone();
+        for (index, item) in items.iter().enumerate() {
+            if session.should_yield() {
+                return Ok(NativeOutcome::Call(NativeCall {
+                    callable: combiner.clone(),
+                    args: order.args(std::mem::replace(&mut acc, Value::nil()), item.clone()),
+                    continuation: Box::new(FoldContinuation {
+                        hof,
+                        combiner: combiner.clone(),
+                        remaining: FoldItems::Sequence {
+                            items: FoldSequenceItems::Snapshot {
+                                items: items[index + 1..].to_vec(),
+                                start: 0,
+                                end: items.len() - index - 1,
+                            },
+                            direction: FoldDirection::Forward,
+                        },
+                        order,
+                    }),
+                }));
+            }
+            let mut call_args = match order {
+                FoldOrder::AccumulatorThenItem => {
+                    [std::mem::replace(&mut acc, Value::nil()), item.clone()]
+                }
+                FoldOrder::ItemThenAccumulator => {
+                    [item.clone(), std::mem::replace(&mut acc, Value::nil())]
+                }
+            };
+            acc = session.call_owned(&mut call_args)?;
+        }
+        Ok(NativeOutcome::Return(std::mem::replace(
+            &mut acc,
+            Value::nil(),
+        )))
+    })
+}
+
+/// Synchronous `for-each` twin of [`sync_map`]; the mid-sequence handoff
+/// resumes as an ordinary `ForEachContinuation`.
+fn sync_for_each(
+    host: &dyn SyncHofHost,
+    callback: &Value,
+    items: &[Value],
+) -> Option<NativeResult> {
+    if items.is_empty() {
+        return None;
+    }
+    host.run_sync_hof(callback, &mut |session| {
+        for (index, item) in items.iter().enumerate() {
+            if session.should_yield() {
+                return Ok(NativeOutcome::Call(NativeCall {
+                    callable: callback.clone(),
+                    args: vec![item.clone()],
+                    continuation: Box::new(ForEachContinuation {
+                        callback: callback.clone(),
+                        remaining: items[index + 1..].iter().cloned().collect(),
+                    }),
+                }));
+            }
+            let mut call_args = [item.clone()];
+            session.call_owned(&mut call_args)?;
+        }
+        Ok(NativeOutcome::Return(Value::nil()))
+    })
 }
 
 /// Build the initial cooperative `NativeOutcome::Call` for a single-list `map`
@@ -1718,19 +1872,47 @@ fn repeat_impl(args: &[Value]) -> Result<Value, SemaError> {
 /// (an async op inside it parks/resumes). Everywhere else (a bare top-level eval
 /// or nested/sync re-entry) the VM runs `legacy`, the synchronous per-element
 /// path.
+/// Callback argument positions per HOF name, consumed by the VM's suspension
+/// analysis: a call to the HOF may suspend only if a callback at one of these
+/// positions may. Every `register_hof`/`register_hof_ctx` registration is a
+/// HOF by definition; position 0 is the default, so ONLY register a new HOF
+/// here when its callback(s) sit elsewhere. A wrong entry is safe but costly:
+/// the analysis then proves the wrong argument, and a suspending callback
+/// falls off the fast path with a structured error instead of parking.
+fn hof_callback_positions(name: &str) -> &'static [usize] {
+    match name {
+        "call-with-values" => &[0, 1],
+        "tap" | "list/times" | "sort" => &[1],
+        "map/update" | "update-in" => &[2],
+        _ => &[0],
+    }
+}
+
 pub(crate) fn register_hof(
     env: &sema_core::Env,
     name: &'static str,
     legacy: impl Fn(&[Value]) -> Result<Value, SemaError> + 'static,
     runtime: impl Fn(&[Value]) -> NativeResult + 'static,
 ) {
+    register_hof_ctx(env, name, legacy, move |_ctx, args| runtime(args));
+}
+
+/// [`register_hof`] whose runtime callback also receives the
+/// [`NativeCallContext`] — required by HOFs that consult
+/// [`NativeCallContext::hof_host`] for the synchronous non-suspending fast
+/// path before falling back to their cooperative `NativeOutcome::Call` shape.
+pub(crate) fn register_hof_ctx(
+    env: &sema_core::Env,
+    name: &'static str,
+    legacy: impl Fn(&[Value]) -> Result<Value, SemaError> + 'static,
+    runtime: impl for<'a> Fn(&mut NativeCallContext<'a>, &[Value]) -> NativeResult + 'static,
+) {
     env.set(
         sema_core::intern(name),
-        Value::native_fn(sema_core::NativeFn::simple_with_runtime(
-            name,
-            legacy,
-            move |_ctx, args| runtime(args),
-        )),
+        Value::native_fn(
+            sema_core::NativeFn::simple_with_runtime(name, legacy, runtime)
+                .with_callback_suspension(hof_callback_positions(name)),
+        ),
     );
 }
 
@@ -1861,10 +2043,12 @@ pub fn register(env: &sema_core::Env) {
 
     // `map` drives its callback COOPERATIVELY under the runtime (its `runtime`
     // ABI returns the initial `NativeOutcome::Call`) so an async op inside the
-    // callback (spawn/await/channel) parks and resumes correctly. Both the
-    // single-list and multi-list (zipped) shapes are cooperative; the legacy
-    // value ABI keeps the synchronous per-element path for bare/top-level eval.
-    register_hof(
+    // callback (spawn/await/channel) parks and resumes correctly — unless the
+    // host proves the callback non-suspending, in which case the element loop
+    // runs synchronously (`sync_map`). Both the single-list and multi-list
+    // (zipped) shapes are cooperative; the legacy value ABI keeps the
+    // synchronous per-element path for bare/top-level eval.
+    register_hof_ctx(
         env,
         "map",
         |args| {
@@ -1880,10 +2064,15 @@ pub fn register(env: &sema_core::Env) {
                 map_multi(args)
             }
         },
-        |args| {
+        |ctx, args| {
             check_arity!(args, "map", 2..);
             if args.len() == 2 {
                 let items = get_sequence(&args[1], "map")?;
+                if let Some(host) = ctx.hof_host {
+                    if let Some(result) = sync_map(host, &args[0], &items) {
+                        return result;
+                    }
+                }
                 Ok(map_call(&args[0], &items))
             } else {
                 map_multi_call(args)
@@ -1929,7 +2118,7 @@ pub fn register(env: &sema_core::Env) {
     });
 
     // `filter` drives its predicate COOPERATIVELY under the runtime (see `map`).
-    register_hof(
+    register_hof_ctx(
         env,
         "filter",
         |args| {
@@ -1945,8 +2134,14 @@ pub fn register(env: &sema_core::Env) {
             }
             Ok(Value::list(result))
         },
-        |args| {
+        |ctx, args| {
             check_arity!(args, "filter", 2);
+            if let Some(host) = ctx.hof_host {
+                let items = get_sequence(&args[1], "filter")?;
+                if let Some(result) = sync_filter(host, &args[0], &items) {
+                    return result;
+                }
+            }
             predicate_call(
                 &args[0],
                 &args[1],
@@ -1960,7 +2155,7 @@ pub fn register(env: &sema_core::Env) {
     );
 
     // `foldl` threads its accumulator COOPERATIVELY under the runtime (see `map`).
-    register_hof(
+    register_hof_ctx(
         env,
         "foldl",
         |args| {
@@ -1975,8 +2170,21 @@ pub fn register(env: &sema_core::Env) {
             }
             Ok(acc)
         },
-        |args| {
+        |ctx, args| {
             check_arity!(args, "foldl", 3);
+            if let Some(host) = ctx.hof_host {
+                let items = get_sequence(&args[2], "foldl")?;
+                if let Some(result) = sync_fold(
+                    host,
+                    &args[0],
+                    args[1].clone(),
+                    &items,
+                    FoldOrder::AccumulatorThenItem,
+                    "foldl",
+                ) {
+                    return result;
+                }
+            }
             fold_sequence_call(
                 &args[0],
                 args[1].clone(),
@@ -1989,7 +2197,7 @@ pub fn register(env: &sema_core::Env) {
     );
 
     // `for-each` runs its callback COOPERATIVELY under the runtime (see `map`).
-    register_hof(
+    register_hof_ctx(
         env,
         "for-each",
         |args| {
@@ -2000,9 +2208,14 @@ pub fn register(env: &sema_core::Env) {
             }
             Ok(Value::nil())
         },
-        |args| {
+        |ctx, args| {
             check_arity!(args, "for-each", 2);
             let items = get_sequence(&args[1], "for-each")?;
+            if let Some(host) = ctx.hof_host {
+                if let Some(result) = sync_for_each(host, &args[0], &items) {
+                    return result;
+                }
+            }
             Ok(for_each_call(&args[0], &items))
         },
     );
@@ -2262,7 +2475,7 @@ pub fn register(env: &sema_core::Env) {
 
     // `reduce` threads its accumulator COOPERATIVELY under the runtime (see
     // `foldl`): seed with the first element and fold the rest.
-    register_hof(
+    register_hof_ctx(
         env,
         "reduce",
         |args| {
@@ -2279,8 +2492,23 @@ pub fn register(env: &sema_core::Env) {
             }
             Ok(acc)
         },
-        |args| {
+        |ctx, args| {
             check_arity!(args, "reduce", 2);
+            if let Some(host) = ctx.hof_host {
+                let items = get_sequence(&args[1], "reduce")?;
+                if let Some((first, rest)) = items.split_first() {
+                    if let Some(result) = sync_fold(
+                        host,
+                        &args[0],
+                        first.clone(),
+                        rest,
+                        FoldOrder::AccumulatorThenItem,
+                        "reduce",
+                    ) {
+                        return result;
+                    }
+                }
+            }
             reduce_call(&args[0], &args[1])
         },
     );

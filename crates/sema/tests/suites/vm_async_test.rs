@@ -2496,6 +2496,106 @@ fn sleep_wrapped_in_predicate_callback_suspends() {
     );
 }
 
+// === Non-suspending HOF direct-dispatch fast path (PERF-RESIDUAL-1) ===
+//
+// `sema_vm::sync_hof_runs()` counts synchronous fast-path sessions on this
+// thread, so these assert the dispatch ROUTE, not just the result value.
+
+#[test]
+fn suspending_lambda_callbacks_fall_back_to_cooperative_path() {
+    let before = sema_vm::sync_hof_runs();
+    // async/sleep in the body
+    assert_eq!(
+        eval(r#"(map (fn (x) (async/sleep 1) (* x 10)) (list 1 2 3))"#),
+        Value::list(vec![Value::int(10), Value::int(20), Value::int(30)])
+    );
+    // async/spawn + await in the body
+    assert_eq!(
+        eval(r#"(filter (fn (x) (async/await (async/spawn (fn () (> x 1))))) (list 1 2 3))"#),
+        Value::list(vec![Value::int(2), Value::int(3)])
+    );
+    // channel rendezvous in the body
+    assert_eq!(
+        eval(
+            r#"(let ((c (channel/new 8)))
+                 (foldl (fn (acc x) (channel/send c x) (+ acc (channel/recv c))) 0 (list 1 2 3)))"#
+        ),
+        Value::int(6)
+    );
+    assert_eq!(
+        sema_vm::sync_hof_runs(),
+        before,
+        "a suspending callback must never take the synchronous fast path"
+    );
+}
+
+#[test]
+fn nested_nonsuspending_map_takes_sync_fast_path() {
+    let before = sema_vm::sync_hof_runs();
+    assert_eq!(
+        eval(r#"(map (fn (row) (map (fn (x) (* x 2)) row)) (list (list 1 2) (list 3)))"#),
+        Value::list(vec![
+            Value::list(vec![Value::int(2), Value::int(4)]),
+            Value::list(vec![Value::int(6)]),
+        ])
+    );
+    assert!(
+        sema_vm::sync_hof_runs() >= before + 3,
+        "outer map and both nested maps must run synchronously"
+    );
+}
+
+#[test]
+fn recursive_global_callback_is_proven_nonsuspending() {
+    // deriv-shape: the callback is a global function whose body maps itself —
+    // the analysis must close the cycle coinductively and keep it synchronous.
+    let before = sema_vm::sync_hof_runs();
+    assert_eq!(
+        eval(
+            r#"(begin
+                 (define (walk a)
+                   (cond ((not (pair? a)) (if (= a 'x) 1 0))
+                         ((= (car a) '+) (cons '+ (map walk (cdr a))))
+                         (else 'err)))
+                 (walk '(+ x x 3)))"#
+        ),
+        eval("'(+ 1 1 0)")
+    );
+    assert!(
+        sema_vm::sync_hof_runs() > before,
+        "the recursive map-in-map callback must take the synchronous fast path"
+    );
+}
+
+#[test]
+fn native_callback_hof_takes_sync_fast_path() {
+    let before = sema_vm::sync_hof_runs();
+    assert_eq!(eval(r#"(foldl + 0 (list 1 2 3 4))"#), Value::int(10));
+    assert!(
+        sema_vm::sync_hof_runs() > before,
+        "an inert native callback must take the synchronous fast path"
+    );
+}
+
+#[test]
+fn global_redefinition_reroutes_to_cooperative_path() {
+    // The first map proves `helper` non-suspending and memoizes the verdict;
+    // redefining `helper` to a suspending body bumps the env-chain fingerprint,
+    // so the second map re-analyzes and falls back cooperatively — correct
+    // results both times, no "callback suspended" error.
+    assert_eq!(
+        eval(
+            r#"(begin
+                 (define (helper x) (* x 2))
+                 (define (cb x) (helper x))
+                 (define first-run (map cb (list 1 2)))
+                 (define (helper x) (async/sleep 1) (* x 3))
+                 (list first-run (map cb (list 1 2))))"#
+        ),
+        eval("'((2 4) (3 6))")
+    );
+}
+
 #[test]
 fn sleep_passed_directly_to_cooperative_hof_still_suspends() {
     // `map`/`filter`/`sort-by` (`register_hof`, dual-ABI) drive their callback

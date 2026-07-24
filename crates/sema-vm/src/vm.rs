@@ -549,6 +549,12 @@ pub struct VM {
     /// by the owning opcode arm in the same iteration. Always `None` between
     /// opcodes.
     native_signal: Option<VmNativeSignal>,
+    /// Instructions a synchronous HOF fast-path session consumed inside the
+    /// last native dispatch (`hof_sync`). The dispatching opcode arm takes
+    /// this and debits it from the live quantum countdown, so a sync element
+    /// loop spends the same budget the cooperative path would. Always `0`
+    /// between opcodes.
+    pending_nested_instructions: usize,
 }
 
 impl sema_core::runtime::Trace for VM {
@@ -799,6 +805,14 @@ pub(crate) fn with_active_debug_for_root<R>(
 /// callback VM therefore remains visible after the parent synchronizes its
 /// tracked cells back to the stack.
 pub fn snapshot_escaping_call_with_owner(owner_vm: &mut VM, callable: &Value, args: &[Value]) {
+    snapshot_escaping_call_shared(owner_vm, callable, args);
+}
+
+/// [`snapshot_escaping_call_with_owner`] over a shared owner borrow — the
+/// walker only reads the owner's frames; cell conversion happens through the
+/// cells' own interior mutability. Used by the synchronous HOF fast path,
+/// which holds the parent VM behind `&VM` for the whole native invocation.
+pub(crate) fn snapshot_escaping_call_shared(owner_vm: &VM, callable: &Value, args: &[Value]) {
     let mut walker = EscapingValueWalker::with_owner(owner_vm);
     walker.visit_value(callable);
     for arg in args {
@@ -1689,6 +1703,7 @@ impl VM {
             pending_resume_error: None,
             quantum_cancellation: CancellationView::default(),
             native_signal: None,
+            pending_nested_instructions: 0,
         })
     }
 
@@ -1751,6 +1766,7 @@ impl VM {
             pending_resume_error: None,
             quantum_cancellation: CancellationView::default(),
             native_signal: None,
+            pending_nested_instructions: 0,
         }
     }
 
@@ -1782,6 +1798,7 @@ impl VM {
             pending_resume_error: None,
             quantum_cancellation: CancellationView::default(),
             native_signal: None,
+            pending_nested_instructions: 0,
         })
     }
 
@@ -1833,6 +1850,7 @@ impl VM {
         self.pending_resume_error = None;
         self.quantum_cancellation = CancellationView::default();
         self.native_signal = None;
+        self.pending_nested_instructions = 0;
     }
 
     /// Drop every strong heap reference this VM holds *purely as a cache* — the
@@ -2124,6 +2142,64 @@ impl VM {
         self.frames.len()
     }
 
+    /// Instructions left in the running quantum as of the last countdown sync
+    /// (`usize::MAX` when unbudgeted). Mid-quantum this lags the register-local
+    /// countdown, so it over-reports — callers use it only to size a
+    /// synchronous HOF session's allowance, where the dispatching arm settles
+    /// the exact debit afterwards.
+    pub(crate) fn remaining_quantum_budget(&self) -> usize {
+        self.instruction_budget.map_or(usize::MAX, |budget| {
+            budget.saturating_sub(self.instructions_executed)
+        })
+    }
+
+    /// The running quantum's cancellation snapshot (default outside a quantum).
+    pub(crate) fn quantum_cancellation_view(&self) -> CancellationView {
+        self.quantum_cancellation.clone()
+    }
+
+    /// Clear the frames and stack an aborted (errored or fast-path-rejected)
+    /// callback run left behind, so this scratch VM can be pooled and later
+    /// re-targeted by `reset_for_task_with_native_fns`.
+    pub(crate) fn reset_for_reuse(&mut self) {
+        self.stack.clear();
+        self.frames.clear();
+        self.pending_resume_error = None;
+        self.native_signal = None;
+    }
+
+    /// True when any live frame holds an open upvalue cell. When none does, no
+    /// value can reference this VM's stack through an `Open` cell, so a
+    /// foreign-run snapshot (`snapshot_escaping_call_shared`) has nothing to
+    /// convert and can be skipped wholesale. Frames don't change while this VM
+    /// is parked inside a native dispatch, so the answer holds for the whole
+    /// dispatch.
+    pub(crate) fn has_open_upvalue_cells(&self) -> bool {
+        self.frames.iter().any(|frame| {
+            frame
+                .open_upvalues
+                .as_ref()
+                .is_some_and(|open| open.iter().any(Option::is_some))
+        })
+    }
+
+    /// True when this idle VM already targets exactly this compilation unit —
+    /// its inline global cache is then valid as-is (entries self-validate
+    /// against `env_version` on read) and a pooled reuse can skip the full
+    /// re-target/cache wipe of `reset_for_task_with_native_fns`.
+    pub(crate) fn targets_unit(
+        &self,
+        globals: &Rc<Env>,
+        functions: &Rc<Vec<Rc<Function>>>,
+        native_fns: &Rc<Vec<Rc<NativeFn>>>,
+    ) -> bool {
+        self.frames.is_empty()
+            && self.stack.is_empty()
+            && Rc::ptr_eq(&self.globals, globals)
+            && Rc::ptr_eq(&self.base_functions, functions)
+            && Rc::ptr_eq(&self.native_fns, native_fns)
+    }
+
     pub(crate) fn active_globals(&self) -> Rc<Env> {
         self.globals.clone()
     }
@@ -2256,18 +2332,34 @@ impl VM {
         if ctx.runtime_quantum_active() {
             if let Some(handle) = ctx.task_context() {
                 let _installed = ctx.scope_task_context(handle.clone());
-                let mut native_ctx = NativeCallContext {
-                    eval_context: ctx,
-                    task_context: handle,
-                    call_env: Some(self.globals.clone()),
-                    cancellation: self.quantum_cancellation.clone(),
-                };
+                snapshot_native_escaping_args(self, func, call_args);
+                let call_env = Some(self.globals.clone());
+                let cancellation = self.quantum_cancellation.clone();
+                // The host borrows this VM shared for the invocation; the
+                // mutations it owes back (instruction debit, tracked-upvalue
+                // sync) are read out of its cells once the borrow ends.
+                let host = crate::hof_sync::VmHofHost::new(self, ctx, handle.clone());
                 let outcome = {
-                    snapshot_native_escaping_args(self, func, call_args);
+                    let mut native_ctx = NativeCallContext {
+                        hof_host: Some(&host),
+                        eval_context: ctx,
+                        task_context: handle,
+                        call_env,
+                        cancellation,
+                    };
                     func.invoke_runtime(&mut native_ctx, call_args)
-                }?;
+                };
+                let nested_instructions = host.consumed();
+                let ran_sync = host.ran_sync();
+                drop(host);
+                if ran_sync {
+                    self.sync_tracked_upvalues_to_stack();
+                    self.pending_nested_instructions = self
+                        .pending_nested_instructions
+                        .saturating_add(nested_instructions);
+                }
                 drop(_installed);
-                return Ok(match outcome {
+                return Ok(match outcome? {
                     NativeOutcome::Return(value) => NativeDispatchResult::Value(value),
                     other => NativeDispatchResult::Pending(VmPendingOutcome::from_outcome(other)),
                 });
@@ -2556,6 +2648,19 @@ impl VM {
                     ExceptionAction::Propagate(e) => return Err(e),
                 }
             }};
+        }
+
+        // Debit instructions a synchronous HOF fast-path session consumed
+        // inside the native call this arm just dispatched (`hof_sync`), so the
+        // element loop spends the same quantum budget the cooperative path
+        // would. Runs after every arm that can dispatch a native.
+        macro_rules! debit_nested {
+            ($self:expr, $guard:expr) => {
+                if $self.pending_nested_instructions != 0 {
+                    let nested = std::mem::take(&mut $self.pending_nested_instructions);
+                    $guard.remaining = $guard.remaining.saturating_sub(nested);
+                }
+            };
         }
 
         // Snapshot the VM's base function table — the table used by the
@@ -3149,11 +3254,13 @@ impl VM {
                         self.frames[fi].pc = pc;
                         let saved_pc = pc - op::SIZE_OP_U16;
                         if let Err(err) = self.call_value(argc, ctx) {
+                            debit_nested!(self, instr_guard);
                             match self.handle_exception(err, saved_pc)? {
                                 ExceptionAction::Handled => {}
                                 ExceptionAction::Propagate(e) => return Err(e),
                             }
                         }
+                        debit_nested!(self, instr_guard);
                         // A native dispatched via call_value suspended structurally.
                         if let Some(signal) = self.native_signal.take() {
                             if let Some(top) = self.stack.last_mut() {
@@ -3169,11 +3276,13 @@ impl VM {
                         self.frames[fi].pc = pc;
                         let saved_pc = pc - op::SIZE_OP_U16;
                         if let Err(err) = self.tail_call_value(argc, ctx) {
+                            debit_nested!(self, instr_guard);
                             match self.handle_exception(err, saved_pc)? {
                                 ExceptionAction::Handled => {}
                                 ExceptionAction::Propagate(e) => return Err(e),
                             }
                         }
+                        debit_nested!(self, instr_guard);
                         // A native dispatched via tail_call_value → call_value
                         // suspended structurally.
                         if let Some(signal) = self.native_signal.take() {
@@ -3293,6 +3402,7 @@ impl VM {
                                 handle_err!(self, fi, pc, err, saved_pc, 'dispatch);
                             }
                         }
+                        debit_nested!(self, instr_guard);
                         // The native completed on this frame, so stay in the
                         // inner loop instead of re-entering 'dispatch. The
                         // length check guards frame topology; DEBUG re-enters
@@ -3697,6 +3807,7 @@ impl VM {
                                 let func = func.clone();
                                 match self.call_native_with(&func, argc, ctx) {
                                     Ok(()) => {
+                                        debit_nested!(self, instr_guard);
                                         // The native suspended structurally. The call
                                         // pushed a nil placeholder; on resume the
                                         // runtime substitutes the actual resume value.
@@ -3734,11 +3845,13 @@ impl VM {
                             CachedGlobal::Plain(value) => {
                                 let func_val = value.clone();
                                 if let Err(err) = self.call_value_with(func_val, argc, ctx) {
+                                    debit_nested!(self, instr_guard);
                                     match self.handle_exception(err, saved_pc)? {
                                         ExceptionAction::Handled => {}
                                         ExceptionAction::Propagate(e) => return Err(e),
                                     }
                                 }
+                                debit_nested!(self, instr_guard);
                                 // A native callable suspended structurally; the
                                 // placeholder is on top.
                                 if let Some(signal) = self.native_signal.take() {
@@ -5225,6 +5338,7 @@ impl VM {
         rollback.capture_owner_frames(self, &mut traversal_budget)?;
         traversal_budget.check_boundary()?;
         let native_context = NativeCallContext {
+            hof_host: None,
             eval_context: ctx,
             task_context: task_context.clone(),
             call_env: Some(Rc::clone(&env)),
@@ -6100,6 +6214,7 @@ pub fn compile_program_with_spans_and_natives(
             source_file,
             local_scopes: Vec::new(),
             cache_offset: 0,
+            suspend_cache: std::cell::Cell::new(None),
         }),
         upvalues: Vec::new(),
         // Top-level main closure: uses the VM's own globals and function table.
@@ -6244,6 +6359,7 @@ pub fn compile_program(
             source_file: None,
             local_scopes: Vec::new(),
             cache_offset: 0,
+            suspend_cache: std::cell::Cell::new(None),
         }),
         upvalues: Vec::new(),
         // Top-level main closure: uses the VM's own globals and function table.
@@ -7022,6 +7138,7 @@ mod tests {
             source_file: None,
             local_scopes: Vec::new(),
             cache_offset: 0,
+            suspend_cache: std::cell::Cell::new(None),
         });
         let closure = Rc::new(Closure {
             func: func.clone(),
@@ -7074,6 +7191,7 @@ mod tests {
             source_file: None,
             local_scopes: Vec::new(),
             cache_offset: 0,
+            suspend_cache: std::cell::Cell::new(None),
         });
         let closure = Rc::new(Closure {
             func: func.clone(),
@@ -7631,6 +7749,7 @@ mod tests {
             source_file: None,
             local_scopes: Vec::new(),
             cache_offset: 0,
+            suspend_cache: std::cell::Cell::new(None),
         });
         let closure = Rc::new(Closure {
             func,
@@ -7673,6 +7792,7 @@ mod tests {
             source_file: None,
             local_scopes: Vec::new(),
             cache_offset: 0,
+            suspend_cache: std::cell::Cell::new(None),
         });
         let closure = Rc::new(Closure {
             func,
@@ -8671,6 +8791,7 @@ mod tests {
             source_file: None,
             local_scopes: Vec::new(),
             cache_offset: 0,
+            suspend_cache: std::cell::Cell::new(None),
         });
         let closure = Rc::new(Closure {
             func,
@@ -8822,6 +8943,7 @@ mod tests {
             source_file: Some(source_a.clone()),
             local_scopes: Vec::new(),
             cache_offset: 0,
+            suspend_cache: std::cell::Cell::new(None),
         });
 
         let mut chunk_b = Chunk::new();
@@ -8846,6 +8968,7 @@ mod tests {
             source_file: Some(source_b.clone()),
             local_scopes: Vec::new(),
             cache_offset: 0,
+            suspend_cache: std::cell::Cell::new(None),
         });
 
         let main = Rc::new(Closure {
@@ -8926,6 +9049,7 @@ mod tests {
             source_file: None,
             local_scopes: Vec::new(),
             cache_offset: 0,
+            suspend_cache: std::cell::Cell::new(None),
         });
         let closure = Rc::new(Closure {
             func,

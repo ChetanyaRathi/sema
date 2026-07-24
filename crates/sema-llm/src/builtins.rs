@@ -12913,6 +12913,7 @@ mod tests {
         let native = callable.as_native_fn_rc().expect("probe is a native");
         let task_context = TaskContextHandle::default();
         let mut call_context = NativeCallContext {
+            hof_host: None,
             eval_context,
             task_context,
             call_env: None,
@@ -13548,6 +13549,7 @@ mod tests {
         let eval_context = EvalContext::new();
         let task_context = TaskContextHandle::default();
         let mut call_context = NativeCallContext {
+            hof_host: None,
             eval_context: &eval_context,
             task_context,
             call_env: None,

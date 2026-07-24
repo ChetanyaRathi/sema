@@ -1454,6 +1454,7 @@ mod tests {
         let task_context = TaskContextHandle::default();
         task_context.borrow_mut().insert(Rc::new(TestTaskLocal(33)));
         let native_context = crate::runtime::NativeCallContext {
+            hof_host: None,
             eval_context: &eval_context,
             task_context,
             call_env: Some(call_env),
@@ -1481,6 +1482,7 @@ mod tests {
 
         let other_context = EvalContext::new();
         let other_native_context = crate::runtime::NativeCallContext {
+            hof_host: None,
             eval_context: &other_context,
             task_context: TaskContextHandle::default(),
             call_env: None,

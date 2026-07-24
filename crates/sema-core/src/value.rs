@@ -123,6 +123,26 @@ pub fn compare_spurs(a: Spur, b: Spur) -> std::cmp::Ordering {
 pub type NativeFnInner = dyn Fn(&EvalContext, &[Value]) -> Result<Value, SemaError>;
 type RuntimeNativeFnInner = dyn for<'a> Fn(&mut NativeCallContext<'a>, &[Value]) -> NativeResult;
 
+/// How a native's runtime ABI can leave the synchronous happy path.
+///
+/// Consumed by the VM's non-suspending HOF fast path: a callback whose call
+/// graph reaches only `Inert` natives (and `CallbackDriven` natives whose
+/// callback arguments are themselves provably inert) can run its element loop
+/// synchronously, skipping the cooperative drive round-trip per call.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NativeSuspensionClass {
+    /// Settles synchronously — returns a value or raises. Every native without
+    /// a runtime ABI is inherently inert (its only outcome is `Return`).
+    Inert,
+    /// Emits `NativeOutcome::Call` for user callbacks taken at these argument
+    /// positions and suspends only when one of those callbacks suspends (the
+    /// cooperative HOFs: `map`/`filter`/`foldl`/…).
+    CallbackDriven(&'static [usize]),
+    /// May park the task or issue runtime requests (async/channel/IO offload).
+    /// The conservative default for every native with a runtime ABI.
+    MaySuspend,
+}
+
 pub struct NativeFn {
     pub name: String,
     /// Legacy callback ABI.
@@ -161,6 +181,9 @@ pub struct NativeFn {
     /// The VM snapshots closures reachable from only these arguments while the
     /// owning frame is known, avoiding an all-native graph walk.
     escaping_args: &'static [usize],
+    /// Explicit suspension classification, when a registration overrides the
+    /// ABI-derived default (see [`NativeFn::suspension_class`]).
+    suspension: Option<NativeSuspensionClass>,
 }
 
 impl NativeFn {
@@ -182,6 +205,7 @@ impl NativeFn {
             runtime_func: None,
             runtime_only: false,
             escaping_args: &[],
+            suspension: None,
         }
     }
 
@@ -203,6 +227,7 @@ impl NativeFn {
             runtime_func: None,
             runtime_only: false,
             escaping_args: &[],
+            suspension: None,
         }
     }
 
@@ -225,6 +250,7 @@ impl NativeFn {
             runtime_func: None,
             runtime_only: false,
             escaping_args: &[],
+            suspension: None,
         }
     }
 
@@ -252,6 +278,7 @@ impl NativeFn {
             is_closure: false,
             runtime_only: true,
             escaping_args: &[],
+            suspension: None,
         }
     }
 
@@ -280,6 +307,7 @@ impl NativeFn {
             is_closure: false,
             runtime_only: true,
             escaping_args: &[],
+            suspension: None,
         }
     }
 
@@ -317,6 +345,7 @@ impl NativeFn {
             })),
             runtime_only: true,
             escaping_args: &[],
+            suspension: None,
         }
     }
 
@@ -355,6 +384,7 @@ impl NativeFn {
             })),
             runtime_only: false,
             escaping_args: &[],
+            suspension: None,
         }
     }
 
@@ -380,6 +410,7 @@ impl NativeFn {
             is_closure: false,
             runtime_only: false,
             escaping_args: &[],
+            suspension: None,
         }
     }
 
@@ -406,6 +437,7 @@ impl NativeFn {
             is_closure: false,
             runtime_only: false,
             escaping_args: &[],
+            suspension: None,
         }
     }
 
@@ -420,6 +452,25 @@ impl NativeFn {
     /// Argument positions that must be snapshotted before this native runs.
     pub fn escaping_args(&self) -> &'static [usize] {
         self.escaping_args
+    }
+
+    /// Mark this native as suspending only through the user callbacks it takes
+    /// at `positions` (a cooperative HOF). The metadata is static and carries
+    /// no traceable state, preserving invariant I2.
+    pub fn with_callback_suspension(mut self, positions: &'static [usize]) -> Self {
+        self.suspension = Some(NativeSuspensionClass::CallbackDriven(positions));
+        self
+    }
+
+    /// This native's suspension classification. Without an explicit override,
+    /// derived from the ABI: no runtime ABI means the only possible outcome is
+    /// `Return` (inert); any runtime ABI is conservatively `MaySuspend`.
+    pub fn suspension_class(&self) -> NativeSuspensionClass {
+        self.suspension.unwrap_or(if self.runtime_func.is_none() {
+            NativeSuspensionClass::Inert
+        } else {
+            NativeSuspensionClass::MaySuspend
+        })
     }
 
     #[doc(hidden)]

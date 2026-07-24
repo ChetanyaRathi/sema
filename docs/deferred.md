@@ -1358,7 +1358,32 @@ decoded `Value` must carry a `Trace` impl (GC invariant I2); macrotask fairness 
 roots; cancel latency for a root suspended in an External wait; the worker-protocol rewrite
 dropping the SAB; `MessageChannel` vs `setTimeout(0)` throttling in background tabs.
 
-## PERF-RESIDUAL-1 — post-flip runtime overhead (REOPENED 2026-07-24 — allocation-heavy compute regresses 3–5×; RELEASE GATE)
+## PERF-RESIDUAL-1 — post-flip runtime overhead (RESOLVED 2026-07-24 — non-suspending HOF fast path; release gate lifted)
+
+**RESOLVED 2026-07-24** by the non-suspending HOF direct-dispatch fast path
+(`docs/plans/archive/2026-07-24-hof-nonsuspending-fast-path.md`;
+`crates/sema-vm/src/hof_sync.rs`): when a HOF callback's call graph provably
+cannot suspend (conservative bytecode scan, memoized per `Function`, keyed on
+the env-chain version fingerprint), `map`/`filter`/`foldl`/`reduce`/`for-each`
+run their element loop synchronously on a pooled scratch VM inside the parent
+quantum — no drive round-trip per call, no continuation rebuild per element.
+Suspending callbacks keep the cooperative path (analysis is conservative);
+`context.rs` callback guards are untouched. Recovery, same protocol (hyperfine,
+baseline binary rebuilt+verified at `3f111e83`):
+
+| program | was (reopen) | now | note |
+|---|---|---|---|
+| `deriv` | 4.78× | **1.18×** | tiny nested maps, recursive global callback |
+| `string-pipeline` | 3.92× | **1.12×** | inert-native callbacks (`string/to-number`, `+`) |
+| `higher-order-fold` | 3.25× | **0.78× (faster)** | foldl/map/filter × 10k |
+| flat 10M-element map | 3.47× | **0.75× (faster)** | micro |
+| nested map | 3.90× | **0.72× (faster)** | micro |
+| `tak`/`nqueens`/`closure-storm`/`throw-catch` | ≤1.06× | ≤1.05× | unchanged |
+| `mandelbrot` / `hashmap-bench` | 1.15×/1.11× | 1.12×/1.09× | unchanged band |
+| spawn/sleep-storm, deep-await, primes | — | 0.55–0.87× (faster) | async no-regress ✓ |
+| channel-pingpong | ~1.4× accepted | 1.26× | within accepted end-state |
+
+The reopened entry's analysis is preserved below for context.
 
 **REOPENED 2026-07-24 (pre-merge-to-main A/B, candidate `e0e5acb8` vs baseline
 `14c44309`).** The `jake bench` VM suite — which the branch's async-focused

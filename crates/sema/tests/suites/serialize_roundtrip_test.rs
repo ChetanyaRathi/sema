@@ -42,6 +42,7 @@ fn eval_roundtrip(input: &str) -> Value {
             local_scopes: Vec::new(),
             source_file: None,
             cache_offset: 0,
+            suspend_cache: std::cell::Cell::new(None),
         }),
         upvalues: Vec::new(),
         globals: None,
