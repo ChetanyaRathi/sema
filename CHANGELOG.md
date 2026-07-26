@@ -1,7 +1,49 @@
 # Changelog
 
-## Unreleased
+## 1.31.0 — 2026-07-26
 
+- **`file/fold-lines(-bytes)` joins the synchronous fast path — the 1BRC
+  cross-dialect entry is back within 6% of its pre-async record.** The full
+  fifteen-dialect benchmark exposed two more faces of the cooperative-dispatch
+  overhead: the in-place callback loop deep-walked the fold accumulator
+  against the caller on every line (~10× the VM's own execution time on a 10M
+  line fold over a growing station map — 38.5 s where 3.6 s was recorded), and
+  once that walk was gated on the caller actually holding open upvalue cells,
+  the per-line cooperative `Call` round and then the chunked read handoff
+  became the bottlenecks. Drive-level continuation resumes now offer the same
+  `SyncHofHost` capability the in-quantum HOFs get, `FileLineContinuation`
+  drives each buffered chunk of lines as direct synchronous calls when the
+  callback is proven non-suspending, and line chunks grow to 2048 lines/1 MiB
+  (per-line fairness on the suspending path is unchanged). A trivial 10M-line
+  fold now matches the pre-async engine exactly (958 ms vs 957 ms); the
+  optimized 1BRC entry lands at 3.83 s (8th of fifteen, ~1.3× ahead of Janet,
+  fastest entry without JIT or native codegen) — see the website's
+  lisp-comparison page for the refreshed tables.
+- **Browser runtime un-broken: re-entrant host callbacks route through the
+  restricted driver.** The synchronous-VM-re-entry-bridge removal migrated the
+  debugger and macro expansion onto the restricted driver but missed
+  sema-wasm's `invokeGlobal`/`invokeCallback` exports, so a JS callback fired
+  from inside a native during an eval — `mount!`'s component render, a
+  state-change re-render — died with "legacy native callback cannot re-enter a
+  VM during an active runtime quantum", breaking every `@sema-lang/sema-web`
+  component scenario at mount. `sema-vm` gains `call_value_restricted` (the
+  host-adapter twin of `run_program_restricted` for an already-evaluated
+  callable); the wasm exports use it whenever a runtime quantum is active. All
+  23 sema-web e2e specs pass again.
+- **Terminal input: a parked ESC no longer completes as a lone escape while
+  its continuation bytes are buffered.** `io/read-key` consulted the 50 ms
+  lone-ESC disambiguation timeout before draining available input, so an
+  arrow key split across reads could decode as ESC + `[` + the final byte.
+  The time-based completion now fires only after a poll confirms nothing is
+  waiting. (Also de-flaked the terminal-query preservation test, which
+  additionally raced PTY teardown on macOS.)
+- **CI actually runs again**: cargo-nextest is installed before `jake
+  docs-check` (which runs the LSP builtin-doc-coverage test through nextest),
+  and ripgrep is installed for the unified-runtime conformance scanners —
+  both had silently stopped every CI test run since the docs-check recipe
+  migrated to nextest. The MCP cancellation tests' liveness probe now treats
+  a SIGKILLed-but-unreaped transport child (a zombie awaiting tokio's
+  background reap) as interrupted, fixing their Linux-only failures.
 - **Non-suspending HOF fast path — the post-flip compute regression is
   recovered (PERF-RESIDUAL-1 resolved; release gate lifted).** The `jake bench`
   compute suite exposed a 3–5× regression the async-focused benchmarks never
