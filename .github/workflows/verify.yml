@@ -20,7 +20,7 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libudev-dev pkg-config
+          sudo apt-get install -y libudev-dev pkg-config ripgrep
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -91,7 +91,7 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libudev-dev pkg-config
+          sudo apt-get install -y libudev-dev pkg-config ripgrep
 
       - name: Install Rust (pinned) + wasm target
         uses: dtolnay/rust-toolchain@1.97.0

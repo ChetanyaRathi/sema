@@ -23,10 +23,12 @@ jobs:
         # libudev-dev is required by `serialport` (transitive `libudev-sys`)
         # on Linux. The release workflow installs this via cargo-dist's
         # apt dependency hook (see dist-workspace.toml); CI needs to do it
-        # explicitly.
+        # explicitly. ripgrep is required by the unified-runtime conformance
+        # tests (they drive scripts/check-unified-runtime-*.sh, which scan
+        # with `rg`).
         run: |
           sudo apt-get update
-          sudo apt-get install -y libudev-dev
+          sudo apt-get install -y libudev-dev ripgrep
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
