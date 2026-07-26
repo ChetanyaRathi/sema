@@ -68,6 +68,16 @@ engine):
 The async benchmark matrix (spawn/sleep storms, deep await chains, channel
 ping-pong) is unregressed — most of it faster than the pre-async engine.
 
+The same open-upvalue-cell check also gates the cooperative in-place callback
+loop's per-element escaping-value snapshots (the machinery that lets a `set!`
+inside a callback reach the caller's stack). With no open cell on the parked
+caller the walk is a no-op by construction — and skipping it matters most for
+folds that thread a large accumulator: a 10M-line `file/fold-lines-bytes` over
+a growing station map (the 1BRC hot loop) spent ~10× the VM's own execution
+time deep-walking the accumulator per line before the skip (38.5 s → 4.8 s
+with PGO; the pre-async peak was 3.6 s — the remaining gap is the cooperative
+per-line dispatch, the next candidate for the synchronous fast path).
+
 ## Per-Instruction Inline Cache (Mar 2026)
 
 The VM's global variable lookup was originally served by a 256-slot direct-mapped cache. Each `LoadGlobal`/`CallGlobal` hashed the variable name to a slot, leading to collisions on hot paths where multiple globals mapped to the same slot.
