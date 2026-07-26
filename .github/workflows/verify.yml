@@ -54,11 +54,13 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace -- -D warnings
 
-      - name: Check builtin docs
-        run: jake docs-check
-
+      # Before docs-check: `jake docs-check` runs the LSP builtin-doc-coverage
+      # test through cargo nextest.
       - name: Install cargo-nextest
         uses: taiki-e/install-action@nextest
+
+      - name: Check builtin docs
+        run: jake docs-check
 
       - name: Run tests
         run: cargo nextest run --workspace --profile ci
