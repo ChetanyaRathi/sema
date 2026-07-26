@@ -2,6 +2,31 @@
 
 ## Unreleased
 
+- **Non-suspending HOF fast path — the post-flip compute regression is
+  recovered (PERF-RESIDUAL-1 resolved; release gate lifted).** The `jake bench`
+  compute suite exposed a 3–5× regression the async-focused benchmarks never
+  covered (deriv 4.78×, string-pipeline 3.92×, higher-order-fold 3.25× vs the
+  pre-unification engine): under the cooperative runtime, every
+  `map`/`filter`/`foldl`/`reduce`/`for-each` call round-tripped the drive loop
+  and every element paid continuation machinery — overhead that dominates
+  cheap callbacks. HOF callbacks whose call graph provably cannot suspend now
+  run their element loop synchronously inside the parent quantum on a warm
+  pooled scratch VM (`crates/sema-vm/src/hof_sync.rs`): a conservative bytecode
+  analysis proves non-suspension (memoized per function, invalidated when a
+  global along the resolution chain is rebound), and inert native callbacks
+  (`(map string/to-number xs)`, `(foldl + 0 xs)`) qualify with no analysis at
+  all. Recovered: deriv 1.18×, string-pipeline 1.12×, higher-order-fold 0.78×
+  and flat/nested map micros 0.72–0.75× (all three faster than the
+  pre-unification engine); the async benchmark matrix is unregressed.
+  Suspending callbacks keep the cooperative path unchanged, quantum budgets
+  hold at element granularity, and deep `map`-in-`map` recursion de-opts to a
+  flat scheduler-free driver instead of growing the Rust stack. Design and
+  measurements: `docs/plans/archive/2026-07-24-hof-nonsuspending-fast-path.md`.
+- **Drive-loop wall-clock bound check batched to the 64-iteration clock
+  refresh.** The per-iteration `saturating_duration_since` was constant between
+  clock refreshes and therefore pure redundancy; moving it into the refresh
+  block is behavior-equivalent and trims ~2% and syscall pressure on
+  drive-heavy workloads.
 - **Unified async runtime — terminal-inventory ledger signed off; conformance
   gate green.** The async-runtime migration inventory
   (`docs/internals/async-runtime-inventory.md`) is now terminal for every
@@ -130,8 +155,10 @@
   The CLI now cancels gracefully on Ctrl-C (double-press hard-exits, 130); the
   notebook engine drives cells through the API with per-cell output capture,
   in-order stderr, and cross-thread cell cancellation.
-- **Runtime fast-path recovery (0b/0c):** HOF-heavy compute and task fan-out now
-  beat the pre-unification engine (primes/spawn-storm 0.7×); channel rendezvous
+- **Runtime fast-path recovery (0b/0c):** HOF compute with substantial
+  callbacks and task fan-out beat the pre-unification engine
+  (primes/spawn-storm 0.7×) — cheap-callback HOF compute (deriv-class) needed
+  the later non-suspending fast path above; channel rendezvous
   7.4×→~1.4× via inline completion + direct task-to-task handoff; O(1)
   cancel-waiting and ready-remaining; depth-bounded value drop; divan scheduler
   micro-benchmarks (`jake bench.micro`).

@@ -33,6 +33,41 @@ All benchmarks were run on Apple Silicon (M-series), processing the 1BRC dataset
 > (long-lived async servers no longer accrete unreachable closures) and blocking
 > I/O yields to the scheduler so sibling tasks interleave.
 
+## Non-Suspending HOF Fast Path (Jul 2026)
+
+The unified cooperative async runtime initially drove **every** stdlib
+higher-order-function callback through its structural call protocol: each
+`map`/`filter`/`foldl` call round-tripped the runtime's drive loop, and each
+element paid continuation machinery. Callbacks doing real work amortize that
+fine (primes-style filters actually beat the old engine), but for cheap
+callbacks (`cons`/`car`/`+`) the dispatch overhead dominated — a 3–5×
+regression on HOF-heavy compute that the async-focused benchmark suite never
+caught.
+
+The fix: when a callback's call graph **provably cannot suspend**, the HOF runs
+its element loop synchronously inside the parent task's quantum on a warm
+pooled scratch VM. A conservative bytecode analysis proves non-suspension
+(dynamic callees, unknown globals, and suspension-capable natives all
+disqualify; verdicts are memoized per function and invalidated when a global
+along the resolution chain is rebound), and inert native callbacks like
+`(map string/to-number xs)` qualify with no analysis at all. Suspending
+callbacks keep the cooperative path unchanged, and quantum budgets still hold
+at element granularity.
+
+**Impact** (Apple Silicon, release builds, hyperfine, vs the pre-async-runtime
+engine):
+
+| Benchmark         | Regressed | Recovered | Notes                                  |
+| ----------------- | --------: | --------: | -------------------------------------- |
+| deriv             |     4.78× | **1.18×** | tiny nested maps, recursive callback   |
+| string-pipeline   |     3.92× | **1.12×** | inert-native callbacks                 |
+| higher-order-fold |     3.25× | **0.78×** | faster than the pre-async engine       |
+| flat 10M-elem map |     3.47× | **0.75×** | faster (warm VM vs fresh VM per elem)  |
+| nested map        |     3.90× | **0.72×** | faster                                 |
+
+The async benchmark matrix (spawn/sleep storms, deep await chains, channel
+ping-pong) is unregressed — most of it faster than the pre-async engine.
+
 ## Per-Instruction Inline Cache (Mar 2026)
 
 The VM's global variable lookup was originally served by a 256-slot direct-mapped cache. Each `LoadGlobal`/`CallGlobal` hashed the variable name to a slot, leading to collisions on hot paths where multiple globals mapped to the same slot.

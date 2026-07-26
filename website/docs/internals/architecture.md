@@ -464,16 +464,24 @@ sema_core::set_eval_callback(&ctx, eval_value);
 sema_core::set_call_callback(&ctx, call_value);
 ```
 
-All stdlib higher-order functions (`map`, `filter`, `fold`, `sort-by`, `for-each`, `file/fold-lines`, etc.) invoke user-provided lambdas through `sema_core::call_callback`, which dispatches to the real evaluator:
+Stdlib higher-order functions (`map`, `filter`, `fold`, `sort-by`, `for-each`, `file/fold-lines`, etc.) invoke user-provided lambdas without depending on `sema-eval`, through one of three routes depending on the dispatch context:
 
-```rust
-// In sema-stdlib, e.g. map implementation
-let result = sema_core::call_callback(ctx, &func, &[elem])?;
-```
+1. **Host path (outside a runtime quantum)** — `sema_core::call_callback`, which dispatches to the real evaluator through a registered function pointer:
 
-The `with_stdlib_ctx` function provides a shared `EvalContext` for stdlib callbacks, avoiding per-call allocation of a new context.
+   ```rust
+   // In sema-stdlib, e.g. map's legacy value-ABI implementation
+   let result = sema_core::call_callback(ctx, &func, &[elem])?;
+   ```
 
-This is a clean dependency inversion — `sema-stdlib` depends only on the callback signature defined in `sema-core`, not on `sema-eval`. The runtime cost is one `Cell::get()` + function pointer dispatch per call, which is negligible. Unlike the previous mini-evaluator approach, this architecture uses the _same_ evaluator everywhere — all special forms, builtins, and features are available inside higher-order functions like `map` and `file/fold-lines`.
+   This path is **host-only**: it rejects re-entry while a runtime quantum is active (a synchronous nested callback could not honor a suspension), so it serves embedders and synchronous adapters, not the cooperative runtime.
+
+2. **Cooperative path (inside a runtime quantum)** — the HOF's runtime ABI returns one structural `NativeOutcome::Call` per element; the runtime drives the callback as real task work, so an `await` or channel operation inside a `map` callback parks and resumes correctly.
+
+3. **Synchronous fast path (inside a runtime quantum, non-suspending callback)** — when a conservative bytecode analysis proves the callback's call graph cannot suspend (or the callback is an inert native like `string/to-number`), the HOF runs its whole element loop directly on a warm pooled scratch VM via the `SyncHofHost` capability the VM installs into `NativeCallContext` during native dispatch — skipping the per-call drive round-trip and per-element continuation machinery entirely (see `sema-vm/src/hof_sync.rs`).
+
+The `with_stdlib_ctx` function provides a shared `EvalContext` for stdlib callbacks on the host path, avoiding per-call allocation of a new context.
+
+This is a clean dependency inversion — `sema-stdlib` depends only on signatures defined in `sema-core` (`call_callback`, `NativeOutcome`, `SyncHofHost`), not on `sema-eval` or `sema-vm`. Unlike the previous mini-evaluator approach, this architecture uses the _same_ evaluator everywhere — all special forms, builtins, and features are available inside higher-order functions like `map` and `file/fold-lines`.
 
 ### Solution 2: Eval Callback (sema-llm) — redundant, slated for removal
 
