@@ -1380,6 +1380,11 @@ fn terminal_query_requeues_unrelated_events_before_its_partial_suffix() {
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
 
+    // The result is printed explicitly and the program then parks on one more
+    // read: a child that exits right after its final write races the PTY
+    // teardown, and macOS occasionally drops the still-unread bytes — the test
+    // must observe the result BEFORE the child goes away (the kill below
+    // releases the parked read).
     let program = r#"
         (let ((_raw-token (io/tty-raw!)))
           (term/supports-kitty-keys?)
@@ -1389,9 +1394,11 @@ fn terminal_query_requeues_unrelated_events_before_its_partial_suffix() {
                 (focus (io/read-key))
                 (mouse (io/read-key))
                 (key (io/read-key)))
-            (list (:kind character) (:char character)
-                  (:kind focus) (:focused focus)
-                  (:kind mouse) (:kind key) (:name key))))
+            (println (list (:kind character) (:char character)
+                           (:kind focus) (:focused focus)
+                           (:kind mouse) (:kind key) (:name key)))
+            (io/flush)
+            (io/read-key)))
     "#;
     let pty = native_pty_system();
     let pair = pty

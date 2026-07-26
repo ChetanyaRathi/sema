@@ -2250,11 +2250,21 @@ fn runtime_key_poll_delay(bytes: &[u8], escape_started: Option<std::time::Instan
 
 #[cfg(unix)]
 fn poll_runtime_key(probe: &mut KeyProbe) -> RuntimePollResult {
+    fn finish(probe: &mut KeyProbe) -> RuntimePollResult {
+        probe.terminal = true;
+        probe.completed_bytes = std::mem::take(&mut probe.bytes);
+        RuntimePollResult::Ready(decode_runtime_key(&probe.completed_bytes))
+    }
+
     loop {
-        if runtime_key_complete(&probe.bytes, probe.escape_started) {
-            probe.terminal = true;
-            probe.completed_bytes = std::mem::take(&mut probe.bytes);
-            return RuntimePollResult::Ready(decode_runtime_key(&probe.completed_bytes));
+        // Structural completeness only (escape clock withheld): the lone-ESC
+        // disambiguation timeout may fire only once a poll confirms no byte is
+        // waiting — an ESC parked on its 50ms window must not complete as a
+        // bare escape while its '[' (delivered in a separate read) is already
+        // sitting in the buffer, or a split arrow key decodes as ESC + '[' +
+        // the final byte.
+        if runtime_key_complete(&probe.bytes, None) {
+            return finish(probe);
         }
         match probe.lease.poll(1, None, "io/read-key") {
             Ok(crate::stream::StdinInputPoll::Data(bytes)) => {
@@ -2278,10 +2288,12 @@ fn poll_runtime_key(probe: &mut KeyProbe) -> RuntimePollResult {
             Ok(crate::stream::StdinInputPoll::Eof) => {
                 probe.terminal = true;
                 mark_stdin_eof();
-                probe.completed_bytes = std::mem::take(&mut probe.bytes);
-                return RuntimePollResult::Ready(decode_runtime_key(&probe.completed_bytes));
+                return finish(probe);
             }
             Ok(crate::stream::StdinInputPoll::Pending) => {
+                if runtime_key_complete(&probe.bytes, probe.escape_started) {
+                    return finish(probe);
+                }
                 return RuntimePollResult::PendingAfter(runtime_key_poll_delay(
                     &probe.bytes,
                     probe.escape_started,

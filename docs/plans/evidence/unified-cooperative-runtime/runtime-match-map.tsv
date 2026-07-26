@@ -644,11 +644,11 @@ R08A	crates/sema-stdlib/src/io.rs:1342:                std::thread::sleep(Durati
 R08A	crates/sema-stdlib/src/io.rs:1883:                    std::thread::sleep(Duration::from_millis(delay));
 R08A	crates/sema-stdlib/src/io.rs:2055:/// `IoHandle`.
 R08B	crates/sema-stdlib/src/io.rs:218:/// guard(s) it opened. When the task settles — including an `async/cancel` that
-R08A	crates/sema-stdlib/src/io.rs:2467:            RuntimePollResult::PendingAfter(delay) => std::thread::sleep(delay),
-R08A	crates/sema-stdlib/src/io.rs:2515:                std::thread::sleep(sleep);
-R22A	crates/sema-stdlib/src/io.rs:3212:                    sema_core::call_callback(ctx, &func, &[Value::string(&line_buf)])?;
-R22A	crates/sema-stdlib/src/io.rs:3263:                    acc = sema_core::call_callback_owned(ctx, &func, &mut cb_args)?;
-R22A	crates/sema-stdlib/src/io.rs:3321:                    acc = sema_core::call_callback_owned(ctx, &func, &mut cb_args)?;
+R08A	crates/sema-stdlib/src/io.rs:2479:            RuntimePollResult::PendingAfter(delay) => std::thread::sleep(delay),
+R08A	crates/sema-stdlib/src/io.rs:2527:                std::thread::sleep(sleep);
+R22A	crates/sema-stdlib/src/io.rs:3224:                    sema_core::call_callback(ctx, &func, &[Value::string(&line_buf)])?;
+R22A	crates/sema-stdlib/src/io.rs:3275:                    acc = sema_core::call_callback_owned(ctx, &func, &mut cb_args)?;
+R22A	crates/sema-stdlib/src/io.rs:3333:                    acc = sema_core::call_callback_owned(ctx, &func, &mut cb_args)?;
 R08C	crates/sema-stdlib/src/io.rs:85:thread_local! {
 R09A	crates/sema-stdlib/src/kv.rs:127:thread_local! {
 R22A	crates/sema-stdlib/src/list.rs:3601:/// A runtime-only native (`async/spawn`, `channel/*`, `async/resolved`, …) can
