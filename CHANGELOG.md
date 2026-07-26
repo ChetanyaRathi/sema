@@ -1,5 +1,38 @@
 # Changelog
 
+## 1.31.1 — 2026-07-27
+
+- **Playground concurrency examples un-hung: a root-filtered drive can no
+  longer wedge the runtime's timer wheel.** `worker-pool.sema` ran correctly
+  under native `sema` but hung forever in the browser with no error, and once
+  a session hit the hang every later program using `async/sleep` hung too.
+  Both causes were state that a *root-filtered* drive could never reach —
+  wasm32 is the only host that drives with `drive_roots` (native `drive()`
+  drains pending work and fires timers regardless of ownership, which masked
+  the whole class). Since `fire_timer` defers while anything is ready or
+  pending, one unreachable item stalls every timer on the runtime forever.
+  Two of them existed: closing a channel with no parked sender or receiver
+  staged an empty wake batch that belonged to no task (so no selection could
+  drain it — this is the one `worker-pool.sema` tripped, filling a buffered
+  queue and closing it before any worker parks); and `fire_timer` itself used
+  a runtime-wide gate plus an unfiltered timer pop while the same turn's
+  `next_deadline`/`inbox_wakeup_required` were already scoped to the
+  selection, so a settled root that left parked detached work behind killed
+  every later timer — running `timeout.sema` poisoned every subsequent sleep
+  in that worker session. Both halves of `fire_timer` are now selection-scoped
+  like the rest of the turn. Parked detached tasks still outlive their root
+  exactly as before; native hosts take a byte-identical path. Covered by two
+  regression tests that hang for 10s on the old code, plus every concurrency
+  example running twice in one browser session against a rebuilt playground.
+- **`def`, `defn`, and `progn` are treated as the first-class aliases they
+  are.** The REPL's "veteran hint" told users to rewrite `defn` as `defun` and
+  `progn` as `begin` — both spellings work — the `; defined <name>` echo was
+  skipped for `(defn`/`(def`, and `,help` used one `/` separator to mean both
+  "alias" and "unrelated form". The functions tutorial also had the
+  relationship backwards, calling `define` a shorthand for `defn`; `define` is
+  the general binding form, and its signature form is shorthand for binding a
+  `fn`.
+
 ## 1.31.0 — 2026-07-26
 
 - **`file/fold-lines(-bytes)` joins the synchronous fast path — the 1BRC
