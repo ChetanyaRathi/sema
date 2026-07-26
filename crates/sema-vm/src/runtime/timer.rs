@@ -59,6 +59,21 @@ impl TimerQueue {
         Some(key)
     }
 
+    /// The earliest due timer whose key satisfies `matches`, without removing
+    /// it — the read half of a filtered pop, so the caller can hold an
+    /// immutable borrow of the rest of the runtime state while deciding
+    /// (`cancel` then removes it). Mirrors [`next_deadline_for`]: entries that
+    /// don't match are skipped rather than blocking the ones behind them, so a
+    /// root-filtered drive never observes another root's timer.
+    ///
+    /// [`next_deadline_for`]: Self::next_deadline_for
+    pub fn peek_due_for(&self, now: Instant, matches: impl Fn(WaitKey) -> bool) -> Option<WaitKey> {
+        self.deadlines
+            .iter()
+            .find(|(&(deadline, _), &key)| deadline <= now && matches(key))
+            .map(|(_, &key)| key)
+    }
+
     pub fn next_deadline(&self) -> Option<Instant> {
         self.next_deadline_for(|_| true)
     }

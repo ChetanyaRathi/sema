@@ -309,3 +309,153 @@ fn non_captured_output_still_reaches_process_stdout() {
         run.stderr
     );
 }
+
+/// Closing a channel that has no parked sender or receiver must not leave a
+/// pending stage behind that `drive_roots` can never drain.
+///
+/// `drive_roots` (the selected-roots host surface the WASM Promise driver in
+/// `crates/sema-wasm/src/driver.rs` uses) only advances pending stages that
+/// belong to one of its roots. A wake batch with no waiters belongs to no
+/// task at all, so nothing would ever advance it — and `fire_timer`'s gate is
+/// runtime-wide ("no ready task, no pending stage"), so one orphaned stage
+/// stalls EVERY later timer on that runtime: the sleep below never fires and
+/// the root never settles. Regression: the playground's `worker-pool.sema`
+/// example (buffered queue, closed before any worker parks on it, then a
+/// cooperative `(async/sleep 0)` yield) hung forever in the browser while
+/// running fine under the native `drive`, which drains `pending` regardless
+/// of ownership.
+#[test]
+fn closing_an_unwaited_channel_leaves_no_undrainable_pending_stage() {
+    let interp = Interpreter::new();
+    let handle = interp
+        .submit_str(
+            r#"(define jobs (channel/new 8))
+               (for-each (fn (c) (channel/send jobs c)) (list 1 2 3))
+               (channel/close jobs)
+               (define w (async (let loop ((load 0))
+                 (async/sleep 0)
+                 (let ((cost (channel/recv jobs)))
+                   (if (nil? cost) load (loop (+ load cost)))))))
+               (await w)"#,
+            RootOptions {
+                name: Some("pool".into()),
+                capture_output: true,
+            },
+        )
+        .expect("root submits");
+    let root = handle.id();
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        assert!(
+            Instant::now() < deadline,
+            "root never settled under drive_roots — an undrainable pending \
+             stage is blocking the timer queue"
+        );
+        let state = interp.drive_roots(&[root]).expect("drive turn");
+        match handle.poll_result() {
+            RootPoll::Pending => {}
+            RootPoll::Ready(settlement) => {
+                let outcome = format!("{:?}", settlement.outcome);
+                assert!(
+                    outcome.contains('6'),
+                    "expected the three jobs (1+2+3) to be drained, got {outcome}"
+                );
+                return;
+            }
+            RootPoll::Aborted(fault) => panic!("root aborted: {fault:?}"),
+            RootPoll::RuntimeDropped => panic!("runtime dropped"),
+            RootPoll::InvariantViolation => panic!("invariant violation"),
+        }
+        // Mirror the Promise driver: wait out a reported timer deadline
+        // instead of busy-polling, so a never-firing timer hangs here exactly
+        // as it does in the browser.
+        if let DriveState::Idle {
+            next_deadline: Some(_),
+            ..
+        } = state
+        {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+}
+
+/// A detached task still parked on a timer when its root settles must not
+/// wedge the NEXT root's timers.
+///
+/// Parked detached tasks deliberately outlive their root (see the drain
+/// comment in `Interpreter::drive_handle_to_settlement`), so the orphan below
+/// is expected to survive. What must not happen is the orphan's overdue timer
+/// blocking a later root: `drive_roots` scopes `next_deadline` and
+/// `inbox_wakeup_required` to its selection, so the timer wheel has to be
+/// scoped the same way. Otherwise the second program's `(async/sleep 0)` never
+/// fires and the root hangs forever — the playground symptom where running
+/// `timeout.sema` (whose `async/timeout`/`async/race` losers are left parked)
+/// poisoned every later sleep in that worker session.
+#[test]
+fn an_orphaned_timer_from_a_settled_root_does_not_stall_a_later_root() {
+    let interp = Interpreter::new();
+
+    // Program 1: settles immediately, leaving a detached task parked on a timer.
+    let first = interp
+        .submit_str(
+            r#"(define orphan (async (begin (async/sleep 400) (println "orphan woke"))))
+               1"#,
+            RootOptions {
+                name: Some("leaves-an-orphan".into()),
+                capture_output: true,
+            },
+        )
+        .expect("first root submits");
+    drive_selected_to_settlement(&interp, &first, "first");
+
+    // No driving at all while the orphan's deadline passes — what a browser
+    // does between two Run clicks. The orphan timer is now overdue, and (being
+    // the oldest) it is the earliest entry in the timer wheel.
+    std::thread::sleep(Duration::from_millis(600));
+
+    // Program 2: a plain cooperative yield. Its timer must still fire.
+    let second = interp
+        .submit_str(
+            "(async/sleep 0) 7",
+            RootOptions {
+                name: Some("later-sleeper".into()),
+                capture_output: true,
+            },
+        )
+        .expect("second root submits");
+    let outcome = drive_selected_to_settlement(&interp, &second, "second");
+    assert!(
+        outcome.contains('7'),
+        "second root settled with the wrong value: {outcome}"
+    );
+}
+
+/// Drive `handle` to settlement through `drive_roots` only — the selected-roots
+/// host surface the WASM Promise driver uses — waiting out reported deadlines
+/// instead of busy-polling, so a timer that never fires hangs here exactly as
+/// it does in the browser. Returns the settled outcome, rendered.
+fn drive_selected_to_settlement(
+    interp: &Interpreter,
+    handle: &sema_vm::runtime::RootHandle,
+    label: &str,
+) -> String {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        assert!(
+            Instant::now() < deadline,
+            "{label} root never settled under drive_roots — its timer never fired"
+        );
+        let state = interp.drive_roots(&[handle.id()]).expect("drive turn");
+        match handle.poll_result() {
+            RootPoll::Pending => {}
+            RootPoll::Ready(settlement) => return format!("{:?}", settlement.outcome),
+            RootPoll::Aborted(fault) => panic!("{label} root aborted: {fault:?}"),
+            RootPoll::RuntimeDropped => panic!("{label} runtime dropped"),
+            RootPoll::InvariantViolation => panic!("{label} invariant violation"),
+        }
+        if let DriveState::Idle { .. } = state {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+}

@@ -1326,7 +1326,9 @@ impl Runtime {
                 }
                 2 => self.cancel_waiting()?,
                 3 => self.advance_pending_selected(selected_roots)?,
-                4 if timers < budget.timer_limit.get() && self.fire_timer(clock_now)? => {
+                4 if timers < budget.timer_limit.get()
+                    && self.fire_timer(clock_now, selected_roots)? =>
+                {
                     timers += 1;
                     true
                 }
@@ -1668,7 +1670,11 @@ impl Runtime {
     /// one 64-iteration window; timers are self-resolving (a due-but-not-
     /// yet-observed timer is simply re-checked, and fires, on the next
     /// window) so this never delays a timer past that bound.
-    fn fire_timer(&self, now: Instant) -> Result<bool, RuntimeFault> {
+    fn fire_timer(
+        &self,
+        now: Instant,
+        selected_roots: Option<&[RootId]>,
+    ) -> Result<bool, RuntimeFault> {
         let mut state = self.state.borrow_mut();
         // Virtual-clock cooperative semantics: never fire a timer while any task
         // is still runnable. A cooperative scheduler drains all ready work to a
@@ -1679,10 +1685,46 @@ impl Runtime {
         // longer sleeper's — or a select/retry backoff's — timer fires. Deferring
         // here is bounded: the drive loop still makes progress via `visit_ready`,
         // and once ready work quiesces this fires on the next turn.
-        if state.ready.root_count() > 0 || !state.pending.is_empty() {
+        //
+        // Both halves below are scoped to `selected_roots`, exactly as this
+        // turn's `next_deadline`/`inbox_wakeup_required` already are. A
+        // root-filtered drive cannot run another root's ready task or pending
+        // stage, so counting those as "still runnable" would defer forever, and
+        // firing another root's timer would stage a resume this drive can never
+        // advance — either one wedges the whole timer wheel for good once a
+        // settled root leaves parked detached work behind (which it may: parked
+        // detached tasks deliberately outlive their root).
+        let runnable = match selected_roots {
+            None => state.ready.root_count() > 0 || !state.pending.is_empty(),
+            Some(roots) => {
+                state.ready.root_count_for(roots) > 0
+                    || state
+                        .pending
+                        .iter()
+                        .any(|stage| stage.belongs_to_roots(&state, roots))
+            }
+        };
+        if runnable {
             return Ok(false);
         }
-        let Some(key) = state.timers.pop_due(now) else {
+        let due = match selected_roots {
+            None => state.timers.pop_due(now),
+            Some(roots) => {
+                // Peek under an immutable borrow (the predicate reads
+                // `protocol_waits`/`tasks`), then remove by key.
+                let key = state.timers.peek_due_for(now, |key| {
+                    state
+                        .protocol_waits
+                        .get(&key)
+                        .is_some_and(|wait| task_belongs_to_roots(&state, wait.task, roots))
+                });
+                if let Some(key) = key {
+                    state.timers.cancel(key);
+                }
+                key
+            }
+        };
+        let Some(key) = due else {
             return Ok(false);
         };
         // A continuation parked on a bare `Timer(d)` suspension, or an
@@ -3684,7 +3726,15 @@ impl Runtime {
                     let response = match operation {
                         ChannelOperation::Close => state.channels.close(channel).map(|close| {
                             if let Some(close) = close {
-                                state.pending.push_back(PendingStage::ChannelClose(close));
+                                // Stage a close only when it has waiters to wake —
+                                // the invariant every `PromiseWakes` push upholds.
+                                // An empty batch belongs to no task, so it matches
+                                // no `drive_roots` selection and could never drain,
+                                // and `fire_timer`'s runtime-wide "nothing pending"
+                                // gate would then stall every later timer.
+                                if !close.is_empty() {
+                                    state.pending.push_back(PendingStage::ChannelClose(close));
+                                }
                                 RuntimeResponse::Value(sema_core::Value::TRUE)
                             } else {
                                 RuntimeResponse::Value(sema_core::Value::FALSE)
