@@ -295,21 +295,43 @@ enum CancellationResourceOracle {
     HttpPeerDisconnect,
 }
 
+/// True once the stdio server process was interrupted: gone entirely, or
+/// killed but not yet reaped (a zombie). Cancellation SIGKILLs the transport
+/// child and leaves reaping to tokio's background best-effort, so a plain
+/// `kill(pid, 0)` probe — which succeeds on zombies — would misread an
+/// interrupted-but-unreaped child as alive (observed on Linux CI, where the
+/// reap consistently lags the probe window). Polls briefly: the kill itself
+/// is prompt; only its observation needs slack on loaded runners.
 fn stdio_server_exited(entered: &std::path::Path) -> bool {
     let Ok(pid) = std::fs::read_to_string(entered) else {
         return false;
     };
     let probe = r#"
-import os, sys
+import os, subprocess, sys
+pid = int(sys.argv[1])
 try:
-    os.kill(int(sys.argv[1]), 0)
+    os.kill(pid, 0)
 except OSError:
-    raise SystemExit(1)
+    raise SystemExit(1)  # process gone
+state = subprocess.run(
+    ["ps", "-o", "stat=", "-p", str(pid)],
+    capture_output=True, text=True,
+).stdout.strip()
+if not state or state.startswith("Z"):
+    raise SystemExit(1)  # reaped mid-probe, or a kill-pending zombie
+raise SystemExit(0)  # genuinely still running
 "#;
-    !Command::new("python3")
-        .args(["-c", probe, pid.trim()])
-        .status()
-        .is_ok_and(|status| status.success())
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let interrupted = !Command::new("python3")
+            .args(["-c", probe, pid.trim()])
+            .status()
+            .is_ok_and(|status| status.success());
+        if interrupted || Instant::now() >= deadline {
+            return interrupted;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
 }
 
 fn assert_cancelled_before_server_fallback(
