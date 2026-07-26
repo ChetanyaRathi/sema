@@ -779,8 +779,8 @@ C16	crates/sema-vm/src/lower.rs:15:thread_local! {
 C16	crates/sema-vm/src/lower.rs:325:thread_local! {
 C16	crates/sema-vm/src/lower.rs:328:    /// `Spur` ids are only meaningful within the `thread_local!` interner that
 C16	crates/sema-vm/src/lower.rs:391:    thread_local! {
-F28	crates/sema-vm/src/restricted.rs:1611:                    std::thread::sleep(Duration::from_millis(150));
-F28	crates/sema-vm/src/restricted.rs:1662:                std::thread::sleep(Duration::from_millis(150));
+F28	crates/sema-vm/src/restricted.rs:1679:                    std::thread::sleep(Duration::from_millis(150));
+F28	crates/sema-vm/src/restricted.rs:1730:                std::thread::sleep(Duration::from_millis(150));
 F09B	crates/sema-vm/src/runtime/host.rs:306:            match guard.recv() {
 F09B	crates/sema-vm/src/runtime/host.rs:346:        ExecutorDispatch::Async(async_dispatch) => block_on(async_dispatch.into_future()),
 F09B	crates/sema-vm/src/runtime/host.rs:370:fn block_on<F: Future>(future: F) -> F::Output {
@@ -890,7 +890,7 @@ H09	crates/sema-wasm/src/lib.rs:1977:    /// `http/get`/`async/sleep` inside it 
 H09	crates/sema-wasm/src/lib.rs:2767:            sema_core::set_eval_callback(&ctx, sema_eval::eval_value_vm);
 H09	crates/sema-wasm/src/lib.rs:2768:            sema_core::set_call_callback(&ctx, sema_eval::call_value);
 H09	crates/sema-wasm/src/lib.rs:2769:            sema_core::set_call_owned_callback(&ctx, sema_eval::call_value_owned);
-H10A	crates/sema-wasm/src/lib.rs:3152:    /// replays, and `http/get`/`async/sleep` resume the original root in place.
+H10A	crates/sema-wasm/src/lib.rs:3184:    /// replays, and `http/get`/`async/sleep` resume the original root in place.
 C12	crates/sema-workflow/src/context.rs:114:thread_local! {
 C12	crates/sema-workflow/src/journal.rs:150:        let _ = ack.recv_timeout(HOST_FLUSH_TIMEOUT);
 C12	crates/sema-workflow/src/writer.rs:152:    while let Ok(msg) = rx.recv() {

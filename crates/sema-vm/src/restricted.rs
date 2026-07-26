@@ -122,6 +122,74 @@ pub fn run_program_restricted_with_budget(
     RestrictedVmDriver::new(ctx, task_context, policy, budget).run(program, globals)
 }
 
+/// Call `callable` with `args` without driving the runtime scheduler,
+/// continuation chains and callee VMs handled iteratively. The host-adapter
+/// twin of [`run_program_restricted`] for an already-evaluated callable: a
+/// re-entrant host boundary (the wasm `invokeGlobal`/`invokeCallback` exports
+/// servicing a JS callback fired from inside a native) cannot take the legacy
+/// synchronous VM entry while a runtime quantum is active, and must not drive
+/// the scheduler re-entrantly either. Any wait or runtime request fails with
+/// the policy's suspension error.
+pub fn call_value_restricted(
+    ctx: &EvalContext,
+    task_context: TaskContextHandle,
+    callable: Value,
+    args: Vec<Value>,
+    policy: RestrictedRunPolicy,
+) -> Result<Value, SemaError> {
+    let budget = RestrictedRunBudget::new(policy.instruction_limit, policy.transition_limit);
+    let _task_context = ctx.scope_task_context(task_context.clone());
+    let _quantum = if ctx.runtime_quantum_active() {
+        None
+    } else {
+        Some(ctx.enter_runtime_quantum()?)
+    };
+    let driver = RestrictedVmDriver::new(ctx, task_context, policy, budget);
+    driver.drive(driver_seed_call(callable, args))
+}
+
+/// Seed work for [`call_value_restricted`]: one structural call whose result
+/// passes through unchanged.
+fn driver_seed_call(callable: Value, args: Vec<Value>) -> RestrictedWork {
+    use sema_core::runtime::Trace;
+
+    struct Passthrough;
+
+    impl Trace for Passthrough {
+        fn trace(&self, _sink: &mut dyn FnMut(sema_core::cycle::GcEdge<'_>)) -> bool {
+            true
+        }
+    }
+
+    impl NativeContinuation for Passthrough {
+        fn resume(
+            self: Box<Self>,
+            _context: &mut NativeCallContext<'_>,
+            input: ResumeInput,
+        ) -> NativeResult {
+            match input {
+                ResumeInput::Returned(value) => Ok(NativeOutcome::Return(value)),
+                ResumeInput::Failed(error) => Err(error),
+                ResumeInput::Cancelled(reason) => Err(SemaError::eval(format!(
+                    "restricted call was cancelled ({reason:?})"
+                ))),
+                ResumeInput::Runtime(_) => Err(SemaError::eval(
+                    "restricted call received an unexpected runtime response",
+                )),
+            }
+        }
+    }
+
+    RestrictedWork::Apply {
+        owner: RestrictedOwner::default(),
+        result: Ok(NativeOutcome::Call(NativeCall {
+            callable,
+            args,
+            continuation: Box::new(Passthrough),
+        })),
+    }
+}
+
 /// Drive a VM parked on a structural `Pending` outcome to completion without
 /// the scheduler, continuation chains and callee VMs handled iteratively (flat
 /// Rust stack). Used by the synchronous HOF fast path when a proven

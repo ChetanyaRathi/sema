@@ -34,8 +34,8 @@ pub use opcodes::Op;
 pub use optimize::optimize as optimize_expr;
 pub use resolve::resolve_with_locals;
 pub use restricted::{
-    run_program_restricted, run_program_restricted_with_budget, RestrictedRunBudget,
-    RestrictedRunPolicy,
+    call_value_restricted, run_program_restricted, run_program_restricted_with_budget,
+    RestrictedRunBudget, RestrictedRunPolicy,
 };
 pub use serialize::{deserialize_from_bytes, is_bytecode_file, serialize_to_bytes};
 pub use vm::{

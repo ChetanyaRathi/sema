@@ -2895,6 +2895,38 @@ impl WasmInterpreter {
             .set_str(name, Value::native_fn(native));
     }
 
+    /// Call a Sema callable from a host (JS) boundary. Outside a runtime
+    /// quantum this is the ordinary synchronous host path. Inside one — a JS
+    /// callback fired from within a native while an eval is running, e.g. a
+    /// `mount!` render or a component event re-render — the legacy path must
+    /// not re-enter the VM, so the call drives through the scheduler-free
+    /// restricted driver instead (waits and runtime requests fail cleanly
+    /// rather than corrupting the active quantum).
+    fn call_from_host(
+        &self,
+        func: &sema_core::Value,
+        args: Vec<sema_core::Value>,
+    ) -> Result<sema_core::Value, sema_core::SemaError> {
+        let ctx = &self.inner.ctx;
+        if ctx.runtime_quantum_active() || sema_core::in_runtime_quantum() {
+            let policy = sema_vm::RestrictedRunPolicy {
+                operation: "host callback invocation",
+                suspension_error:
+                    "host callback invocation cannot suspend; move async work to an event handler",
+                instruction_limit: std::num::NonZeroUsize::new(64_000_000)
+                    .expect("nonzero instruction limit"),
+                transition_limit: std::num::NonZeroUsize::new(1_000_000)
+                    .expect("nonzero transition limit"),
+                deadline: None,
+                cancellation: Default::default(),
+            };
+            let task_context = ctx.task_context().unwrap_or_default();
+            sema_vm::call_value_restricted(ctx, task_context, func.clone(), args, policy)
+        } else {
+            sema_eval::call_value(ctx, func, &args)
+        }
+    }
+
     /// Invoke a named global function directly with JS arguments.
     ///
     /// This avoids reparsing source strings and works for functions
@@ -2916,7 +2948,7 @@ impl WasmInterpreter {
             )?);
         }
 
-        match sema_eval::call_value(&self.inner.ctx, &func, &sema_args) {
+        match self.call_from_host(&func, sema_args) {
             Ok(val) => Ok(sema_value_to_jsvalue_with_callbacks(
                 &val,
                 &self.callback_handles,
@@ -2949,7 +2981,7 @@ impl WasmInterpreter {
             )?);
         }
 
-        match sema_eval::call_value(&self.inner.ctx, &func, &sema_args) {
+        match self.call_from_host(&func, sema_args) {
             Ok(val) => Ok(sema_value_to_jsvalue_with_callbacks(
                 &val,
                 &self.callback_handles,
