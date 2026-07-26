@@ -260,11 +260,14 @@ pub fn suggest_similar(name: &str, candidates: &[&str]) -> Option<String> {
 
 /// Provide targeted hints for common names from other Lisp dialects.
 /// Checked before fuzzy matching to give more helpful, specific guidance.
+///
+/// Only for names Sema does *not* have. Names accepted as aliases (`defn`,
+/// `progn`, `def`, `fn`) belong in the special-form table, not here — a hint
+/// redirecting away from a working form is worse than no hint.
 pub fn veteran_hint(name: &str) -> Option<&'static str> {
     match name {
         // Common Lisp / Emacs Lisp
         "setq" | "setf" => Some("Sema uses 'set!' for variable assignment"),
-        "progn" => Some("Sema uses 'begin' to sequence expressions"),
         "funcall" => Some("In Sema, functions are called directly: (f arg ...)"),
         "mapcar" => Some("Sema uses 'map' for mapping over lists"),
         "loop" => Some("Sema uses 'do' or 'while' for iteration, or tail recursion"),
@@ -279,7 +282,6 @@ pub fn veteran_hint(name: &str) -> Option<&'static str> {
         "typep" | "type-of" => Some("Sema uses 'type' to get the type of a value"),
 
         // Clojure
-        "defn" => Some("Sema uses 'defun' to define named functions"),
         "atom" => Some("Sema is single-threaded; use 'define' for mutable state with 'set!'"),
         "swap!" => Some("Sema is single-threaded; use 'set!' for mutation"),
         "deref" => Some("Sema uses 'force' to evaluate delayed/promised values"),
@@ -901,20 +903,16 @@ mod tests {
     #[test]
     fn test_veteran_hint_known() {
         assert_eq!(
-            veteran_hint("defn"),
-            Some("Sema uses 'defun' to define named functions")
-        );
-        assert_eq!(
             veteran_hint("setq"),
             Some("Sema uses 'set!' for variable assignment")
         );
         assert_eq!(
-            veteran_hint("progn"),
-            Some("Sema uses 'begin' to sequence expressions")
-        );
-        assert_eq!(
             veteran_hint("mapcar"),
             Some("Sema uses 'map' for mapping over lists")
+        );
+        assert_eq!(
+            veteran_hint("funcall"),
+            Some("In Sema, functions are called directly: (f arg ...)")
         );
     }
 
@@ -931,6 +929,10 @@ mod tests {
         assert!(veteran_hint("while").is_none());
         assert!(veteran_hint("str").is_none());
         assert!(veteran_hint("count").is_none());
+        // Accepted aliases — hinting away from a working form would mislead
+        assert!(veteran_hint("defn").is_none());
+        assert!(veteran_hint("progn").is_none());
+        assert!(veteran_hint("def").is_none());
     }
 
     // type_error_with_value constructor — verify variant/fields AND display

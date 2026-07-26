@@ -258,8 +258,9 @@ fn print_help() {
     println!("  *e           Last error message");
     println!();
     println!("Core Forms:");
-    println!("  define/defun, lambda/fn, if, cond, let, let*, begin/do");
+    println!("  define, defun, lambda, if, cond, let, let*, begin, do");
     println!("  quote, quasiquote, defmacro, and, or, when, unless");
+    println!("  Aliases: def=define, defn=defun, fn=lambda, progn=begin");
 }
 
 fn print_env(interpreter: &Interpreter, prelude_keys: &HashSet<Spur>) {

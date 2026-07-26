@@ -58,7 +58,9 @@ pub const SPECIAL_FORM_NAMES: &[&str] = &[
     "deftool",
     "message",
     "prompt",
-    // Silent aliases for other Lisp dialects (undocumented)
+    // Aliases from other Lisp dialects. Each shares a handler with the
+    // canonical name above: `def`/`define`, `defn`/`defun`, `progn`/`begin`.
+    // Errors report the canonical name.
     "def",
     "defn",
     "progn",
