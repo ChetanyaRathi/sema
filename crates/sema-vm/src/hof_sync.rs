@@ -227,6 +227,18 @@ impl SyncHofHost for VmHofHost<'_> {
         if allowance < SYNC_HOF_MIN_BUDGET {
             return None;
         }
+        // Drive-level hosts (a continuation resumed between quanta, e.g. a
+        // fold-lines chunk delivery) run outside an active quantum; enter one
+        // for the session so callback natives take the same runtime-ABI
+        // dispatch they would on the in-quantum path.
+        let _quantum = if self.ctx.runtime_quantum_active() {
+            None
+        } else {
+            match self.ctx.enter_runtime_quantum() {
+                Ok(guard) => Some(guard),
+                Err(_) => return None,
+            }
+        };
         if let Some((closure, functions, native_fns)) = extract_vm_closure(callable) {
             let globals = closure.globals.clone()?;
             let _depth = DepthGuard::acquire()?;

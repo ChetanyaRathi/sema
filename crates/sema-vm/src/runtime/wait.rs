@@ -220,18 +220,37 @@ impl PendingResume {
     }
 
     pub fn invoke_continuation(self, eval_context: &sema_core::EvalContext) -> NativeResult {
+        self.invoke_continuation_with_parent(eval_context, None).0
+    }
+
+    /// [`invoke_continuation`](Self::invoke_continuation) with the caller's
+    /// parked VM, which powers the
+    /// [`SyncHofHost`](sema_core::runtime::SyncHofHost) capability offered to
+    /// the continuation (a streaming continuation drives non-suspending
+    /// callback batches synchronously through it). Returns the continuation's
+    /// result and the instructions any sync session consumed, for the caller's
+    /// turn accounting.
+    pub fn invoke_continuation_with_parent(
+        self,
+        eval_context: &sema_core::EvalContext,
+        parent_vm: Option<&crate::VM>,
+    ) -> (NativeResult, usize) {
         let _installed = eval_context.scope_task_context(self.context.clone());
+        let host = parent_vm
+            .map(|vm| crate::hof_sync::VmHofHost::new(vm, eval_context, self.context.clone()));
         let mut context = NativeCallContext {
-            hof_host: None,
+            hof_host: host.as_ref().map(|host| host as _),
             eval_context,
             task_context: self.context,
             call_env: self.call_env,
             cancellation: self.cancellation,
         };
-        self.continuation.resume(
+        let resumed = self.continuation.resume(
             &mut context,
             self.input.expect("decoder is charged before continuation"),
-        )
+        );
+        drop(context);
+        (resumed, host.map_or(0, |host| host.consumed()))
     }
 
     /// Surrender the continuation so the runtime can resume it through the

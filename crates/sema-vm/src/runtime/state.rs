@@ -2100,9 +2100,14 @@ impl Runtime {
                             })?;
                     TaskScopeSwap::install(task_mut)
                 };
-                let resumed = pending.invoke_continuation(&eval_context);
+                let mut owner = owner;
+                let (resumed, sync_instructions) = {
+                    let parent_vm = owner.parked_parent_vm_mut().map(|vm| &*vm);
+                    pending.invoke_continuation_with_parent(&eval_context, parent_vm)
+                };
                 {
                     let mut state = self.state.borrow_mut();
+                    state.turn_instructions += sync_instructions;
                     if let Some(task_mut) = state.tasks.get_mut(&task) {
                         scopes.restore(task_mut);
                     }
@@ -3173,7 +3178,7 @@ impl Runtime {
             .map_or_else(ResumeInput::Failed, ResumeInput::Runtime);
         let call_env = resume.owner.call_env();
         let resumed =
-            self.resume_continuation_value(resume.task_id, resume.frame, input, call_env)?;
+            self.resume_continuation_value(resume.task_id, resume.frame, input, call_env, None)?;
         let mut state = self.state.borrow_mut();
         if apply_native_result_now(&mut state, resume.task_id, resume.owner, resumed)? {
             state.channel_fast_path_credit += 1;
@@ -4321,12 +4326,15 @@ impl Runtime {
     fn resume_continuation(
         &self,
         task_id: TaskId,
-        owner: ReturnOwner,
+        mut owner: ReturnOwner,
         frame: ContinuationFrame,
         input: ResumeInput,
     ) -> Result<(), RuntimeFault> {
         let call_env = owner.call_env();
-        let resumed = self.resume_continuation_value(task_id, frame, input, call_env)?;
+        let resumed = {
+            let parent_vm = owner.parked_parent_vm_mut().map(|vm| &*vm);
+            self.resume_continuation_value(task_id, frame, input, call_env, parent_vm)?
+        };
         self.state
             .borrow_mut()
             .pending
@@ -4346,12 +4354,18 @@ impl Runtime {
     /// pass triggered inside `frame.resume` needs to `try_borrow()` the same
     /// `RefCell` to trace channel buffers, and silently skips tracing them if
     /// it's already held).
+    /// `parent_vm` is the caller's parked VM when the owner has one; it powers
+    /// the [`SyncHofHost`](sema_core::runtime::SyncHofHost) capability offered
+    /// to the continuation, so a streaming continuation (`file/fold-lines`'s
+    /// chunk delivery) can drive a proven non-suspending callback batch
+    /// synchronously instead of emitting one cooperative `Call` per element.
     fn resume_continuation_value(
         &self,
         task_id: TaskId,
         frame: ContinuationFrame,
         input: ResumeInput,
         call_env: Option<Rc<Env>>,
+        parent_vm: Option<&VM>,
     ) -> Result<NativeResult, RuntimeFault> {
         let (eval_context, context, cancellation, root, published_task_id) = {
             let state = self.state.borrow();
@@ -4395,8 +4409,10 @@ impl Runtime {
             TaskScopeSwap::install(task)
         };
         let mut id_guard = QuantumIdGuard::install(published_task_id, root);
+        let host =
+            parent_vm.map(|vm| crate::hof_sync::VmHofHost::new(vm, &eval_context, context.clone()));
         let mut native_context = NativeCallContext {
-            hof_host: None,
+            hof_host: host.as_ref().map(|host| host as _),
             eval_context: &eval_context,
             task_context: context,
             call_env,
@@ -4409,9 +4425,12 @@ impl Runtime {
             .map(|request| ResumeInput::Cancelled(request.reason))
             .unwrap_or(input);
         let resumed = frame.resume(&mut native_context, input);
+        drop(native_context);
+        let sync_instructions = host.map_or(0, |host| host.consumed());
         id_guard.restore();
         {
             let mut state = self.state.borrow_mut();
+            state.turn_instructions += sync_instructions;
             let task = state
                 .tasks
                 .get_mut(&task_id)

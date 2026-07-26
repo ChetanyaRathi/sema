@@ -2128,7 +2128,7 @@ fn streaming_line_drains_valid_callbacks_before_later_utf8_failure() {
 #[test]
 fn streaming_line_rejects_one_byte_over_limit_without_callbacks() {
     let f = TempFile::new("line-oversized");
-    std::fs::write(&f.0, vec![b'x'; 256 * 1024 + 1]).expect("write oversized line fixture");
+    std::fs::write(&f.0, vec![b'x'; 1024 * 1024 + 1]).expect("write oversized line fixture");
     let interp = Interpreter::new();
     let result = interp
         .eval_str_compiled(&format!(
@@ -2161,7 +2161,7 @@ fn streaming_line_rejects_one_byte_over_limit_without_callbacks() {
         assert!(
             message
                 .as_str()
-                .is_some_and(|text| text.contains("line exceeds") && text.contains("262144")),
+                .is_some_and(|text| text.contains("line exceeds") && text.contains("1048576")),
             "expected a clear bounded-line error, got {message}"
         );
     }
@@ -2171,7 +2171,7 @@ fn streaming_line_rejects_one_byte_over_limit_without_callbacks() {
 
 #[test]
 fn streaming_line_limit_counts_content_bytes_not_crlf_terminators() {
-    const LIMIT: usize = 256 * 1024;
+    const LIMIT: usize = 1024 * 1024;
 
     let lf = TempFile::new("line-exact-limit-lf");
     let mut lf_contents = vec![b'x'; LIMIT];
@@ -2231,7 +2231,7 @@ fn streaming_line_limit_counts_content_bytes_not_crlf_terminators() {
         assert!(
             message
                 .as_str()
-                .is_some_and(|text| text.contains("line exceeds") && text.contains("262144")),
+                .is_some_and(|text| text.contains("line exceeds") && text.contains("1048576")),
             "a bare CR beyond the content limit must remain an oversized line, got {message}"
         );
     }

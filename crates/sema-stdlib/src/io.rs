@@ -1561,9 +1561,9 @@ pub(crate) fn admit_regular_file(_op: &str, _path: &str) -> Result<(), SemaError
 // `Value` stays in a traced continuation on the VM thread. Cancellation drops
 // that continuation (and its reader) or discards a still-running bounded read.
 
-const FILE_LINE_CHUNK_MAX_LINES: usize = 256;
-const FILE_LINE_CHUNK_MAX_BYTES: usize = 256 * 1024;
-const FILE_LINE_READER_BUFFER_BYTES: usize = 64 * 1024;
+const FILE_LINE_CHUNK_MAX_LINES: usize = 2048;
+const FILE_LINE_CHUNK_MAX_BYTES: usize = 1024 * 1024;
+const FILE_LINE_READER_BUFFER_BYTES: usize = 256 * 1024;
 
 #[derive(Clone, Copy)]
 enum FileLineKind {
@@ -1893,7 +1893,50 @@ impl FileLineContinuation {
         }))
     }
 
-    fn continue_iteration(mut self: Box<Self>) -> NativeResult {
+    fn continue_iteration(
+        mut self: Box<Self>,
+        context: &mut NativeCallContext<'_>,
+    ) -> NativeResult {
+        // Fast path: with a sync-HOF host available (a drive-level resume with
+        // a parked caller) and a provably non-suspending callback, run the
+        // whole buffered chunk of lines as direct calls — one session per
+        // chunk instead of one cooperative `Call` round per line. The host
+        // declines (and we fall through to the per-line cooperative path) for
+        // suspension-capable callbacks, so an `await` inside a fold callback
+        // still parks per element exactly as before.
+        if !self.lines.is_empty() {
+            if let Some(host) = context.hof_host {
+                let callback = self.callback.clone();
+                let lines = &mut self.lines;
+                let result = &mut self.result;
+                if let Some(outcome) = host.run_sync_hof(&callback, &mut |session| {
+                    while let Some(line) = lines.pop_front() {
+                        match result {
+                            FileLineResult::Fold(accumulator) => {
+                                let mut args = [
+                                    std::mem::replace(accumulator, Value::nil()),
+                                    line.into_value(),
+                                ];
+                                *accumulator = session.call_owned(&mut args)?;
+                            }
+                            FileLineResult::ForEach => {
+                                let mut args = [line.into_value()];
+                                session.call_owned(&mut args)?;
+                            }
+                        }
+                        if session.should_yield() {
+                            break;
+                        }
+                    }
+                    Ok(NativeOutcome::Return(Value::nil()))
+                }) {
+                    // The sentinel return value carries nothing; a callback
+                    // error aborts the stream (fail-fast, like the
+                    // cooperative path).
+                    outcome?;
+                }
+            }
+        }
         if let Some(line) = self.lines.pop_front() {
             let args = self.result.callback_args(line.into_value());
             return Ok(NativeOutcome::Call(sema_core::runtime::NativeCall {
@@ -1915,7 +1958,7 @@ impl FileLineContinuation {
 impl NativeContinuation for FileLineContinuation {
     fn resume(
         mut self: Box<Self>,
-        _context: &mut NativeCallContext<'_>,
+        context: &mut NativeCallContext<'_>,
         input: ResumeInput,
     ) -> NativeResult {
         if let Some(slot) = self.read_slot.take() {
@@ -1949,7 +1992,7 @@ impl NativeContinuation for FileLineContinuation {
             let value = crate::list::resume_value(input, self.kind.op())?;
             self.result.accept_callback_result(value);
         }
-        self.continue_iteration()
+        self.continue_iteration(context)
     }
 }
 
@@ -3665,13 +3708,13 @@ mod file_line_trace_tests {
     #[test]
     fn line_chunk_is_bounded_by_line_count() {
         let path = temp_path("count");
-        let contents: String = (0..261).map(|index| format!("line-{index}\n")).collect();
+        let contents: String = (0..2053).map(|index| format!("line-{index}\n")).collect();
         std::fs::write(&path, contents).expect("write line fixture");
         let path_text = path.to_string_lossy();
 
         let first = read_file_line_chunk("file/fold-lines", &path_text, None, false)
             .expect("read first bounded chunk");
-        assert_eq!(first.lines.len(), 256);
+        assert_eq!(first.lines.len(), 2048);
         assert!(!first.eof);
         let second = read_file_line_chunk("file/fold-lines", &path_text, Some(first.reader), false)
             .expect("read remaining lines");
@@ -3684,7 +3727,7 @@ mod file_line_trace_tests {
     #[test]
     fn line_chunk_is_bounded_by_bytes() {
         let path = temp_path("bytes");
-        let line = vec![b'x'; 130 * 1024];
+        let line = vec![b'x'; 520 * 1024];
         let mut contents = Vec::with_capacity((line.len() + 1) * 3);
         for _ in 0..3 {
             contents.extend_from_slice(&line);
