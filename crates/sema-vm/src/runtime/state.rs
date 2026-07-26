@@ -4088,6 +4088,21 @@ impl Runtime {
             ),
         }
 
+        // Escaping-value snapshots convert the parked parent's OPEN upvalue
+        // cells for foreign runs; with no open cell anywhere they are no-ops.
+        // The parent stays parked (frames unchanged) for this loop's whole
+        // duration, so one check covers every element — the same reasoning as
+        // the synchronous HOF fast path (`hof_sync`). This is the difference
+        // between O(1) and O(size-of-args) per element when a fold threads a
+        // large accumulator (a 10M-line `file/fold-lines` over a growing map
+        // spent ~10× the VM's own time re-walking the accumulator per line).
+        let parent_needs_snapshots = owner
+            .parked_parent_vm_mut()
+            .is_some_and(|vm| vm.has_open_upvalue_cells());
+        // One shared instruction total for the whole chain, folded into the
+        // turn accounting once at loop exit instead of borrowing the state
+        // cell per element.
+        let mut chain_instructions = 0usize;
         let mut current_call = call;
         let outcome = loop {
             if let Some(cancel) = task.record.cancellation() {
@@ -4137,16 +4152,19 @@ impl Runtime {
                 loaded_functions = next_functions;
                 loaded_native_fns = next_native_fns;
             }
-            // MUST run per element, not once for the chain: it walks not just
-            // the callable but `args`, which can carry a DIFFERENT closure
-            // with its own open upvalues on the parent VM's stack on every
-            // element (see this function's doc comment).
-            if let Some(parent_vm) = owner.parked_parent_vm_mut() {
-                snapshot_escaping_call_with_owner(
-                    parent_vm,
-                    &current_call.callable,
-                    &current_call.args,
-                );
+            // When the parent holds open cells, this MUST run per element, not
+            // once for the chain: it walks not just the callable but `args`,
+            // which can carry a DIFFERENT closure with its own open upvalues
+            // on the parent VM's stack on every element (see this function's
+            // doc comment).
+            if parent_needs_snapshots {
+                if let Some(parent_vm) = owner.parked_parent_vm_mut() {
+                    snapshot_escaping_call_with_owner(
+                        parent_vm,
+                        &current_call.callable,
+                        &current_call.args,
+                    );
+                }
             }
             if let Err(error) = vm.setup_for_call_owned(next_closure, &mut current_call.args) {
                 let mut native_context = NativeCallContext {
@@ -4170,7 +4188,7 @@ impl Runtime {
             } else {
                 vm.run_quantum(&eval_context, remaining_budget, cancellation_view)
             };
-            self.state.borrow_mut().turn_instructions += quantum.instructions;
+            chain_instructions = chain_instructions.saturating_add(quantum.instructions);
             remaining_budget = remaining_budget.saturating_sub(quantum.instructions);
             match quantum.outcome {
                 Ok(VmExecResult::Finished(value)) => {
@@ -4224,6 +4242,9 @@ impl Runtime {
         id_guard.restore();
         scopes.restore(&mut task);
         drop(quantum_guard);
+        if chain_instructions != 0 {
+            self.state.borrow_mut().turn_instructions += chain_instructions;
+        }
 
         match outcome {
             ElementOutcome::Settled(result) => {
