@@ -29,16 +29,23 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# No --offline: cargo package must rewrite the internal path dependencies
-# (sema-core, sema-reader, ...) into pure registry version requirements and
-# confirm they resolve, which needs the crates.io index. A fresh CI runner's
-# local index cache has never been queried for these crates (a normal build
-# resolves them via path, never touching the registry), so --offline fails
-# here even though the crates themselves are published.
+# `--workspace`, not `-p sema-lang`. Packaging rewrites the internal path
+# dependencies into pure registry requirements (`sema-core = "=X.Y.Z"`) and
+# resolves them — and this gate runs BEFORE the publish, so the version being
+# released is by definition not on crates.io yet. Packaging one crate alone
+# therefore failed on every release after a version bump ("failed to select a
+# version for the requirement `sema-core = "=X.Y.Z"`"), which deadlocked
+# publishing: the gate blocked the release, so the version never landed, so the
+# gate kept failing. Packaging the whole workspace in ONE invocation lets cargo
+# satisfy those pins from the sibling crates it is packaging alongside, so no
+# registry lookup for them is needed. Listing the siblings by hand with repeated
+# `-p` would work too and would drift; `--workspace` cannot.
+#
+# No --offline: third-party dependencies are still resolved through the index.
 PACKAGE_TARGET="$TMP/package-target"
 CARGO_TARGET_DIR="$PACKAGE_TARGET" cargo package \
   --manifest-path "$ROOT/Cargo.toml" \
-  -p sema-lang \
+  --workspace \
   --allow-dirty \
   --no-verify
 

@@ -28,14 +28,14 @@ task build: [packages/sema-wasm/pkg/sema_wasm_bg.wasm]
 @desc "Build WASM VM + the JS embedding packages"
 task js-lib-build: [build]
     @needs wasm-pack npm
-    wasm-pack build crates/sema-wasm --target web --release --scope sema-lang --out-dir ../../packages/sema-wasm/pkg -- --config 'profile.release.package.sema-wasm.opt-level="s"'
+    ./scripts/wasm-build.sh crates/sema-wasm --target web --release --scope sema-lang --out-dir ../../packages/sema-wasm/pkg -- --config 'profile.release.package.sema-wasm.opt-level="s"'
     cd packages/sema && npm install && npm run build
 
 @group wasm
 @desc "Fast (non-optimized) WASM VM build for iteration"
 task js-lib-dev:
     @needs wasm-pack
-    wasm-pack build crates/sema-wasm --target web --scope sema-lang --out-dir ../../packages/sema-wasm/pkg
+    ./scripts/wasm-build.sh crates/sema-wasm --target web --scope sema-lang --out-dir ../../packages/sema-wasm/pkg
 
 # ── Shared runtime vendoring ─────────────────────────────────────────
 

@@ -5,6 +5,13 @@ name: Verify
 
 on:
   workflow_call:
+  # Run the gate on demand, without cutting a release. `workflow_call` alone
+  # means this only ever executes on a tag push, so a break in it stays
+  # invisible until someone tries to publish — which is exactly what happened:
+  # the packaged-crate check landed 2026-07-10 and its failure was not seen
+  # until the next release, 16 days later, by which point it had also hidden a
+  # genuine packaging bug behind it. Exercise this before tagging.
+  workflow_dispatch:
 
 jobs:
   playground-runtime:

@@ -59,6 +59,11 @@ SVG_CONSUMERS = {
 # rendered PNG (name-SIZE) -> consumer path.
 PNG_CONSUMERS = {
     "sema-mark-square-512": "website/public/avatar.png",
+    # `crates/sema` embeds this as the Windows executable icon for `sema build`.
+    # It needs a copy INSIDE the crate: `cargo package` ships only files under
+    # the package root, so an `include_bytes!` reaching up to the repo-root
+    # `assets/` builds here and fails from the published .crate.
+    "sema-mark-rounded-512": "crates/sema/assets/sema-mark-rounded-512.png",
 }
 
 

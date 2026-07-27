@@ -3189,9 +3189,11 @@ fn write_executable_platform(
                 .write_resource("semaexec", archive_bytes.to_vec())?
                 // The rounded mark carries its own dark tile, so it reads correctly on
                 // both light and dark backgrounds — PE icons cannot adapt to theme.
-                .set_icon(include_bytes!(
-                    "../../../assets/icons/png/sema-mark-rounded-512.png"
-                ))?
+                // In-crate copy, not the repo-root `assets/`: `cargo package` ships
+                // only files under the package root, so embedding across the crate
+                // boundary compiles here and breaks the published crate. Synced from
+                // canonical by `scripts/gen-icon-assets.py` (`jake icons-assets`).
+                .set_icon(include_bytes!("../assets/sema-mark-rounded-512.png"))?
                 .build(&mut branded)?;
             let branded = set_windows_version_info(branded, output_path)?;
             std::fs::write(output_path, branded)?;
