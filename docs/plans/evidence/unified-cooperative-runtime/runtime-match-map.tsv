@@ -651,10 +651,10 @@ R22A	crates/sema-stdlib/src/io.rs:3275:                    acc = sema_core::call
 R22A	crates/sema-stdlib/src/io.rs:3333:                    acc = sema_core::call_callback_owned(ctx, &func, &mut cb_args)?;
 R08C	crates/sema-stdlib/src/io.rs:85:thread_local! {
 R09A	crates/sema-stdlib/src/kv.rs:127:thread_local! {
-R22A	crates/sema-stdlib/src/list.rs:3601:/// A runtime-only native (`async/spawn`, `channel/*`, `async/resolved`, …) can
-R22A	crates/sema-stdlib/src/list.rs:3642:                sema_core::call_callback(ctx, func, args)
-R22A	crates/sema-stdlib/src/list.rs:3646:        sema_core::with_stdlib_ctx(|ctx| sema_core::call_callback(ctx, func, args))
-R22A	crates/sema-stdlib/src/list.rs:3655:    sema_core::with_stdlib_ctx(|ctx| sema_core::call_callback_owned(ctx, func, args))
+R22A	crates/sema-stdlib/src/list.rs:3596:/// A runtime-only native (`async/spawn`, `channel/*`, `async/resolved`, …) can
+R22A	crates/sema-stdlib/src/list.rs:3637:                sema_core::call_callback(ctx, func, args)
+R22A	crates/sema-stdlib/src/list.rs:3641:        sema_core::with_stdlib_ctx(|ctx| sema_core::call_callback(ctx, func, args))
+R22A	crates/sema-stdlib/src/list.rs:3650:    sema_core::with_stdlib_ctx(|ctx| sema_core::call_callback_owned(ctx, func, args))
 R21A	crates/sema-stdlib/src/markup.rs:42:thread_local! {
 R22A	crates/sema-stdlib/src/meta.rs:116:    // nonblocking-agent-run.md`) — so this real `thread::sleep` loop is
 R22A	crates/sema-stdlib/src/meta.rs:119:    // that backs off via `async/sleep` instead.

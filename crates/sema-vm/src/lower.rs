@@ -1319,12 +1319,21 @@ fn lower_quasiquote(args: &[Value]) -> Result<CoreExpr, SemaError> {
         return Err(SemaError::arity("quasiquote", "1", args.len()));
     }
     let mut gensym_map: HashMap<String, String> = HashMap::new();
-    expand_quasiquote(&args[0], &mut gensym_map)
+    expand_quasiquote(&args[0], &mut gensym_map, 1)
 }
 
+/// Expand one quasiquoted datum.
+///
+/// `depth` is the R7RS nesting level: `quasiquote` raises it, `unquote` and
+/// `unquote-splicing` lower it, and only at depth 1 does an unquote actually
+/// evaluate. Without it, an inner unquote was evaluated one level too early —
+/// `` `(a `(b ,c)) `` substituted `c` instead of reproducing `(unquote c)` as
+/// data, and `,,x` leaked the bare symbol `unquote` into operator position
+/// ("Unbound variable: unquote"). This is what macro-writing macros rely on.
 fn expand_quasiquote(
     val: &Value,
     gensym_map: &mut HashMap<String, String>,
+    depth: usize,
 ) -> Result<CoreExpr, SemaError> {
     // Auto-gensym: replace foo# with a consistent gensym within this quasiquote
     if let Some(sym) = val.as_symbol() {
@@ -1343,20 +1352,36 @@ fn expand_quasiquote(
             if items.is_empty() {
                 return Ok(CoreExpr::Quote(val.clone()));
             }
-            // Check for (unquote x)
+            // Check for (unquote x) / a nested (quasiquote x)
             if let Some(sym) = items[0].as_symbol() {
                 if sym == "unquote" {
                     if items.len() != 2 {
                         return Err(SemaError::arity("unquote", "1", items.len() - 1));
                     }
-                    return lower_expr(&items[1], false);
+                    if depth == 1 {
+                        return lower_expr(&items[1], false);
+                    }
+                    // Deeper than the innermost level: reproduce the `unquote`
+                    // form itself as data, expanding its payload one level in.
+                    return Ok(CoreExpr::MakeList(vec![
+                        CoreExpr::Quote(Value::symbol("unquote")),
+                        expand_quasiquote(&items[1], gensym_map, depth - 1)?,
+                    ]));
+                }
+                if sym == "quasiquote" && items.len() == 2 {
+                    // A nested quasiquote raises the level and is reproduced as
+                    // data, so its own unquotes stay unevaluated here.
+                    return Ok(CoreExpr::MakeList(vec![
+                        CoreExpr::Quote(Value::symbol("quasiquote")),
+                        expand_quasiquote(&items[1], gensym_map, depth + 1)?,
+                    ]));
                 }
             }
-            expand_quasiquote_seq(&items, gensym_map, false)
+            expand_quasiquote_seq(&items, gensym_map, false, depth)
         }
         ValueView::Vector(items) => {
             // Same splicing semantics as lists (EVAL-1): `[1 ,@xs 2]` must splice.
-            expand_quasiquote_seq(&items, gensym_map, true)
+            expand_quasiquote_seq(&items, gensym_map, true, depth)
         }
         ValueView::Map(map) => {
             // Honor unquotes inside map keys/values (EVAL-2). Splicing into a map
@@ -1369,8 +1394,8 @@ fn expand_quasiquote(
                     reject_splice_in_map(k)?;
                     reject_splice_in_map(v)?;
                     Ok((
-                        expand_quasiquote(k, gensym_map)?,
-                        expand_quasiquote(v, gensym_map)?,
+                        expand_quasiquote(k, gensym_map, depth)?,
+                        expand_quasiquote(v, gensym_map, depth)?,
                     ))
                 })
                 .collect::<Result<Vec<_>, SemaError>>()?;
@@ -1403,17 +1428,21 @@ fn expand_quasiquote_seq(
     items: &[Value],
     gensym_map: &mut HashMap<String, String>,
     as_vector: bool,
+    depth: usize,
 ) -> Result<CoreExpr, SemaError> {
-    let has_splice = items.iter().any(|item| {
-        item.as_list()
-            .and_then(|inner| inner.first().and_then(|h| h.as_symbol()))
-            .is_some_and(|sym| sym == "unquote-splicing")
-    });
+    // Only the innermost level splices; deeper ones are data, handled by the
+    // ordinary element walk below.
+    let has_splice = depth == 1
+        && items.iter().any(|item| {
+            item.as_list()
+                .and_then(|inner| inner.first().and_then(|h| h.as_symbol()))
+                .is_some_and(|sym| sym == "unquote-splicing")
+        });
 
     if !has_splice {
         let exprs = items
             .iter()
-            .map(|item| expand_quasiquote(item, gensym_map))
+            .map(|item| expand_quasiquote(item, gensym_map, depth))
             .collect::<Result<_, _>>()?;
         return Ok(if as_vector {
             CoreExpr::MakeVector(exprs)
@@ -1442,7 +1471,7 @@ fn expand_quasiquote_seq(
                 }
             }
         }
-        current_list.push(expand_quasiquote(item, gensym_map)?);
+        current_list.push(expand_quasiquote(item, gensym_map, depth)?);
     }
     if !current_list.is_empty() {
         segments.push(CoreExpr::MakeList(current_list));

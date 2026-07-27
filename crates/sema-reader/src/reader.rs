@@ -656,6 +656,23 @@ fn rewrite_percent_args(expr: &Value, max_arg: &mut usize) -> Value {
                 .collect();
             Value::vector(new_items)
         }
+        // Map literals are scanned too. Without this arm `%` inside `{...}` was
+        // neither rewritten to `%1` nor counted, so `#({:n %})` built a
+        // zero-argument lambda and calling it failed with a misleading arity
+        // error that never mentioned the `%`. Keys as well as values: `{% 1}`
+        // is as legitimate as `{:k %}`.
+        ValueView::Map(entries) => {
+            let rewritten: std::collections::BTreeMap<Value, Value> = entries
+                .iter()
+                .map(|(k, v)| {
+                    (
+                        rewrite_percent_args(k, max_arg),
+                        rewrite_percent_args(v, max_arg),
+                    )
+                })
+                .collect();
+            Value::map(rewritten)
+        }
         _ => expr.clone(),
     }
 }

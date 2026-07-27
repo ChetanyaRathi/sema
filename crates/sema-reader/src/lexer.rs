@@ -235,7 +235,19 @@ pub fn tokenize(input: &str) -> Result<Vec<SpannedToken>, SemaError> {
                     if chars[i] == '\\' && i + 1 < chars.len() {
                         i += 1;
                         col += 1;
+                        let escape_start = i;
                         read_string_escape(&chars, &mut i, &mut col, &mut s, span)?;
+                        // An escape can consume a literal line break (`\` at
+                        // end of line). Only the non-escape branch below bumped
+                        // `line`, so every span after such a string was reported
+                        // one line early — which also mis-places LSP go-to-
+                        // definition and DAP breakpoints, not just messages.
+                        let consumed = &chars[escape_start..=i.min(chars.len() - 1)];
+                        let breaks = consumed.iter().filter(|c| **c == '\n').count();
+                        if breaks > 0 {
+                            line += breaks;
+                            col = 0;
+                        }
                     } else {
                         if chars[i] == '\n' {
                             line += 1;
@@ -359,8 +371,27 @@ pub fn tokenize(input: &str) -> Result<Vec<SpannedToken>, SemaError> {
                             col += 2;
                             let mut s = String::new();
                             while i < chars.len() && chars[i] != '"' {
-                                if chars[i] == '\\' && i + 1 < chars.len() && chars[i + 1] == '"' {
-                                    s.push('"');
+                                // A backslash always consumes the character
+                                // after it, whatever that is. Only special-
+                                // casing `\"` let the SECOND backslash of a
+                                // trailing `\\` pair with the terminator, so
+                                // `#"\\"` — the regex for one literal
+                                // backslash — swallowed its own closing quote
+                                // and reported "unterminated string" (or, with
+                                // another quote later on the line, silently
+                                // reparsed as something else).
+                                if chars[i] == '\\' && i + 1 < chars.len() {
+                                    if chars[i + 1] == '"' {
+                                        s.push('"');
+                                    } else {
+                                        // Raw: keep both characters as written.
+                                        s.push('\\');
+                                        s.push(chars[i + 1]);
+                                        if chars[i + 1] == '\n' {
+                                            line += 1;
+                                            col = 0;
+                                        }
+                                    }
                                     i += 2;
                                     col += 2;
                                 } else {
@@ -826,6 +857,17 @@ fn read_hash_number(chars: &[char], span: &Span) -> Result<(Token, usize), SemaE
     }
     // Parse the number body. A non-decimal radix admits only integers; a decimal
     // body (`#d`, or no radix at all) uses the full number grammar.
+    // An exactness- or `#d`-only prefix with nothing after it is a reader error,
+    // not a panic: `read_number` indexes `chars[0]` unconditionally, so a source
+    // ending in `#i`/`#e`/`#d` aborted the process with "index out of bounds".
+    // (`#x` was already safe — `read_radix_integer` guards.) Reachable from any
+    // untrusted input: a file, `(read s)`, the LSP, the WASM playground.
+    if i >= chars.len() {
+        return Err(SemaError::Reader {
+            message: "expected a number after the `#` prefix".to_string(),
+            span: *span,
+        });
+    }
     let (num, body_len) = match radix {
         Some(r) if r != 10 => read_radix_integer(&chars[i..], r, span)?,
         _ => {

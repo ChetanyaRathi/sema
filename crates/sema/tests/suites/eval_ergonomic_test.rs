@@ -52,3 +52,53 @@ eval_tests! {
     if_let_truthy: "(if-let (x 42) (+ x 1) 0)" => Value::int(43),
     if_let_nil: "(if-let (x nil) (+ x 1) 0)" => Value::int(0),
 }
+
+// ============================================================
+// Reader / lowering regressions (2026-07-27 sweep)
+// ============================================================
+
+eval_tests! {
+    // R7RS 4.2.8: a nested quasiquote raises the level, so the inner unquote is
+    // DATA here, not a substitution. Without level tracking the inner `,c` was
+    // evaluated one level too early — the bug that breaks macro-writing macros.
+    nested_quasiquote_keeps_the_inner_unquote_as_data:
+        "(define c 42) (str `(a `(b ,c)))"
+        => Value::string("(a (quasiquote (b (unquote c))))"),
+    // Doubled unquote reaches the outer level and DOES evaluate; previously it
+    // leaked the bare symbol `unquote` into operator position.
+    nested_quasiquote_double_unquote_evaluates_at_the_outer_level:
+        "(define x 5) (str `(a `(b ,,x)))"
+        => Value::string("(a (quasiquote (b (unquote 5))))"),
+    nested_quasiquote_splice_stays_data_when_nested:
+        "(define xs (list 1 2)) (str `(a `(b ,@xs)))"
+        => Value::string("(a (quasiquote (b (unquote-splicing xs))))"),
+    // Single-level behavior must be untouched by the level tracking.
+    quasiquote_single_level_still_substitutes:
+        "(define x 2) (str `(1 ,x 3))" => Value::string("(1 2 3)"),
+    quasiquote_single_level_still_splices:
+        "(define xs (list 2 3)) (str `(1 ,@xs 4))" => Value::string("(1 2 3 4)"),
+
+    // `rewrite_percent_args` skipped map literals, so `%` inside `{...}` was
+    // neither renamed nor counted and the lambda came out with arity 0 —
+    // reported as a confusing arity error that never mentioned the `%`.
+    short_lambda_counts_percent_inside_a_map_literal:
+        "(str (map #(list {:n %}) (list 1 2)))" => Value::string("(({:n 1}) ({:n 2}))"),
+    short_lambda_percent_in_a_map_key:
+        "(str (map #(get {:a 10 :b 20} %) (list :a :b)))" => Value::string("(10 20)"),
+
+    // The raw-regex scanner only paired `\` with a following `"`, so the second
+    // backslash of a trailing `\\` consumed the terminator and the literal was
+    // reported as an unterminated string.
+    regex_literal_ending_in_an_escaped_backslash:
+        r#"(regex/match? #"\\" "a")"# => Value::bool(false),
+    regex_literal_matches_a_literal_backslash:
+        r#"(regex/match? #"a\\b" "a\\b")"# => Value::bool(true),
+}
+
+eval_error_tests! {
+    // `read_number` indexed chars[0] unconditionally, so a source ending in an
+    // exactness-only prefix aborted the process instead of erroring.
+    hash_inexact_prefix_at_eof: "#i",
+    hash_exact_prefix_at_eof: "#e",
+    hash_decimal_prefix_at_eof: "#d",
+}

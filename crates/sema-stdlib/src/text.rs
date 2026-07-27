@@ -464,12 +464,10 @@ fn trim_indent(text: &str) -> String {
 /// Drop up to `count` leading whitespace CHARACTERS, stopping early at the
 /// first non-whitespace one. Slices only on char boundaries by construction.
 fn strip_leading_whitespace(line: &str, count: usize) -> &str {
-    let mut dropped = 0;
-    for (offset, ch) in line.char_indices() {
+    for (dropped, (offset, ch)) in line.char_indices().enumerate() {
         if dropped == count || !ch.is_whitespace() {
             return &line[offset..];
         }
-        dropped += 1;
     }
     // Every character was whitespace we were asked to drop.
     ""
