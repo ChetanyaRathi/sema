@@ -117,61 +117,119 @@ impl EngineHandle {
             .build()
             .map_err(|e| format!("Failed to build notebook engine runtime: {e}"))?;
 
-        std::thread::spawn(move || {
-            use crate::engine::Engine;
+        // A LARGE stack, explicitly. Evaluation recurses over the expression
+        // tree, and `MAX_RESOLVE_DEPTH` (256) is calibrated against a main-
+        // thread-sized stack — `resolve.rs`'s own depth test spawns 8MiB for
+        // exactly this reason. A default `std::thread::spawn` gets ~2MiB, so a
+        // cell nested only ~200 deep overflowed and took the whole SERVER down
+        // ("fatal runtime error: stack overflow, aborting") before the guard
+        // could report the error. That loses every unsaved cell in the
+        // notebook, since saving is explicit. The same input through the CLI
+        // reports "maximum resolution depth exceeded" and carries on.
+        std::thread::Builder::new()
+            .name("sema-notebook-engine".to_string())
+            .stack_size(16 * 1024 * 1024)
+            .spawn(move || {
+                use crate::engine::Engine;
 
-            let mut engine = Engine::new(notebook);
-            let nb_path = notebook_path;
+                let mut engine = Engine::new(notebook);
+                let nb_path = notebook_path;
 
-            while let Some(req) = rt.block_on(rx.recv()) {
-                match req {
-                    EngineRequest::GetNotebook { reply } => {
-                        let _ = reply.send(render::notebook_response(
-                            &engine.notebook,
-                            engine.can_undo(),
-                        ));
-                    }
-                    EngineRequest::CreateCell {
-                        cell_type,
-                        source,
-                        after,
-                        reply,
-                    } => {
-                        let result = (|| {
-                            let id = match cell_type {
-                                CellType::Code => engine.notebook.add_code_cell(&source),
-                                CellType::Markdown => engine.notebook.add_markdown_cell(&source),
-                            };
-                            if let Some(after_id) = &after {
-                                let after_idx = engine
-                                    .notebook
-                                    .cell_index(after_id)
-                                    .ok_or_else(|| format!("Cell not found: {after_id}"))?;
-                                let new_idx = engine.notebook.cell_index(&id).unwrap();
-                                let cell = engine.notebook.cells.remove(new_idx);
-                                let insert_at = if after_idx < new_idx {
-                                    after_idx + 1
-                                } else {
-                                    after_idx
+                while let Some(req) = rt.block_on(rx.recv()) {
+                    match req {
+                        EngineRequest::GetNotebook { reply } => {
+                            let _ = reply.send(render::notebook_response(
+                                &engine.notebook,
+                                engine.can_undo(),
+                            ));
+                        }
+                        EngineRequest::CreateCell {
+                            cell_type,
+                            source,
+                            after,
+                            reply,
+                        } => {
+                            let result = (|| {
+                                let id = match cell_type {
+                                    CellType::Code => engine.notebook.add_code_cell(&source),
+                                    CellType::Markdown => {
+                                        engine.notebook.add_markdown_cell(&source)
+                                    }
                                 };
-                                engine.notebook.cells.insert(insert_at, cell);
-                            }
-                            let cell = engine.notebook.cell(&id).unwrap();
-                            let cell_number = engine
-                                .notebook
-                                .cells
-                                .iter()
-                                .filter(|c| c.cell_type == CellType::Code)
-                                .position(|c| c.id == id)
-                                .map(|i| i + 1);
-                            let rendered = render::render_cell(cell, cell_number);
-                            Ok(render::CreateCellData { id, cell: rendered })
-                        })();
-                        let _ = reply.send(result);
-                    }
-                    EngineRequest::GetCell { id, reply } => {
-                        let result = match engine.notebook.cell(&id) {
-                            Some(cell) => {
+                                if let Some(after_id) = &after {
+                                    let after_idx = engine
+                                        .notebook
+                                        .cell_index(after_id)
+                                        .ok_or_else(|| format!("Cell not found: {after_id}"))?;
+                                    let new_idx = engine.notebook.cell_index(&id).unwrap();
+                                    let cell = engine.notebook.cells.remove(new_idx);
+                                    let insert_at = if after_idx < new_idx {
+                                        after_idx + 1
+                                    } else {
+                                        after_idx
+                                    };
+                                    engine.notebook.cells.insert(insert_at, cell);
+                                }
+                                let cell = engine.notebook.cell(&id).unwrap();
+                                let cell_number = engine
+                                    .notebook
+                                    .cells
+                                    .iter()
+                                    .filter(|c| c.cell_type == CellType::Code)
+                                    .position(|c| c.id == id)
+                                    .map(|i| i + 1);
+                                let rendered = render::render_cell(cell, cell_number);
+                                Ok(render::CreateCellData { id, cell: rendered })
+                            })();
+                            let _ = reply.send(result);
+                        }
+                        EngineRequest::GetCell { id, reply } => {
+                            let result = match engine.notebook.cell(&id) {
+                                Some(cell) => {
+                                    let cell_number = engine
+                                        .notebook
+                                        .cells
+                                        .iter()
+                                        .filter(|c| c.cell_type == CellType::Code)
+                                        .position(|c| c.id == id)
+                                        .map(|i| i + 1);
+                                    Ok(render::render_cell(cell, cell_number))
+                                }
+                                None => Err(format!("Cell not found: {id}")),
+                            };
+                            let _ = reply.send(result);
+                        }
+                        EngineRequest::UpdateCell {
+                            id,
+                            source,
+                            cell_type,
+                            reply,
+                        } => {
+                            let result = (|| {
+                                let cell = engine
+                                    .notebook
+                                    .cell_mut(&id)
+                                    .ok_or_else(|| format!("Cell not found: {id}"))?;
+                                if let Some(s) = source {
+                                    // React only to a genuine change. The UI re-syncs
+                                    // every cell's source on blur and before save, so
+                                    // treating an identical resend as an edit would
+                                    // spuriously mark evaluated cells stale.
+                                    if cell.source != s {
+                                        cell.source = s;
+                                        if !cell.outputs.is_empty() {
+                                            cell.stale = true;
+                                        }
+                                    }
+                                }
+                                if let Some(ct) = cell_type {
+                                    cell.cell_type = match ct.as_str() {
+                                        "code" => CellType::Code,
+                                        "markdown" => CellType::Markdown,
+                                        other => return Err(format!("Unknown type: {other}")),
+                                    };
+                                }
+                                let cell = engine.notebook.cell(&id).unwrap();
                                 let cell_number = engine
                                     .notebook
                                     .cells
@@ -180,170 +238,128 @@ impl EngineHandle {
                                     .position(|c| c.id == id)
                                     .map(|i| i + 1);
                                 Ok(render::render_cell(cell, cell_number))
-                            }
-                            None => Err(format!("Cell not found: {id}")),
-                        };
-                        let _ = reply.send(result);
-                    }
-                    EngineRequest::UpdateCell {
-                        id,
-                        source,
-                        cell_type,
-                        reply,
-                    } => {
-                        let result = (|| {
-                            let cell = engine
-                                .notebook
-                                .cell_mut(&id)
-                                .ok_or_else(|| format!("Cell not found: {id}"))?;
-                            if let Some(s) = source {
-                                // React only to a genuine change. The UI re-syncs
-                                // every cell's source on blur and before save, so
-                                // treating an identical resend as an edit would
-                                // spuriously mark evaluated cells stale.
-                                if cell.source != s {
-                                    cell.source = s;
-                                    if !cell.outputs.is_empty() {
-                                        cell.stale = true;
+                            })();
+                            let _ = reply.send(result);
+                        }
+                        EngineRequest::EvalCell { id, reply } => {
+                            let result = engine.eval_cell(&id).map(|r| {
+                                let output = render::render_output(&r.output);
+                                render::EvalResponse {
+                                    id: id.clone(),
+                                    output,
+                                    stdout: r.stdout,
+                                    can_undo: engine.can_undo(),
+                                }
+                            });
+                            let _ = reply.send(result);
+                        }
+                        EngineRequest::DeleteCell { id, reply } => {
+                            let result = match engine.notebook.cell_index(&id) {
+                                Some(idx) => {
+                                    engine.notebook.cells.remove(idx);
+                                    Ok(())
+                                }
+                                None => Err(format!("Cell not found: {id}")),
+                            };
+                            let _ = reply.send(result);
+                        }
+                        EngineRequest::ReorderCells { cell_ids, reply } => {
+                            let result = (|| {
+                                // Reject duplicate IDs up front: a duplicate would clone
+                                // the same cell into the result twice while a real cell
+                                // gets dropped, permanently corrupting the notebook.
+                                let mut seen =
+                                    std::collections::HashSet::with_capacity(cell_ids.len());
+                                for id in &cell_ids {
+                                    if !seen.insert(id.as_str()) {
+                                        return Err(format!("Duplicate cell ID in reorder: {id}"));
                                     }
                                 }
-                            }
-                            if let Some(ct) = cell_type {
-                                cell.cell_type = match ct.as_str() {
-                                    "code" => CellType::Code,
-                                    "markdown" => CellType::Markdown,
-                                    other => return Err(format!("Unknown type: {other}")),
-                                };
-                            }
-                            let cell = engine.notebook.cell(&id).unwrap();
-                            let cell_number = engine
-                                .notebook
-                                .cells
-                                .iter()
-                                .filter(|c| c.cell_type == CellType::Code)
-                                .position(|c| c.id == id)
-                                .map(|i| i + 1);
-                            Ok(render::render_cell(cell, cell_number))
-                        })();
-                        let _ = reply.send(result);
-                    }
-                    EngineRequest::EvalCell { id, reply } => {
-                        let result = engine.eval_cell(&id).map(|r| {
-                            let output = render::render_output(&r.output);
-                            render::EvalResponse {
-                                id: id.clone(),
-                                output,
-                                stdout: r.stdout,
-                                can_undo: engine.can_undo(),
-                            }
-                        });
-                        let _ = reply.send(result);
-                    }
-                    EngineRequest::DeleteCell { id, reply } => {
-                        let result = match engine.notebook.cell_index(&id) {
-                            Some(idx) => {
-                                engine.notebook.cells.remove(idx);
+                                let mut reordered = Vec::with_capacity(engine.notebook.cells.len());
+                                for id in &cell_ids {
+                                    let idx = engine
+                                        .notebook
+                                        .cell_index(id)
+                                        .ok_or_else(|| format!("Cell not found: {id}"))?;
+                                    reordered.push(engine.notebook.cells[idx].clone());
+                                }
+                                for cell in &engine.notebook.cells {
+                                    if !seen.contains(cell.id.as_str()) {
+                                        reordered.push(cell.clone());
+                                    }
+                                }
+                                engine.notebook.cells = reordered;
                                 Ok(())
-                            }
-                            None => Err(format!("Cell not found: {id}")),
-                        };
-                        let _ = reply.send(result);
-                    }
-                    EngineRequest::ReorderCells { cell_ids, reply } => {
-                        let result = (|| {
-                            // Reject duplicate IDs up front: a duplicate would clone
-                            // the same cell into the result twice while a real cell
-                            // gets dropped, permanently corrupting the notebook.
-                            let mut seen = std::collections::HashSet::with_capacity(cell_ids.len());
-                            for id in &cell_ids {
-                                if !seen.insert(id.as_str()) {
-                                    return Err(format!("Duplicate cell ID in reorder: {id}"));
-                                }
-                            }
-                            let mut reordered = Vec::with_capacity(engine.notebook.cells.len());
-                            for id in &cell_ids {
-                                let idx = engine
-                                    .notebook
-                                    .cell_index(id)
-                                    .ok_or_else(|| format!("Cell not found: {id}"))?;
-                                reordered.push(engine.notebook.cells[idx].clone());
-                            }
-                            for cell in &engine.notebook.cells {
-                                if !seen.contains(cell.id.as_str()) {
-                                    reordered.push(cell.clone());
-                                }
-                            }
-                            engine.notebook.cells = reordered;
-                            Ok(())
-                        })();
-                        let _ = reply.send(result);
-                    }
-                    EngineRequest::EvalAll { sources, reply } => {
-                        for (id, source) in sources {
-                            if let Some(cell) = engine.notebook.cell_mut(&id) {
-                                cell.source = source;
-                            }
+                            })();
+                            let _ = reply.send(result);
                         }
-                        let results = engine.eval_all();
-                        let can_undo = engine.can_undo();
-                        let responses = results
-                            .into_iter()
-                            .map(|(id, result)| {
-                                let (output, stdout) = match result {
-                                    Ok(r) => (render::render_output(&r.output), r.stdout),
-                                    Err(e) => (
-                                        render::RenderedOutput {
-                                            output_type: crate::format::OutputType::Error,
-                                            content: e,
-                                            mime_type: "text/x-sema-error".to_string(),
-                                            meta: render::OutputMeta::default(),
-                                        },
-                                        String::new(),
-                                    ),
-                                };
-                                render::EvalResponse {
-                                    id,
-                                    output,
-                                    stdout,
-                                    can_undo,
+                        EngineRequest::EvalAll { sources, reply } => {
+                            for (id, source) in sources {
+                                if let Some(cell) = engine.notebook.cell_mut(&id) {
+                                    cell.source = source;
                                 }
-                            })
-                            .collect();
-                        let _ = reply.send(responses);
-                    }
-                    EngineRequest::GetEnv { reply } => {
-                        let _ = reply.send(render::EnvResponse {
-                            bindings: engine.env_bindings(),
-                        });
-                    }
-                    EngineRequest::Reset { reply } => {
-                        engine.reset();
-                        let _ = reply.send(());
-                    }
-                    EngineRequest::SetTitle { title, reply } => {
-                        engine.notebook.metadata.title = title;
-                        let _ = reply.send(());
-                    }
-                    EngineRequest::Save { reply } => {
-                        let result = match &nb_path {
-                            Some(path) => engine
-                                .notebook
-                                .save(path)
-                                .map(|_| path.display().to_string()),
-                            None => Err("No file path".to_string()),
-                        };
-                        let _ = reply.send(result);
-                    }
-                    EngineRequest::UndoCell { reply } => {
-                        let result = engine.undo_last_cell().map(|info| render::UndoResponse {
-                            undone_cell_id: info.cell_id,
-                            can_undo: engine.can_undo(),
-                        });
-                        let _ = reply.send(result);
+                            }
+                            let results = engine.eval_all();
+                            let can_undo = engine.can_undo();
+                            let responses = results
+                                .into_iter()
+                                .map(|(id, result)| {
+                                    let (output, stdout) = match result {
+                                        Ok(r) => (render::render_output(&r.output), r.stdout),
+                                        Err(e) => (
+                                            render::RenderedOutput {
+                                                output_type: crate::format::OutputType::Error,
+                                                content: e,
+                                                mime_type: "text/x-sema-error".to_string(),
+                                                meta: render::OutputMeta::default(),
+                                            },
+                                            String::new(),
+                                        ),
+                                    };
+                                    render::EvalResponse {
+                                        id,
+                                        output,
+                                        stdout,
+                                        can_undo,
+                                    }
+                                })
+                                .collect();
+                            let _ = reply.send(responses);
+                        }
+                        EngineRequest::GetEnv { reply } => {
+                            let _ = reply.send(render::EnvResponse {
+                                bindings: engine.env_bindings(),
+                            });
+                        }
+                        EngineRequest::Reset { reply } => {
+                            engine.reset();
+                            let _ = reply.send(());
+                        }
+                        EngineRequest::SetTitle { title, reply } => {
+                            engine.notebook.metadata.title = title;
+                            let _ = reply.send(());
+                        }
+                        EngineRequest::Save { reply } => {
+                            let result = match &nb_path {
+                                Some(path) => engine
+                                    .notebook
+                                    .save(path)
+                                    .map(|_| path.display().to_string()),
+                                None => Err("No file path".to_string()),
+                            };
+                            let _ = reply.send(result);
+                        }
+                        EngineRequest::UndoCell { reply } => {
+                            let result = engine.undo_last_cell().map(|info| render::UndoResponse {
+                                undone_cell_id: info.cell_id,
+                                can_undo: engine.can_undo(),
+                            });
+                            let _ = reply.send(result);
+                        }
                     }
                 }
-            }
-        });
+            })
+            .map_err(|e| format!("Failed to spawn notebook engine thread: {e}"))?;
 
         Ok(Self { tx })
     }

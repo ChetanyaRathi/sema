@@ -535,7 +535,7 @@ C13	crates/sema-mcp/src/oauth/flow.rs:276:            let request = server.recv(
 H07	crates/sema-mcp/src/oauth/loopback.rs:98:                .recv_timeout(remaining.min(OPENER_ERROR_POLL))
 C13	crates/sema-mcp/src/server.rs:27:/// synchronously and LLM builtins reach `sema_io::io_block_on`, which panics
 H07	crates/sema-mcp/src/tools.rs:581:    // runtime, the sole async engine, so async/await, channels, and timers work
-H06	crates/sema-notebook/src/bridge.rs:126:            while let Some(req) = rt.block_on(rx.recv()) {
+H06	crates/sema-notebook/src/bridge.rs:138:                while let Some(req) = rt.block_on(rx.recv()) {
 H06	crates/sema-notebook/src/engine.rs:144:    /// whichever cell this engine is currently driving (`async/sleep 60000`
 H06	crates/sema-notebook/src/engine.rs:627:                   (channel/send ch (list ch))
 H06	crates/sema-notebook/src/engine.rs:917:                std::thread::sleep(Duration::from_millis(1));
