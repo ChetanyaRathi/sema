@@ -28,7 +28,7 @@ Also noted from the PR #59 merge review as low-priority, not-yet-done: capping t
 
 ## ASYNC-2 — Stepping across the scheduler boundary into sibling async tasks
 
-**Found 2026-06-23; residual of the async-breakpoints fix.** Breakpoints inside async tasks now fully work under both the native DAP and the WASM playground: a breakpoint in an `(async …)` / `(async/spawn …)` body stops, `Continue` resumes, inspection (stack/scopes/variables) targets the paused **task's** VM frames, and Step Over/Out follow the task's own call depth (gate tests: `crates/sema/tests/dap_async_breakpoint_test.rs`, `crates/sema/tests/wasm_async_debug_test.rs`, `playground/tests/async-debugger.spec.ts`). The one remaining gap: stepping (Step Into/Over/Out) does **not** follow control *across* the scheduler boundary into sibling tasks or back to the main VM — while a task is paused, siblings stay parked and a step stays within the current task slice. **Deferred because** cross-task stepping is a distinct design problem (the stepper would have to model the cooperative scheduler's task graph, not just one VM's frame depth), it's an enhancement rather than the reported bug, and the STOP+CONTINUE+inspect slice already covers the common debugging need. Revisit if async stepping across tasks becomes a real workflow ask.
+**Found 2026-06-23; residual of the async-breakpoints fix.** Breakpoints inside async tasks now fully work under both the native DAP and the WASM playground: a breakpoint in an `(async …)` / `(async/spawn …)` body stops, `Continue` resumes, inspection (stack/scopes/variables) targets the paused **task's** VM frames, and Step Over/Out follow the task's own call depth (gate tests: `crates/sema/tests/dap_async_breakpoint_test.rs`, `crates/sema/tests/wasm_async_debug_test.rs`, `playground/tests/debugger-async.spec.ts`). The one remaining gap: stepping (Step Into/Over/Out) does **not** follow control *across* the scheduler boundary into sibling tasks or back to the main VM — while a task is paused, siblings stay parked and a step stays within the current task slice. **Deferred because** cross-task stepping is a distinct design problem (the stepper would have to model the cooperative scheduler's task graph, not just one VM's frame depth), it's an enhancement rather than the reported bug, and the STOP+CONTINUE+inspect slice already covers the common debugging need. Revisit if async stepping across tasks becomes a real workflow ask.
 
 ---
 
@@ -63,7 +63,7 @@ Fixed 2026-07-02: **ASYNC-1** (dynamic-scope flags vs deferred async tasks) — 
 
 ---
 
-## N5 — `server.rs` response-helper `.unwrap()`s
+## N5 — `server.rs` response-helper `.unwrap()`s — FIXED (2026-07-27)
 
 **Today:** `crates/sema-stdlib/src/server.rs` lines ~1028-1099 (as of 2026-06-09) unwrap on `as_map_rc()` / `__stream_handler` / `__ws_handler` after a single-marker `is_*_response` check. A user who constructs a partially-formed response map (sets `__file_path` flag but forgets `__stream_handler`) panics the HTTP server thread.
 
@@ -72,6 +72,19 @@ Fixed 2026-07-02: **ASYNC-1** (dynamic-scope flags vs deferred async tasks) — 
 **Why deferred:** the helper functions return `()` today; restructuring to propagate errors via the existing `oneshot::Sender<ServerResponse>` requires a new `ServerResponse::Error` variant and changes to the axum-side handler. Medium-effort refactor with non-trivial blast radius.
 
 **Workaround today:** users normally build response maps with `http/ok`, `http/file`, etc. — those constructors always produce well-formed maps. The bug only triggers if a user builds a map by hand with the wrong `__*` markers. Low-likelihood in practice.
+
+**Fixed 2026-07-27.** Reproduced first: a handler returning `{:__websocket true}`
+panicked the server thread on the FIRST request (`called \`Option::unwrap()\` on a
+\`None\` value`, server.rs:1854) and every later request got connection-refused —
+so "low-likelihood" understated it, since one malformed response killed the
+server for good, not just that request.
+
+The fix needed no `ServerResponse::Error` variant after all: a malformed
+response is naturally a 500, so all four sites (file, SSE, and both WebSocket
+handlers) now send `ServerResponse::Raw` with status 500 and a body naming the
+missing key — `handler returned a malformed websocket response: it is marked as
+websocket but has no \`__ws_handler\`` — and the server keeps serving. Regression:
+`server_test::test_malformed_marker_response_does_not_kill_the_server`.
 
 ---
 
@@ -1447,7 +1460,7 @@ Benchmark binary-identity rule: rebuild and verify the baseline worktree binary
 (`git log` + mtime) before measuring — a stale bisect-era binary contaminated
 one investigation.
 
-## PG-E2E-1 — two playground debugger defects remain
+## PG-E2E-1 — two playground debugger defects — RESOLVED (2026-07-27)
 
 **Recorded 2026-07-17; narrowed 2026-07-19.** The broad debugger red set was
 mostly test-harness drift. `@sema-lang/ui` exposes current and breakpoint state
@@ -1461,8 +1474,26 @@ debugger tests pass. Two independent defects remain:
 - The infinite-loop debugger test receives `unsupported runtime VM stop:
   Yielded` instead of the expected step-limit termination.
 
+**Resolved 2026-07-27 by the unified-runtime migration, not by direct repair.**
+Both defects are gone and neither needed its own fix:
+
+- The error string `unsupported runtime VM stop: Yielded` no longer exists
+  anywhere in the tree — the code path that produced it was removed when the
+  blocking compatibility paths were retired and the Promise-driven roots became
+  the only mechanism.
+- The exchange-rates HTTP control-flow defect no longer reproduces.
+
+Verified by running the whole debugger set against a playground rebuilt at
+1.31.5: `debugger`, `debugger-async`, `debugger-promise`,
+`debugger-exchange-rates`, `debugger-http-single-execution` and
+`debugger-perlin` — **43 passed, 0 failed**. (One run failed first on
+`archive version mismatch: built with Sema 1.31.5, runtime is 1.31.4`, which was
+a stale `playground/pkg` after the release bump, not a defect — rebuild the
+playground after a version bump before trusting these specs.)
+
 The release gates now build the final playground WASM and run the stable
-runtime subset: `unified-runtime.spec.ts` and `debug-http-replay.spec.ts` (13
+runtime subset: `unified-runtime.spec.ts` and
+`debugger-http-single-execution.spec.ts` (13
 tests). The two remaining debugger defects are excluded from that focused gate
 until repaired; the full playground suite remains the local acceptance suite.
 

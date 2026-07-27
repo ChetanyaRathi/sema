@@ -2570,3 +2570,51 @@ fn test_router_query_does_not_match_get() {
     );
     assert_eq!(result, Value::int(404));
 }
+
+// N5: a response map carrying a type marker but not the payload that marker
+// promises must not take the server down. The `is_*_response` guards check only
+// the marker (`__websocket`), while the handlers used to `.unwrap()` the payload
+// (`__ws_handler`) — so ONE such request panicked the server thread and every
+// subsequent request got connection-refused.
+#[test]
+#[ignore] // requires network
+fn test_malformed_marker_response_does_not_kill_the_server() {
+    use std::process::{Command, Stdio};
+    use std::time::Duration;
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_sema"))
+        .arg("-e")
+        .arg(r#"(http/serve (fn (req) (if (= (:path req) "/bad") {:__websocket true} (http/ok "alive"))) {:port 19894})"#)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("Failed to spawn sema");
+
+    std::thread::sleep(Duration::from_millis(1500));
+
+    sema_llm::http::ensure_crypto_provider();
+    let client = reqwest::blocking::Client::new();
+
+    let bad = client
+        .get("http://127.0.0.1:19894/bad")
+        .timeout(Duration::from_secs(5))
+        .send()
+        .expect("the malformed response must produce a reply, not a dead socket");
+    assert_eq!(bad.status(), 500, "a malformed response is a server error");
+    let body = bad.text().unwrap_or_default();
+    assert!(
+        body.contains("__ws_handler"),
+        "the 500 should name the missing key; got {body:?}"
+    );
+
+    // The point of the fix: the server is still serving afterwards.
+    let good = client
+        .get("http://127.0.0.1:19894/ok")
+        .timeout(Duration::from_secs(5))
+        .send()
+        .expect("THE SERVER MUST STILL BE ALIVE after a malformed response");
+    assert_eq!(good.status(), 200);
+
+    child.kill().ok();
+    child.wait().ok();
+}

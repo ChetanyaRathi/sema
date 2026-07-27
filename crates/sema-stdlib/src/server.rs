@@ -1506,6 +1506,28 @@ async fn bridge_websocket(
 }
 
 /// Check if a response Value is an SSE stream marker.
+/// A 500 for a response map that carries a type marker but not the payload that
+/// marker promises — `{:__websocket true}` with no `__ws_handler`, say.
+///
+/// The `is_*_response` guards check only the marker, so the handlers below used
+/// to `.unwrap()` the payload and PANIC the server thread, killing the whole
+/// server for every later request. Returning a 500 keeps the process alive and
+/// tells the author which key is missing. Constructors like `http/ok` and
+/// `http/websocket` always produce well-formed maps; this is the hand-built path.
+fn malformed_response(kind: &str, missing_key: &str) -> ServerResponse {
+    ServerResponse::Raw(RawResponse {
+        status: 500,
+        headers: vec![(
+            "content-type".to_string(),
+            "text/plain; charset=utf-8".to_string(),
+        )],
+        body: format!(
+            "handler returned a malformed {kind} response: it is marked as {kind} \
+             but has no `{missing_key}`"
+        ),
+    })
+}
+
 fn is_stream_response(val: &Value) -> bool {
     if let Some(m) = val.as_map_rc() {
         m.get(&Value::keyword("__stream"))
@@ -1543,7 +1565,10 @@ fn handle_file_response(
     response_val: &Value,
     respond: tokio::sync::oneshot::Sender<ServerResponse>,
 ) {
-    let map = response_val.as_map_rc().unwrap();
+    let Some(map) = response_val.as_map_rc() else {
+        let _ = respond.send(malformed_response("file", "__file_path"));
+        return;
+    };
     let path_str = map
         .get(&Value::keyword("__file_path"))
         .and_then(|v| v.as_str().map(|s| s.to_string()))
@@ -1584,11 +1609,14 @@ fn prepare_sse_response(
     response_val: &Value,
     respond: tokio::sync::oneshot::Sender<ServerResponse>,
 ) -> (Value, Value) {
-    let map = response_val.as_map_rc().unwrap();
-    let stream_handler = map
-        .get(&Value::keyword("__stream_handler"))
-        .cloned()
-        .unwrap();
+    let handler = response_val
+        .as_map_rc()
+        .and_then(|map| map.get(&Value::keyword("__stream_handler")).cloned());
+    let Some(stream_handler) = handler else {
+        let _ = respond.send(malformed_response("stream", "__stream_handler"));
+        // Nil pair: the caller treats it as "nothing to drive".
+        return (Value::nil(), Value::nil());
+    };
 
     // Create the SSE channel. Unbounded because the handler runs on the
     // evaluator thread and may `send` from inside a provider's block_on (e.g.
@@ -1850,8 +1878,13 @@ fn handle_ws_response_runtime(
     use std::cell::RefCell;
     use std::rc::Rc;
 
-    let map = response_val.as_map_rc().unwrap();
-    let ws_handler = map.get(&Value::keyword("__ws_handler")).cloned().unwrap();
+    let handler = response_val
+        .as_map_rc()
+        .and_then(|map| map.get(&Value::keyword("__ws_handler")).cloned());
+    let Some(ws_handler) = handler else {
+        let _ = respond.send(malformed_response("websocket", "__ws_handler"));
+        return Ok(NativeOutcome::Return(Value::nil()));
+    };
 
     let (in_tx, in_rx) = tokio::sync::mpsc::channel::<WsMsg>(256);
     let (incoming_generation_tx, incoming_generation) = tokio::sync::watch::channel(0_u64);
@@ -1983,8 +2016,13 @@ fn handle_ws_response(
     use std::cell::RefCell;
     use std::rc::Rc;
 
-    let map = response_val.as_map_rc().unwrap();
-    let ws_handler = map.get(&Value::keyword("__ws_handler")).cloned().unwrap();
+    let handler = response_val
+        .as_map_rc()
+        .and_then(|map| map.get(&Value::keyword("__ws_handler")).cloned());
+    let Some(ws_handler) = handler else {
+        let _ = respond.send(malformed_response("websocket", "__ws_handler"));
+        return;
+    };
 
     // Create bidirectional channels
     let (in_tx, in_rx) = tokio::sync::mpsc::channel::<WsMsg>(256); // client -> evaluator

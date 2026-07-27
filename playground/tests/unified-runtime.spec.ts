@@ -1321,7 +1321,12 @@ test('the replay loops and MAX_REPLAYS are gone repo-wide', async () => {
   for (const marker of ['MAX_REPLAYS', 'legacySab', 'new SharedArrayBuffer(']) {
     for (const root of roots) {
       execSync(
+        // Skip dependency and vendored trees: this guard is about OUR source.
+        // Without the exclusion a doc comment in `@types/node` mentioning
+        // `new SharedArrayBuffer()` failed the test, which says nothing about
+        // whether the replay machinery is gone.
         `! grep -RIn --include='*.rs' --include='*.js' --include='*.ts' ` +
+          `--exclude-dir=node_modules --exclude-dir=vendor ` +
           `-- '${marker}' ${path.join(REPO_ROOT, root)}`,
         { shell: '/bin/bash' },
       );
