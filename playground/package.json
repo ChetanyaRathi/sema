@@ -30,7 +30,7 @@
     "test:ui": "npx playwright test --ui"
   },
   "dependencies": {
-    "@sema-lang/ui": "^0.1.4"
+    "@sema-lang/ui": "^0.2.0"
   },
   "devDependencies": {
     "@playwright/test": "^1.60.0",
