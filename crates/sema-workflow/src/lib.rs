@@ -7,15 +7,19 @@
 //! like the `.semac` bytecode format) — its layout and event vocabulary are FROZEN
 //! (append-only Option/skippable fields only).
 //!
-//! This crate is a leaf: it depends only on `sema-core` + `sema-otel` + serde.
+//! This crate is a leaf: it depends only on `sema-core` + serde.
 //! The builtins that invoke Sema thunks (`workflow/run`, `workflow/phase`,
 //! `checkpoint`, `workflow/agent`) live in `sema-stdlib`, which depends on this crate.
 
 pub mod context;
 pub mod event;
 mod journal;
+pub mod writer;
 
-pub use context::{current, resolve_run_id, set_workflow_scope, WorkflowCtx, WorkflowGuard};
+pub use context::{
+    cur_agent_for, current_for, resolve_run_id, set_cur_agent_for, set_workflow_scope, WorkflowCtx,
+    WorkflowGuard, WorkflowTaskState,
+};
 pub use event::WorkflowEvent;
 pub use journal::Journal;
 

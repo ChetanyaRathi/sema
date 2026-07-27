@@ -778,6 +778,7 @@ pub fn deserialize_function(
         local_scopes,
         source_file: None,
         cache_offset: 0,
+        suspend_cache: std::cell::Cell::new(None),
     })
 }
 
@@ -2035,6 +2036,7 @@ mod tests {
             source_file: None,
             local_scopes: vec![(2, 0, 7), (3, 4, 9)],
             cache_offset: 0,
+            suspend_cache: std::cell::Cell::new(None),
         };
 
         let mut buf = Vec::new();
@@ -2082,6 +2084,7 @@ mod tests {
             source_file: None,
             local_scopes: Vec::new(),
             cache_offset: 0,
+            suspend_cache: std::cell::Cell::new(None),
         };
 
         let mut buf = Vec::new();
@@ -2149,6 +2152,7 @@ mod tests {
             source_file: None,
             local_scopes: Vec::new(),
             cache_offset: 0,
+            suspend_cache: std::cell::Cell::new(None),
         };
 
         let result = CompileResult::new(chunk, vec![func]);

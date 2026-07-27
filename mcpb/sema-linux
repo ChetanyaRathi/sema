@@ -1,0 +1,14 @@
+#!/bin/sh
+# Linux arch-dispatch shim for the Sema MCPB bundle.
+#
+# MCPB's `platform_overrides` key on OS only (darwin/win32/linux) — never on
+# CPU architecture, and there is no `${arch}` substitution variable. So on
+# Linux we pick the right binary ourselves: resolve our own directory (POSIX,
+# no `readlink -f` dependency) and exec the matching arch binary, forwarding
+# every argument ("mcp" …) verbatim.
+dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+case "$(uname -m)" in
+  x86_64 | amd64)  exec "$dir/sema-linux-x64"   "$@" ;;
+  aarch64 | arm64) exec "$dir/sema-linux-arm64" "$@" ;;
+  *) echo "sema: unsupported Linux architecture: $(uname -m)" >&2; exit 1 ;;
+esac

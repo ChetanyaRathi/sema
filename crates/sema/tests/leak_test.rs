@@ -1,3 +1,6 @@
+//! Own binary (NOT in vm_suite): the teardown oracles assert whole-process
+//! allocation/env state and fail when unrelated tests run in the same process.
+//!
 //! CORE-2 leak oracles: recursive local closures and env⇄closure `define`s
 //! form `Rc` cycles that reference counting alone cannot reclaim. The cycle
 //! collector (`sema_core::cycle`, ADR #66, `docs/plans/2026-07-02-core2-gc.md`)

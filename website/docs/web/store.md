@@ -8,7 +8,7 @@ The `store/*` namespace provides access to the browser's `localStorage` and `ses
 
 Retrieve a value from localStorage. Returns `nil` if the key does not exist or if parsing fails.
 
-```scheme
+```sema
 (store/get "username")        ;; => "alice"
 (store/get "preferences")     ;; => {:theme "dark" :lang "en"}
 (store/get "nonexistent")     ;; => nil
@@ -18,7 +18,7 @@ Retrieve a value from localStorage. Returns `nil` if the key does not exist or i
 
 Store a value in localStorage. The value is JSON-serialized.
 
-```scheme
+```sema
 (store/set! "username" "alice")
 (store/set! "count" 42)
 (store/set! "todos" [{:text "Buy milk" :done false}])
@@ -28,7 +28,7 @@ Store a value in localStorage. The value is JSON-serialized.
 
 Remove a key from localStorage.
 
-```scheme
+```sema
 (store/remove! "username")
 ```
 
@@ -36,7 +36,7 @@ Remove a key from localStorage.
 
 Remove all keys from localStorage.
 
-```scheme
+```sema
 (store/clear!)
 ```
 
@@ -44,7 +44,7 @@ Remove all keys from localStorage.
 
 List all keys currently in localStorage.
 
-```scheme
+```sema
 (store/keys)  ;; => ("username" "count" "todos")
 ```
 
@@ -52,7 +52,7 @@ List all keys currently in localStorage.
 
 Check whether a key exists in localStorage.
 
-```scheme
+```sema
 (if (store/has? "auth-token")
   (println "Logged in")
   (println "Not logged in"))
@@ -64,25 +64,25 @@ Session storage functions mirror their localStorage counterparts but data is sco
 
 ### `(store/session-get key)` -> value | nil
 
-```scheme
+```sema
 (store/session-get "draft")
 ```
 
 ### `(store/session-set! key value)` -> nil
 
-```scheme
+```sema
 (store/session-set! "draft" "Work in progress...")
 ```
 
 ### `(store/session-remove! key)` -> nil
 
-```scheme
+```sema
 (store/session-remove! "draft")
 ```
 
 ### `(store/session-clear!)` -> nil
 
-```scheme
+```sema
 (store/session-clear!)
 ```
 
@@ -101,7 +101,7 @@ Values are stored as JSON, so the following types round-trip correctly:
 
 ## Example: Persisting State
 
-```scheme
+```sema
 ;; Save state on change
 (define (save-todos! todos)
   (store/set! "todos" todos))

@@ -2,6 +2,8 @@
 use sema_core::Value;
 use sema_eval::Interpreter;
 
+pub mod watchdog;
+
 /// Evaluate Sema source on the VM (the sole evaluator), panicking on error. Used both to
 /// run a test's input and to turn an expected Sema literal into a `Value`
 /// (e.g. `=> common::eval("'(2 4 6)")`).
@@ -27,7 +29,7 @@ macro_rules! eval_tests {
         $(
             #[test]
             fn $name() {
-                let result = common::eval($input);
+                let result = $crate::common::eval($input);
                 assert_eq!(result, $expected, "VM: {}", $input);
             }
         )*

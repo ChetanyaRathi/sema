@@ -71,6 +71,11 @@ pub struct Function {
     /// Offset into the VM's inline_cache Vec where this function's cache slots begin.
     /// Assigned at VM creation time; not serialized.
     pub cache_offset: usize,
+    /// Memoized "can this function's call graph suspend?" verdict for the
+    /// non-suspending HOF fast path, keyed on the version fingerprint of the
+    /// global env chain it was resolved against (a rebind re-analyzes). Not
+    /// serialized (like `cache_offset`); computed lazily per process.
+    pub suspend_cache: std::cell::Cell<Option<(u64, bool)>>,
 }
 
 /// Describes how an upvalue is captured relative to the immediately enclosing function.

@@ -19,6 +19,8 @@
 #   jake/bench.jake    — hyperfine benchmarks + samply profiling
 #   jake/fuzz.jake     — cargo-fuzz + in-Sema grammar fuzzer
 #   jake/release.jake  — coverage, mutation testing, publish-list guard
+#   jake/mcpb.jake     — cross-platform MCP Bundle (.mcpb) packaging, namespaced `mcpb`
+#   jake/scripts.jake  — shellcheck + shfmt hygiene for scripts/*.sh, namespaced `scripts`
 
 # `@rooted` so the `sema-lisp/workspace` meta-repo can `@import "sema/Jakefile" as
 # sema` and have these recipes' relative paths (jake/*.jake, scripts/, crates/)
@@ -35,6 +37,8 @@
 @import "jake/bench.jake" as bench
 @import "jake/fuzz.jake" as fuzz
 @import "jake/release.jake" as release
+@import "jake/mcpb.jake" as mcpb
+@import "jake/scripts.jake" as scripts
 
 # Load .env so LLM/provider tasks pick up API keys (ANTHROPIC_API_KEY, …)
 # without polluting the shell. No-op when there's no .env.

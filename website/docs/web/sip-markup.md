@@ -16,7 +16,7 @@ SIP vectors map directly to HTML elements:
 
 The general shape is:
 
-```scheme
+```sema
 [:tag-name {:attr "value"} child1 child2 ...]
 ```
 
@@ -26,7 +26,7 @@ The attribute map is optional. When the second element is not a map, all remaini
 
 Tags are keywords. The leading colon is stripped during rendering:
 
-```scheme
+```sema
 [:div "content"]       ;; <div>content</div>
 [:span "inline"]       ;; <span>inline</span>
 [:button "Click me"]   ;; <button>Click me</button>
@@ -36,7 +36,7 @@ Tags are keywords. The leading colon is stripped during rendering:
 
 Attributes are a map in the second position. Keyword colons on keys are stripped automatically:
 
-```scheme
+```sema
 [:div {:id "main" :class "container" :data-count "5"}
   [:p "Hello"]]
 ```
@@ -47,7 +47,7 @@ Renders as: `<div id="main" class="container" data-count="5"><p>Hello</p></div>`
 
 Style accepts either a string or a map of CSS properties:
 
-```scheme
+```sema
 ;; String form
 [:p {:style "color: red; font-size: 14px"} "Red text"]
 
@@ -59,7 +59,7 @@ Style accepts either a string or a map of CSS properties:
 
 Boolean attributes are set or removed based on truthiness:
 
-```scheme
+```sema
 [:input {:disabled true}]   ;; <input disabled>
 [:input {:disabled false}]  ;; <input>  (attribute removed)
 [:input {:checked true}]    ;; sets the checked DOM property
@@ -69,7 +69,7 @@ Boolean attributes are set or removed based on truthiness:
 
 `value`, `checked`, and `disabled` set the corresponding DOM properties directly rather than using `setAttribute`:
 
-```scheme
+```sema
 [:input {:type "text" :value "initial"}]
 [:input {:type "checkbox" :checked true}]
 ```
@@ -78,7 +78,7 @@ Boolean attributes are set or removed based on truthiness:
 
 Event handlers use `on-*` attributes. In SIP markup, the value must still be a **named function** string. The handler is installed as a delegated event via a `data-sema-on-*` attribute:
 
-```scheme
+```sema
 (define (handle-click ev)
   (println "clicked!"))
 
@@ -93,7 +93,7 @@ The event handler receives a numeric event handle as its argument. Use `dom/even
 
 Children can be strings, numbers, booleans, `nil`, or nested SIP vectors:
 
-```scheme
+```sema
 [:div
   [:h1 "Title"]
   [:p "Paragraph " 42 " items"]
@@ -106,7 +106,7 @@ Children can be strings, numbers, booleans, `nil`, or nested SIP vectors:
 
 When the first element of an array is not a string (keyword), the array is treated as a fragment -- a list of sibling elements:
 
-```scheme
+```sema
 ;; Returns two paragraphs as siblings
 [[:p "First"] [:p "Second"]]
 ```
@@ -117,7 +117,7 @@ This is useful for returning multiple root elements from a function.
 
 Use standard Sema conditionals -- they return SIP vectors:
 
-```scheme
+```sema
 (if loading?
   [:div {:class "spinner"} "Loading..."]
   [:div {:class "content"} "Ready"])
@@ -127,7 +127,7 @@ Use standard Sema conditionals -- they return SIP vectors:
 
 Use `map` to produce lists of elements:
 
-```scheme
+```sema
 [:ul
   (map (fn [item] [:li (:text item)]) items)]
 ```
@@ -140,7 +140,7 @@ Since `map` returns a list (not a keyword-prefixed vector), the result is treate
 
 Renders SIP data and returns an element handle (numeric ID):
 
-```scheme
+```sema
 (def el (sip/render [:div {:class "card"} "Hello"]))
 (dom/append-child! parent el)
 ```
@@ -151,7 +151,7 @@ Non-element nodes (text, fragments) are wrapped in a `<span>`.
 
 Renders SIP data into a target element selected by CSS selector. Replaces existing content:
 
-```scheme
+```sema
 (sip/render-into! "#app"
   [:div
     [:h1 "My App"]

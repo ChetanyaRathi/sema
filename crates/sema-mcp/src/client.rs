@@ -500,6 +500,7 @@ impl HttpTransport {
         if config.url.is_empty() {
             return Err("mcp/connect (http) requires a non-empty :url".to_string());
         }
+        crate::ensure_crypto_provider();
         let client = reqwest::Client::builder()
             .build()
             .map_err(|err| format!("failed to build HTTP client: {err}"))?;
@@ -765,6 +766,7 @@ impl LegacySseTransport {
         if config.url.is_empty() {
             return Err("mcp/connect (legacy sse) requires a non-empty :url".to_string());
         }
+        crate::ensure_crypto_provider();
         let client = reqwest::Client::builder()
             .build()
             .map_err(|err| format!("failed to build HTTP client: {err}"))?;

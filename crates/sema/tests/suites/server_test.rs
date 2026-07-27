@@ -1,0 +1,2572 @@
+use sema_core::{SemaError, Value};
+use sema_eval::Interpreter;
+
+fn eval(input: &str) -> Value {
+    let interp = Interpreter::new();
+    interp
+        .eval_str(input)
+        .unwrap_or_else(|_| panic!("failed to eval: {input}"))
+}
+
+fn eval_err(input: &str) -> SemaError {
+    let interp = Interpreter::new();
+    interp.eval_str(input).unwrap_err()
+}
+
+struct LoopbackServer {
+    url: String,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl LoopbackServer {
+    fn url(&self) -> &str {
+        &self.url
+    }
+
+    fn finish(mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Release);
+        if let Some(thread) = self.thread.take() {
+            thread.join().expect("loopback server thread panicked");
+        }
+    }
+}
+
+impl Drop for LoopbackServer {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Release);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+fn spawn_loopback_server(
+    handler: impl FnOnce(std::net::TcpStream) + Send + 'static,
+) -> LoopbackServer {
+    use std::io::ErrorKind;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback server");
+    let address = listener.local_addr().expect("read loopback address");
+    listener
+        .set_nonblocking(true)
+        .expect("make loopback accept cancellable");
+    let stop = Arc::new(AtomicBool::new(false));
+    let thread_stop = stop.clone();
+    let thread = std::thread::spawn(move || loop {
+        match listener.accept() {
+            Ok((stream, _)) => {
+                stream
+                    .set_nonblocking(false)
+                    .expect("make accepted loopback socket blocking");
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .expect("set loopback read timeout");
+                stream
+                    .set_write_timeout(Some(Duration::from_secs(2)))
+                    .expect("set loopback write timeout");
+                handler(stream);
+                return;
+            }
+            Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                if thread_stop.load(Ordering::Acquire) {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            Err(error) => panic!("loopback accept failed: {error}"),
+        }
+    });
+
+    LoopbackServer {
+        url: format!("ws://{address}"),
+        stop,
+        thread: Some(thread),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Web server integration tests (server-based, require network)
+// ---------------------------------------------------------------------------
+
+#[test]
+#[ignore] // requires network
+fn test_http_serve_json_body_parsing() {
+    use std::process::{Command, Stdio};
+    use std::time::Duration;
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_sema"))
+        .arg("-e")
+        .arg(r#"(http/serve (fn (req) (http/ok (or (:json req) "no json"))) {:port 19880})"#)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("Failed to spawn sema");
+
+    std::thread::sleep(Duration::from_millis(1500));
+
+    sema_llm::http::ensure_crypto_provider();
+    let client = reqwest::blocking::Client::new();
+
+    // POST with JSON body
+    let resp = client
+        .post("http://127.0.0.1:19880/test")
+        .header("content-type", "application/json")
+        .body(r#"{"name":"Ada","age":36}"#)
+        .timeout(Duration::from_secs(5))
+        .send()
+        .expect("Failed to POST");
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().expect("Failed to parse JSON response");
+    assert_eq!(body["name"], "Ada");
+    assert_eq!(body["age"], 36);
+
+    // GET without JSON body should get "no json"
+    let resp = client
+        .get("http://127.0.0.1:19880/test")
+        .timeout(Duration::from_secs(5))
+        .send()
+        .expect("Failed to GET");
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().expect("Failed to parse JSON response");
+    assert_eq!(body, "no json");
+
+    child.kill().ok();
+    child.wait().ok();
+}
+
+// STD-6: request body is capped (16 MiB) so a large body returns 413 instead of
+// being buffered unbounded into memory.
+#[test]
+#[ignore] // requires network
+fn test_http_serve_rejects_oversized_body() {
+    use std::process::{Command, Stdio};
+    use std::time::Duration;
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_sema"))
+        .arg("-e")
+        .arg(r#"(http/serve (fn (req) (http/ok "ok")) {:port 19890})"#)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("Failed to spawn sema");
+
+    std::thread::sleep(Duration::from_millis(1500));
+
+    sema_llm::http::ensure_crypto_provider();
+    let client = reqwest::blocking::Client::new();
+
+    // A small body is accepted.
+    let ok = client
+        .post("http://127.0.0.1:19890/x")
+        .body("hello")
+        .timeout(Duration::from_secs(5))
+        .send()
+        .expect("small POST failed");
+    assert_eq!(ok.status(), 200);
+
+    // A 17 MiB body exceeds the 16 MiB cap → 413.
+    let big = vec![b'a'; 17 * 1024 * 1024];
+    let resp = client
+        .post("http://127.0.0.1:19890/x")
+        .body(big)
+        .timeout(Duration::from_secs(10))
+        .send()
+        .expect("large POST failed");
+    assert_eq!(resp.status(), 413, "oversized body should be rejected");
+
+    child.kill().ok();
+    child.wait().ok();
+}
+
+// STD-7: (ws/close) actually closes the socket even while the handler is still
+// running. The handler sends a message, closes, then sleeps 3s; a correct close
+// drops the sole sender so the client observes closure well before the sleep
+// ends. (Before the fix, close dropped only a clone and the socket stayed open
+// until the handler returned.)
+#[test]
+#[ignore] // requires network
+fn test_ws_close_closes_socket_while_handler_runs() {
+    use std::net::TcpStream;
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_sema"))
+        .arg("-e")
+        .arg(
+            r#"(http/serve
+                 (fn (req)
+                   (http/websocket
+                     (fn (conn)
+                       ((:send conn) "hi")
+                       ((:close conn))
+                       (sleep 3000))))
+                 {:port 19891})"#,
+        )
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("Failed to spawn sema");
+
+    std::thread::sleep(Duration::from_millis(1500));
+
+    let stream = TcpStream::connect("127.0.0.1:19891").expect("tcp connect");
+    // Read timeout MUST exceed the handler's 3s sleep, so that on the buggy
+    // (no-op close) path the read blocks until the real close at ~3s rather than
+    // timing out early and masquerading as a fast close.
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let (mut socket, _resp) =
+        tungstenite::client("ws://127.0.0.1:19891/", stream).expect("ws handshake");
+
+    let start = Instant::now();
+    let first = socket.read().expect("read first message");
+    assert_eq!(first.into_text().unwrap().as_str(), "hi");
+
+    // The next read must observe the close (Close frame or connection error)
+    // quickly — long before the handler's 3s sleep finishes.
+    let closed = loop {
+        match socket.read() {
+            Ok(msg) if msg.is_close() => break true,
+            Ok(_) => continue,
+            Err(_) => break true, // connection dropped == closed
+        }
+    };
+    let elapsed = start.elapsed();
+    assert!(closed, "socket should have closed");
+    assert!(
+        elapsed < Duration::from_millis(2500),
+        "close took {elapsed:?} — handler sleep was not bypassed (ws/close ineffective)"
+    );
+
+    child.kill().ok();
+    child.wait().ok();
+}
+
+#[test]
+#[ignore] // requires network
+fn test_http_serve_query_string() {
+    use std::process::{Command, Stdio};
+    use std::time::Duration;
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_sema"))
+        .arg("-e")
+        .arg(r#"(http/serve (fn (req) (http/ok (:query req))) {:port 19881})"#)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("Failed to spawn sema");
+
+    std::thread::sleep(Duration::from_millis(1500));
+
+    sema_llm::http::ensure_crypto_provider();
+    let client = reqwest::blocking::Client::new();
+    let resp = client
+        .get("http://127.0.0.1:19881/search?q=hello&page=2")
+        .timeout(Duration::from_secs(5))
+        .send()
+        .expect("Failed to GET");
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().expect("Failed to parse JSON response");
+    assert_eq!(body["page"], "2");
+    assert_eq!(body["q"], "hello");
+
+    child.kill().ok();
+    child.wait().ok();
+}
+
+#[test]
+#[ignore] // requires network
+fn test_http_serve_handler_error() {
+    use std::process::{Command, Stdio};
+    use std::time::Duration;
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_sema"))
+        .arg("-e")
+        .arg(r#"(http/serve (fn (req) (error "something broke")) {:port 19882})"#)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("Failed to spawn sema");
+
+    std::thread::sleep(Duration::from_millis(1500));
+
+    sema_llm::http::ensure_crypto_provider();
+    let client = reqwest::blocking::Client::new();
+
+    // First request: handler errors, should get 500
+    let resp = client
+        .get("http://127.0.0.1:19882/test")
+        .timeout(Duration::from_secs(5))
+        .send()
+        .expect("Failed to GET");
+    assert_eq!(resp.status(), 500);
+
+    // Second request: server should still be running
+    let resp = client
+        .get("http://127.0.0.1:19882/test2")
+        .timeout(Duration::from_secs(5))
+        .send()
+        .expect("Server should still be running after handler error");
+    assert_eq!(resp.status(), 500);
+
+    child.kill().ok();
+    child.wait().ok();
+}
+
+#[test]
+#[ignore] // requires network
+fn test_http_serve_method_dispatch() {
+    use std::process::{Command, Stdio};
+    use std::time::Duration;
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_sema"))
+        .arg("-e")
+        .arg(
+            r#"
+            (http/serve
+              (http/router
+                [[:get "/data" (fn (req) (http/ok "got"))]
+                 [:post "/data" (fn (req) (http/ok "posted"))]])
+              {:port 19883})
+        "#,
+        )
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("Failed to spawn sema");
+
+    std::thread::sleep(Duration::from_millis(1500));
+
+    sema_llm::http::ensure_crypto_provider();
+    let client = reqwest::blocking::Client::new();
+
+    // GET /data
+    let resp = client
+        .get("http://127.0.0.1:19883/data")
+        .timeout(Duration::from_secs(5))
+        .send()
+        .expect("Failed to GET /data");
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().unwrap();
+    assert_eq!(body, "got");
+
+    // POST /data
+    let resp = client
+        .post("http://127.0.0.1:19883/data")
+        .timeout(Duration::from_secs(5))
+        .send()
+        .expect("Failed to POST /data");
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().unwrap();
+    assert_eq!(body, "posted");
+
+    child.kill().ok();
+    child.wait().ok();
+}
+
+#[test]
+#[ignore] // requires network
+fn test_http_serve_custom_headers() {
+    use std::process::{Command, Stdio};
+    use std::time::Duration;
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_sema"))
+        .arg("-e")
+        .arg(
+            r#"
+            (http/serve
+              (fn (req)
+                {:status 200
+                 :headers {"x-custom" "hello" "content-type" "text/plain"}
+                 :body "ok"})
+              {:port 19884})
+        "#,
+        )
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("Failed to spawn sema");
+
+    std::thread::sleep(Duration::from_millis(1500));
+
+    sema_llm::http::ensure_crypto_provider();
+    let client = reqwest::blocking::Client::new();
+    let resp = client
+        .get("http://127.0.0.1:19884/test")
+        .timeout(Duration::from_secs(5))
+        .send()
+        .expect("Failed to GET");
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        resp.headers().get("x-custom").map(|v| v.to_str().unwrap()),
+        Some("hello")
+    );
+    assert_eq!(
+        resp.headers()
+            .get("content-type")
+            .map(|v| v.to_str().unwrap()),
+        Some("text/plain")
+    );
+    let body = resp.text().unwrap();
+    assert_eq!(body, "ok");
+
+    child.kill().ok();
+    child.wait().ok();
+}
+
+#[test]
+#[ignore] // requires network
+fn test_http_serve_wildcard_route() {
+    use std::process::{Command, Stdio};
+    use std::time::Duration;
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_sema"))
+        .arg("-e")
+        .arg(
+            r#"
+            (http/serve
+              (http/router
+                [[:get "/files/*" (fn (req) (http/ok (:* (:params req))))]])
+              {:port 19885})
+        "#,
+        )
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("Failed to spawn sema");
+
+    std::thread::sleep(Duration::from_millis(1500));
+
+    sema_llm::http::ensure_crypto_provider();
+    let client = reqwest::blocking::Client::new();
+    let resp = client
+        .get("http://127.0.0.1:19885/files/a/b/c.txt")
+        .timeout(Duration::from_secs(5))
+        .send()
+        .expect("Failed to GET /files/a/b/c.txt");
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().unwrap();
+    assert_eq!(body, "a/b/c.txt");
+
+    child.kill().ok();
+    child.wait().ok();
+}
+
+#[test]
+#[ignore] // requires network
+fn test_http_serve_concurrent_requests() {
+    use std::process::{Command, Stdio};
+    use std::time::Duration;
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_sema"))
+        .arg("-e")
+        .arg(r#"(http/serve (fn (req) (http/ok {:path (:path req)})) {:port 19886})"#)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("Failed to spawn sema");
+
+    std::thread::sleep(Duration::from_millis(1500));
+
+    // Spawn 5 threads, each making a request
+    let handles: Vec<_> = (0..5)
+        .map(|i| {
+            std::thread::spawn(move || {
+                sema_llm::http::ensure_crypto_provider();
+                let client = reqwest::blocking::Client::new();
+                let resp = client
+                    .get(format!("http://127.0.0.1:19886/item/{i}"))
+                    .timeout(Duration::from_secs(10))
+                    .send()
+                    .expect("Failed to GET");
+                assert_eq!(resp.status(), 200);
+                let body: serde_json::Value = resp.json().unwrap();
+                assert_eq!(body["path"], format!("/item/{i}"));
+            })
+        })
+        .collect();
+
+    for h in handles {
+        h.join().expect("Thread panicked");
+    }
+
+    child.kill().ok();
+    child.wait().ok();
+}
+
+#[test]
+#[ignore] // requires network
+fn test_http_serve_middleware() {
+    use std::process::{Command, Stdio};
+    use std::time::Duration;
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_sema"))
+        .arg("-e")
+        .arg(
+            r#"
+            (begin
+              (define (add-header handler)
+                (fn (req)
+                  (let ((resp (handler req)))
+                    (let ((headers (or (:headers resp) {})))
+                      (assoc resp :headers (assoc headers "x-middleware" "applied"))))))
+              (http/serve
+                (add-header (fn (req) (http/ok "hello")))
+                {:port 19887}))
+        "#,
+        )
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("Failed to spawn sema");
+
+    std::thread::sleep(Duration::from_millis(1500));
+
+    sema_llm::http::ensure_crypto_provider();
+    let client = reqwest::blocking::Client::new();
+    let resp = client
+        .get("http://127.0.0.1:19887/test")
+        .timeout(Duration::from_secs(5))
+        .send()
+        .expect("Failed to GET");
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        resp.headers()
+            .get("x-middleware")
+            .map(|v| v.to_str().unwrap()),
+        Some("applied")
+    );
+
+    child.kill().ok();
+    child.wait().ok();
+}
+
+// ---------------------------------------------------------------------------
+// Router edge cases — unit tests (no network)
+// ---------------------------------------------------------------------------
+
+fn make_request(method: &str, path: &str) -> String {
+    format!(
+        r#"{{:method :{method} :path "{path}" :headers {{}} :query {{}} :params {{}} :body "" :remote "127.0.0.1"}}"#
+    )
+}
+
+fn router_eval(routes: &str, method: &str, path: &str) -> Value {
+    let req = make_request(method, path);
+    eval(&format!(
+        r#"(let ((router (http/router {routes}))) (router {req}))"#
+    ))
+}
+
+fn get_status(result: &Value) -> i64 {
+    result
+        .as_map_rc()
+        .unwrap()
+        .get(&Value::keyword("status"))
+        .and_then(|v| v.as_int())
+        .unwrap()
+}
+
+fn get_body(result: &Value) -> String {
+    result
+        .as_map_rc()
+        .unwrap()
+        .get(&Value::keyword("body"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .unwrap_or_default()
+}
+
+// --- Route matching ---
+
+#[test]
+fn test_router_first_match_wins() {
+    let result = router_eval(
+        r#"[[:get "/x" (fn (req) (http/ok "first"))]
+            [:get "/x" (fn (req) (http/ok "second"))]]"#,
+        "get",
+        "/x",
+    );
+    assert_eq!(get_status(&result), 200);
+    assert!(get_body(&result).contains("first"));
+}
+
+#[test]
+fn test_router_trailing_slash_normalized() {
+    let result = router_eval(
+        r#"[[:get "/api/data" (fn (req) (http/ok "found"))]]"#,
+        "get",
+        "/api/data/",
+    );
+    assert_eq!(get_status(&result), 200);
+}
+
+#[test]
+fn test_router_root_path() {
+    let result = router_eval(r#"[[:get "/" (fn (req) (http/ok "root"))]]"#, "get", "/");
+    assert_eq!(get_status(&result), 200);
+}
+
+#[test]
+fn test_router_empty_path() {
+    let result = router_eval(r#"[[:get "/" (fn (req) (http/ok "root"))]]"#, "get", "");
+    // Empty path should match "/" or 404
+    let status = get_status(&result);
+    assert!(status == 200 || status == 404);
+}
+
+#[test]
+fn test_router_multi_segment_params() {
+    let result = router_eval(
+        r#"[[:get "/users/:id/posts/:pid" (fn (req) (http/ok (:params req)))]]"#,
+        "get",
+        "/users/42/posts/99",
+    );
+    assert_eq!(get_status(&result), 200);
+    let body = get_body(&result);
+    assert!(body.contains("42"), "should contain user id 42: {body}");
+    assert!(body.contains("99"), "should contain post id 99: {body}");
+}
+
+#[test]
+fn test_router_param_with_special_chars() {
+    let result = router_eval(
+        r#"[[:get "/search/:q" (fn (req) (http/ok (:params req)))]]"#,
+        "get",
+        "/search/hello%20world",
+    );
+    assert_eq!(get_status(&result), 200);
+}
+
+#[test]
+fn test_router_wildcard_captures_rest() {
+    let result = router_eval(
+        r#"[[:get "/files/*" (fn (req) (http/ok (:params req)))]]"#,
+        "get",
+        "/files/a/b/c/d.txt",
+    );
+    assert_eq!(get_status(&result), 200);
+    let body = get_body(&result);
+    assert!(
+        body.contains("a/b/c/d.txt"),
+        "wildcard should capture full path: {body}"
+    );
+}
+
+#[test]
+fn test_router_wildcard_empty_rest() {
+    let result = router_eval(
+        r#"[[:get "/files/*" (fn (req) (http/ok "matched"))]]"#,
+        "get",
+        "/files/",
+    );
+    assert_eq!(get_status(&result), 200);
+}
+
+#[test]
+fn test_router_no_routes() {
+    let result = router_eval(r#"[]"#, "get", "/anything");
+    assert_eq!(get_status(&result), 404);
+}
+
+// --- Method matching ---
+
+#[test]
+fn test_router_all_methods() {
+    for method in &["get", "post", "put", "delete", "patch", "head"] {
+        let result = router_eval(
+            r#"[[:any "/test" (fn (req) (http/ok "ok"))]]"#,
+            method,
+            "/test",
+        );
+        assert_eq!(
+            get_status(&result),
+            200,
+            "method :{method} should match :any"
+        );
+    }
+}
+
+#[test]
+fn test_router_method_case() {
+    let result = router_eval(
+        r#"[[:get "/test" (fn (req) (http/ok "ok"))]]"#,
+        "get",
+        "/test",
+    );
+    assert_eq!(get_status(&result), 200);
+}
+
+#[test]
+fn test_router_post_doesnt_match_get() {
+    let result = router_eval(
+        r#"[[:post "/data" (fn (req) (http/ok "posted"))]]"#,
+        "get",
+        "/data",
+    );
+    assert_eq!(get_status(&result), 404);
+}
+
+#[test]
+fn test_router_multiple_methods_same_path() {
+    let routes = r#"[[:get "/api" (fn (req) (http/ok "got"))]
+                     [:post "/api" (fn (req) (http/ok "posted"))]
+                     [:delete "/api" (fn (req) (http/ok "deleted"))]]"#;
+
+    let r1 = router_eval(routes, "get", "/api");
+    assert!(get_body(&r1).contains("got"));
+
+    let r2 = router_eval(routes, "post", "/api");
+    assert!(get_body(&r2).contains("posted"));
+
+    let r3 = router_eval(routes, "delete", "/api");
+    assert!(get_body(&r3).contains("deleted"));
+
+    let r4 = router_eval(routes, "put", "/api");
+    assert_eq!(get_status(&r4), 404);
+}
+
+// --- Handler behavior ---
+
+#[test]
+fn test_router_handler_receives_method() {
+    let req = make_request("get", "/m");
+    let result = eval(&format!(
+        r#"(let ((router (http/router [[:get "/m" (fn (req) (http/ok (:method req)))]])))
+          (router {req}))"#
+    ));
+    let body = get_body(&result);
+    assert!(
+        body.contains("get"),
+        "handler should receive :method as keyword: {body}"
+    );
+}
+
+#[test]
+fn test_router_handler_receives_path() {
+    let req = make_request("get", "/test/path");
+    let result = eval(&format!(
+        r#"(let ((router (http/router [[:get "/test/path" (fn (req) (http/text (:path req)))]])))
+          (router {req}))"#
+    ));
+    let body = get_body(&result);
+    assert!(
+        body.contains("/test/path"),
+        "handler should receive :path: {body}"
+    );
+}
+
+#[test]
+fn test_router_handler_error_returns_err() {
+    // When a handler calls (error ...), the router propagates the error
+    let _err = eval_err(&format!(
+        r#"(let ((router (http/router [[:get "/crash" (fn (req) (error "boom"))]])))
+              (router {}))"#,
+        make_request("get", "/crash")
+    ));
+}
+
+#[test]
+fn test_router_handler_returns_non_map() {
+    // If handler returns a non-map, the router returns it as-is (no wrapping)
+    let req = make_request("get", "/bad");
+    let result = eval(&format!(
+        r#"(let ((router (http/router [[:get "/bad" (fn (req) "just a string")]])))
+          (router {req}))"#
+    ));
+    // The handler returns a plain string, which is what we get back
+    assert!(result.as_str().is_some() || result.as_map_rc().is_some());
+}
+
+// --- Query string ---
+
+#[test]
+fn test_router_query_preserved() {
+    let result = eval(
+        r#"(let ((router (http/router [[:get "/q" (fn (req) (http/ok (:query req)))]])))
+          (router {:method :get :path "/q" :headers {} :query {:foo "bar" :baz "42"} :params {} :body "" :remote "127.0.0.1"}))"#,
+    );
+    let body = get_body(&result);
+    assert!(
+        body.contains("bar"),
+        "query params should be passed through: {body}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Router unit tests (no server needed) — original tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_http_router_multiple_methods_same_path() {
+    let get_result = eval(
+        r#"
+        (let ((router (http/router
+                       [[:get "/data" (fn (req) (http/ok "got"))]
+                        [:post "/data" (fn (req) (http/ok "posted"))]])))
+          (router {:method :get :path "/data" :headers {} :query {} :params {} :body "" :remote "127.0.0.1"}))
+    "#,
+    );
+    let map = get_result.as_map_rc().unwrap();
+    let body = map.get(&Value::keyword("body")).unwrap();
+    assert!(
+        body.as_str().unwrap().contains("got"),
+        "GET should return 'got', got: {}",
+        body
+    );
+
+    let post_result = eval(
+        r#"
+        (let ((router (http/router
+                       [[:get "/data" (fn (req) (http/ok "got"))]
+                        [:post "/data" (fn (req) (http/ok "posted"))]])))
+          (router {:method :post :path "/data" :headers {} :query {} :params {} :body "" :remote "127.0.0.1"}))
+    "#,
+    );
+    let map = post_result.as_map_rc().unwrap();
+    let body = map.get(&Value::keyword("body")).unwrap();
+    assert!(
+        body.as_str().unwrap().contains("posted"),
+        "POST should return 'posted', got: {}",
+        body
+    );
+}
+
+#[test]
+fn test_http_router_wildcard() {
+    let result = eval(
+        r#"
+        (let ((router (http/router
+                       [[:get "/files/*" (fn (req) (http/ok (:params req)))]])))
+          (router {:method :get :path "/files/a/b/c.txt" :headers {} :query {} :params {} :body "" :remote "127.0.0.1"}))
+    "#,
+    );
+    let map = result.as_map_rc().unwrap();
+    let body = map.get(&Value::keyword("body")).unwrap();
+    assert!(
+        body.as_str().unwrap().contains("a/b/c.txt"),
+        "wildcard should capture 'a/b/c.txt', got: {}",
+        body
+    );
+}
+
+#[test]
+fn test_http_response_helpers_arity() {
+    // http/ok requires exactly 1 arg
+    let _err = eval_err(r#"(http/ok)"#);
+    let _err = eval_err(r#"(http/ok 1 2)"#);
+    // http/created requires exactly 1 arg
+    let _err = eval_err(r#"(http/created)"#);
+    // http/not-found requires exactly 1 arg
+    let _err = eval_err(r#"(http/not-found)"#);
+    // http/redirect requires exactly 1 string arg
+    let _err = eval_err(r#"(http/redirect)"#);
+    let _err = eval_err(r#"(http/redirect 123)"#);
+    // http/error requires 2 args: integer status + body
+    let _err = eval_err(r#"(http/error 422)"#);
+    let _err = eval_err(r#"(http/error "not-a-number" "body")"#);
+    // http/html requires 1 string arg
+    let _err = eval_err(r#"(http/html 123)"#);
+    // http/text requires 1 string arg
+    let _err = eval_err(r#"(http/text 123)"#);
+    // http/no-content requires 0 args
+    let _err = eval_err(r#"(http/no-content "extra")"#);
+    // http/file requires 1-2 args
+    let _err = eval_err(r#"(http/file)"#);
+    let _err = eval_err(r#"(http/file "a" "b" "c")"#);
+    let _err = eval_err(r#"(http/file 123)"#);
+}
+
+#[test]
+fn test_http_file_returns_marker() {
+    // http/file on an existing file returns a map with __file marker
+    let result = eval(r#"(http/file "Cargo.toml")"#);
+    let map = result.as_map_rc().unwrap();
+    assert_eq!(
+        map.get(&Value::keyword("__file")).and_then(|v| v.as_bool()),
+        Some(true)
+    );
+    assert!(map
+        .get(&Value::keyword("__file_path"))
+        .and_then(|v| v.as_str())
+        .unwrap()
+        .contains("Cargo.toml"));
+    assert_eq!(
+        map.get(&Value::keyword("__file_content_type"))
+            .and_then(|v| v.as_str()),
+        Some("text/x-toml")
+    );
+}
+
+#[test]
+fn test_http_file_custom_content_type() {
+    let result = eval(r#"(http/file "Cargo.toml" "application/json")"#);
+    let map = result.as_map_rc().unwrap();
+    assert_eq!(
+        map.get(&Value::keyword("__file_content_type"))
+            .and_then(|v| v.as_str()),
+        Some("application/json")
+    );
+}
+
+#[test]
+fn test_http_file_nonexistent() {
+    let err = eval_err(r#"(http/file "nonexistent-file-12345.txt")"#);
+    let msg = err.to_string();
+    assert!(
+        msg.contains("http/file"),
+        "error should mention http/file: {msg}"
+    );
+}
+
+#[test]
+fn test_http_router_static_route() {
+    // Create a temp directory with a test file
+    let tmp = std::env::temp_dir().join("sema-static-route-test");
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).unwrap();
+    std::fs::write(tmp.join("hello.txt"), "hello world").unwrap();
+    let dir = tmp.to_string_lossy().replace('\\', "/");
+
+    let result = eval(&format!(
+        r#"
+        (let ((router (http/router
+                       [[:static "/assets" "{dir}"]])))
+          (router {{:method :get :path "/assets/hello.txt" :headers {{}} :query {{}} :params {{}} :body "" :remote "127.0.0.1"}}))
+    "#
+    ));
+    let map = result.as_map_rc().unwrap();
+    assert_eq!(
+        map.get(&Value::keyword("__file")).and_then(|v| v.as_bool()),
+        Some(true),
+        "should return a file marker for existing file"
+    );
+    assert!(map
+        .get(&Value::keyword("__file_path"))
+        .and_then(|v| v.as_str())
+        .unwrap()
+        .contains("hello.txt"));
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[test]
+fn test_http_router_static_fallthrough() {
+    let tmp = std::env::temp_dir().join("sema-static-fallthrough-test");
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).unwrap();
+    std::fs::write(tmp.join("exists.txt"), "yes").unwrap();
+    let dir = tmp.to_string_lossy().replace('\\', "/");
+
+    let result = eval(&format!(
+        r#"
+        (let ((router (http/router
+                       [[:static "/assets" "{dir}"]
+                        [:get "/*" (fn (req) (http/html "<h1>SPA</h1>"))]])))
+          (router {{:method :get :path "/assets/nonexistent.xyz" :headers {{}} :query {{}} :params {{}} :body "" :remote "127.0.0.1"}}))
+    "#
+    ));
+    let map = result.as_map_rc().unwrap();
+    let body = map
+        .get(&Value::keyword("body"))
+        .and_then(|v| v.as_str())
+        .unwrap();
+    assert!(
+        body.contains("SPA"),
+        "non-existent static file should fall through to SPA route, got: {body}"
+    );
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[test]
+fn test_http_router_static_path_traversal() {
+    let tmp = std::env::temp_dir().join("sema-static-traversal-test");
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).unwrap();
+    std::fs::write(tmp.join("safe.txt"), "safe").unwrap();
+    let dir = tmp.to_string_lossy().replace('\\', "/");
+
+    let result = eval(&format!(
+        r#"
+        (let ((router (http/router
+                       [[:static "/assets" "{dir}"]])))
+          (router {{:method :get :path "/assets/../etc/passwd" :headers {{}} :query {{}} :params {{}} :body "" :remote "127.0.0.1"}}))
+    "#
+    ));
+    let map = result.as_map_rc().unwrap();
+    let status = map
+        .get(&Value::keyword("status"))
+        .and_then(|v| v.as_int())
+        .unwrap();
+    assert_eq!(status, 400, "path traversal should return 400");
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[test]
+fn test_http_router_static_post_rejected() {
+    let tmp = std::env::temp_dir().join("sema-static-post-test");
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).unwrap();
+    std::fs::write(tmp.join("file.txt"), "content").unwrap();
+    let dir = tmp.to_string_lossy().replace('\\', "/");
+
+    let result = eval(&format!(
+        r#"
+        (let ((router (http/router
+                       [[:static "/assets" "{dir}"]])))
+          (router {{:method :post :path "/assets/file.txt" :headers {{}} :query {{}} :params {{}} :body "" :remote "127.0.0.1"}}))
+    "#
+    ));
+    let map = result.as_map_rc().unwrap();
+    let status = map
+        .get(&Value::keyword("status"))
+        .and_then(|v| v.as_int())
+        .unwrap();
+    assert_eq!(status, 404, "POST to static should 404");
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[test]
+#[ignore] // requires network
+fn test_http_serve_static_files() {
+    use std::process::{Command, Stdio};
+    use std::time::Duration;
+
+    // Create a temp directory with test files
+    let tmp = std::env::temp_dir().join("sema-static-test");
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).unwrap();
+    std::fs::write(tmp.join("index.html"), "<h1>Hello</h1>").unwrap();
+    std::fs::write(tmp.join("style.css"), "body { color: red; }").unwrap();
+    std::fs::write(tmp.join("app.js"), "console.log('hi');").unwrap();
+
+    let sema_code = format!(
+        r#"(http/serve
+             (http/router
+               [[:static "/static" "{dir}"]
+                [:get "/*" (fn (_) (http/file "{dir}/index.html"))]])
+             {{:port 19895}})"#,
+        dir = tmp.to_string_lossy().replace('\\', "/")
+    );
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_sema"))
+        .arg("-e")
+        .arg(&sema_code)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("Failed to spawn sema");
+
+    std::thread::sleep(Duration::from_millis(1500));
+
+    sema_llm::http::ensure_crypto_provider();
+    let client = reqwest::blocking::Client::new();
+
+    // Serve HTML
+    let resp = client
+        .get("http://127.0.0.1:19895/static/index.html")
+        .timeout(Duration::from_secs(5))
+        .send()
+        .expect("Failed to GET html");
+    assert_eq!(resp.status(), 200);
+    assert!(resp
+        .headers()
+        .get("content-type")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .contains("text/html"));
+    assert_eq!(resp.text().unwrap(), "<h1>Hello</h1>");
+
+    // Serve CSS with correct MIME type
+    let resp = client
+        .get("http://127.0.0.1:19895/static/style.css")
+        .timeout(Duration::from_secs(5))
+        .send()
+        .expect("Failed to GET css");
+    assert_eq!(resp.status(), 200);
+    assert!(resp
+        .headers()
+        .get("content-type")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .contains("text/css"));
+
+    // Serve JS with correct MIME type
+    let resp = client
+        .get("http://127.0.0.1:19895/static/app.js")
+        .timeout(Duration::from_secs(5))
+        .send()
+        .expect("Failed to GET js");
+    assert_eq!(resp.status(), 200);
+    assert!(resp
+        .headers()
+        .get("content-type")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .contains("javascript"));
+
+    // Non-existent static file falls through to SPA
+    let resp = client
+        .get("http://127.0.0.1:19895/about")
+        .timeout(Duration::from_secs(5))
+        .send()
+        .expect("Failed to GET spa");
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.text().unwrap(), "<h1>Hello</h1>");
+
+    // 404 for non-existent static file (no SPA match for /static/ prefix)
+    let resp = client
+        .get("http://127.0.0.1:19895/static/nonexistent.txt")
+        .timeout(Duration::from_secs(5))
+        .send()
+        .expect("Failed to GET nonexistent");
+    // Falls through static, then matches SPA catch-all
+    assert_eq!(resp.status(), 200);
+
+    child.kill().ok();
+    child.wait().ok();
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+// ---------------------------------------------------------------------------
+// Static file serving edge cases — unit tests (no network)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_static_index_html_for_directory() {
+    let tmp = std::env::temp_dir().join("sema-static-index-test");
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(tmp.join("sub")).unwrap();
+    std::fs::write(tmp.join("sub/index.html"), "<h1>Index</h1>").unwrap();
+    let dir = tmp.to_string_lossy().replace('\\', "/");
+
+    let result = eval(&format!(
+        r#"(let ((router (http/router [[:static "/s" "{dir}"]])))
+          (router {{:method :get :path "/s/sub/" :headers {{}} :query {{}} :params {{}} :body "" :remote "127.0.0.1"}}))"#
+    ));
+    let map = result.as_map_rc().unwrap();
+    // Should serve index.html via the file marker
+    let has_file = map
+        .get(&Value::keyword("__file"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    if has_file {
+        let path = map
+            .get(&Value::keyword("__file_path"))
+            .and_then(|v| v.as_str())
+            .unwrap();
+        assert!(
+            path.contains("index.html"),
+            "should serve index.html for directory: {path}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[test]
+fn test_static_nested_path_traversal_double_dot() {
+    let tmp = std::env::temp_dir().join("sema-static-dotdot-test");
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).unwrap();
+    std::fs::write(tmp.join("safe.txt"), "safe").unwrap();
+    let dir = tmp.to_string_lossy().replace('\\', "/");
+
+    // Various traversal attempts
+    for path in &[
+        "/s/../../etc/passwd",
+        "/s/..%2f..%2fetc/passwd",
+        "/s/sub/../../out.txt",
+    ] {
+        let result = eval(&format!(
+            r#"(let ((router (http/router [[:static "/s" "{dir}"]])))
+              (router {{:method :get :path "{path}" :headers {{}} :query {{}} :params {{}} :body "" :remote "127.0.0.1"}}))"#
+        ));
+        let map = result.as_map_rc().unwrap();
+        let status = map
+            .get(&Value::keyword("status"))
+            .and_then(|v| v.as_int())
+            .unwrap_or(0);
+        assert!(
+            status == 400 || status == 404,
+            "path traversal {path} should be blocked, got {status}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[test]
+fn test_static_mime_types() {
+    let tmp = std::env::temp_dir().join("sema-static-mime-test");
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).unwrap();
+
+    let files = [
+        ("test.html", "text/html"),
+        ("test.css", "text/css"),
+        ("test.js", "javascript"),
+        ("test.json", "application/json"),
+        ("test.png", "image/png"),
+        ("test.svg", "svg"),
+    ];
+
+    for (name, _) in &files {
+        std::fs::write(tmp.join(name), "content").unwrap();
+    }
+    let dir = tmp.to_string_lossy().replace('\\', "/");
+
+    for (name, expected_mime) in &files {
+        let result = eval(&format!(
+            r#"(let ((router (http/router [[:static "/s" "{dir}"]])))
+              (router {{:method :get :path "/s/{name}" :headers {{}} :query {{}} :params {{}} :body "" :remote "127.0.0.1"}}))"#
+        ));
+        let map = result.as_map_rc().unwrap();
+        let has_file = map
+            .get(&Value::keyword("__file"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        assert!(has_file, "{name} should return file marker");
+        let ct = map
+            .get(&Value::keyword("__file_content_type"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        assert!(
+            ct.contains(expected_mime),
+            "{name}: expected MIME containing '{expected_mime}', got '{ct}'"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[test]
+fn test_http_file_nonexistent_error() {
+    let err = eval_err(r#"(http/file "/definitely/not/a/real/path/xyz.txt")"#);
+    assert!(err.to_string().contains("http/file"));
+}
+
+// ---------------------------------------------------------------------------
+// Router/stream/websocket construction errors
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_router_invalid_method() {
+    // Invalid method keyword: router constructs fine, but the method never matches
+    let result = router_eval(r#"[[:banana "/x" (fn (req) (http/ok "x"))]]"#, "get", "/x");
+    assert_eq!(get_status(&result), 404);
+}
+
+#[test]
+fn test_router_empty_pattern() {
+    let result = router_eval(r#"[[:get "" (fn (req) (http/ok "empty"))]]"#, "get", "/");
+    // Empty pattern should match "/" or 404 — just shouldn't crash
+    let _ = get_status(&result);
+}
+
+#[test]
+fn test_http_router_no_args() {
+    let _ = eval_err(r#"(http/router)"#);
+}
+
+#[test]
+fn test_http_serve_no_args() {
+    let _ = eval_err(r#"(http/serve)"#);
+}
+
+#[test]
+fn test_http_stream_no_args() {
+    let _ = eval_err(r#"(http/stream)"#);
+}
+
+#[test]
+fn test_http_websocket_no_args() {
+    let _ = eval_err(r#"(http/websocket)"#);
+}
+
+#[test]
+fn test_http_stream_non_function() {
+    let _ = eval_err(r#"(http/stream 42)"#);
+}
+
+#[test]
+fn test_http_websocket_non_function() {
+    let _ = eval_err(r#"(http/websocket 42)"#);
+}
+
+// ---------------------------------------------------------------------------
+// WebSocket runtime integration tests (ephemeral loopback only)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_ws_runtime_connect_completes_in_spawned_task() {
+    use tungstenite::Message;
+
+    let server = spawn_loopback_server(|stream| {
+        let mut socket = tungstenite::accept(stream).expect("accept websocket handshake");
+        let marker = socket.read().expect("read connected marker");
+        assert_eq!(marker.into_text().unwrap().as_str(), "connected");
+        socket
+            .send(Message::Text("ack".into()))
+            .expect("send handshake ack");
+        let _ = socket.read();
+    });
+
+    let output = eval(&format!(
+        r#"
+        (await
+          (async
+            (with-open (sock (ws/connect "{}" {{:timeout 1000}}))
+              (ws/send sock "connected")
+              (:text (ws/recv-timeout sock 1000)))))
+        "#,
+        server.url()
+    ));
+    assert_eq!(output, Value::string("ack"));
+    server.finish();
+}
+
+#[test]
+fn test_ws_runtime_handshake_failure_keeps_eval_error_domain() {
+    use std::io::Write;
+
+    let server = spawn_loopback_server(|mut stream| {
+        stream
+            .write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n")
+            .expect("write rejected handshake");
+        stream.flush().expect("flush rejected handshake");
+    });
+
+    let output = eval(&format!(
+        r#"
+        (await
+          (async
+            (try
+              (ws/connect "{}" {{:timeout 1000}})
+              (catch e (list (:type e) (:message e))))))
+        "#,
+        server.url()
+    ));
+    let values = output.as_list_rc().expect("caught error must be a list");
+    assert_eq!(values.first(), Some(&Value::keyword("eval")));
+    assert!(
+        values
+            .get(1)
+            .and_then(Value::as_str)
+            .is_some_and(|message| message.contains("ws/connect")),
+        "caught handshake error must retain its message: {output}"
+    );
+    server.finish();
+}
+
+#[test]
+fn test_ws_runtime_cancelled_recv_preserves_connection_receiver() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use tungstenite::Message;
+
+    let waiting = Arc::new(AtomicBool::new(false));
+    let server_waiting = waiting.clone();
+    let server = spawn_loopback_server(move |stream| {
+        let mut socket = tungstenite::accept(stream).expect("accept websocket handshake");
+        let marker = socket.read().expect("read waiting marker");
+        assert_eq!(marker.into_text().unwrap().as_str(), "waiting");
+        server_waiting.store(true, Ordering::Release);
+        let release = socket.read().expect("read release marker");
+        assert_eq!(release.into_text().unwrap().as_str(), "release");
+        socket
+            .send(Message::Text("still-open".into()))
+            .expect("send post-cancel event");
+        let _ = socket.read();
+    });
+
+    let interpreter = Interpreter::new();
+    interpreter.global_env.set_str(
+        "test/ws-waiting?",
+        Value::native_fn(sema_core::NativeFn::simple("test/ws-waiting?", move |_| {
+            Ok(Value::bool(waiting.load(Ordering::Acquire)))
+        })),
+    );
+    let output = interpreter
+        .eval_str(&format!(
+            r#"
+        (await
+          (async
+            (with-open (sock (ws/connect "{}" {{:timeout 1000}}))
+              (let ((pending (async (ws/send sock "waiting") (ws/recv sock))))
+                (let wait ((remaining 2000))
+                  (cond
+                    ((test/ws-waiting?) #t)
+                    ((= remaining 0) (error "cancelled recv did not park"))
+                    (else (async/sleep 1) (wait (- remaining 1)))))
+                (async/cancel pending)
+                (ws/send sock "release")
+                (let ((event (ws/recv-timeout sock 1000)))
+                  (list (async/cancelled? pending) (:text event)))))))
+        "#,
+            server.url()
+        ))
+        .expect("evaluate cancelled websocket receive");
+    assert_eq!(
+        output,
+        Value::list(vec![Value::bool(true), Value::string("still-open")])
+    );
+    server.finish();
+}
+
+#[test]
+fn test_ws_runtime_server_close_wakes_recv_to_nil() {
+    let server = spawn_loopback_server(|stream| {
+        let mut socket = tungstenite::accept(stream).expect("accept websocket handshake");
+        let close = socket.read().expect("read close marker");
+        assert_eq!(close.into_text().unwrap().as_str(), "close");
+        socket.close(None).expect("send server close frame");
+    });
+
+    let output = eval(&format!(
+        r#"
+        (await
+          (async
+            (with-open (sock (ws/connect "{}" {{:timeout 1000}}))
+              (ws/send sock "close")
+              (ws/recv sock)
+              (null? (ws/recv-timeout sock 1000)))))
+        "#,
+        server.url()
+    ));
+    assert_eq!(output, Value::bool(true));
+    server.finish();
+}
+
+#[test]
+fn test_ws_runtime_connect_cancel_aborts_pending_pump() {
+    use std::io::{ErrorKind, Read};
+    use std::sync::mpsc;
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
+    use std::time::Duration;
+
+    let accepted = Arc::new(AtomicBool::new(false));
+    let server_accepted = accepted.clone();
+    let (closed_tx, closed_rx) = mpsc::sync_channel(1);
+    let server = spawn_loopback_server(move |mut stream| {
+        server_accepted.store(true, Ordering::Release);
+        let mut buffer = [0_u8; 1024];
+        loop {
+            match stream.read(&mut buffer) {
+                Ok(0) => {
+                    closed_tx.send(()).expect("report closed connection");
+                    return;
+                }
+                Ok(_) => {}
+                Err(error)
+                    if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) =>
+                {
+                    return;
+                }
+                Err(_) => {
+                    closed_tx.send(()).expect("report reset connection");
+                    return;
+                }
+            }
+        }
+    });
+
+    let interpreter = Interpreter::new();
+    interpreter.global_env.set_str(
+        "test/ws-accepted?",
+        Value::native_fn(sema_core::NativeFn::simple(
+            "test/ws-accepted?",
+            move |_| Ok(Value::bool(accepted.load(Ordering::Acquire))),
+        )),
+    );
+    let output = interpreter
+        .eval_str(&format!(
+            r#"
+        (let ((pending (async (ws/connect "{}" {{:timeout 10000}}))))
+          (let wait ((remaining 2000))
+            (cond
+              ((test/ws-accepted?) #t)
+              ((= remaining 0) (error "loopback server did not accept ws/connect"))
+              (else (async/sleep 1) (wait (- remaining 1)))))
+          (async/cancel pending))
+        "#,
+            server.url()
+        ))
+        .expect("evaluate deterministic ws/connect cancellation");
+    assert_eq!(output, Value::bool(true));
+    closed_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("cancelling ws/connect must abort the in-progress pump socket");
+    server.finish();
+}
+
+#[test]
+fn test_ws_runtime_two_pending_receivers_rearm_for_second_generation() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use tungstenite::Message;
+
+    let waiters_ready = Arc::new(AtomicUsize::new(0));
+    let server_waiters_ready = waiters_ready.clone();
+    let server = spawn_loopback_server(move |stream| {
+        let mut socket = tungstenite::accept(stream).expect("accept websocket handshake");
+        for _ in 0..2 {
+            let marker = socket.read().expect("read receiver waiting marker");
+            assert!(matches!(
+                marker.into_text().unwrap().as_str(),
+                "first-waiting" | "second-waiting"
+            ));
+            server_waiters_ready.fetch_add(1, Ordering::AcqRel);
+        }
+        let release = socket.read().expect("read release marker");
+        assert_eq!(release.into_text().unwrap().as_str(), "release");
+        socket
+            .send(Message::Text("one".into()))
+            .expect("send first event");
+        let second = socket.read().expect("read second-generation marker");
+        assert_eq!(second.into_text().unwrap().as_str(), "second");
+        socket
+            .send(Message::Text("two".into()))
+            .expect("send second event");
+        let _ = socket.read();
+    });
+
+    let interpreter = Interpreter::new();
+    interpreter.global_env.set_str(
+        "test/ws-waiters-ready?",
+        Value::native_fn(sema_core::NativeFn::simple(
+            "test/ws-waiters-ready?",
+            move |_| Ok(Value::bool(waiters_ready.load(Ordering::Acquire) == 2)),
+        )),
+    );
+    let output = interpreter
+        .eval_str(&format!(
+            r#"
+        (await
+          (async
+            (with-open (sock (ws/connect "{}" {{:timeout 1000}}))
+              (let ((first (async (ws/send sock "first-waiting") (ws/recv sock)))
+                    (second (async (ws/send sock "second-waiting") (ws/recv sock))))
+                (let wait-ready ((remaining 2000))
+                  (cond
+                    ((test/ws-waiters-ready?) #t)
+                    ((= remaining 0) (error "websocket receivers did not park"))
+                    (else (async/sleep 1) (wait-ready (- remaining 1)))))
+                (ws/send sock "release")
+                (let wait-first ((remaining 2000))
+                  (cond
+                    ((or (async/resolved? first) (async/resolved? second)) #t)
+                    ((= remaining 0) (error "first websocket event was not consumed"))
+                    (else (async/sleep 1) (wait-first (- remaining 1)))))
+                (ws/send sock "second")
+                (list (:text (async/timeout 1000 first))
+                      (:text (async/timeout 1000 second)))))))
+        "#,
+            server.url()
+        ))
+        .expect("evaluate two pending websocket receives");
+    let values = output.as_list_rc().expect("receive results must be a list");
+    let mut texts = values
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .expect("receive result must be text")
+                .to_string()
+        })
+        .collect::<Vec<_>>();
+    texts.sort();
+    assert_eq!(texts, vec!["one".to_string(), "two".to_string()]);
+    server.finish();
+}
+
+// ---------------------------------------------------------------------------
+// WebSocket multi-message integration tests (require network)
+// ---------------------------------------------------------------------------
+
+#[test]
+#[ignore] // requires network
+fn test_websocket_multi_message() {
+    use std::process::{Command, Stdio};
+    use std::time::Duration;
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_sema"))
+        .arg("-e")
+        .arg(
+            r#"
+            (http/serve
+              (http/router
+                [[:ws "/chat" (fn (conn)
+                  (let loop ()
+                    (let ((msg ((:recv conn))))
+                      (when msg
+                        ((:send conn) (string-append "re:" msg))
+                        (loop)))))]])
+              {:port 19900})
+        "#,
+        )
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("Failed to spawn");
+
+    std::thread::sleep(Duration::from_millis(1500));
+
+    let (mut ws, _) = tungstenite::connect("ws://127.0.0.1:19900/chat").expect("WS connect");
+
+    // Send multiple messages and verify each echo
+    for i in 0..5 {
+        let msg = format!("msg{i}");
+        ws.send(tungstenite::Message::Text(msg.clone().into()))
+            .unwrap();
+        let reply = ws.read().unwrap();
+        assert_eq!(reply.into_text().unwrap(), format!("re:{msg}"));
+    }
+
+    ws.close(None).ok();
+    child.kill().ok();
+    child.wait().ok();
+}
+
+// A generic echo handler (recv -> send) round-trips *binary* frames as well as
+// text: server-side `:recv` surfaces a binary frame as a bytevector and `:send`
+// accepts a bytevector as a binary frame.
+#[test]
+#[ignore] // requires network
+fn test_websocket_binary_echo() {
+    use std::process::{Command, Stdio};
+    use std::time::Duration;
+    use tungstenite::Message;
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_sema"))
+        .arg("-e")
+        .arg(
+            r#"
+            (http/serve
+              (http/router
+                [[:ws "/echo" (fn (conn)
+                  (let loop ()
+                    (let ((msg ((:recv conn))))
+                      (when msg
+                        ((:send conn) msg)
+                        (loop)))))]])
+              {:port 19923})
+        "#,
+        )
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("Failed to spawn");
+
+    std::thread::sleep(Duration::from_millis(1500));
+
+    let (mut ws, _) = tungstenite::connect("ws://127.0.0.1:19923/echo").expect("WS connect");
+
+    // Binary frame with edge bytes (0, 255, 128) must round-trip byte-identical.
+    let payload = vec![1u8, 2, 3, 255, 0, 128, 64];
+    ws.send(Message::Binary(payload.clone().into())).unwrap();
+    let reply = ws.read().unwrap();
+    assert!(reply.is_binary(), "expected a binary echo, got {reply:?}");
+    assert_eq!(
+        reply.into_data().to_vec(),
+        payload,
+        "binary bytes must match"
+    );
+
+    // Text still works through the same handler.
+    ws.send(Message::Text("hi".into())).unwrap();
+    assert_eq!(ws.read().unwrap().into_text().unwrap().as_str(), "hi");
+
+    ws.close(None).ok();
+    child.kill().ok();
+    child.wait().ok();
+}
+
+#[test]
+#[ignore] // requires network
+fn test_websocket_close_from_server() {
+    use std::process::{Command, Stdio};
+    use std::time::Duration;
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_sema"))
+        .arg("-e")
+        .arg(
+            r#"
+            (http/serve
+              (http/router
+                [[:ws "/once" (fn (conn)
+                  (let ((msg ((:recv conn))))
+                    (when msg
+                      ((:send conn) "goodbye")
+                      ((:close conn)))))]])
+              {:port 19901})
+        "#,
+        )
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("Failed to spawn");
+
+    std::thread::sleep(Duration::from_millis(1500));
+
+    let (mut ws, _) = tungstenite::connect("ws://127.0.0.1:19901/once").expect("WS connect");
+    ws.send(tungstenite::Message::Text("hi".into())).unwrap();
+    let reply = ws.read().unwrap();
+    assert_eq!(reply.into_text().unwrap(), "goodbye");
+
+    // Next read should indicate closure
+    let next = ws.read();
+    assert!(
+        next.is_err() || matches!(next.as_ref().unwrap(), tungstenite::Message::Close(_)),
+        "should get close or error after server closes: {next:?}"
+    );
+
+    child.kill().ok();
+    child.wait().ok();
+}
+
+// ws/* error paths that never touch the network (no #[ignore] — run in CI).
+#[test]
+fn test_websocket_client_arg_errors() {
+    // Non-websocket value rejected with a typed error.
+    assert!(eval_err("(ws/recv 5)")
+        .to_string()
+        .contains("expected websocket"));
+    assert!(eval_err(r#"(ws/send 5 "x")"#)
+        .to_string()
+        .contains("expected websocket"));
+    // A real stream that is not a websocket is still rejected.
+    assert!(eval_err(r#"(ws/recv (stream/open-input "Cargo.toml"))"#)
+        .to_string()
+        .contains("expected websocket"));
+    // Non-ws:// URL is rejected before any connection attempt.
+    let err = eval_err(r#"(ws/connect "http://example.com")"#).to_string();
+    assert!(err.contains("not a websocket URL"), "{err}");
+    // Arity.
+    assert!(eval_err("(ws/connect)").to_string().contains("ws/connect"));
+    assert!(eval_err("(ws/send)").to_string().contains("ws/send"));
+    // Phase 2 ops reject non-websockets and bad arities too.
+    assert!(eval_err("(ws/recv-timeout 5 100)")
+        .to_string()
+        .contains("expected websocket"));
+    assert!(eval_err("(ws/ping 5)")
+        .to_string()
+        .contains("expected websocket"));
+    assert!(eval_err("(ws/recv-timeout)")
+        .to_string()
+        .contains("ws/recv-timeout"));
+}
+
+// The Sema WebSocket *client* (`ws/connect`/`ws/send`/`ws/recv`/`ws/close`),
+// round-tripped against the Sema WebSocket *server*. Drives both ends through
+// the binary: a server subprocess echoes "re:" + msg, and a client subprocess
+// connects, sends text and a JSON map, and prints each typed reply.
+#[test]
+#[ignore] // requires network
+fn test_websocket_client_round_trip() {
+    use std::process::{Command, Stdio};
+    use std::time::Duration;
+
+    let mut server = Command::new(env!("CARGO_BIN_EXE_sema"))
+        .arg("-e")
+        .arg(
+            r#"
+            (http/serve
+              (http/router
+                [[:ws "/chat" (fn (conn)
+                  (let loop ()
+                    (let ((msg ((:recv conn))))
+                      (when msg
+                        ((:send conn) (string-append "re:" msg))
+                        (loop)))))]])
+              {:port 19920})
+        "#,
+        )
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("Failed to spawn server");
+
+    // Wait for the server subprocess to actually LISTEN (spawn + prelude + bind
+    // can take seconds under full-suite parallel load) — a fixed sleep flakes.
+    {
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            if std::net::TcpStream::connect("127.0.0.1:19920").is_ok() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "server on :19920 never started listening"
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    // Client: text round-trip, connected? predicate, and a map sent as JSON text.
+    let client = Command::new(env!("CARGO_BIN_EXE_sema"))
+        .arg("-e")
+        .arg(
+            r#"
+            (with-open (sock (ws/connect "ws://127.0.0.1:19920/chat"))
+              (println (ws/connected? sock))
+              (ws/send sock "hello")
+              (println (ws/recv sock))
+              (ws/send sock {:n 42})
+              (println (ws/recv sock)))
+        "#,
+        )
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("Failed to run client");
+
+    server.kill().ok();
+    server.wait().ok();
+
+    let stdout = String::from_utf8_lossy(&client.stdout);
+    assert!(
+        client.status.success(),
+        "client failed: stdout={stdout:?} stderr={:?}",
+        String::from_utf8_lossy(&client.stderr)
+    );
+    assert!(
+        stdout.contains("#t"),
+        "connected? should be true: {stdout:?}"
+    );
+    assert!(
+        stdout.contains(r#"{:text "re:hello"}"#),
+        "text echo missing: {stdout:?}"
+    );
+    assert!(
+        stdout.contains(r#"re:{\"n\":42}"#),
+        "json-map echo missing: {stdout:?}"
+    );
+}
+
+// Phase 2 client: connect options, explicit `{:json …}` framing, ws/ping, and
+// ws/recv-timeout (both the timeout and the message case), against the echo server.
+#[test]
+#[ignore] // requires network
+fn test_websocket_client_options_and_framing() {
+    use std::process::{Command, Stdio};
+    use std::time::Duration;
+
+    let mut server = Command::new(env!("CARGO_BIN_EXE_sema"))
+        .arg("-e")
+        .arg(
+            r#"
+            (http/serve
+              (http/router
+                [[:ws "/chat" (fn (conn)
+                  (let loop ()
+                    (let ((msg ((:recv conn))))
+                      (when msg
+                        ((:send conn) (string-append "re:" msg))
+                        (loop)))))]])
+              {:port 19921})
+        "#,
+        )
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("Failed to spawn server");
+
+    // Wait for the server subprocess to actually LISTEN (spawn + prelude + bind
+    // can take seconds under full-suite parallel load) — a fixed sleep flakes.
+    {
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            if std::net::TcpStream::connect("127.0.0.1:19921").is_ok() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "server on :19921 never started listening"
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    let client = Command::new(env!("CARGO_BIN_EXE_sema"))
+        .arg("-e")
+        .arg(
+            r#"
+            (with-open (sock (ws/connect "ws://127.0.0.1:19921/chat"
+                               {:timeout 3000 :retries 2 :headers {"X-Test" "1"}}))
+              ;; {:json v} sends the inner value as JSON (not wrapped in {"json":…}).
+              (ws/send sock {:json {:type "ping"}})
+              (println (ws/recv sock))
+              (ws/ping sock "hb")
+              ;; Nothing pending yet → recv-timeout returns the :timeout keyword.
+              (println (ws/recv-timeout sock 300))
+              (ws/send sock "later")
+              (println (ws/recv-timeout sock 2000)))
+        "#,
+        )
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("Failed to run client");
+
+    server.kill().ok();
+    server.wait().ok();
+
+    let stdout = String::from_utf8_lossy(&client.stdout);
+    assert!(
+        client.status.success(),
+        "client failed: stdout={stdout:?} stderr={:?}",
+        String::from_utf8_lossy(&client.stderr)
+    );
+    assert!(
+        stdout.contains(r#"re:{\"type\":\"ping\"}"#),
+        "json framing missing: {stdout:?}"
+    );
+    assert!(
+        stdout.contains(":timeout"),
+        "recv-timeout missing: {stdout:?}"
+    );
+    assert!(
+        stdout.contains(r#"{:text "re:later"}"#),
+        "post-timeout message missing: {stdout:?}"
+    );
+}
+
+// Phase 2 client: the ws/listen evented macro. The server sends one message then
+// closes; the listen loop fires :on-message then :on-close.
+#[test]
+#[ignore] // requires network
+fn test_websocket_listen() {
+    use std::process::{Command, Stdio};
+    use std::time::Duration;
+
+    let mut server = Command::new(env!("CARGO_BIN_EXE_sema"))
+        .arg("-e")
+        .arg(
+            r#"
+            (http/serve
+              (http/router
+                [[:ws "/once" (fn (conn)
+                  (let ((msg ((:recv conn))))
+                    (when msg
+                      ((:send conn) "hello-listener")
+                      ((:close conn)))))]])
+              {:port 19922})
+        "#,
+        )
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("Failed to spawn server");
+
+    // Wait for the server subprocess to actually LISTEN (spawn + prelude + bind
+    // can take seconds under full-suite parallel load) — a fixed sleep flakes.
+    {
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            if std::net::TcpStream::connect("127.0.0.1:19922").is_ok() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "server on :19922 never started listening"
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    let client = Command::new(env!("CARGO_BIN_EXE_sema"))
+        .arg("-e")
+        .arg(
+            r#"
+            (with-open (sock (ws/connect "ws://127.0.0.1:19922/once"))
+              (ws/send sock "go")
+              (async/await
+                (ws/listen sock
+                  {:on-message (fn (c m) (println (list :got m)))
+                   :on-close   (fn (c info) (println :listener-closed))})))
+        "#,
+        )
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("Failed to run client");
+
+    server.kill().ok();
+    server.wait().ok();
+
+    let stdout = String::from_utf8_lossy(&client.stdout);
+    assert!(
+        client.status.success(),
+        "client failed: stdout={stdout:?} stderr={:?}",
+        String::from_utf8_lossy(&client.stderr)
+    );
+    assert!(
+        stdout.contains(r#"(:got "hello-listener")"#),
+        "on-message missing: {stdout:?}"
+    );
+    assert!(
+        stdout.contains(":listener-closed"),
+        "on-close missing: {stdout:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// SSE streaming integration tests (require network)
+// ---------------------------------------------------------------------------
+
+#[test]
+#[ignore] // requires network
+fn test_sse_multiple_events() {
+    use std::process::{Command, Stdio};
+    use std::time::Duration;
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_sema"))
+        .arg("-e")
+        .arg(
+            r#"
+            (http/serve
+              (http/router
+                [[:get "/events"
+                  (fn (req)
+                    (http/stream (fn (send)
+                      (send "event1")
+                      (send "event2")
+                      (send "event3"))))]])
+              {:port 19902})
+        "#,
+        )
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("Failed to spawn");
+
+    std::thread::sleep(Duration::from_millis(1500));
+
+    sema_llm::http::ensure_crypto_provider();
+    let client = reqwest::blocking::Client::new();
+    let resp = client
+        .get("http://127.0.0.1:19902/events")
+        .timeout(Duration::from_secs(5))
+        .send()
+        .expect("GET /events");
+
+    let body = resp.text().unwrap();
+    assert!(body.contains("event1"), "should contain event1: {body}");
+    assert!(body.contains("event2"), "should contain event2: {body}");
+    assert!(body.contains("event3"), "should contain event3: {body}");
+
+    child.kill().ok();
+    child.wait().ok();
+}
+
+#[test]
+#[ignore] // requires network
+fn test_sse_content_type() {
+    use std::process::{Command, Stdio};
+    use std::time::Duration;
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_sema"))
+        .arg("-e")
+        .arg(
+            r#"
+            (http/serve
+              (http/router
+                [[:get "/sse"
+                  (fn (req)
+                    (http/stream (fn (send) (send "data"))))]])
+              {:port 19903})
+        "#,
+        )
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("Failed to spawn");
+
+    std::thread::sleep(Duration::from_millis(1500));
+
+    sema_llm::http::ensure_crypto_provider();
+    let client = reqwest::blocking::Client::new();
+    let resp = client
+        .get("http://127.0.0.1:19903/sse")
+        .timeout(Duration::from_secs(5))
+        .send()
+        .expect("GET /sse");
+
+    let ct = resp
+        .headers()
+        .get("content-type")
+        .unwrap()
+        .to_str()
+        .unwrap();
+    assert!(
+        ct.contains("text/event-stream"),
+        "SSE should have event-stream content-type: {ct}"
+    );
+
+    child.kill().ok();
+    child.wait().ok();
+}
+
+// ---------------------------------------------------------------------------
+// Error resilience & concurrency integration tests (require network)
+// ---------------------------------------------------------------------------
+
+#[test]
+#[ignore] // requires network
+fn test_server_survives_handler_panic() {
+    use std::process::{Command, Stdio};
+    use std::time::Duration;
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_sema"))
+        .arg("-e")
+        .arg(
+            r#"
+            (http/serve
+              (http/router
+                [[:get "/crash" (fn (req) (error "kaboom"))]
+                 [:get "/ok" (fn (req) (http/ok "alive"))]])
+              {:port 19904})
+        "#,
+        )
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("Failed to spawn");
+
+    std::thread::sleep(Duration::from_millis(1500));
+
+    sema_llm::http::ensure_crypto_provider();
+    let client = reqwest::blocking::Client::new();
+
+    // Crash the handler
+    let resp = client
+        .get("http://127.0.0.1:19904/crash")
+        .timeout(Duration::from_secs(5))
+        .send()
+        .unwrap();
+    assert_eq!(resp.status(), 500);
+
+    // Server should still be alive
+    let resp = client
+        .get("http://127.0.0.1:19904/ok")
+        .timeout(Duration::from_secs(5))
+        .send()
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().unwrap();
+    assert_eq!(body, "alive");
+
+    // Crash again
+    let resp = client
+        .get("http://127.0.0.1:19904/crash")
+        .timeout(Duration::from_secs(5))
+        .send()
+        .unwrap();
+    assert_eq!(resp.status(), 500);
+
+    // Still alive
+    let resp = client
+        .get("http://127.0.0.1:19904/ok")
+        .timeout(Duration::from_secs(5))
+        .send()
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    child.kill().ok();
+    child.wait().ok();
+}
+
+#[test]
+#[ignore] // requires network
+fn test_server_concurrent_requests() {
+    use std::process::{Command, Stdio};
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+    use std::time::Duration;
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_sema"))
+        .arg("-e")
+        .arg(
+            r#"
+            (http/serve
+              (fn (req) (http/ok (:path req)))
+              {:port 19905})
+        "#,
+        )
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("Failed to spawn");
+
+    std::thread::sleep(Duration::from_millis(1500));
+
+    let success_count = Arc::new(AtomicUsize::new(0));
+    let threads: Vec<_> = (0..10)
+        .map(|i| {
+            let count = success_count.clone();
+            std::thread::spawn(move || {
+                sema_llm::http::ensure_crypto_provider();
+                let client = reqwest::blocking::Client::new();
+                let resp = client
+                    .get(format!("http://127.0.0.1:19905/req/{i}"))
+                    .timeout(Duration::from_secs(10))
+                    .send();
+                if let Ok(r) = resp {
+                    if r.status() == 200 {
+                        count.fetch_add(1, Ordering::SeqCst);
+                    }
+                }
+            })
+        })
+        .collect();
+
+    for t in threads {
+        t.join().unwrap();
+    }
+
+    let successes = success_count.load(Ordering::SeqCst);
+    assert!(
+        successes >= 8,
+        "at least 8/10 concurrent requests should succeed, got {successes}"
+    );
+
+    child.kill().ok();
+    child.wait().ok();
+}
+
+#[test]
+#[ignore] // requires network
+fn test_server_large_json_body() {
+    use std::process::{Command, Stdio};
+    use std::time::Duration;
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_sema"))
+        .arg("-e")
+        .arg(
+            r#"
+            (http/serve
+              (fn (req) (http/ok (string-length (or (:body req) ""))))
+              {:port 19906})
+        "#,
+        )
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("Failed to spawn");
+
+    std::thread::sleep(Duration::from_millis(1500));
+
+    sema_llm::http::ensure_crypto_provider();
+    let client = reqwest::blocking::Client::new();
+    let large_body = "x".repeat(100_000);
+    let resp = client
+        .post("http://127.0.0.1:19906/data")
+        .body(large_body)
+        .timeout(Duration::from_secs(10))
+        .send()
+        .expect("POST large body");
+
+    assert_eq!(resp.status(), 200);
+
+    child.kill().ok();
+    child.wait().ok();
+}
+
+#[test]
+#[ignore] // requires network
+fn test_server_custom_response_headers() {
+    use std::process::{Command, Stdio};
+    use std::time::Duration;
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_sema"))
+        .arg("-e")
+        .arg(
+            r#"
+            (http/serve
+              (fn (req) {:status 200
+                         :headers {"x-custom" "hello"
+                                   "x-request-id" "abc-123"}
+                         :body "ok"})
+              {:port 19907})
+        "#,
+        )
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("Failed to spawn");
+
+    std::thread::sleep(Duration::from_millis(1500));
+
+    sema_llm::http::ensure_crypto_provider();
+    let client = reqwest::blocking::Client::new();
+    let resp = client
+        .get("http://127.0.0.1:19907/test")
+        .timeout(Duration::from_secs(5))
+        .send()
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        resp.headers().get("x-custom").unwrap().to_str().unwrap(),
+        "hello"
+    );
+    assert_eq!(
+        resp.headers()
+            .get("x-request-id")
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        "abc-123"
+    );
+
+    child.kill().ok();
+    child.wait().ok();
+}
+
+// ---------------------------------------------------------------------------
+// Middleware pattern integration tests (require network)
+// ---------------------------------------------------------------------------
+
+#[test]
+#[ignore] // requires network
+fn test_middleware_cors() {
+    use std::process::{Command, Stdio};
+    use std::time::Duration;
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_sema"))
+        .arg("-e")
+        .arg(
+            r#"
+            (define (cors-wrap handler)
+              (fn (req)
+                (let ((resp (handler req)))
+                  (assoc resp :headers
+                    (merge (or (get resp :headers) {})
+                           {"access-control-allow-origin" "*"
+                            "access-control-allow-methods" "GET, POST"})))))
+
+            (http/serve
+              (cors-wrap
+                (http/router
+                  [[:get "/api" (fn (req) (http/ok {:data 42}))]]))
+              {:port 19908})
+        "#,
+        )
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("Failed to spawn");
+
+    std::thread::sleep(Duration::from_millis(1500));
+
+    sema_llm::http::ensure_crypto_provider();
+    let client = reqwest::blocking::Client::new();
+    let resp = client
+        .get("http://127.0.0.1:19908/api")
+        .timeout(Duration::from_secs(5))
+        .send()
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        resp.headers()
+            .get("access-control-allow-origin")
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        "*"
+    );
+
+    child.kill().ok();
+    child.wait().ok();
+}
+
+#[test]
+#[ignore] // requires network
+fn test_middleware_logging() {
+    use std::process::{Command, Stdio};
+    use std::time::Duration;
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_sema"))
+        .arg("-e")
+        .arg(r#"
+            (define (log-wrap handler)
+              (fn (req)
+                (let ((resp (handler req)))
+                  (display (string-append (:method req) " " (:path req) " -> " (number->string (get resp :status))))
+                  resp)))
+
+            (http/serve
+              (log-wrap (fn (req) (http/ok "logged")))
+              {:port 19909})
+        "#)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("Failed to spawn");
+
+    std::thread::sleep(Duration::from_millis(1500));
+
+    sema_llm::http::ensure_crypto_provider();
+    let client = reqwest::blocking::Client::new();
+    let resp = client
+        .get("http://127.0.0.1:19909/test")
+        .timeout(Duration::from_secs(5))
+        .send()
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    child.kill().ok();
+    child.wait().ok();
+}
+
+#[test]
+#[ignore] // requires network (binds localhost sockets)
+fn test_http_serve_port_fallback_and_on_listen() {
+    use std::io::{BufRead, BufReader};
+    use std::process::{Command, Stdio};
+    use std::time::Duration;
+
+    // Occupy the target port with a plain (no-fallback) server.
+    let mut occupier = Command::new(env!("CARGO_BIN_EXE_sema"))
+        .arg("-e")
+        .arg(r#"(http/serve (fn (req) (http/ok "a")) {:port 19910})"#)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("Failed to spawn occupier");
+    std::thread::sleep(Duration::from_millis(1200));
+
+    // A second server requests the same port with :port-fallback + :on-listen.
+    // It must land on a different port and report it via the callback.
+    let mut child = Command::new(env!("CARGO_BIN_EXE_sema"))
+        .arg("-e")
+        .arg(
+            r#"(http/serve (fn (req) (http/ok "b"))
+                  {:port 19910
+                   :port-fallback true
+                   :on-listen (fn (info)
+                     (println (string-append "BOUND:" (number->string (:port info)))))})"#,
+        )
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("Failed to spawn fallback server");
+
+    // Read the reported port from the on-listen callback's stdout line.
+    let stdout = child.stdout.take().expect("piped stdout");
+    let mut bound_port: Option<u16> = None;
+    for line in BufReader::new(stdout).lines() {
+        let line = line.unwrap_or_default();
+        if let Some(rest) = line.strip_prefix("BOUND:") {
+            bound_port = rest.trim().parse::<u16>().ok();
+            break;
+        }
+    }
+
+    let bound_port = bound_port.expect("fallback server should report a bound port");
+    assert_ne!(
+        bound_port, 19910,
+        "fallback must not reuse the occupied port"
+    );
+    assert!(
+        bound_port > 19910,
+        "fallback advances upward from the start port"
+    );
+
+    // Prove the fallback server actually serves on the new port.
+    sema_llm::http::ensure_crypto_provider();
+    let client = reqwest::blocking::Client::new();
+    let resp = client
+        .get(format!("http://127.0.0.1:{bound_port}/"))
+        .timeout(Duration::from_secs(5))
+        .send()
+        .expect("request to fallback port");
+    assert_eq!(resp.status(), 200);
+
+    child.kill().ok();
+    child.wait().ok();
+    occupier.kill().ok();
+    occupier.wait().ok();
+}
+
+#[test]
+#[ignore] // requires network (binds localhost sockets)
+fn test_http_serve_without_fallback_fails_on_taken_port() {
+    use std::process::{Command, Stdio};
+    use std::time::Duration;
+
+    // Occupy the port.
+    let mut occupier = Command::new(env!("CARGO_BIN_EXE_sema"))
+        .arg("-e")
+        .arg(r#"(http/serve (fn (req) (http/ok "a")) {:port 19912})"#)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("Failed to spawn occupier");
+    std::thread::sleep(Duration::from_millis(1200));
+
+    // Without fallback, binding the taken port must fail fast (opt-in contract).
+    let output = Command::new(env!("CARGO_BIN_EXE_sema"))
+        .arg("-e")
+        .arg(r#"(http/serve (fn (req) (http/ok "b")) {:port 19912})"#)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("Failed to spawn second server")
+        .wait_with_output()
+        .expect("second server should exit, not hang");
+
+    assert!(
+        !output.status.success(),
+        "http/serve on a taken port without fallback must error"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr).to_lowercase();
+    assert!(
+        stderr.contains("bind") || stderr.contains("in use") || stderr.contains("address"),
+        "error should mention the bind failure, got: {stderr}"
+    );
+
+    occupier.kill().ok();
+    occupier.wait().ok();
+}
+
+// ── QUERY method routing (RFC 10008) ───────────────────────────────────────
+// The router is a pure function, so QUERY dispatch is tested in-process without
+// binding a socket.
+
+#[test]
+fn test_router_query_method_routes() {
+    // A :query route matches a QUERY request and runs its handler.
+    let result = eval(
+        r#"
+        (let ((app (http/router (list (vector :query "/search"
+                     (fn (req) (http/ok {:method (str (:method req)) :body (:body req)})))))))
+          (:status (app {:method :query :path "/search" :body "q=hi"})))
+    "#,
+    );
+    assert_eq!(result, Value::int(200));
+}
+
+#[test]
+fn test_router_query_does_not_match_get() {
+    // A GET request must not fall into a :query route (distinct methods).
+    let result = eval(
+        r#"
+        (let ((app (http/router (list (vector :query "/search"
+                     (fn (req) (http/ok {:ok 1})))))))
+          (:status (app {:method :get :path "/search"})))
+    "#,
+    );
+    assert_eq!(result, Value::int(404));
+}

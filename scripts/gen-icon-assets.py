@@ -45,7 +45,8 @@ LOGOTYPE_WIDTHS = [366, 732, 1098]  # sema-logotype.svg, by width
 SVG_CONSUMERS = {
     "sema-mark-rounded": [
         "website/public/favicon.svg",
-        "pkg/static/favicon.svg",
+        # NOTE: the pkg registry (sema-lisp/pkg) is its own repo now and keeps its
+        # own vendored favicon copy — do not sync into this repo's tree.
         "playground/favicon.svg",
     ],
     "sema-mark-square": ["website/public/avatar.svg"],

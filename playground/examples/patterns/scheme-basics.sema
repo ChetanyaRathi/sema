@@ -17,12 +17,14 @@
 
 (println "\n=== Do Loops ===")
 (define sum
-  (do ((i 1 (+ i 1)) (acc 0 (+ acc i)))
+  (do
+    ((i 1 (+ i 1)) (acc 0 (+ acc i)))
     ((> i 10) acc)))
 (println (format "Sum 1..10: ~a" sum))
 
 (define fact
-  (do ((n 10 (- n 1)) (acc 1 (* acc n)))
+  (do
+    ((n 10 (- n 1)) (acc 1 (* acc n)))
     ((= n 0) acc)))
 (println (format "10!: ~a" fact))
 
@@ -41,7 +43,7 @@
 (println (format "Forced? ~a" (promise-forced? p)))
 
 ;; Memoization
-(define counter 0)
-(define memo-p (delay (begin (set! counter (+ counter 1)) counter)))
+(define counter  0)
+(define memo-p   (delay (begin (set! counter (+ counter 1)) counter)))
 (println (format "\nFirst force:  ~a" (force memo-p)))
 (println (format "Second force: ~a (same — memoized)" (force memo-p)))

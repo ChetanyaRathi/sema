@@ -128,7 +128,10 @@ Add to Zed's `settings.json` (also reachable via Settings → AI → MCP Servers
 
 Add to the project's `opencode.json`:
 
-```json
+```jsonc
+// opencode.json — either location works:
+//   ./opencode.json                    (project)
+//   ~/.config/opencode/opencode.json   (global)
 {
   "$schema": "https://opencode.ai/config.json",
   "mcp": {
@@ -140,6 +143,8 @@ Add to the project's `opencode.json`:
   }
 }
 ```
+
+For a one-line setup that also wires in the language server, formatter, and theme, use the [`opencode-sema` plugin](/docs/editors#opencode) instead.
 
 ### Pi
 
@@ -289,6 +294,25 @@ sema mcp tools/receipts.sema --include extract-receipt
 sema mcp tools/receipts.sema --exclude order-pineapple-pizza
 ```
 
+### 4. Sandboxing
+
+By default the server runs **unsandboxed** — its `eval` and user-defined tools have
+full shell/filesystem/network access. Restrict it with `--sandbox`, using the same
+grammar as the top-level flag (`strict`, or a comma-separated capability list):
+
+```bash
+# Deny shell, network, fs-write, env-write, process, and LLM calls
+sema mcp tools/receipts.sema --sandbox strict
+
+# Targeted: everything allowed except shell and filesystem writes
+sema mcp tools/receipts.sema --sandbox no-shell,no-fs-write
+```
+
+A denied capability surfaces to the client as a normal tool error
+(`Permission denied: shell requires 'shell' capability`). The subcommand flag wins
+over a top-level `--sandbox`; with neither, the historical allow-everything
+behavior is unchanged.
+
 ---
 
 ## Stateful Notebook Tools
@@ -333,7 +357,7 @@ The sections above cover Sema acting as an MCP **server**. Sema can also be an M
 
 **stdio** — launch the server as a child process and exchange JSON-RPC 2.0 over its stdin/stdout. `:command` is required; `:args`, `:env`, and `:cwd` are optional. A server that needs a credential reads it from the environment Sema hands the child, so pass tokens through `:env`:
 
-```scheme
+```sema
 (define fs (mcp/connect {:command "npx"
                          :args ["-y" "@modelcontextprotocol/server-filesystem" "/tmp"]}))
 
@@ -352,7 +376,7 @@ The sections above cover Sema acting as an MCP **server**. Sema can also be an M
 
 **HTTP** — connect to a remote server by `:url`. Sema speaks the modern **Streamable HTTP** transport (MCP spec `2025-11-25`: a single endpoint, `Mcp-Session-Id` continuity, JSON-or-SSE responses) and **auto-detects and falls back** to the deprecated 2024-11-05 HTTP+SSE two-endpoint transport when a server only speaks that — so you use the same call either way:
 
-```scheme
+```sema
 ;; Open server, or a static bearer token you already have:
 (define gh (mcp/connect {:url "https://mcp.example.com/mcp"
                          :headers {"Authorization" "Bearer ghp_…"}}))
@@ -367,7 +391,7 @@ For a remote server that requires authorization, `mcp/connect` runs the standard
 3. **Authorize** with the Authorization-Code + **PKCE-S256** flow, binding the token to the server with `resource=` (RFC 8707), by **opening your browser** and capturing the redirect on a loopback listener (RFC 8252).
 4. **Cache & refresh** — tokens are stored (OS keychain, or a `0600` file) and refreshed automatically, so later connects are silent.
 
-```scheme
+```sema
 ;; Browser opens on first use; subsequent runs reuse the cached token.
 (define asana (mcp/connect {:url "https://mcp.asana.com/mcp"}))
 
@@ -398,7 +422,7 @@ export SEMA_MCP_TOKEN_STORE=keychain  # force the OS keychain
 
 `mcp/tools->sema` produces values structurally identical to what `deftool` yields, so an agent uses them exactly like local tools — no new agent concepts:
 
-```scheme
+```sema
 (define asana (mcp/connect {:url "https://mcp.asana.com/mcp"}))
 
 (defagent assistant
@@ -422,7 +446,7 @@ A tool that reports `isError` surfaces as an error the agent loop feeds back to 
 
 MCP `tools/call` results record and replay through the same **cassette** tape as LLM calls, so an agent-over-MCP flow can be captured once and replayed offline (no network, no live server) in CI. Record a session, then replay it:
 
-```scheme
+```sema
 ;; Record: real calls run and their results are taped.
 (llm/cassette-load "tape.ndjson" {:mode :record})
 (define s (mcp/connect {:url "https://mcp.example.com/mcp"}))

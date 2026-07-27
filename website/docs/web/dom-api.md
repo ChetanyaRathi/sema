@@ -8,7 +8,7 @@ The `dom/*` namespace provides a thin wrapper over the browser DOM API. All func
 
 Find the first element matching a CSS selector.
 
-```scheme
+```sema
 (def el (dom/query ".my-class"))
 (def nav (dom/query "nav > ul"))
 ```
@@ -17,7 +17,7 @@ Find the first element matching a CSS selector.
 
 Find all elements matching a CSS selector.
 
-```scheme
+```sema
 (def items (dom/query-all "li.todo"))
 ```
 
@@ -25,7 +25,7 @@ Find all elements matching a CSS selector.
 
 Find an element by its `id` attribute.
 
-```scheme
+```sema
 (def app (dom/get-id "app"))
 ```
 
@@ -35,7 +35,7 @@ Find an element by its `id` attribute.
 
 Create a new DOM element.
 
-```scheme
+```sema
 (def div (dom/create-element "div"))
 ```
 
@@ -43,7 +43,7 @@ Create a new DOM element.
 
 Create a text node.
 
-```scheme
+```sema
 (def txt (dom/create-text "Hello, world!"))
 ```
 
@@ -53,7 +53,7 @@ Create a text node.
 
 Append a child node to a parent element. Returns the child handle.
 
-```scheme
+```sema
 (def container (dom/get-id "app"))
 (def p (dom/create-element "p"))
 (dom/set-text! p "New paragraph")
@@ -64,7 +64,7 @@ Append a child node to a parent element. Returns the child handle.
 
 Remove a child node from its parent.
 
-```scheme
+```sema
 (dom/remove-child! container p)
 ```
 
@@ -72,7 +72,7 @@ Remove a child node from its parent.
 
 Remove an element from the DOM entirely.
 
-```scheme
+```sema
 (dom/remove! (dom/query ".obsolete"))
 ```
 
@@ -80,19 +80,19 @@ Remove an element from the DOM entirely.
 
 ### `(dom/set-attribute! handle attr value)` -> nil
 
-```scheme
+```sema
 (dom/set-attribute! el "data-count" "5")
 ```
 
 ### `(dom/get-attribute handle attr)` -> string | nil
 
-```scheme
+```sema
 (dom/get-attribute el "href")
 ```
 
 ### `(dom/remove-attribute! handle attr)` -> nil
 
-```scheme
+```sema
 (dom/remove-attribute! el "disabled")
 ```
 
@@ -102,7 +102,7 @@ Remove an element from the DOM entirely.
 
 Add one or more CSS classes.
 
-```scheme
+```sema
 (dom/add-class! el "active" "highlighted")
 ```
 
@@ -110,7 +110,7 @@ Add one or more CSS classes.
 
 Remove one or more CSS classes.
 
-```scheme
+```sema
 (dom/remove-class! el "active")
 ```
 
@@ -118,7 +118,7 @@ Remove one or more CSS classes.
 
 Toggle a CSS class. Returns `true` if the class is now present, `false` otherwise.
 
-```scheme
+```sema
 (dom/toggle-class! el "expanded")
 ```
 
@@ -126,7 +126,7 @@ Toggle a CSS class. Returns `true` if the class is now present, `false` otherwis
 
 Check whether an element has a CSS class.
 
-```scheme
+```sema
 (if (dom/has-class? el "active")
   (println "Element is active"))
 ```
@@ -137,7 +137,7 @@ Check whether an element has a CSS class.
 
 Set a CSS style property. Use kebab-case property names.
 
-```scheme
+```sema
 (dom/set-style! el "background-color" "#f0f0f0")
 (dom/set-style! el "font-size" "16px")
 ```
@@ -146,7 +146,7 @@ Set a CSS style property. Use kebab-case property names.
 
 Get a CSS style property value.
 
-```scheme
+```sema
 (dom/get-style el "color")
 ```
 
@@ -156,7 +156,7 @@ Get a CSS style property value.
 
 Set the `textContent` of an element.
 
-```scheme
+```sema
 (dom/set-text! el "Updated content")
 ```
 
@@ -168,7 +168,7 @@ Get the `textContent` of an element.
 
 Set the `innerHTML` of an element. Use with caution -- no sanitization is performed.
 
-```scheme
+```sema
 (dom/set-html! el "<strong>Bold</strong>")
 ```
 
@@ -182,7 +182,7 @@ Get the `innerHTML` of an element.
 
 Set the `value` property of an input element.
 
-```scheme
+```sema
 (dom/set-value! input "default text")
 ```
 
@@ -190,7 +190,7 @@ Set the `value` property of an input element.
 
 Get the `value` property of an input element.
 
-```scheme
+```sema
 (def text (dom/get-value input))
 ```
 
@@ -198,7 +198,7 @@ Get the `value` property of an input element.
 
 Read `event.target.value` from an event handle. Useful in input event handlers:
 
-```scheme
+```sema
 (define (on-input ev)
   (def val (dom/event-value ev))
   (println "Input:" val))
@@ -215,7 +215,7 @@ Add an event listener. The callback may be either:
 
 The callback receives a numeric event handle as its argument.
 
-```scheme
+```sema
 (define (handle-click ev)
   (dom/prevent-default! ev)
   (println "Clicked!"))
@@ -231,7 +231,7 @@ The event handle is automatically released after the callback returns.
 
 Remove a previously registered event listener.
 
-```scheme
+```sema
 (dom/off! btn "click" handle-click)
 ;; or:
 (dom/off! btn "click" "handle-click")
@@ -241,7 +241,7 @@ Remove a previously registered event listener.
 
 Call `preventDefault()` on an event.
 
-```scheme
+```sema
 (define (on-submit ev)
   (dom/prevent-default! ev)
   ;; handle form submission
@@ -254,7 +254,7 @@ Call `preventDefault()` on an event.
 
 Render a SIP vector into a DOM element and return its handle. See [SIP Markup](./sip-markup.md) for the format.
 
-```scheme
+```sema
 (def card (dom/render [:div {:class "card"} "Hello"]))
 ```
 
@@ -262,7 +262,7 @@ Render a SIP vector into a DOM element and return its handle. See [SIP Markup](.
 
 Render SIP data into the element matching `selector`, replacing existing content.
 
-```scheme
+```sema
 (dom/render-into! "#app"
   [:div [:h1 "Hello, world!"]])
 ```

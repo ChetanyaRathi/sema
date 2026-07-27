@@ -12,23 +12,27 @@ Functions are the primary building blocks of Sema programs. Functions in Sema ar
 
 There are two equivalent ways to define a named function:
 
-### The `defn` Macro
-By convention, the `defn` macro is the most common way to declare a function:
+### The `define` Form
+`define` binds a name to a value. Given a signature list rather than a bare symbol, it binds the name to a function — shorthand for `(define square (fn (x) (* x x)))`:
 
 ```sema
-(defn square (x)
+(define (square x)
   (* x x))
 
 (square 5) ; => 25
 ```
 
-### The `define` Shorthand
-You can also define functions using a shorthand syntax with `define`:
+This is the form used throughout Sema's examples and standard library.
+
+### The `defun` Form
+`defun` takes the name and the parameter list as separate arguments:
 
 ```sema
-(define (square x)
+(defun square (x)
   (* x x))
 ```
+
+`defn` is accepted as an alias for `defun`.
 
 ---
 
@@ -65,7 +69,7 @@ Sema provides a compact Clojure-style shorthand syntax for short anonymous funct
 Sema functions are **lexically scoped**. This means they can access variables declared in their outer parent scopes. When a function references variables from its enclosing scope, it creates a **closure**:
 
 ```sema
-(defn make-adder (x)
+(define (make-adder x)
   (fn (y) (+ x y)))
 
 (define add-five (make-adder 5))
@@ -86,7 +90,7 @@ Sema implements **Tail-Call Optimization (TCO)**. When a function calls itself (
 A function is tail-recursive if the recursive call's value is directly returned without further computation:
 
 ```sema
-(defn factorial (n accumulator)
+(define (factorial n accumulator)
   (if (<= n 1)
       accumulator
       (factorial (- n 1) (* n accumulator)))) ; Tail position
@@ -97,7 +101,7 @@ A function is tail-recursive if the recursive call's value is directly returned 
 Contrast this with a non-tail-recursive version where the recursive call is not the last operation:
 
 ```sema
-(defn factorial-bad (n)
+(define (factorial-bad n)
   (if (<= n 1)
       1
       (* n (factorial-bad (- n 1))))) ; NOT in tail position (* must run after)

@@ -40,7 +40,24 @@ pub fn sema_value_to_json_schema(val: &Value) -> serde_json::Value {
                         .as_keyword()
                         .or_else(|| t.as_str().map(|s| s.to_string()))
                         .unwrap_or_else(|| "string".to_string());
-                    prop_obj.insert("type".to_string(), serde_json::Value::String(type_str));
+                    // Sema type keywords → JSON Schema draft 2020-12 type names.
+                    // LLM providers validate tool schemas strictly and reject the
+                    // ENTIRE request over one bad name — `:list` leaking through as
+                    // "list" broke every turn of an MCP client session.
+                    let json_type = match type_str.as_str() {
+                        "str" => "string",
+                        "int" => "integer",
+                        "float" | "double" => "number",
+                        "bool" => "boolean",
+                        "list" | "vector" | "array" => "array",
+                        "map" | "dict" => "object",
+                        "nil" => "null",
+                        other => other,
+                    };
+                    prop_obj.insert(
+                        "type".to_string(),
+                        serde_json::Value::String(json_type.to_string()),
+                    );
                 } else {
                     prop_obj.insert(
                         "type".to_string(),
@@ -177,7 +194,7 @@ fn handler_shape(params: &Value, handler: &Value) -> Option<HandlerShape> {
         });
     }
 
-    if let Some((closure, _)) = sema_vm::extract_vm_closure(handler) {
+    if let Some((closure, _, _)) = sema_vm::extract_vm_closure(handler) {
         let arity = closure.func.arity as usize;
         // Reconstruct positional names from (slot, name) pairs.
         let mut names: Vec<Option<String>> = vec![None; arity];
@@ -479,13 +496,13 @@ where
 
     let buf = Arc::new(Mutex::new(String::new()));
     let out = buf.clone();
-    sema_core::set_stdout_hook(Some(Box::new(move |s: &str| {
+    sema_core::set_host_stdout_hook(Some(Box::new(move |s: &str| {
         if let Ok(mut b) = out.lock() {
             b.push_str(s);
         }
     })));
     let err = buf.clone();
-    sema_core::set_stderr_hook(Some(Box::new(move |s: &str| {
+    sema_core::set_host_stderr_hook(Some(Box::new(move |s: &str| {
         if let Ok(mut b) = err.lock() {
             b.push_str(s);
         }
@@ -497,13 +514,28 @@ where
     // into an error result.
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
 
-    sema_core::set_stdout_hook(None);
-    sema_core::set_stderr_hook(None);
+    sema_core::set_host_stdout_hook(None);
+    sema_core::set_host_stderr_hook(None);
 
     let captured = buf.lock().map(|b| b.clone()).unwrap_or_default();
 
     match result {
-        Ok(r) => (r.map_err(|e| format!("{e}")), captured),
+        // Keep structured hint/note: Display on WithContext is "{inner}" only,
+        // so plain "{e}" silently drops the VM's did-you-mean suggestions that
+        // the CLI prints — exactly the guidance an MCP client needs most.
+        Ok(r) => (
+            r.map_err(|e| {
+                let mut message = e.to_string();
+                if let Some(hint) = e.hint() {
+                    message.push_str(&format!("\nhint: {hint}"));
+                }
+                if let Some(note) = e.note() {
+                    message.push_str(&format!("\nnote: {note}"));
+                }
+                message
+            }),
+            captured,
+        ),
         Err(panic) => std::panic::resume_unwind(panic),
     }
 }
@@ -531,6 +563,7 @@ pub fn run_bytecode_bytes(
             local_scopes: Vec::new(),
             source_file: None,
             cache_offset: 0,
+            suspend_cache: std::cell::Cell::new(None),
         }),
         upvalues: Vec::new(),
         // Top-level main closure: uses the VM's own globals and function table.
@@ -544,14 +577,15 @@ pub fn run_bytecode_bytes(
         &[],
         main_cache_slots,
     )?;
-    // Initialize the async scheduler so async/await and channels work when an
-    // MCP `run_file` executes a `.semac` program. A `.semac` carries no native
-    // table (the format is process-local), and bytecode compiled with
+    // Drive the `.semac` program on the interpreter's unified cooperative
+    // runtime, the sole async engine, so async/await, channels, and timers work
+    // when an MCP `run_file` executes a `.semac` program. A `.semac` carries no
+    // native table (the format is process-local), and bytecode compiled with
     // `known_natives=None` uses CallGlobal rather than CallNative, so task VMs
-    // resolve natives via the shared global env — an empty native table is
-    // correct here.
-    sema_vm::init_scheduler(interpreter.global_env.clone(), Vec::new());
-    vm.execute(closure, &interpreter.ctx)
+    // resolve natives via the shared global env — the empty native table passed
+    // to `VM::new` is correct here.
+    vm.seed_main_frame(closure);
+    interpreter.drive_vm_on_runtime(vm)
 }
 
 /// Lists all default, notebook, and user-defined tools matching CLI filters
@@ -620,7 +654,7 @@ pub fn list_mcp_tools(
             "type": "object",
             "properties": {}
         })),
-        ("docs_search", "Search Sema documentation by natural-language query (e.g. 'reverse a list', 'read file lines'). Returns the most relevant builtins/special forms ranked by relevance, as a JSON array of {name, module, summary, score}. Use this to discover the right function or syntax when you don't already know its name; use `docs` for the full docs of a known symbol.", json!({
+        ("docs_search", "Search Sema documentation by natural-language query (e.g. 'reverse a list', 'read file lines'). Returns the most relevant builtins/special forms ranked by relevance, as a JSON array of {name, module, signature, summary, score} — the signature shows argument ORDER. Use this to discover the right function or syntax when you don't already know its name; use `docs` for the full docs of a known symbol.", json!({
             "type": "object",
             "properties": {
                 "query": { "type": "string", "description": "What you're looking for, in plain words (e.g. 'parse json string', 'spawn an async task')." },
@@ -1011,7 +1045,23 @@ fn call_mcp_tool_inner(
             // Fallback to builtin docs database
             match get_builtin_doc(symbol) {
                 Some(doc) => success_result(doc.clone()),
-                None => error_result(format!("No documentation found for symbol: {symbol}")),
+                None => {
+                    // A bare miss invites blind re-guessing (a real session
+                    // burned turns on string/concat, llm/generate). Suggest
+                    // near-misses the same way the CLI/REPL does.
+                    let mut text = format!("No documentation found for symbol: {symbol}");
+                    let map = BUILTIN_DOCS.get_or_init(crate::builtin_docs::build_builtin_docs);
+                    let names: Vec<&str> = map.keys().map(|s| s.as_str()).collect();
+                    if let Some(suggestion) = sema_core::error::suggest_similar(symbol, &names) {
+                        text.push_str(&format!("\nhint: {suggestion}"));
+                    } else if let Some(hint) = sema_core::error::veteran_hint(symbol) {
+                        text.push_str(&format!("\nhint: {hint}"));
+                    }
+                    text.push_str(
+                        "\nTry docs_search with a plain-words query to discover the right name.",
+                    );
+                    error_result(text)
+                }
             }
         }
         "docs_search" => {
@@ -1043,11 +1093,7 @@ fn call_mcp_tool_inner(
                     Ok(c) => c,
                     Err(e) => return error_result(format!("Failed to read {file}: {e}")),
                 };
-                let fmt_opts = sema_fmt::FormatOptions {
-                    width: 80,
-                    indent: 2,
-                    align: false,
-                };
+                let fmt_opts = sema_fmt::FormatOptions::default();
                 let formatted = match sema_fmt::format_source(&content, &fmt_opts) {
                     Ok(f) => f,
                     Err(e) => return error_result(format!("Format error: {e}")),
@@ -1057,11 +1103,7 @@ fn call_mcp_tool_inner(
                 }
                 success_result(format!("Formatted file {file} in-place successfully."))
             } else if let Some(src) = code {
-                let fmt_opts = sema_fmt::FormatOptions {
-                    width: 80,
-                    indent: 2,
-                    align: false,
-                };
+                let fmt_opts = sema_fmt::FormatOptions::default();
                 match sema_fmt::format_source(src, &fmt_opts) {
                     Ok(formatted) => success_result(formatted),
                     Err(e) => error_result(format!("Format error: {e}")),
@@ -1443,5 +1485,45 @@ fn error_result(text: impl Into<String>) -> CallToolResult {
     CallToolResult {
         content: vec![ToolContent::Text { text: text.into() }],
         is_error: true,
+    }
+}
+
+#[cfg(test)]
+mod schema_tests {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    fn schema_for(param_type: &str) -> serde_json::Value {
+        let mut spec = BTreeMap::new();
+        spec.insert(Value::keyword("type"), Value::keyword(param_type));
+        let mut params = BTreeMap::new();
+        params.insert(Value::keyword("x"), Value::map(spec));
+        sema_value_to_json_schema(&Value::map(params))
+    }
+
+    /// Providers validate tool schemas against JSON Schema draft 2020-12 and
+    /// reject the whole request over one bad type name — Sema keywords must map.
+    #[test]
+    fn sema_type_keywords_map_to_json_schema_types() {
+        for (sema_ty, json_ty) in [
+            ("string", "string"),
+            ("str", "string"),
+            ("int", "integer"),
+            ("integer", "integer"),
+            ("float", "number"),
+            ("number", "number"),
+            ("bool", "boolean"),
+            ("boolean", "boolean"),
+            ("list", "array"),
+            ("vector", "array"),
+            ("map", "object"),
+            ("nil", "null"),
+        ] {
+            let schema = schema_for(sema_ty);
+            assert_eq!(
+                schema["properties"]["x"]["type"], json_ty,
+                "sema :{sema_ty} should emit JSON Schema type {json_ty}"
+            );
+        }
     }
 }

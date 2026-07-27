@@ -33,6 +33,7 @@ pub fn mcp_login(url: &str, use_device: bool, client_id: Option<&str>) -> Result
     let creds = if use_device {
         let rt = runtime()?;
         rt.block_on(async {
+            crate::ensure_crypto_provider();
             let http = reqwest::Client::new();
             let config = oauth::login::LoginConfig {
                 mcp_url: url,
@@ -93,6 +94,7 @@ pub fn login_interactive(
 ) -> Result<StoredCredentials, String> {
     let rt = runtime()?;
     rt.block_on(async {
+        crate::ensure_crypto_provider();
         let http = reqwest::Client::new();
         let existing = oauth::store::default_store()
             .load(url)

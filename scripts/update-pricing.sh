@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-#
+
 # Regenerate the vendored LLM pricing snapshot from models.dev.
 #
 # Source:  https://models.dev/api.json  (data is MIT-licensed; see the snapshot header)
@@ -68,9 +68,9 @@ jq --arg generated "$GENERATED" '
     | add
     | sort_by(.id, vrank(.vendor), .vendor)
   }
-' "$RAW" > "$OUT"
+' "$RAW" >"$OUT"
 
 COUNT="$(jq '.prices | length' "$OUT")"
-BYTES="$(wc -c < "$OUT" | tr -d ' ')"
+BYTES="$(wc -c <"$OUT" | tr -d ' ')"
 echo "Wrote $OUT"
 echo "  $COUNT priced models, $BYTES bytes, generated $GENERATED"

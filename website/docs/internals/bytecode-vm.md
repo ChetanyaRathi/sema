@@ -121,8 +121,8 @@ CallFrame { closure: Rc<Closure>, pc: usize, base: usize, open_upvalues: Option<
 **Key design points:**
 
 - **Unsafe hot path**: The dispatch loop uses `unsafe` unchecked stack operations (`pop_unchecked`) and raw pointer bytecode reads via `read_u16!`/`read_i32!`/`read_u32!` macros for performance. Opcodes are dispatched by matching the raw byte against `u8` constants (the `op` module), avoiding decode overhead; `std::mem::transmute` is used only to reconstruct `Spur` handles from `u32` operands. Debug builds retain bounds checks via `debug_assert!`.
-- **Closure interop**: VM closures are wrapped as `Value::NativeFn` values so code outside the VM can call them. Each NativeFn carries an `Rc<dyn Any>` payload containing `VmClosurePayload` (closure + function table), and the VM uses `raw_tag()` + `downcast_ref` to avoid `Rc` refcount bumps on the hot path. When called from outside the VM (e.g., stdlib higher-order-function callbacks), the NativeFn wrapper creates a fresh VM instance to execute the closure's bytecode; in-VM calls unwrap the payload and run in the same VM.
-- **Upvalue cells**: Lua-style open upvalues. `UpvalueCell` holds a `RefCell<UpvalueState>` — `Open { frame_base, slot }` points into the VM stack while the defining frame is alive; `Closed(Value)` owns the value after the frame exits. Locals are read and written directly on the stack (no cell indirection); cells are closed when a frame returns, tail-calls, unwinds — and before any non-VM call (see Current Limitations).
+- **Closure interop**: VM closures are wrapped as `Value::NativeFn` values so code outside the VM can call them. Each NativeFn carries an `Rc<dyn Any>` payload containing `VmClosurePayload` (closure + function table), and the VM uses `raw_tag()` + `downcast_ref` to avoid `Rc` refcount bumps on the hot path. In-VM calls unwrap the payload and run in the same VM. Callback dispatch from the runtime (stdlib higher-order functions) runs on a reused scratch VM — cooperatively via the runtime's structural call protocol, or synchronously via the non-suspending fast path (`hof_sync.rs`); only host-side calls outside a runtime quantum build a fresh VM.
+- **Upvalue cells**: Lua-style open upvalues. `UpvalueCell` holds a `RefCell<UpvalueState>` — `Open { frame_base, slot }` points into the VM stack while the defining frame is alive; `Closed(Value)` owns the value after the frame exits; `Tracked` shares a captured local with a foreign run (a callback executing on a scratch/task VM) so a `set!` inside a `map`/`for-each` callback propagates back to the defining frame's stack slot when it resumes. Locals are read and written directly on the stack (no cell indirection); cells are closed when a frame returns, tail-calls, or unwinds, and converted to `Tracked` when a value escapes onto a foreign VM.
 - **Exception handling**: `Throw` opcode triggers handler search via the chunk's exception table. Stack is restored to saved depth, error value pushed, PC jumps to handler.
 
 **Entry points**: `VM::execute()` takes a closure and `EvalContext`. `compile_program()` is the pipeline for normal compilation: `Value AST → lower → optimize → resolve → compile → CompiledProgram`. `compile_program_with_spans()` adds span/source-file support for debug (DAP breakpoints).
@@ -247,29 +247,52 @@ sema-core ← sema-reader ← sema-vm ← sema-eval
 | `vm.rs`        | VM dispatch loop, call frames, closures, exception handling       |
 | `optimize.rs`  | Constant folding and simplification on CoreExpr IR                |
 | `serialize.rs` | Bytecode serialization/deserialization for `.semac` file format   |
-| `scheduler.rs` | Cooperative async task scheduler (VM-per-task, yield signals)     |
+| `runtime/`     | Unified cooperative runtime: drive loop, tasks, waits, channels, timers, promises |
+| `hof_sync.rs`  | Non-suspending HOF fast path: suspension analysis + synchronous element dispatch |
+| `restricted.rs`| Scheduler-free VM evaluation (bounded, suspension-rejecting)      |
 | `debug.rs`     | VM debug hooks for DAP (breakpoints, stepping, state queries)     |
 
 ## Async Execution (VM-Only)
 
-Async/await and channels are implemented entirely in the VM.
+Async/await and channels are implemented entirely in the VM, on the **unified
+cooperative runtime** (`runtime/`).
 
-The model is **VM-per-task with cooperative scheduling**:
+The model is **VM-per-task, driven in quanta**:
 
-- Each `async/spawn` creates a **new VM instance** that shares the parent's global `Env` (`Rc<Env>`) and function table (`Rc<Vec<Rc<Function>>>`). Tasks are cheap: no threads, no work stealing — everything stays single-threaded.
-- A cooperative scheduler in `scheduler.rs` runs tasks **round-robin**. A task runs until it yields (e.g. `await` on a pending promise, channel operations, `async/sleep`).
-- Yielding is signaled via a thread-local **yield signal** (`sema-core/src/async_signal.rs`), not an error variant. The VM checks the signal after every native call (`CallNative`, `CallGlobal`).
-- On yield, the VM leaves a `nil` placeholder on the stack and advances the PC past the call. On resume, the scheduler swaps the placeholder for the wake value (`replace_stack_top`), so from bytecode's perspective the call simply returned.
+- Each `async/spawn` creates a task with its own VM that shares the parent's
+  global `Env` (`Rc<Env>`) and function table (`Rc<Vec<Rc<Function>>>`). Tasks
+  are cheap: no threads, no work stealing — everything stays single-threaded.
+- The runtime's drive loop runs ready tasks in **quanta** (bounded instruction
+  budgets). A task runs until its quantum expires or it suspends.
+- Suspension is **structural**, not signaled: a native that must wait returns a
+  `NativeOutcome` (`Suspend` with a wait kind — timer, promise, channel,
+  external I/O — or a `RuntimeRequest` like spawn/channel-create) instead of a
+  value. The VM parks the frame with a `nil` placeholder on the stack and hands
+  the outcome to the runtime; on wake, the resume value replaces the
+  placeholder (`replace_stack_top`), so from bytecode's perspective the call
+  simply returned. (The earlier thread-local yield-signal bridge is fully
+  retired.)
+- Stdlib higher-order functions (`map`, `filter`, `foldl`, `for-each`, …) drive
+  their callbacks through the same protocol: one `NativeOutcome::Call` per
+  element, so an `await` inside a `map` callback parks and resumes correctly.
+  When the callback's call graph **provably cannot suspend** (a conservative
+  bytecode analysis in `hof_sync.rs`, with inert native callbacks like
+  `(map string/to-number xs)` qualifying outright), the element loop instead
+  runs synchronously on a warm pooled scratch VM inside the parent's quantum —
+  no per-call drive round-trip, no per-element continuation — which is what
+  keeps cheap-callback HOF compute at (or ahead of) pre-async-runtime speed.
 
-This replaced an earlier replay-based design that re-executed entire task bodies on resume (corrupting side effects). Promises support cancellation (`PromiseState::Cancelled`), and task wake-ups preserve FIFO order.
+Promises support cancellation, task wake-ups preserve FIFO order, and quantum
+budgets keep a long-running task from starving siblings.
 
-Yield-aware native functions must work on both closure paths (in-VM and the fresh-VM fallback described under Current Limitations) — see `vm_async_test.rs` for the VM-only test suite.
+Suspension-capable native functions are exercised on every dispatch path (in-VM
+call, cooperative callback, host adapter) — see `vm_async_test.rs` for the
+VM-only test suite.
 
 ## Current Limitations
 
 - The compiler emits inline opcodes for common builtins (`+`, `-`, `*`, `/`, `<`, `>`, `<=`, `>=`, `=`, `not`, `car`/`first`, `cdr`/`rest`, `cons`, `null?`, `pair?`, `list?`, `number?`, `string?`, `symbol?`, `length`, `append`, `get`, `contains?`, `nth`, `mod`/`modulo`) via intrinsic recognition. Redefining one of these names in the same program suppresses the intrinsic for that program, but a redefinition from a separate compilation unit (e.g., an earlier REPL entry) does not — the intrinsic still fires.
 - `CallNative` optimization requires passing `known_natives` at compile time (done automatically by `eval_str_compiled`); without it, all global calls use `CallGlobal`
-- `set!` to a captured local is silently lost when the closure is invoked through a stdlib higher-order function (`map`, `filter`, `for-each`, …) — upvalue cells are closed to snapshots before every non-VM call, so the callback mutates a detached copy. Globals and in-VM calls are unaffected. Use `foldl` with explicit accumulator threading as a workaround.
 
 ## Design Decisions
 

@@ -17,23 +17,23 @@
 
 ;; Fine-grained simulation grid; each terminal char shows a 2x2 block of it,
 ;; so these are double the minimum terminal footprint in each axis.
-(define MIN-ROWS 20)
-(define MIN-COLS 40)
-(define MARGIN 1) ; blank terminal rows/cols left around the box on every side
+(define MIN-ROWS  20)
+(define MIN-COLS  40)
+(define MARGIN    1)   ; blank terminal rows/cols left around the box on every side
 
 ;; Generation delay / key-poll timeout, in ms — [up]/[down] adjust it. 0
 ;; means "don't wait for input at all", so the loop free-runs at whatever
 ;; speed compute + render can sustain (the "as fast as possible" max speed).
-(define DEFAULT-TICK-MS 90)
-(define MIN-TICK-MS 0)
-(define MAX-TICK-MS 400)
-(define TICK-STEP-MS 10)
+(define DEFAULT-TICK-MS  90)
+(define MIN-TICK-MS      0)
+(define MAX-TICK-MS      400)
+(define TICK-STEP-MS     10)
 
 ;; Live-cell probability used on reseed — [left]/[right] adjust it.
-(define DEFAULT-DENSITY 0.15)
-(define MIN-DENSITY 0.05)
-(define MAX-DENSITY 0.5)
-(define DENSITY-STEP 0.05)
+(define DEFAULT-DENSITY  0.15)
+(define MIN-DENSITY      0.05)
+(define MAX-DENSITY      0.5)
+(define DENSITY-STEP     0.05)
 
 ;; Raw mode (cfmakeraw) disables output post-processing, so a bare "\n" does
 ;; NOT return the cursor to column 1 on a real terminal — every line must be
@@ -46,10 +46,10 @@
 ;; Warm gold accent on a dark canvas, matching sema-lang.com and the
 ;; examples/sema-coder/theme.sema TUI palette; vendored here (rather than
 ;; loaded) so this example stays a single self-contained file.
-(define (accent text) (term/rgb text 200 168 85)) ; brand gold #c8a855
-(define (accent-dim text) (term/rgb text 160 136 56)) ; darker gold #a08838
-(define (bright text) (term/rgb text 255 255 255)) ; pure white
-(define (muted text) (term/rgb text 150 140 121)) ; warm gray
+(define (accent text)      (term/rgb text 200 168 85))   ; brand gold #c8a855
+(define (accent-dim text)  (term/rgb text 160 136 56))   ; darker gold #a08838
+(define (bright text)      (term/rgb text 255 255 255))  ; pure white
+(define (muted text)       (term/rgb text 150 140 121))  ; warm gray
 
 ;; Parentheses in gold, letters in bold white — the canonical (sema) wordmark.
 (define (wordmark)
@@ -82,22 +82,22 @@
 (define GLIDER (list (list 1 2) (list 2 3) (list 3 1) (list 3 2) (list 3 3)))
 
 ;; --- Mutable UI/sim state ---
-(define *rows* MIN-ROWS)
-(define *cols* MIN-COLS)
-(define *grid* (mutable-array/new))
-(define *next-grid* (mutable-array/new))
-(define *generation* 0)
-(define *alive-count* 0)
-(define *paused* #f)
-(define *should-quit* #f)
-(define *resize-pending* #t)
-(define *tick-ms* DEFAULT-TICK-MS)
-(define *density* DEFAULT-DENSITY)
+(define *rows*            MIN-ROWS)
+(define *cols*            MIN-COLS)
+(define *grid*            (mutable-array/new))
+(define *next-grid*       (mutable-array/new))
+(define *generation*      0)
+(define *alive-count*     0)
+(define *paused*          #f)
+(define *should-quit*     #f)
+(define *resize-pending*  #t)
+(define *tick-ms*         DEFAULT-TICK-MS)
+(define *density*         DEFAULT-DENSITY)
 
 ;; --- Grid access (toroidal wrapping) ---
-(define (cell-index r c) (+ (* (mod r *rows*) *cols*) (mod c *cols*)))
-(define (cell-get grid r c) (mutable-array/get grid (cell-index r c)))
-(define (cell-set! grid r c v) (mutable-array/set! grid (cell-index r c) v))
+(define (cell-index r c)        (+ (* (mod r *rows*) *cols*) (mod c *cols*)))
+(define (cell-get grid r c)     (mutable-array/get grid (cell-index r c)))
+(define (cell-set! grid r c v)  (mutable-array/set! grid (cell-index r c) v))
 
 ;; Set all 4 fine cells of the 2x2 block at (r0,c0) to V — a mouse click only
 ;; has terminal-cell resolution, so drawing acts on a whole QUADRANTS block.
@@ -127,8 +127,8 @@
       (cell-get grid rd cr))))
 
 (define (next-cell-state grid r c)
-  (let* ((alive (cell-get grid r c))
-         (n (count-neighbors grid r c)))
+  (let* ((alive  (cell-get grid r c))
+         (n      (count-neighbors grid r c)))
     (cond
       ((and (= alive 1) (< n 2)) 0)
       ; underpopulation
@@ -207,11 +207,11 @@
 (define (density-percent) (int (round (* *density* 100))))
 
 (define (quadrant-glyph r0 r1 c0 c1)
-  (let* ((tl (cell-get *grid* r0 c0))
-         (tr (cell-get *grid* r0 c1))
-         (bl (cell-get *grid* r1 c0))
-         (br (cell-get *grid* r1 c1))
-         (idx (+ (* tl 8) (* tr 4) (* bl 2) br)))
+  (let* ((tl   (cell-get *grid* r0 c0))
+         (tr   (cell-get *grid* r0 c1))
+         (bl   (cell-get *grid* r1 c0))
+         (br   (cell-get *grid* r1 c1))
+         (idx  (+ (* tl 8) (* tr 4) (* bl 2) br)))
     (nth QUADRANTS idx)))
 
 (define (render-term-row tr term-cols)
@@ -276,10 +276,10 @@
 ;; Map an absolute 1-based terminal mouse position to the fine-grid (r0 c0)
 ;; origin of the 2x2 block under it, or nil when outside the grid area.
 (define (mouse->cell x y)
-  (let ((term-rows (quotient *rows* 2))
-        (term-cols (quotient *cols* 2))
-        (tr (- y (grid-origin-row)))
-        (tc (- x (grid-origin-col))))
+  (let ((term-rows  (quotient *rows* 2))
+        (term-cols  (quotient *cols* 2))
+        (tr         (- y (grid-origin-row)))
+        (tc         (- x (grid-origin-col))))
     (if (and (>= tr 0) (< tr term-rows) (>= tc 0) (< tc term-cols))
       (list (* tr 2) (* tc 2))
       nil)))
@@ -311,9 +311,9 @@
   (reseed!))
 
 (define (handle-key k)
-  (let ((kind (:kind k))
-        (ch (:char k))
-        (name (:name k)))
+  (let ((kind  (:kind k))
+        (ch    (:char k))
+        (name  (:name k)))
     (cond
       ((and (equal? kind :char) (equal? ch "q")) (set! *should-quit* #t))
       ((and (equal? kind :char) (equal? ch " ")) (set! *paused* (not *paused*)))
@@ -334,17 +334,17 @@
 ;; Left click/drag paints alive cells; right click/drag erases. Only :press
 ;; and :move carry a meaningful click — :release/:wheel-* are ignored.
 (define (handle-mouse k)
-  (let ((action (:action k))
-        (button (:button k))
-        (cell (mouse->cell (:x k) (:y k))))
+  (let ((action  (:action k))
+        (button  (:button k))
+        (cell    (mouse->cell (:x k) (:y k))))
     (when cell
       (let ((r0 (car cell)) (c0 (cadr cell)))
         (cond
-          ((and (equal? action :press) (= button 0)) (toggle-block! r0 c0))
-          ((and (equal? action :press) (= button 2)) (paint-block! r0 c0 0))
-          ((and (equal? action :move) (= button 0)) (paint-block! r0 c0 1))
-          ((and (equal? action :move) (= button 2)) (paint-block! r0 c0 0))
-          (else nil))))))
+          ((and (equal? action :press) (= button 0))  (toggle-block! r0 c0))
+          ((and (equal? action :press) (= button 2))  (paint-block! r0 c0 0))
+          ((and (equal? action :move) (= button 0))   (paint-block! r0 c0 1))
+          ((and (equal? action :move) (= button 2))   (paint-block! r0 c0 0))
+          (else                                       nil))))))
 
 ;; --- Main loop ---
 ;; The kitty keyboard protocol gives terminals that support it more reliable

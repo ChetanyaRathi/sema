@@ -19,7 +19,7 @@ The first argument may be either:
 - a URL string
 - an options map with `:url`, `:method`, `:headers`, `:body`, and `:with-credentials`
 
-```scheme
+```sema
 (def stream
   (http/event-source "https://example.com/events"))
 
@@ -36,7 +36,7 @@ The first argument may be either:
 
 Dereferencing the returned signal gives a map with this shape:
 
-```scheme
+```sema
 {:data "raw event payload"
  :event "message"
  :id nil
@@ -64,7 +64,7 @@ Fields:
 
 Close a stream created by `http/event-source`.
 
-```scheme
+```sema
 (http/close-event-source stream)
 ```
 
@@ -72,7 +72,7 @@ Close a stream created by `http/event-source`.
 
 Alias for `http/close-event-source`.
 
-```scheme
+```sema
 (http/close-stream stream)
 ```
 
@@ -80,7 +80,7 @@ Alias for `http/close-event-source`.
 
 Streams created during a component render or lifecycle hook are owned by that component and are closed automatically on unmount. You can still close them manually if you want earlier shutdown behavior.
 
-```scheme
+```sema
 (defcomponent ticker ()
   (let ((stream (local "stream" nil)))
     (on-mount (fn ()
@@ -95,7 +95,7 @@ Streams created during a component render or lifecycle hook are owned by that co
 
 `llm/chat-stream` is built on the same streaming machinery, but consumes the normalized LLM proxy SSE protocol and returns a simpler signal shape:
 
-```scheme
+```sema
 {:text "partial response" :done false :error nil}
 ```
 

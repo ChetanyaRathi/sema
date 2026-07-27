@@ -8,11 +8,11 @@ homepage.workspace = true
 description = "Sequential dynamic-workflow runtime + frozen JSONL run-directory journal for Sema"
 
 [dependencies]
-# Leaf crate by design: depends on sema-core + sema-otel + serde only — NEVER
-# sema-eval (CLAUDE.md no-circular-dep invariant). The builtins that invoke
-# Sema thunks live in sema-stdlib (which depends on this crate for the types).
+# Leaf crate by design: depends on sema-core + serde only — NEVER sema-eval
+# (CLAUDE.md no-circular-dep invariant). The builtins that invoke Sema thunks
+# live in sema-stdlib (which depends on this crate for the types). Journal/guard
+# shapes are copied from sema-otel patterns but carry no code dependency on it.
 sema-core = { workspace = true }
-sema-otel = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 md5 = { workspace = true }

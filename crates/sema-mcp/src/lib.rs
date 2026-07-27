@@ -10,12 +10,13 @@ pub mod server;
 pub mod tools;
 
 pub use builtins::{
-    browser_open_allowed, close_handle, connect_from_config, gated_browser_opener,
-    register_mcp_builtins, ConnectFailure, ConnectOpts,
+    browser_open_allowed, close_handle, connect_from_config, connect_send, gated_browser_opener,
+    host_capability_allowed, register_connected, register_mcp_builtins, ConnectFailure,
+    ConnectOpts, ConnectedClient,
 };
 pub use client::{McpClient, McpClientConfig, McpHttpConfig};
 pub use client_auth::{login_interactive, mcp_login, mcp_login_token, mcp_logout};
-pub use server::{run_mcp_server, run_mcp_server_on};
+pub use server::{run_mcp_server, run_mcp_server_on, run_mcp_server_sync};
 
 /// A random 128-bit value as 32 lowercase hex characters (a UUID v4 with the
 /// dashes stripped — `crates/sema-mcp/src/notebook.rs` mints notebook ids the
@@ -24,6 +25,17 @@ pub use server::{run_mcp_server, run_mcp_server_on};
 /// just a convenient 32-hex-char random token shape. Used by the workflow
 /// dashboard (`sema::workflow_view`) to mint its per-process session-hardening
 /// token (docs/plans/2026-06-24-workflow-mcp-auth.md §8).
+/// Install rustls's ring `CryptoProvider` once per process. reqwest is built with
+/// `rustls-no-provider` (workspace-wide, to avoid the aws-lc-sys build); without an
+/// installed provider every `reqwest::Client` construction panics.
+pub fn ensure_crypto_provider() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        // Err(_) just means another provider is already installed — that's fine.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    });
+}
+
 pub fn random_hex_token() -> String {
     uuid::Uuid::new_v4().simple().to_string()
 }

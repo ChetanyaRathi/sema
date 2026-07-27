@@ -9,6 +9,11 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  playground-runtime:
+    permissions:
+      contents: read
+    uses: ./.github/workflows/playground-runtime.yml
+
   test:
     runs-on: ubuntu-latest
     steps:
@@ -18,10 +23,12 @@ jobs:
         # libudev-dev is required by `serialport` (transitive `libudev-sys`)
         # on Linux. The release workflow installs this via cargo-dist's
         # apt dependency hook (see dist-workspace.toml); CI needs to do it
-        # explicitly.
+        # explicitly. ripgrep is required by the unified-runtime conformance
+        # tests (they drive scripts/check-unified-runtime-*.sh, which scan
+        # with `rg`).
         run: |
           sudo apt-get update
-          sudo apt-get install -y libudev-dev
+          sudo apt-get install -y libudev-dev ripgrep
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -48,11 +55,13 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace -- -D warnings
 
-      - name: Check builtin docs (committed index fresh + fully documented)
-        run: jake docs-check
-
+      # Before docs-check: `jake docs-check` runs the LSP builtin-doc-coverage
+      # test through cargo nextest.
       - name: Install cargo-nextest
         uses: taiki-e/install-action@nextest
+
+      - name: Check builtin docs (committed index fresh + fully documented)
+        run: jake docs-check
 
       - name: Run tests
         run: cargo nextest run --workspace --profile ci
@@ -66,10 +75,41 @@ jobs:
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
 
+      # Advisory: coverage re-runs the suite through plain `cargo test` under
+      # instrumentation (slower, no nextest retries), so a timing-sensitive
+      # test can flake here after the real gate above already passed. Metrics
+      # must not paint the run red.
       - name: Generate coverage
+        continue-on-error: true
         run: cargo llvm-cov --workspace --lcov --output-path lcov.info
 
       - name: Upload coverage reports to Codecov
+        continue-on-error: true
         uses: codecov/codecov-action@v5
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
+
+  # Windows leg (advisory until first green, then drop continue-on-error and
+  # treat as required). The nextest `ci` profile's slow-timeout
+  # (120s x terminate-after 3) is the hang watchdog: a wedged async-runtime
+  # test surfaces as a terminated slow test, not a silent 6h job. Known
+  # platform limitation: subprocess eager-cancel (`group_sigkill_abort`) is a
+  # documented no-op off Unix, so cancel tests that assert child teardown are
+  # expected to need `cfg(unix)` gating in the first fix wave.
+  test-windows:
+    runs-on: windows-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo + target
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
+
+      - name: Run tests
+        run: cargo nextest run --workspace --profile ci

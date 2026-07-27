@@ -278,6 +278,7 @@ mod tests {
             let _ = request.respond(response);
         });
 
+        crate::ensure_crypto_provider();
         let client = reqwest::Client::new();
         let err = post_token(
             &client,

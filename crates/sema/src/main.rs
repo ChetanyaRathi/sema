@@ -24,6 +24,16 @@ struct FmtConfig {
     indent: usize,
     #[serde(default)]
     align: bool,
+    #[serde(
+        default = "default_max_blank_lines",
+        alias = "max_blank_lines",
+        rename = "max-blank-lines"
+    )]
+    max_blank_lines: usize,
+    /// Glob patterns (or literal path prefixes) excluded from formatting.
+    /// Explicitly named files bypass this list.
+    #[serde(default)]
+    ignore: Vec<String>,
 }
 
 impl Default for FmtConfig {
@@ -32,6 +42,8 @@ impl Default for FmtConfig {
             width: 80,
             indent: 2,
             align: false,
+            max_blank_lines: 1,
+            ignore: Vec::new(),
         }
     }
 }
@@ -41,6 +53,9 @@ fn default_width() -> usize {
 }
 fn default_indent() -> usize {
     sema_fmt::FormatOptions::default().indent
+}
+fn default_max_blank_lines() -> usize {
+    sema_fmt::FormatOptions::default().max_blank_lines
 }
 
 /// Walk up from cwd to find sema.toml
@@ -244,8 +259,11 @@ enum Commands {
         #[arg(long = "include", action = clap::ArgAction::Append)]
         includes: Vec<String>,
 
-        /// Sema binary to use as runtime base (default: current executable)
-        #[arg(long, conflicts_with = "target")]
+        /// Path to a sema executable to embed the program into, instead of this
+        /// executable (the default) or the release binary that --target downloads.
+        /// The output inherits its platform and version — pass e.g. a Windows
+        /// sema.exe to cross-build without a download. Conflicts with --target.
+        #[arg(long, value_name = "SEMA_BINARY", conflicts_with = "target")]
         runtime: Option<String>,
 
         /// Target platform triple or alias (e.g. linux, macos, windows, web, or a full triple).
@@ -260,6 +278,15 @@ enum Commands {
         /// Force re-download of cached runtime binaries
         #[arg(long)]
         no_cache: bool,
+
+        /// Show per-step build detail and runtime cache/checksum info
+        #[arg(short, long)]
+        verbose: bool,
+
+        /// Print a machine-readable build manifest to stdout (paths, sizes,
+        /// sha256, per-target status)
+        #[arg(long)]
+        json: bool,
     },
     /// Format Sema source files
     Fmt {
@@ -286,8 +313,12 @@ enum Commands {
         #[arg(long)]
         align: bool,
 
-        /// Output result as JSON (useful for editor integrations)
+        /// Max consecutive blank lines to keep (default: 1, or value from sema.toml)
         #[arg(long)]
+        max_blank_lines: Option<usize>,
+
+        /// Emit read-only NDJSON results for editor integrations
+        #[arg(long, conflicts_with = "diff")]
         json: bool,
     },
     /// Start the Language Server Protocol (LSP) server
@@ -309,6 +340,10 @@ enum Commands {
         /// Comma-separated list of tool names to explicitly exclude
         #[arg(long, value_name = "TOOLS")]
         exclude: Option<String>,
+        /// Sandbox mode for the server (e.g. "strict" or "no-fs-write,no-shell").
+        /// Defaults to the top-level --sandbox value, else allows everything.
+        #[arg(long, value_name = "MODE")]
+        sandbox: Option<String>,
     },
     /// Cell-based notebook with a browser UI
     Notebook {
@@ -356,7 +391,7 @@ enum Commands {
         #[arg(long)]
         path: Option<String>,
 
-        /// Kill evaluation after N milliseconds (default: 5000)
+        /// Kill evaluation after N milliseconds; 0 disables the timeout (default: 5000)
         #[arg(long, default_value = "5000")]
         timeout: u64,
 
@@ -668,10 +703,113 @@ fn build_interpreter(sandbox: &sema_core::Sandbox) -> Interpreter {
     let interpreter = Interpreter::new_with_sandbox(sandbox);
     sema_mcp::register_mcp_builtins(&interpreter.global_env, sandbox);
     sema::workflow_mcp::register_real_resolver();
+    install_ctrlc_handler(&interpreter);
     interpreter
 }
 
+/// Install a process-wide Ctrl-C handler that cancels every live root on this
+/// interpreter's persistent runtime, replacing the native CLI's former
+/// reliance on `check_interrupt` polling (that TLS stays for wasm's SAB-cancel
+/// path — see `crates/sema-core/src/async_signal.rs` — but nothing on native
+/// installs the callback that would make it fire, so a native script had no
+/// interruption path at all before this).
+///
+/// `ctrlc::set_handler` runs the closure on its own dedicated thread (not the
+/// raw OS signal handler itself), so it needs no async-signal-safety, but it
+/// DOES need to be `Send` — the closure below captures only
+/// [`RuntimeCommandHandle`](sema_vm::runtime::RuntimeCommandHandle) (a
+/// channel handle, `Send + Sync`, holding no `Rc`/`Value`/`Env`) plus plain
+/// `Send` bookkeeping (an `Instant` and an `AtomicU64`), never the
+/// `Interpreter` itself.
+///
+/// First Ctrl-C requests a graceful cancel (`cancel_all`): every live root
+/// settles `Cancelled(HostStop)`, which the existing drive loop
+/// (`Interpreter::drive_handle_to_settlement`) already surfaces as a normal
+/// `SemaError` through whichever `eval_str*` call is driving the program, so
+/// callers see the CLI's ordinary error-exit path with no new branch needed.
+/// A second Ctrl-C within 2s of the first — the runtime is unresponsive, or a
+/// Sema program is deliberately swallowing the cancellation — hard-exits
+/// immediately (`128 + SIGINT`), the conventional double-interrupt escape
+/// hatch. Ctrl-C presses spaced further apart than that are treated as
+/// independent requests (e.g. a REPL session cancelling one long-running
+/// command, then later cancelling an unrelated one) rather than accumulating
+/// toward a hard exit.
+///
+/// Only meaningful while raw terminal mode is OFF (a plain blocking eval —
+/// `-e`, a script file, or code running between REPL prompts): reedline only
+/// enables raw mode for the duration of `read_line` and disables `ISIG`, so a
+/// Ctrl-C keypress at the REPL prompt itself never reaches this handler as a
+/// real `SIGINT` — it is delivered to reedline as a raw key event and handled
+/// entirely by the REPL's own `Signal::CtrlC` branch, unchanged.
+fn install_ctrlc_handler(interpreter: &Interpreter) {
+    let handle = interpreter.command_handle();
+    let start = std::time::Instant::now();
+    let last_sigint_ms = std::sync::atomic::AtomicU64::new(0);
+    // A second interpreter in the same process would hit MultipleHandlers here,
+    // leaving Ctrl-C pinned to the FIRST interpreter's (possibly dead) handle —
+    // single-press would then no-op (double-press still hard-exits). Every
+    // current build_interpreter call site is a mutually exclusive subcommand
+    // path, so the install runs once per process.
+    let _ = ctrlc::set_handler(move || {
+        let now_ms = start.elapsed().as_millis() as u64;
+        let previous_ms = last_sigint_ms.swap(now_ms, std::sync::atomic::Ordering::SeqCst);
+        if is_double_interrupt(previous_ms, now_ms) {
+            // Exit code 130 = 128 + SIGINT(2), the shell convention for
+            // "killed by Ctrl-C" (matches what the OS default SIGINT
+            // disposition would have produced had we never installed a
+            // handler).
+            std::process::exit(130);
+        }
+        handle.cancel_all();
+    });
+}
+
+/// The double-interrupt decision `install_ctrlc_handler` applies on every
+/// `SIGINT`: `previous_ms`/`now_ms` are millis-since-process-start of the
+/// prior and current signal (`0` for "no prior signal yet"). `true` means
+/// hard-exit instead of another graceful `cancel_all` — the second Ctrl-C
+/// arrived within `DOUBLE_INTERRUPT_WINDOW_MS` of the first, the
+/// conventional "it's not responding, just kill it" escape hatch. Pulled out
+/// of the signal-handler closure as a pure function so the window arithmetic
+/// (in particular the `previous_ms != 0` "no prior signal" guard and the
+/// `saturating_sub` protecting against a first signal landing at exactly
+/// `0ms`) is unit-testable without spawning a process or sending real
+/// signals.
+fn is_double_interrupt(previous_ms: u64, now_ms: u64) -> bool {
+    const DOUBLE_INTERRUPT_WINDOW_MS: u64 = 2_000;
+    previous_ms != 0 && now_ms.saturating_sub(previous_ms) < DOUBLE_INTERRUPT_WINDOW_MS
+}
+
+#[cfg(test)]
+mod ctrlc_tests {
+    use super::is_double_interrupt;
+
+    #[test]
+    fn first_signal_never_hard_exits() {
+        // previous_ms == 0 is the sentinel for "no prior signal", including
+        // the edge case of a first signal landing at exactly process-start.
+        assert!(!is_double_interrupt(0, 0));
+        assert!(!is_double_interrupt(0, 5_000));
+    }
+
+    #[test]
+    fn second_signal_within_window_hard_exits() {
+        assert!(is_double_interrupt(1_000, 1_001));
+        assert!(is_double_interrupt(1_000, 2_999));
+    }
+
+    #[test]
+    fn second_signal_outside_window_is_treated_as_independent() {
+        assert!(!is_double_interrupt(1_000, 3_000));
+        assert!(!is_double_interrupt(1_000, 60_000));
+    }
+}
+
 fn main() {
+    // reqwest is built with rustls-no-provider (see workspace Cargo.toml); install
+    // the ring provider before anything (OTLP exporter, pkg, LLM) builds a client.
+    sema_llm::http::ensure_crypto_provider();
+
     // Check for embedded archive before parsing CLI args
     if let Some(exit_code) = try_run_embedded() {
         std::process::exit(exit_code);
@@ -800,6 +938,8 @@ fn main() {
                 target,
                 list_targets,
                 no_cache,
+                verbose,
+                json,
             } => {
                 if list_targets {
                     cross_compile::list_targets();
@@ -813,6 +953,7 @@ fn main() {
                     runtime.as_deref(),
                     target.as_deref(),
                     no_cache,
+                    BuildOutputOpts { verbose, json },
                 ) {
                     eprintln!("Error: {e}");
                     std::process::exit(1);
@@ -825,6 +966,7 @@ fn main() {
                 width,
                 indent,
                 align,
+                max_blank_lines,
                 json,
             } => {
                 let config = find_config().unwrap_or_default();
@@ -832,8 +974,9 @@ fn main() {
                     width: width.unwrap_or(config.fmt.width),
                     indent: indent.unwrap_or(config.fmt.indent),
                     align: align || config.fmt.align,
+                    max_blank_lines: max_blank_lines.unwrap_or(config.fmt.max_blank_lines),
                 };
-                run_fmt(&files, check, diff, &opts, json);
+                run_fmt(&files, check, diff, &opts, &config.fmt.ignore, json);
             }
             Commands::Lsp => {
                 eprintln!("Sema LSP server starting on stdio...");
@@ -855,6 +998,7 @@ fn main() {
                 files,
                 include,
                 exclude,
+                sandbox: mcp_sandbox,
             } => {
                 if let Some(auth) = auth {
                     let result = match auth {
@@ -890,7 +1034,17 @@ fn main() {
                         .collect::<Vec<String>>()
                 });
 
-                let sandbox = sema_core::Sandbox::allow_all();
+                // --sandbox on the subcommand wins; else the top-level --sandbox
+                // (already parsed into `sandbox`, defaulting to allow-all). The
+                // server historically hardcoded allow_all, so absent flags keep
+                // exactly that behavior.
+                let sandbox = match mcp_sandbox.as_deref() {
+                    Some(value) => sema_core::Sandbox::parse_cli(value).unwrap_or_else(|e| {
+                        eprintln!("mcp: invalid --sandbox: {e}");
+                        std::process::exit(1);
+                    }),
+                    None => sandbox,
+                };
                 let interpreter = build_interpreter(&sandbox);
 
                 let _ = interpreter.eval_str("(llm/auto-configure)");
@@ -910,18 +1064,13 @@ fn main() {
                     }
                 }
 
-                tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .expect("Failed to create tokio runtime")
-                    .block_on(async {
-                        if let Err(e) =
-                            sema_mcp::run_mcp_server(interpreter, inc_tools, exc_tools).await
-                        {
-                            eprintln!("MCP server error: {e}");
-                            std::process::exit(1);
-                        }
-                    });
+                // Sync loop, deliberately NO tokio runtime: with an ambient
+                // runtime, llm/* builtins hit io_block_on's runtime-in-runtime
+                // panic and killed the server on the first LLM tool call.
+                if let Err(e) = sema_mcp::run_mcp_server_sync(interpreter, inc_tools, exc_tools) {
+                    eprintln!("MCP server error: {e}");
+                    std::process::exit(1);
+                }
             }
             Commands::Notebook { command } => {
                 run_notebook_command(command);
@@ -946,11 +1095,11 @@ fn main() {
                 expr,
                 json,
                 path,
-                timeout: _timeout,
+                timeout,
                 sandbox,
                 no_llm,
             } => {
-                run_eval(stdin, expr, json, path, sandbox, no_llm);
+                run_eval(stdin, expr, json, path, timeout, sandbox, no_llm);
             }
             Commands::Update {
                 check,
@@ -1440,23 +1589,12 @@ fn open_in_browser(url: &str) {
 
 /// Drain any pending async tasks scheduled by a top-level form.
 ///
-/// Top-level `(async ...)` forms spawn a task but don't implicitly await it,
-/// so their side effects would silently vanish on exit unless we explicitly
-/// run the scheduler. This drains all pending tasks (target = `All`).
-///
-/// The scheduler callback is only registered once an eval has run, so we
-/// silently ignore the "no async scheduler registered" error (nothing async was
-/// scheduled). Other scheduler errors are reported to stderr as warnings but do
-/// not fail the program — the side effects already ran.
-pub(crate) fn drain_async_scheduler(interpreter: &Interpreter) {
-    if let Err(e) = sema_core::call_run_scheduler(&interpreter.ctx, None) {
-        let msg = e.to_string();
-        if msg.contains("no async scheduler registered") {
-            return;
-        }
-        eprintln!("warning: background task error: {msg}");
-    }
-}
+/// Retained as a call-site marker; under the unified cooperative runtime the
+/// evaluator already drives every spawned task to completion during `eval`
+/// (the persistent runtime drains to idle before returning), and any still-
+/// detached task is reaped by the interpreter's bounded shutdown on drop. There
+/// is no separate scheduler to run, so this is a no-op.
+pub(crate) fn drain_async_scheduler(_interpreter: &Interpreter) {}
 
 fn run_notebook_command(command: NotebookCommands) {
     match command {
@@ -1599,6 +1737,7 @@ fn run_eval(
     expr: Option<String>,
     json: bool,
     path: Option<String>,
+    timeout_ms: u64,
     sandbox_arg: Option<String>,
     no_llm: bool,
 ) {
@@ -1695,6 +1834,17 @@ fn run_eval(
     let captured_stderr: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
     if json {
         install_capturing_io(&interpreter, &captured_stdout, &captured_stderr);
+    }
+
+    // Arm the VM's wall-clock deadline so runaway loops abort with an eval
+    // error instead of hanging the caller. Armed after (llm/auto-configure)
+    // so setup time is not billed to the user's program; it stays armed
+    // through the async drain so spawned tasks are bounded too. A saturating
+    // deadline (checked_add → None) means "no timeout", same as 0.
+    if timeout_ms > 0 {
+        let deadline =
+            std::time::Instant::now().checked_add(std::time::Duration::from_millis(timeout_ms));
+        interpreter.ctx.set_eval_deadline(deadline);
     }
 
     let start = std::time::Instant::now();
@@ -2000,16 +2150,11 @@ fn try_run_embedded() -> Option<i32> {
             return Some(1);
         }
 
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("Failed to create tokio runtime")
-            .block_on(async {
-                if let Err(e) = sema_mcp::run_mcp_server(interpreter, inc_tools, exc_tools).await {
-                    eprintln!("MCP server error: {e}");
-                    std::process::exit(1);
-                }
-            });
+        // Same no-ambient-runtime rule as the CLI mcp arm (llm/* + io_block_on).
+        if let Err(e) = sema_mcp::run_mcp_server_sync(interpreter, inc_tools, exc_tools) {
+            eprintln!("MCP server error: {e}");
+            std::process::exit(1);
+        }
         Some(0)
     } else {
         match run_bytecode_bytes(&interpreter, &bytecode) {
@@ -2022,121 +2167,244 @@ fn try_run_embedded() -> Option<i32> {
     }
 }
 
-fn run_build(
-    file: &str,
+/// Expand a leading `~` to the user's home directory. Shells do not tilde-expand
+/// inside `--output=~/x` (the `~` follows `=`), so without this the path would be
+/// created literally as a directory named `~` in the cwd — a deletion hazard.
+fn expand_tilde(path: &str) -> std::path::PathBuf {
+    let home = || std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE"));
+    if path == "~" {
+        if let Ok(h) = home() {
+            return std::path::PathBuf::from(h);
+        }
+    } else if let Some(rest) = path.strip_prefix("~/") {
+        if let Ok(h) = home() {
+            return std::path::Path::new(&h).join(rest);
+        }
+    }
+    std::path::PathBuf::from(path)
+}
+
+/// The default output filename for a build: source stem, plus `.exe` for Windows
+/// targets (or a host build on Windows).
+fn default_output_name(source: &std::path::Path, target: Option<&str>) -> String {
+    let stem = source
+        .file_stem()
+        .unwrap_or(source.as_os_str())
+        .to_string_lossy();
+    let needs_exe = target
+        .and_then(|t| cross_compile::resolve_target(t).ok())
+        .is_some_and(cross_compile::is_windows_target)
+        || (target.is_none() && cfg!(windows));
+    if needs_exe {
+        format!("{stem}.exe")
+    } else {
+        stem.into_owned()
+    }
+}
+
+/// Resolve `--output` to the actual file path a single-target build writes.
+/// A path that IS a directory (or ends in a separator) means "default filename
+/// inside this directory"; anything else is the file path itself.
+fn resolve_output_path(
     output: Option<&str>,
-    includes: &[String],
-    runtime: Option<&str>,
+    source: &std::path::Path,
     target: Option<&str>,
-    no_cache: bool,
-) -> Result<(), String> {
-    // Handle --target all (build for every supported target)
-    if target == Some("all") {
-        let stem = std::path::Path::new(file)
-            .file_stem()
-            .unwrap_or(std::ffi::OsStr::new(file))
-            .to_string_lossy();
-        let mut failures = Vec::new();
-        for t in cross_compile::SUPPORTED_TARGETS {
+) -> std::path::PathBuf {
+    match output {
+        None => std::path::PathBuf::from(default_output_name(source, target)),
+        Some(o) => {
+            let p = expand_tilde(o);
+            if p.is_dir() || o.ends_with('/') || o.ends_with(std::path::MAIN_SEPARATOR) {
+                p.join(default_output_name(source, target))
+            } else {
+                p
+            }
+        }
+    }
+}
+
+/// Plan the per-target output paths for `--target all`, honoring `--output`:
+/// a directory output gets `<dir>/<stem>-<target>[.exe]`; a file-ish output is
+/// used as the base name, `<base>-<target>[.exe]` (a trailing `.exe` on the base
+/// is dropped first); no output means `<stem>-<target>[.exe]` in the cwd.
+fn plan_all_target_outputs(
+    output: Option<&str>,
+    source: &std::path::Path,
+) -> Vec<(&'static str, std::path::PathBuf)> {
+    let stem = source
+        .file_stem()
+        .unwrap_or(source.as_os_str())
+        .to_string_lossy()
+        .into_owned();
+    let (dir, base): (std::path::PathBuf, String) = match output {
+        None => (std::path::PathBuf::new(), stem),
+        Some(o) => {
+            let p = expand_tilde(o);
+            if p.is_dir() || o.ends_with('/') || o.ends_with(std::path::MAIN_SEPARATOR) {
+                (p, stem)
+            } else {
+                let base = p
+                    .file_name()
+                    .map(|f| {
+                        let f = f.to_string_lossy();
+                        f.strip_suffix(".exe").unwrap_or(&f).to_string()
+                    })
+                    .unwrap_or(stem);
+                (
+                    p.parent().map(|d| d.to_path_buf()).unwrap_or_default(),
+                    base,
+                )
+            }
+        }
+    };
+    cross_compile::SUPPORTED_TARGETS
+        .iter()
+        .map(|&t| {
             let ext = if cross_compile::is_windows_target(t) {
                 ".exe"
             } else {
                 ""
             };
-            let target_output = format!("{stem}-{t}{ext}");
-            eprintln!("\n━━━ Building for {t} ━━━");
-            if let Err(e) = run_build(
-                file,
-                Some(&target_output),
-                includes,
-                None,
-                Some(t),
-                no_cache,
-            ) {
-                eprintln!("Error: {e}");
-                failures.push(*t);
-            }
-        }
-        if !failures.is_empty() {
-            return Err(format!(
-                "failed to build for {} target(s): {}\n  Hint: re-run a single target for details: `sema build --target <target> {}`\n  Hint: use `--runtime /path/to/sema` if downloads fail, or install a released version of sema.",
-                failures.len(),
-                failures.join(", "),
-                file
-            ));
-        }
-        return Ok(());
-    }
+            (t, dir.join(format!("{base}-{t}{ext}")))
+        })
+        .collect()
+}
 
-    if target == Some("web") {
-        return run_build_web(file, output, includes);
-    }
+/// Output-mode flags for `sema build`, threaded through the pipeline.
+#[derive(Clone, Copy, Default)]
+struct BuildOutputOpts {
+    verbose: bool,
+    json: bool,
+}
 
+/// The target-independent build product — one archive, embedded into every
+/// per-target executable.
+struct BuildArchive {
+    files_count: usize,
+    archive_bytes: Vec<u8>,
+}
+
+/// One successfully written artifact (native executable or web .vfs archive).
+struct BuiltArtifact {
+    /// Resolved target triple, or "web".
+    target: String,
+    /// Absolute output path.
+    path: std::path::PathBuf,
+    bytes: u64,
+    /// How the runtime was obtained: "host" | "cached" | "downloaded" | "custom",
+    /// or None for web (no runtime is embedded).
+    runtime: Option<&'static str>,
+    duration: std::time::Duration,
+}
+
+/// `29289346` → `27.9 MB` (base-1024, one decimal above bytes).
+fn human_size(bytes: u64) -> String {
+    const UNITS: [&str; 4] = ["B", "KB", "MB", "GB"];
+    let mut v = bytes as f64;
+    let mut u = 0;
+    while v >= 1024.0 && u < UNITS.len() - 1 {
+        v /= 1024.0;
+        u += 1;
+    }
+    if u == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{v:.1} {}", UNITS[u])
+    }
+}
+
+fn human_duration(d: std::time::Duration) -> String {
+    let secs = d.as_secs_f64();
+    if secs < 60.0 {
+        format!("{secs:.1}s")
+    } else {
+        format!("{}m {:02}s", d.as_secs() / 60, d.as_secs() % 60)
+    }
+}
+
+/// Split a target triple into user-facing (os, arch) — `aarch64-apple-darwin`
+/// → ("macos", "arm64"). Unknown triples fall back to the raw string.
+fn triple_os_arch(target: &str) -> (&'static str, String) {
+    if target == "web" {
+        return ("web", "-".to_string());
+    }
+    let arch = match target.split('-').next().unwrap_or(target) {
+        "aarch64" => "arm64".to_string(),
+        other => other.to_string(),
+    };
+    let os = if target.contains("apple-darwin") {
+        "macos"
+    } else if target.contains("linux") {
+        "linux"
+    } else if target.contains("windows") {
+        "windows"
+    } else {
+        "?"
+    };
+    (os, arch)
+}
+
+fn sha256_hex_of_file(path: &std::path::Path) -> Option<String> {
+    use sha2::Digest;
+    let data = std::fs::read(path).ok()?;
+    let hash = sha2::Sha256::digest(&data);
+    Some(hash.iter().map(|b| format!("{b:02x}")).collect())
+}
+
+/// Refuse to clobber the source file itself (`-o hello.sema` would otherwise
+/// silently replace the program with its own binary).
+fn check_output_not_source(
+    source: &std::path::Path,
+    output_path: &std::path::Path,
+) -> Result<(), String> {
+    let a = std::fs::canonicalize(source).unwrap_or_else(|_| source.to_path_buf());
+    let b = std::fs::canonicalize(output_path).unwrap_or_else(|_| output_path.to_path_buf());
+    if a == b {
+        return Err(format!(
+            "Output path would overwrite the source file '{}'.\n  Hint: use `-o <output>` to specify a different output path, or rename your source file to use a .sema extension.",
+            source.display()
+        ));
+    }
+    Ok(())
+}
+
+/// Steps 1–4: compile → trace imports → collect assets → serialize archive.
+/// Fully target-independent; `--target all` runs this ONCE. Prints the per-step
+/// detail only in verbose mode, plus a one-line completion note always (stderr).
+fn build_archive(
+    file: &str,
+    includes: &[String],
+    opts: BuildOutputOpts,
+) -> Result<BuildArchive, String> {
     let path = std::path::Path::new(file);
-
     let source = read_source_file(path)?;
 
-    // Pre-flight: resolve output path now so we can probe the parent directory
-    // for writability before running any compilation steps. This avoids the
-    // frustrating "failed at step 5 of 5" experience when the user gave an
-    // unwritable -o path.
-    let output_path: std::path::PathBuf = match output {
-        Some(o) => std::path::PathBuf::from(o),
-        None => {
-            let stem = path.file_stem().unwrap_or(path.as_os_str());
-            let needs_exe = target
-                .and_then(|t| cross_compile::resolve_target(t).ok())
-                .is_some_and(cross_compile::is_windows_target)
-                || (target.is_none() && cfg!(windows));
-            if needs_exe {
-                std::path::PathBuf::from(format!("{}.exe", stem.to_string_lossy()))
-            } else {
-                std::path::PathBuf::from(stem)
-            }
-        }
-    };
-    probe_output_writable(&output_path)?;
+    if opts.verbose {
+        eprintln!("[1/4] Compiling {file}...");
+    }
 
-    eprintln!("[1/5] Compiling {file}...");
-
-    // Compute source hash and compile to bytecode
     let source_hash = crc32fast::hash(source.as_bytes());
     let sandbox = sema_core::Sandbox::allow_all();
     let interpreter = build_interpreter(&sandbox);
 
-    let result = match interpreter.compile_to_bytecode(&source) {
-        Ok(r) => r,
-        Err(e) => {
-            return Err(format!("compile error: {}", e.inner()));
-        }
-    };
+    let result = interpreter
+        .compile_to_bytecode(&source)
+        .map_err(|e| format!("compile error: {}", e.inner()))?;
+    let bytecode = sema_vm::serialize_to_bytes(&result, source_hash)
+        .map_err(|e| format!("serialization error: {}", e.inner()))?;
 
-    let bytecode = match sema_vm::serialize_to_bytes(&result, source_hash) {
-        Ok(b) => b,
-        Err(e) => {
-            return Err(format!("serialization error: {}", e.inner()));
-        }
-    };
+    if opts.verbose {
+        eprintln!("[2/4] Tracing imports...");
+    }
+    let imports =
+        import_tracer::trace_imports(path).map_err(|e| format!("tracing imports: {e}"))?;
 
-    eprintln!("[2/5] Tracing imports...");
-
-    // Trace transitive imports
-    let imports = match import_tracer::trace_imports(path) {
-        Ok(m) => m,
-        Err(e) => {
-            return Err(format!("tracing imports: {e}"));
-        }
-    };
-
-    eprintln!("[3/5] Collecting assets...");
-
-    // Build VFS files map
+    if opts.verbose {
+        eprintln!("[3/4] Collecting assets...");
+    }
     let mut files = std::collections::HashMap::new();
-
-    // Entry point bytecode
     files.insert("__main__.semac".to_string(), bytecode);
 
-    // Traced imports
     for (rel_path, contents) in &imports {
         if let Err(e) = sema_core::vfs::validate_vfs_path(rel_path) {
             eprintln!("Warning: skipping import with invalid VFS path: {e}");
@@ -2145,7 +2413,6 @@ fn run_build(
         files.insert(rel_path.clone(), contents.clone());
     }
 
-    // Additional --include assets
     for include in includes {
         let inc_path = std::path::Path::new(include);
         if inc_path.is_dir() {
@@ -2178,9 +2445,13 @@ fn run_build(
         }
     }
 
-    eprintln!("[4/5] Building archive ({} files)...", files.len());
-
-    // Build metadata
+    if opts.verbose {
+        eprintln!(
+            "[4/4] Building archive ({} file{})...",
+            files.len(),
+            if files.len() == 1 { "" } else { "s" }
+        );
+    }
     let mut metadata = std::collections::HashMap::new();
     metadata.insert(
         "sema-version".to_string(),
@@ -2202,25 +2473,38 @@ fn run_build(
     );
 
     let archive_bytes = archive::serialize_archive(&metadata, &files);
+    eprintln!(
+        "Compiled {file} → archive ({} file{}, {})",
+        files.len(),
+        if files.len() == 1 { "" } else { "s" },
+        human_size(archive_bytes.len() as u64)
+    );
 
-    eprintln!("[5/5] Writing executable...");
+    Ok(BuildArchive {
+        files_count: files.len(),
+        archive_bytes,
+    })
+}
 
-    // Check that output doesn't overwrite the source file
-    let input_canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-    let output_canonical =
-        std::fs::canonicalize(&output_path).unwrap_or_else(|_| output_path.clone());
-    if input_canonical == output_canonical {
-        return Err(format!(
-            "Output path would overwrite the source file '{}'.\n  Hint: use `-o <output>` to specify a different output path, or rename your source file to use a .sema extension.",
-            path.display()
-        ));
-    }
+/// Step 5: resolve the runtime for one target and write the executable.
+fn write_target_executable(
+    source: &std::path::Path,
+    archive: &BuildArchive,
+    output_path: &std::path::Path,
+    runtime: Option<&str>,
+    target: Option<&str>,
+    no_cache: bool,
+    opts: BuildOutputOpts,
+) -> Result<BuiltArtifact, String> {
+    let started = std::time::Instant::now();
+    check_output_not_source(source, output_path)?;
+    probe_output_writable(output_path)?;
 
-    // Resolve target triple for later use
     let resolved_target = target.and_then(|t| cross_compile::resolve_target(t).ok());
 
-    // Determine runtime binary
-    let runtime_path = if let Some(r) = runtime {
+    let (runtime_path, runtime_source): (std::path::PathBuf, &'static str) = if let Some(r) =
+        runtime
+    {
         // Validate runtime binary format against target if both are specified
         if let Some(resolved) = resolved_target {
             let runtime_bytes =
@@ -2235,60 +2519,277 @@ fn run_build(
                 }
             }
         }
-        std::path::PathBuf::from(r)
+        (std::path::PathBuf::from(r), "custom")
     } else if let Some(t) = target {
-        let resolved = match cross_compile::resolve_target(t) {
-            Ok(t) => t,
-            Err(e) => {
-                return Err(e.to_string());
-            }
-        };
+        let resolved = cross_compile::resolve_target(t).map_err(|e| e.to_string())?;
         if cross_compile::is_host_target(resolved) {
-            eprintln!("  Target {resolved} matches host — using local runtime (no download)");
-            match std::env::current_exe() {
-                Ok(p) => p,
-                Err(e) => {
-                    return Err(format!("cannot determine current executable path: {e}"));
-                }
+            if opts.verbose {
+                eprintln!("  Target {resolved} matches host — using local runtime (no download)");
             }
+            let exe = std::env::current_exe()
+                .map_err(|e| format!("cannot determine current executable path: {e}"))?;
+            (exe, "host")
         } else {
-            match cross_compile::ensure_runtime(resolved, no_cache) {
-                Ok(p) => p,
-                Err(e) => {
-                    return Err(e.to_string());
-                }
-            }
+            let (path, fetch) = cross_compile::ensure_runtime(resolved, no_cache, opts.verbose)
+                .map_err(|e| e.to_string())?;
+            let label = match fetch {
+                cross_compile::RuntimeFetch::Cached => "cached",
+                cross_compile::RuntimeFetch::Downloaded => "downloaded",
+            };
+            (path, label)
         }
     } else {
-        match std::env::current_exe() {
-            Ok(p) => p,
-            Err(e) => {
-                return Err(format!("cannot determine current executable path: {e}"));
-            }
-        }
+        let exe = std::env::current_exe()
+            .map_err(|e| format!("cannot determine current executable path: {e}"))?;
+        (exe, "host")
     };
 
-    if let Err(e) = write_executable_platform(&runtime_path, &output_path, &archive_bytes) {
-        return Err(format!("writing executable: {e}"));
+    write_executable_platform(&runtime_path, output_path, &archive.archive_bytes)
+        .map_err(|e| format!("writing executable: {e}"))?;
+
+    let bytes = std::fs::metadata(output_path).map(|m| m.len()).unwrap_or(0);
+    let abs = std::path::absolute(output_path).unwrap_or_else(|_| output_path.to_path_buf());
+    Ok(BuiltArtifact {
+        target: resolved_target
+            .unwrap_or_else(cross_compile::host_target)
+            .to_string(),
+        path: abs,
+        bytes,
+        runtime: Some(runtime_source),
+        duration: started.elapsed(),
+    })
+}
+
+/// Print the machine-readable manifest for any build (single, all, or web).
+fn print_build_json(
+    source: &str,
+    bundled_files: usize,
+    archive_bytes: usize,
+    artifacts: &[BuiltArtifact],
+    failures: &[(String, String)],
+    elapsed: std::time::Duration,
+) {
+    let mut targets: Vec<serde_json::Value> = Vec::new();
+    for a in artifacts {
+        let (os, arch) = triple_os_arch(&a.target);
+        targets.push(serde_json::json!({
+            "target": a.target,
+            "os": os,
+            "arch": arch,
+            "path": a.path,
+            "bytes": a.bytes,
+            "sha256": sha256_hex_of_file(&a.path),
+            "runtime": a.runtime,
+            "ok": true,
+            "error": null,
+        }));
     }
-
-    eprintln!(
-        "Built: {} ({} bytes, {} bundled files)",
-        output_path.display(),
-        std::fs::metadata(&output_path)
-            .map(|m| m.len())
-            .unwrap_or(0),
-        files.len()
+    for (t, e) in failures {
+        let (os, arch) = triple_os_arch(t);
+        targets.push(serde_json::json!({
+            "target": t,
+            "os": os,
+            "arch": arch,
+            "path": null,
+            "bytes": null,
+            "sha256": null,
+            "runtime": null,
+            "ok": false,
+            "error": e,
+        }));
+    }
+    let manifest = serde_json::json!({
+        "source": std::path::absolute(source).unwrap_or_else(|_| source.into()),
+        "bundled_files": bundled_files,
+        "archive_bytes": archive_bytes,
+        "duration_ms": elapsed.as_millis() as u64,
+        "targets": targets,
+    });
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&manifest).unwrap_or_else(|_| "{}".to_string())
     );
+}
 
-    if let Some(resolved) = resolved_target {
-        if !cross_compile::is_host_target(resolved) {
-            eprintln!(
-                "  Note: this binary targets {resolved} and won't run on your current machine."
-            );
+/// Render the aligned human summary table for `--target all`.
+fn render_build_summary(
+    artifacts: &[BuiltArtifact],
+    failures: &[(String, String)],
+    elapsed: std::time::Duration,
+) -> String {
+    use std::fmt::Write;
+    let mut out = String::new();
+    let total = artifacts.len() + failures.len();
+    let _ = writeln!(
+        out,
+        "Built {}/{} target{} in {}:",
+        artifacts.len(),
+        total,
+        if total == 1 { "" } else { "s" },
+        human_duration(elapsed)
+    );
+    let _ = writeln!(out);
+    // rows: (os, arch, size-or-FAILED, path-or-error)
+    let mut rows: Vec<(String, String, String, String)> = Vec::new();
+    for a in artifacts {
+        let (os, arch) = triple_os_arch(&a.target);
+        rows.push((
+            os.to_string(),
+            arch,
+            human_size(a.bytes),
+            a.path.display().to_string(),
+        ));
+    }
+    for (t, e) in failures {
+        let (os, arch) = triple_os_arch(t);
+        let first = e.lines().next().unwrap_or("build failed").to_string();
+        rows.push((os.to_string(), arch, "FAILED".to_string(), first));
+    }
+    let w_os = rows.iter().map(|r| r.0.len()).max().unwrap_or(0);
+    let w_arch = rows.iter().map(|r| r.1.len()).max().unwrap_or(0);
+    let w_size = rows.iter().map(|r| r.2.len()).max().unwrap_or(0);
+    for (os, arch, size, path) in rows {
+        let _ = writeln!(
+            out,
+            "  {os:<w_os$}  {arch:<w_arch$}  {size:>w_size$}   {path}"
+        );
+    }
+    out
+}
+
+/// Build every supported native target from one shared archive.
+fn run_build_all(
+    file: &str,
+    output: Option<&str>,
+    includes: &[String],
+    runtime: Option<&str>,
+    no_cache: bool,
+    opts: BuildOutputOpts,
+) -> Result<(), String> {
+    let started = std::time::Instant::now();
+    if runtime.is_some() {
+        // clap's conflicts_with should prevent this; belt and braces.
+        return Err("--runtime cannot be combined with --target all".to_string());
+    }
+    let source = std::path::Path::new(file);
+    let archive = build_archive(file, includes, opts)?;
+    let plans = plan_all_target_outputs(output, source);
+    let name_w = plans.iter().map(|(t, _)| t.len()).max().unwrap_or(0);
+
+    let mut artifacts: Vec<BuiltArtifact> = Vec::new();
+    let mut failures: Vec<(String, String)> = Vec::new();
+    for (t, target_output) in &plans {
+        match write_target_executable(
+            source,
+            &archive,
+            target_output,
+            None,
+            Some(t),
+            no_cache,
+            opts,
+        ) {
+            Ok(a) => {
+                eprintln!(
+                    "  {t:<name_w$}  ✓ {:>6}  ({} runtime)",
+                    human_duration(a.duration),
+                    a.runtime.unwrap_or("host"),
+                );
+                artifacts.push(a);
+            }
+            Err(e) => {
+                let first = e.lines().next().unwrap_or("build failed");
+                eprintln!("  {t:<name_w$}  ✗ {first}");
+                failures.push((t.to_string(), e));
+            }
         }
     }
 
+    eprintln!();
+    if opts.json {
+        print_build_json(
+            file,
+            archive.files_count,
+            archive.archive_bytes.len(),
+            &artifacts,
+            &failures,
+            started.elapsed(),
+        );
+    } else {
+        print!(
+            "{}",
+            render_build_summary(&artifacts, &failures, started.elapsed())
+        );
+    }
+
+    if !failures.is_empty() {
+        let failed: Vec<&str> = failures.iter().map(|(t, _)| t.as_str()).collect();
+        return Err(format!(
+            "failed to build for {} target(s): {}\n  Hint: re-run a single target for details: `sema build --target <target> {}`\n  Hint: use `--runtime /path/to/sema` if downloads fail, or install a released version of sema.",
+            failed.len(),
+            failed.join(", "),
+            file
+        ));
+    }
+    Ok(())
+}
+
+fn run_build(
+    file: &str,
+    output: Option<&str>,
+    includes: &[String],
+    runtime: Option<&str>,
+    target: Option<&str>,
+    no_cache: bool,
+    opts: BuildOutputOpts,
+) -> Result<(), String> {
+    if target == Some("all") {
+        return run_build_all(file, output, includes, runtime, no_cache, opts);
+    }
+    if target == Some("web") {
+        return run_build_web(file, output, includes, opts);
+    }
+
+    let started = std::time::Instant::now();
+    let path = std::path::Path::new(file);
+
+    // Pre-flight before any compilation: resolve the output path, refuse to
+    // clobber the source, and probe the parent for writability (creating missing
+    // directories). Avoids "failed at the last step" after a full compile.
+    let output_path = resolve_output_path(output, path, target);
+    check_output_not_source(path, &output_path)?;
+    probe_output_writable(&output_path)?;
+
+    let archive = build_archive(file, includes, opts)?;
+    let artifact = write_target_executable(
+        path,
+        &archive,
+        &output_path,
+        runtime,
+        target,
+        no_cache,
+        opts,
+    )?;
+
+    if opts.json {
+        print_build_json(
+            file,
+            archive.files_count,
+            archive.archive_bytes.len(),
+            std::slice::from_ref(&artifact),
+            &[],
+            started.elapsed(),
+        );
+    } else {
+        println!(
+            "Built {} ({}, {} bundled file{}) for {} in {}",
+            artifact.path.display(),
+            human_size(artifact.bytes),
+            archive.files_count,
+            if archive.files_count == 1 { "" } else { "s" },
+            artifact.target,
+            human_duration(started.elapsed())
+        );
+    }
     Ok(())
 }
 
@@ -2321,7 +2822,7 @@ fn web_output_path(input: &std::path::Path, output: Option<&str>) -> std::path::
 
     match output {
         Some(raw) => {
-            let path = std::path::PathBuf::from(raw);
+            let path = expand_tilde(raw);
             if path.is_dir() || raw.ends_with(std::path::MAIN_SEPARATOR) {
                 path.join(default_name)
             } else if path.extension().is_none() {
@@ -2341,14 +2842,20 @@ fn web_output_path(input: &std::path::Path, output: Option<&str>) -> std::path::
 pub(crate) fn build_web_archive(
     path: &std::path::Path,
     includes: &[String],
+    opts: BuildOutputOpts,
 ) -> Result<(Vec<u8>, usize), String> {
     let source =
         std::fs::read_to_string(path).map_err(|e| format!("reading {}: {e}", path.display()))?;
+    if opts.verbose {
+        eprintln!("[1/4] Compiling {} (web prelude)...", path.display());
+    }
     let entry_bytecode = compile_source_to_bytecode(&source)?;
 
+    if opts.verbose {
+        eprintln!("[2/4] Tracing imports...");
+    }
     let imports =
         import_tracer::trace_imports(path).map_err(|e| format!("tracing imports: {e}"))?;
-    let import_count = imports.len();
 
     let mut files = std::collections::HashMap::new();
     files.insert("__main__.semac".to_string(), entry_bytecode);
@@ -2371,6 +2878,9 @@ pub(crate) fn build_web_archive(
         files.insert(rel_path.clone(), bundled);
     }
 
+    if opts.verbose {
+        eprintln!("[3/4] Collecting assets...");
+    }
     for include in includes {
         let inc_path = std::path::Path::new(include);
         if inc_path.is_dir() {
@@ -2424,17 +2934,36 @@ pub(crate) fn build_web_archive(
         canonical_root.to_string_lossy().into_owned().into_bytes(),
     );
 
-    Ok((archive::serialize_archive(&metadata, &files), import_count))
+    if opts.verbose {
+        eprintln!(
+            "[4/4] Building archive ({} file{})...",
+            files.len(),
+            if files.len() == 1 { "" } else { "s" }
+        );
+    }
+    let files_count = files.len();
+    Ok((archive::serialize_archive(&metadata, &files), files_count))
 }
 
-fn run_build_web(file: &str, output: Option<&str>, includes: &[String]) -> Result<(), String> {
+fn run_build_web(
+    file: &str,
+    output: Option<&str>,
+    includes: &[String],
+    opts: BuildOutputOpts,
+) -> Result<(), String> {
+    let started = std::time::Instant::now();
     let path = std::path::Path::new(file);
     if !path.exists() {
         return Err(format!("source file not found: {file}"));
     }
 
-    eprintln!("Compiling {file} for web...");
-    let (archive_bytes, import_count) = build_web_archive(path, includes)?;
+    let (archive_bytes, files_count) = build_web_archive(path, includes, opts)?;
+    eprintln!(
+        "Compiled {file} → web archive ({} file{}, {})",
+        files_count,
+        if files_count == 1 { "" } else { "s" },
+        human_size(archive_bytes.len() as u64)
+    );
 
     let output_path = web_output_path(path, output);
     if let Some(parent) = output_path.parent() {
@@ -2446,16 +2975,33 @@ fn run_build_web(file: &str, output: Option<&str>, includes: &[String]) -> Resul
     std::fs::write(&output_path, &archive_bytes)
         .map_err(|e| format!("writing {}: {e}", output_path.display()))?;
 
-    eprintln!(
-        "Built web archive: {} ({} bytes, {} imports bundled)",
-        output_path.display(),
-        archive_bytes.len(),
-        import_count
-    );
-    eprintln!(
-        "  Load with <script type=\"text/sema\" src=\"{}\"></script>",
-        output_path.display()
-    );
+    let abs = std::path::absolute(&output_path).unwrap_or_else(|_| output_path.clone());
+    if opts.json {
+        let artifact = BuiltArtifact {
+            target: "web".to_string(),
+            path: abs,
+            bytes: archive_bytes.len() as u64,
+            runtime: None,
+            duration: started.elapsed(),
+        };
+        print_build_json(
+            file,
+            files_count,
+            archive_bytes.len(),
+            std::slice::from_ref(&artifact),
+            &[],
+            started.elapsed(),
+        );
+    } else {
+        println!(
+            "Built {} ({}, {} bundled file{}) for web in {}",
+            abs.display(),
+            human_size(archive_bytes.len() as u64),
+            files_count,
+            if files_count == 1 { "" } else { "s" },
+            human_duration(started.elapsed())
+        );
+    }
 
     Ok(())
 }
@@ -2473,10 +3019,8 @@ fn probe_output_writable(output_path: &Path) -> Result<(), String> {
         parent
     };
     if !parent.exists() {
-        return Err(format!(
-            "output directory does not exist: {}",
-            parent.display()
-        ));
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("cannot create output directory {}: {e}", parent.display()))?;
     }
     let probe_name = format!(
         ".sema-build-probe-{}-{}",
@@ -2519,6 +3063,71 @@ fn strip_os_error(s: &str) -> String {
         }
     }
     s.to_string()
+}
+
+/// Add a `VERSIONINFO` resource to a `sema build` Windows executable so Explorer's
+/// Details tab shows the program name and the Sema runtime version. The resource
+/// directory already contains the payload + icons written by libsui; editpe rebuilds
+/// it in place, preserving them.
+fn set_windows_version_info(
+    pe_bytes: Vec<u8>,
+    output_path: &std::path::Path,
+) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    use editpe::types::{VersionU16, VersionU32};
+
+    let program = output_path
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "program".to_string());
+    let sema_version = env!("CARGO_PKG_VERSION");
+    let (maj, min, pat) = {
+        let mut it = sema_version
+            .split('.')
+            .map(|p| p.parse::<u16>().unwrap_or(0));
+        (
+            it.next().unwrap_or(0),
+            it.next().unwrap_or(0),
+            it.next().unwrap_or(0),
+        )
+    };
+    // VS_FIXEDFILEINFO packs each version as two dwords: MS = major<<16|minor,
+    // LS = patch<<16|build.
+    let version = VersionU32 {
+        major: ((maj as u32) << 16) | min as u32,
+        minor: (pat as u32) << 16,
+    };
+
+    let mut info = editpe::VersionInfo::default();
+    info.info.file_version = version;
+    info.info.product_version = version;
+    info.info.file_os = 0x0004_0004; // VOS_NT_WINDOWS32
+    info.info.file_type = 0x1; // VFT_APP
+
+    // en-US (0x0409), Unicode codepage (0x04B0) — key format Windows expects.
+    let mut table = editpe::VersionStringTable {
+        key: "040904b0".to_string(),
+        strings: Default::default(),
+    };
+    for (k, v) in [
+        ("ProductName", program.clone()),
+        ("FileDescription", format!("{program} (built with Sema)")),
+        ("FileVersion", sema_version.to_string()),
+        ("ProductVersion", sema_version.to_string()),
+        ("OriginalFilename", format!("{program}.exe")),
+    ] {
+        table.strings.insert(k.to_string(), v);
+    }
+    info.strings.push(table);
+    info.vars.push(VersionU16 {
+        major: 0x0409,
+        minor: 0x04B0,
+    });
+
+    let mut image = editpe::Image::parse(&pe_bytes[..])?;
+    let mut dir = image.resource_directory().cloned().unwrap_or_default();
+    dir.set_version_info(&info)?;
+    image.set_resource_directory(dir)?;
+    Ok(image.data().to_vec())
 }
 
 /// Write the executable using format-aware injection.
@@ -2571,10 +3180,21 @@ fn write_executable_platform(
                 .build_and_sign(&mut out)?;
         }
         cross_compile::BinaryFormat::Pe => {
-            let mut out = std::fs::File::create(output_path)?;
+            // libsui writes the payload + multi-resolution icon; a second editpe pass
+            // (same crate libsui uses internally) adds the VERSIONINFO resource that
+            // Explorer's Details tab reads. Both are branding — the payload embed
+            // above them is what makes the binary work.
+            let mut branded = Vec::with_capacity(runtime.len() + archive_bytes.len());
             libsui::PortableExecutable::from(&runtime)?
                 .write_resource("semaexec", archive_bytes.to_vec())?
-                .build(&mut out)?;
+                // The rounded mark carries its own dark tile, so it reads correctly on
+                // both light and dark backgrounds — PE icons cannot adapt to theme.
+                .set_icon(include_bytes!(
+                    "../../../assets/icons/png/sema-mark-rounded-512.png"
+                ))?
+                .build(&mut branded)?;
+            let branded = set_windows_version_info(branded, output_path)?;
+            std::fs::write(output_path, branded)?;
         }
         cross_compile::BinaryFormat::Elf => {
             archive::write_bundled_executable_from_bytes(&runtime, output_path, archive_bytes)?;
@@ -2946,6 +3566,7 @@ fn run_bytecode_bytes(
             local_scopes: Vec::new(),
             source_file: None,
             cache_offset: 0,
+            suspend_cache: std::cell::Cell::new(None),
         }),
         upvalues: Vec::new(),
         // Top-level main closure: uses the VM's own globals and function table.
@@ -2959,14 +3580,15 @@ fn run_bytecode_bytes(
         &[],
         main_cache_slots,
     )?;
-    // Initialize the async scheduler so async/await and channels work in a
-    // `.semac` program (top-level or inside a `(load ...)`). A `.semac` carries
-    // no native table (the format is process-local), and bytecode compiled with
-    // `known_natives=None` uses CallGlobal rather than CallNative, so task VMs
-    // resolve natives via the shared global env — an empty native table is
-    // correct here.
-    sema_vm::init_scheduler(interpreter.global_env.clone(), Vec::new());
-    vm.execute(closure, &interpreter.ctx)
+    // Drive the `.semac` program on the interpreter's unified cooperative
+    // runtime, the sole async engine, so async/await, channels, and timers work
+    // in compiled bytecode (top-level or inside a `(load ...)`). A `.semac`
+    // carries no native table (the format is process-local), and bytecode
+    // compiled with `known_natives=None` uses CallGlobal rather than CallNative,
+    // so task VMs resolve natives via the shared global env — the empty native
+    // table passed to `VM::new` is correct here.
+    vm.seed_main_frame(closure);
+    interpreter.drive_vm_on_runtime(vm)
 }
 
 fn run_fmt(
@@ -2974,8 +3596,33 @@ fn run_fmt(
     check: bool,
     show_diff: bool,
     opts: &sema_fmt::FormatOptions,
+    ignore: &[String],
     json: bool,
 ) {
+    // A path is ignored when it matches an `ignore` entry from sema.toml.
+    // An entry with glob characters matches as a glob; anything else is a
+    // literal path prefix (file or directory). Paths are matched relative to
+    // the working directory, `./`-stripped.
+    let is_ignored = |path: &str| -> bool {
+        let normalized = path.strip_prefix("./").unwrap_or(path);
+        ignore.iter().any(|pat| {
+            if pat.contains('*') || pat.contains('?') || pat.contains('[') {
+                glob::Pattern::new(pat)
+                    .map(|g| g.matches(normalized))
+                    .unwrap_or(false)
+            } else {
+                let prefix = pat.trim_end_matches('/');
+                normalized == prefix || normalized.starts_with(&format!("{prefix}/"))
+            }
+        })
+    };
+    // Wildcards don't cross a leading dot: the recursive walk stays out of
+    // hidden directories (.git, .worktrees, ...) unless a pattern names one
+    // literally.
+    let match_opts = glob::MatchOptions {
+        require_literal_leading_dot: true,
+        ..Default::default()
+    };
     // Handle stdin ("-")
     if patterns.len() == 1 && patterns[0] == "-" {
         let mut source = String::new();
@@ -3028,10 +3675,11 @@ fn run_fmt(
     // Determine which files to format
     let files = if patterns.is_empty() {
         // Default: all .sema files in current directory recursively
-        match glob::glob("**/*.sema") {
+        match glob::glob_with("**/*.sema", match_opts) {
             Ok(paths) => paths
                 .filter_map(|p| p.ok())
                 .map(|p| p.to_string_lossy().to_string())
+                .filter(|p| !is_ignored(p))
                 .collect::<Vec<_>>(),
             Err(e) => {
                 eprintln!("Error: invalid glob pattern: {e}");
@@ -3044,10 +3692,13 @@ fn run_fmt(
         for pattern in patterns {
             // If it contains glob characters, expand it
             if pattern.contains('*') || pattern.contains('?') || pattern.contains('[') {
-                match glob::glob(pattern) {
+                match glob::glob_with(pattern, match_opts) {
                     Ok(paths) => {
                         for path in paths.filter_map(|p| p.ok()) {
-                            all_files.push(path.to_string_lossy().to_string());
+                            let path = path.to_string_lossy().to_string();
+                            if !is_ignored(&path) {
+                                all_files.push(path);
+                            }
                         }
                     }
                     Err(e) => {
@@ -3056,7 +3707,7 @@ fn run_fmt(
                     }
                 }
             } else {
-                // Treat as literal file path
+                // An explicitly named file always formats, ignore list or not
                 all_files.push(pattern.clone());
             }
         }
@@ -3064,7 +3715,9 @@ fn run_fmt(
     };
 
     if files.is_empty() {
-        println!("No .sema files found");
+        if !json {
+            println!("No .sema files found");
+        }
         return;
     }
 
@@ -3113,23 +3766,26 @@ fn run_fmt(
             }
         };
 
+        checked += 1;
+        let file_changed = source != formatted;
+        if file_changed {
+            changed += 1;
+        }
+
         if json {
             println!(
                 "{}",
                 serde_json::json!({
                     "file": file,
                     "formatted": true,
+                    "changed": file_changed,
                     "source": formatted
                 })
             );
             continue;
         }
 
-        checked += 1;
-
-        if source != formatted {
-            changed += 1;
-
+        if file_changed {
             if check {
                 println!("Would reformat: {file}");
             } else if show_diff {
@@ -3148,26 +3804,32 @@ fn run_fmt(
     }
 
     // Print summary
-    if check {
-        if changed > 0 {
-            println!("\n{changed} file(s) would be reformatted, {checked} file(s) checked");
-            std::process::exit(1);
+    if !json {
+        if check {
+            if changed > 0 {
+                println!("\n{changed} file(s) would be reformatted, {checked} file(s) checked");
+                std::process::exit(1);
+            } else {
+                println!("{checked} file(s) already formatted");
+            }
+        } else if show_diff {
+            println!("\n{changed} file(s) would change, {checked} file(s) checked");
+        } else if changed > 0 {
+            println!(
+                "\n{changed} file(s) formatted, {} file(s) unchanged",
+                checked - changed
+            );
         } else {
             println!("{checked} file(s) already formatted");
         }
-    } else if show_diff {
-        println!("\n{changed} file(s) would change, {checked} file(s) checked");
-    } else if changed > 0 {
-        println!(
-            "\n{changed} file(s) formatted, {} file(s) unchanged",
-            checked - changed
-        );
-    } else {
-        println!("{checked} file(s) already formatted");
     }
 
     if errors > 0 {
         eprintln!("{errors} error(s)");
+        std::process::exit(1);
+    }
+
+    if check && changed > 0 {
         std::process::exit(1);
     }
 }
@@ -3738,6 +4400,181 @@ fn install_completions(shell: Shell) {
 mod tests {
     use super::*;
 
+    #[test]
+    fn build_summary_helpers() {
+        assert_eq!(
+            triple_os_arch("aarch64-apple-darwin"),
+            ("macos", "arm64".into())
+        );
+        assert_eq!(
+            triple_os_arch("x86_64-unknown-linux-gnu"),
+            ("linux", "x86_64".into())
+        );
+        assert_eq!(
+            triple_os_arch("x86_64-pc-windows-msvc"),
+            ("windows", "x86_64".into())
+        );
+        assert_eq!(triple_os_arch("web"), ("web", "-".into()));
+
+        assert_eq!(human_size(512), "512 B");
+        assert_eq!(human_size(12_700), "12.4 KB");
+        assert_eq!(human_size(29_289_346), "27.9 MB");
+        assert_eq!(human_size(2_147_483_648), "2.0 GB");
+
+        assert_eq!(
+            human_duration(std::time::Duration::from_millis(640)),
+            "0.6s"
+        );
+        assert_eq!(human_duration(std::time::Duration::from_secs(92)), "1m 32s");
+    }
+
+    #[test]
+    fn build_summary_table_aligns_and_reports_failures() {
+        let artifacts = vec![
+            BuiltArtifact {
+                target: "aarch64-apple-darwin".into(),
+                path: "/x/game-aarch64-apple-darwin".into(),
+                bytes: 29_289_346,
+                runtime: Some("host"),
+                duration: std::time::Duration::from_secs(1),
+            },
+            BuiltArtifact {
+                target: "x86_64-unknown-linux-gnu".into(),
+                path: "/x/game-x86_64-unknown-linux-gnu".into(),
+                bytes: 32_462_497,
+                runtime: Some("downloaded"),
+                duration: std::time::Duration::from_secs(3),
+            },
+        ];
+        let failures = vec![(
+            "x86_64-pc-windows-msvc".to_string(),
+            "download failed: 404".to_string(),
+        )];
+        let table = render_build_summary(&artifacts, &failures, std::time::Duration::from_secs(14));
+        assert!(table.starts_with("Built 2/3 targets in 14.0s:"), "{table}");
+        // every data row aligns: the path column starts at the same byte offset
+        let rows: Vec<&str> = table.lines().skip(2).collect();
+        assert_eq!(rows.len(), 3);
+        let col = rows[0].find("/x/").unwrap();
+        assert_eq!(rows[1].find("/x/"), Some(col), "{table}");
+        assert!(rows[2].contains("FAILED"));
+        assert!(rows[2].contains("download failed: 404"));
+        assert!(!table.contains("won't run"));
+    }
+
+    #[test]
+    fn build_output_default_name_adds_exe_for_windows_targets() {
+        let src = std::path::Path::new("examples/game-of-life.sema");
+        assert_eq!(default_output_name(src, None), "game-of-life");
+        assert_eq!(
+            default_output_name(src, Some("windows")),
+            "game-of-life.exe"
+        );
+        assert_eq!(
+            default_output_name(src, Some("x86_64-pc-windows-msvc")),
+            "game-of-life.exe"
+        );
+        assert_eq!(default_output_name(src, Some("linux")), "game-of-life");
+    }
+
+    #[test]
+    fn build_output_into_existing_dir_uses_default_filename() {
+        let dir = std::env::temp_dir().join(format!("sema-out-dir-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = std::path::Path::new("hello.sema");
+        let out = resolve_output_path(Some(dir.to_str().unwrap()), src, None);
+        assert_eq!(out, dir.join("hello"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn build_output_trailing_slash_means_directory_even_if_missing() {
+        let src = std::path::Path::new("hello.sema");
+        let out = resolve_output_path(Some("no/such/dir/"), src, None);
+        assert_eq!(out, std::path::Path::new("no/such/dir/hello"));
+    }
+
+    #[test]
+    fn build_output_plain_path_is_the_file_itself() {
+        let src = std::path::Path::new("hello.sema");
+        let out = resolve_output_path(Some("dist/game"), src, None);
+        assert_eq!(out, std::path::Path::new("dist/game"));
+    }
+
+    #[test]
+    fn build_output_expands_leading_tilde() {
+        // `--output=~/x` reaches us unexpanded (the ~ follows `=`); it must never
+        // be treated as a literal `./~` directory.
+        if let Ok(home) = std::env::var("HOME") {
+            let src = std::path::Path::new("hello.sema");
+            let out = resolve_output_path(Some("~/sema-out/game"), src, None);
+            assert_eq!(out, std::path::Path::new(&home).join("sema-out/game"));
+        }
+    }
+
+    #[test]
+    fn build_all_targets_suffixes_filenames_and_honors_output_file_base() {
+        let src = std::path::Path::new("examples/game-of-life.sema");
+        // file-ish output: base name is taken from the output path
+        let plans = plan_all_target_outputs(Some("dist/game"), src);
+        assert_eq!(plans.len(), cross_compile::SUPPORTED_TARGETS.len());
+        for (t, path) in &plans {
+            let expect_ext = if cross_compile::is_windows_target(t) {
+                ".exe"
+            } else {
+                ""
+            };
+            assert_eq!(
+                path,
+                &std::path::PathBuf::from(format!("dist/game-{t}{expect_ext}")),
+                "unexpected plan for {t}"
+            );
+        }
+        // every planned path is distinct — this is the bug that motivated the plan
+        let unique: std::collections::HashSet<_> = plans.iter().map(|(_, p)| p).collect();
+        assert_eq!(unique.len(), plans.len());
+    }
+
+    #[test]
+    fn build_all_targets_strips_exe_from_output_base() {
+        let src = std::path::Path::new("hello.sema");
+        let plans = plan_all_target_outputs(Some("dist/game.exe"), src);
+        assert!(plans
+            .iter()
+            .all(|(_, p)| !p.to_string_lossy().contains(".exe-")));
+        assert!(plans
+            .iter()
+            .any(|(t, p)| cross_compile::is_windows_target(t)
+                && p.to_string_lossy().ends_with(".exe")));
+    }
+
+    #[test]
+    fn build_all_targets_into_directory_uses_source_stem() {
+        let dir = std::env::temp_dir().join(format!("sema-all-dir-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = std::path::Path::new("examples/game-of-life.sema");
+        let plans = plan_all_target_outputs(Some(dir.to_str().unwrap()), src);
+        for (t, path) in &plans {
+            assert!(path.starts_with(&dir));
+            assert!(path
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with(&format!("game-of-life-{t}")));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn build_all_targets_without_output_uses_cwd_stem() {
+        let src = std::path::Path::new("examples/game-of-life.sema");
+        let plans = plan_all_target_outputs(None, src);
+        assert_eq!(
+            plans[0].1,
+            std::path::PathBuf::from(format!("game-of-life-{}", plans[0].0))
+        );
+    }
+
     /// Pins the zsh-completion repair (`fix_zsh_root_completion`): position 1
     /// must dispatch subcommands (clap_complete emits the FILE/SCRIPT_ARGS
     /// positionals first, which swallows the subcommand word — `sema notebook
@@ -3762,8 +4599,9 @@ mod tests {
             !script.contains("File to execute"),
             "top-level FILE positional must not shadow the subcommand slot"
         );
-        // The nested groups must still be intact (spot-check one).
-        assert!(script.contains("_sema__notebook_commands"));
+        // The nested groups must still be intact (spot-check one). clap_complete
+        // names nested subcommand groups `_sema__subcmd__<name>_commands`.
+        assert!(script.contains("_sema__subcmd__notebook_commands"));
     }
 
     use super::{compile_source_to_bytecode, run_bytecode_bytes};

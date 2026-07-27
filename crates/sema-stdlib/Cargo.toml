@@ -43,6 +43,10 @@ sema-workflow.workspace = true
 sema-llm.workspace = true
 tokio.workspace = true
 reqwest.workspace = true
+# Enables rustls's `ring` feature in the unified graph: with exactly one provider
+# feature on, rustls auto-selects it as process default (reqwest is built with
+# rustls-no-provider, so no provider would exist otherwise).
+rustls.workspace = true
 hostname.workspace = true
 libc.workspace = true
 pdf-extract.workspace = true

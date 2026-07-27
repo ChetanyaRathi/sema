@@ -1,12 +1,5 @@
-# cargo-nextest configuration. See https://nexte.st/docs/configuration/
-#
-# nextest is the sole local/CI test runner (`jake test`, CI "Run tests" step).
-# It runs each test in its own process and schedules across all workspace test
-# binaries, which is ~2.6x faster than the libtest harness on this suite.
-#
-# Note: nextest does NOT run doctests. This repo has zero *executable* doctests
-# (all `///` code fences are `no_run`/`text`), so nothing is lost. If an
-# executable doctest is ever added, run `cargo test --doc` separately.
+# cargo-nextest
+# See https://nexte.st/docs/configuration/
 
 [profile.default]
 # Ignored tests (http/llm/live) stay skipped, matching the old `cargo test`.

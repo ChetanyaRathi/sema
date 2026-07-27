@@ -8,7 +8,7 @@ The `css` function generates unique class names and injects scoped CSS rules int
 
 Pass a map of CSS properties. Returns a generated class name (e.g., `"sema-1"`) that you can use in SIP markup:
 
-```scheme
+```sema
 (def card-class
   (css {:background "#fff"
         :border-radius "8px"
@@ -30,7 +30,7 @@ The underlying function. `css` is a convenience alias for `css/scoped`.
 
 Use the `&` prefix to define nested pseudo-selectors and modifiers:
 
-```scheme
+```sema
 (def btn-class
   (css {:padding "8px 16px"
         :background "#3b82f6"
@@ -58,7 +58,7 @@ This generates:
 
 CSS property names written in camelCase are automatically converted to kebab-case:
 
-```scheme
+```sema
 (css {:fontSize "14px"         ;; -> font-size: 14px
       :backgroundColor "#eee"  ;; -> background-color: #eee
       :borderRadius "4px"})    ;; -> border-radius: 4px
@@ -68,7 +68,7 @@ You can also write property names in kebab-case directly -- both forms work.
 
 ## Example: Styled Component
 
-```scheme
+```sema
 (def heading-style
   (css {:font-size "24px"
         :font-weight "bold"

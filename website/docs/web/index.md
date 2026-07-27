@@ -22,7 +22,7 @@ Everything runs client-side. No build step required -- add a script tag and go.
 
 A counter in 12 lines of Sema:
 
-```scheme
+```sema
 ;; Reactive state
 (def count (state 0))
 
@@ -117,7 +117,7 @@ Browser Page
 
 Components return vectors that describe DOM structure -- Sema's take on Clojure's Hiccup:
 
-```scheme
+```sema
 [:div {:class "card"}
   [:h1 "Title"]
   [:p {:style "color: gray"} "Subtitle"]]
@@ -129,7 +129,7 @@ The name is a nod: a sip cures a hiccup.
 
 State is managed through signals. Reading a signal inside a component or `computed` expression automatically subscribes to changes:
 
-```scheme
+```sema
 (def name (state "world"))
 (def greeting (computed (string-append "Hello, " @name "!")))
 ```
@@ -140,7 +140,7 @@ When `name` changes, `greeting` recomputes, and any component reading either val
 
 Components are functions that return SIP markup. Mount them to a DOM element and they auto-re-render when their signal dependencies change:
 
-```scheme
+```sema
 (defcomponent app ()
   [:div [:p @greeting]])
 

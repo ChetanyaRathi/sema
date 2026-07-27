@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-#
-# grammar-fuzz.sh — driver for the Sema grammar fuzzer (fuzz/grammar-fuzz.sema).
+
+# Driver for the Sema grammar fuzzer (fuzz/grammar-fuzz.sema).
 #
 # Runs the in-language fuzzer, which checks two correctness oracles over randomly
 # generated Sema programs:
@@ -24,14 +24,18 @@
 #   0  all checks passed
 #   1  a deterministic mismatch was found (round-trip or value oracle)
 #   2  a hard crash (VM panic) was found; reproducing seed is printed
-set -uo pipefail
+
+set -uo pipefail # no -e: inspect the fuzzer's 0/1/2 exit status instead of aborting
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-cd "$ROOT"
+cd "$ROOT" || exit 1
 
 MODE="check"
 case "${1:-}" in
-  check|emit) MODE="$1"; shift ;;
+  check | emit)
+    MODE="$1"
+    shift
+    ;;
 esac
 
 COUNT=""
@@ -47,18 +51,27 @@ while getopts "n:d:s:o:v" opt; do
     s) SEED="$OPTARG" ;;
     o) OUT="$OPTARG" ;;
     v) VERBOSE="1" ;;
-    *) echo "usage: $0 [check|emit] [-n COUNT] [-d DEPTH] [-s SEED] [-o FILE] [-v]" >&2; exit 64 ;;
+    *)
+      echo "usage: $0 [check|emit] [-n COUNT] [-d DEPTH] [-s SEED] [-o FILE] [-v]" >&2
+      exit 64
+      ;;
   esac
 done
 
 # Locate (or build) the sema binary.
 BIN=""
 for cand in "$ROOT/target/release/sema" "$ROOT/target/debug/sema" "$(command -v sema 2>/dev/null || true)"; do
-  if [ -n "$cand" ] && [ -x "$cand" ]; then BIN="$cand"; break; fi
+  if [ -n "$cand" ] && [ -x "$cand" ]; then
+    BIN="$cand"
+    break
+  fi
 done
 if [ -z "$BIN" ]; then
   echo "==> building release binary (cargo build --release -p sema-lang)" >&2
-  cargo build --release -p sema-lang || { echo "build failed" >&2; exit 70; }
+  cargo build --release -p sema-lang || {
+    echo "build failed" >&2
+    exit 70
+  }
   BIN="$ROOT/target/release/sema"
 fi
 
@@ -69,7 +82,7 @@ fi
 
 # Random seed if not pinned.
 if [ -z "$SEED" ]; then
-  SEED=$(( ($(date +%s) ^ ($$ << 13) ^ ${RANDOM:-0}) % 1000000000 ))
+  SEED=$((($(date +%s) ^ ($$ << 13) ^ ${RANDOM:-0}) % 1000000000))
 fi
 
 export SEMA_FUZZ_COUNT="$COUNT"

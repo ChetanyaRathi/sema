@@ -12,7 +12,7 @@ Components are functions that return [SIP markup](./index#sip-markup-sema-interf
 
 Defines a component. This is a macro that expands to a regular `define` -- components are just functions that return SIP vectors.
 
-```scheme
+```sema
 (defcomponent greeting ()
   [:h1 "Hello, world!"])
 
@@ -22,7 +22,7 @@ Defines a component. This is a macro that expands to a regular `define` -- compo
 
 `defcomponent` is syntactic sugar. These are equivalent:
 
-```scheme
+```sema
 (defcomponent counter-view ()
   [:p @count])
 
@@ -35,7 +35,7 @@ Defines a component. This is a macro that expands to a regular `define` -- compo
 
 Mounts a component to a DOM element identified by a CSS selector. The component renders immediately and re-renders automatically when its signal dependencies change.
 
-```scheme
+```sema
 (defcomponent app ()
   [:div [:p "Hello"]])
 
@@ -58,7 +58,7 @@ Creates reactive state scoped to the current component. Unlike hooks in React, l
 - You can call `local` in any order
 - The name must be unique within the component
 
-```scheme
+```sema
 (defcomponent counter ()
   (let ((count (local "count" 0)))
     [:div
@@ -78,7 +78,7 @@ Registers a function to call once after the component's first render. The callba
 
 That cleanup runs when the component is unmounted.
 
-```scheme
+```sema
 (defcomponent timer ()
   (let ((elapsed (local "elapsed" 0))
         (interval-id (local "interval-id" nil)))
@@ -106,7 +106,7 @@ Key points:
 
 Removes a mounted component, runs its cleanup function (if any), clears the mount target, and stops reactive tracking.
 
-```scheme
+```sema
 (component/unmount! "#app")
 ```
 
@@ -114,7 +114,7 @@ Removes a mounted component, runs its cleanup function (if any), clears the moun
 
 Triggers a re-render even if no signal dependencies changed. Rarely needed, but useful for debugging.
 
-```scheme
+```sema
 (component/force-render! "#app")
 ```
 
@@ -122,7 +122,7 @@ Triggers a re-render even if no signal dependencies changed. Rarely needed, but 
 
 Events are handled through **delegated event listeners**. In SIP markup, `on-*` attributes specify the name of a Sema function to call:
 
-```scheme
+```sema
 (define (handle-click ev)
   (console/log "Clicked!"))
 
@@ -132,7 +132,7 @@ Events are handled through **delegated event listeners**. In SIP markup, `on-*` 
 
 The event handler receives a handle to the DOM event. You can extract data from it:
 
-```scheme
+```sema
 (define (handle-input ev)
   (let ((value (dom/event-value ev)))
     (put! search-text value)))
@@ -174,7 +174,7 @@ morphdom is configured to preserve focus state. If the user is typing in an inpu
 
 Only signals read via `@` during the component's render are tracked. Event handlers, `watch` callbacks, and `on-mount` code do not create subscriptions.
 
-```scheme
+```sema
 (def a (state 1))
 (def b (state 2))
 
@@ -191,7 +191,7 @@ Only signals read via `@` during the component's render are tracked. Event handl
 
 ## Full Example: Timer with Cleanup
 
-```scheme
+```sema
 ;; A timer that counts seconds and cleans up on unmount
 
 (def elapsed (state 0))
@@ -235,7 +235,7 @@ Only signals read via `@` during the component's render are tracked. Event handl
 
 ## Full Example: Todo App
 
-```scheme
+```sema
 ;; --- State ---
 (def todos (state '()))
 (def next-id (state 1))

@@ -4,7 +4,7 @@ Complete Sema Web examples using the current `state` / SIP / component APIs.
 
 ## Counter
 
-```scheme
+```sema
 (def count (state 0))
 
 (define (increment ev)
@@ -43,7 +43,7 @@ Complete Sema Web examples using the current `state` / SIP / component APIs.
 
 ## Todo List
 
-```scheme
+```sema
 (def todos (state '()))
 (def input-text (state ""))
 (def next-id (state 1))
@@ -85,7 +85,7 @@ Complete Sema Web examples using the current `state` / SIP / component APIs.
 
 Requires a deployed [LLM proxy](./llm-proxy).
 
-```scheme
+```sema
 (def messages (state '()))
 (def input-text (state ""))
 (def current-stream (state nil))

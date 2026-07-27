@@ -138,6 +138,7 @@ async fn test_401_mid_session_refresh() {
         Box::new(|_url: &str| Err("browser must not open on a refresh".to_string()));
     let driver = LoopbackDriver::with_opener(Duration::from_secs(5), opener).unwrap();
 
+    sema_mcp::ensure_crypto_provider();
     let token = reauth_on_challenge(
         &reqwest::Client::new(),
         &store,

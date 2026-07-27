@@ -47,7 +47,7 @@ Recommended structure inside `app.sema`:
 4. Define presentational helpers and components.
 5. Mount one root component at the end.
 
-```scheme
+```sema
 (def tasks (state '()))
 (def draft (state ""))
 
@@ -95,7 +95,7 @@ For production apps, this shape scales well:
 
 Use `watch` for persistence and side effects:
 
-```scheme
+```sema
 (def todos (state (or (store/get "todos") '())))
 
 (defcomponent app ()

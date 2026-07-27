@@ -62,8 +62,33 @@ const SYNONYMS: &[(&str, &[&str])] = &[
 pub struct SearchHit {
     pub name: String,
     pub module: String,
+    /// Call shape with argument ORDER, e.g. `(regex/replace-all pattern replacement text) -> string`.
+    /// Summaries alone caused real arg-order bugs (subject passed as pattern runs without error).
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub signature: String,
     pub summary: String,
     pub score: f64,
+}
+
+/// Render a call signature from what the doc entry already carries: prefer the
+/// authored `syntax` line, else `(name p1 p2 …) [-> returns]` from params.
+fn entry_signature(e: &DocEntry) -> String {
+    if let Some(syntax) = &e.syntax {
+        return syntax.trim().to_string();
+    }
+    if e.params.is_empty() {
+        return String::new();
+    }
+    let params = e
+        .params
+        .iter()
+        .map(|p| p.name.as_str())
+        .collect::<Vec<_>>()
+        .join(" ");
+    match &e.returns {
+        Some(ret) if !ret.trim().is_empty() => format!("({} {}) -> {}", e.name, params, ret.trim()),
+        _ => format!("({} {})", e.name, params),
+    }
 }
 
 /// An in-memory BM25 index over the documentation corpus.
@@ -246,6 +271,7 @@ impl SearchIndex {
                 SearchHit {
                     name: e.name.clone(),
                     module: e.module.clone(),
+                    signature: entry_signature(e),
                     summary: e.summary.clone(),
                     score: (score * 1000.0).round() / 1000.0,
                 }

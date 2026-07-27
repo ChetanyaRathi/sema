@@ -160,6 +160,7 @@ async fn test_403_insufficient_scope_step_up() {
     // The server now demands `read write`.
     let challenge = r#"Bearer error="insufficient_scope", scope="read write""#;
     let opener: BrowserOpener = Box::new(|u: &str| {
+        sema_mcp::ensure_crypto_provider();
         reqwest::blocking::Client::new()
             .get(u)
             .send()
@@ -168,6 +169,7 @@ async fn test_403_insufficient_scope_step_up() {
     });
     let driver = LoopbackDriver::with_opener(Duration::from_secs(10), opener).unwrap();
 
+    sema_mcp::ensure_crypto_provider();
     let token = reauth_on_challenge(
         &reqwest::Client::new(),
         &store,

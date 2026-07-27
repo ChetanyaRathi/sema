@@ -8,8 +8,9 @@ If a `../CLAUDE.md` and `../repos.tsv` exist beside this repo, you are inside th
 - Create/remove git worktrees ONLY via `jake wt-new` / `jake wt-rm` run from the
   workspace root — never `git worktree add` by hand, and never outside
   `../.worktrees/`.
-- Rust builds use the workspace's sccache cache with incremental disabled
-  (`../.cargo/config.toml`); reclaim disk with `jake sweep`. Don't re-enable
-  incremental or drop the wrapper.
+- Rust builds run with incremental compilation on and NO rustc wrapper
+  (`../.cargo/config.toml`; policy rationale in `docs/build-time-report.md`).
+  Don't re-add an sccache wrapper — it hard-fails incremental builds. Reclaim
+  disk with `jake sweep` (worktree hygiene matters more with incremental on).
 
 Read `../CLAUDE.md` before creating worktrees or running large builds.

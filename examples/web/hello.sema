@@ -3,13 +3,14 @@
 ;; Demonstrates basic DOM manipulation from Sema.
 ;; Run in a page with: <div id="app"></div>
 
-(let ((app (dom/query "#app"))
-      (heading (dom/create-element "h1"))
-      (paragraph (dom/create-element "p")))
+(let ((app        (dom/query "#app"))
+      (heading    (dom/create-element "h1"))
+      (paragraph  (dom/create-element "p")))
 
   ;; Set content
   (dom/set-text! heading "Hello from Sema!")
-  (dom/set-text! paragraph "This page is powered by Sema running in WebAssembly.")
+  (dom/set-text! paragraph
+    "This page is powered by Sema running in WebAssembly.")
 
   ;; Style the heading
   (dom/set-style! heading "color" "#6366f1")

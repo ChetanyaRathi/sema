@@ -10,12 +10,16 @@ Special forms are built into the evaluator — they control evaluation order and
 
 ### `define`
 
-Bind a value or define a function.
+Bind a name to a value. Given a signature list rather than a bare symbol, it binds the name to a function.
 
 ```sema
 (define x 42)                          ; bind a value
-(define (square x) (* x x))           ; define a function (shorthand)
+(define (square x) (* x x))            ; same as (define square (fn (x) (* x x)))
 ```
+
+::: tip Clojure alias
+`def` is accepted as an alias for `define`.
+:::
 
 ### `set!`
 

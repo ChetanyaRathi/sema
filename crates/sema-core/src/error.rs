@@ -1,6 +1,7 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 
+use crate::runtime::{CancelReason, OperationId, RootId, ScopeId};
 use crate::value::Value;
 
 /// Check arity of a native function's arguments, returning `SemaError::Arity` on mismatch.
@@ -259,11 +260,14 @@ pub fn suggest_similar(name: &str, candidates: &[&str]) -> Option<String> {
 
 /// Provide targeted hints for common names from other Lisp dialects.
 /// Checked before fuzzy matching to give more helpful, specific guidance.
+///
+/// Only for names Sema does *not* have. Names accepted as aliases (`defn`,
+/// `progn`, `def`, `fn`) belong in the special-form table, not here — a hint
+/// redirecting away from a working form is worse than no hint.
 pub fn veteran_hint(name: &str) -> Option<&'static str> {
     match name {
         // Common Lisp / Emacs Lisp
         "setq" | "setf" => Some("Sema uses 'set!' for variable assignment"),
-        "progn" => Some("Sema uses 'begin' to sequence expressions"),
         "funcall" => Some("In Sema, functions are called directly: (f arg ...)"),
         "mapcar" => Some("Sema uses 'map' for mapping over lists"),
         "loop" => Some("Sema uses 'do' or 'while' for iteration, or tail recursion"),
@@ -278,7 +282,6 @@ pub fn veteran_hint(name: &str) -> Option<&'static str> {
         "typep" | "type-of" => Some("Sema uses 'type' to get the type of a value"),
 
         // Clojure
-        "defn" => Some("Sema uses 'defun' to define named functions"),
         "atom" => Some("Sema is single-threaded; use 'define' for mutable state with 'set!'"),
         "swap!" => Some("Sema is single-threaded; use 'set!' for mutation"),
         "deref" => Some("Sema uses 'force' to evaluate delayed/promised values"),
@@ -327,6 +330,8 @@ const CONDITION_TYPES: &[&str] = &[
     "llm",
     "reader",
     "permission-denied",
+    "cancelled",
+    "timeout",
 ];
 
 /// The `:message` of a condition map, for `Display` of `SemaError::Condition`.
@@ -355,9 +360,88 @@ fn is_condition_map(value: &Value) -> bool {
             .is_some_and(|m| m.as_str().is_some())
 }
 
+fn cancel_reason_keyword(reason: CancelReason) -> &'static str {
+    match reason {
+        CancelReason::Root => "root",
+        CancelReason::Owner => "owner",
+        CancelReason::Explicit => "explicit",
+        CancelReason::Timeout => "timeout",
+        CancelReason::HostStop => "host-stop",
+        CancelReason::ResourceDisconnect => "resource-disconnect",
+        CancelReason::InterpreterShutdown => "interpreter-shutdown",
+    }
+}
+
+fn insert_decimal(condition: &mut BTreeMap<Value, Value>, key: &str, value: Option<u64>) {
+    if let Some(value) = value {
+        condition.insert(Value::keyword(key), Value::int(value as i64));
+    }
+}
+
+fn insert_optional_string(condition: &mut BTreeMap<Value, Value>, key: &str, value: Option<&str>) {
+    if let Some(value) = value {
+        condition.insert(Value::keyword(key), Value::string(value));
+    }
+}
+
 impl SemaError {
     pub fn eval(msg: impl Into<String>) -> Self {
         SemaError::Eval(msg.into())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn cancelled_condition(
+        message: &str,
+        reason: CancelReason,
+        root_id: Option<RootId>,
+        scope_id: Option<ScopeId>,
+        operation_id: Option<OperationId>,
+        operation: Option<&str>,
+        duration_ms: Option<u64>,
+        resource_kind: Option<&str>,
+    ) -> Self {
+        let mut condition = BTreeMap::from([
+            (Value::keyword("type"), Value::keyword("cancelled")),
+            (Value::keyword("message"), Value::string(message)),
+            (
+                Value::keyword("reason"),
+                Value::keyword(cancel_reason_keyword(reason)),
+            ),
+        ]);
+        insert_decimal(&mut condition, "root-id", root_id.map(RootId::get));
+        insert_decimal(&mut condition, "scope-id", scope_id.map(ScopeId::get));
+        insert_decimal(
+            &mut condition,
+            "operation-id",
+            operation_id.map(OperationId::get),
+        );
+        insert_optional_string(&mut condition, "operation", operation);
+        insert_decimal(&mut condition, "duration-ms", duration_ms);
+        insert_optional_string(&mut condition, "resource-kind", resource_kind);
+        SemaError::Condition(Value::map(condition))
+    }
+
+    pub fn timeout_condition(
+        message: &str,
+        operation: &str,
+        duration_ms: u64,
+        operation_id: Option<OperationId>,
+    ) -> Self {
+        let mut condition = BTreeMap::from([
+            (Value::keyword("type"), Value::keyword("timeout")),
+            (Value::keyword("message"), Value::string(message)),
+            (Value::keyword("operation"), Value::string(operation)),
+            (
+                Value::keyword("duration-ms"),
+                Value::int(duration_ms as i64),
+            ),
+        ]);
+        insert_decimal(
+            &mut condition,
+            "operation-id",
+            operation_id.map(OperationId::get),
+        );
+        SemaError::Condition(Value::map(condition))
     }
 
     /// The error a `throw`/`raise` of `value` raises: a caught condition map
@@ -471,6 +555,31 @@ impl SemaError {
                 inner: Box::new(other),
                 trace,
             },
+        }
+    }
+
+    /// Fill in `file` on any trace frame that lacks one (no-op without a trace).
+    ///
+    /// Lowering errors synthesize frames with `file: None` because the lowering
+    /// pass doesn't know the source path; the compile entry points (which do)
+    /// stamp it here so traces render the real filename instead of `<input>`.
+    /// Frames that already carry a file are left untouched.
+    pub fn fill_trace_file(self, file: &std::path::Path) -> Self {
+        match self {
+            SemaError::WithTrace { inner, mut trace } => {
+                for frame in &mut trace.0 {
+                    if frame.file.is_none() {
+                        frame.file = Some(file.to_path_buf());
+                    }
+                }
+                SemaError::WithTrace { inner, trace }
+            }
+            SemaError::WithContext { inner, hint, note } => SemaError::WithContext {
+                inner: Box::new(inner.fill_trace_file(file)),
+                hint,
+                note,
+            },
+            other => other,
         }
     }
 
@@ -675,6 +784,44 @@ mod tests {
         assert_eq!(st.0[0].name, "first");
     }
 
+    // fill_trace_file fills only `file: None` frames, recurses through
+    // WithContext, and is a no-op without a trace.
+    #[test]
+    fn fill_trace_file_fills_missing_files() {
+        let e = SemaError::eval("err")
+            .with_stack_trace(StackTrace(vec![
+                CallFrame {
+                    name: "bare".into(),
+                    file: None,
+                    span: None,
+                },
+                CallFrame {
+                    name: "stamped".into(),
+                    file: Some("already.sema".into()),
+                    span: None,
+                },
+            ]))
+            .with_hint("h");
+        let e = e.fill_trace_file(std::path::Path::new("main.sema"));
+        assert_eq!(e.hint(), Some("h"));
+        let st = e.stack_trace().unwrap();
+        assert_eq!(
+            st.0[0].file.as_deref(),
+            Some(std::path::Path::new("main.sema"))
+        );
+        assert_eq!(
+            st.0[1].file.as_deref(),
+            Some(std::path::Path::new("already.sema"))
+        );
+    }
+
+    #[test]
+    fn fill_trace_file_noop_without_trace() {
+        let e = SemaError::eval("err").fill_trace_file(std::path::Path::new("main.sema"));
+        assert!(e.stack_trace().is_none());
+        assert!(matches!(e, SemaError::Eval(_)));
+    }
+
     // 13. inner() unwraps through WithTrace and WithContext
     #[test]
     fn inner_unwraps() {
@@ -756,20 +903,16 @@ mod tests {
     #[test]
     fn test_veteran_hint_known() {
         assert_eq!(
-            veteran_hint("defn"),
-            Some("Sema uses 'defun' to define named functions")
-        );
-        assert_eq!(
             veteran_hint("setq"),
             Some("Sema uses 'set!' for variable assignment")
         );
         assert_eq!(
-            veteran_hint("progn"),
-            Some("Sema uses 'begin' to sequence expressions")
-        );
-        assert_eq!(
             veteran_hint("mapcar"),
             Some("Sema uses 'map' for mapping over lists")
+        );
+        assert_eq!(
+            veteran_hint("funcall"),
+            Some("In Sema, functions are called directly: (f arg ...)")
         );
     }
 
@@ -786,6 +929,10 @@ mod tests {
         assert!(veteran_hint("while").is_none());
         assert!(veteran_hint("str").is_none());
         assert!(veteran_hint("count").is_none());
+        // Accepted aliases — hinting away from a working form would mislead
+        assert!(veteran_hint("defn").is_none());
+        assert!(veteran_hint("progn").is_none());
+        assert!(veteran_hint("def").is_none());
     }
 
     // type_error_with_value constructor — verify variant/fields AND display

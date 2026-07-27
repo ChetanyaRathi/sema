@@ -63,11 +63,9 @@ pub fn run(interpreter: Interpreter, quiet: bool, sandbox_mode: Option<&str>) {
 
     // Reedline puts the terminal in raw mode and queries the cursor; it
     // can't run against piped stdin (CI, test harnesses, `printf ... | sema`).
-    // Fall back to a plain BufRead loop in that case.
+    // Fall back to the coordinated headless loop in that case.
     if !std::io::stdin().is_terminal() {
-        let stdin = std::io::stdin();
-        let reader = stdin.lock();
-        match headless::run(reader, &interpreter, &env, &prelude_keys) {
+        match headless::run_stdin(&interpreter, &env, &prelude_keys) {
             Ok(()) => {
                 println!("Goodbye!");
             }
@@ -157,9 +155,13 @@ pub(super) fn rotate_result_slots(env: &sema_core::Env, val: Value) {
 /// If `input` is a top-level definition form like `(define x ...)`,
 /// `(defun foo ...)`, or `(defmacro bar ...)`, return the defined name.
 /// Returns `None` for anything else, including nested defines.
+///
+/// The `def`/`defn` aliases are listed last so the longer canonical spellings
+/// match first; the whitespace check after the prefix keeps them from
+/// swallowing `define`/`defun` anyway.
 pub(super) fn top_level_define_name(input: &str) -> Option<String> {
     let trimmed = input.trim_start();
-    for kw in ["(define", "(defun", "(defmacro"] {
+    for kw in ["(define", "(defun", "(defmacro", "(defn", "(def"] {
         if let Some(rest) = trimmed.strip_prefix(kw) {
             let next = rest.chars().next()?;
             if !next.is_whitespace() && next != '(' {
@@ -203,9 +205,16 @@ mod tests {
     }
 
     #[test]
+    fn detects_aliases() {
+        assert_eq!(top_level_define_name("(def x 42)"), Some("x".into()));
+        assert_eq!(top_level_define_name("(defn bb (x) x)"), Some("bb".into()));
+    }
+
+    #[test]
     fn ignores_non_define() {
         assert_eq!(top_level_define_name("(+ 1 2)"), None);
         assert_eq!(top_level_define_name("(definer x 1)"), None);
+        assert_eq!(top_level_define_name("(defrecord x 1)"), None);
         assert_eq!(top_level_define_name("(let ((x 1)) (define y 2))"), None);
     }
 }

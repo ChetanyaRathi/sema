@@ -11,9 +11,9 @@
 (println "=== Extract from image ===")
 (define result
   (llm/extract-from-image
-    {:text {:type :string :description "Any visible text"}
-     :colors {:type :string :description "Dominant colors"}
-     :description {:type :string :description "Brief description"}}
+    {:text         {:type :string :description "Any visible text"}
+     :colors       {:type :string :description "Dominant colors"}
+     :description  {:type :string :description "Brief description"}}
     "assets/logo.png"))
 
 (println "Extracted:")

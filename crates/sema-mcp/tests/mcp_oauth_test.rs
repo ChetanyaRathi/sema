@@ -150,12 +150,14 @@ async fn test_oauth_login_end_to_end() {
     let base = format!("http://127.0.0.1:{port}");
     let mcp_url = format!("{base}/mcp");
 
+    sema_mcp::ensure_crypto_provider();
     let http = reqwest::Client::new();
 
     // The "browser": a blocking GET that follows the 302 from /authorize to our
     // loopback listener. Runs on the driver's own thread, so it never nests a
     // runtime inside the test's tokio runtime.
     let opener: BrowserOpener = Box::new(|url: &str| {
+        sema_mcp::ensure_crypto_provider();
         reqwest::blocking::Client::new()
             .get(url)
             .send()

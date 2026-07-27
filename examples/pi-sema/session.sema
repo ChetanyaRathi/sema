@@ -20,18 +20,18 @@
          (dir (sessions-dir))
          (path (string/append dir id ".ndjson"))
          (header
-           {:type "session"
-            :id id
-            :cwd cwd
-            :model model
-            :timestamp (timestamp)}))
+           {:type       "session"
+            :id         id
+            :cwd        cwd
+            :model      model
+            :timestamp  (timestamp)}))
     (ensure-dir dir)
     (file/write path (string/append (json/encode header) "\n"))
-    {:id id
-     :path path
-     :messages '()
-     :model model
-     :cwd cwd}))
+    {:id        id
+     :path      path
+     :messages  '()
+     :model     model
+     :cwd       cwd}))
 
 ;; ============================================================
 ;; Section 3: Append Entry to Session File
@@ -52,10 +52,10 @@
 
 (define (session/save-message session role content)
   (session/append session
-    {:type "message"
-     :role role
-     :content content
-     :timestamp (timestamp)}))
+    {:type       "message"
+     :role       role
+     :content    content
+     :timestamp  (timestamp)}))
 
 ;; ============================================================
 ;; Section 5: Load Session from NDJSON File
@@ -110,12 +110,12 @@
                    (if (equal? (get (car rest) :type) "model-change")
                      (get (car rest) :model)
                      m))))))
-      {:id (get header :id)
-       :path path
-       :messages messages
-       :model model
-       :plan plan
-       :cwd (get header :cwd)})))
+      {:id        (get header :id)
+       :path      path
+       :messages  messages
+       :model     model
+       :plan      plan
+       :cwd       (get header :cwd)})))
 
 ;; ============================================================
 ;; Section 6: List All Sessions
@@ -151,17 +151,17 @@
                          (truncate-str
                            (get (json/decode (car msg-lines)) :content)
                            80))))
-                {:id (get header :id)
-                 :path path
-                 :timestamp (get header :timestamp)
-                 :cwd (get header :cwd)
-                 :preview preview})
+                {:id         (get header :id)
+                 :path       path
+                 :timestamp  (get header :timestamp)
+                 :cwd        (get header :cwd)
+                 :preview    preview})
               (catch e
-                {:id f
-                 :path (string/append dir f)
-                 :timestamp 0
-                 :cwd ""
-                 :preview "(error reading session)"})))
+                {:id         f
+                 :path       (string/append dir f)
+                 :timestamp  0
+                 :cwd        ""
+                 :preview    "(error reading session)"})))
           files)))))
 
 ;; ============================================================

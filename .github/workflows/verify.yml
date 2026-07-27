@@ -7,6 +7,11 @@ on:
   workflow_call:
 
 jobs:
+  playground-runtime:
+    permissions:
+      contents: read
+    uses: ./.github/workflows/playground-runtime.yml
+
   verify:
     runs-on: ubuntu-latest
     steps:
@@ -15,7 +20,7 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libudev-dev pkg-config
+          sudo apt-get install -y libudev-dev pkg-config ripgrep
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -49,11 +54,13 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace -- -D warnings
 
-      - name: Check builtin docs
-        run: jake docs-check
-
+      # Before docs-check: `jake docs-check` runs the LSP builtin-doc-coverage
+      # test through cargo nextest.
       - name: Install cargo-nextest
         uses: taiki-e/install-action@nextest
+
+      - name: Check builtin docs
+        run: jake docs-check
 
       - name: Run tests
         run: cargo nextest run --workspace --profile ci
@@ -84,7 +91,7 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libudev-dev pkg-config
+          sudo apt-get install -y libudev-dev pkg-config ripgrep
 
       - name: Install Rust (pinned) + wasm target
         uses: dtolnay/rust-toolchain@1.97.0

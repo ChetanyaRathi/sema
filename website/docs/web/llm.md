@@ -49,7 +49,7 @@ All non-streaming `llm/*` functions are asynchronous because they make HTTP requ
 
 Send a simple text prompt and get a completion string back.
 
-```scheme
+```sema
 (llm/complete "Explain monads in one sentence")
 ;; => "A monad is a design pattern that..."
 
@@ -68,7 +68,7 @@ Send a simple text prompt and get a completion string back.
 
 Chat completion with a list of messages. This is the most commonly used function.
 
-```scheme
+```sema
 (llm/chat
   (list (message :system "You are a helpful assistant.")
         (message :user "What is the capital of France?"))
@@ -86,7 +86,7 @@ Chat completion with a list of messages. This is the most commonly used function
 
 Streaming chat completion. Returns a **reactive signal** that updates progressively as tokens arrive from the server. Components that `deref` the signal automatically re-render.
 
-```scheme
+```sema
 (def stream (llm/chat-stream
   (list (message :user "Write a poem about Lisp"))
   {:model "gpt-4o"}))
@@ -114,7 +114,7 @@ This is the only LLM function that works synchronously (it returns immediately w
 
 Extract structured data from text using a JSON schema.
 
-```scheme
+```sema
 (llm/extract
   {:name "string" :age "number" :hobbies ["string"]}
   "My name is Alice, I'm 30, and I like hiking and painting.")
@@ -132,7 +132,7 @@ Extract structured data from text using a JSON schema.
 
 Classify text into one of the given categories.
 
-```scheme
+```sema
 (llm/classify
   ["positive" "negative" "neutral"]
   "I absolutely love this product!")
@@ -150,7 +150,7 @@ Classify text into one of the given categories.
 
 Get a vector embedding for text.
 
-```scheme
+```sema
 (llm/embed "The quick brown fox")
 ;; => {:embedding [0.0123 -0.0456 ...] :model "text-embedding-3-small"}
 ```
@@ -169,7 +169,7 @@ Anthropic does not support embeddings. Use OpenAI, Gemini, Mistral, or Ollama fo
 
 List available models from the configured provider.
 
-```scheme
+```sema
 (llm/list-models)
 ;; => {:models ["gpt-4o" "gpt-4o-mini" "gpt-3.5-turbo" ...]}
 ```
@@ -180,7 +180,7 @@ List available models from the configured provider.
 
 Helper function for building chat message maps.
 
-```scheme
+```sema
 (message :user "Hello!")
 ;; => {:role "user" :content "Hello!"}
 
@@ -199,7 +199,7 @@ Helper function for building chat message maps.
 
 Here is a complete example that builds a chat interface with progressive token display using `llm/chat-stream` and the reactive system:
 
-```scheme
+```sema
 ;; ai-chat.sema — Streaming chat with progressive rendering
 
 (def messages (state '()))

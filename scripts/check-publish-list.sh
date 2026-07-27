@@ -1,9 +1,12 @@
 #!/usr/bin/env bash
-# Guard: every publishable workspace crate must appear in the crates.io publish
-# order in .github/workflows/publish.yml. This catches the "added a new crate but
-# forgot to add it to the publish list" mistake — which once half-published a
-# release (sema-llm failed: "no matching package named sema-otel") because the new
-# sema-otel crate wasn't in the list. Run in CI so it fails BEFORE any publish.
+
+# Guard: every publishable workspace crate appears in publish.yml's crates.io order.
+#
+# Catches the "added a new crate but forgot the publish list" mistake — which once
+# half-published a release (sema-llm failed: "no matching package named sema-otel")
+# because the new sema-otel crate wasn't in the list. Run in CI so it fails BEFORE
+# any publish.
+
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -11,8 +14,8 @@ WF="$ROOT/.github/workflows/publish.yml"
 
 # Publishable crates = workspace members without `publish = false` (publish != []).
 # sema-wasm is publish=false (it ships to npm, not crates.io) and is excluded here.
-publishable=$(cargo metadata --no-deps --format-version 1 --manifest-path "$ROOT/Cargo.toml" \
-  | jq -r '.packages[] | select(.publish != []) | .name' | sort)
+publishable=$(cargo metadata --no-deps --format-version 1 --manifest-path "$ROOT/Cargo.toml" |
+  jq -r '.packages[] | select(.publish != []) | .name' | sort)
 
 # Crates named by `publish <crate>` lines in the workflow.
 listed=$(grep -oE 'publish sema-[a-z]+' "$WF" | awk '{print $2}' | sort -u)
@@ -35,21 +38,31 @@ fi
 # `cargo publish` fails to resolve the `=X.Y.Z` pin against the crates.io index
 # (this half-published v1.30.0: sema-stdlib gained a sema-fmt dep that sat later
 # in the list).
+#
+# Dev-dependencies are deliberately excluded. They may legitimately point back
+# up the graph (sema-vm's tests use sema-eval/sema-stdlib, which both depend on
+# sema-vm) and no publish order can satisfy such a cycle. Those dev-deps are
+# declared path-only, so `cargo package` strips them and the uploaded manifest
+# never names them — they impose no ordering constraint. A dev-dep that DID
+# carry a version would break publishing, but that is the version pin's fault,
+# not the order's, and cargo reports it directly.
 order=$(grep -oE 'publish sema-[a-z]+' "$WF" | awk '{print $2}')
 pos() { echo "$order" | grep -n "^$1\$" | cut -d: -f1; }
-edges=$(cargo metadata --no-deps --format-version 1 --manifest-path "$ROOT/Cargo.toml" \
-  | jq -r '.packages[] | select(.publish != []) | .name as $n
-           | .dependencies[] | select(.name | startswith("sema-")) | "\($n) \(.name)"')
+edges=$(cargo metadata --no-deps --format-version 1 --manifest-path "$ROOT/Cargo.toml" |
+  jq -r '.packages[] | select(.publish != []) | .name as $n
+           | .dependencies[] | select(.kind != "dev")
+           | select(.name | startswith("sema-")) | "\($n) \(.name)"')
 bad=0
 while read -r crate dep; do
   [ -z "$crate" ] && continue
-  cp=$(pos "$crate"); dp=$(pos "$dep")
+  cp=$(pos "$crate")
+  dp=$(pos "$dep")
   # deps not in the list (publish=false crates) are caught by the checks above
   if [ -n "$cp" ] && [ -n "$dp" ] && [ "$dp" -gt "$cp" ]; then
     echo "::error::publish order: $dep must be published before $crate (currently after)"
     bad=1
   fi
-done <<< "$edges"
+done <<<"$edges"
 [ "$bad" -eq 1 ] && exit 1
 
 echo "publish list OK: all $(echo "$publishable" | wc -l | tr -d ' ') publishable crates present, dependency order valid."
