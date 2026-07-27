@@ -423,24 +423,24 @@ C07D	crates/sema-llm/src/anthropic.rs:540:        sema_io::io_block_on(self.comp
 C07D	crates/sema-llm/src/anthropic.rs:556:        // io_block_on drives ON THIS thread: `on_chunk` may touch non-Send Sema
 C07D	crates/sema-llm/src/anthropic.rs:558:        sema_io::io_block_on(self.stream_complete_async(request, on_chunk))
 C07D	crates/sema-llm/src/anthropic.rs:562:        sema_io::io_block_on(async {
-C07D	crates/sema-llm/src/builtins.rs:10050:        // synchronous caller thread (the provider's own block_on has already
-C10	crates/sema-llm/src/builtins.rs:10055:            std::thread::sleep(std::time::Duration::from_millis(sleep_ms));
-C10	crates/sema-llm/src/builtins.rs:10071:/// offloaded future, or a `std::thread::sleep` on a pool worker) so sibling
-C11	crates/sema-llm/src/builtins.rs:10407:thread_local! {
-C07B	crates/sema-llm/src/builtins.rs:10903:    // `async/cancel` cuts the loop at an inter-round park.
-C07B	crates/sema-llm/src/builtins.rs:10960:    // `mcp/call`'s runtime external wait, or an `async/await` inside the handler),
-C07C	crates/sema-llm/src/builtins.rs:10981:            let _ = sema_core::call_callback(ctx, callback, &[Value::map(event_map)]);
-C07C	crates/sema-llm/src/builtins.rs:11017:            let _ = sema_core::call_callback(ctx, callback, &[Value::map(event_map)]);
+C07D	crates/sema-llm/src/builtins.rs:10079:        // synchronous caller thread (the provider's own block_on has already
+C10	crates/sema-llm/src/builtins.rs:10084:            std::thread::sleep(std::time::Duration::from_millis(sleep_ms));
+C10	crates/sema-llm/src/builtins.rs:10100:/// offloaded future, or a `std::thread::sleep` on a pool worker) so sibling
+C11	crates/sema-llm/src/builtins.rs:10436:thread_local! {
+C07B	crates/sema-llm/src/builtins.rs:10932:    // `async/cancel` cuts the loop at an inter-round park.
+C07B	crates/sema-llm/src/builtins.rs:10989:    // `mcp/call`'s runtime external wait, or an `async/await` inside the handler),
+C07C	crates/sema-llm/src/builtins.rs:11010:            let _ = sema_core::call_callback(ctx, callback, &[Value::map(event_map)]);
+C07C	crates/sema-llm/src/builtins.rs:11046:            let _ = sema_core::call_callback(ctx, callback, &[Value::map(event_map)]);
 C07C	crates/sema-llm/src/builtins.rs:1124:                let result = sema_core::call_callback(
 C07C	crates/sema-llm/src/builtins.rs:1138:                results.push(sema_core::call_callback(
 C07C	crates/sema-llm/src/builtins.rs:1150:                    let result = sema_core::call_callback(
-C11	crates/sema-llm/src/builtins.rs:11653:thread_local! {
+C11	crates/sema-llm/src/builtins.rs:11682:thread_local! {
 C07C	crates/sema-llm/src/builtins.rs:1168:                if sema_core::call_callback(ctx, &plan.callback, std::slice::from_ref(&argument))?
-C11	crates/sema-llm/src/builtins.rs:12238:                    match rx.recv() {
-C10	crates/sema-llm/src/builtins.rs:12468:            std::thread::sleep(std::time::Duration::from_millis(STREAM_POLL_INTERVAL_MS));
-C07C	crates/sema-llm/src/builtins.rs:12686:                let _ = sema_core::call_callback(ctx, callback, &[Value::map(event_map)]);
-C07C	crates/sema-llm/src/builtins.rs:12739:                let _ = sema_core::call_callback(ctx, callback, &[Value::map(event_map)]);
-C07C	crates/sema-llm/src/builtins.rs:12812:    let result = sema_core::call_callback(ctx, &tool_def.handler, &sema_args)?;
+C11	crates/sema-llm/src/builtins.rs:12267:                    match rx.recv() {
+C10	crates/sema-llm/src/builtins.rs:12497:            std::thread::sleep(std::time::Duration::from_millis(STREAM_POLL_INTERVAL_MS));
+C07C	crates/sema-llm/src/builtins.rs:12715:                let _ = sema_core::call_callback(ctx, callback, &[Value::map(event_map)]);
+C07C	crates/sema-llm/src/builtins.rs:12768:                let _ = sema_core::call_callback(ctx, callback, &[Value::map(event_map)]);
+C07C	crates/sema-llm/src/builtins.rs:12841:    let result = sema_core::call_callback(ctx, &tool_def.handler, &sema_args)?;
 C07B	crates/sema-llm/src/builtins.rs:1392:/// `NativeOutcome::Call`, so an async op inside the thunk (`async/spawn`,
 C07C	crates/sema-llm/src/builtins.rs:1394:/// `call_callback` re-entry would suspend the runtime quantum and hit the
 C07C	crates/sema-llm/src/builtins.rs:1396:/// synchronous `call_callback` extent): a thunk that only builds a promise tears down
@@ -455,16 +455,16 @@ C07C	crates/sema-llm/src/builtins.rs:4121:                let result = sema_core
 C11	crates/sema-llm/src/builtins.rs:539:thread_local! {
 C07C	crates/sema-llm/src/builtins.rs:6126:                let result = sema_core::call_callback(ctx, &body_fn, &[]);
 C10	crates/sema-llm/src/builtins.rs:6707:        std::thread::sleep(std::time::Duration::from_millis(ms));
-C07C	crates/sema-llm/src/builtins.rs:6893:                sema_core::call_callback(ctx, &callable, std::slice::from_ref(&argument))
 C11	crates/sema-llm/src/builtins.rs:68:/// so they satisfy the `'static` bound required by `thread_local!`.
-C11	crates/sema-llm/src/builtins.rs:7284:thread_local! {
-C07C	crates/sema-llm/src/builtins.rs:7464:        sema_core::call_callback(ctx, on_text, &[Value::string(chunk)])
+C07C	crates/sema-llm/src/builtins.rs:6922:                sema_core::call_callback(ctx, &callable, std::slice::from_ref(&argument))
+C11	crates/sema-llm/src/builtins.rs:7313:thread_local! {
 C07B	crates/sema-llm/src/builtins.rs:747:// `async/timeout` or a pool error-path) still runs to completion and decrements the
-C07D	crates/sema-llm/src/builtins.rs:8506:/// async tier drives futures with `block_on` (no task-abort). Lives on the runtime
-C11	crates/sema-llm/src/builtins.rs:9525:thread_local! {
-C07D	crates/sema-llm/src/builtins.rs:9605:/// Synchronous-path loop (the VM thread; provider `block_on` already returned
-C10	crates/sema-llm/src/builtins.rs:9606:/// before the backoff `thread::sleep`); the async wire stage uses the twin
-C10	crates/sema-llm/src/builtins.rs:9629:                        std::thread::sleep(std::time::Duration::from_millis(wait));
+C07C	crates/sema-llm/src/builtins.rs:7493:        sema_core::call_callback(ctx, on_text, &[Value::string(chunk)])
+C07D	crates/sema-llm/src/builtins.rs:8535:/// async tier drives futures with `block_on` (no task-abort). Lives on the runtime
+C11	crates/sema-llm/src/builtins.rs:9554:thread_local! {
+C07D	crates/sema-llm/src/builtins.rs:9634:/// Synchronous-path loop (the VM thread; provider `block_on` already returned
+C10	crates/sema-llm/src/builtins.rs:9635:/// before the backoff `thread::sleep`); the async wire stage uses the twin
+C10	crates/sema-llm/src/builtins.rs:9658:                        std::thread::sleep(std::time::Duration::from_millis(wait));
 C07D	crates/sema-llm/src/embeddings.rs:237:        sema_io::io_block_on(self.embed_async(request))
 C07D	crates/sema-llm/src/embeddings.rs:247:            Some(dialect) => sema_io::io_block_on(self.rerank_async(request, dialect)),
 C07D	crates/sema-llm/src/embeddings.rs:392:        sema_io::io_block_on(self.embed_async(request))
