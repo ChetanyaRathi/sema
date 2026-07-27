@@ -13093,6 +13093,26 @@
       "body": "Return the description of a tool definition.\n\n```sema\n(tool/description get-weather)   ; => \"Fetch the current weather for a city\"\n```"
     },
     {
+      "name": "tool/invoke",
+      "module": "tool",
+      "summary": "Invoke a tool definition's handler directly, without routing through an LLM agent. Arguments are validated against the tool's parameter schema (`tool/parameters`) and mapped to the handler's declared parameter order, then the handler's raw return value is passed through unchanged (not stringified for an LLM).",
+      "params": [
+        {
+          "name": "tool",
+          "type": "tool"
+        },
+        {
+          "name": "args",
+          "type": "map"
+        }
+      ],
+      "returns": "any",
+      "examples": [
+        "(deftool add-numbers \"Add two numbers\"\n  {:a {:type :number} :b {:type :number}}\n  (lambda (a b) (+ a b)))\n\n(tool/invoke add-numbers {:a 2 :b 3})   ; => 5\n(tool/invoke add-numbers {})            ; error: invalid arguments for tool 'add-numbers'"
+      ],
+      "body": "Invoke a tool definition's handler directly, without routing through an LLM\nagent. Arguments are validated against the tool's parameter schema\n(`tool/parameters`) and mapped to the handler's declared parameter order, then\nthe handler's raw return value is passed through unchanged (not stringified for\nan LLM).\n\nArgument values are JSON-coerced exactly as agent-driven tool calls: keywords\nbecome strings, and values with no JSON representation are converted lossily.\nThis keeps a direct invocation byte-for-byte identical to what the handler\nwould receive from a model.\n\n```sema\n(deftool add-numbers \"Add two numbers\"\n  {:a {:type :number} :b {:type :number}}\n  (lambda (a b) (+ a b)))\n\n(tool/invoke add-numbers {:a 2 :b 3})   ; => 5\n(tool/invoke add-numbers {})            ; error: invalid arguments for tool 'add-numbers'\n```"
+    },
+    {
       "name": "tool/name",
       "module": "tool",
       "summary": "Return the name of a tool definition.",
