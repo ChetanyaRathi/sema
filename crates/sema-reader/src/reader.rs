@@ -1971,7 +1971,9 @@ mod tests {
     fn test_read_short_lambda_nested_short_lambda_error() {
         // #(#(+ % 1)) should be a read error
         let err = read("#(#(+ % 1))").unwrap_err();
-        assert!(err.to_string().contains("nested short lambdas are not allowed"));
+        assert!(err
+            .to_string()
+            .contains("nested short lambdas are not allowed"));
     }
 
     #[test]
@@ -1997,7 +1999,11 @@ mod tests {
             Value::list(vec![
                 Value::symbol("lambda"),
                 Value::list(vec![Value::symbol("."), Value::symbol("%&")]),
-                Value::list(vec![Value::symbol("apply"), Value::symbol("+"), Value::symbol("%&")]),
+                Value::list(vec![
+                    Value::symbol("apply"),
+                    Value::symbol("+"),
+                    Value::symbol("%&")
+                ]),
             ])
         );
     }
