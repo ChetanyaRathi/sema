@@ -1,5 +1,81 @@
 # Changelog
 
+## 1.31.5 — 2026-07-27
+
+Twenty-one fixes from an audit of the stdlib, reader/compiler, LLM layer and
+notebook. Three of them abort the process; one loses your work.
+
+### Crashes and hangs
+
+- **A deeply nested cell no longer kills the notebook server.** Evaluating a
+  cell nested only ~200 deep aborted the whole process ("fatal runtime error:
+  stack overflow"), taking every unsaved cell with it — and saving is explicit,
+  so that is real work lost. `MAX_RESOLVE_DEPTH` was already there to prevent
+  exactly this, but it is calibrated against a main-thread-sized stack, while
+  the notebook engine ran on a default ~2MiB thread: the native stack gave out
+  before the guard could report. The engine thread now asks for 16MiB, and the
+  same input that used to abort returns a depth error while the server keeps
+  serving.
+- **`text/trim-indent` no longer aborts on multi-byte indentation.** It measured
+  the common indent in bytes and sliced that offset off every line, so one line
+  indented with an NBSP or ideographic space — ordinary in text pasted from a
+  browser or word processor — landed mid-character and killed the process,
+  uncatchable by `try`.
+- **A source file ending in `#i`, `#e` or `#d` no longer aborts the reader.**
+  It indexed past the end of input. Reachable from anything that reads untrusted
+  text: a file, `(read s)`, the LSP, the playground.
+- **`range` no longer spins forever.** Its counter wrapped at the i64 boundary
+  back into the loop: `(range 9223372036854775800 ... 3)` never returned and
+  reached 8.4 GB resident in three seconds.
+
+### Silently wrong results
+
+- **`list/sum` agrees with `+` again.** It kept a private i64 accumulator, so it
+  wrapped where `+` promotes to bignum — the same list summed two ways gave two
+  different answers — and it rejected bignums outright. Both now share one fold.
+- **Nested quasiquote follows R7RS.** `` `(a `(b ,c)) `` substituted `c` instead
+  of reproducing the form as data, and `,,x` failed with "Unbound variable:
+  unquote". This is what macro-writing macros depend on.
+- **Desugarings no longer resolve through rebindable names.** Binding `str`,
+  `get`, `append` or `list->vector` silently changed the meaning of f-strings,
+  quasiquote splicing and map destructuring — ordinary names a program may bind
+  by accident. Your own bindings still work for your own calls.
+- **Cached agent turns keep their tool calls.** Inside `llm/with-cache` a
+  tool-call round was stored as its (empty) content and replayed as a final
+  answer: no tool ran, nothing errored, and the entry persisted to disk for an
+  hour — poisoning exactly the "re-run the script cheaply" workflow the feature
+  exists for.
+- **Anthropic parallel tool calls work.** Results were sent as one message each,
+  but Anthropic requires all of them in the single message after the assistant
+  turn, so every multi-tool turn 400d — and Claude 4.x emits parallel calls by
+  default.
+- `string/number?` now agrees with `string->number` (it accepted `"+5"`, which
+  the conversion rejects, so the idiomatic guard-then-convert returned a
+  boolean); `math/sign` accepts rationals and bignums; `math/round-to` no longer
+  truncates its `places` argument through i32; `list/page` no longer overflows
+  into page 1; a regex literal ending in `\` no longer swallows its closing
+  quote; a string line-continuation no longer shifts every later line number
+  (which also misplaced LSP jumps and DAP breakpoints); and `%` inside a map
+  literal is now counted by `#(...)`.
+
+### LLM accounting and requests
+
+- `Retry-After` is read from the response instead of a hard-coded 5s, so a
+  provider asking for 60s is honored and rate-limited fan-outs no longer re-fire
+  in lockstep. A cache hit on a priced model no longer books a phantom $0.00
+  call. The cache key covers `max-tokens` and tool schemas. Ollama translates
+  `stop_sequences`, `json_mode` and `reasoning_effort` instead of dropping them.
+  Per-call `:timeout` applies to streaming. OpenAI streaming no longer
+  concatenates the tool name across deltas.
+
+### Tests
+
+- Notebook end-to-end coverage goes from 49 to 94 tests: on-disk durability
+  against the `.sema-nb` file, session semantics, API hardening, rendering
+  safety, overlapping requests, insertion position and pathological input. Two
+  boundaries are now pinned rather than assumed — there is no autosave, and undo
+  is single-level — so changing either becomes a deliberate decision.
+
 ## 1.31.4 — 2026-07-27
 
 - **Cancelling an MCP operation no longer leaks the server subprocess.** On
