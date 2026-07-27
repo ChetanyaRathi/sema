@@ -1,5 +1,30 @@
 # Changelog
 
+## 1.31.4 — 2026-07-27
+
+- **Cancelling an MCP operation no longer leaks the server subprocess.** On
+  cancellation the worker observed the signal and finished, but handed its live
+  `McpConnection` back inside the completion payload — and the runtime had
+  already reaped the wait that payload belonged to, so nothing decoded it and
+  nothing dropped it. The transport stayed open and, for a stdio server, the
+  child process kept running: measured still alive 30 seconds after
+  cancellation, while the runtime reported zero live tasks and zero resource
+  gates, i.e. a leaked process it believed it had cleaned up. Each worker now
+  distinguishes cancellation from failure — previously both arrived as
+  `Err("cancelled")`, indistinguishable from a real transport error — and drops
+  the connection on the worker thread when cancelled, so teardown no longer
+  depends on anyone draining a discarded completion. An operation that merely
+  failed still returns its connection to be checked back in. Fixed at all three
+  worker sites (`mcp/call`, `mcp/tools`/close, and the terminal close).
+- **The MCP cancellation tests assert causality instead of wall-clock timing.**
+  They encoded "promptly cancellable" as "the peer reacted within 1 second",
+  with the fixture releasing itself after 5 — a claim about the machine rather
+  than the code, so a loaded runner failed cancellations that had actually
+  worked. That intermittent red was indistinguishable from the leak above, which
+  is how the leak survived. The fixture now reports *why* its stall ended and
+  its self-release is a 120s leak guard; the tests wait for a terminal outcome
+  instead of a deadline. The full suite now passes with no retries.
+
 ## 1.31.3 — 2026-07-27
 
 - **Publishing works again — the release gate is green for the first time since
