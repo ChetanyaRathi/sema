@@ -209,10 +209,16 @@ eval_tests! {
     agent_system: r#"(begin (deftool greet "Greet" {:name {:type :string}} (lambda (name) name)) (defagent greeter {:system "You greet." :tools [greet]}) (agent/system greeter))"# => Value::string("You greet."),
     tool_invoke_ping: r#"(begin (deftool ping "Return pong" {} (lambda () "pong")) (tool/invoke ping {}))"# => Value::string("pong"),
     tool_invoke_typed: r#"(begin (deftool add-numbers "Add" {:a {:type :number} :b {:type :number}} (lambda (a b) (+ a b))) (tool/invoke add-numbers {:a 2 :b 3}))"# => Value::int(5),
+    // A `:validate` predicate dispatches as a structural call before the handler runs.
+    tool_invoke_validate_pass: r#"(begin (deftool check "Check" {:x {:type :number :validate (lambda (v) (> v 0)) :message "must be positive"}} (lambda (x) (* x 10))) (tool/invoke check {:x 4}))"# => Value::int(40),
+    // A handler that suspends parks on the runtime and resumes; the raw value
+    // (a keyword, which has no JSON form) passes through unstringified.
+    tool_invoke_suspending_handler: r#"(begin (deftool slow "Sleep then return" {} (lambda () (async/sleep 1) :done)) (tool/invoke slow {}))"# => Value::keyword("done"),
 }
 
 eval_error_tests! {
     tool_invoke_invalid_args: r#"(begin (deftool calc "Add" {:x {:type :number}} (lambda (x) x)) (tool/invoke calc {}))"# => "invalid arguments for tool 'calc': missing key: x",
+    tool_invoke_validate_fail: r#"(begin (deftool check "Check" {:x {:type :number :validate (lambda (v) (> v 0)) :message "must be positive"}} (lambda (x) x)) (tool/invoke check {:x -1}))"# => "invalid arguments for tool 'check': key x: must be positive",
 }
 
 // ============================================================

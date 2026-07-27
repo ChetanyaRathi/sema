@@ -6710,28 +6710,33 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
         Ok(NativeOutcome::Return(Value::int(id)))
     });
 
-    // (tool/invoke tool args) — Direct invocation of a deftool handler
-    register_fn_ctx(env, "tool/invoke", |ctx, args| {
+    // (tool/invoke tool args) — direct invocation of a deftool handler, without
+    // routing through an LLM agent. Custom `:validate` predicates and the handler
+    // itself dispatch as structural `NativeOutcome::Call`s so a handler that
+    // suspends parks on the runtime like any cooperative work.
+    register_runtime_fn_ctx(env, "tool/invoke", |_ctx, args| {
         if args.len() != 2 {
             return Err(SemaError::arity("tool/invoke", "2", args.len()));
         }
         let tool_def = args[0]
             .as_tool_def_rc()
             .ok_or_else(|| SemaError::type_error("tool", args[0].type_name()))?;
-        let _ = args[1]
-            .as_map_rc()
-            .ok_or_else(|| SemaError::type_error("map", args[1].type_name()))?;
-
-        if let Err(msg) = validate_extraction(&args[1], &tool_def.parameters) {
-            return Err(SemaError::Llm(format!(
-                "invalid arguments for tool '{name}': {msg}",
-                name = tool_def.name
-            )));
+        if args[1].as_map_rc().is_none() {
+            return Err(SemaError::type_error("map", args[1].type_name()));
         }
 
+        // JSON-coerce the arguments (lossily) so a direct invocation hands the
+        // handler exactly what an agent-driven tool call would.
         let json_args = sema_core::value_to_json_lossy(&args[1]);
-        let sema_args = json_args_to_sema(&tool_def.parameters, &json_args, &tool_def.handler);
-        sema_core::call_callback(ctx, &tool_def.handler, &sema_args)
+        let handler_args = json_args_to_sema(&tool_def.parameters, &json_args, &tool_def.handler);
+        Box::new(ToolInvokeContinuation {
+            tool_name: tool_def.name.clone(),
+            steps: prepare_extraction_validation(&args[1], &tool_def.parameters),
+            errors: Vec::new(),
+            pending_predicate: None,
+            handler: Some((tool_def.handler.clone(), handler_args)),
+        })
+        .advance()
     });
 }
 
@@ -12851,6 +12856,114 @@ fn stringify_tool_result(result: Value) -> String {
         serde_json::to_string(&json).unwrap_or_else(|_| result.to_string())
     } else {
         result.to_string()
+    }
+}
+
+/// Drives `(tool/invoke tool args)`: runs the argument-validation steps (custom
+/// `:validate` predicates dispatch as structural calls), then tail-calls the
+/// handler and passes its raw return value through unchanged.
+struct ToolInvokeContinuation {
+    tool_name: String,
+    steps: VecDeque<ExtractionValidationStep>,
+    errors: Vec<String>,
+    /// `(key_name, failure_message)` for the predicate call in flight.
+    pending_predicate: Option<(String, String)>,
+    /// Taken at handler dispatch; a `Returned` with no pending predicate is the
+    /// handler settling.
+    handler: Option<(Value, Vec<Value>)>,
+}
+
+impl ToolInvokeContinuation {
+    fn advance(mut self: Box<Self>) -> sema_core::runtime::NativeResult {
+        use sema_core::runtime::{NativeCall, NativeOutcome};
+        while let Some(step) = self.steps.pop_front() {
+            match step {
+                ExtractionValidationStep::Error(error) => self.errors.push(error),
+                ExtractionValidationStep::Predicate {
+                    callable,
+                    argument,
+                    key_name,
+                    failure_message,
+                } => {
+                    self.pending_predicate = Some((key_name, failure_message));
+                    return Ok(NativeOutcome::Call(NativeCall {
+                        callable,
+                        args: vec![argument],
+                        continuation: self,
+                    }));
+                }
+            }
+        }
+        if !self.errors.is_empty() {
+            return Err(SemaError::Llm(format!(
+                "invalid arguments for tool '{}': {}",
+                self.tool_name,
+                self.errors.join("; ")
+            )));
+        }
+        let (handler, args) = self.handler.take().expect("handler present until dispatch");
+        Ok(NativeOutcome::Call(NativeCall {
+            callable: handler,
+            args,
+            continuation: self,
+        }))
+    }
+}
+
+impl sema_core::runtime::Trace for ToolInvokeContinuation {
+    fn trace(&self, sink: &mut dyn FnMut(sema_core::cycle::GcEdge<'_>)) -> bool {
+        for step in &self.steps {
+            if let ExtractionValidationStep::Predicate {
+                callable, argument, ..
+            } = step
+            {
+                sink(sema_core::cycle::GcEdge::Value(callable));
+                sink(sema_core::cycle::GcEdge::Value(argument));
+            }
+        }
+        if let Some((handler, args)) = &self.handler {
+            sink(sema_core::cycle::GcEdge::Value(handler));
+            for value in args {
+                sink(sema_core::cycle::GcEdge::Value(value));
+            }
+        }
+        true
+    }
+}
+
+impl sema_core::runtime::NativeContinuation for ToolInvokeContinuation {
+    fn resume(
+        mut self: Box<Self>,
+        _context: &mut sema_core::runtime::NativeCallContext<'_>,
+        input: sema_core::runtime::ResumeInput,
+    ) -> sema_core::runtime::NativeResult {
+        use sema_core::runtime::{NativeOutcome, ResumeInput};
+        match input {
+            ResumeInput::Returned(value) => match self.pending_predicate.take() {
+                Some((key_name, failure_message)) => {
+                    if !value.is_truthy() {
+                        self.errors
+                            .push(format!("key {key_name}: {failure_message}"));
+                    }
+                    self.advance()
+                }
+                None => Ok(NativeOutcome::Return(value)),
+            },
+            ResumeInput::Failed(error) => match self.pending_predicate.take() {
+                Some((key_name, _)) => {
+                    self.errors
+                        .push(format!("key {key_name}: validation error: {error}"));
+                    self.advance()
+                }
+                None => Err(error),
+            },
+            ResumeInput::Cancelled(reason) => Err(SemaError::eval(format!(
+                "tool/invoke was cancelled ({reason:?})"
+            ))),
+            ResumeInput::Runtime(_) => Err(SemaError::eval(
+                "tool/invoke received an unexpected runtime response",
+            )),
+        }
     }
 }
 
