@@ -38,11 +38,20 @@ fi
 # `cargo publish` fails to resolve the `=X.Y.Z` pin against the crates.io index
 # (this half-published v1.30.0: sema-stdlib gained a sema-fmt dep that sat later
 # in the list).
+#
+# Dev-dependencies are deliberately excluded. They may legitimately point back
+# up the graph (sema-vm's tests use sema-eval/sema-stdlib, which both depend on
+# sema-vm) and no publish order can satisfy such a cycle. Those dev-deps are
+# declared path-only, so `cargo package` strips them and the uploaded manifest
+# never names them — they impose no ordering constraint. A dev-dep that DID
+# carry a version would break publishing, but that is the version pin's fault,
+# not the order's, and cargo reports it directly.
 order=$(grep -oE 'publish sema-[a-z]+' "$WF" | awk '{print $2}')
 pos() { echo "$order" | grep -n "^$1\$" | cut -d: -f1; }
 edges=$(cargo metadata --no-deps --format-version 1 --manifest-path "$ROOT/Cargo.toml" |
   jq -r '.packages[] | select(.publish != []) | .name as $n
-           | .dependencies[] | select(.name | startswith("sema-")) | "\($n) \(.name)"')
+           | .dependencies[] | select(.kind != "dev")
+           | select(.name | startswith("sema-")) | "\($n) \(.name)"')
 bad=0
 while read -r crate dep; do
   [ -z "$crate" ] && continue
