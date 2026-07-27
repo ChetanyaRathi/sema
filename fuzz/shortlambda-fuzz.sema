@@ -1,0 +1,178 @@
+;; shortlambda-fuzz.sema — a targeted generative fuzzer for `#(...)` reader desugar.
+;;
+;; The grammar fuzzer (grammar-fuzz.sema) generates programs as Sema *values* and
+;; evals them directly, so read-time syntax like `#(...)` never passes through it.
+;; This harness closes that gap: it generates short-lambda SOURCE STRINGS whose
+;; expected value is computed bottom-up during generation, then checks the oracle
+;;
+;;     (= expected (eval (read src)))
+;;
+;; driving tokenizer -> parse_short_lambda -> rewrite_percent_args -> lower ->
+;; compile -> VM for every program. Placeholders are exercised in every position
+;; the scan recurses into: nested (lambda ...)/(fn ...) bodies (issue #116), map
+;; literals (keys and values), vector literals, quasiquote/unquote(-splicing),
+;; and let bodies — plus `%&` rest args and mixed `%N`+`%&` forms.
+;;
+;; Error oracles: nested `#()` (with and without an intervening lambda) must be a
+;; read error; placeholders past the %255 cap must be a read error.
+;;
+;; Configuration (environment variables):
+;;   SEMA_FUZZ_SEED   base seed (int, default 0)
+;;   SEMA_FUZZ_COUNT  number of programs (default 500)
+;;   SEMA_FUZZ_DEPTH  max body depth (default 4)
+;;
+;; Iteration i uses seed (base + i); a failure reproduces with
+;;   SEMA_FUZZ_SEED=<seed> SEMA_FUZZ_COUNT=1
+
+;; ── PRNG (same LCG family as grammar-fuzz.sema) ─────────────────────────
+(define *rng* 1)
+
+(define (rng-seed! s)
+  (set! *rng*
+    (mod (abs (+ (* (+ (abs s) 1) 6364136223846793005) 1442695040888963407))
+      9223372036854775806)))
+
+(define (rng-next!)
+  (set! *rng* (+ (* *rng* 6364136223846793005) 1442695040888963407))
+  *rng*)
+
+(define (rng-int! n)
+  (if (<= n 1) 0 (mod (abs (bit/shift-right (rng-next!) 17)) n)))
+
+;; ── generation state ────────────────────────────────────────────────────
+;; `*args*` holds the values the positional placeholders will be called with;
+;; `*max-used*` / `*rest-used*` track what the generated body actually
+;; references, so the call site passes exactly the right number of arguments.
+(define *args* [])
+(define *rest* [])
+(define *max-used* 0)
+(define *rest-used* #f)
+
+(define (use-placeholder! i)
+  (set! *max-used* (max *max-used* i))
+  (nth *args* (- i 1)))
+
+(define (sum xs) (foldl + 0 xs))
+(define (second xs) (first (rest xs)))
+
+;; gen-expr returns (src-string expected-value); small ints only, `+`-heavy to
+;; keep values well inside i64.
+(define (gen-expr depth)
+  (let ((arity (count *args*))
+        (pick (rng-int! (if (= depth 0) 3 11))))
+    (cond
+      ;; leaf: int literal
+      ((= pick 0)
+       (let ((k (rng-int! 100)))
+         (list (str k) k)))
+      ;; leaf: positional placeholder (falls back to a literal when arity 0)
+      ((or (= pick 1) (= pick 2))
+       (if (= arity 0)
+         (let ((k (rng-int! 100))) (list (str k) k))
+         (let ((i (+ 1 (rng-int! arity))))
+           (list (if (and (= i 1) (= (rng-int! 2) 0)) "%" f"%${i}")
+             (use-placeholder! i)))))
+      ;; (+ a b)
+      ((= pick 3)
+       (let ((a (gen-expr (- depth 1))) (b (gen-expr (- depth 1))))
+         (list f"(+ ${(first a)} ${(first b)})" (+ (second a) (second b)))))
+      ;; (- a)
+      ((= pick 4)
+       (let ((a (gen-expr (- depth 1))))
+         (list f"(- ${(first a)})" (- (second a)))))
+      ;; rest-arg sum (falls back to + when no rest args this round)
+      ((= pick 5)
+       (if (empty? *rest*)
+         (let ((a (gen-expr (- depth 1))) (b (gen-expr (- depth 1))))
+           (list f"(+ ${(first a)} ${(first b)})" (+ (second a) (second b))))
+         (begin
+           (set! *rest-used* #t)
+           (if (= (rng-int! 2) 0)
+             (list "(apply + %&)" (sum *rest*))
+             ;; splice through a quasiquote for the ,@%& path
+             (list "(apply + `(,@%&))" (sum *rest*))))))
+      ;; nested lambda applied immediately — the issue #116 shape
+      ((= pick 6)
+       (let ((e (gen-expr (- depth 1))) (k (rng-int! 50)))
+         (list f"((lambda (y) (+ y ${(first e)})) ${k})" (+ k (second e)))))
+      ;; nested fn, two params, one shadowing-prone name
+      ((= pick 7)
+       (let ((e (gen-expr (- depth 1))) (k (rng-int! 50)))
+         (list f"((fn (y) (+ y ${(first e)})) ${k})" (+ k (second e)))))
+      ;; map literal, placeholder in the value position
+      ((= pick 8)
+       (let ((e (gen-expr (- depth 1))))
+         (list f"(get {:k ${(first e)}} :k)" (second e))))
+      ;; vector literal
+      ((= pick 9)
+       (let ((a (gen-expr (- depth 1))) (b (gen-expr (- depth 1))))
+         (list f"(nth [${(first a)} ${(first b)}] 1)" (second b))))
+      ;; quasiquote + unquote
+      (else
+       (let ((e (gen-expr (- depth 1))))
+         (list f"(first `(,${(first e)}))" (second e)))))))
+
+(define (run-one seed depth)
+  (rng-seed! seed)
+  (let ((arity (rng-int! 4))
+        (n-rest (rng-int! 4)))
+    (set! *args* (map (lambda (_) (rng-int! 100)) (range 0 arity)))
+    (set! *rest* (map (lambda (_) (rng-int! 100)) (range 0 n-rest)))
+    (set! *max-used* 0)
+    (set! *rest-used* #f)
+    (let* ((body (gen-expr depth))
+           (call-args (append (take *max-used* *args*)
+                        (if *rest-used* *rest* (list))))
+           ;; `#(...)`'s contents ARE the call form (`#(x)` calls x), so the
+           ;; generated expression is always embedded as an operand of `+`.
+           (src (str "(#(+ 0 " (first body) ")"
+                  (apply str (map (lambda (a) f" ${a}") call-args))
+                  ")"))
+           (expected (second body))
+           (got (try (eval (read src)) (catch e (list :error (str e))))))
+      (if (= got expected)
+        #t
+        (begin
+          (println f"MISMATCH seed=${seed}")
+          (println f"  src:      ${src}")
+          (println f"  expected: ${expected}")
+          (println f"  got:      ${got}")
+          #f)))))
+
+;; error-oracle rounds: these sources must FAIL to read
+(define (run-error-one seed)
+  (rng-seed! seed)
+  (let* ((cases
+           (list
+             "#(#(+ % 1))"
+             "#(map (lambda (y) #(+ y %)) (list 1))"
+             f"#(%${(+ 256 (rng-int! 100000))})"
+             "#(list `(a ,#(+ % 1)))"))
+         (src (nth cases (rng-int! (count cases))))
+         (got (try (list :read-ok (read src)) (catch e :error))))
+    (if (= got :error)
+      #t
+      (begin
+        (println f"ERROR-ORACLE MISS seed=${seed}: read accepted ${src}")
+        #f))))
+
+(define (main)
+  (let* ((base (int (or (env "SEMA_FUZZ_SEED") "0")))
+         (n (int (or (env "SEMA_FUZZ_COUNT") "500")))
+         (depth (int (or (env "SEMA_FUZZ_DEPTH") "4")))
+         (failures
+           (foldl
+             (lambda (acc i)
+               (let ((ok (if (= 0 (mod i 10))
+                           (run-error-one (+ base i))
+                           (run-one (+ base i) depth))))
+                 (if ok acc (+ acc 1))))
+             0
+             (range 0 n))))
+    (if (= failures 0)
+      (println f"shortlambda-fuzz: ${n} programs OK (seed base ${base}, depth ${depth})")
+      (begin
+        (println f"shortlambda-fuzz: ${failures}/${n} FAILED")
+        (exit 1)))))
+
+(main)
