@@ -63,7 +63,8 @@ packages/sema-web/src/*
 .cargo/config.toml
 scripts/wasm-build.sh"
 
-DIGESTS="$(python3 - "$LOCK" "$MODE" <<PY
+DIGESTS="$(
+  python3 - "$LOCK" "$MODE" <<PY
 import hashlib
 import json
 import pathlib

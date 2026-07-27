@@ -503,7 +503,7 @@ impl Parser {
                 ..
             }) => {
                 let parts = parts.clone();
-                let mut items = vec![Value::symbol("str")];
+                let mut items = vec![Value::symbol("__vm-str")];
                 for part in &parts {
                     match part {
                         FStringPart::Literal(s) => {
@@ -1613,7 +1613,7 @@ mod tests {
         let result = read(r#"f"hello""#).unwrap();
         assert_eq!(
             result,
-            Value::list(vec![Value::symbol("str"), Value::string("hello")])
+            Value::list(vec![Value::symbol("__vm-str"), Value::string("hello")])
         );
     }
 
@@ -1623,7 +1623,7 @@ mod tests {
         assert_eq!(
             result,
             Value::list(vec![
-                Value::symbol("str"),
+                Value::symbol("__vm-str"),
                 Value::string("hello "),
                 Value::symbol("name"),
             ])
@@ -1636,7 +1636,7 @@ mod tests {
         assert_eq!(
             result,
             Value::list(vec![
-                Value::symbol("str"),
+                Value::symbol("__vm-str"),
                 Value::symbol("a"),
                 Value::string(" and "),
                 Value::symbol("b"),
@@ -1650,7 +1650,7 @@ mod tests {
         assert_eq!(
             result,
             Value::list(vec![
-                Value::symbol("str"),
+                Value::symbol("__vm-str"),
                 Value::string("result: "),
                 Value::list(vec![Value::symbol("+"), Value::int(1), Value::int(2),]),
             ])
@@ -1662,7 +1662,7 @@ mod tests {
         let result = read(r#"f"costs \$5""#).unwrap();
         assert_eq!(
             result,
-            Value::list(vec![Value::symbol("str"), Value::string("costs $5")])
+            Value::list(vec![Value::symbol("__vm-str"), Value::string("costs $5")])
         );
     }
 
@@ -1671,7 +1671,7 @@ mod tests {
         let result = read(r#"f"costs $5""#).unwrap();
         assert_eq!(
             result,
-            Value::list(vec![Value::symbol("str"), Value::string("costs $5")])
+            Value::list(vec![Value::symbol("__vm-str"), Value::string("costs $5")])
         );
     }
 
@@ -1680,7 +1680,10 @@ mod tests {
         let result = read(r#"f"line1\nline2""#).unwrap();
         assert_eq!(
             result,
-            Value::list(vec![Value::symbol("str"), Value::string("line1\nline2"),])
+            Value::list(vec![
+                Value::symbol("__vm-str"),
+                Value::string("line1\nline2"),
+            ])
         );
     }
 
@@ -1739,7 +1742,7 @@ mod tests {
         assert_eq!(
             result,
             Value::list(vec![
-                Value::symbol("str"),
+                Value::symbol("__vm-str"),
                 Value::string("name: "),
                 Value::list(vec![Value::keyword("name"), Value::symbol("user")]),
             ])
@@ -1754,7 +1757,7 @@ mod tests {
             Value::list(vec![
                 Value::symbol("println"),
                 Value::list(vec![
-                    Value::symbol("str"),
+                    Value::symbol("__vm-str"),
                     Value::string("hello "),
                     Value::symbol("name"),
                 ]),
@@ -1765,7 +1768,7 @@ mod tests {
     #[test]
     fn test_read_fstring_empty() {
         let result = read(r#"f"""#).unwrap();
-        assert_eq!(result, Value::list(vec![Value::symbol("str")]));
+        assert_eq!(result, Value::list(vec![Value::symbol("__vm-str")]));
     }
 
     #[test]
@@ -1773,7 +1776,7 @@ mod tests {
         let result = read(r#"f"${x}""#).unwrap();
         assert_eq!(
             result,
-            Value::list(vec![Value::symbol("str"), Value::symbol("x")])
+            Value::list(vec![Value::symbol("__vm-str"), Value::symbol("x")])
         );
     }
 

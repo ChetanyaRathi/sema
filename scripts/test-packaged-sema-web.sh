@@ -79,8 +79,8 @@ fi
 # someone forgot to `git add`, would then be embedded in dev yet MISSING from the
 # .crate: the exact ship-vs-dev divergence. Reject any untracked/ignored file.
 STRAY="$(
-  git -C "$ROOT" status --porcelain --ignored -- crates/sema/src/web/assets \
-    | sed -n '/^?? /p;/^!! /p'
+  git -C "$ROOT" status --porcelain --ignored -- crates/sema/src/web/assets |
+    sed -n '/^?? /p;/^!! /p'
 )"
 if [[ -n "$STRAY" ]]; then
   echo "packaged web smoke: untracked/ignored files in the asset dir (embedded locally, NOT shipped):" >&2
@@ -121,7 +121,8 @@ cp "$PACKAGE_WASM" "$TMP/expected-sema_wasm_bg.wasm"
 # bug: the installed binary must reject the candidate and publish the bytes
 # embedded from this .crate, without consulting the checkout.
 PACKAGE_VERSION="${PACKAGE_DIR##*/sema-lang-}"
-ASSET_DIGEST="$(python3 - "$PACKAGE_DIR/src/web/assets" <<'PY'
+ASSET_DIGEST="$(
+  python3 - "$PACKAGE_DIR/src/web/assets" <<'PY'
 import hashlib
 import pathlib
 import struct

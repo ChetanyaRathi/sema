@@ -34,7 +34,8 @@ SYSROOT="$(rustc --print sysroot)"
 # configuration and produce a binary that overflows on deep recursion. Read that
 # array out of the config and prepend it rather than restating it here, so the
 # config stays the single source of truth for those flags.
-CARGO_ENCODED_RUSTFLAGS="$(python3 - "$ROOT/.cargo/config.toml" "$CARGO_ROOT" "$SYSROOT" "$ROOT" <<'PY'
+CARGO_ENCODED_RUSTFLAGS="$(
+  python3 - "$ROOT/.cargo/config.toml" "$CARGO_ROOT" "$SYSROOT" "$ROOT" <<'PY'
 import pathlib
 import sys
 import tomllib

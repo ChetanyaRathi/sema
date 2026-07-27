@@ -3467,6 +3467,28 @@ fn force_legacy(
 pub fn register_vm_delegates(env: &Rc<Env>, ctx: &Rc<EvalContext>) {
     sema_core::set_macro_expand_callback(ctx, expand_for_vm_runtime_callback);
 
+    // Private aliases for the stdlib functions that DESUGARINGS expand into.
+    //
+    // An f-string lowers to a `str` call, quasiquote splicing to `append` /
+    // `list->vector`, and map destructuring to `get`. Emitting those bare names
+    // meant a user binding of any of them silently changed the meaning of
+    // unrelated syntax — `(let ((str ...)) f"a${1}b")` called the local, as did
+    // a top-level `(define (str . xs) ...)`. Aliasing the same function VALUE
+    // under a `__vm-` name (the convention `__vm-destructure` already uses, and
+    // which the reader/lowerer now emit) keeps the expansion pointing at the
+    // real function regardless of what the user rebinds. Registered here
+    // because stdlib is in place by the time delegates are.
+    for (alias, target) in [
+        ("__vm-str", "str"),
+        ("__vm-append", "append"),
+        ("__vm-list->vector", "list->vector"),
+        ("__vm-get", "get"),
+    ] {
+        if let Some(f) = env.get(intern(target)) {
+            env.set(intern(alias), f);
+        }
+    }
+
     // __vm-eval: macro-expand, compile, and run the expression on the bytecode
     // VM (rooted at the global env so top-level `define`s persist). The runtime
     // `(eval ...)` meta path is thus VM-native.

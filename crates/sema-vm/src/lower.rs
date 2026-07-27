@@ -460,7 +460,7 @@ fn lower_destructuring_bindings(
     let tmp = gensym("val");
     let map_tmp = gensym("map");
     let vars = collect_pattern_vars(pattern);
-    let get_spur = intern("get");
+    let get_spur = intern("__vm-get");
 
     let mut bindings = Vec::new();
     // (define tmp init)
@@ -1481,7 +1481,7 @@ fn expand_quasiquote_seq(
         segments.into_iter().next().unwrap()
     } else {
         CoreExpr::Call {
-            func: Box::new(CoreExpr::Var(intern("append"))),
+            func: Box::new(CoreExpr::Var(intern("__vm-append"))),
             args: segments,
             tail: false,
         }
@@ -1489,7 +1489,7 @@ fn expand_quasiquote_seq(
 
     if as_vector {
         Ok(CoreExpr::Call {
-            func: Box::new(CoreExpr::Var(intern("list->vector"))),
+            func: Box::new(CoreExpr::Var(intern("__vm-list->vector"))),
             args: vec![list_expr],
             tail: false,
         })
