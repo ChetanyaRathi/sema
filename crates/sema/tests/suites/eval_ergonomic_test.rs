@@ -26,6 +26,42 @@ eval_tests! {
     short_lambda_two_args: "(#(+ %1 %2) 3 4)" => Value::int(7),
     short_lambda_no_args: "(#(+ 1 2))" => Value::int(3),
     short_lambda_nested_call: r#"(map #(string-length %) '("hi" "hello" "hey"))"# => Value::list(vec![Value::int(2), Value::int(5), Value::int(3)]),
+
+    // Clojure semantics (issue #116): a placeholder inside a nested `lambda`/`fn`
+    // belongs to the enclosing `#()` — before, it was silently not counted and
+    // the short lambda came out arity-0.
+    short_lambda_percent_in_nested_lambda:
+        "(str (map #(map (lambda (y) (+ y %)) (list 10)) (list 1 2)))" => Value::string("((11) (12))"),
+    short_lambda_percent_in_nested_fn:
+        "(str (map #(map (fn (y) (+ y %)) (list 10)) (list 1 2)))" => Value::string("((11) (12))"),
+    short_lambda_three_deep_nesting:
+        "(str (#(map (lambda (a) (map (lambda (b) (+ a b %)) (list 1))) (list 10)) 100))" => Value::string("((111))"),
+    short_lambda_nested_lambda_param_shadows:
+        "(str (map #(map (lambda (y) (* y %)) (list 2 3)) (list 10)))" => Value::string("((20 30))"),
+
+    // `%&` rest argument: all args past the highest positional, as a list.
+    short_lambda_rest_arg: "(#(apply + %&) 1 2 3)" => Value::int(6),
+    short_lambda_rest_arg_empty: "(#(apply + %&))" => Value::int(0),
+    short_lambda_positional_plus_rest: "(#(+ %1 (apply + %&)) 10 1 2 3)" => Value::int(16),
+    short_lambda_rest_captured_by_nested_lambda: "(#((lambda () (apply + %&))) 1 2 3)" => Value::int(6),
+    short_lambda_rest_in_map_value: "(str (#(get {:r %&} :r) 1 2))" => Value::string("(1 2)"),
+
+    // `%2` alone still makes the lambda binary.
+    short_lambda_percent2_only: "(str (#(list %2) 1 2))" => Value::string("(2)"),
+    short_lambda_percent_in_vector_literal: "(#(count [% %]) 3)" => Value::int(2),
+
+    // Quasiquote interplay: an unquoted placeholder is substituted; a nested
+    // quasiquote keeps the R7RS depth rules with the rewritten placeholder.
+    short_lambda_percent_in_unquote:
+        "(str (#(list `(a ,%)) 5))" => Value::string("((a 5))"),
+    short_lambda_rest_in_unquote_splicing:
+        "(str (#(list `(a ,@%&)) 1 2 3))" => Value::string("((a 1 2 3))"),
+    short_lambda_percent_in_nested_quasiquote:
+        "(str (#(list `(a `(b ,,%))) 9))" => Value::string("((a (quasiquote (b (unquote 9)))))"),
+
+    // A quoted `%` is still renamed (Clojure-faithful): it evaluates to the
+    // symbol `%1` as data, and the placeholder still counts toward the arity.
+    short_lambda_percent_under_quote: "(str (#(list '%) 5))" => Value::string("(%1)"),
 }
 
 // ============================================================
@@ -101,4 +137,14 @@ eval_error_tests! {
     hash_inexact_prefix_at_eof: "#i",
     hash_exact_prefix_at_eof: "#e",
     hash_decimal_prefix_at_eof: "#d",
+
+    // Nesting `#()` inside `#()` is a read-time error (Clojure semantics) — even
+    // with an intervening regular lambda, since the placeholders would be
+    // ambiguous either way.
+    short_lambda_directly_nested: "#(#(+ % 1))" => "nested short lambdas are not allowed",
+    short_lambda_nested_behind_lambda:
+        "#(map (lambda (y) #(+ y %)) (list 1))" => "nested short lambdas are not allowed",
+    // A short lambda after a *failed* short-lambda parse must still work: the
+    // in-short-lambda flag has to unwind on the error path.
+    short_lambda_unterminated: "#(+ 1" => "unterminated short lambda",
 }

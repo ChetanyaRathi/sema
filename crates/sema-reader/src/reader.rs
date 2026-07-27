@@ -10,6 +10,12 @@ use crate::lexer::{tokenize, FStringPart, SpannedToken, Token};
 /// stack via thousands of nested forms. 1024 is far beyond any real program.
 const MAX_PARSE_DEPTH: usize = 1024;
 
+/// Highest positional placeholder (`%N`) a short lambda may use. The desugar
+/// materializes a parameter symbol for every slot up to the highest index, so
+/// this bound is what keeps a tiny malicious input from forcing a huge
+/// allocation at read time.
+const MAX_SHORT_LAMBDA_ARG: usize = 255;
+
 struct Parser {
     tokens: Vec<SpannedToken>,
     pos: usize,
@@ -396,6 +402,22 @@ impl Parser {
         let mut max_arg: usize = 0;
         let mut has_rest = false;
         let body = rewrite_percent_args(&body, &mut max_arg, &mut has_rest);
+
+        // The parameter list below materializes one interned symbol per slot up
+        // to the highest placeholder, so an unbounded `%N` lets a 12-byte input
+        // (`#(%9999999)`) allocate millions of symbols — reachable from any
+        // untrusted read (a .sema file, `(read s)`, the LSP, the playground).
+        // 255 is far beyond any legitimate short lambda and keeps the
+        // allocation trivial.
+        if max_arg > MAX_SHORT_LAMBDA_ARG {
+            return Err(SemaError::Reader {
+                message: format!(
+                    "short lambda placeholder %{max_arg} exceeds the maximum of {MAX_SHORT_LAMBDA_ARG}"
+                ),
+                span: open_span,
+            }
+            .with_hint("use a regular `lambda` with named parameters instead"));
+        }
 
         // Build parameter list
         let mut params: Vec<Value> = if max_arg == 0 {
@@ -1950,6 +1972,20 @@ mod tests {
         // #(#(+ % 1)) should be a read error
         let err = read("#(#(+ % 1))").unwrap_err();
         assert!(err.to_string().contains("nested short lambdas are not allowed"));
+    }
+
+    #[test]
+    fn test_read_short_lambda_placeholder_cap() {
+        // At the cap: fine (255 params materialize).
+        let ok = read("#(+ %255 1)").unwrap();
+        let items = ok.as_list().unwrap();
+        assert_eq!(items[1].as_list().unwrap().len(), 255);
+        // One past the cap: a clear read error instead of a huge allocation.
+        let err = read("#(+ %256 1)").unwrap_err();
+        assert!(err.to_string().contains("exceeds the maximum"));
+        // The fuzzer's 12-byte slow unit.
+        let err = read("#(%9999999)").unwrap_err();
+        assert!(err.to_string().contains("exceeds the maximum"));
     }
 
     #[test]
