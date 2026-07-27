@@ -2257,15 +2257,25 @@ pub fn register(env: &sema_core::Env) {
         }
         let mut result = Vec::new();
         let mut i = start;
+        // `i += step` wraps at the i64 boundary and lands back inside the loop
+        // condition, which then spins forever allocating (observed: 8.4 GB in
+        // 3s for `(range 9223372036854775800 9223372036854775807 3)`) or emits
+        // wrapped values. The sequence simply ends where i64 does.
         if step > 0 {
             while i < end {
                 result.push(Value::int(i));
-                i += step;
+                match i.checked_add(step) {
+                    Some(next) => i = next,
+                    None => break,
+                }
             }
         } else {
             while i > end {
                 result.push(Value::int(i));
-                i += step;
+                match i.checked_add(step) {
+                    Some(next) => i = next,
+                    None => break,
+                }
             }
         }
         Ok(Value::list(result))
@@ -2955,25 +2965,10 @@ pub fn register(env: &sema_core::Env) {
     register_fn(env, "list/sum", |args| {
         check_arity!(args, "list/sum", 1);
         let items = get_sequence(&args[0], "list/sum")?;
-        let mut int_sum: i64 = 0;
-        let mut has_float = false;
-        let mut float_sum: f64 = 0.0;
-        for item in items.iter() {
-            if let Some(n) = item.as_int() {
-                int_sum += n;
-                float_sum += n as f64;
-            } else if let Some(f) = item.as_float() {
-                has_float = true;
-                float_sum += f;
-            } else {
-                return Err(SemaError::type_error("number", item.type_name()));
-            }
-        }
-        if has_float {
-            Ok(Value::float(float_sum))
-        } else {
-            Ok(Value::int(int_sum))
-        }
+        // Through the SAME fold as `+`: which builtin you reach for must not
+        // change the answer. The old i64 accumulator wrapped silently past
+        // i64::MAX and rejected bignums outright.
+        crate::arithmetic::sum_through_tower(items.iter())
     });
 
     register_fn(env, "list/min", |args| {
@@ -3322,7 +3317,7 @@ pub fn register(env: &sema_core::Env) {
         if page < 1 {
             return Err(SemaError::eval("list/page: page must be >= 1"));
         }
-        let start = ((page - 1) as usize) * per_page;
+        let start = ((page - 1) as usize).saturating_mul(per_page);
         if start >= items.len() {
             return Ok(Value::list(vec![]));
         }

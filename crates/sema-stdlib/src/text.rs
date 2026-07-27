@@ -442,23 +442,37 @@ fn trim_indent(text: &str) -> String {
         return String::new();
     }
     let lines: Vec<&str> = text.split('\n').collect();
+    // Measure the common indent in CHARACTERS, not bytes. A byte count taken
+    // from one line and sliced off another lands inside a character the moment
+    // any line is indented with multi-byte whitespace — NBSP or an ideographic
+    // space, both ordinary in text pasted from a browser or a word processor —
+    // and `&line[min_indent..]` then aborts the process with "byte index is not
+    // a char boundary", which `try`/`catch` cannot catch.
     let min_indent = lines
         .iter()
         .filter(|l| !l.trim().is_empty())
-        .map(|l| l.len() - l.trim_start().len())
+        .map(|l| l.chars().take_while(|c| c.is_whitespace()).count())
         .min()
         .unwrap_or(0);
     lines
         .iter()
-        .map(|line| {
-            if line.len() >= min_indent {
-                &line[min_indent..]
-            } else {
-                line.trim_start()
-            }
-        })
+        .map(|line| strip_leading_whitespace(line, min_indent))
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// Drop up to `count` leading whitespace CHARACTERS, stopping early at the
+/// first non-whitespace one. Slices only on char boundaries by construction.
+fn strip_leading_whitespace(line: &str, count: usize) -> &str {
+    let mut dropped = 0;
+    for (offset, ch) in line.char_indices() {
+        if dropped == count || !ch.is_whitespace() {
+            return &line[offset..];
+        }
+        dropped += 1;
+    }
+    // Every character was whitespace we were asked to drop.
+    ""
 }
 
 // --- Template helpers ---

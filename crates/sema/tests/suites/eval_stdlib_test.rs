@@ -1,5 +1,6 @@
 #![allow(clippy::approx_constant)]
 
+use crate::common;
 use sema_core::Value;
 
 // ============================================================
@@ -423,4 +424,61 @@ eval_error_tests! {
     http_html_non_string: "(http/html 123)",
     http_text_non_string: "(http/text 123)",
     http_no_content_extra: r#"(http/no-content "extra")"#,
+}
+
+// ============================================================
+// Numeric/boundary regressions (2026-07-27 sweep)
+//
+// Each of these had a concrete failure: a process abort, an unbounded loop, or
+// a silently wrong value. They are pinned here so a future refactor of the
+// numeric fast paths cannot quietly reintroduce one.
+// ============================================================
+
+eval_tests! {
+    // `trim_indent` measured the common indent in BYTES and sliced it off every
+    // line, so one line indented with a multi-byte space (NBSP here, ordinary
+    // in pasted text) aborted the process mid-character — uncatchable by `try`.
+    trim_indent_multibyte_indent_does_not_abort:
+        r#"(text/trim-indent (string-append " a\n" (string/from-codepoints (list 160)) "b"))"#
+        => Value::string("a\nb"),
+
+    // `i += step` wrapped past i64::MAX and re-entered the loop below `end`:
+    // either spinning forever (8.4GB in 3s) or emitting wrapped values.
+    range_step_overflow_stops_at_the_i64_boundary:
+        "(range 1 10 9223372036854775807)" => common::eval("'(1)"),
+    range_walks_up_to_the_boundary_without_wrapping:
+        "(range 9223372036854775800 9223372036854775807 3)"
+        => common::eval("'(9223372036854775800 9223372036854775803 9223372036854775806)"),
+
+    // `list/sum` kept its own i64 accumulator, so it wrapped where `+` promotes
+    // to bignum: the same list gave two answers depending on the builtin.
+    list_sum_promotes_past_i64_like_plus:
+        "(= (list/sum (list 9223372036854775807 1)) (+ 9223372036854775807 1))"
+        => Value::bool(true),
+    list_sum_accepts_bignums:
+        "(list/sum (list 10000000000000000000000 1))"
+        => common::eval("10000000000000000000001"),
+
+    // The guard disagreed with the thing it guards, so the idiomatic
+    // `(if (string/number? s) (string->number s) fb)` returned #f for "+5".
+    string_number_p_agrees_with_conversion_on_leading_plus:
+        r#"(string/number? "+5")"# => Value::bool(false),
+    string_number_p_accepts_rationals_like_the_reader:
+        r#"(string/number? "1/2")"# => Value::bool(true),
+
+    // Matched only Int/Float, so the rest of the numeric tower errored.
+    math_sign_of_a_rational: "(math/sign 1/2)" => Value::int(1),
+    math_sign_of_a_negative_rational: "(math/sign -1/2)" => Value::int(-1),
+    math_sign_of_a_bignum: "(math/sign 10000000000000000000000)" => Value::int(1),
+
+    // `places as i32` truncated the high bits, so an absurd argument silently
+    // rounded to 2 decimals instead of leaving the value alone.
+    math_round_to_absurd_places_is_a_no_op:
+        "(math/round-to 3.14159 4294967298)" => Value::float(3.14159),
+    math_round_to_still_rounds_normally:
+        "(math/round-to 3.14159 2)" => Value::float(3.14),
+
+    // `(page - 1) * per_page` overflowed to a small offset, returning page 1.
+    list_page_offset_overflow_yields_no_rows:
+        "(list/page (list 'a 'b 'c) 4611686018427387905 4)" => common::eval("'()"),
 }

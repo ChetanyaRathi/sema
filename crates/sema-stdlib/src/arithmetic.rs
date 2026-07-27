@@ -6,6 +6,72 @@ use sema_core::{check_arity, SemaError, Value, ValueViewRef};
 use crate::register_fn;
 
 /// Shared "expected number" type error for arithmetic operand validation.
+/// Sum `values` through the numeric tower: an i64 fast path that promotes to
+/// bignum on overflow, and to f64 as soon as any operand is real.
+///
+/// Shared by `+` and `list/sum` so the two cannot disagree — they did. Where
+/// this promotes, `list/sum` used a bare `int_sum += n`, which wrapped silently
+/// past i64::MAX, so the same list summed two different ways gave two different
+/// answers; it also rejected bignums outright with a self-contradictory
+/// "expected number, got int".
+pub(crate) fn sum_through_tower<'a>(
+    values: impl Iterator<Item = &'a Value>,
+) -> Result<Value, SemaError> {
+    let mut has_float = false;
+    let mut int_sum: i64 = 0;
+    let mut float_sum: f64 = 0.0;
+    // Engaged once an operand overflows the i64 fast path or is itself a
+    // bignum; from that point on every remaining operand folds through the
+    // tower instead of the i64/f64 accumulators.
+    let mut tower: Option<SemaNumber> = None;
+    for arg in values {
+        if let Some(acc) = tower.take() {
+            let n = arg.as_number().ok_or_else(|| not_a_number(arg))?;
+            tower = Some(acc.add(n));
+            continue;
+        }
+        match arg.view_ref() {
+            ValueViewRef::Int(n) => {
+                if has_float {
+                    float_sum += n as f64;
+                } else {
+                    match int_sum.checked_add(n) {
+                        Some(s) => int_sum = s,
+                        None => {
+                            tower =
+                                Some(SemaNumber::from_i64(int_sum).add(SemaNumber::from_i64(n)));
+                        }
+                    }
+                }
+            }
+            ValueViewRef::Float(f) => {
+                if !has_float {
+                    float_sum = int_sum as f64;
+                    has_float = true;
+                }
+                float_sum += f;
+            }
+            ValueViewRef::BigInt(_) => {
+                let seed = if has_float {
+                    SemaNumber::Real(float_sum)
+                } else {
+                    SemaNumber::from_i64(int_sum)
+                };
+                let n = arg.as_number().ok_or_else(|| not_a_number(arg))?;
+                tower = Some(seed.add(n));
+            }
+            _ => return Err(not_a_number(arg)),
+        }
+    }
+    if let Some(acc) = tower {
+        Ok(Value::from_number(acc))
+    } else if has_float {
+        Ok(Value::float(float_sum))
+    } else {
+        Ok(Value::int(int_sum))
+    }
+}
+
 fn not_a_number(arg: &Value) -> SemaError {
     SemaError::type_error("number", arg.type_name())
 }
@@ -38,65 +104,7 @@ fn mod_impl(args: &[Value]) -> Result<Value, SemaError> {
 }
 
 pub fn register(env: &sema_core::Env) {
-    register_fn(env, "+", |args| {
-        if args.is_empty() {
-            return Ok(Value::int(0));
-        }
-        let mut has_float = false;
-        let mut int_sum: i64 = 0;
-        let mut float_sum: f64 = 0.0;
-        // Engaged once an operand overflows the i64 fast path or is itself a
-        // bignum; from that point on every remaining operand folds through
-        // the tower instead of the i64/f64 accumulators.
-        let mut tower: Option<SemaNumber> = None;
-        for arg in args {
-            if let Some(acc) = tower.take() {
-                let n = arg.as_number().ok_or_else(|| not_a_number(arg))?;
-                tower = Some(acc.add(n));
-                continue;
-            }
-            match arg.view_ref() {
-                ValueViewRef::Int(n) => {
-                    if has_float {
-                        float_sum += n as f64;
-                    } else {
-                        match int_sum.checked_add(n) {
-                            Some(s) => int_sum = s,
-                            None => {
-                                tower = Some(
-                                    SemaNumber::from_i64(int_sum).add(SemaNumber::from_i64(n)),
-                                );
-                            }
-                        }
-                    }
-                }
-                ValueViewRef::Float(f) => {
-                    if !has_float {
-                        float_sum = int_sum as f64;
-                        has_float = true;
-                    }
-                    float_sum += f;
-                }
-                ValueViewRef::BigInt(_) => {
-                    let seed = if has_float {
-                        SemaNumber::Real(float_sum)
-                    } else {
-                        SemaNumber::from_i64(int_sum)
-                    };
-                    let n = arg.as_number().ok_or_else(|| not_a_number(arg))?;
-                    tower = Some(seed.add(n));
-                }
-                _ => return Err(not_a_number(arg)),
-            }
-        }
-        if let Some(acc) = tower {
-            Ok(Value::from_number(acc))
-        } else if has_float {
-            Ok(Value::float(float_sum))
-        } else {
-            Ok(Value::int(int_sum))
-        }
-    });
+    register_fn(env, "+", |args| sum_through_tower(args.iter()));
 
     register_fn(env, "-", |args| {
         check_arity!(args, "-", 1..);

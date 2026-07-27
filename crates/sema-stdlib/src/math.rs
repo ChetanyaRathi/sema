@@ -216,8 +216,20 @@ pub fn register(env: &sema_core::Env) {
         let places = args[1]
             .as_int()
             .ok_or_else(|| SemaError::type_error("integer", args[1].type_name()))?;
-        let factor = 10f64.powi(places as i32);
-        Ok(Value::float((x * factor).round() / factor))
+        // `places as i32` silently truncated the high bits: 4294967298 became
+        // 2, so an absurd argument quietly rounded to 2 decimals instead of
+        // being a no-op. Past ~17 significant decimals an f64 has no digits
+        // left to round, so the value already IS its own rounding.
+        if places >= 17 {
+            return Ok(Value::float(x));
+        }
+        let factor = 10f64.powi(places.clamp(-308, 308) as i32);
+        let scaled = x * factor;
+        if !scaled.is_finite() || factor == 0.0 {
+            // Scaling overflowed or underflowed; no rounding is representable.
+            return Ok(Value::float(x));
+        }
+        Ok(Value::float(scaled.round() / factor))
     });
 
     // Fixed-decimal display string, padding trailing zeros: (math/format-fixed 1.2 3) => "1.200".
@@ -509,23 +521,21 @@ pub fn register(env: &sema_core::Env) {
 
     register_fn(env, "math/sign", |args| {
         check_arity!(args, "math/sign", 1);
-        match args[0].view_ref() {
-            ValueViewRef::Int(n) => Ok(Value::int(if n > 0 {
-                1
-            } else if n < 0 {
-                -1
-            } else {
-                0
-            })),
-            ValueViewRef::Float(f) => Ok(Value::int(if f > 0.0 {
-                1
-            } else if f < 0.0 {
-                -1
-            } else {
-                0
-            })),
-            _ => Err(SemaError::type_error("number", args[0].type_name())),
-        }
+        // Every number, not just the two machine ones: matching only Int/Float
+        // made `(math/sign 1/2)` and `(math/sign 10000000000000000000000)` fail
+        // with "expected number, got rational" / "got int", contradicting the
+        // documented `n: number` parameter. `cmp_real` orders the whole tower.
+        let n = args[0]
+            .as_number()
+            .ok_or_else(|| SemaError::type_error("number", args[0].type_name()))?;
+        let zero = SemaNumber::from_i64(0);
+        Ok(Value::int(match n.cmp_real(&zero) {
+            Some(std::cmp::Ordering::Greater) => 1,
+            Some(std::cmp::Ordering::Less) => -1,
+            // Equal, or unordered (NaN) — matching the old float behavior,
+            // which reported 0 for NaN.
+            _ => 0,
+        }))
     });
 
     register_fn(env, "truncate", |args| {

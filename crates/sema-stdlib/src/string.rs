@@ -207,6 +207,26 @@ fn parse_decimal_fast(s: &str) -> Option<Value> {
     }
 }
 
+/// Whether `string->number` (radix 10) would return a number for `s`.
+/// Deliberately shares `parse_decimal_fast` and the reader with that builtin so
+/// the predicate and the conversion cannot drift apart.
+fn parses_as_number(s: &str) -> bool {
+    if parse_decimal_fast(s).is_some() {
+        return true;
+    }
+    match sema_reader::read_many(s) {
+        Ok(exprs) if exprs.len() == 1 => matches!(
+            exprs[0].view_ref(),
+            ValueViewRef::Int(_)
+                | ValueViewRef::BigInt(_)
+                | ValueViewRef::Rational(_)
+                | ValueViewRef::Complex(_)
+                | ValueViewRef::Float(_)
+        ),
+        _ => false,
+    }
+}
+
 pub fn register(env: &sema_core::Env) {
     register_fn(env, "string-append", |args| {
         use std::fmt::Write;
@@ -647,8 +667,17 @@ pub fn register(env: &sema_core::Env) {
         let s = args[0]
             .as_str()
             .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
-        let is_num = s.parse::<i64>().is_ok() || s.parse::<f64>().is_ok();
-        Ok(Value::bool(is_num))
+        // Answer exactly the question the caller is really asking — "will
+        // `string->number` give me a number?" — by asking it, rather than by
+        // running a second, differently-shaped parse.
+        //
+        // Rust's `parse::<i64>`/`parse::<f64>` accept spellings the reader does
+        // not (a leading `+`, `inf`, `NaN`) and reject ones it does (rationals,
+        // bignums past f64), so the guard disagreed with the thing it guards:
+        // `(string/number? "+5")` was #t while `(string->number "+5")` is #f,
+        // and the idiomatic `(if (string/number? s) (string->number s) fb)`
+        // then yielded #f — a boolean — where the caller required a number.
+        Ok(Value::bool(parses_as_number(s)))
     });
 
     register_fn(env, "string/pad-left", |args| {
