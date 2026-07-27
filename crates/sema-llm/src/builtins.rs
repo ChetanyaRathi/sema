@@ -141,9 +141,17 @@ pub struct LeafUsage {
 fn accumulate_into(slot: &Rc<RefCell<LeafUsage>>, usage: &Usage, cost: Option<f64>) {
     let input = usage.prompt_tokens as u64;
     let output = usage.completion_tokens as u64;
-    // Cache-hit-zero-usage invariant: an all-zero, unpriced completion is a cache hit;
+    // Cache-hit-zero-usage invariant: an all-zero completion is a cache hit;
     // don't count it as a call (no phantom zero Budget event for a cached leaf).
-    if input == 0 && output == 0 && cost.is_none() {
+    //
+    // Cost is deliberately NOT part of this test. The only caller prices the
+    // usage first, and pricing a zero-token usage against a model that IS in the
+    // snapshot yields `Some(0.0)`, not `None` — so requiring `cost.is_none()`
+    // let every cache hit on a priced model (gpt-5.5, claude-*, …) fall through
+    // and book a call at $0.00, flipping a purely-cached leaf's cost from
+    // "unknown" to "free". Only fakes and unpriced models took the intended
+    // path, which is why nothing caught it.
+    if input == 0 && output == 0 && cost.unwrap_or(0.0) == 0.0 {
         return;
     }
     let mut acc = slot.borrow_mut();
@@ -503,6 +511,17 @@ struct CachedResponse {
     prompt_tokens: u32,
     completion_tokens: u32,
     cached_at: i64,
+    /// The assistant turn's tool calls, if any.
+    ///
+    /// Omitting these made caching silently break agents: a tool-call turn has
+    /// empty `content` and N tool calls, so it was stored as an empty string
+    /// and replayed as a *final* answer. `run_tool_loop` sees no tool calls,
+    /// stops, and returns "" — no tool ever runs, no error is raised. Since
+    /// entries persist to disk, that poisoned every later run within the TTL,
+    /// which is exactly the "re-run the script cheaply" workflow `with-cache`
+    /// exists for. Defaulted so entries written before this field still load.
+    #[serde(default)]
+    tool_calls: Vec<ToolCall>,
 }
 
 /// One entry in an `llm/with-fallback` chain: a provider name plus an optional
@@ -7019,6 +7038,22 @@ fn compute_cache_key(request: &ChatRequest) -> String {
         hasher.update(msg.role.as_bytes());
         hasher.update(msg.content.to_text().as_bytes());
     }
+    // `max_tokens` and the tool schemas are part of what was ASKED, so they
+    // belong in the key. Without them `(llm/complete p {:max-tokens 100})`
+    // poisoned the entry for a later `{:max-tokens 4000}` call, and a
+    // tool-bearing agent round shared a key with a bare completion of the same
+    // prompt.
+    if let Some(max_tokens) = request.max_tokens {
+        hasher.update(b"\x00max_tokens\x00");
+        hasher.update(max_tokens.to_le_bytes());
+    }
+    for tool in &request.tools {
+        hasher.update(b"\x00tool\x00");
+        hasher.update(tool.name.as_bytes());
+        if let Ok(schema) = serde_json::to_string(&tool.parameters) {
+            hasher.update(schema.as_bytes());
+        }
+    }
     format!("{:x}", hasher.finalize())
 }
 
@@ -7075,6 +7110,7 @@ fn store_cached(key: &str, response: &ChatResponse) {
         prompt_tokens: response.usage.prompt_tokens,
         completion_tokens: response.usage.completion_tokens,
         cached_at: unix_timestamp(),
+        tool_calls: response.tool_calls.clone(),
     };
     // In-memory cache is authoritative for in-process reuse; update it on the VM
     // thread. Render the JSON here (bounded — a single response) and push the DISK
@@ -7115,7 +7151,7 @@ fn cache_hit_response(cached: CachedResponse, usage_model: String) -> ChatRespon
         content: cached.content,
         role: "assistant".to_string(),
         model: cached.model,
-        tool_calls: vec![],
+        tool_calls: cached.tool_calls,
         usage: Usage {
             prompt_tokens: 0,
             completion_tokens: 0,
@@ -13861,5 +13897,56 @@ mod tests {
             Value::string("b"),
         ]);
         assert!(parse_fallback_entry(&v).is_err());
+    }
+
+    /// A cached tool-call turn must replay AS a tool-call turn.
+    ///
+    /// The cache entry had no tool-call field and the hit path hard-coded an
+    /// empty vector, so an agent round inside `llm/with-cache` was stored as
+    /// its (empty) content and replayed as a final answer: `run_tool_loop` saw
+    /// no tool calls, stopped, and returned "" without running anything or
+    /// raising. Entries persist to disk, so one run poisoned every later run
+    /// within the TTL.
+    #[test]
+    fn cached_tool_call_turns_survive_the_round_trip() {
+        let key = "test-tool-call-round-trip";
+        let response = ChatResponse {
+            content: String::new(),
+            role: "assistant".to_string(),
+            model: "m".to_string(),
+            tool_calls: vec![ToolCall {
+                id: "call_1".to_string(),
+                name: "get_weather".to_string(),
+                arguments: serde_json::json!({"city": "Oslo"}),
+                thought_signature: None,
+            }],
+            usage: Usage::default(),
+            stop_reason: Some("tool_use".to_string()),
+        };
+        store_cached(key, &response);
+
+        let cached = CACHE_MEM
+            .with(|c| c.borrow().get(key).cloned())
+            .expect("entry was just stored");
+        let replayed = cache_hit_response(cached, "m".to_string());
+
+        assert_eq!(replayed.tool_calls.len(), 1, "the tool call must survive");
+        assert_eq!(replayed.tool_calls[0].name, "get_weather");
+        assert_eq!(replayed.tool_calls[0].id, "call_1");
+        assert_eq!(replayed.tool_calls[0].arguments["city"], "Oslo");
+        // Still a cache hit: no provider call happened, so usage stays zero.
+        assert_eq!(replayed.usage.prompt_tokens, 0);
+        assert_eq!(replayed.usage.completion_tokens, 0);
+    }
+
+    /// Entries written before the field existed must still load.
+    #[test]
+    fn cache_entries_without_tool_calls_still_deserialize() {
+        let legacy =
+            r#"{"content":"hi","model":"m","prompt_tokens":1,"completion_tokens":2,"cached_at":0}"#;
+        let parsed: CachedResponse =
+            serde_json::from_str(legacy).expect("a pre-existing entry must still load");
+        assert_eq!(parsed.content, "hi");
+        assert!(parsed.tool_calls.is_empty());
     }
 }

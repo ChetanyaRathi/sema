@@ -28,49 +28,77 @@ impl AnthropicProvider {
 
     fn build_request_body(&self, request: &ChatRequest) -> AnthropicRequest {
         let model = self.resolve_model(&request.model);
-        let messages: Vec<AnthropicMessage> = request
-            .messages
-            .iter()
-            .filter(|m| m.role != "system")
-            .map(|m| {
-                if !m.tool_calls.is_empty() {
-                    // Assistant turn → tool_use content blocks (with optional leading text).
-                    let mut blocks: Vec<serde_json::Value> = Vec::new();
-                    let text = m.content.to_text();
-                    if !text.is_empty() {
-                        blocks.push(serde_json::json!({ "type": "text", "text": text }));
-                    }
-                    for tc in &m.tool_calls {
-                        blocks.push(serde_json::json!({
-                            "type": "tool_use",
-                            "id": tc.id,
-                            "name": tc.name,
-                            "input": tc.arguments,
-                        }));
-                    }
-                    AnthropicMessage {
-                        role: "assistant".to_string(),
-                        content: serde_json::Value::Array(blocks),
-                    }
-                } else if m.role == "tool" {
-                    // Tool result → a USER message carrying a tool_result block keyed
-                    // by tool_use_id (Anthropic's correlation mechanism).
-                    AnthropicMessage {
-                        role: "user".to_string(),
-                        content: serde_json::json!([{
-                            "type": "tool_result",
-                            "tool_use_id": m.tool_call_id.clone().unwrap_or_default(),
-                            "content": m.content.to_text(),
-                        }]),
-                    }
-                } else {
-                    AnthropicMessage {
-                        role: m.role.clone(),
-                        content: serialize_anthropic_content(&m.content),
-                    }
+        // NOT a 1:1 map over messages: Anthropic requires every `tool_result`
+        // answering one assistant turn to sit in the SINGLE message
+        // immediately following it. The agent loop pushes one
+        // `ChatMessage::tool_result` per tool call, so emitting one `user`
+        // message each made any turn with parallel tool calls 400 with
+        // "tool_use ids were found without tool_result blocks immediately
+        // after". Claude 4.x emits parallel calls by default, so that was every
+        // multi-tool turn. Consecutive tool results are folded into one message.
+        // OpenAI and Ollama genuinely do take one message per result, which is
+        // why this grouping belongs here and not in the shared request.
+        let mut messages: Vec<AnthropicMessage> = Vec::new();
+        for m in request.messages.iter().filter(|m| m.role != "system") {
+            if !m.tool_calls.is_empty() {
+                // Assistant turn → tool_use content blocks (with optional leading text).
+                let mut blocks: Vec<serde_json::Value> = Vec::new();
+                let text = m.content.to_text();
+                if !text.is_empty() {
+                    blocks.push(serde_json::json!({ "type": "text", "text": text }));
                 }
-            })
-            .collect();
+                for tc in &m.tool_calls {
+                    blocks.push(serde_json::json!({
+                        "type": "tool_use",
+                        "id": tc.id,
+                        "name": tc.name,
+                        "input": tc.arguments,
+                    }));
+                }
+                messages.push(AnthropicMessage {
+                    role: "assistant".to_string(),
+                    content: serde_json::Value::Array(blocks),
+                });
+            } else if m.role == "tool" {
+                // Tool result → a tool_result block keyed by tool_use_id
+                // (Anthropic's correlation mechanism), carried on a user message.
+                let block = serde_json::json!({
+                    "type": "tool_result",
+                    "tool_use_id": m.tool_call_id.clone().unwrap_or_default(),
+                    "content": m.content.to_text(),
+                });
+                let appended = messages.last_mut().is_some_and(|last| {
+                    if last.role != "user" {
+                        return false;
+                    }
+                    match &mut last.content {
+                        // Only extend a message that is ITSELF tool results, so a
+                        // genuine user turn is never absorbed.
+                        serde_json::Value::Array(blocks)
+                            if !blocks.is_empty()
+                                && blocks.iter().all(|b| {
+                                    b.get("type").and_then(|t| t.as_str()) == Some("tool_result")
+                                }) =>
+                        {
+                            blocks.push(block.clone());
+                            true
+                        }
+                        _ => false,
+                    }
+                });
+                if !appended {
+                    messages.push(AnthropicMessage {
+                        role: "user".to_string(),
+                        content: serde_json::Value::Array(vec![block]),
+                    });
+                }
+            } else {
+                messages.push(AnthropicMessage {
+                    role: m.role.clone(),
+                    content: serialize_anthropic_content(&m.content),
+                });
+            }
+        }
 
         let system = request.system.clone().or_else(|| {
             request
@@ -141,7 +169,7 @@ impl AnthropicProvider {
         let status = resp.status().as_u16();
         if status == 429 {
             return Err(LlmError::RateLimited {
-                retry_after_ms: 5000,
+                retry_after_ms: crate::http::retry_after_ms(resp.headers()),
             });
         }
         if status != 200 {
@@ -211,21 +239,22 @@ impl AnthropicProvider {
         body.stream = true;
         let model_name = body.model.clone();
 
-        let resp = self
-            .client
-            .post("https://api.anthropic.com/v1/messages")
-            .header("x-api-key", &self.api_key)
-            .header("anthropic-version", "2023-06-01")
-            .header("content-type", "application/json")
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| LlmError::Http(e.to_string()))?;
+        let resp = crate::http::with_timeout(
+            self.client.post("https://api.anthropic.com/v1/messages"),
+            request.timeout_ms,
+        )
+        .header("x-api-key", &self.api_key)
+        .header("anthropic-version", "2023-06-01")
+        .header("content-type", "application/json")
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| LlmError::Http(e.to_string()))?;
 
         let status = resp.status().as_u16();
         if status == 429 {
             return Err(LlmError::RateLimited {
-                retry_after_ms: 5000,
+                retry_after_ms: crate::http::retry_after_ms(resp.headers()),
             });
         }
         if status != 200 {
@@ -642,5 +671,68 @@ mod tests {
         let mut r = ChatRequest::new("claude-x".into(), vec![ChatMessage::new("user", "hi")]);
         r.reasoning_effort = Some("none".into());
         assert!(p.build_request_body(&r).thinking.is_none());
+    }
+
+    /// Anthropic rejects an assistant turn whose `tool_use` blocks are not all
+    /// answered in the single message immediately after it. The agent loop
+    /// emits one `tool_result` message per call, so a parallel-tool turn used
+    /// to serialize as two separate user messages and 400.
+    #[test]
+    fn parallel_tool_results_are_grouped_into_one_user_message() {
+        let p = AnthropicProvider::new("k".into(), Some("claude-x".into())).unwrap();
+        let call = |id: &str, name: &str| ToolCall {
+            id: id.into(),
+            name: name.into(),
+            arguments: serde_json::json!({}),
+            thought_signature: None,
+        };
+        let mut assistant = ChatMessage::new("assistant", "");
+        assistant.tool_calls = vec![call("a", "one"), call("b", "two")];
+
+        let r = ChatRequest::new(
+            "claude-x".into(),
+            vec![
+                ChatMessage::new("user", "go"),
+                assistant,
+                ChatMessage::tool_result("a", "one", "ra"),
+                ChatMessage::tool_result("b", "two", "rb"),
+            ],
+        );
+        let body = p.build_request_body(&r);
+
+        // user, assistant(tool_use x2), user(tool_result x2)
+        assert_eq!(
+            body.messages.len(),
+            3,
+            "results must not become two messages"
+        );
+        let last = &body.messages[2];
+        assert_eq!(last.role, "user");
+        let blocks = last.content.as_array().expect("tool results are blocks");
+        assert_eq!(blocks.len(), 2, "both results belong in the same message");
+        let ids: Vec<&str> = blocks
+            .iter()
+            .map(|b| b["tool_use_id"].as_str().unwrap_or_default())
+            .collect();
+        assert_eq!(ids, vec!["a", "b"], "each result keeps its own tool_use_id");
+        assert!(blocks.iter().all(|b| b["type"] == "tool_result"));
+    }
+
+    /// The grouping must not swallow a real user turn that happens to follow
+    /// tool results.
+    #[test]
+    fn a_following_user_turn_stays_its_own_message() {
+        let p = AnthropicProvider::new("k".into(), Some("claude-x".into())).unwrap();
+        let r = ChatRequest::new(
+            "claude-x".into(),
+            vec![
+                ChatMessage::tool_result("a", "one", "ra"),
+                ChatMessage::new("user", "and now this"),
+                ChatMessage::tool_result("b", "two", "rb"),
+            ],
+        );
+        let body = p.build_request_body(&r);
+        assert_eq!(body.messages.len(), 3);
+        assert_eq!(body.messages[1].content.as_str(), Some("and now this"));
     }
 }

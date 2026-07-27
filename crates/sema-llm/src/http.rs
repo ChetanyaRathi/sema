@@ -91,3 +91,40 @@ pub fn with_timeout(
         None => rb,
     }
 }
+
+/// Milliseconds to wait after a 429, taken from the response when the server
+/// says so.
+///
+/// Every provider used to hard-code 5000 here. The retry loop treats a positive
+/// server hint as authoritative and skips its own exponential backoff and full
+/// jitter, so that constant meant: a provider asking for 60s was retried at 5s,
+/// 5s, 5s and then failed, and — because 429 is the common retry case — jitter
+/// effectively never applied, so a fan-out that all rate-limited re-fired in
+/// lockstep at exactly +5000ms.
+///
+/// Handles both documented forms: delay-seconds (`Retry-After: 30`) and the
+/// `x-ratelimit-reset-*` seconds hints the OpenAI/Anthropic families send.
+/// Falls back to 5s when the response says nothing.
+pub fn retry_after_ms(headers: &reqwest::header::HeaderMap) -> u64 {
+    const FALLBACK_MS: u64 = 5000;
+    const MAX_MS: u64 = 120_000;
+
+    let seconds = |name: &str| -> Option<f64> {
+        let raw = headers.get(name)?.to_str().ok()?.trim().to_string();
+        // `30`, `1.5`, or `1.5s` / `900ms` as some gateways spell it.
+        if let Some(ms) = raw.strip_suffix("ms") {
+            return ms.trim().parse::<f64>().ok().map(|v| v / 1000.0);
+        }
+        let raw = raw.strip_suffix('s').unwrap_or(&raw);
+        raw.parse::<f64>().ok()
+    };
+
+    let hint = seconds("retry-after")
+        .or_else(|| seconds("x-ratelimit-reset-requests"))
+        .or_else(|| seconds("x-ratelimit-reset-tokens"));
+    match hint {
+        // A non-positive or absurd value is not actionable; use the fallback.
+        Some(s) if s > 0.0 => ((s * 1000.0) as u64).clamp(1, MAX_MS),
+        _ => FALLBACK_MS,
+    }
+}

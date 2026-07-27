@@ -148,8 +148,25 @@ impl OllamaProvider {
         if let Some(temp) = request.temperature {
             options.insert("temperature".to_string(), serde_json::json!(temp));
         }
+        // Canonical `ChatRequest` fields Ollama does support, and was silently
+        // dropping. Per the one-canonical-request rule these must be translated
+        // here rather than being no-ops the caller cannot see.
+        if !request.stop_sequences.is_empty() {
+            options.insert(
+                "stop".to_string(),
+                serde_json::json!(request.stop_sequences),
+            );
+        }
         if !options.is_empty() {
             body["options"] = serde_json::Value::Object(options);
+        }
+        if request.json_mode {
+            body["format"] = serde_json::json!("json");
+        }
+        if let Some(ref effort) = request.reasoning_effort {
+            // Ollama exposes reasoning as a boolean switch, so map the tiers:
+            // "none" turns thinking off, anything else turns it on.
+            body["think"] = serde_json::json!(effort != "none");
         }
 
         let resp = self
@@ -244,8 +261,25 @@ impl OllamaProvider {
         if let Some(temp) = request.temperature {
             options.insert("temperature".to_string(), serde_json::json!(temp));
         }
+        // Canonical `ChatRequest` fields Ollama does support, and was silently
+        // dropping. Per the one-canonical-request rule these must be translated
+        // here rather than being no-ops the caller cannot see.
+        if !request.stop_sequences.is_empty() {
+            options.insert(
+                "stop".to_string(),
+                serde_json::json!(request.stop_sequences),
+            );
+        }
         if !options.is_empty() {
             body["options"] = serde_json::Value::Object(options);
+        }
+        if request.json_mode {
+            body["format"] = serde_json::json!("json");
+        }
+        if let Some(ref effort) = request.reasoning_effort {
+            // Ollama exposes reasoning as a boolean switch, so map the tiers:
+            // "none" turns thinking off, anything else turns it on.
+            body["think"] = serde_json::json!(effort != "none");
         }
 
         let resp = self

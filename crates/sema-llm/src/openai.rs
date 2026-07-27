@@ -388,7 +388,7 @@ impl OpenAiProvider {
         let status = resp.status().as_u16();
         if status == 429 {
             return Err(LlmError::RateLimited {
-                retry_after_ms: 5000,
+                retry_after_ms: crate::http::retry_after_ms(resp.headers()),
             });
         }
         if status != 200 {
@@ -472,20 +472,25 @@ impl OpenAiProvider {
         }
         let model_name = body.model.clone();
 
-        let resp = self
-            .client
-            .post(format!("{}/chat/completions", self.base_url))
-            .header("Authorization", format!("Bearer {}", self.api_key))
-            .header("Content-Type", "application/json")
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| LlmError::Http(e.to_string()))?;
+        // Per-call `:timeout` applies to streaming too — it was only wired
+        // into the non-streaming twin, so `llm/stream` and `:on-text` agent
+        // rounds silently got the 120s client default.
+        let resp = crate::http::with_timeout(
+            self.client
+                .post(format!("{}/chat/completions", self.base_url)),
+            request.timeout_ms,
+        )
+        .header("Authorization", format!("Bearer {}", self.api_key))
+        .header("Content-Type", "application/json")
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| LlmError::Http(e.to_string()))?;
 
         let status = resp.status().as_u16();
         if status == 429 {
             return Err(LlmError::RateLimited {
-                retry_after_ms: 5000,
+                retry_after_ms: crate::http::retry_after_ms(resp.headers()),
             });
         }
         if status != 200 {
@@ -562,7 +567,13 @@ impl OpenAiProvider {
                                     }
                                     if let Some(f) = tc.get("function") {
                                         if let Some(name) = f.get("name").and_then(|v| v.as_str()) {
-                                            entry.1.push_str(name);
+                                            // Assign, don't append: only the
+                                            // ARGUMENTS accumulate across deltas.
+                                            // Any OpenAI-compatible endpoint
+                                            // that repeats the name per chunk
+                                            // produced "get_weatherget_weather"
+                                            // and then "tool not found".
+                                            entry.1 = name.to_string();
                                         }
                                         if let Some(args) =
                                             f.get("arguments").and_then(|v| v.as_str())

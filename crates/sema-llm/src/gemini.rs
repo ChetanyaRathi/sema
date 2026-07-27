@@ -71,7 +71,7 @@ impl GeminiProvider {
         let status = resp.status().as_u16();
         if status == 429 {
             return Err(LlmError::RateLimited {
-                retry_after_ms: 5000,
+                retry_after_ms: crate::http::retry_after_ms(resp.headers()),
             });
         }
         if status != 200 {
@@ -103,9 +103,10 @@ impl GeminiProvider {
 
         let body = self.build_request_body(&request);
 
-        let resp = self
-            .client
-            .post(&url)
+        // Per-call `:timeout` applies to streaming too — it was only wired
+        // into the non-streaming twin, so `llm/stream` and `:on-text` agent
+        // rounds silently got the 120s client default.
+        let resp = crate::http::with_timeout(self.client.post(&url), request.timeout_ms)
             .header("Content-Type", "application/json")
             .header("x-goog-api-key", &self.api_key)
             .json(&body)
@@ -116,7 +117,7 @@ impl GeminiProvider {
         let status = resp.status().as_u16();
         if status == 429 {
             return Err(LlmError::RateLimited {
-                retry_after_ms: 5000,
+                retry_after_ms: crate::http::retry_after_ms(resp.headers()),
             });
         }
         if status != 200 {
