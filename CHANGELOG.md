@@ -1,5 +1,36 @@
 # Changelog
 
+## 1.31.3 — 2026-07-27
+
+- **Publishing works again — the release gate is green for the first time since
+  2026-07-09.** Three separate faults had blocked it, none of them visible
+  outside a release because `verify.yml` only ran on a tag push:
+  - The packaged-crate smoke ran `cargo package -p sema-lang`, which resolves
+    the rewritten `sema-core = "=X.Y.Z"` pins against crates.io — but it runs
+    *before* publishing, so the version being released is never there yet. It
+    could only pass for an already-published version, which deadlocked
+    releases: the gate blocked the publish, so the version never landed, so the
+    gate kept failing. Packaging the whole workspace in one invocation lets
+    cargo satisfy those pins from the siblings alongside it.
+  - Hidden behind that: `sema build`'s Windows icon was embedded with
+    `include_bytes!("../../../assets/...")`, reaching outside the crate.
+    `cargo package` ships only files under the package root, so **the published
+    crate could not build at all**. It has an in-crate copy now, synced from
+    canonical by `jake icons-assets` like every other consumer copy.
+  - The embedded browser runtime was gated by rebuilding it and demanding
+    byte-identity, which no contributor could satisfy: rustc derives crate
+    disambiguators from host-dependent inputs, so the same source yields
+    different bytes on macOS and a Linux runner. It is now gated on freshness —
+    vendoring records a fingerprint of the runtime's inputs and CI recompares —
+    which is host-independent and also catches VM-internal changes that leave
+    the public API untouched.
+- **Shipped WASM no longer embeds build-machine paths.** Every wasm-pack build
+  goes through `scripts/wasm-build.sh`, which remaps `CARGO_HOME`, the rustc
+  sysroot, and the checkout to fixed roots. The browser runtime previously
+  carried 180 absolute paths from whoever built it; it is also slightly smaller.
+- `verify.yml` gained a manual trigger, so the release gate can be exercised
+  without cutting a release.
+
 ## 1.31.2 — 2026-07-27
 
 - **crates.io and npm publishing works again.** The publish gate had been red
