@@ -108,7 +108,7 @@
       "patterns": [
         {
           "comment": "define with parens: (define (name args...) ...) — must come before simple define",
-          "match": "(\\()\\s*(define)\\s+(\\()\\s*([\\w!$%&*+\\-./:<=>?@^~][\\w!$%&*+\\-./:<=>?@^~0-9]*)",
+          "match": "(\\()\\s*(define|def)\\s+(\\()\\s*([\\w!$%&*+\\-./:<=>?@^~][\\w!$%&*+\\-./:<=>?@^~0-9]*)",
           "captures": {
             "1": {
               "name": "punctuation.paren.open.sema"
@@ -126,7 +126,7 @@
         },
         {
           "comment": "define with a simple name: (define name ...)",
-          "match": "(\\()\\s*(define)\\s+([\\w!$%&*+\\-./:<=>?@^~][\\w!$%&*+\\-./:<=>?@^~0-9]*)",
+          "match": "(\\()\\s*(define|def)\\s+([\\w!$%&*+\\-./:<=>?@^~][\\w!$%&*+\\-./:<=>?@^~0-9]*)",
           "captures": {
             "1": {
               "name": "punctuation.paren.open.sema"
@@ -141,7 +141,7 @@
         },
         {
           "comment": "defun/defmacro/defmulti/defmethod/defagent/deftool name",
-          "match": "(\\()\\s*(defun|defmacro|defmulti|defmethod|defagent|deftool|defn|def|defworkflow|define-record-type)\\s+([\\w!$%&*+\\-./:<=>?@^~][\\w!$%&*+\\-./:<=>?@^~0-9]*)",
+          "match": "(\\()\\s*(defun|defmacro|defmulti|defmethod|defagent|deftool|defn|defworkflow|define-record-type)\\s+([\\w!$%&*+\\-./:<=>?@^~][\\w!$%&*+\\-./:<=>?@^~0-9]*)",
           "captures": {
             "1": {
               "name": "punctuation.paren.open.sema"

@@ -27,13 +27,13 @@ impl BackendState {
                                 "defmacro" => {
                                     user_macro_names.insert(name);
                                 }
-                                "define" => {
+                                "define" | "def" => {
                                     // (define (f x) ...) shorthand
                                     // Already handled below
                                 }
                                 _ => {}
                             }
-                        } else if head == "define" {
+                        } else if head == "define" || head == "def" {
                             // (define (f args...) body) — function shorthand
                             if let Some(sig) = items[1].as_list() {
                                 if !sig.is_empty() {

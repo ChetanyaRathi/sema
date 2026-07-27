@@ -423,7 +423,8 @@ pub fn user_definitions_from_ast(
             if items.len() >= 2 {
                 if let Some(head) = items[0].as_symbol() {
                     match head.as_str() {
-                        "define" | "defun" | "defn" | "defmacro" | "defagent" | "deftool" => {
+                        "define" | "def" | "defun" | "defn" | "defmacro" | "defagent"
+                        | "deftool" => {
                             let form_span = expr_span(expr, span_map);
                             // (define name ...) or (defun name (...) ...)
                             if let Some(name) = items[1].as_symbol() {
@@ -482,7 +483,7 @@ pub fn extract_params_from_ast(ast: &[sema_core::Value], name: &str) -> Option<S
                                 }
                             }
                         }
-                        "define" => {
+                        "define" | "def" => {
                             if let Some(sig) = items[1].as_list() {
                                 if !sig.is_empty() {
                                     if let Some(sym) = sig[0].as_symbol() {
@@ -526,7 +527,7 @@ pub fn extract_docstring_from_ast(ast: &[sema_core::Value], name: &str) -> Optio
         // shorthand. Match the function's name.
         let matches_name = match head.as_str() {
             "defun" | "defn" | "defmacro" => items[1].as_symbol().as_deref() == Some(name),
-            "define" => {
+            "define" | "def" => {
                 items[1]
                     .as_list()
                     .and_then(|sig| sig.first().and_then(|v| v.as_symbol()))
@@ -540,7 +541,7 @@ pub fn extract_docstring_from_ast(ast: &[sema_core::Value], name: &str) -> Optio
         }
         // Body start: `(defun name (params) body...)` → index 3; `(define (name ..) body...)` → 2.
         let body_start = match head.as_str() {
-            "define" => 2,
+            "define" | "def" => 2,
             _ => 3,
         };
         let body = items.get(body_start..).unwrap_or(&[]);
@@ -1120,7 +1121,7 @@ pub fn document_symbols_from_ast(
                                 continue;
                             }
                         }
-                        "define" => {
+                        "define" | "def" => {
                             if let Some(name) = items[1].as_symbol() {
                                 let fs = expr_span(expr, span_map);
                                 let nr =
