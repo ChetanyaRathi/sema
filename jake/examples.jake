@@ -54,7 +54,11 @@ task example-notebook-serve: [build]
 # SEMA_UI_VERSION. Naive copy: only the main bundle is vendored; lazily-loaded
 # Shiki grammar chunks aren't served, so non-`sema` code fences in markdown
 # degrade to unhighlighted (the `sema` grammar is bundled).
-SEMA_UI_VERSION = "0.1.4"
+#
+# Only ever bump this to a version that is actually on npm. The notebook UI
+# depends on 0.2.0's form testids and dialog event names, so re-vendoring from
+# an older release downgrades the bundle and fails three notebook e2e specs.
+SEMA_UI_VERSION = "0.2.0"
 
 @group notebook
 @desc "Vendor @sema-lang/ui bundle + tokens.css into the notebook crate (pinned SEMA_UI_VERSION)"
