@@ -6,9 +6,6 @@ outline: [2, 3]
 
 Sema features a **cooperative asynchronous concurrency model** using Promises and Channels. Tasks run on the bytecode VM's built-in scheduler and interleave execution at specific **yield points** (such as waiting for a channel, sleeping, or awaiting another task).
 
-> [!IMPORTANT]
-> Async features are **VM-only** and require the bytecode VM backend (which is the default since v1.13).
-
 ---
 
 ## 1. Promises and Tasks
