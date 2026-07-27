@@ -121,7 +121,7 @@ prominently:
 (sort xs #(- (get %2 1) (get %1 1)))   ;; just needs docs + examples
 ```
 
-**Implementation**: Reader support for `%1`/`%2` already existed, and `%&` support plus nested `#()` read-time errors were implemented in #116 (`crates/sema-reader/src/reader.rs`).
+**Implementation**: Reader support for `%1`/`%2` already existed, and `%&` support plus nested `#()` read-time errors were implemented in PR #120 (issue #116) (`crates/sema-reader/src/reader.rs`).
 Remaining work is documentation + example updates.
 
 > **Verified**: `rg '%[12]' --glob '*.sema'` returns zero results — confirmed that multi-arg
