@@ -526,6 +526,8 @@ notebook. Three of them abort the process; one loses your work.
 
 ### Fixed
 
+- **Short lambdas `#(…)` inside nested lambdas** — `%`, `%1`…`%N`, and `%&` appearing inside a nested `(lambda …)` or `(fn …)` form within a short lambda `#()` now correctly belong to the enclosing short lambda (matching Clojure semantics), fixing a silent arity-0 issue. Nesting a short lambda `#()` directly inside another short lambda `#()` is now explicitly rejected with a clear read-time error (fixes #116).
+
 - **Many more blocking natives are now scheduler-compatible under `async`.** A
   native that ran a blocking syscall on the cooperative VM thread would freeze
   every concurrent task; the offload pass (PR #119) is now extended to the
