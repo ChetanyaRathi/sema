@@ -1,5 +1,20 @@
 # Changelog
 
+## 1.31.2 — 2026-07-27
+
+- **crates.io and npm publishing works again.** The publish gate had been red
+  since v1.30.0, so v1.31.0 and v1.31.1 were tagged but never reached either
+  registry. `sema-vm`'s dev-dependencies on `sema-eval`/`sema-stdlib` (its
+  tests and the `runtime_micro` bench use the full stack) inherited the
+  workspace's `=X.Y.Z` pin, putting a cycle in the published manifest —
+  crates.io requires every dependency a manifest names, dev ones included, to
+  already exist, and neither crate can be published before `sema-vm`. They are
+  path-only now, which `cargo package` strips, so the uploaded manifest names
+  neither; local builds, tests, and benches are unaffected. The publish-order
+  guard skips dev edges for the same reason, and still catches real ordering
+  mistakes. The embedded browser runtime under `crates/sema/src/web/assets/`
+  was also stale against its sources and has been re-vendored.
+
 ## 1.31.1 — 2026-07-27
 
 - **Playground concurrency examples un-hung: a root-filtered drive can no
