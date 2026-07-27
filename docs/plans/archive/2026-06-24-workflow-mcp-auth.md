@@ -12,9 +12,11 @@
 > `[Connect]`/`[Forget]` buttons — also SHIPPED (see §5's status note); only the
 > in-process live-resume sub-piece of (d) remains, and it is moot (see §9).
 
-**Status:** Headless precursor + run-start interactive login + the dashboard's
-one-click Connect/Forget write endpoints are all shipped (2026-07-10) — see the
-blockquote above. This doc scopes
+**Status:** COMPLETE (archived 2026-07-27). Headless precursor + run-start
+interactive login + the dashboard's one-click Connect/Forget write endpoints are
+all shipped (2026-07-10) — see the blockquote above. The only unshipped
+sub-piece, in-process live-resume, is moot per §9, so nothing here is
+outstanding. This doc scopes
 the *workflow + dashboard* integration: how a `defworkflow` declares the MCP
 servers / tools it needs, how the web UI drives the login flow for the ones that
 require auth, and how the resulting auth session is persisted so the run (and
