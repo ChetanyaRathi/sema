@@ -949,6 +949,29 @@ fn fire_cancel_signal(signal: &mut Option<McpCancelSignal>) {
     }
 }
 
+/// The connection to hand back in a worker's payload — `None` once cancelled.
+///
+/// A cancelled worker must NOT return its `McpConnection`. By the time it
+/// finishes, the wait that owned it has already been reaped (the cancel hook
+/// reports `CancelDisposition::Reaped`), so nothing decodes that payload and
+/// nothing drops it promptly: the transport — and for stdio, the server child
+/// process — stays alive. Measured before this existed: the child still running
+/// 30s after cancellation while the runtime reported zero live tasks and zero
+/// resource gates, i.e. a leaked subprocess the runtime believed it had cleaned
+/// up. Dropping here, on the worker thread, kills it the moment cancellation is
+/// observed, independent of what the runtime does with the late completion.
+///
+/// Only cancellation gets this treatment. An operation that merely FAILED still
+/// returns its connection: the decoder checks it back in and the handle stays
+/// usable, which is the intended behavior for a transport-level error.
+fn conn_unless_cancelled(conn: McpConnection, cancelled: bool) -> Option<McpConnection> {
+    if cancelled {
+        drop(conn);
+        return None;
+    }
+    Some(conn)
+}
+
 struct McpConnectCancelHook {
     signal: Option<McpCancelSignal>,
 }
@@ -1481,7 +1504,8 @@ type Materialize = Box<dyn FnOnce(serde_json::Value) -> Result<Value, String>>;
 /// Only `Send` data — `McpConnection` is `Send` (see
 /// `_assert_mcp_connection_is_send`) and `serde_json::Value`/`String` are plain.
 struct McpCallPayload {
-    conn: McpConnection,
+    /// `None` when the worker was cancelled — see [`conn_unless_cancelled`].
+    conn: Option<McpConnection>,
     result: Result<serde_json::Value, String>,
 }
 
@@ -1566,7 +1590,16 @@ impl CompletionDecoder for McpCallDecoder {
                     return Err(SemaError::eval(format!("mcp/call: {}", failure.message())));
                 }
             };
-        checkin(&entry, conn);
+        match conn {
+            Some(conn) => checkin(&entry, conn),
+            // Released by a cancelled worker: the handle can never be reused.
+            // The cancel hook normally tombstones first; this covers the
+            // ordering where the completion is decoded anyway.
+            None => {
+                tombstone_slot(&entry, "cancelled mid-call");
+                lifecycle.mark_terminal();
+            }
+        }
         let raw = result.map_err(|e| SemaError::eval(format!("mcp/call: {e}")))?;
         if let Some(recorder) = cassette_recorder {
             recorder.record(&raw);
@@ -1710,13 +1743,17 @@ impl McpGatedAction for McpCallAction {
                 interactive_auth,
                 BrowserAuthority::from_allowed(browser_allowed),
             );
-            let result = sema_io::io_block_on(async move {
+            // `None` from the select is cancellation, distinct from a call that
+            // ran and returned `Err` — only the former releases the connection.
+            let completed = sema_io::io_block_on(async move {
                 tokio::select! {
                     biased;
-                    _ = cancel_rx => Err("cancelled".to_string()),
-                    result = call => result,
+                    _ = cancel_rx => None,
+                    result = call => Some(result),
                 }
             });
+            let conn = conn_unless_cancelled(conn, completed.is_none());
+            let result = completed.unwrap_or_else(|| Err("cancelled".to_string()));
             Ok(Box::new(McpCallPayload { conn, result }) as SendPayload)
         })
     }
@@ -1996,7 +2033,8 @@ enum McpConnectionOperationResult {
 }
 
 struct McpConnectionOperationPayload {
-    conn: McpConnection,
+    /// `None` when the worker was cancelled — see [`conn_unless_cancelled`].
+    conn: Option<McpConnection>,
     result: McpConnectionOperationResult,
 }
 
@@ -2094,7 +2132,14 @@ impl CompletionDecoder for McpConnectionDecoder {
                 McpConnectionFinish::Tools { label, materialize },
                 McpConnectionOperationResult::Tools(result),
             ) => {
-                checkin(&entry, conn);
+                match conn {
+                    Some(conn) => checkin(&entry, conn),
+                    // Released by a cancelled worker: the handle is unusable.
+                    None => {
+                        tombstone_slot(&entry, format!("{label} cancelled mid-operation"));
+                        lifecycle.mark_terminal();
+                    }
+                }
                 let tools = result.map_err(|error| SemaError::eval(format!("{label}: {error}")))?;
                 Ok(materialize(tools, &entry.meta))
             }
@@ -2169,28 +2214,38 @@ impl McpGatedAction for McpConnectionAction {
         );
         PreparedExternalOperation::interruptible_blocking(kind, decoder, resource, move || {
             let mut conn = conn;
-            let result = match operation {
+            // `None` from a select is cancellation, distinct from an operation
+            // that ran and returned `Err` — only the former releases the
+            // connection (see `conn_unless_cancelled`).
+            let (result, cancelled) = match operation {
                 McpConnectionOperation::ListTools => {
                     let list = list_tools_async(&mut conn);
-                    McpConnectionOperationResult::Tools(sema_io::io_block_on(async move {
+                    let completed = sema_io::io_block_on(async move {
                         tokio::select! {
                             biased;
-                            _ = cancel_rx => Err("cancelled".to_string()),
-                            result = list => result,
+                            _ = cancel_rx => None,
+                            result = list => Some(result),
                         }
-                    }))
+                    });
+                    let cancelled = completed.is_none();
+                    let result = completed.unwrap_or_else(|| Err("cancelled".to_string()));
+                    (McpConnectionOperationResult::Tools(result), cancelled)
                 }
                 McpConnectionOperation::Close => {
                     let close = close_async(&mut conn);
-                    McpConnectionOperationResult::Close(sema_io::io_block_on(async move {
+                    let completed = sema_io::io_block_on(async move {
                         tokio::select! {
                             biased;
-                            _ = cancel_rx => Err("cancelled".to_string()),
-                            result = close => result,
+                            _ = cancel_rx => None,
+                            result = close => Some(result),
                         }
-                    }))
+                    });
+                    let cancelled = completed.is_none();
+                    let result = completed.unwrap_or_else(|| Err("cancelled".to_string()));
+                    (McpConnectionOperationResult::Close(result), cancelled)
                 }
             };
+            let conn = conn_unless_cancelled(conn, cancelled);
             Ok(Box::new(McpConnectionOperationPayload { conn, result }) as SendPayload)
         })
     }
@@ -2512,13 +2567,15 @@ fn foreign_runtime_close(
         resource,
         move || {
             let close = close_async(&mut conn);
-            let result = sema_io::io_block_on(async move {
+            let completed = sema_io::io_block_on(async move {
                 tokio::select! {
                     biased;
-                    _ = cancel_rx => Err("cancelled".to_string()),
-                    result = close => result,
+                    _ = cancel_rx => None,
+                    result = close => Some(result),
                 }
             });
+            let conn = conn_unless_cancelled(conn, completed.is_none());
+            let result = completed.unwrap_or_else(|| Err("cancelled".to_string()));
             Ok(Box::new(McpConnectionOperationPayload {
                 conn,
                 result: McpConnectionOperationResult::Close(result),

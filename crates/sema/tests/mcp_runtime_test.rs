@@ -102,21 +102,34 @@ stdin_fd = sys.stdin.fileno()
 def touch(path):
     open(path, "w").close()
 
+def finish(reason):
+    # The REASON the stall ended is the signal the cancellation tests read:
+    # "closed" means the transport went away (what cancellation must cause),
+    # "released" means the test let it go, "leak-guard" means neither happened.
+    with open(finished, "w") as marker:
+        marker.write(reason)
+
 def wait_for_release():
     with open(entered, "w") as marker:
         marker.write(str(os.getpid()))
-    deadline = time.monotonic() + 5
+    # Leak guard, NOT a test oracle. The stall is meant to end because the test
+    # closed the transport or wrote `release`; this bound only stops an
+    # abandoned fixture outliving the run. It must stay far longer than any
+    # deadline the test itself applies, so a loaded machine can never make it
+    # the thing that ends a healthy run — that race is exactly what used to make
+    # the cancellation tests flaky, when this was 5s.
+    deadline = time.monotonic() + 120
     while time.monotonic() < deadline:
         if os.path.exists(release):
-            touch(finished)
+            finish("released")
             return
         readable, _, _ = select.select([stdin_fd], [], [], 0)
         if readable and os.read(stdin_fd, 1) == b"":
-            touch(finished)
+            finish("closed")
             raise SystemExit(0)
         time.sleep(0.005)
     touch(timed_out)
-    touch(finished)
+    finish("leak-guard")
 
 def send(message):
     sys.stdout.write(json.dumps(message) + "\n")
@@ -193,6 +206,10 @@ release, entered, timed_out, finished = sys.argv[1:5]
 def touch(path):
     open(path, "w").close()
 
+def finish(reason):
+    with open(finished, "w") as marker:
+        marker.write(reason)
+
 def peer_closed(connection):
     readable, _, _ = select.select([connection], [], [], 0)
     if not readable:
@@ -238,18 +255,19 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_DELETE(self):
         touch(entered)
-        deadline = time.monotonic() + 5
+        # See the stdio fixture: this bound is a leak guard, never the oracle.
+        deadline = time.monotonic() + 120
         while time.monotonic() < deadline:
             if os.path.exists(release):
-                touch(finished)
+                finish("released")
                 self.reply(200)
                 return
             if peer_closed(self.connection):
-                touch(finished)
+                finish("closed")
                 return
             time.sleep(0.005)
         touch(timed_out)
-        touch(finished)
+        finish("leak-guard")
         self.reply(200)
 
 server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
@@ -295,13 +313,12 @@ enum CancellationResourceOracle {
     HttpPeerDisconnect,
 }
 
-/// True once the stdio server process was interrupted: gone entirely, or
-/// killed but not yet reaped (a zombie). Cancellation SIGKILLs the transport
+/// One probe: true if the stdio server process is interrupted — gone entirely,
+/// or killed but not yet reaped (a zombie). Cancellation SIGKILLs the transport
 /// child and leaves reaping to tokio's background best-effort, so a plain
 /// `kill(pid, 0)` probe — which succeeds on zombies — would misread an
 /// interrupted-but-unreaped child as alive (observed on Linux CI, where the
-/// reap consistently lags the probe window). Polls briefly: the kill itself
-/// is prompt; only its observation needs slack on loaded runners.
+/// reap consistently lags the probe window).
 fn stdio_server_exited(entered: &std::path::Path) -> bool {
     let Ok(pid) = std::fs::read_to_string(entered) else {
         return false;
@@ -321,16 +338,50 @@ if not state or state.startswith("Z"):
     raise SystemExit(1)  # reaped mid-probe, or a kill-pending zombie
 raise SystemExit(0)  # genuinely still running
 "#;
-    let deadline = Instant::now() + Duration::from_secs(2);
-    loop {
-        let interrupted = !Command::new("python3")
-            .args(["-c", probe, pid.trim()])
-            .status()
-            .is_ok_and(|status| status.success());
-        if interrupted || Instant::now() >= deadline {
-            return interrupted;
+    !Command::new("python3")
+        .args(["-c", probe, pid.trim()])
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+/// Block until the transport peer reaches ANY terminal state, so the caller
+/// reads a settled outcome instead of racing one.
+///
+/// The peer ends in exactly one of these, and each is directly observable:
+///   - `finished` contains "closed" — it saw the transport go away. This is what
+///     cancellation must cause.
+///   - the process is gone — cancellation SIGKILLed it before it could write.
+///   - `finished` contains "released" — the test let it go (only the failure
+///     cleanup path does that here).
+///   - `timed_out` — none of the above, so the fixture's leak guard fired.
+///
+/// The peer reports WHY its stall ended, so the test reads causality rather than
+/// inferring it from timing. The deadline below is not an oracle: it is far
+/// beyond any plausible scheduling delay (a healthy run settles in ~0.1s) and
+/// far below the fixture's 120s leak guard, so no machine speed can change the
+/// verdict — only which marker exists can.
+fn wait_for_peer_outcome(markers: &Markers, oracle: CancellationResourceOracle) {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut next_process_probe = Instant::now();
+    while Instant::now() < deadline {
+        // Markers are a cheap stat(2) — poll them tightly.
+        if markers.finished.exists() || markers.timed_out.exists() {
+            return;
         }
-        thread::sleep(Duration::from_millis(50));
+        // The liveness probe forks a python + ps, so it is thousands of times
+        // more expensive. Only the SIGKILL case needs it (a killed peer writes
+        // no marker), and that case is not latency-sensitive, so probe it
+        // sparingly: spamming it here would add load to the very machine whose
+        // scheduling delays this function exists to tolerate.
+        if matches!(oracle, CancellationResourceOracle::StdioServerExit)
+            && Instant::now() >= next_process_probe
+        {
+            if stdio_server_exited(&markers.entered) {
+                return;
+            }
+            next_process_probe = Instant::now() + Duration::from_millis(500);
+        }
+        thread::sleep(Duration::from_millis(10));
     }
 }
 
@@ -358,11 +409,15 @@ fn assert_cancelled_before_server_fallback(
 
     let result = interp.drive_until_settled(&root);
     let (saw_entry, cancel_accepted) = canceller.join().expect("canceller thread completes");
-    let peer_finished = wait_for_path(&markers.finished, Duration::from_secs(1));
-    let resource_interrupted = peer_finished
-        || matches!(oracle, CancellationResourceOracle::StdioServerExit)
-            && stdio_server_exited(&markers.entered);
-    let server_fallback_ran = markers.timed_out.exists();
+    wait_for_peer_outcome(markers, oracle);
+    // Why the peer's stall ended, straight from the peer.
+    let peer_reason = std::fs::read_to_string(&markers.finished).unwrap_or_default();
+    let peer_saw_close = peer_reason.trim() == "closed";
+    // A SIGKILLed peer never gets to report anything, so its death is the report.
+    let peer_killed = matches!(oracle, CancellationResourceOracle::StdioServerExit)
+        && stdio_server_exited(&markers.entered);
+    let resource_interrupted = peer_saw_close || peer_killed;
+    let leak_guard_fired = markers.timed_out.exists();
     if !resource_interrupted {
         // Cleanup for the RED/failure path only. A passing cancellation must
         // make the transport peer close without this release marker.
@@ -377,12 +432,26 @@ fn assert_cancelled_before_server_fallback(
     assert!(cancel_accepted, "the live MCP root rejected cancellation");
     assert!(result.is_err(), "the cancelled MCP root returned a value");
     assert!(
-        !server_fallback_ran,
-        "runtime cancellation was not serviced until the server's bounded fallback released the operation"
+        !leak_guard_fired,
+        "the delayed server sat for its full leak-guard window: cancellation \
+         never closed the transport, and nothing else ended the call"
     );
+    if !resource_interrupted {
+        // The runtime's own view, printed before the assertion fires. The
+        // distinguishing symptom of the leak this test caught was clean books —
+        // zero tasks, zero gates, root cancelled — alongside a live child.
+        eprintln!(
+            "mcp cancellation diagnostics: peer_reason={peer_reason:?} peer_killed={peer_killed} \
+             live_tasks={} resource_gates={} root_errored={} cancel_accepted={cancel_accepted}",
+            interp.runtime_live_task_count(),
+            interp.runtime_resource_gate_count(),
+            result.is_err(),
+        );
+    }
     assert!(
         resource_interrupted,
-        "cancellation settled the root without interrupting the MCP transport resource"
+        "cancellation settled the root without interrupting the MCP transport \
+         resource (peer reported {peer_reason:?}, process interrupted: {peer_killed})"
     );
     assert_eq!(
         interp.runtime_live_task_count(),
