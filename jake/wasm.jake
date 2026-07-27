@@ -66,6 +66,7 @@ task _vendor-runtime: [build]
 # `_vendor-runtime` so it stays DRY.
 file crates/sema/src/web/assets/sema_wasm_bg.wasm: packages/sema-wasm/pkg/sema_wasm_bg.wasm packages/sema/src/**/* packages/sema-web/src/**/*
     jake wasm._vendor-runtime {{web_runtime_dir}}
+    ./scripts/check-web-runtime-fresh.sh --write
 
 @group wasm
 @desc "Vendor the sema-web browser runtime into the sema crate assets (incremental)"

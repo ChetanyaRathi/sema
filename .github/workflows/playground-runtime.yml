@@ -40,9 +40,11 @@ jobs:
         with:
           tool: wasm-pack@0.15.0
 
+      # Through the shared script (not wasm-pack directly) so this build gets the
+      # same path remapping as every other: sema.run's wasm is a shipped artifact
+      # and should not carry a build machine's absolute paths either.
       - name: Build the playground runtime
-        working-directory: crates/sema-wasm
-        run: wasm-pack build --target web --out-dir ../../playground/pkg -- --config 'profile.release.package.sema-wasm.opt-level="s"'
+        run: ./scripts/wasm-build.sh crates/sema-wasm --target web --out-dir ../../playground/pkg -- --config 'profile.release.package.sema-wasm.opt-level="s"'
 
       - name: Build the playground
         working-directory: playground
