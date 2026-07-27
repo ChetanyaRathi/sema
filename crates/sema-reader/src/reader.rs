@@ -684,8 +684,8 @@ fn rewrite_percent_args(expr: &Value, max_arg: &mut usize, has_rest: &mut bool) 
                 .iter()
                 .map(|(k, v)| {
                     (
-                        rewrite_percent_args(k, max_arg),
-                        rewrite_percent_args(v, max_arg),
+                        rewrite_percent_args(k, max_arg, has_rest),
+                        rewrite_percent_args(v, max_arg, has_rest),
                     )
                 })
                 .collect();
