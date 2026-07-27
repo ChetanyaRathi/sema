@@ -33,26 +33,35 @@ MODE="${1:-check}"
 
 cd "$ROOT"
 
-# Inputs mirror the two `file` recipes in jake/wasm.jake that produce these
-# assets — keep them in sync; a missed input is a change this cannot catch.
-# `.cargo/config.toml` and scripts/wasm-build.sh are in because they set the
+# The crates that actually compile into the WASM are derived from
+# `sema-wasm`'s own dependency tree, not globbed. Globbing `crates/*/src/*`
+# would drag in every crate in the workspace — sema-mcp, sema-lsp, sema-dap,
+# … — none of which reach the browser runtime, so any change to them would
+# demand a pointless re-vendor of a ~5MB binary. Deriving the list also means
+# it cannot go stale when a dependency is added or dropped.
+WASM_CRATE_SPECS="$(cargo tree -p sema-wasm --edges normal --prefix none 2>/dev/null |
+  grep -oE '^sema-[a-z-]+' | sort -u |
+  while read -r crate; do printf 'crates/%s/src/*\ncrates/%s/Cargo.toml\n' "$crate" "$crate"; done)"
+if [ -z "$WASM_CRATE_SPECS" ]; then
+  echo "web-runtime freshness: could not resolve sema-wasm's dependency tree" >&2
+  exit 1
+fi
+
+# The rest mirror the `file` recipes in jake/wasm.jake that vendor these assets.
+# `.cargo/config.toml` and scripts/wasm-build.sh are in because they decide the
 # rustflags the build compiles with.
-# NOTE the trailing `/*` on every directory: a bare `crates/*/src` pathspec
+#
+# NOTE the trailing `/*` on every directory: a bare `crates/x/src` pathspec
 # matches NOTHING in `git ls-files` (it wants files, not directory prefixes), so
-# omitting it silently reduces the fingerprint to a handful of manifests and the
-# check quietly stops covering the code. SANITY_FILES below fails loudly if that
-# ever happens again.
-read -r -d '' INPUT_PATHSPECS <<'SPECS' || true
-crates/*/src/*
-crates/*/Cargo.toml
+# omitting it silently reduces the fingerprint and the check quietly stops
+# covering the code. SANITY_FILES below fails loudly if that ever happens again.
+INPUT_PATHSPECS="$WASM_CRATE_SPECS
 Cargo.toml
 Cargo.lock
 packages/sema/src/*
 packages/sema-web/src/*
 .cargo/config.toml
-scripts/wasm-build.sh
-:(exclude)crates/sema/src/web/assets/*
-SPECS
+scripts/wasm-build.sh"
 
 DIGESTS="$(python3 - "$LOCK" "$MODE" <<PY
 import hashlib
