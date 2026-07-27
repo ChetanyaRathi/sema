@@ -141,6 +141,11 @@ jobs:
             echo "::error::Embedded web runtime is stale. Run 'jake wasm.web-runtime' and commit crates/sema/src/web/assets/."
             git --no-pager status --porcelain -- crates/sema/src/web/assets
             git --no-pager diff --stat -- crates/sema/src/web/assets
+            # The JS glue is text: show it. "Stale" and "built on a different
+            # machine" look identical in a --stat, and only the actual hunks
+            # distinguish them — a contributor seeing this needs to know which.
+            echo "--- sema_wasm.js diff (committed -> rebuilt here) ---"
+            git --no-pager diff -- crates/sema/src/web/assets/sema_wasm.js | head -80
             exit 1
           fi
           echo "embedded web runtime matches source ✓"
