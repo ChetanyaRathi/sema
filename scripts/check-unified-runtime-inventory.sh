@@ -20,6 +20,7 @@ scan_discovery() {
   if ! "$rg_bin" -n --with-filename --no-heading --color never \
     -g '*.rs' -g '*.js' -g '*.ts' \
     -g '!crates/sema/src/web/assets/**' \
+    -g '!crates/sema-notebook/src/ui/vendor/**' \
     -g '!playground/src/examples.js' \
     "$discovery_one" crates/*/src playground/src; then
     return 1
@@ -27,6 +28,7 @@ scan_discovery() {
   if ! "$rg_bin" -n --with-filename --no-heading --color never \
     -g '*.rs' -g '*.sema' -g '*.js' -g '*.ts' \
     -g '!crates/sema/src/web/assets/**' \
+    -g '!crates/sema-notebook/src/ui/vendor/**' \
     -g '!playground/src/examples.js' \
     "$discovery_two" crates/*/src playground/src; then
     return 1
