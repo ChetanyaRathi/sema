@@ -1,6 +1,8 @@
 # Sema as a C-Linkable / FFI Library (`sema-ffi`): Feasibility Study
 
-> **Status:** Exploratory / feasibility only — **no code committed, nothing greenlit.** This document records a multi-agent investigation into whether Sema could ship as a C-ABI shared library so it can be embedded from C/C++, PHP (FFI ext), Dart (`dart:ffi`), and other FFI-capable runtimes. It captures the design that would work, the hard constraints, and an honest effort estimate.
+> **Status:** NOT PLANNED (archived 2026-07-27). Exploratory / feasibility only —
+> **no code committed, nothing greenlit.** Kept for the design and the effort
+> estimate, should C-ABI embedding ever be revisited. This document records a multi-agent investigation into whether Sema could ship as a C-ABI shared library so it can be embedded from C/C++, PHP (FFI ext), Dart (`dart:ffi`), and other FFI-capable runtimes. It captures the design that would work, the hard constraints, and an honest effort estimate.
 >
 > **Date:** 2026-06-22
 > **Related:** `docs/plans/2026-03-11-embedding-api-improvements.md` (Rust embedding-API gaps — step limit, typed registration, value conversion), `crates/sema-wasm/` (the existing thin-binding precedent).

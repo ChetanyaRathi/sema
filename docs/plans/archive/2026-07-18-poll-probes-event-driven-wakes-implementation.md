@@ -1,5 +1,12 @@
 # Poll Probes to Event-Driven Wakes Implementation Plan
 
+**Status:** Implemented 2026-07-18 (the checkboxes below were never ticked
+during execution). Verified in code: the lossless watch-generation wakes are in
+`crates/sema-stdlib/src/server.rs` (`incoming_generation:
+tokio::sync::watch::Sender<u64>`) and the retained structural-timer probe is
+`RuntimePoll`/`RuntimePollResult` in `crates/sema-stdlib/src/io.rs`. Its design
+companion `2026-07-18-poll-probes-event-driven-wakes.md` is marked Implemented.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Replace runtime WebSocket polling with lossless watch-generation wakes, make timer-only `event/select` exact, and retain structural-timer polling only for VM-thread key/process readiness.

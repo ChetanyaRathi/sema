@@ -1,7 +1,11 @@
 # docs_search accuracy tuning — domain-specialized retrieval
 
 **Date:** 2026-06-25
-**Status:** DEFERRED (planning only; not started). See `docs/deferred.md` → DOCS-SEARCH-1.
+**Status:** NOT PLANNED (archived 2026-07-27) — planning only, never started.
+The shipped BM25 `docs_search` is good enough (recall@5 ≈ 0.93 on keyword-ish
+queries); this multi-phase tuning is worth revisiting only if conceptual-query
+quality demonstrably starts to matter. The rationale stays tracked as
+DOCS-SEARCH-1 in `docs/deferred.md`. Originally: DEFERRED (planning only; not started). See `docs/deferred.md` → DOCS-SEARCH-1.
 **Builds on:** `docs/plans/archive/2026-06-25-mcp-docs-search.md` (the shipped BM25 `docs_search` tool).
 
 ## Why this plan exists

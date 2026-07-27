@@ -1,6 +1,11 @@
 # Unified Runtime Finish Remediation
 
-**Status:** In progress 2026-07-18
+**Status:** Complete — superseded 2026-07-23. Its tasks were folded into the
+terminal-inventory stream (`2026-07-19-unified-runtime-terminal-inventory.md`,
+Tasks 8–9) and `2026-07-21-unified-runtime-remaining-work.md`, both Complete
+with `runtime_conformance_test` green. Spot-checked in code: Task 1's
+runtime-quantum RAII (`ActiveDriveGuard`) and Task 7's per-interpreter WASM
+Promise driver (`DRIVER_REGISTRY`) are both present.
 
 ## Goal
 
