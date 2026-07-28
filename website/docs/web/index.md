@@ -154,14 +154,17 @@ Re-rendering uses morphdom for efficient DOM patching -- only changed nodes are 
 | Module | Namespace | Purpose |
 | --- | --- | --- |
 | [Reactive State](./reactive-state) | `state`, `put!`, `update!`, `computed`, `batch`, `watch` | Signal-based reactivity |
-| [Components](./components) | `defcomponent`, `mount!`, `local`, `on-mount` | Reactive UI components |
+| [Components](./components) | `defcomponent`, `mount!`, `component/render`, `local`, `effect`, `on-unmount` | Reactive UI components, composition, lifecycle |
 | [SIP Markup](./sip-markup) | `sip/*` | Declarative DOM rendering |
 | [DOM API](./dom-api) | `dom/*` | Low-level DOM manipulation |
 | [Store](./store) | `store/*` | localStorage / sessionStorage |
-| [Routing](./routing) | `router/*` | Hash-based SPA routing |
+| [Routing](./routing) | `router/*` | SPA routing: params, query strings, links, hash or history mode |
 | [Scoped CSS](./css) | `css/*` | Dynamic style injection |
 | [HTTP & Streams](./http) | `http/*` | Browser fetch integration and SSE streams |
 | [LLM](./llm) | `llm/*` | AI completions via proxy |
+| [Async Resources](./resources) | `resource`, `resource/refresh!`, `resource/cancel!` | Component-owned async data with loading/error state |
+| [Diagnostics](./diagnostics) | `onerror`, `dev` | Error hook and a bounded dev-mode timeline |
+| [Testing](./testing) | `renderSema` | Mount and drive components from a test |
 
 ## Next Steps
 
@@ -169,3 +172,5 @@ Re-rendering uses morphdom for efficient DOM patching -- only changed nodes are 
 - [Building a Sema Web App](./building-apps) -- recommended project layout and compiled-archive workflow
 - [Reactive State](./reactive-state) -- the core programming model
 - [Components](./components) -- building interactive UIs
+- [Async Resources](./resources) -- loading data without wiring loading/error state by hand
+- [Diagnostics & Dev Mode](./diagnostics) -- seeing what the runtime is doing

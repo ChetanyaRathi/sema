@@ -2,6 +2,78 @@
 
 ## Unreleased
 
+### Browser runtime (`sema-wasm`) — critical fix
+
+- **Host-invoked Sema calls no longer abort the WASM instance.** A `Vec::pop()`
+  passed as an argument to `debug_assert_eq!` in
+  `crates/sema-vm/src/restricted.rs` was compiled out of release builds along
+  with the macro, so the restricted driver's parked-VM frame index was never
+  removed. The next frame lookup resolved a stale index and hit an
+  `unreachable!`, surfacing in the browser as `RuntimeError: unreachable`.
+  Everything re-entering Sema from a host callback was affected: component
+  renders, `on-mount`, `watch` callbacks, and effect bodies. In practice that
+  meant `apply`, `update!`, `try`/`catch`, and `map?` were unusable inside any
+  Sema Web component.
+
+  It reproduced only in release builds — the native binary never takes this code
+  path, and `cargo test` compiles with `debug_assertions` on, so the whole Rust
+  suite was green against it. Guarded now by a source assertion plus a new
+  workspace-wide `debug_assert_purity` test that rejects side effects in any
+  `debug_assert*!` argument.
+
+### Sema Web (`@sema-lang/sema-web`)
+
+Nine of the ten gaps on the framework roadmap, plus the adversarial pass that
+followed. The suite went from 297 to 996 unit tests and 47 to 108 browser tests.
+
+- **Composition.** `component/render` renders a child component with props and
+  children; `mount!` takes initial props. Each composed child gets its own
+  render scope, so its `effect`, `on-unmount`, `local`, and `resource`
+  registrations belong to the child instance rather than to the component that
+  mounted it. Give repeated children a `:key` **in their props** — the SIP
+  `:key` attribute gives the DOM its identity, and the prop gives the child's
+  state the same identity.
+- **Keyed lists.** `{:key ...}` on a SIP node drives morphdom's node matching,
+  so reordering a list preserves each row's DOM node, its focus, and what the
+  user has half-typed into it. Duplicate sibling keys are reported in dev mode.
+- **Lifecycle.** `(effect deps fn)` runs after render and re-runs when its deps
+  change, with cleanup before each re-run and at teardown; `(on-unmount fn)` is
+  a direct teardown hook. Both are owned by the component and disposed with it.
+- **Async resources.** `resource`, `resource/refresh!`, and `resource/cancel!`
+  expose `:loading` / `:value` / `:error`, abort in-flight work on unmount, and
+  cannot be overwritten by a stale response.
+- **Router.** Query strings parse into `:query`, a not-found route can be
+  registered, `router/link` renders an accessible anchor that navigates without
+  a page load, and history mode is available alongside the hash default.
+  Percent-encoded and non-ASCII route segments now match.
+- **Event modifiers and forms.** `.prevent`, `.stop`, `.once`, `.capture`, and
+  `.self` on `on-*` attributes, plus `dom/event-form-data` and
+  checkbox/radio/select helpers. An unrecognised `on-*` event name is now
+  reported instead of silently never firing.
+- **Diagnostics.** `SemaWeb.create({ onerror })` installs an app-level error
+  hook, and `{ dev: true }` records a bounded timeline of errors, renders (with
+  durations), route changes, stream lifecycle, and script loads, readable via
+  `web.diagnostics`. Off by default and free when off. An opt-in overlay ships
+  as a separate chunk.
+- **Testing utilities.** `renderSema()` mounts Sema into JSDOM and returns
+  helpers to fire events, read signals, and assert cleanup, on its own
+  `@sema-lang/sema-web/testing` entry point so it stays out of production
+  bundles.
+- **LLM proxy hardening.** Proxy headers are built once for both the streaming
+  and non-streaming paths — they previously had opposite precedence, so the same
+  config authenticated differently depending on whether the call streamed. The
+  stream protocol latches terminal states (a trailing frame could erase an error
+  the UI had already shown) and accepts the OpenAI `[DONE]` sentinel. HTTP
+  failures now raise with the endpoint, status, and body.
+- **Fixed: `(message :user "…")` in the browser.** `message` is a core special
+  form, so the module's own `(define (message ...))` never took effect, and the
+  value it produces cannot be JSON-encoded — the documented
+  `(llm/chat (list (message :user "Hi")))` failed outright. Messages are now
+  normalised before encoding.
+
+Gap 9 (Vite plugin, `npm create` template, CI bundle budgets) is dropped rather
+than deferred: packaging work, with nothing in the library depending on it.
+
 ### Agent memory (`memory/*`)
 
 - **Persistent conversation threads.** `memory/open`, `memory/append`, and
