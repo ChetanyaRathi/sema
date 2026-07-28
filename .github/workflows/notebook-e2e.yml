@@ -2,21 +2,47 @@ name: notebook e2e
 
 on:
   push:
+    # branches (not tags): a release tag is the same commit that already ran on
+    # the main push; the release gate is verify.yml.
+    branches: [main]
     paths:
       - ".github/workflows/notebook-e2e.yml"
       - "Cargo.lock"
       - "Cargo.toml"
       - "crates/sema-notebook/**"
+      # The suite drives `cargo run --bin sema -- notebook serve`, and cell
+      # evaluation goes through the whole engine — an engine change that breaks
+      # notebook eval must not skip this gate (mirrors sema-web-tests.yml).
+      - "crates/sema/**"
+      - "crates/sema-core/**"
+      - "crates/sema-eval/**"
+      - "crates/sema-reader/**"
+      - "crates/sema-stdlib/**"
+      - "crates/sema-vm/**"
   pull_request:
     paths:
       - ".github/workflows/notebook-e2e.yml"
       - "Cargo.lock"
       - "Cargo.toml"
       - "crates/sema-notebook/**"
+      - "crates/sema/**"
+      - "crates/sema-core/**"
+      - "crates/sema-eval/**"
+      - "crates/sema-reader/**"
+      - "crates/sema-stdlib/**"
+      - "crates/sema-vm/**"
+
+concurrency:
+  group: notebook-e2e-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
 
 jobs:
   e2e:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
 
@@ -24,7 +50,7 @@ jobs:
         # The webServer command (playwright.config.ts) shells out to
         # `cargo run --bin sema -- notebook serve`, which compiles the native
         # binary. That pulls in `serialport` (transitive `libudev-sys`), which
-        # needs libudev-dev on Linux. Mirrors the same install in ci.yml.
+        # needs libudev-dev on Linux.
         run: |
           sudo apt-get update
           sudo apt-get install -y libudev-dev
@@ -46,6 +72,12 @@ jobs:
 
       - run: npm ci
         working-directory: crates/sema-notebook/tests/e2e
+
+      - name: Cache Playwright browsers
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ hashFiles('crates/sema-notebook/tests/e2e/package-lock.json') }}
 
       - run: npx playwright install --with-deps chromium
         working-directory: crates/sema-notebook/tests/e2e
