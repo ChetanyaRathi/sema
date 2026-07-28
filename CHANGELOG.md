@@ -4,10 +4,12 @@
 
 ### CI overhaul — one gate, fail fast, release-path fixes
 
-- **Push CI drops from ~44 to ~14 minutes wall clock** (steady-state ~10):
-  the advisory Windows leg (0-for-37 green, 44 min/run, cold-compiling every
-  time) and the flaky coverage tail moved to a nightly schedule; superseded
-  pushes cancel in progress; docs/website-only pushes skip CI entirely.
+- **Push CI drops from ~44 to 8.5 minutes wall clock** (measured steady-state
+  on the branch): the advisory Windows leg (0-for-37 green, 44 min/run,
+  cold-compiling every time) and the flaky coverage tail moved to a nightly
+  schedule; the examples smoke runs as a parallel job (its ~4m release rebuild
+  is mtime-bound, not cacheable); superseded pushes cancel in progress;
+  docs/website-only pushes skip CI entirely.
 - **One gate definition.** ci.yml is a thin caller of verify.yml, and both run
   the same jake recipes (`jake ci` locally = CI). The packaged-crate boundary
   test, web-runtime freshness check, and publish-list guard now run on every
