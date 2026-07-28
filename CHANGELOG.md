@@ -1,5 +1,45 @@
 # Changelog
 
+## Unreleased
+
+### Agent memory (`memory/*`)
+
+- **Persistent conversation threads.** `memory/open`, `memory/append`, and
+  `memory/messages` implement the transcript half of the long-documented memory
+  module: a thread is an append-only conversation log keyed on
+  `(:namespace, :id)`, durable as JSONL under `./.sema/memory/`, reloaded by an
+  idempotent `memory/open` in the next process. `memory/messages` snapshots a
+  thread into an ordinary conversation value. Built for the unified runtime:
+  the open load and the append flush run off the scheduler (a per-thread FIFO
+  gate serializes flushes; durability is write-through), reads never block, and
+  pre-dispatch byte caps bound every disk job. A flush that fails mid-write
+  rolls the sidecar back to its pre-write length, so a retry can never
+  duplicate or tear lines. `memory/open`/`memory/append` are `FS_WRITE`-gated,
+  and the derived sidecar path is checked against the sandbox's allowed paths
+  at open.
+- **`agent/run` learns `:memory`.** Pass a handle and the run seeds its
+  conversation from the thread and appends the new user/assistant text turns
+  back afterwards — including the turns a run cancelled via `async/cancel` had
+  already produced, so an interrupted agent session is no longer lost (the
+  persistence leg of #87). Tool-protocol traffic is deliberately not recorded;
+  a thread re-seeds as an always-valid plain transcript.
+
+### Phantom docs purged, and a gate so they stay gone
+
+- **Docs for functions that never existed are removed.** The memory *facts*
+  half (`memory/remember`, `memory/recall-fact`) and the whole `for`
+  comprehension family (`for`, `for/list`, `for/map`, `for/filter`,
+  `for/fold`) were documented — with examples — but implemented nowhere; LSP
+  completion and REPL apropos advertised names that threw `Unbound variable`.
+  The entries are gone (along with the LSP scope-analyzer special-case and MCP
+  doc strings for `for/*`; `for-range` and the `for.md` "no such form" redirect
+  entry remain), and the never-emitted `Memory` workflow-journal event variant
+  went with them.
+- **`jake docs-check` now runs a reverse coverage gate.** The existing gate
+  checked every registered builtin is documented; the new one checks every
+  documented name is registered, so a phantom entry fails CI instead of
+  shipping.
+
 ## 1.31.5 — 2026-07-27
 
 Twenty-one fixes from an audit of the stdlib, reader/compiler, LLM layer and

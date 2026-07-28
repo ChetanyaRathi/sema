@@ -64,12 +64,30 @@ mod kv;
 pub use kv::set_kv_bounds_override;
 mod list;
 mod map;
+#[cfg(not(target_arch = "wasm32"))]
+mod memory;
 /// Lower the per-input byte cap for `diff/*` under a runtime quantum (clamped to
 /// the hard ceiling), or clear the override with `None`. The B8 seam the diff
 /// cap-boundary regression drives without a multi-megabyte input.
 #[cfg(not(target_arch = "wasm32"))]
 #[doc(hidden)]
 pub use diff::set_diff_input_byte_cap_override;
+/// Point the `memory/*` sidecar base dir somewhere hermetic (normally
+/// `./.sema/memory`), or clear the override with `None`. The regression
+/// suite's isolation seam.
+#[cfg(not(target_arch = "wasm32"))]
+#[doc(hidden)]
+pub use memory::set_memory_base_dir_override;
+/// Lower the per-thread `memory/*` sidecar/turn byte caps (clamped to the hard
+/// ceilings), or clear the override with `None`.
+#[cfg(not(target_arch = "wasm32"))]
+#[doc(hidden)]
+pub use memory::set_memory_bounds_override;
+/// Make the NEXT `memory/*` flush write a partial prefix and fail — the
+/// partial-write rollback seam for the regression suite. One-shot.
+#[cfg(not(target_arch = "wasm32"))]
+#[doc(hidden)]
+pub use memory::set_memory_flush_partial_fail_override;
 #[cfg(not(target_arch = "wasm32"))]
 mod markup;
 /// Lower the per-input byte cap for the `html/*` and `markdown/*` ops under a
@@ -270,6 +288,8 @@ pub fn register_stdlib(env: &Env, sandbox: &Sandbox) {
     stream::register_io(env, sandbox);
     #[cfg(not(target_arch = "wasm32"))]
     kv::register(env, sandbox);
+    #[cfg(not(target_arch = "wasm32"))]
+    memory::register(env, sandbox);
     #[cfg(not(target_arch = "wasm32"))]
     pdf::register(env, sandbox);
     #[cfg(not(target_arch = "wasm32"))]

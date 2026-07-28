@@ -656,6 +656,7 @@ R22A	crates/sema-stdlib/src/list.rs:3637:                sema_core::call_callbac
 R22A	crates/sema-stdlib/src/list.rs:3641:        sema_core::with_stdlib_ctx(|ctx| sema_core::call_callback(ctx, func, args))
 R22A	crates/sema-stdlib/src/list.rs:3650:    sema_core::with_stdlib_ctx(|ctx| sema_core::call_callback_owned(ctx, func, args))
 R21A	crates/sema-stdlib/src/markup.rs:42:thread_local! {
+R09C	crates/sema-stdlib/src/memory.rs:158:thread_local! {
 R22A	crates/sema-stdlib/src/meta.rs:116:    // nonblocking-agent-run.md`) — so this real `thread::sleep` loop is
 R22A	crates/sema-stdlib/src/meta.rs:119:    // that backs off via `async/sleep` instead.
 R22A	crates/sema-stdlib/src/meta.rs:138:                        std::thread::sleep(std::time::Duration::from_millis(delay));

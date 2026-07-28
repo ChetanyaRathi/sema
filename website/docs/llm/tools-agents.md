@@ -96,6 +96,7 @@ An optional third argument takes per-run options. **Passing an options map chang
   (agent/run weather-bot "What's the weather in Tokyo?"
     {:reasoning-effort :high       ; reasoning effort for this run (see Completion)
      :messages prior-history       ; seed the loop with prior conversation
+     :memory mem                   ; persistent thread — see Agent Memory
      :on-tool-call observe-tool})) ; observe each tool call — see below
 
 (:response result)   ; => the final answer string

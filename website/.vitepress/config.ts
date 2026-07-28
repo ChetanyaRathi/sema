@@ -189,6 +189,7 @@ export default defineConfig({
             { text: 'Completion & Chat', link: '/docs/llm/completion' },
             { text: 'Tools & Agents', link: '/docs/llm/tools-agents' },
             { text: 'Conversations', link: '/docs/llm/conversations' },
+            { text: 'Agent Memory', link: '/docs/llm/memory' },
             { text: 'Prompts & Messages', link: '/docs/llm/prompts' },
             { text: 'Structured Extraction', link: '/docs/llm/extraction' }
           ]

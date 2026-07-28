@@ -45,6 +45,60 @@ fn builtin_doc_coverage() {
     );
 }
 
+/// The reverse gate: every documented name must be a REGISTERED builtin,
+/// prelude binding, or special form. Entries for functions that don't exist
+/// ship phantom docs — LSP completion and REPL apropos advertise names that
+/// throw "Unbound variable" (the shipped `memory/*` bug this pins).
+#[test]
+fn builtin_doc_names_are_all_registered() {
+    use std::collections::HashSet;
+    let sandbox = Sandbox::deny(Caps::ALL);
+    let interp = sema_eval::Interpreter::new_with_sandbox(&sandbox);
+    let mut names: HashSet<String> = HashSet::new();
+    interp.global_env.iter_bindings(|spur, _| {
+        names.insert(sema_core::resolve(spur));
+    });
+    for sf in sema_eval::SPECIAL_FORM_NAMES {
+        names.insert(sf.to_string());
+    }
+    // Entries documenting reader/marker syntax or config keywords — never env
+    // bindings, legitimately "unregistered" (`&` destructuring rest marker,
+    // `http/router`'s `:static` route type, regex `\"` escapes).
+    const SYNTAX_DOC_NAMES: &[&str] = &["\"", "&", ":static"];
+    // Registered outside sema-eval's interpreter: `mcp/*` by the sema binary's
+    // sema-mcp crate, `web/*` by sema-wasm (playground target only). Real in
+    // the shipped artifacts; invisible to this test's interpreter.
+    const OUT_OF_TREE_BUILTINS: &[&str] = &[
+        "mcp/call",
+        "mcp/close",
+        "mcp/connect",
+        "mcp/tools",
+        "mcp/tools->sema",
+        "web/user-agent",
+        "web/user-agent-data",
+    ];
+    // Deliberate negative entries: docs that explain a name does NOT exist and
+    // redirect (`for.md` says "Sema has no `for` special form — use `for-each`
+    // or `for-range`"). Only names whose entry documents ABSENCE belong here.
+    const NEGATIVE_DOC_NAMES: &[&str] = &["for"];
+    let mut phantom: Vec<String> = sema_docs::builtin_index()
+        .entries
+        .iter()
+        .map(|e| e.name.clone())
+        .filter(|n| !names.contains(n))
+        .filter(|n| !SYNTAX_DOC_NAMES.contains(&n.as_str()))
+        .filter(|n| !OUT_OF_TREE_BUILTINS.contains(&n.as_str()))
+        .filter(|n| !NEGATIVE_DOC_NAMES.contains(&n.as_str()))
+        .collect();
+    phantom.sort();
+    assert!(
+        phantom.is_empty(),
+        "{} documented names are not registered (phantom docs):\n{}",
+        phantom.len(),
+        phantom.join("\n")
+    );
+}
+
 // ── formatting ───────────────────────────────────────────────
 
 fn format_state(uri: &str, source: &str) -> (BackendState, Url) {

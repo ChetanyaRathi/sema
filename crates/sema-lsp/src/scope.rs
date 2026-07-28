@@ -161,11 +161,6 @@ impl ScopeTree {
             // ── Try/catch ────────────────────────────────────────
             "try" => self.walk_try(items, expr, parent_scope, span_map, symbol_spans),
 
-            // ── For forms ────────────────────────────────────────
-            "for" | "for/list" | "for/map" | "for/filter" | "for/fold" => {
-                self.walk_for(items, expr, parent_scope, span_map, symbol_spans)
-            }
-
             // ── Everything else: recurse ─────────────────────────
             _ => {
                 for item in items {
@@ -768,52 +763,6 @@ impl ScopeTree {
     }
 
     /// `(for ((var expr)...) body...)` and similar for-variants.
-    fn walk_for(
-        &mut self,
-        items: &[Value],
-        expr: &Value,
-        parent_scope: usize,
-        span_map: &SpanMap,
-        symbol_spans: &[(String, Span)],
-    ) {
-        if items.len() < 2 {
-            return;
-        }
-        let form_span = match expr_span(expr, span_map) {
-            Some(s) => s,
-            None => return,
-        };
-
-        let body_scope_idx = self.scopes.len();
-        self.scopes.push(Scope {
-            parent: Some(parent_scope),
-            span: form_span,
-            bindings: Vec::new(),
-        });
-
-        if let Some(bindings) = items[1].as_list() {
-            for binding in bindings {
-                if let Some(pair) = binding.as_list() {
-                    if pair.len() >= 2 {
-                        // Iterator exprs in outer scope
-                        self.walk_expr(&pair[1], parent_scope, span_map, symbol_spans);
-                        self.collect_param_binding(
-                            &pair[0],
-                            body_scope_idx,
-                            &form_span,
-                            span_map,
-                            symbol_spans,
-                        );
-                    }
-                }
-            }
-        }
-
-        for item in &items[2..] {
-            self.walk_expr(item, body_scope_idx, span_map, symbol_spans);
-        }
-    }
-
     /// Collect a binding for a single parameter (symbol or destructuring pattern).
     #[allow(clippy::only_used_in_recursion)]
     fn collect_param_binding(
@@ -1374,30 +1323,6 @@ mod tests {
         let (tree, _) = build_scope(src);
         // 'e' on line 2 should NOT resolve (not in catch scope)
         assert!(!tree.is_locally_scoped("e", 2, 6));
-    }
-
-    // ── for-loop scoping ─────────────────────────────────────────
-
-    #[test]
-    fn for_binds_loop_variable() {
-        let src = "(for ((x (list 1 2 3))) (println x))";
-        let (tree, _) = build_scope(src);
-        // 'x' should be locally scoped inside the for body
-        assert!(tree.is_locally_scoped("x", 1, 34));
-    }
-
-    #[test]
-    fn for_list_binds_variable() {
-        let src = "(for/list ((x (range 10))) (* x x))";
-        let (tree, _) = build_scope(src);
-        assert!(tree.is_locally_scoped("x", 1, 30));
-    }
-
-    #[test]
-    fn for_variable_not_visible_outside() {
-        let src = "(for ((x (list 1 2))) x)\n(+ 1 x)";
-        let (tree, _) = build_scope(src);
-        assert!(!tree.is_locally_scoped("x", 2, 6));
     }
 
     // ── do-loop scoping ──────────────────────────────────────────

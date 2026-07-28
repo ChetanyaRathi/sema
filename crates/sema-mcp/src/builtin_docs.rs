@@ -65,11 +65,6 @@ pub fn build_builtin_docs() -> HashMap<String, String> {
         ("defagent", "Define an LLM agent.\n\n```sema\n(defagent my-agent\n  :model \"claude-sonnet\"\n  :system \"You are helpful.\")\n```"),
         ("deftool", "Define a tool for an LLM agent.\n\n```sema\n(deftool get-weather (location)\n  \"Get weather for a location\"\n  (http/get (format \"https://api.weather.com/~a\" location)))\n```"),
         ("prompt", "Send a prompt to an LLM.\n\n```sema\n(prompt \"Explain recursion in one sentence\")\n```"),
-        ("for", "Iterate with bindings.\n\n```sema\n(for ((x (range 5)))\n  (println x))\n```"),
-        ("for/list", "Collect iteration results into a list.\n\n```sema\n(for/list ((x (range 5)))\n  (* x x))  ; => (0 1 4 9 16)\n```"),
-        ("for/map", "Collect iteration results into a map.\n\n```sema\n(for/map ((x '(1 2 3)))\n  (values x (* x x)))  ; => {1 1, 2 4, 3 9}\n```"),
-        ("for/filter", "Filter iteration results into a list.\n\n```sema\n(for/filter ((x (range 10)))\n  (even? x))  ; => (0 2 4 6 8)\n```"),
-        ("for/fold", "Fold over iteration with an accumulator.\n\n```sema\n(for/fold ((sum 0))\n  ((x (range 5)))\n  (+ sum x))  ; => 10\n```"),
         ("with-budget", "Limit LLM token budget for enclosed operations.\n\n```sema\n(with-budget 1000\n  (prompt \"Be brief.\"))\n```"),
         ("def", "Alias for `define`. Define a variable.\n\n```sema\n(def x 42)\n```"),
     ];
