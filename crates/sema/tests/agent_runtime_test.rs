@@ -9,6 +9,22 @@
 //! tool-error-recovery contract (a tool that errors → fed back as a tool result →
 //! the loop recovers), mirroring `mcp_builtin_test`.
 
+//! CONCURRENCY-OVERLAP TESTS ARE WALL-CLOCK UPPER BOUNDS (noted 2026-07-28).
+//!
+//! The `concurrent_agents_overlap_*` tests assert `wall_ms < N` to prove agents
+//! ran concurrently rather than serially. An upper bound on elapsed time is
+//! load-sensitive by construction: it holds in isolation (measured 5/5 and
+//! 20/20) and fails intermittently under `cargo nextest run --workspace`, where
+//! 7300 tests contend for the same cores. Two different tests of this shape
+//! failed on two consecutive full runs and both passed in isolation.
+//!
+//! A single failure here, in a full-workspace run, on a machine doing other
+//! work, is contention — re-run the test alone before believing it. A failure
+//! in isolation is real: the runtime agent round is blocking the VM thread.
+//!
+//! The lower-bound assertion in the same tests (`io_peak_inflight() >= 2`) is
+//! the load-safe half and can be trusted either way.
+
 #![cfg(not(target_arch = "wasm32"))]
 
 use std::sync::Arc;

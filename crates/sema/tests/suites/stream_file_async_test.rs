@@ -23,6 +23,16 @@
 //! the same mechanism `db_async_test.rs`/`proc_pty_async_test.rs` rely on.
 //! Ordering is asserted via channel receive order — never a wall-clock
 //! duration assert.
+//!
+//! The stdin/TTY tests here are the exception, and deliberately so: they drive
+//! a real `sema` subprocess over pipes, so they carry hard `Duration::from_secs(10)`
+//! deadlines that no amount of ordering discipline can remove. Those deadlines
+//! are generous against ordinary load but NOT against a fully saturated box —
+//! measured 2026-07-27, all 11 of them time out together at exactly 10.0s when
+//! every core is pegged, and pass 6/6 as soon as the load is gone. A CI run
+//! that fails this cluster *en masse* at the 10s mark is reporting machine
+//! contention, not a cancellation regression; check the runner's load before
+//! debugging the code. A single one failing alone is a real signal.
 
 #![cfg(not(target_arch = "wasm32"))]
 

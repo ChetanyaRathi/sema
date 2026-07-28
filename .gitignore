@@ -24,6 +24,9 @@
 
 # Coverage
 lcov.info
+# `vitest --coverage` / `npm run test:coverage` writes this into whichever
+# package it runs in, so match at any depth rather than per package.
+coverage/
 
 # Node / JS
 node_modules/
