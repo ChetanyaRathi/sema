@@ -43,3 +43,18 @@ jobs:
 
       - name: Run tests
         run: cargo nextest run --workspace --profile ci-windows
+
+      # Diagnostic for bug 1 (docs/bugs/2026-07-29-windows-product-bugs.md):
+      # the failing tests embed into the DEBUG test binary as carrier; end
+      # users' `sema build` embeds into the installed RELEASE binary. Probe
+      # both carriers to tell a product bug from a test-environment artifact.
+      - name: Probe embedded-payload carriers
+        if: always()
+        shell: bash
+        run: |
+          set -x
+          printf '(display "carrier-ok")' > probe.sema
+          cargo run -p sema-lang -- build -o probe-debug.exe probe.sema || true
+          ./probe-debug.exe < /dev/null || true
+          cargo run -p sema-lang -- build --target windows -o probe-release.exe probe.sema || true
+          ./probe-release.exe < /dev/null || true
