@@ -10835,9 +10835,6 @@
     },
     {
       "name": "number/to-string",
-      "aliases": [
-        "number->string"
-      ],
       "module": "strings",
       "section": "Type Conversions",
       "summary": "Convert a number to a string. The inverse is `string->number`.",
@@ -10851,7 +10848,7 @@
       "examples": [
         "(number/to-string 42)      ; => \"42\"\n(number/to-string 3.14)    ; => \"3.14\"\n(number/to-string -7)      ; => \"-7\""
       ],
-      "body": "Convert a number to a string. The inverse is `string->number`.\n\n```sema\n(number/to-string 42)      ; => \"42\"\n(number/to-string 3.14)    ; => \"3.14\"\n(number/to-string -7)      ; => \"-7\"\n```"
+      "body": "Convert a number to a string. The inverse is `string->number`.\n\nThe Scheme-legacy spelling `number->string` is documented separately under\n`math`, where it also covers the optional radix argument this alias never\naccepted. Listing it here as an alias registered the same name twice, and\nwhich entry won was nondeterministic — hover showed the radix parameter only\non some runs.\n\n```sema\n(number/to-string 42)      ; => \"42\"\n(number/to-string 3.14)    ; => \"3.14\"\n(number/to-string -7)      ; => \"-7\"\n```"
     },
     {
       "name": "str",
