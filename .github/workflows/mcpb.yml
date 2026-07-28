@@ -1,12 +1,18 @@
 # Build the single cross-platform Sema MCP Bundle (.mcpb), attach it to the
 # release, and publish the entry to the official MCP registry. Runs after
-# cargo-dist's Release workflow publishes the release, on a macOS host (lipo is
-# macOS-only). See docs/plans/archive/2026-07-17-mcpb-bundle.md.
+# cargo-dist's Release workflow, on a macOS host (lipo is macOS-only). See
+# docs/plans/archive/2026-07-17-mcpb-bundle.md.
 name: MCPB Bundle
 
 on:
-  release:
-    types: [published]
+  # Chained off the Release workflow run, NOT `release: [published]`: cargo-dist
+  # creates the GitHub Release with the default GITHUB_TOKEN, and GitHub
+  # suppresses events for token-created objects — a `release:` trigger here
+  # never fired once (verified 2026-07-28: zero runs, no .mcpb asset on any
+  # release since the workflow landed).
+  workflow_run:
+    workflows: ["Release"]
+    types: [completed]
   workflow_dispatch:
     inputs:
       tag:
@@ -18,9 +24,16 @@ permissions:
 
 jobs:
   bundle:
+    # Only after a successful tag-triggered Release (head_branch is the tag for
+    # tag pushes); manual dispatch always runs.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       startsWith(github.event.workflow_run.head_branch, 'v'))
     runs-on: macos-latest # lipo is macOS-only
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
@@ -28,7 +41,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          TAG="${{ github.event.release.tag_name || inputs.tag }}"
+          TAG="${{ inputs.tag || github.event.workflow_run.head_branch }}"
           ./scripts/pack-mcpb.sh --tag "$TAG" --upload
 
       - name: Publish to MCP registry
@@ -40,7 +53,7 @@ jobs:
             exit 0
           fi
           brew install mcp-publisher
-          TAG="${{ github.event.release.tag_name || inputs.tag }}"
+          TAG="${{ inputs.tag || github.event.workflow_run.head_branch }}"
           ./scripts/publish-mcp-registry.sh --tag "$TAG"
 
       # publish-mcp-registry.sh rewrote mcpb/server.json (version + asset URL +
@@ -51,7 +64,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           git diff --quiet -- mcpb/server.json && { echo "server.json unchanged; nothing to commit"; exit 0; }
-          TAG="${{ github.event.release.tag_name || inputs.tag }}"
+          TAG="${{ inputs.tag || github.event.workflow_run.head_branch }}"
           BR="${{ github.event.repository.default_branch }}"
           tmp="$(mktemp)"; cp mcpb/server.json "$tmp"
           git config user.name "github-actions[bot]"
