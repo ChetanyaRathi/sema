@@ -695,7 +695,10 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
     });
 }
 
-#[cfg(test)]
+// unix-only: every test spawns `sh` under a pty, and a pty wait relies on the
+// process-group SIGKILL abort hook — a documented no-op off Unix, so on
+// Windows these can only ever hang to the slow-timeout watchdog.
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use sema_core::{EvalContext, Sandbox};
