@@ -5,7 +5,7 @@
 browser, hot-reloads on edit, and proxies llm/* with server keys — verified
 end-to-end in a real browser (render, hot reload, and a live chat round-trip).
 M2 (concurrency / progressive streaming) and M3 (state-preserving HMR) deferred.
-**Related:** GitHub issue #18 (§11 Tooling), `docs/plans/2026-07-02-sema-web-framework-gaps.md`, `packages/llm-proxy/`
+**Related:** GitHub issue #18 (§11 Tooling), `docs/plans/archive/2026-07-02-sema-web-framework-gaps.md`, `packages/llm-proxy/`
 
 ## 1. Problem
 

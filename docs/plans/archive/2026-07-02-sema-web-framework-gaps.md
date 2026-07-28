@@ -1,6 +1,40 @@
 # Sema Web Framework Gaps Roadmap
 
-**Status:** Exploratory plan - 2026-07-02. Implementation not started.
+**COMPLETE — archived 2026-07-28.** Gaps 1-8 and 10 are closed and hardened. Gap 9
+(build/tooling DX) is **dropped, not deferred**: a Vite plugin, an `npm create`
+template, and CI bundle budgets are packaging and distribution work, not framework
+gaps, and nothing in the library depends on them. Revisit as its own plan if demand
+appears.
+
+Final state: **996 unit tests across 39 files**, **108 Playwright e2e**, 7306 Rust
+workspace tests, `tsc --noEmit` and `npm run build` clean.
+
+An adversarial pass over this work found **37 confirmed defects**; 34 are fixed, 2 are
+partial and 1 is open by explicit decision, each recorded with its regression test in
+[`docs/bugs/2026-07-28-sema-web-adversarial-findings.md`](../../bugs/2026-07-28-sema-web-adversarial-findings.md).
+That ledger, not this plan, is the live document for anything still outstanding.
+
+**Originally re-verified 2026-07-27 against `packages/sema-web/src/` — at that point
+all ten gaps were open, nothing having been closed by the unified-runtime work.** That work was Rust-side
+(`sema-vm`/`sema-stdlib` cooperative scheduling); every gap here is browser/TS
+side, so the two never intersected. Verified absent, not merely undocumented:
+
+| # | Gap | Status / evidence |
+| --- | --- | --- |
+| 1 | Props / children / composition | **CLOSED 2026-07-27** — `component/render` macro + `mount!` props in `COMPONENT_SEMA_PRELUDE`; `normalizeProps` in `component.ts` |
+| 2 | Keyed lists | **CLOSED 2026-07-27** — `SIP_KEY_ATTR`/`sipNodeKey` in `sip.ts`, wired via `sipMorphOptions` |
+| 3 | Lifecycle + effects | **CLOSED 2026-07-28** — `__component/effect` + `__component/on-unmount`; `ownedLifecycleSlots` on `MountedComponent` |
+| 4 | Async resources | **CLOSED 2026-07-28** — `src/resource.ts` (`resource`, `resource/refresh!`, `resource/cancel!`), registered from `index.ts` |
+| 5 | Router upgrade | **CLOSED 2026-07-28** — `parseQuery`/`:query`, `:not-found`, `router/link` + `router/href`, `:mode :history`, `:scroll-to-top`/`:focus` in `src/router.ts`; `e2e/tests/router.spec.ts` |
+| 6 | Event modifiers + form helpers | **CLOSED 2026-07-28** — modifier parsing in `sip.ts`, `dom/event-form-data` + checkbox/radio/select helpers in `dom.ts` |
+| 7 | Diagnostics / dev mode | **CLOSED 2026-07-27** — `onerror` + `dev` on `SemaWebOptions`; `src/diagnostics.ts`, `src/devtools.ts` |
+| 8 | LLM proxy hardening | **CLOSED 2026-07-27** — `buildProxyHeaders`, `createStreamAccumulator`, `buildLlmProxySema`; `llm-hardening.test.ts` + `llm-proxy-sema.test.ts` |
+| 9 | Build / tooling DX | **DROPPED 2026-07-28** — packaging work, not a framework gap; no library dependency on it |
+| 10 | Testing utilities | **CLOSED 2026-07-28** — `renderSema`/`SemaScreen`/`leaks()` in `src/testing.ts`, published as the `./testing` subpath entry; `tests/testing.test.ts` + `tests/testing-entry.test.ts`; `resource-sema.test.ts` and `component-sema.test.ts` migrated onto it |
+
+Ordering guidance below is kept as written for the record. Only gap 9 is still
+actionable; the rest is history now that 1-8 and 10 have shipped and been
+hardened.
 
 Sema Web now has the core pieces of a small browser framework: DOM bindings,
 SIP rendering, reactive state, components, scoped CSS, a hash router, streaming
@@ -394,6 +428,32 @@ Acceptance:
 
 - Users can test a component in under 20 lines.
 - Cleanup assertions prove no listeners, handles, streams, or signals leak.
+
+**CLOSED 2026-07-28.** `packages/sema-web/src/testing.ts` exports `renderSema`,
+`semaWasmAvailable`, `resolveSemaWasmPath`, and `disposeAllScreens`. It boots the
+real WASM interpreter with the full binding set, so a component under test runs
+the same path `SemaWeb.create()` does; the screen scopes every DOM query to the
+mount container and covers events (`click`/`fill`/`select`/`check`/`submit`/
+`press`/`fire`/`focus`), Sema (`eval`/`run`/`output`), state
+(`signal`/`setSignal`), lifecycle (`mount`/`unmount`/`flush`/`dispose`), failures
+(`errors`/`errorContexts`/`diagnostics`), and cleanup (`leaks`/`snapshot`).
+
+`leaks()` reports only the registries that grew, against a baseline taken after
+the source was evaluated and before anything was mounted — so module-level app
+state does not read as a component leak, and `expect(screen.leaks()).toEqual({})`
+after `unmount()` is the whole assertion.
+
+Shipped as its own entry point (`@sema-lang/sema-web/testing`, second `tsup`
+config with `./index.js` external) rather than dependency-free, because the
+helper reads the WASM binary with `node:fs`. `tests/testing-entry.test.ts` reads
+`dist/` to prove the runtime entry imports no Node built-in, carries none of the
+testing API, and is not duplicated inside `dist/testing.js`.
+
+Dogfooded by migrating `tests/resource-sema.test.ts` (8 tests) and
+`tests/component-sema.test.ts` (30 tests) onto it with their assertions
+unchanged; the latter also dropped its dependency on the `target/release/sema`
+subprocess in favour of the WASM interpreter, which is where
+`COMPONENT_SEMA_PRELUDE` actually runs.
 
 ## Documentation Gaps
 
