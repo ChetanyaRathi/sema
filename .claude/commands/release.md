@@ -70,14 +70,15 @@ git tag vX.Y.Z
 git push origin main --tags
 ```
 
-The push triggers 4 CI workflows (CI, Release/binaries, Publish to crates.io,
-Publish to npm). Confirm they started:
+The push triggers 3 CI workflows (CI on the main push, Release/binaries, and
+Publish — one workflow, verify-gated, publishing crates.io and npm as parallel
+jobs; the MCPB Bundle chains off Release afterwards). Confirm they started:
 
 ```bash
 sleep 12 && gh run list --limit 4
 ```
 
-**If "Publish to crates.io" fails**, check whether it's a transient network error
+**If the Publish workflow's crates job fails**, check whether it's a transient network error
 (e.g. `curl failed` / `HTTP2 framing layer` / `download of config.json failed`)
 vs. a real problem. The publish script is **idempotent** (skips crates already on
 crates.io), so for a transient flake just re-run the failed job — it resumes from
