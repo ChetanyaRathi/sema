@@ -27,6 +27,14 @@
 use sema_core::Value;
 use sema_eval::Interpreter;
 
+/// A path as a string safe to embed in Sema source: forward slashes, because
+/// backslashes in a Windows path read as string escapes inside a Sema string
+/// literal (`\Users` starts a `\U` unicode escape), and every platform
+/// accepts `/` separators.
+fn sema_path(p: &std::path::Path) -> String {
+    p.to_string_lossy().replace('\\', "/")
+}
+
 /// A unique temp KV-store JSON path for one test, removed on drop — also on
 /// panic.
 struct TempKv(std::path::PathBuf);
@@ -41,7 +49,7 @@ impl TempKv {
         TempKv(path)
     }
     fn path(&self) -> String {
-        self.0.to_string_lossy().to_string()
+        sema_path(&self.0)
     }
 }
 
@@ -355,8 +363,8 @@ fn kv_cancelled_chain_settles_and_registry_stays_usable() {
               (kv/close "after")
               (list caught got))))
         "#,
-        a = p1.display(),
-        b = p2.display(),
+        a = sema_path(&p1),
+        b = sema_path(&p2),
     );
     let result = interp
         .eval_str_compiled(&program)
@@ -390,7 +398,7 @@ fn kv_cancelled_sibling_does_not_corrupt_shared_store() {
               (kv/close "contend")
               (length keys))))
         "#,
-        p = path.display(),
+        p = sema_path(&path),
     );
     let result = interp
         .eval_str_compiled(&program)

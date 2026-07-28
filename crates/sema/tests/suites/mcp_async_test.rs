@@ -34,6 +34,13 @@ fn sema_str(s: &str) -> String {
     encoded
 }
 
+/// Embed a filesystem path inside a quoted Sema string literal: `\` there
+/// starts an escape (`C:\Users…` begins a `\U` unicode escape), so Windows
+/// separators go in as `/` — std's fs API accepts either.
+fn sema_path(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
+}
+
 // ── Scenario 1: cross-connection overlap ────────────────────────────────────
 //
 // Server A withholds its `tools/call` response until it observes a marker
@@ -518,7 +525,7 @@ fn cassette_replay_stays_synchronous_inside_async_task() {
                    (fn ()
                      (async/spawn (fn () (mcp/call server "count" {{}}))))))
                (await pending-record)"#,
-            tape.display()
+            sema_path(&tape)
         ))
         .expect("deferred MCP record task should retain its cassette recorder");
     assert_eq!(r1.as_str(), Some("call-1"));
@@ -533,7 +540,7 @@ fn cassette_replay_stays_synchronous_inside_async_task() {
                    (fn ()
                      (async/spawn (fn () (mcp/call server "count" {{}}))))))
                (await pending)"#,
-            tape.display()
+            sema_path(&tape)
         ))
         .expect("deferred MCP replay task should retain its cassette scope");
     assert_eq!(

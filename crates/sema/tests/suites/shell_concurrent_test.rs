@@ -159,16 +159,26 @@ fn shell_sync_path_unchanged() {
 #[serial]
 fn shell_async_honors_env_option() {
     let interp = Interpreter::new();
-    let program = r#"
+    // The single-string form runs through the platform shell (`sh -c` /
+    // `cmd /C`), so the variable reference must use that shell's expansion
+    // syntax — `cmd` leaves `$VAR` literal.
+    let var_ref = if cfg!(windows) {
+        "%SEMA_ASYNC_FOO%"
+    } else {
+        "$SEMA_ASYNC_FOO"
+    };
+    let program = format!(
+        r#"
         (first
           (async/all
             (list
               (async/spawn
-                (fn () (:stdout (shell "echo $SEMA_ASYNC_FOO"
-                                       {:env {"SEMA_ASYNC_FOO" "async-bar"}})))))))
-    "#;
+                (fn () (:stdout (shell "echo {var_ref}"
+                                       {{:env {{"SEMA_ASYNC_FOO" "async-bar"}}}})))))))
+    "#
+    );
     let result = interp
-        .eval_str_compiled(program)
+        .eval_str_compiled(&program)
         .expect("async shell with :env evaluated");
     assert_eq!(
         result.as_str().map(str::trim),

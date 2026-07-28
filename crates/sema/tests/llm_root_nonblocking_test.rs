@@ -13,6 +13,13 @@ use sema_llm::types::LlmError;
 use serial_test::serial;
 use std::time::{Duration, Instant};
 
+/// Embed a filesystem path in generated Sema source. A Sema string literal
+/// treats `\` as an escape (`C:\Users…` begins a `\U` unicode escape), so
+/// Windows separators go in as `/` — std's fs API accepts either.
+fn sema_path(path: &std::path::Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
+}
+
 fn strings(value: &sema_core::Value) -> Vec<String> {
     value
         .as_list()
@@ -754,7 +761,7 @@ fn cache_and_cassette_do_no_filesystem_io_on_the_quantum() {
             (llm/with-cassette "{cass}" {{:mode :record}}
               (fn () (llm/complete "{prompt}-cass" {{:model "fake-chat"}})))
             "#,
-            cass = cassette.display()
+            cass = sema_path(&cassette)
         ))
         .expect("cache + cassette workload runs under the runtime");
 

@@ -81,6 +81,18 @@ fn builtin_doc_names_are_all_registered() {
     // redirect (`for.md` says "Sema has no `for` special form — use `for-each`
     // or `for-range`"). Only names whose entry documents ABSENCE belong here.
     const NEGATIVE_DOC_NAMES: &[&str] = &["for"];
+    // Registered under #[cfg(unix)] in sema-stdlib (termios raw mode and the
+    // CSI/DSR terminal queries have no Windows implementation) — documented,
+    // and real on the platforms that register them.
+    const UNIX_ONLY_BUILTINS: &[&str] = &[
+        "io/read-key",
+        "io/read-key-timeout",
+        "io/tty-raw!",
+        "io/tty-restore!",
+        "term/cursor-position",
+        "term/query-cursor-position",
+        "term/supports-kitty-keys?",
+    ];
     let mut phantom: Vec<String> = sema_docs::builtin_index()
         .entries
         .iter()
@@ -89,6 +101,7 @@ fn builtin_doc_names_are_all_registered() {
         .filter(|n| !SYNTAX_DOC_NAMES.contains(&n.as_str()))
         .filter(|n| !OUT_OF_TREE_BUILTINS.contains(&n.as_str()))
         .filter(|n| !NEGATIVE_DOC_NAMES.contains(&n.as_str()))
+        .filter(|n| !(cfg!(windows) && UNIX_ONLY_BUILTINS.contains(&n.as_str())))
         .collect();
     phantom.sort();
     assert!(
@@ -1070,21 +1083,36 @@ fn import_path_on_correct_line_multiline() {
 
 // ── resolve_import_path ──────────────────────────────────────
 
+// Fixture paths are per-platform: `Url::to_file_path` on Windows requires a
+// drive (`file:///project/...` fails there), and `/lib/utils.sema` only counts
+// as absolute on unix.
+#[cfg(unix)]
+const RESOLVE_FIXTURE: (&str, &str, &str) = (
+    "file:///project/src/main.sema",
+    "/project/src/utils.sema",
+    "/lib/utils.sema",
+);
+#[cfg(windows)]
+const RESOLVE_FIXTURE: (&str, &str, &str) = (
+    "file:///C:/project/src/main.sema",
+    "C:/project/src/utils.sema",
+    "C:/lib/utils.sema",
+);
+
 #[test]
 fn resolve_relative_path() {
-    let uri = Url::parse("file:///project/src/main.sema").unwrap();
+    let (uri, relative_resolved, _) = RESOLVE_FIXTURE;
+    let uri = Url::parse(uri).unwrap();
     let resolved = resolve_import_path(&uri, "utils.sema");
-    assert_eq!(
-        resolved,
-        Some(std::path::PathBuf::from("/project/src/utils.sema"))
-    );
+    assert_eq!(resolved, Some(std::path::PathBuf::from(relative_resolved)));
 }
 
 #[test]
 fn resolve_absolute_path() {
-    let uri = Url::parse("file:///project/src/main.sema").unwrap();
-    let resolved = resolve_import_path(&uri, "/lib/utils.sema");
-    assert_eq!(resolved, Some(std::path::PathBuf::from("/lib/utils.sema")));
+    let (uri, _, absolute) = RESOLVE_FIXTURE;
+    let uri = Url::parse(uri).unwrap();
+    let resolved = resolve_import_path(&uri, absolute);
+    assert_eq!(resolved, Some(std::path::PathBuf::from(absolute)));
 }
 
 // ── import_paths_from_ast ────────────────────────────────────

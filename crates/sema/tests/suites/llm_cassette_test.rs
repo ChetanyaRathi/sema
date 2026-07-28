@@ -20,6 +20,13 @@ fn tape_path(name: &str) -> std::path::PathBuf {
     ))
 }
 
+/// Embed a filesystem path in generated Sema source. A Sema string literal
+/// treats `\` as an escape (`C:\Users…` begins a `\U` unicode escape), so
+/// Windows separators go in as `/` — std's fs API accepts either.
+fn sema_path(path: &std::path::Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
+}
+
 /// Run `src` against a fresh interpreter with `fake` installed as the default provider.
 fn run(src: &str, fake: FakeProvider) -> Result<sema_core::Value, sema_core::SemaError> {
     let interp = Interpreter::new();
@@ -42,7 +49,7 @@ fn records_then_replays_without_calling_provider() {
         &format!(
             r#"(llm/with-cassette "{}" {{:mode :record}}
                  (fn () (llm/complete "the prompt" {{:model "m"}})))"#,
-            path.display()
+            sema_path(&path)
         ),
         rec,
     )
@@ -62,7 +69,7 @@ fn records_then_replays_without_calling_provider() {
         &format!(
             r#"(llm/with-cassette "{}" {{:mode :replay}}
                  (fn () (llm/complete "the prompt" {{:model "m"}})))"#,
-            path.display()
+            sema_path(&path)
         ),
         replay_fake,
     )
@@ -86,7 +93,7 @@ fn replay_reports_recorded_usage() {
         &format!(
             r#"(llm/with-cassette "{}" {{:mode :record}}
                  (fn () (llm/complete "p" {{:model "m"}})))"#,
-            path.display()
+            sema_path(&path)
         ),
         rec,
     )
@@ -104,7 +111,7 @@ fn replay_reports_recorded_usage() {
                  (fn ()
                    (llm/complete "p" {{:model "m"}})
                    [(:prompt-tokens (llm/last-usage)) (:completion-tokens (llm/last-usage))]))"#,
-            path.display()
+            sema_path(&path)
         ),
         replay_fake,
     )
@@ -142,7 +149,7 @@ fn replay_miss_is_a_hard_error() {
         &format!(
             r#"(llm/with-cassette "{}" {{:mode :replay}}
                  (fn () (llm/complete "never recorded" {{:model "m"}})))"#,
-            path.display()
+            sema_path(&path)
         ),
         fake,
     );
@@ -176,7 +183,7 @@ fn records_then_replays_a_streamed_completion() {
                  (lambda ()
                    (llm/stream "p" (lambda (c) (set! out (string-append out c))) {{:model "m"}})))
                out"#,
-            path.display()
+            sema_path(&path)
         ),
         rec,
     )
@@ -201,7 +208,7 @@ fn records_then_replays_a_streamed_completion() {
                  (lambda ()
                    (llm/stream "p" (lambda (c) (set! out (string-append out c))) {{:model "m"}})))
                out"#,
-            path.display()
+            sema_path(&path)
         ),
         replay_fake,
     )
@@ -231,7 +238,7 @@ fn records_then_replays_an_embedding() {
         &format!(
             r#"(llm/with-cassette "{}" {{:mode :record}}
                  (lambda () (llm/embed "some text" {{:model "m"}})))"#,
-            path.display()
+            sema_path(&path)
         ),
         rec,
     )
@@ -244,7 +251,7 @@ fn records_then_replays_an_embedding() {
         &format!(
             r#"(llm/with-cassette "{}" {{:mode :replay}}
                  (lambda () (llm/embed "some text" {{:model "m"}})))"#,
-            path.display()
+            sema_path(&path)
         ),
         replay_fake,
     )
@@ -271,7 +278,7 @@ fn tape_never_stores_the_prompt_text() {
         &format!(
             r#"(llm/with-cassette "{}" {{:mode :record}}
                  (fn () (llm/complete "{}" {{:model "m"}})))"#,
-            path.display(),
+            sema_path(&path),
             secret_prompt
         ),
         rec,

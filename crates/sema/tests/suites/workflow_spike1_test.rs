@@ -23,13 +23,30 @@ fn fixture(name: &str) -> PathBuf {
         .join(name)
 }
 
+/// Fixture bytes with line endings normalized to LF. A git `eol=native`
+/// checkout hands this test CRLF bytes on Windows, but the journal contract is
+/// LF-only and the run's `code_version` (folded into every `content_key`)
+/// hashes the workflow source bytes — the oracle must see the same bytes on
+/// every platform.
+fn fixture_lf(name: &str) -> Vec<u8> {
+    let bytes = std::fs::read(fixture(name)).expect("read fixture");
+    String::from_utf8(bytes)
+        .expect("fixture is UTF-8")
+        .replace("\r\n", "\n")
+        .into_bytes()
+}
+
 /// Run `sema workflow run` against the fixture into a fresh temp base dir and
 /// return the bytes of the produced `events.jsonl`.
 fn run_workflow_into(base_dir: &std::path::Path) -> Vec<u8> {
+    // Run an LF-normalized copy so the source-hash content keys in the journal
+    // match the committed golden regardless of checkout eol translation.
+    let workflow = base_dir.join("hello-wf.sema");
+    std::fs::write(&workflow, fixture_lf("hello-wf.sema")).expect("write workflow copy");
     let status = Command::new(env!("CARGO_BIN_EXE_sema"))
         .arg("workflow")
         .arg("run")
-        .arg(fixture("hello-wf.sema"))
+        .arg(&workflow)
         .arg("--args")
         .arg(r#"{"name":"x"}"#)
         .arg("--run-dir")
@@ -48,7 +65,7 @@ fn run_workflow_into(base_dir: &std::path::Path) -> Vec<u8> {
 
 #[test]
 fn spike1_golden_journal_byte_identical() {
-    let golden = std::fs::read(fixture("hello-wf.events.jsonl")).expect("read golden");
+    let golden = fixture_lf("hello-wf.events.jsonl");
 
     // --- run once: must byte-match the committed golden ---
     let tmp1 = tempdir();

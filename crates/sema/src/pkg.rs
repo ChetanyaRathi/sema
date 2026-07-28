@@ -2895,7 +2895,15 @@ name = "myproject"
 
     #[test]
     fn extract_tarball_rejects_absolute_paths() {
-        let malicious = make_malicious_tarball("/tmp/pwned.txt", b"pwned!");
+        // The entry must be absolute in the HOST's spelling: `is_absolute()` is
+        // what extract_tarball checks, and on Windows a drive-less rooted path
+        // like "/tmp/pwned.txt" does not qualify.
+        let abs_entry = if cfg!(windows) {
+            "C:/tmp/pwned.txt"
+        } else {
+            "/tmp/pwned.txt"
+        };
+        let malicious = make_malicious_tarball(abs_entry, b"pwned!");
 
         let dir = tmpdir("abs-path");
         let dest = dir.join("extracted");

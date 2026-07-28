@@ -4467,7 +4467,12 @@ mod tests {
     #[test]
     fn build_output_default_name_adds_exe_for_windows_targets() {
         let src = std::path::Path::new("examples/game-of-life.sema");
-        assert_eq!(default_output_name(src, None), "game-of-life");
+        // No --target builds for the host, so the default name carries the
+        // HOST's exe suffix (".exe" on a Windows host, "" elsewhere).
+        assert_eq!(
+            default_output_name(src, None),
+            format!("game-of-life{}", std::env::consts::EXE_SUFFIX)
+        );
         assert_eq!(
             default_output_name(src, Some("windows")),
             "game-of-life.exe"
@@ -4485,7 +4490,10 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let src = std::path::Path::new("hello.sema");
         let out = resolve_output_path(Some(dir.to_str().unwrap()), src, None);
-        assert_eq!(out, dir.join("hello"));
+        assert_eq!(
+            out,
+            dir.join(format!("hello{}", std::env::consts::EXE_SUFFIX))
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -4493,7 +4501,10 @@ mod tests {
     fn build_output_trailing_slash_means_directory_even_if_missing() {
         let src = std::path::Path::new("hello.sema");
         let out = resolve_output_path(Some("no/such/dir/"), src, None);
-        assert_eq!(out, std::path::Path::new("no/such/dir/hello"));
+        assert_eq!(
+            out,
+            std::path::PathBuf::from(format!("no/such/dir/hello{}", std::env::consts::EXE_SUFFIX))
+        );
     }
 
     #[test]
