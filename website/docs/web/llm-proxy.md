@@ -290,3 +290,81 @@ data: {"type":"done"}
 If a stream fails after it has started, the proxy emits `data: {"type":"error","error":"..."}` before closing the stream.
 
 The `llm/chat-stream` function in Sema Web handles this protocol automatically. You only need to parse it yourself when building a custom client.
+
+### What the client tolerates
+
+The browser client is deliberately lenient about frames it did not expect, because proxies evolve and a passthrough proxy is not fully under your control:
+
+| Frame | Handling |
+|-------|----------|
+| `{"type":"token","text":"..."}` | appended to `:text` |
+| `{"type":"done"}` | marks `:done` |
+| `[DONE]` | also marks `:done` — the OpenAI sentinel, emitted by proxies that pass a provider stream straight through |
+| `{"type":"error","error":"..."}` | sets `:error` and `:done` |
+| any other `type` | **ignored** — a proxy that starts sending usage or model-echo frames does not break existing apps |
+| unparseable data | sets `:error` to `"Invalid stream payload"` and ends the stream |
+
+**Terminal states latch.** Once a stream reports `:done` or `:error`, later frames are ignored. A trailing token after an error cannot clear the error your UI just displayed.
+
+## Client Error Handling
+
+Streaming and non-streaming calls report failures differently, because they have to — one returns a value, the other feeds a signal — but both are predictable.
+
+### Non-streaming (`llm/chat`, `llm/complete`, `llm/embed`, …)
+
+An HTTP error **raises**, so `try`/`catch` works normally:
+
+```sema
+(try
+  (llm/chat (list (message :user "Hi")))
+  (catch e
+    (println "LLM call failed: " (:message e))))
+;; => "LLM call failed: llm proxy chat failed: HTTP 401 - {\"error\":\"AUTH_FAILED\"}"
+```
+
+The message names the endpoint, the status, and the response body. A 200 whose body is not JSON — a gateway HTML error page, typically — raises `llm proxy <endpoint> returned a body that is not valid JSON` rather than leaking a decoder error.
+
+### Streaming (`llm/chat-stream`)
+
+Errors arrive through the signal's `:error` field, never as a raised exception:
+
+```sema
+(def s (llm/chat-stream (list (message :user "Hi"))))
+
+;; in a component
+(let ((state (deref s)))
+  (cond
+    (:error state) [:p {:class "error"} (:error state)]
+    (:done state)  [:p (:text state)]
+    :else          [:p (:text state) [:span.cursor]]))
+```
+
+The signal value is always the full `{:text :done :error}` shape — `:text` is `""` before the first token, never nil.
+
+## Messages
+
+`(message :user "Hi")` is a **core special form**, not a function, and it produces a `:message` value rather than a plain map. The proxy client converts those to `{"role": ..., "content": ...}` before encoding, so all three forms below are equivalent on the wire:
+
+```sema
+(llm/chat (list (message :user "Hi")))
+(llm/chat (list {:role "user" :content "Hi"}))
+(llm/chat (list (message :user "Hi") {:role "assistant" :content "Sure"}))  ;; mixed is fine
+```
+
+## Authentication Headers
+
+When you configure both a `token` and a custom `Authorization` header, **the token wins** and a warning is logged:
+
+```js
+await SemaWeb.create({
+  llmProxy: {
+    url: "/api/llm",
+    token: "session-abc",
+    headers: { Authorization: "Basic xyz" },  // ignored; token wins
+  },
+});
+```
+
+With no `token` configured, a custom `Authorization` header passes through untouched — proxies using a non-Bearer scheme work normally. `Content-Type` defaults to `application/json` and *is* overridable.
+
+The same header set is used for both streaming and non-streaming requests.

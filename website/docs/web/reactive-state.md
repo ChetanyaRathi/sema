@@ -140,6 +140,37 @@ Common uses for `watch`:
 Do not use `watch` to update other signals that drive rendering -- use `computed` instead. Watches are for effects outside the reactive graph (network, storage, logging).
 :::
 
+#### Inside a component body
+
+`watch` and `computed` belong at the top level of a module, in `on-mount`, or in
+an `effect` body -- somewhere that runs once. Calling either from a component's
+**render body** runs it again on every render, and neither has a name to memoize
+on the way `local` and `resource` do.
+
+That is handled rather than left to accumulate, but the handling differs, and
+the difference is worth knowing:
+
+- **`watch` is memoized per render site.** One subscription is kept and each
+  render swaps in its callback, so a watch registered from a render body fires
+  once per change -- not once per render that ever ran. Registering one is
+  reported through [`onerror`](./diagnostics) once per component, because a
+  reader who does not know it is memoized will read the single live registration
+  as a bug.
+- **`computed` is rebuilt.** The previous render's derivation is disposed and a
+  new one takes its place, so the value always reflects the render that read it.
+  Memoizing instead would keep serving whatever the *first* closure produced
+  until a tracked dependency happened to change -- stale data in place of a leak.
+
+A render that stops registering a watch disposes it, and unmounting disposes
+everything either of them created.
+
+```sema
+;; Fine: created once, disposed with the component.
+(defcomponent view ()
+  (on-mount (fn () (watch other on-other-change)))
+  [:p @count])
+```
+
 ### `(unwatch! watch-id)` -- Stop Watching
 
 Disposes a watch created by `watch`.

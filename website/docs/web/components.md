@@ -102,6 +102,121 @@ Key points:
 - The cleanup function runs when `component/unmount!` is called on the selector
 - Call `on-mount` only once per component -- the last call wins
 
+### `(effect deps fn)` -- Run Work After Render
+
+Runs `fn` after the component's DOM has been patched, and again whenever `deps`
+change. `fn` may return a cleanup -- a function value or a global's name -- which
+runs before the next re-run and once when the component is destroyed.
+
+```sema
+(defcomponent clock ()
+  (let ((now (local "now" 0)))
+    (effect (list)
+      (fn ()
+        (let ((id (js/set-interval (fn () (put! now (+ @now 1))) 1000)))
+          (fn () (js/clear-interval id)))))
+
+    [:time (number->string @now)]))
+```
+
+`deps` controls when the body re-runs:
+
+| `deps`        | Behaviour                                        |
+| ------------- | ------------------------------------------------ |
+| `(list)`      | Runs once, cleans up at unmount                  |
+| `(list a b)`  | Re-runs whenever `a` or `b` changes              |
+| `nil`         | Re-runs after every render                       |
+
+Dependencies are compared **structurally**, so a map or list dep counts as
+changed only when its contents differ -- not merely because the render built a
+new one.
+
+Anything an effect body creates -- intervals, watches, streams, state -- is owned
+by the component and disposed with it. That is a **teardown** guarantee, not a
+re-run guarantee: an effect whose deps change runs its body again, and the
+second run's interval or watch is added to the first one's. So a body that
+creates something and can re-run must return a cleanup that undoes it:
+
+```sema
+;; Without the cleanup, changing @topic leaves the old subscription live and
+;; the callback fires once per past run.
+(effect (list @topic)
+  (fn ()
+    (let ((id (js/set-interval poll 1000)))
+      (fn () (js/clear-interval id)))))
+```
+
+An effect with `(list)` deps runs once, so for that shape the cleanup is only
+about teardown.
+
+## Composed children and `:key`
+
+A child rendered with `component/render` gets its own scope: its `effect`,
+`on-unmount`, `local`, and `resource` registrations belong to the child
+instance, not to the component that mounted it.
+
+Repeated children need a `:key` **in their props** to be told apart:
+
+```sema
+(defcomponent row (props)
+  (def draft (local "draft" ""))
+  (effect (list (:id props)) (fn () (subscribe (:id props))))
+  [:li {:key (:id props)} @draft])
+
+(defcomponent page ()
+  [:ul (map (fn (r) (component/render row (assoc r :key (:id r)))) @rows)])
+```
+
+Note the key appears twice, and both matter: `{:key ...}` on the `[:li]` gives
+the **DOM** stable identity, and `:key` in the props map gives the child's
+**state** the same identity. The SIP attribute is invisible to the component
+system, so a keyed list without the prop falls back to sibling ordinals — and
+removing a middle row then shifts every row after it onto its neighbour's
+state, exactly as an unkeyed list does in any framework.
+
+A child that appears once, or a conditional branch between two different
+children, needs no key.
+
+::: warning Register effects unconditionally
+Effects are matched across renders by **call order**, not by name (unlike
+`local`). Put `effect` and `on-unmount` at the top level of the component body,
+never inside an `if` or a `map` callback -- a render that registers a different
+number of effects re-keys the ones that follow.
+:::
+
+
+
+Effects flush at the end of each render, so a first-render effect body runs
+*before* the `on-mount` callback.
+
+### `(on-unmount fn)` -- Teardown Hook
+
+Runs `fn` once when the component is destroyed, whether by
+`(component/unmount! selector)`, by mounting something else over the same
+selector, or by disposing the whole runtime.
+
+```sema
+(defcomponent session-view ()
+  (on-unmount (fn () (console/log "session view went away")))
+  [:p "active"])
+```
+
+Hooks run in reverse registration order, so the last one registered tears down
+first. Like `effect`, `on-unmount` is matched by call order -- register it
+unconditionally.
+
+A hook runs at teardown and nowhere else. If a later render changes the slot
+sequence -- it registers an extra effect above the hook, or stops registering
+the hook at all -- the runtime reports it through the `onerror` handler as
+`lifecycle:<component>#<slot>` rather than
+running the hook while the component is still on screen. A hook a render
+stopped registering never runs, which is why the rule is "register
+unconditionally" rather than "prefer to register unconditionally".
+
+Errors thrown by an effect body, an effect cleanup, or an `on-unmount` hook are
+reported through the runtime's `onerror` handler and never abort teardown; the
+remaining cleanups still run.
+
 ### `(component/unmount! selector)` -- Unmount
 
 Removes a mounted component, runs its cleanup function (if any), clears the mount target, and stops reactive tracking.
@@ -117,6 +232,12 @@ Triggers a re-render even if no signal dependencies changed. Rarely needed, but 
 ```sema
 (component/force-render! "#app")
 ```
+
+Call it from an event handler or from ordinary code -- never from a render body
+or an effect body of the component it names. That component is already
+rendering, so the request is refused and reported as
+`force-render:<component>`; a component re-renders on its own when the state it
+reads changes.
 
 ## Event Handling
 
@@ -146,17 +267,46 @@ The event handler receives a handle to the DOM event. You can extract data from 
 
 ### Supported Events
 
-All standard DOM events are supported via delegation:
+Delegation works by listening on the mount root, so the events it can route are
+the ones that bubble to it. These are the whole set:
 
 | Category | Events |
 | --- | --- |
-| Mouse | `on-click`, `on-dblclick`, `on-contextmenu`, `on-mouseenter`, `on-mouseleave` |
-| Pointer | `on-pointerdown`, `on-pointerup`, `on-pointermove` |
+| Mouse | `on-click`, `on-dblclick`, `on-auxclick`, `on-contextmenu`, `on-mousedown`, `on-mouseup`, `on-mousemove`, `on-mouseover`, `on-mouseout`, `on-wheel`, `on-mouseenter`, `on-mouseleave` |
+| Pointer | `on-pointerdown`, `on-pointerup`, `on-pointermove`, `on-pointerover`, `on-pointerout`, `on-pointercancel` |
+| Touch | `on-touchstart`, `on-touchend`, `on-touchmove`, `on-touchcancel` |
 | Keyboard | `on-keydown`, `on-keyup`, `on-keypress` |
-| Form | `on-input`, `on-change`, `on-submit` |
+| Form | `on-input`, `on-change`, `on-submit`, `on-reset`, `on-select` |
 | Focus | `on-focusin`, `on-focusout` |
+| Clipboard | `on-copy`, `on-cut`, `on-paste` |
+| Drag & drop | `on-drag`, `on-dragstart`, `on-dragend`, `on-dragenter`, `on-dragleave`, `on-dragover`, `on-drop` |
+| Animation | `on-animationstart`, `on-animationend`, `on-transitionend` |
 
 Event handler values are **always strings** -- the name of a defined Sema function.
+
+Anything else is refused rather than rendered dead. A misspelled name
+(`{:on-sumbit.prevent "save"}`) reports through `onerror` under
+`sip-render:on-handler` with the correction named, and installs no handler --
+because a `.prevent` that silently never runs lets the form navigate away, which
+is the entire symptom a typo would otherwise have.
+
+`focus` and `blur` do not bubble; use `on-focusin` / `on-focusout`, which do.
+For a custom element's event or another non-bubbling one (`scroll`), attach the
+listener yourself from an `on-mount` callback:
+
+```sema
+(defcomponent picker ()
+  (on-mount (fn ()
+    (let ((el (dom/query "#picker")))
+      (dom/on! el "picker-change" "handle-pick")
+      (fn () (dom/off! el "picker-change" "handle-pick")))))
+  [:my-picker {:id "picker"}])
+```
+
+`mouseenter` and `mouseleave` are synthesized from `mouseover`/`mouseout`. Every
+element the pointer actually entered runs its handler, outermost first, and
+every element it left runs its handler innermost first -- so a hover counter
+kept by a nested pair of handlers stays balanced.
 
 ## Re-rendering and Diffing
 
@@ -168,7 +318,9 @@ Components re-render via `@preact/signals-core`'s `effect()`. When a signal depe
 
 ### Focus Preservation
 
-morphdom is configured to preserve focus state. If the user is typing in an input field and a re-render occurs, the input retains focus and cursor position. Attributes (like `class`) are still updated, but the `value` property is left alone for the active element.
+morphdom is configured to preserve focus state. If the user is typing in an input field and a re-render occurs, the input retains focus and cursor position.
+
+Everything else about the element is still patched: attributes the new render declares are applied, attributes it **no longer** declares are removed (including a dropped `on-*`, whose handler stops firing with it), and a focused `<select>` still gains and loses `<option>`s -- a dependent dropdown must update for the user who has it focused. What is left alone is the live state the user owns: the `value` and `checked` properties, the caret, and which options are selected.
 
 ### What Triggers a Re-render
 

@@ -204,6 +204,74 @@ Read `event.target.value` from an event handle. Useful in input event handlers:
   (println "Input:" val))
 ```
 
+### `(dom/event-checked event-handle)` -> boolean | nil
+
+Read `event.target.checked`. `nil` when the target has no checked state.
+
+```sema
+(define (on-toggle ev)
+  (put! enabled (dom/event-checked ev)))
+```
+
+### `(dom/checked? handle)` -> boolean
+
+Read the `checked` state of an element handle. `#f` for anything that has none.
+
+### `(dom/selected-values handle)` -> list
+
+Values of every selected `<option>` in a `<select>`. A single select yields a
+one-element list, a multi-select with nothing selected yields `()`, and
+anything that is not a select yields `()`.
+
+```sema
+(def sizes (dom/selected-values select-el))
+```
+
+### `(dom/event-selected-values event-handle)` -> list | nil
+
+The same, read from the event's target. `nil` for a non-element target.
+
+## Forms
+
+### `(dom/event-form-data event-handle)` -> map | nil
+
+Every submittable field of the form the event came from, keyed by field name.
+`nil` when the event target owns no form.
+
+```sema
+(define (save ev)
+  (def fields (dom/event-form-data ev))
+  (println (:title fields)))
+
+[:form {:on-submit.prevent "save"}
+  [:input {:name "title"}]
+  [:input {:name "tag"}]
+  [:input {:name "tag"}]
+  [:button {:type "submit"} "Save"]]
+```
+
+Value shapes:
+
+- a field name that appears **once** is a plain string;
+- a field name that **repeats** is a list, in document order -- the `:tag`
+  inputs above read as `("a" "b")`;
+- a file input is a map, `{:name "a.txt" :size 3 :type "text/plain"}`;
+- unchecked checkboxes, disabled controls, and unnamed controls are absent,
+  exactly as in a real form submission;
+- the submitting button's own `name`/`value` is included when there is one.
+
+Field names become keywords, so `(:title fields)` works. A name that is not a
+valid keyword needs `(get fields (string->keyword "user[name]"))`.
+
+### `(dom/form-data handle)` -> map | nil
+
+The same map, from an element handle. Accepts the `<form>` itself or any
+element inside it (or associated with it via `form="<id>"`).
+
+### `(dom/event-form event-handle)` -> handle | nil
+
+The `<form>` the event's target belongs to.
+
 ## Events
 
 ### `(dom/on! handle event callback)` -> nil
@@ -235,6 +303,19 @@ Remove a previously registered event listener.
 (dom/off! btn "click" handle-click)
 ;; or:
 (dom/off! btn "click" "handle-click")
+```
+
+### `(dom/event-current-target event-handle)` -> handle | nil
+
+The element that declared the handler. For a delegated SIP handler this is the
+element carrying the `:on-*` attribute, **not** the mount root that
+`event.currentTarget` would report. For a `dom/on!` listener it is the element
+the listener was attached to.
+
+```sema
+(define (on-row-click ev)
+  (def row (dom/event-current-target ev))
+  (println (dom/get-attribute row "data-row-id")))
 ```
 
 ### `(dom/prevent-default! event-handle)` -> nil
