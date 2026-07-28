@@ -266,13 +266,72 @@ The last line is the footgun: `and` in head position is the special form, not th
 
 ---
 
-### 37. `http/serve`'s dispatch loop is single-consumer (updated 2026-07-12)
+### 37. `http/serve` back-pressures on a full WebSocket send queue (updated 2026-07-27)
 
-`crates/sema-stdlib/src/server.rs`'s dispatch loop pulls one `ServerRequest` off a shared channel at a time and runs the Sema handler to completion — including a WebSocket handler idling in `(:recv conn)` (`ws/recv`) — before looping back for the next connection's request. axum itself is fully concurrent (every connection gets its own task and queues on the bounded channel), but the single evaluator thread draining that queue serially is the actual concurrency ceiling: a WS client that goes quiet stalls every *other* HTTP/WS request on the same server until that client sends something or disconnects.
+`http/serve` is concurrent: `crates/sema-stdlib/src/server.rs`'s accept loop parks on a re-arming cooperative wait and spawns a task per connection, so a slow, sleeping, or streaming handler no longer stalls its siblings. A WebSocket handler idling in `(:recv conn)` (`ws/recv`) parks cooperatively too, and `http/serve` composes inside `async/spawn`. The former single-consumer dispatch loop and the fail-fast guard that rejected `http/serve` inside `async/spawn` are both gone (SRV-1, resolved — see [`deferred-resolved.md`](plans/archive/deferred-resolved.md)).
 
-**Fix (not done):** a yield-aware dispatch loop with a handler task per connection, so an idle handler parks instead of holding the loop. Real design work, tracked as SRV-1 in `docs/deferred.md`.
+**What remains:** `ws/send` and `ws/close` are still synchronous. `ws/send` can block the VM thread, but only when that connection's 256-slot outgoing queue is already full — i.e. a client that stopped reading while the handler keeps writing. A handler that pushes unbounded data at a stalled client will stall its siblings; one that sends in response to received messages will not.
 
-**Separately guarded:** calling `http/serve` from inside `async/spawn` used to freeze the whole cooperative scheduler forever (that thread IS the VM thread every task runs on) with no error at all. It now fails fast with an explained error instead — `http/serve` still must be started from the top level; see SRV-1.
+**Also unconverted:** an SSE stream handler is still invoked via `call_callback`, which suspends `in_runtime_quantum()` for the call's duration. A cooperative op inside an SSE handler body silently falls back to its blocking path rather than parking. Sending from SSE handlers works normally; suspending inside one does not.
+
+---
+
+### ~~38. Host-invoked Sema calls trap the WASM VM~~ → RESOLVED (2026-07-28)
+
+**Root cause: a `Vec::pop()` passed as an argument to `debug_assert_eq!`.**
+`RestrictedOwner::pop` in `crates/sema-vm/src/restricted.rs` maintained a
+`vm_frame_indices` side-index of which frames hold a parked VM, and removed the
+index like this:
+
+```rust
+debug_assert_eq!(self.vm_frame_indices.pop(), Some(self.frames.len()));
+```
+
+`debug_assert_eq!` compiles to nothing in release, taking the `pop()` with it. So
+in every release build — which is what `wasm-pack --release` produces, and
+therefore what every browser user runs — popping a VM frame left its index
+behind. The next `call_env()` / `parked_parent_vm_mut()` resolved that stale
+index onto a frame that had since become a `Continuation` and hit the
+`unreachable!` guard, surfacing in JS as `RuntimeError: unreachable`.
+
+The restricted driver is reached only from `call_from_host` in
+`crates/sema-wasm/src/lib.rs`, and only when a host callback re-enters while a
+runtime quantum is active. That is precisely why the trap looked so arbitrary:
+
+| Call site | Re-entrant? | Behaviour |
+| --- | --- | --- |
+| top-level `evalStr` | no | worked (took `sema_eval::call_value`) |
+| delegated event handler | no | worked |
+| mounted component render | yes | trapped |
+| `on-mount`, `watch`, `effect` body | yes | trapped |
+
+And why it never reproduced natively: the native binary does not use the
+restricted driver at all, and `cargo test` builds with `debug_assertions` on, so
+the pop was present in every configuration the Rust suite exercises.
+
+**Everything previously recorded under this section is fixed by the one-line
+change** — verified by A/B against the pre-fix and post-fix `.wasm`, in a
+mounted render each time:
+
+| Construct | pre-fix | post-fix |
+| --- | --- | --- |
+| `(apply f args)` | `unreachable` | works |
+| `update!` (which is `apply` underneath) | `unreachable` | works |
+| `try`/`catch` that catches | `unreachable` | works |
+| `try` inside a `map` callback | `unreachable` | works |
+| `(map? x)` inside a `map` callback | `unreachable` | works |
+| host-registered call inside a HOF callback | `unreachable` | works |
+
+Guarded by `restricted_owner_pops_its_vm_index_in_release_builds_too`
+(`restricted.rs`), which asserts on the source rather than on behaviour: a
+behavioural test compiled in debug cannot observe the difference at all, so it
+would pass against both the fixed and the broken tree.
+
+**Consumers of this section should be revisited.** `component/render` in
+`packages/sema-web/src/component.ts` deliberately dropped per-child error
+isolation to route around the trap, and
+`packages/sema-web/e2e/fixtures/scripts/composition.sema` avoids `try` for the
+same reason. Both restrictions are now unnecessary.
 
 ---
 
