@@ -82,7 +82,7 @@ source_files() {
   for root in "$@"; do
     if [[ -f "$root" ]]; then
       case "$root" in
-        *.rs|*.js|*.ts) printf '%s\n' "$root" ;;
+        *.rs | *.js | *.ts) printf '%s\n' "$root" ;;
       esac
     elif [[ -d "$root" ]]; then
       rg --files -g '*.rs' -g '*.js' -g '*.ts' \
@@ -109,8 +109,8 @@ scan_legacy_symbols() {
     -g '!crates/sema/src/web/assets/**' \
     -g '!playground/src/examples.js' \
     "$legacy_pattern" \
-    "$@" \
-    | LC_ALL=C sort -u
+    "$@" |
+    LC_ALL=C sort -u
 }
 
 require_nonempty_scan() {
@@ -132,14 +132,14 @@ scan_purged_paths() {
   while IFS= read -r f; do
     [[ -z "$f" ]] && continue
     local matched
-    matched=$(sed -E 's://.*$::; s:;;.*$::' "$f" \
-      | rg -n --no-heading --color never "$purged_pattern" || true)
+    matched=$(sed -E 's://.*$::; s:;;.*$::' "$f" |
+      rg -n --no-heading --color never "$purged_pattern" || true)
     if [[ -n "$matched" ]]; then
       while IFS= read -r line; do
         hits+="$f:$line"$'\n'
-      done <<< "$matched"
+      done <<<"$matched"
     fi
-  done <<< "$files"
+  done <<<"$files"
   # Apply the exact-file allowlist.
   local filtered=""
   while IFS= read -r hit; do
@@ -148,11 +148,14 @@ scan_purged_paths() {
     for entry in ${purged_allowlist[@]+"${purged_allowlist[@]}"}; do
       local suffix="${entry%%|*}"
       case "$hit" in
-        *"$suffix"*) allowed=1; break ;;
+        *"$suffix"*)
+          allowed=1
+          break
+          ;;
       esac
     done
     [[ "$allowed" -eq 0 ]] && filtered+="$hit"$'\n'
-  done <<< "$hits"
+  done <<<"$hits"
   printf '%s' "$filtered"
 }
 
@@ -170,14 +173,14 @@ scan_restricted_paths() {
     for entry in "${restricted_tokens[@]}"; do
       token="${entry%%|*}"
       pattern="${entry#*|}"
-      matched=$(sed -E 's://.*$::; s:;;.*$::' "$file" \
-        | rg -n --no-heading --color never "$pattern" || true)
+      matched=$(sed -E 's://.*$::; s:;;.*$::' "$file" |
+        rg -n --no-heading --color never "$pattern" || true)
       while IFS= read -r line; do
         [[ -z "$line" ]] && continue
         printf '%s\t%s\t%s\n' "$token" "$rel" "$line"
-      done <<< "$matched"
+      done <<<"$matched"
     done
-  done <<< "$files"
+  done <<<"$files"
 }
 
 scan_active_runtime_callbacks_paths() {
@@ -269,8 +272,8 @@ scan_active_runtime_callbacks_paths() {
     while IFS=$'\t' read -r token line; do
       [[ -z "$token" ]] && continue
       printf '%s\t%s\t%s\n' "$token" "$rel" "$line"
-    done <<< "$matched"
-  done <<< "$files"
+    done <<<"$matched"
+  done <<<"$files"
 }
 
 check_restricted_paths() {
@@ -369,13 +372,13 @@ scan_workflow_journal_file() {
   while IFS=: read -r ln _; do
     [[ -z "$ln" ]] && continue
     printf 'WORKFLOW_CREATE_DIR_ALL\t%s:%s\n' "$rel" "$ln"
-  done <<< "$matched"
-  matched=$(printf '%s\n' "$prod" \
-    | rg -n --no-heading --color never 'resume-.*\.exists[[:space:]]*\(' || true)
+  done <<<"$matched"
+  matched=$(printf '%s\n' "$prod" |
+    rg -n --no-heading --color never 'resume-.*\.exists[[:space:]]*\(' || true)
   while IFS=: read -r ln _; do
     [[ -z "$ln" ]] && continue
     printf 'WORKFLOW_SEGMENT_EXISTS_PROBE\t%s:%s\n' "$rel" "$ln"
-  done <<< "$matched"
+  done <<<"$matched"
 }
 
 check_workflow_journal_file() {
@@ -449,12 +452,12 @@ scan_workflow_writer_file() {
   while IFS=: read -r ln _; do
     [[ -z "$ln" ]] && continue
     printf 'WORKFLOW_WRITE_ALL\t%s\n' "$ln"
-  done <<< "$matched"
+  done <<<"$matched"
   matched=$(printf '%s\n' "$prod" | rg -n --no-heading --color never '\bfs::write\b' || true)
   while IFS=: read -r ln _; do
     [[ -z "$ln" ]] && continue
     printf 'WORKFLOW_FS_WRITE\t%s\n' "$ln"
-  done <<< "$matched"
+  done <<<"$matched"
 }
 
 # Emit "TOKEN<TAB>REL<TAB>LINE" across every production .rs in the sema-workflow crate.
@@ -594,12 +597,12 @@ scan_otel_writer_file() {
   while IFS=: read -r ln _; do
     [[ -z "$ln" ]] && continue
     printf 'SEMA_OTEL_WRITE_ALL\t%s\n' "$ln"
-  done <<< "$matched"
+  done <<<"$matched"
   matched=$(printf '%s\n' "$prod" | rg -n --no-heading --color never '\bfs::write\b' || true)
   while IFS=: read -r ln _; do
     [[ -z "$ln" ]] && continue
     printf 'SEMA_OTEL_FS_WRITE\t%s\n' "$ln"
-  done <<< "$matched"
+  done <<<"$matched"
 }
 
 # Emit "TOKEN<TAB>REL<TAB>LINE" across every production .rs in the sema-otel crate.
@@ -742,7 +745,7 @@ scan_spinner_park_file() {
   while IFS=: read -r ln _; do
     [[ -z "$ln" ]] && continue
     printf 'SPINNER_FRAME_SLEEP\t%s\n' "$ln"
-  done <<< "$matched"
+  done <<<"$matched"
 }
 
 # Pin terminal.rs to the allowlisted thread::sleep count (zero); a reintroduced bare
@@ -879,7 +882,7 @@ case "${1:-}" in
     fi
     check_otel_writer_file "$2" "$3"
     ;;
-  ""|--check)
+  "" | --check)
     if ! check_source_policy_paths "$host_adapter_allowlist" crates/*/src playground/src; then
       echo "unified-runtime source policy failed" >&2
       exit 1
