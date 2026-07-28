@@ -212,6 +212,12 @@ impl LanguageServer for Backend {
 
         Ok(InitializeResult {
             capabilities: ServerCapabilities {
+                // Positions on the wire count UTF-16 code units (the LSP
+                // default, and what helpers.rs's utf16_to_byte_offset /
+                // byte_offset_to_utf16 implement). UTF-16 is the one encoding
+                // every client must support, so declaring it needs no
+                // inspection of the client's `general.positionEncodings`.
+                position_encoding: Some(PositionEncodingKind::UTF16),
                 text_document_sync: Some(TextDocumentSyncCapability::Kind(
                     TextDocumentSyncKind::FULL,
                 )),

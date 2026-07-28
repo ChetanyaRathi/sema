@@ -24,6 +24,24 @@
   persistence leg of #87). Tool-protocol traffic is deliberately not recorded;
   a thread re-seeds as an always-valid plain transcript.
 
+### Runtime and LSP fixes
+
+- **A Rust-side spawn with a custom continuation is no longer silently
+  dropped.** `RuntimeRequest::Spawn`'s parked-VM fast path inlined
+  `async/spawn`'s trivial promise-handle mapping for EVERY caller, discarding
+  any custom continuation without invoking it — the trap that once broke
+  `http/serve`'s accept-loop re-arm. The fast path is now gated on the
+  continuation declaring itself trivial
+  (`NativeContinuation::is_trivial_spawn_handle`); anything else routes
+  through the general pending-stage path and actually runs. First
+  deterministic regression test included; `async/spawn`'s hot path is
+  unchanged.
+- **The LSP declares `positionEncoding: utf-16`** in its capabilities, with a
+  wire-level regression test proving request and response positions count
+  UTF-16 code units across astral-plane characters. The Python LSP e2e suite
+  (56 tests) now runs in CI on every push instead of only via a local
+  `jake test.lsp`.
+
 ### Phantom docs purged, and a gate so they stay gone
 
 - **Docs for functions that never existed are removed.** The memory *facts*

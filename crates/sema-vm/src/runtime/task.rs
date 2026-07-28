@@ -24,6 +24,17 @@ impl ContinuationFrame {
         Self::VmNativeBoundary { continuation }
     }
 
+    /// Whether the wrapped continuation is `async/spawn`'s trivial
+    /// promise-to-handle mapping (see
+    /// [`NativeContinuation::is_trivial_spawn_handle`]).
+    pub fn is_trivial_spawn_handle(&self) -> bool {
+        match self {
+            Self::Native { continuation } | Self::VmNativeBoundary { continuation } => {
+                continuation.is_trivial_spawn_handle()
+            }
+        }
+    }
+
     fn into_continuation(self) -> Box<dyn NativeContinuation> {
         match self {
             Self::Native { continuation } | Self::VmNativeBoundary { continuation } => continuation,

@@ -2649,21 +2649,15 @@ fn next_accept_wait(
 /// park, exactly like `RouterDecoder`'s route handlers.
 ///
 /// The factory does the `async/spawn` itself, in compiled Sema bytecode,
-/// rather than this continuation issuing a bare `RuntimeRequest::Spawn` —
-/// deliberately: `spawn_via_registry` (`sema-vm/src/runtime/state.rs`) has a
-/// `ReturnOwner::VmResume` fast path that silently discards any
-/// caller-supplied continuation OTHER than `async/spawn`'s own trivial
-/// default, injecting the settled promise straight onto the parked VM's stack
-/// instead. Every hop chained off a plain top-level call keeps
-/// `owner == VmResume` the whole way (confirmed empirically: a version of this
-/// code that issued `RuntimeRequest::Spawn` with a custom re-arm continuation
-/// had that continuation silently skipped — the spawned task still ran
-/// correctly, but the accept loop's OWN promise, not the connection's
-/// response, became `http/serve`'s call result, and the loop stopped
-/// re-arming after one request). Routing the spawn through compiled bytecode
-/// (see prelude.rs's factory) sidesteps the gap entirely — no bare
-/// `RuntimeRequest::Spawn` ever crosses this Rust continuation boundary — at
-/// the cost of one Sema-level indirection, and needs no sema-vm change.
+/// rather than this continuation issuing a bare `RuntimeRequest::Spawn`.
+/// A Rust-side Spawn with a custom continuation is safe nowadays —
+/// `spawn_via_registry`'s `VmResume` fast path is gated on
+/// `NativeContinuation::is_trivial_spawn_handle` and routes any custom
+/// continuation through the general pending-stage path (the gate exists
+/// because an earlier version of THIS code had its re-arm continuation
+/// silently dropped by the ungated fast path) — but the bytecode route
+/// keeps the spawn on `async/spawn`'s ordinary hot path and costs one
+/// Sema-level indirection, so it stays.
 struct AcceptLoopContinuation {
     handler: Value,
     factory: Value,

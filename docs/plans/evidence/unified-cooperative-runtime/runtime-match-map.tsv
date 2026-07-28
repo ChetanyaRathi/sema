@@ -67,6 +67,7 @@ F21A	crates/sema-core/src/mcp_cassette.rs:52:thread_local! {
 F21B	crates/sema-core/src/mcp_cassette.rs:76:    thread_local! {
 F22	crates/sema-core/src/output_hook.rs:28:thread_local! {
 F22	crates/sema-core/src/output_hook.rs:71:thread_local! {
+F24	crates/sema-core/src/runtime/native.rs:393:    /// `Value::async_promise_id(id)` — `async/spawn`'s own default. The spawn
 F18	crates/sema-core/src/value.rs:173:    /// "requires runtime invocation" hard-error stub (async/spawn, channel/*,
 F18	crates/sema-core/src/value.rs:175:    /// `with_ctx_runtime`, e.g. `async/sleep`, `__llm-chat-blocking`) has a real
 C17	crates/sema-core/src/value.rs:2868:thread_local! {
@@ -347,11 +348,8 @@ F31	crates/sema-eval/src/eval.rs:8656:                   (list (channel/recv out
 F31	crates/sema-eval/src/eval.rs:8674:                 (begin (async (channel/send ch :ran)) :end)",
 F31	crates/sema-eval/src/eval.rs:8680:            .eval_str_via_runtime("(channel/recv ch)")
 F34A	crates/sema-eval/src/prelude.rs:1016:;; connection, spawned via `async/spawn`'s runtime ABI, which requires a
-F34A	crates/sema-eval/src/prelude.rs:1018:;; docs/deferred.md "SRV-1"). It also needs `async/spawn` itself called from
-F34A	crates/sema-eval/src/prelude.rs:1022:;; that — correctly, for `async/spawn`'s own trivial default continuation —
-F34A	crates/sema-eval/src/prelude.rs:1056:;; is a serial `blocking_recv` loop for synchronous, non-quantum callers. Routing
-F34A	crates/sema-eval/src/prelude.rs:1058:;; and any `async/spawn` inside a handler would fail with "requires runtime
-F34A	crates/sema-eval/src/prelude.rs:1063:  (let ((factory (fn (h req responder) (async/spawn (fn () (responder (h req)))))))
+F34A	crates/sema-eval/src/prelude.rs:1020:;; being `async/spawn`'s trivial promise-handle mapping —
+F34A	crates/sema-eval/src/prelude.rs:1047:  (let ((factory (fn (h req responder) (async/spawn (fn () (responder (h req)))))))
 F34D	crates/sema-eval/src/prelude.rs:137:;; (async/await (ws/listen sock {:on-message (fn (c m) (println m))}))
 F34A	crates/sema-eval/src/prelude.rs:146:       (async/spawn
 F34A	crates/sema-eval/src/prelude.rs:505:;; The OWNED combinators (`async/spawn-all`, `async/map`, `async/pool-map`,
@@ -495,10 +493,10 @@ C07D	crates/sema-llm/src/openai.rs:919:        sema_io::io_block_on(async {
 C07D	crates/sema-llm/src/openai.rs:929:        sema_io::io_block_on(self.embed_async(request))
 C09	crates/sema-llm/src/pricing.rs:92:thread_local! {
 H05	crates/sema-lsp/src/handlers/command.rs:209:        handle.block_on(async {
-H05	crates/sema-lsp/src/server.rs:752:    // `blocking_recv` observes channel closure (and the join below can finish)
-H05	crates/sema-lsp/src/server.rs:772:            rx.blocking_recv()
-H05	crates/sema-lsp/src/server.rs:863:                    handle.block_on(async {
-H05	crates/sema-lsp/src/server.rs:873:                    handle.block_on(async {
+H05	crates/sema-lsp/src/server.rs:758:    // `blocking_recv` observes channel closure (and the join below can finish)
+H05	crates/sema-lsp/src/server.rs:778:            rx.blocking_recv()
+H05	crates/sema-lsp/src/server.rs:869:                    handle.block_on(async {
+H05	crates/sema-lsp/src/server.rs:879:                    handle.block_on(async {
 C13	crates/sema-mcp/src/builtins.rs:1083:            let result = sema_io::io_block_on(async move {
 C13	crates/sema-mcp/src/builtins.rs:1448:    let result = block_on(call_tool_async(
 C13	crates/sema-mcp/src/builtins.rs:1748:            let completed = sema_io::io_block_on(async move {
@@ -547,75 +545,75 @@ C06	crates/sema-otel/src/imp.rs:336:    // `thread_local!` block, but std destro
 C06	crates/sema-otel/src/imp.rs:458:        std::thread::sleep(Duration::from_millis(25));
 C06	crates/sema-otel/src/imp.rs:83:thread_local! {
 R01B	crates/sema-stdlib/src/async_ops.rs:12:/// Parse a duration-in-milliseconds argument for `async/sleep` / `async/timeout`.
-R01A	crates/sema-stdlib/src/async_ops.rs:239:/// `async/await` continuation: the awaited promise settled (delivered as a
-R01A	crates/sema-stdlib/src/async_ops.rs:262:                "async/await: awaited promise resumed with an unexpected runtime response",
-R01A	crates/sema-stdlib/src/async_ops.rs:268:/// `async/all` continuation: on success the runtime delivers every observed
-R01A	crates/sema-stdlib/src/async_ops.rs:303:                "async/all: resumed with an unexpected runtime response",
-R01A	crates/sema-stdlib/src/async_ops.rs:309:/// `async/race` and `async/timeout` continuation: the winning settlement is
-R01A	crates/sema-stdlib/src/async_ops.rs:310:/// delivered as a single `Settlement`; an elapsed `async/timeout` deadline
-R01D	crates/sema-stdlib/src/async_ops.rs:339:/// `async/cancel` continuation: returns the boolean first-request result.
-R01D	crates/sema-stdlib/src/async_ops.rs:360:                "async/cancel: resumed with an unexpected runtime response",
-R01D	crates/sema-stdlib/src/async_ops.rs:412:/// `async/run` continuation: the origin-root drain completed; resume with nil.
-R01D	crates/sema-stdlib/src/async_ops.rs:446:    // async/spawn — spawn a thunk as a detached task; resume with its promise.
-R01D	crates/sema-stdlib/src/async_ops.rs:447:    register_runtime_fn(env, "async/spawn", |args| {
-R01D	crates/sema-stdlib/src/async_ops.rs:448:        check_arity!(args, "async/spawn", 1);
-R01A	crates/sema-stdlib/src/async_ops.rs:455:    // async/await — suspend until the promise settles. A rejection re-raises the
-R01A	crates/sema-stdlib/src/async_ops.rs:460:    // that are already plain values — e.g. an `async/all` value list — pass
-R01A	crates/sema-stdlib/src/async_ops.rs:462:    register_runtime_fn(env, "async/await", |args| {
-R01A	crates/sema-stdlib/src/async_ops.rs:463:        check_arity!(args, "async/await", 1);
-R01D	crates/sema-stdlib/src/async_ops.rs:473:    // async/run — suspend on the self-resolving-waits barrier: wait until every
-R01D	crates/sema-stdlib/src/async_ops.rs:476:    register_runtime_fn(env, "async/run", |args| {
-R01D	crates/sema-stdlib/src/async_ops.rs:477:        check_arity!(args, "async/run", 0);
+R01A	crates/sema-stdlib/src/async_ops.rs:245:/// `async/await` continuation: the awaited promise settled (delivered as a
+R01A	crates/sema-stdlib/src/async_ops.rs:268:                "async/await: awaited promise resumed with an unexpected runtime response",
+R01A	crates/sema-stdlib/src/async_ops.rs:274:/// `async/all` continuation: on success the runtime delivers every observed
+R01A	crates/sema-stdlib/src/async_ops.rs:309:                "async/all: resumed with an unexpected runtime response",
+R01A	crates/sema-stdlib/src/async_ops.rs:315:/// `async/race` and `async/timeout` continuation: the winning settlement is
+R01A	crates/sema-stdlib/src/async_ops.rs:316:/// delivered as a single `Settlement`; an elapsed `async/timeout` deadline
+R01D	crates/sema-stdlib/src/async_ops.rs:345:/// `async/cancel` continuation: returns the boolean first-request result.
+R01D	crates/sema-stdlib/src/async_ops.rs:366:                "async/cancel: resumed with an unexpected runtime response",
+R01D	crates/sema-stdlib/src/async_ops.rs:418:/// `async/run` continuation: the origin-root drain completed; resume with nil.
+R01D	crates/sema-stdlib/src/async_ops.rs:452:    // async/spawn — spawn a thunk as a detached task; resume with its promise.
+R01D	crates/sema-stdlib/src/async_ops.rs:453:    register_runtime_fn(env, "async/spawn", |args| {
+R01D	crates/sema-stdlib/src/async_ops.rs:454:        check_arity!(args, "async/spawn", 1);
+R01A	crates/sema-stdlib/src/async_ops.rs:461:    // async/await — suspend until the promise settles. A rejection re-raises the
+R01A	crates/sema-stdlib/src/async_ops.rs:466:    // that are already plain values — e.g. an `async/all` value list — pass
+R01A	crates/sema-stdlib/src/async_ops.rs:468:    register_runtime_fn(env, "async/await", |args| {
+R01A	crates/sema-stdlib/src/async_ops.rs:469:        check_arity!(args, "async/await", 1);
+R01D	crates/sema-stdlib/src/async_ops.rs:479:    // async/run — suspend on the self-resolving-waits barrier: wait until every
+R01D	crates/sema-stdlib/src/async_ops.rs:482:    register_runtime_fn(env, "async/run", |args| {
+R01D	crates/sema-stdlib/src/async_ops.rs:483:        check_arity!(args, "async/run", 0);
 R01D	crates/sema-stdlib/src/async_ops.rs:49:        "async/await: awaited task was cancelled",
-R01D	crates/sema-stdlib/src/async_ops.rs:523:    register_runtime_fn(env, "async/cancelled?", |args| {
-R01D	crates/sema-stdlib/src/async_ops.rs:524:        inspect_op(args, "async/cancelled?", Predicate::Cancelled)
-R01D	crates/sema-stdlib/src/async_ops.rs:527:    // async/cancel — request cancellation of the spawned task behind a promise.
-R01D	crates/sema-stdlib/src/async_ops.rs:530:    register_runtime_fn(env, "async/cancel", |args| {
-R01D	crates/sema-stdlib/src/async_ops.rs:531:        check_arity!(args, "async/cancel", 1);
-R01D	crates/sema-stdlib/src/async_ops.rs:532:        let id = expect_promise(args, "async/cancel", 0)?;
-R01A	crates/sema-stdlib/src/async_ops.rs:539:    // async/all — OBSERVE every supplied promise; resume with the input-ordered
-R01A	crates/sema-stdlib/src/async_ops.rs:542:    register_runtime_fn(env, "async/all", |args| {
-R01A	crates/sema-stdlib/src/async_ops.rs:543:        check_arity!(args, "async/all", 1);
-R01A	crates/sema-stdlib/src/async_ops.rs:544:        let items = expect_list_or_vector(&args[0], "async/all")?;
-R01A	crates/sema-stdlib/src/async_ops.rs:545:        let promises = collect_promise_ids(items, "async/all")?;
-R01A	crates/sema-stdlib/src/async_ops.rs:555:    // async/race — OBSERVE the supplied promises; resume with the first (lowest-
-R01A	crates/sema-stdlib/src/async_ops.rs:557:    register_runtime_fn(env, "async/race", |args| {
-R01A	crates/sema-stdlib/src/async_ops.rs:558:        check_arity!(args, "async/race", 1);
-R01A	crates/sema-stdlib/src/async_ops.rs:559:        let items = expect_list_or_vector(&args[0], "async/race")?;
-R01A	crates/sema-stdlib/src/async_ops.rs:561:            return Err(SemaError::eval("async/race: requires at least one promise"));
-R01A	crates/sema-stdlib/src/async_ops.rs:563:        let promises = collect_promise_ids(items, "async/race")?;
-R01B	crates/sema-stdlib/src/async_ops.rs:573:    // async/timeout — OBSERVE a single promise bounded by a deadline. An
-R01B	crates/sema-stdlib/src/async_ops.rs:576:    register_runtime_fn(env, "async/timeout", |args| {
-R01B	crates/sema-stdlib/src/async_ops.rs:577:        check_arity!(args, "async/timeout", 2);
-R01B	crates/sema-stdlib/src/async_ops.rs:578:        let ms = duration_ms(&args[0], "async/timeout")?;
-R01B	crates/sema-stdlib/src/async_ops.rs:582:                "async/timeout: duration {ms} ms exceeds maximum {MAX_TIMEOUT_MS} ms (1 day)"
-R01A	crates/sema-stdlib/src/async_ops.rs:586:        let id = expect_promise(args, "async/timeout", 1)?;
-R01B	crates/sema-stdlib/src/async_ops.rs:596:    // async/sleep — suspend for a duration in milliseconds.
+R01D	crates/sema-stdlib/src/async_ops.rs:529:    register_runtime_fn(env, "async/cancelled?", |args| {
+R01D	crates/sema-stdlib/src/async_ops.rs:530:        inspect_op(args, "async/cancelled?", Predicate::Cancelled)
+R01D	crates/sema-stdlib/src/async_ops.rs:533:    // async/cancel — request cancellation of the spawned task behind a promise.
+R01D	crates/sema-stdlib/src/async_ops.rs:536:    register_runtime_fn(env, "async/cancel", |args| {
+R01D	crates/sema-stdlib/src/async_ops.rs:537:        check_arity!(args, "async/cancel", 1);
+R01D	crates/sema-stdlib/src/async_ops.rs:538:        let id = expect_promise(args, "async/cancel", 0)?;
+R01A	crates/sema-stdlib/src/async_ops.rs:545:    // async/all — OBSERVE every supplied promise; resume with the input-ordered
+R01A	crates/sema-stdlib/src/async_ops.rs:548:    register_runtime_fn(env, "async/all", |args| {
+R01A	crates/sema-stdlib/src/async_ops.rs:549:        check_arity!(args, "async/all", 1);
+R01A	crates/sema-stdlib/src/async_ops.rs:550:        let items = expect_list_or_vector(&args[0], "async/all")?;
+R01A	crates/sema-stdlib/src/async_ops.rs:551:        let promises = collect_promise_ids(items, "async/all")?;
+R01A	crates/sema-stdlib/src/async_ops.rs:561:    // async/race — OBSERVE the supplied promises; resume with the first (lowest-
+R01A	crates/sema-stdlib/src/async_ops.rs:563:    register_runtime_fn(env, "async/race", |args| {
+R01A	crates/sema-stdlib/src/async_ops.rs:564:        check_arity!(args, "async/race", 1);
+R01A	crates/sema-stdlib/src/async_ops.rs:565:        let items = expect_list_or_vector(&args[0], "async/race")?;
+R01A	crates/sema-stdlib/src/async_ops.rs:567:            return Err(SemaError::eval("async/race: requires at least one promise"));
+R01A	crates/sema-stdlib/src/async_ops.rs:569:        let promises = collect_promise_ids(items, "async/race")?;
+R01B	crates/sema-stdlib/src/async_ops.rs:579:    // async/timeout — OBSERVE a single promise bounded by a deadline. An
+R01B	crates/sema-stdlib/src/async_ops.rs:582:    register_runtime_fn(env, "async/timeout", |args| {
+R01B	crates/sema-stdlib/src/async_ops.rs:583:        check_arity!(args, "async/timeout", 2);
+R01B	crates/sema-stdlib/src/async_ops.rs:584:        let ms = duration_ms(&args[0], "async/timeout")?;
+R01B	crates/sema-stdlib/src/async_ops.rs:588:                "async/timeout: duration {ms} ms exceeds maximum {MAX_TIMEOUT_MS} ms (1 day)"
+R01A	crates/sema-stdlib/src/async_ops.rs:592:        let id = expect_promise(args, "async/timeout", 1)?;
+R01B	crates/sema-stdlib/src/async_ops.rs:602:    // async/sleep — suspend for a duration in milliseconds.
 R01B	crates/sema-stdlib/src/async_ops.rs:60:/// Validate and cap `async/sleep`'s duration argument, returning the sleep in
-R01B	crates/sema-stdlib/src/async_ops.rs:612:        sema_core::intern("async/sleep"),
-R01B	crates/sema-stdlib/src/async_ops.rs:614:            "async/sleep",
-R01B	crates/sema-stdlib/src/async_ops.rs:619:                        "async/sleep: entered through a synchronous callback path while the \
-R01A	crates/sema-stdlib/src/async_ops.rs:628:                std::thread::sleep(std::time::Duration::from_millis(ms));
+R01B	crates/sema-stdlib/src/async_ops.rs:618:        sema_core::intern("async/sleep"),
+R01B	crates/sema-stdlib/src/async_ops.rs:620:            "async/sleep",
+R01B	crates/sema-stdlib/src/async_ops.rs:625:                        "async/sleep: entered through a synchronous callback path while the \
+R01A	crates/sema-stdlib/src/async_ops.rs:634:                std::thread::sleep(std::time::Duration::from_millis(ms));
 R01B	crates/sema-stdlib/src/async_ops.rs:63:    check_arity!(args, "async/sleep", 1);
-R01C	crates/sema-stdlib/src/async_ops.rs:646:/// The error raised when `channel/send` finds the channel closed (eagerly or
 R01B	crates/sema-stdlib/src/async_ops.rs:64:    let ms = duration_ms(&args[0], "async/sleep")?;
-R01C	crates/sema-stdlib/src/async_ops.rs:651:        "channel/send: channel is closed; value {value} was dropped"
+R01C	crates/sema-stdlib/src/async_ops.rs:652:/// The error raised when `channel/send` finds the channel closed (eagerly or
+R01C	crates/sema-stdlib/src/async_ops.rs:657:        "channel/send: channel is closed; value {value} was dropped"
 R01B	crates/sema-stdlib/src/async_ops.rs:65:    // Cap the duration (mirrors async/timeout). The runtime's virtual
 R01A	crates/sema-stdlib/src/async_ops.rs:67:    // whole delta in one `thread::sleep`; without a bound an out-of-range
-R01C	crates/sema-stdlib/src/async_ops.rs:681:/// `channel/send` continuation: `Sent` → nil; `Closed` → the closed-send error
-R01C	crates/sema-stdlib/src/async_ops.rs:710:            _ => Err(SemaError::eval("channel/send: unexpected runtime response")),
-R01C	crates/sema-stdlib/src/async_ops.rs:715:/// `channel/recv` continuation: `Received(v)` → v; `Closed` → nil (the documented
+R01C	crates/sema-stdlib/src/async_ops.rs:687:/// `channel/send` continuation: `Sent` → nil; `Closed` → the closed-send error
+R01C	crates/sema-stdlib/src/async_ops.rs:716:            _ => Err(SemaError::eval("channel/send: unexpected runtime response")),
+R01C	crates/sema-stdlib/src/async_ops.rs:721:/// `channel/recv` continuation: `Received(v)` → v; `Closed` → nil (the documented
 R01B	crates/sema-stdlib/src/async_ops.rs:72:            "async/sleep: duration {ms} ms exceeds maximum {MAX_SLEEP_MS} ms (1 day)"
-R01C	crates/sema-stdlib/src/async_ops.rs:741:            _ => Err(SemaError::eval("channel/recv: unexpected runtime response")),
+R01C	crates/sema-stdlib/src/async_ops.rs:747:            _ => Err(SemaError::eval("channel/recv: unexpected runtime response")),
 R01B	crates/sema-stdlib/src/async_ops.rs:79:/// Continuation for `async/sleep` under the unified runtime. A timer wait carries
-R01C	crates/sema-stdlib/src/async_ops.rs:872:    // channel/send — send a value; suspend until buffered/handed to a receiver.
-R01C	crates/sema-stdlib/src/async_ops.rs:875:    register_runtime_fn_with_escaping_args(env, "channel/send", &[1], |args| {
-R01C	crates/sema-stdlib/src/async_ops.rs:876:        check_arity!(args, "channel/send", 2);
-R01C	crates/sema-stdlib/src/async_ops.rs:877:        let channel = expect_channel(args, "channel/send", 0)?;
-R01C	crates/sema-stdlib/src/async_ops.rs:889:    // channel/recv — receive a value; suspend until one is available. A closed +
-R01C	crates/sema-stdlib/src/async_ops.rs:891:    register_runtime_fn(env, "channel/recv", |args| {
-R01C	crates/sema-stdlib/src/async_ops.rs:892:        check_arity!(args, "channel/recv", 1);
-R01C	crates/sema-stdlib/src/async_ops.rs:893:        let channel = expect_channel(args, "channel/recv", 0)?;
+R01C	crates/sema-stdlib/src/async_ops.rs:878:    // channel/send — send a value; suspend until buffered/handed to a receiver.
+R01C	crates/sema-stdlib/src/async_ops.rs:881:    register_runtime_fn_with_escaping_args(env, "channel/send", &[1], |args| {
+R01C	crates/sema-stdlib/src/async_ops.rs:882:        check_arity!(args, "channel/send", 2);
+R01C	crates/sema-stdlib/src/async_ops.rs:883:        let channel = expect_channel(args, "channel/send", 0)?;
+R01C	crates/sema-stdlib/src/async_ops.rs:895:    // channel/recv — receive a value; suspend until one is available. A closed +
+R01C	crates/sema-stdlib/src/async_ops.rs:897:    register_runtime_fn(env, "channel/recv", |args| {
+R01C	crates/sema-stdlib/src/async_ops.rs:898:        check_arity!(args, "channel/recv", 1);
+R01C	crates/sema-stdlib/src/async_ops.rs:899:        let channel = expect_channel(args, "channel/recv", 0)?;
 R23A	crates/sema-stdlib/src/context.rs:32:    let result = sema_core::call_callback(ctx, &thunk, &[]);
 R21B	crates/sema-stdlib/src/crypto.rs:26:thread_local! {
 R21A	crates/sema-stdlib/src/csv_ops.rs:41:thread_local! {
@@ -716,19 +714,19 @@ R15B	crates/sema-stdlib/src/server.rs:2439:                match call_callback(c
 R15A	crates/sema-stdlib/src/server.rs:2627:                    request = requests.recv() => request.map_or(ServeEvent::Closed, ServeEvent::Request),
 R15A	crates/sema-stdlib/src/server.rs:2628:                    notification = lifecycle.recv() => {
 R15A	crates/sema-stdlib/src/server.rs:2651:/// The factory does the `async/spawn` itself, in compiled Sema bytecode,
-R15A	crates/sema-stdlib/src/server.rs:2655:/// caller-supplied continuation OTHER than `async/spawn`'s own trivial
-R15B	crates/sema-stdlib/src/server.rs:2912:/// `async/spawn` uses), so a slow/parked handler does not stall its
-R15A	crates/sema-stdlib/src/server.rs:3079:        let request = request_rx.recv().await.expect("route enqueues request");
-R15A	crates/sema-stdlib/src/server.rs:3085:            tokio::time::timeout(std::time::Duration::from_secs(1), lifecycle_rx.recv())
-R15A	crates/sema-stdlib/src/server.rs:3103:        let request = request_rx.recv().await.expect("route enqueues request");
-R15A	crates/sema-stdlib/src/server.rs:3120:            .recv()
-R15A	crates/sema-stdlib/src/server.rs:3138:        let request = request_rx.recv().await.expect("route enqueues request");
-R15A	crates/sema-stdlib/src/server.rs:3372:        sema_io::io_block_on(async {
-R15A	crates/sema-stdlib/src/server.rs:3448:        sema_io::io_block_on(async {
-R15A	crates/sema-stdlib/src/server.rs:3477:        sema_io::io_block_on(async {
-R15A	crates/sema-stdlib/src/server.rs:3518:        sema_io::io_block_on(async {
-R15B	crates/sema-stdlib/src/server.rs:3588:        let result = rt.block_on(async {
-R15B	crates/sema-stdlib/src/server.rs:3611:        rt.block_on(async {
+R15A	crates/sema-stdlib/src/server.rs:2659:/// keeps the spawn on `async/spawn`'s ordinary hot path and costs one
+R15B	crates/sema-stdlib/src/server.rs:2906:/// `async/spawn` uses), so a slow/parked handler does not stall its
+R15A	crates/sema-stdlib/src/server.rs:3073:        let request = request_rx.recv().await.expect("route enqueues request");
+R15A	crates/sema-stdlib/src/server.rs:3079:            tokio::time::timeout(std::time::Duration::from_secs(1), lifecycle_rx.recv())
+R15A	crates/sema-stdlib/src/server.rs:3097:        let request = request_rx.recv().await.expect("route enqueues request");
+R15A	crates/sema-stdlib/src/server.rs:3114:            .recv()
+R15A	crates/sema-stdlib/src/server.rs:3132:        let request = request_rx.recv().await.expect("route enqueues request");
+R15A	crates/sema-stdlib/src/server.rs:3366:        sema_io::io_block_on(async {
+R15A	crates/sema-stdlib/src/server.rs:3442:        sema_io::io_block_on(async {
+R15A	crates/sema-stdlib/src/server.rs:3471:        sema_io::io_block_on(async {
+R15A	crates/sema-stdlib/src/server.rs:3512:        sema_io::io_block_on(async {
+R15B	crates/sema-stdlib/src/server.rs:3582:        let result = rt.block_on(async {
+R15B	crates/sema-stdlib/src/server.rs:3605:        rt.block_on(async {
 R16A	crates/sema-stdlib/src/sqlite.rs:118:thread_local! {
 R16A	crates/sema-stdlib/src/sqlite.rs:27://! queues (an async caller's `IoHandle` re-attempts the checkout every poll —
 R16A	crates/sema-stdlib/src/sqlite.rs:40://! handle + flag the op interrupted) and a `reclaim` closure. On `async/cancel`
@@ -819,28 +817,29 @@ F27	crates/sema-vm/src/runtime/state.rs:4592:            // cancel edge the plan
 F23	crates/sema-vm/src/runtime/state.rs:4594:            // the tasks it spawned (e.g. a task parked on `async/await` of a child
 F27	crates/sema-vm/src/runtime/state.rs:4596:            // It does NOT make `async/await`/`all`/`race`/`timeout` cancel SUPPLIED
 F27	crates/sema-vm/src/runtime/state.rs:4637:        // (`async/pending?`, `async/cancel`) sees it Pending, and a post-spawn op
-F24	crates/sema-vm/src/runtime/state.rs:4639:        // quantum. `async/spawn` always parks its VM, so `owner` is a `VmResume`:
-F23	crates/sema-vm/src/runtime/state.rs:4812:        let mut task = state.tasks.remove(&task_id).expect("task prevalidated");
-F23	crates/sema-vm/src/runtime/state.rs:4863:    /// - root main task parked directly on `channel/recv` (top-level, no sender)
-F23	crates/sema-vm/src/runtime/state.rs:4864:    ///   → "channel/recv: channel is empty";
-F23	crates/sema-vm/src/runtime/state.rs:4865:    /// - root main task parked directly on `channel/send` (full, no receiver)
-F23	crates/sema-vm/src/runtime/state.rs:4866:    ///   → "channel/send: channel is full";
-F23	crates/sema-vm/src/runtime/state.rs:4893:            // The root main task parked directly on a `channel/recv`/`channel/send`
-F23	crates/sema-vm/src/runtime/state.rs:4910:                    sema_core::SemaError::eval("channel/recv: channel is empty")
-F23	crates/sema-vm/src/runtime/state.rs:4912:                    sema_core::SemaError::eval("channel/send: channel is full").with_hint(
-F27	crates/sema-vm/src/runtime/state.rs:5024:            let Some(task) = state.tasks.remove(&task_id) else {
-F27	crates/sema-vm/src/runtime/state.rs:5087:    /// `async/cancel`/`CancelPromise` path) walks the LIVE
+F24	crates/sema-vm/src/runtime/state.rs:4639:        // quantum. `async/spawn` parks its VM with the TRIVIAL promise-handle
+F23	crates/sema-vm/src/runtime/state.rs:4817:        let mut task = state.tasks.remove(&task_id).expect("task prevalidated");
+F23	crates/sema-vm/src/runtime/state.rs:4868:    /// - root main task parked directly on `channel/recv` (top-level, no sender)
+F23	crates/sema-vm/src/runtime/state.rs:4869:    ///   → "channel/recv: channel is empty";
+F23	crates/sema-vm/src/runtime/state.rs:4870:    /// - root main task parked directly on `channel/send` (full, no receiver)
+F23	crates/sema-vm/src/runtime/state.rs:4871:    ///   → "channel/send: channel is full";
+F23	crates/sema-vm/src/runtime/state.rs:4898:            // The root main task parked directly on a `channel/recv`/`channel/send`
+F23	crates/sema-vm/src/runtime/state.rs:4915:                    sema_core::SemaError::eval("channel/recv: channel is empty")
+F23	crates/sema-vm/src/runtime/state.rs:4917:                    sema_core::SemaError::eval("channel/send: channel is full").with_hint(
+F27	crates/sema-vm/src/runtime/state.rs:5029:            let Some(task) = state.tasks.remove(&task_id) else {
+F27	crates/sema-vm/src/runtime/state.rs:5092:    /// `async/cancel`/`CancelPromise` path) walks the LIVE
 F03	crates/sema-vm/src/runtime/state.rs:554:    // Count of live `OriginBarrier` (`async/run`) protocol waits. A cheap
-F23	crates/sema-vm/src/runtime/state.rs:5876:        &format!("async/timeout: operation timed out after {duration_ms} ms"),
-F23	crates/sema-vm/src/runtime/state.rs:5877:        "async/timeout",
+F23	crates/sema-vm/src/runtime/state.rs:5881:        &format!("async/timeout: operation timed out after {duration_ms} ms"),
+F23	crates/sema-vm/src/runtime/state.rs:5882:        "async/timeout",
 F03	crates/sema-vm/src/runtime/state.rs:621:    /// An `async/run` (`OriginBarrier`) suspension: the caller parks until every
-F03	crates/sema-vm/src/runtime/state.rs:6319:/// Whether an `async/run` barrier for `caller` (whose origin root is `root` and
-F03	crates/sema-vm/src/runtime/state.rs:6364:                    // suspends before its own `async/run` lets a descendant park
-F03	crates/sema-vm/src/runtime/state.rs:6376:/// Register an `async/run` (`OriginBarrier`) suspension: park the caller with an
-F23	crates/sema-vm/src/runtime/state.rs:6970:    thread_local! {
+F03	crates/sema-vm/src/runtime/state.rs:6324:/// Whether an `async/run` barrier for `caller` (whose origin root is `root` and
+F03	crates/sema-vm/src/runtime/state.rs:6369:                    // suspends before its own `async/run` lets a descendant park
+F03	crates/sema-vm/src/runtime/state.rs:6381:/// Register an `async/run` (`OriginBarrier`) suspension: park the caller with an
+F23	crates/sema-vm/src/runtime/state.rs:6975:    thread_local! {
 F23	crates/sema-vm/src/runtime/state.rs:706:thread_local! {
 F24	crates/sema-vm/src/runtime/state.rs:978:    /// shape `async/spawn` produces. Used to build multi-task origin-root graphs
 F03	crates/sema-vm/src/runtime/state.rs:979:    /// (e.g. an `async/run` barrier caller with a `ResourceSlot`-parked sibling)
+F24	crates/sema-vm/src/runtime/task.rs:27:    /// Whether the wrapped continuation is `async/spawn`'s trivial
 F23	crates/sema-vm/src/runtime/tests.rs:2244:thread_local! {
 F27	crates/sema-vm/src/runtime/tests.rs:2545:// `async/cancel`/`CancelPromise` path — never called by `cancel_root`
 F27	crates/sema-vm/src/runtime/tests.rs:2555:// directly on the root, the `async/spawn`-from-main shape) and the new

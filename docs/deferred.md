@@ -44,26 +44,6 @@ Fixed 2026-07-02: **ASYNC-1** (dynamic-scope flags vs deferred async tasks) — 
 
 ---
 
-## LSP-CI-1 — LSP e2e suite not in CI; no positionEncoding/UTF-16 wire coverage
-
-**Today:** the 17-file Python e2e suite under `crates/sema-lsp/tests/e2e/` runs
-only locally (`jake test.lsp` → `uv run pytest`); no GitHub workflow invokes it,
-so a protocol-level regression (initialize handshake, diagnostics push, code
-lens) ships silently if nobody ran it. Separately, the server does no
-`positionEncoding` negotiation and has no astral-plane UTF-16 wire tests.
-
-**Proposed fix:** a CI job that installs `uv` and runs the pytest suite against
-the debug binary; a `positionEncoding` capability + one surrogate-pair
-regression test.
-
-**Why deferred:** demoted from the archived
-`plans/archive/2026-06-09-lsp-e2e-compliance-testing.md` (its larger in-process
-harness design went stale when the editor plugins left the monorepo). These two
-facts are the surviving actionable part.
-
-**Workaround today:** run `jake test.lsp` locally before LSP releases.
-
----
 
 ## D5 — Typed `try`/`catch` form
 
@@ -148,21 +128,12 @@ Remaining work:
 
 ## LLM-1 — LLM bulletproofing remnants (from the archived plan)
 
-**Deferred (revisit later) — 2026-06-22.** The bulletproofing plan
-(`docs/plans/archive/2026-06-21-llm-bulletproofing.md`) shipped Phases 0–3, 4.1, 4.2, 4.4,
-5, and 6.3. What's left:
+**Deferred (revisit later) — 2026-06-22; trimmed 2026-07-28.** The bulletproofing plan
+(`docs/plans/archive/2026-06-21-llm-bulletproofing.md`) shipped Phases 0–3, 4.x, 5, 6.3,
+and streaming-through-dispatch (4.3, 2026-06-23). `llm/generate-object` (6.1) and the
+batch budget pre-flight (6.2) were decided against 2026-07-28 — see the resolved ledger.
+What's left:
 
-- ~~**4.3 — streaming through the dispatch layer**~~ ✅ **DONE 2026-06-23.** `llm/stream`
-  now applies rate-limit + fallback at stream-open and an opt-in budget pre-gate
-  (`:on-stream :pre-gate`); mid-stream failure surfaces + keeps the partial (no failover —
-  the spike proved a retry would duplicate). Cache stays off for streams (cassettes cover
-  deterministic replay). Verified live.
-- **6.1 — `llm/generate-object`**: schema-validated structured output with a bounded repair
-  loop (today only `llm/extract` does schema+reask). Reuse `validate_extraction` +
-  `format_reask_prompt`.
-- **6.2 — batch budget pre-flight**: budgets are post-call caps, so a concurrent
-  `llm/batch`/`llm/pmap` fan-out can overshoot before the cap fires. Add a pre-dispatch
-  token-estimate gate.
 - **6.5 — agent eval harness**: a `deftest`/`eval` surface that scores an agent against a
   fixture task + cassette in CI. Explicitly deferred by owner; reuses FakeProvider/cassettes.
 
@@ -232,42 +203,6 @@ These are not deferred — they're design questions that need a deliberate decis
 - Add operator controls: pause/resume/cancel run, cancel/restart agent, inspect prompt/result/tool-transcript, export report.
 - Prefer SSE over WebSockets for the first live local dashboard stream.
 
-## AST-GREP-1 — Upstream `@ast-grep/lang-sema` PR to ast-grep/langs
-
-**Found 2026-07-05.** ast-grep works with Sema today via its custom-language
-mechanism (compile `tree-sitter-sema`'s grammar to a `.so`, point `sgconfig.yml`
-at it) — verified end-to-end, no code changes needed on our side. A polished
-`@ast-grep/lang-sema` package (the standard contribution path for
-`@ast-grep/napi`'s `registerDynamicLanguage`) was written and passed its own
-isolated test (nursery.js: parse, `(define $NAME $VAL)` match, metavariable
-capture). Full details: `docs/plans/2026-07-05-ast-grep-support.md`.
-
-**Attempted:** forked `ast-grep/langs`, dropped the package into `packages/sema`,
-tried to verify it the way the monorepo expects — a root `pnpm install`
-(needed because the root `postinstall` recompiles every workspace package).
-That install fails for reasons unrelated to Sema: `tree-sitter-dart`'s native
-Node binding doesn't compile against this machine's Node 26 (V8
-`GetAlignedPointerFromInternalField` API changed), plus flaky npm-registry
-timeouts fetching ~30 unrelated language grammars/binaries.
-
-**Why deferred:** getting a green full-monorepo install wasn't worth fighting
-through an unrelated package's broken native build. The lower-risk path (verify
-`packages/sema` in an isolated standalone npm project outside the monorepo,
-the way the original investigation did, then open the PR and let ast-grep's own
-CI do the full build) was offered but the whole effort was parked for now
-instead. **The `website/docs/ast-grep.md` docs page was pulled from the live
-site and sidebar** (was briefly published) since the upstream package isn't
-actually shipped — no point advertising `@ast-grep/lang-sema` before it exists
-on npm. The CLI-only workflow (manual `.so` build) still works and needs no
-package; it just isn't separately documented right now.
-
-**To resume:** either (a) verify `packages/sema` standalone outside the
-`ast-grep/langs` checkout and open the PR from that verified state, ignoring
-the rest of the monorepo's install health, or (b) retry the full monorepo
-install once `tree-sitter-dart` (or the Node/node-gyp toolchain) is fixed
-upstream. A GitHub fork (`HelgeSverre/langs`) already exists with the package
-staged in `packages/sema` if picking this back up.
-
 ## Notebook: per-cell + per-session LLM cost tracking (status bar)
 
 Accumulate LLM spend for a notebook session and attribute it per cell / per
@@ -291,53 +226,6 @@ run, surfaced as a per-cell badge and a session-cumulative status bar. Scoped
 - Headless `notebook run` should print the same summary line at the end.
 
 Deferred: feature work, not async-runtime scope. Filed as a GitHub issue.
-
-## SRV-TRAPS-1 — three live traps left behind by the `http/serve` concurrency work
-
-**SRV-1 itself is resolved** (concurrent accept loop, task per connection,
-cooperative server-side `ws/recv`, fail-fast guard deleted — see
-[`deferred-resolved.md`](plans/archive/deferred-resolved.md) for the full design record). These
-three hazards outlived it. None breaks anything shipped today; each is a silent
-trap for the *next* caller who touches the same seam, which is why they are
-recorded rather than left in the commit log.
-
-1. **`spawn_via_registry`'s `ReturnOwner::VmResume` fast path silently drops a
-   custom Spawn continuation** (`sema-vm/src/runtime/state.rs`). For
-   `RuntimeRequest::Spawn` it injects the settled promise straight onto the
-   parked VM's stack and `drop`s the caller-supplied continuation without ever
-   calling it. That is byte-equivalent to `async/spawn`'s own trivial default
-   continuation, but wrong for any other caller — and `owner` stays `VmResume`
-   for every hop chained off a plain top-level call, so the fast path is the
-   common case, not the exotic one. SRV-1's first attempt lost its "re-arm the
-   next accept wait" continuation exactly this way; the symptom was a stray
-   `<async-promise>` echoed by `-e` and an accept loop that never advanced past
-   request one. **Workaround in use:** route the spawn through compiled bytecode
-   (`__http-serve-dispatch-task` in `prelude.rs` calls `async/spawn` itself).
-   **Real fix, unpicked:** either gate the fast path on the continuation being
-   the trivial default (needs a type-identity check — fragile) or always route
-   through the continuation (measure the `async/spawn` hot path first).
-
-2. **`apply` routes only closures and known runtime-only natives through
-   `NativeOutcome::Call`** (`sema-stdlib/src/list.rs`). Every other native —
-   including a dual-ABI one whose two ABIs genuinely differ in capability, like
-   `__http-serve-run` — takes `apply`'s synchronous fallback unconditionally, so
-   applying it silently gets the weaker ABI. `http/serve`'s prelude wrapper
-   avoids `apply` for this reason. The next native with divergent dual ABIs must
-   do the same, or `apply`'s routing needs a capability marker.
-
-3. **`in_runtime_quantum()` lies inside a `call_callback` body.**
-   `sema-vm/src/vm.rs`'s `make_closure` "TEMPORARY BRIDGE" arm suspends the
-   quantum for the call's duration by design (a Task-04-era necessity for
-   ordinary synchronous callback re-entry — HOFs, tool handlers). So a
-   suspending native invoked from inside another native's `call_callback` body
-   silently falls back to its blocking path. SRV-1's piece (c) had to route
-   *around* this via `NativeOutcome::Call` rather than through it.
-   **Still unconverted:** `handle_sse_response`'s `call_callback` invocation of
-   the SSE stream handler. A cooperative op inside an SSE handler body hits the
-   identical silent fallback that `ws/recv` had before piece (c). Flagged, not
-   fixed — no acceptance test currently exercises a suspending op inside an SSE
-   handler body. Converting it means mirroring `handle_ws_response_runtime`'s
-   dual-ABI `NativeOutcome::Call` shape for SSE.
 
 ## Consciously-not-converted blocking natives
 

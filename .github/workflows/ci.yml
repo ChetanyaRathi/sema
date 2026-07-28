@@ -72,6 +72,18 @@ jobs:
       - name: Smoke test bytecode
         run: jake smoke-bytecode
 
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      # LSP protocol-level e2e suite (pytest-lsp over stdio): initialize
+      # handshake, capabilities, diagnostics push, UTF-16 positions — coverage
+      # the in-crate tests cannot see. Reuses the debug `sema` binary the test
+      # build above already produced (cargo build is an incremental no-op).
+      - name: LSP e2e suite (pytest)
+        run: |
+          cargo build -p sema-lang
+          cd crates/sema-lsp/tests/e2e && SEMA_BIN="$GITHUB_WORKSPACE/target/debug/sema" uv run pytest -q
+
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
 

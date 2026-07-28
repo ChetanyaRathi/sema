@@ -4636,12 +4636,17 @@ impl Runtime {
         // next suspends, so a same-quantum observation of the promise
         // (`async/pending?`, `async/cancel`) sees it Pending, and a post-spawn op
         // on the spawner (e.g. `channel/close`) runs before the child's first
-        // quantum. `async/spawn` always parks its VM, so `owner` is a `VmResume`:
-        // resume it directly with the promise handle (the continuation only maps
-        // the id to the handle, which we do here) so its Ready enqueue is not
-        // deferred behind the child through the pending-stage chain.
+        // quantum. `async/spawn` parks its VM with the TRIVIAL promise-handle
+        // continuation, so the common case is `VmResume` + trivial: resume the
+        // VM directly with the handle (inlining the mapping the continuation
+        // would do) so its Ready enqueue is not deferred behind the child
+        // through the pending-stage chain. A CUSTOM continuation must never be
+        // skipped — dropping it here silently discards the caller's follow-up
+        // (http/serve's accept-loop re-arm was lost exactly this way), so any
+        // non-trivial frame takes the general pending-stage path even when the
+        // owner is a parked VM.
         match owner {
-            ReturnOwner::VmResume { vm, parent } => {
+            ReturnOwner::VmResume { vm, parent } if frame.is_trivial_spawn_handle() => {
                 drop(frame);
                 self.reinstall_parent_vm(
                     spawner,

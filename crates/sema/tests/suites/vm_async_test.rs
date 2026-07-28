@@ -3148,3 +3148,84 @@ fn channel_send_loop_handoff_respects_instruction_budget_and_lets_sibling_progre
         sender_settlement.outcome
     );
 }
+
+// === Spawn with a CUSTOM continuation (SRV-TRAPS-1 trap 1) ===
+//
+// `RuntimeRequest::Spawn`'s dispatcher has a VmResume fast path that inlines
+// `async/spawn`'s trivial promise-handle mapping. A caller-supplied
+// continuation that does MORE than that mapping must still be invoked — the
+// original http/serve accept loop lost its re-arm continuation exactly here
+// (silently dropped, stray promise echoed). This pins the general path: a
+// top-level call (root main task, VmResume owner) spawning with a custom
+// continuation must see that continuation's result, not the raw handle.
+
+/// A spawn continuation that tags its result: resumes with
+/// `(:custom <promise>)` instead of the bare promise handle.
+struct CustomSpawnCont;
+
+impl sema_core::runtime::Trace for CustomSpawnCont {
+    fn trace(&self, _sink: &mut dyn FnMut(sema_core::cycle::GcEdge<'_>)) -> bool {
+        true
+    }
+}
+
+impl sema_core::runtime::NativeContinuation for CustomSpawnCont {
+    fn resume(
+        self: Box<Self>,
+        _context: &mut sema_core::runtime::NativeCallContext<'_>,
+        input: sema_core::runtime::ResumeInput,
+    ) -> sema_core::runtime::NativeResult {
+        use sema_core::runtime::{NativeOutcome, ResumeInput, RuntimeResponse};
+        match input {
+            ResumeInput::Runtime(RuntimeResponse::Promise(id)) => {
+                Ok(NativeOutcome::Return(Value::list(vec![
+                    Value::keyword("custom"),
+                    Value::async_promise_id(id),
+                ])))
+            }
+            ResumeInput::Failed(error) => Err(error),
+            _ => Err(SemaError::eval(
+                "custom spawn continuation: unexpected resume",
+            )),
+        }
+    }
+}
+
+#[test]
+fn spawn_with_custom_continuation_is_not_dropped() {
+    use sema_core::runtime::{NativeOutcome, RuntimeRequest};
+    let interp = sema_eval::Interpreter::new();
+    interp.global_env.set(
+        intern("__test-spawn-custom"),
+        Value::native_fn(NativeFn::simple_with_runtime(
+            "__test-spawn-custom",
+            |_args| {
+                Err(SemaError::eval(
+                    "__test-spawn-custom requires the cooperative runtime",
+                ))
+            },
+            |_call, args| {
+                Ok(NativeOutcome::Runtime(RuntimeRequest::Spawn {
+                    callable: args[0].clone(),
+                    continuation: Box::new(CustomSpawnCont),
+                }))
+            },
+        )),
+    );
+    let val = interp
+        .eval_str_compiled(
+            r#"
+            (let ((r (__test-spawn-custom (fn () (+ 40 2)))))
+              (list (first r) (async/await (first (rest r)))))
+            "#,
+        )
+        .expect("custom-continuation spawn should evaluate");
+    let items = val.as_list().expect("result list");
+    assert_eq!(
+        items[0],
+        Value::keyword("custom"),
+        "the custom spawn continuation's tagging must run — a bare promise here \
+         means the VmResume fast path dropped the continuation"
+    );
+    assert_eq!(items[1], Value::int(42));
+}

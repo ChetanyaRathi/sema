@@ -218,6 +218,12 @@ impl Trace for PromiseHandleCont {
 }
 
 impl NativeContinuation for PromiseHandleCont {
+    // The spawn dispatcher's parked-VM fast path inlines exactly this
+    // continuation's promise-to-handle mapping.
+    fn is_trivial_spawn_handle(&self) -> bool {
+        true
+    }
+
     fn resume(
         self: Box<Self>,
         _context: &mut NativeCallContext<'_>,

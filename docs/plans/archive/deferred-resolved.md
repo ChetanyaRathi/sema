@@ -1234,3 +1234,66 @@ console-script shebang pointing at the pre-move `~/code/sema-lisp/...` path, so
 `uv run pytest` (what `jake test.lsp` runs) died with `ModuleNotFoundError:
 pytest_lsp` while `uv run python -m pytest` worked. `rm -rf .venv && uv sync`
 fixes it; re-run that after any repo move.
+
+## LLM-1 §6.1 `llm/generate-object` + §6.2 batch budget pre-flight — DECIDED AGAINST
+
+**Decided against 2026-07-28.** Schema-validated structured output with a repair loop
+(6.1) and a pre-dispatch token-estimate gate for `llm/batch`/`llm/pmap` (6.2), both
+remnants of the archived bulletproofing plan. Not wanted: `llm/extract` already covers
+the schema+reask need (6.1), and budgets remain post-call caps by design (6.2). The
+surviving LLM-1 item is the owner-deferred agent eval harness (6.5).
+
+---
+
+## AST-GREP-1 — Upstream `@ast-grep/lang-sema` PR — DECIDED AGAINST (popularity-gated)
+
+**Decided against 2026-07-28.** The package is written and passed isolated verification;
+upstreaming was parked indefinitely — an ast-grep language package only earns its
+maintenance cost if there is demand for Sema support. The CLI-only workflow (compile
+`tree-sitter-sema` to a `.so`, point `sgconfig.yml` at it) works today without any
+package. Staged work survives at `HelgeSverre/langs` (`packages/sema`) and
+`docs/plans/archive/2026-07-05-ast-grep-support.md` if demand shows up.
+
+---
+
+## LSP-CI-1 — LSP e2e suite in CI + positionEncoding — RESOLVED
+
+**Recorded and resolved 2026-07-28** (demoted from the archived LSP e2e
+compliance plan the same day, then fixed). The Python e2e suite now runs in CI
+(`.github/workflows/ci.yml`, "LSP e2e suite" step: `uv run pytest` against the
+debug binary via `SEMA_BIN`). The server declares
+`position_encoding: utf-16` in its capabilities (`server.rs` initialize), and
+`crates/sema-lsp/tests/e2e/test_utf16_positions.py` pins request- and
+response-side UTF-16 column handling across astral-plane characters (the
+definition-across-emoji test discriminates UTF-16 from char- and byte-counting
+servers).
+
+---
+
+## SRV-TRAPS-1 — three live traps from the `http/serve` concurrency work — ALL RESOLVED
+
+**Recorded ~2026-07-10; verified and closed 2026-07-28.**
+
+1. **`spawn_via_registry`'s `VmResume` fast path dropped custom Spawn
+   continuations — FIXED 2026-07-28.** The fast path is now gated on
+   `NativeContinuation::is_trivial_spawn_handle` (a marker only `async/spawn`'s
+   own `PromiseHandleCont` sets); any custom continuation routes through the
+   general `ApplyRuntimeResponse` pending-stage path and actually runs.
+   Regression: `vm_async_test::spawn_with_custom_continuation_is_not_dropped`
+   — the first deterministic reproduction of the drop (it fails on the ungated
+   code with the exact historical symptom: the raw promise handle surfacing as
+   the call result). `http/serve`'s bytecode-factory route remains as the hot
+   path but is no longer load-bearing for correctness.
+2. **`apply`'s capability-blind routing — FIXED 2026-07-19** (`150e9ac4`,
+   structural callback dispatch): `apply_call` now emits `NativeOutcome::Call`
+   for every callable, so dual-ABI natives pick their own runtime
+   implementation. `is_runtime_only_native` survives only to give the
+   synchronous value-ABI arm an actionable error.
+3. **`handle_sse_response`'s `call_callback` fallback — FIXED 2026-07-19**
+   (`3a9b5dfd`): `handle_sse_response_runtime` mirrors the ws dual-ABI
+   `NativeOutcome::Call` shape; the legacy path is reachable only from the
+   host-only value ABI. Suspension inside an SSE handler body is pinned by
+   `suspended_sse_handler_does_not_block_plain_request` and
+   `suspended_sse_handler_resumes_and_closes_stream`.
+
+---

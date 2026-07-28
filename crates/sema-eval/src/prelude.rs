@@ -1014,21 +1014,14 @@ pub const PRELUDE: &str = r#"
 ;; SRV-1: `http/serve`'s concurrent accept loop (`sema-stdlib/src/server.rs`,
 ;; the native registered as `__http-serve-run` below) needs one task per
 ;; connection, spawned via `async/spawn`'s runtime ABI, which requires a
-;; compiled VM closure — a hand-built native fn is rejected (see
-;; docs/deferred.md "SRV-1"). It also needs `async/spawn` itself called from
-;; ORDINARY compiled bytecode, not re-issued as a bare `RuntimeRequest::Spawn`
-;; from a Rust continuation: `spawn_via_registry`
-;; (`sema-vm/src/runtime/state.rs`) has a `ReturnOwner::VmResume` fast path
-;; that — correctly, for `async/spawn`'s own trivial default continuation —
-;; injects the settled promise straight onto the parked VM's stack, but that
-;; same fast path SILENTLY DISCARDS any other caller-supplied
-;; `NativeContinuation` without ever invoking it. Every native-outcome hop
-;; chained off a plain top-level call (Suspend/Call/Runtime resumed from a
-;; continuation, never handed back to real bytecode in between) keeps
-;; `owner == VmResume` the whole way, so a Rust continuation built to run
-;; AFTER a raw `RuntimeRequest::Spawn` — e.g. one that re-arms the next accept
-;; wait — is silently dropped, and the spawn's promise value pops out as if it
-;; had settled the ENTIRE top-level call.
+;; compiled VM closure — a hand-built native fn is rejected. (A Rust-side
+;; `RuntimeRequest::Spawn` with a custom continuation works too, now that
+;; `spawn_via_registry`'s `VmResume` fast path is gated on the continuation
+;; being `async/spawn`'s trivial promise-handle mapping —
+;; `NativeContinuation::is_trivial_spawn_handle` — and routes any other
+;; continuation through the general pending-stage path instead of dropping
+;; it. This bytecode route predates that gate and stays for the lifetime
+;; reason below.)
 ;;
 ;; `http/serve` is therefore defined HERE, as a thin Sema wrapper around the
 ;; native `__http-serve-run`, so the per-connection dispatch factory — the
@@ -1045,20 +1038,11 @@ pub const PRELUDE: &str = r#"
 ;; Building the factory fresh per call has no such lifetime mismatch — its
 ;; only reference is the call's own argument, dropped normally with everything
 ;; else once the connection's task settles.
-;; NOTE: calls `__http-serve-run` DIRECTLY (a fixed-arity call per branch),
-;; deliberately NOT via `apply`. `apply`'s cooperative routing (`list.rs`)
-;; only sends a callee through the `NativeOutcome::Call` path when it is
-;; closure or a known runtime-only native; every OTHER native — including a
-;; plain dual-ABI one like `__http-serve-run` — takes `apply`'s synchronous
-;; `call_function` fallback unconditionally, on the assumption that a
-;; dual-ABI native's plain value callback is a complete, equivalent implementation.
-;; That assumption does not hold here: `__http-serve-run`'s plain value callback
-;; is a serial `blocking_recv` loop for synchronous, non-quantum callers. Routing
-;; through `apply` would select that path instead of the concurrent accept loop,
-;; and any `async/spawn` inside a handler would fail with "requires runtime
-;; invocation". A direct call
-;; goes through the VM's normal native-dispatch (`dispatch_native`), which
-;; correctly honors the runtime ABI.
+;; NOTE: calls `__http-serve-run` DIRECTLY (a fixed-arity call per branch).
+;; `apply` would work too — its runtime arm routes EVERY callable through
+;; `NativeOutcome::Call` (structural dispatch, `list.rs`), so a dual-ABI
+;; native picks its own runtime implementation — but the direct call keeps
+;; the dispatch obvious and is what the acceptance tests pin.
 (defn http/serve (handler . opts)
   (let ((factory (fn (h req responder) (async/spawn (fn () (responder (h req)))))))
     (if (null? opts)

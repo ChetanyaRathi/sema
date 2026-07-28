@@ -387,6 +387,18 @@ pub trait NativeContinuation: Trace {
         context: &mut NativeCallContext<'_>,
         input: ResumeInput,
     ) -> NativeResult;
+
+    /// True ONLY for a [`RuntimeRequest::Spawn`] continuation whose entire
+    /// behavior is mapping `RuntimeResponse::Promise(id)` to
+    /// `Value::async_promise_id(id)` — `async/spawn`'s own default. The spawn
+    /// dispatcher's parked-VM fast path inlines exactly that mapping and skips
+    /// invoking the continuation; a continuation that leaves this `false` is
+    /// routed through the general pending-stage path so its logic actually
+    /// runs. Do not return `true` from a continuation that does anything else:
+    /// the fast path would silently discard that behavior.
+    fn is_trivial_spawn_handle(&self) -> bool {
+        false
+    }
 }
 
 fn trace_error(error: &SemaError, sink: &mut dyn FnMut(GcEdge<'_>)) -> bool {
