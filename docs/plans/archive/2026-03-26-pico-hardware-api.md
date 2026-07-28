@@ -1,7 +1,11 @@
 # Sema Pico Hardware API Design
 
 **Date:** 2026-03-26
-**Status:** On Hold (2026-06-09) — PIO DSL shipped host-side (`crates/sema-stdlib/src/pio.rs`); native gpio/adc/pwm/i2c API deferred until the on-device Pico port exists. Interim hardware control works via the serial bridge (`serial/send` + MicroPython, see `examples/pico-blink.sema`).
+**Status:** KILLED with the port (2026-07-28); previously On Hold (2026-06-09).
+What shipped lives on as host-side features independent of any Pico: the PIO DSL
+(`crates/sema-stdlib/src/pio.rs`) and the unified stream protocol
+(`SemaStream`, `website/docs/stdlib/streams.md`). The device-native gpio/adc/pwm/
+i2c tiers die with the port plan. — PIO DSL shipped host-side (`crates/sema-stdlib/src/pio.rs`); native gpio/adc/pwm/i2c API deferred until the on-device Pico port exists. Interim hardware control works via the serial bridge (`serial/send` + MicroPython, see `examples/pico-blink.sema`).
 **Depends on:** [Raspberry Pi Pico Port](2026-03-25-raspberry-pi-pico-port.md) (Phase 1–4)
 
 ## Overview

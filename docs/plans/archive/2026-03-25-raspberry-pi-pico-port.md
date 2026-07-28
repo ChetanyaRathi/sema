@@ -1,7 +1,11 @@
 # Sema on Raspberry Pi Pico — Embedded Port Investigation
 
 **Date:** 2026-03-25
-**Status:** Future / Investigation
+**Status:** KILLED (2026-07-28) — four months with zero code (no `no_std` work, no
+embedded crates, no thumbv* targets) and no owner; the serial bridge
+(`serial/send` + MicroPython, `examples/pico-*.sema`) turned out to cover the real
+use cases. Revive by re-proposing fresh — the investigation below stays valid as
+research, but nothing waits on it any more.
 **Depends on:** Bytecode VM (completed), `.semac` format (completed), `sema build` (completed)
 
 ## Overview
