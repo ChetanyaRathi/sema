@@ -42,9 +42,15 @@ runs:
 
     # Smart Rust cache (partial-restores across Cargo.lock changes) instead of
     # an exact-match key that cold-rebuilds the whole workspace each time.
+    # prefix-key rotated off the default: rust-cache never saves on an exact
+    # primary-key hit, so caches written before cache-workspace-crates existed
+    # would exact-hit forever and the workspace release artifacts (what makes
+    # `jake examples` cheap) could never enter the cache. Bump the suffix if
+    # the cache layout changes again.
     - name: Cache cargo + target
       uses: Swatinem/rust-cache@v2
       with:
+        prefix-key: v1-rust-sema
         cache-workspace-crates: ${{ inputs.cache-workspace-crates }}
 
     - name: Install cargo-nextest
