@@ -147,7 +147,7 @@ describe("loadScripts", () => {
     const results = await loadScripts({ evalStr });
 
     expect(results).toHaveLength(2);
-    expect(results[0]?.error).toBe("Evaluation error: boom");
+    expect(results[0]?.error).toBe("Evaluation error in inline-script:0: boom");
     expect(results[1]?.value).toBe("ok");
   });
 
@@ -163,7 +163,7 @@ describe("loadScripts", () => {
 
     const results = await loadScripts({ evalStr: vi.fn(), evalStrAsync });
 
-    expect(errorSpy).toHaveBeenCalledWith("[sema-web] Error in inline script: syntax bad");
+    expect(errorSpy).toHaveBeenCalledWith("[sema-web] Error in inline-script:0: syntax bad");
     expect(results[0]?.error).toBe("syntax bad");
     expect(results[1]?.value).toBe("ok");
   });
@@ -264,7 +264,7 @@ describe("loadScripts", () => {
     });
 
     expect(logSpy).toHaveBeenCalledWith("[sema] archive line");
-    expect(errorSpy).toHaveBeenCalledWith("[sema-web] Error in /app.vfs: runtime err");
+    expect(errorSpy).toHaveBeenCalledWith("[sema-web] Error in script:/app.vfs: runtime err");
     expect(results[0]?.error).toBe("runtime err");
   });
 });

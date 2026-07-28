@@ -20,6 +20,86 @@ interface SemaInterpreterLike {
 }
 
 /**
+ * The `<form>` a node belongs to.
+ *
+ * Prefers a control's own `.form` over `closest("form")`: a control may be
+ * associated with a form by `form="<id>"` while living outside it entirely,
+ * and an ancestor search cannot see that association.
+ */
+export function resolveForm(node: unknown): HTMLFormElement | null {
+  if (!(node instanceof Element)) return null;
+  if (node.tagName === "FORM") return node as HTMLFormElement;
+  const owner = (node as Partial<HTMLInputElement>).form;
+  if (owner) return owner;
+  return node.closest("form");
+}
+
+/**
+ * Flatten a `FormData` into a plain object Sema can read as a map.
+ *
+ * Shape rules, each chosen because the alternative silently corrupts data:
+ *
+ * - a name that appears once is a bare string, a name that repeats is an
+ *   array (a Sema list) — always-array would make every single-value read
+ *   need a `car`, always-scalar would drop every value but the last;
+ * - a `File` becomes `{name, size, type}`, because a `File` JSON-stringifies
+ *   to `{}` on the way across the WASM boundary;
+ * - keys are used verbatim, with NO colon prefix. Object keys are keywordized
+ *   when they cross into Sema, so `title` arrives as `:title`; prefixing here
+ *   would produce `::title` and make every field read nil with no error.
+ *
+ * Built on a null-prototype object so a field literally named `__proto__`
+ * lands as an ordinary key instead of mutating the result's prototype.
+ */
+export function formDataToFields(fd: FormData): Record<string, unknown> {
+  const out: Record<string, unknown> = Object.create(null);
+  for (const [name, entry] of fd.entries()) {
+    const value =
+      typeof entry === "string"
+        ? entry
+        : { name: entry.name, size: entry.size, type: entry.type };
+    if (!(name in out)) {
+      out[name] = value;
+    } else if (Array.isArray(out[name])) {
+      (out[name] as unknown[]).push(value);
+    } else {
+      out[name] = [out[name], value];
+    }
+  }
+  return out;
+}
+
+/**
+ * Extract every submittable field of a form.
+ *
+ * @param submitter - the button that submitted the form, whose own
+ *   name/value is part of the submission. A submitter that belongs to a
+ *   *different* form is a `DOMException`, and an older runtime rejects the
+ *   two-argument constructor outright; neither is worth losing the whole
+ *   extraction over, so both fall back to the form's fields alone.
+ */
+export function formFields(
+  form: HTMLFormElement,
+  submitter?: Element | null,
+): Record<string, unknown> {
+  if (submitter) {
+    try {
+      return formDataToFields(new FormData(form, submitter as HTMLElement));
+    } catch {
+      // fall through to the plain form
+    }
+  }
+  return formDataToFields(new FormData(form));
+}
+
+/** Values of every selected `<option>`; empty for anything that is not a select. */
+function selectedValues(el: Element): string[] {
+  const options = (el as Partial<HTMLSelectElement>).selectedOptions;
+  if (!options) return [];
+  return Array.from(options).map((option) => option.value);
+}
+
+/**
  * Register all `dom/*` namespace functions on the given interpreter.
  *
  * Functions registered:
@@ -52,6 +132,14 @@ interface SemaInterpreterLike {
  * - `dom/render` — render SIP data, return element handle
  * - `dom/render-into!` — render SIP data into a target element
  * - `dom/event-value` — read event.target.value from an event handle
+ * - `dom/event-form-data` — all fields of the form an event came from
+ * - `dom/form-data` — all fields of a form (or a form-owning element)
+ * - `dom/event-form` — the `<form>` an event came from
+ * - `dom/event-current-target` — the element that declared the handler
+ * - `dom/event-checked` — `event.target.checked`
+ * - `dom/checked?` — an element's `checked` state
+ * - `dom/selected-values` — selected `<option>` values of a `<select>`
+ * - `dom/event-selected-values` — the same, from an event handle
  */
 export function registerDomBindings(interp: SemaInterpreterLike, ctx: SemaWebContext): void {
 
@@ -297,6 +385,61 @@ export function registerDomBindings(interp: SemaInterpreterLike, ctx: SemaWebCon
       return storeHandle(target, ctx);
     }
     return null;
+  });
+
+  // --- Event current target (the element that declared the handler) ---
+
+  interp.registerFunction("dom/event-current-target", (evId: number) => {
+    const ev = getEvent(evId, ctx);
+    // For a delegated handler `ev.currentTarget` is the mount root, never the
+    // element the app wrote `:on-click` on; the delegator stashes that one.
+    const declaring = (ev as any).__sema_current_target;
+    if (declaring instanceof Element) return storeHandle(declaring, ctx);
+    const current = ev.currentTarget;
+    return current instanceof Element ? storeHandle(current, ctx) : null;
+  });
+
+  // --- Forms ---
+
+  interp.registerFunction("dom/event-form-data", (evId: number) => {
+    const ev = getEvent(evId, ctx);
+    const form = resolveForm(ev.target);
+    if (!form) return null;
+    return formFields(form, (ev as SubmitEvent).submitter);
+  });
+
+  interp.registerFunction("dom/form-data", (id: number) => {
+    const form = resolveForm(getElement(id, ctx));
+    if (!form) return null;
+    return formFields(form);
+  });
+
+  interp.registerFunction("dom/event-form", (evId: number) => {
+    const ev = getEvent(evId, ctx);
+    return storeHandle(resolveForm(ev.target), ctx);
+  });
+
+  interp.registerFunction("dom/event-checked", (evId: number) => {
+    const ev = getEvent(evId, ctx);
+    const target = ev.target as Partial<HTMLInputElement> | null;
+    if (target && "checked" in target) return Boolean(target.checked);
+    return null;
+  });
+
+  interp.registerFunction("dom/checked?", (id: number) => {
+    const el = getElement(id, ctx) as Partial<HTMLInputElement>;
+    return "checked" in el ? Boolean(el.checked) : false;
+  });
+
+  interp.registerFunction("dom/selected-values", (id: number) => {
+    return selectedValues(getElement(id, ctx));
+  });
+
+  interp.registerFunction("dom/event-selected-values", (evId: number) => {
+    const ev = getEvent(evId, ctx);
+    const target = ev.target;
+    if (!(target instanceof Element)) return null;
+    return selectedValues(target);
   });
 
   // --- Event target closest (find closest ancestor matching selector) ---

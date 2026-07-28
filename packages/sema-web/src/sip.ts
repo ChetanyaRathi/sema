@@ -45,6 +45,353 @@ const NS_ATTR_PREFIXES: Record<string, string> = {
 
 const EVENT_NAME_RE = /^[a-zA-Z][a-zA-Z0-9_-]*$/;
 
+/**
+ * DOM events the delegator listens for on a mount root.
+ *
+ * The single source of truth: `EventDelegator.setup` registers exactly these
+ * (plus the synthetic pair below), and {@link delegationError} refuses any
+ * `on-*` attribute naming something else. Two lists that could drift would
+ * reintroduce the defect this exists to prevent — an `on-*` attribute that
+ * renders, looks right in devtools, and can never fire.
+ *
+ * Everything here bubbles, because delegation from the mount root is only
+ * possible for events that reach it. `focus`/`blur`/`scroll` do not bubble and
+ * are therefore absent; `focusin`/`focusout` are their delegable equivalents.
+ */
+export const DELEGATED_EVENTS: readonly string[] = [
+  // Mouse
+  "click", "dblclick", "auxclick", "contextmenu", "mousedown", "mouseup",
+  "mousemove", "mouseover", "mouseout", "wheel",
+  // Pointer
+  "pointerdown", "pointerup", "pointermove", "pointerover", "pointerout",
+  "pointercancel",
+  // Touch
+  "touchstart", "touchend", "touchmove", "touchcancel",
+  // Keyboard
+  "keydown", "keyup", "keypress",
+  // Form
+  "input", "change", "submit", "reset", "select",
+  // Focus (the bubbling pair)
+  "focusin", "focusout",
+  // Clipboard
+  "copy", "cut", "paste",
+  // Drag and drop
+  "drag", "dragstart", "dragend", "dragenter", "dragleave", "dragover", "drop",
+  // Animation and transition
+  "animationstart", "animationend", "transitionend",
+];
+
+/**
+ * Events synthesized by the delegator from `mouseover`/`mouseout`.
+ *
+ * Routable like the rest, but with no listener of their own — see
+ * `EventDelegator.setup`.
+ */
+export const SYNTHETIC_EVENTS: readonly string[] = ["mouseenter", "mouseleave"];
+
+/** Every event name an `on-*` attribute may name. */
+export const ROUTABLE_EVENTS: ReadonlySet<string> = new Set([
+  ...DELEGATED_EVENTS,
+  ...SYNTHETIC_EVENTS,
+]);
+
+/**
+ * Delegable stand-ins for events that cannot be delegated from the mount root.
+ *
+ * `focus` and `blur` are the two a form is actually likely to want, and the
+ * bubbling pair is a drop-in replacement, so the diagnostic names it rather
+ * than sending the reader to `dom/on!` for no reason.
+ */
+const NON_BUBBLING_ALTERNATIVES: Readonly<Record<string, string>> = {
+  focus: "focusin",
+  blur: "focusout",
+};
+
+/** Levenshtein distance. Only ever reached on the error path. */
+function editDistance(a: string, b: string): number {
+  const previous = new Array<number>(b.length + 1);
+  for (let j = 0; j <= b.length; j++) previous[j] = j;
+  for (let i = 1; i <= a.length; i++) {
+    let diagonal = previous[0];
+    previous[0] = i;
+    for (let j = 1; j <= b.length; j++) {
+      const candidate = Math.min(
+        previous[j] + 1,
+        previous[j - 1] + 1,
+        diagonal + (a[i - 1] === b[j - 1] ? 0 : 1),
+      );
+      diagonal = previous[j];
+      previous[j] = candidate;
+    }
+  }
+  return previous[b.length];
+}
+
+/** The routable event name closest to `name`, if one is close enough to name. */
+function nearestRoutableEvent(name: string): string | null {
+  const lower = name.toLowerCase();
+  let best: string | null = null;
+  let bestDistance = Infinity;
+  for (const candidate of ROUTABLE_EVENTS) {
+    const distance = editDistance(lower, candidate);
+    if (distance < bestDistance) {
+      bestDistance = distance;
+      best = candidate;
+    }
+  }
+  // Two edits over a short name is already most of the word; beyond that the
+  // "did you mean" is noise that would send a reader after the wrong fix.
+  return best !== null && bestDistance <= 2 && bestDistance < lower.length ? best : null;
+}
+
+/**
+ * Why an `on-*` event name cannot be routed, or `null` if it can.
+ *
+ * The event name gets the same treatment as a modifier: a name the delegator
+ * does not listen for is refused loudly. Silence here is the worst failure a
+ * typo can have — `{:on-sumbit.prevent "save"}` renders happily, prevents
+ * nothing, and the form navigates the page away.
+ */
+export function delegationError(event: string, key: string): string | null {
+  if (ROUTABLE_EVENTS.has(event)) return null;
+  const alternative = NON_BUBBLING_ALTERNATIVES[event];
+  if (alternative) {
+    return (
+      `Event "${event}" in attribute: ${key} is not delegated because it does not bubble ` +
+      `to the mount root. Use "${alternative}", which does, or attach it directly with ` +
+      "(dom/on! …) from an on-mount callback."
+    );
+  }
+  const suggestion = nearestRoutableEvent(event);
+  return (
+    `Unknown event "${event}" in attribute: ${key}. ` +
+    (suggestion ? `Did you mean "${suggestion}"? ` : "") +
+    "SIP delegates a fixed set of bubbling DOM events; for anything else " +
+    "(a custom element's event, or a non-bubbling one like scroll) attach the " +
+    "listener directly with (dom/on! …) from an on-mount callback."
+  );
+}
+
+/**
+ * Modifiers a SIP `on-*` attribute may carry: `{:on-submit.prevent "save"}`.
+ *
+ * Declaration order is the canonical encoding order, so `.stop.prevent` and
+ * `.prevent.stop` write a byte-identical attribute and a re-render never
+ * churns it. It is deliberately NOT the order they are *applied* in — see
+ * `tryRun` in `component.ts`, where `.self` filters, then `.prevent` runs, then
+ * `.once` gates, then the handler, then `.stop`.
+ */
+export const EVENT_MODIFIERS = ["prevent", "stop", "once", "capture", "self"] as const;
+
+/** One of {@link EVENT_MODIFIERS}. */
+export type EventModifierName = (typeof EVENT_MODIFIERS)[number];
+
+/** Decoded modifier flags for one `on-*` handler. */
+export type EventModifiers = Readonly<Record<EventModifierName, boolean>>;
+
+/**
+ * The all-false result, shared.
+ *
+ * Returned by {@link readEventModifiers} for the overwhelmingly common
+ * unmodified handler, so delegated dispatch — which runs on every click of
+ * every app — allocates nothing on that path.
+ */
+export const NO_EVENT_MODIFIERS: EventModifiers = Object.freeze({
+  prevent: false,
+  stop: false,
+  once: false,
+  capture: false,
+  self: false,
+});
+
+/**
+ * Prefix of the attribute carrying a handler's modifiers.
+ *
+ * A sibling attribute rather than a suffix on `data-sema-on-<event>`, and
+ * rather than an encoding inside the handler value, for two reasons. The
+ * delegator's upward walk matches on the exact handler attribute name, so the
+ * value must stay exactly the handler name. And a suffix form
+ * (`data-sema-on-<event>-mods`) would collide: event names may contain `-`, so
+ * `{:on-foo-mods "h"}` would be indistinguishable from the modifier set of
+ * event `foo`.
+ */
+export const SIP_EVENT_MODS_PREFIX = "data-sema-mods-";
+
+/** Name of the modifier attribute for an event. */
+export function eventModsAttr(event: string): string {
+  return `${SIP_EVENT_MODS_PREFIX}${event}`;
+}
+
+/** Result of {@link parseEventAttrKey}. */
+export type ParsedEventAttr =
+  | { ok: true; event: string; modifiers: EventModifierName[] }
+  | { ok: false; error: string };
+
+/**
+ * Split a colon-stripped `on-*` attribute key into event name and modifiers.
+ *
+ * @param key - e.g. `"on-submit.prevent"`. The `on-` prefix is assumed; the
+ *   caller has already matched it.
+ *
+ * An unknown or empty modifier is an error rather than something to ignore:
+ * a silently dropped `.prevnt` lets a form navigate away with no signal
+ * anywhere, which is the worst possible failure for a typo to have.
+ *
+ * Syntax only — whether the *event* can actually be routed is
+ * {@link delegationError}'s question, kept separate so the parser stays usable
+ * for reading back an attribute the delegator already accepted.
+ */
+export function parseEventAttrKey(key: string): ParsedEventAttr {
+  const body = key.slice(3);
+  const dot = body.indexOf(".");
+  const event = dot === -1 ? body : body.slice(0, dot);
+  if (!EVENT_NAME_RE.test(event)) {
+    return { ok: false, error: `Invalid event handler attribute: ${key}` };
+  }
+  if (dot === -1) {
+    return { ok: true, event, modifiers: [] };
+  }
+
+  const seen = new Set<EventModifierName>();
+  for (const name of body.slice(dot + 1).split(".")) {
+    if (!(EVENT_MODIFIERS as readonly string[]).includes(name)) {
+      return {
+        ok: false,
+        error:
+          `Invalid event modifier ${JSON.stringify(name)} in attribute: ${key} ` +
+          `(supported: ${EVENT_MODIFIERS.join(", ")})`,
+      };
+    }
+    seen.add(name as EventModifierName);
+  }
+  return { ok: true, event, modifiers: EVENT_MODIFIERS.filter((name) => seen.has(name)) };
+}
+
+/**
+ * Read the modifiers a rendered element declared for an event.
+ *
+ * The delegator calls this only after a handler attribute has already matched,
+ * so an app that uses no modifiers pays one `getAttribute` per dispatched
+ * handler and nothing else.
+ */
+export function readEventModifiers(el: Element, event: string): EventModifiers {
+  const encoded = el.getAttribute(eventModsAttr(event));
+  if (!encoded) return NO_EVENT_MODIFIERS;
+  const mods: Record<EventModifierName, boolean> = {
+    prevent: false,
+    stop: false,
+    once: false,
+    capture: false,
+    self: false,
+  };
+  for (const name of encoded.split(" ")) {
+    if (Object.prototype.hasOwnProperty.call(mods, name)) {
+      mods[name as EventModifierName] = true;
+    }
+  }
+  return mods;
+}
+
+/**
+ * DOM attribute carrying a SIP `:key`.
+ *
+ * A data attribute rather than a side table: morphdom's `getNodeKey` runs
+ * against nodes from *both* trees — the freshly rendered clone and the live
+ * DOM that has persisted across renders — and only an attribute survives on
+ * both without extra bookkeeping. It is namespaced and invisible to users, and
+ * being inspectable makes "why did this row lose focus" answerable in devtools.
+ */
+export const SIP_KEY_ATTR = "data-sema-key";
+
+/**
+ * Read the stable identity of a node for morphdom's diffing.
+ *
+ * Falls back to `id`, which is morphdom's own default — overriding
+ * `getNodeKey` replaces that behaviour entirely, so an app relying on `id` for
+ * stability would silently lose it.
+ */
+export function sipNodeKey(node: Node): string | undefined {
+  if (node.nodeType !== 1) return undefined;
+  const el = node as Element;
+  return el.getAttribute(SIP_KEY_ATTR) || (el as HTMLElement).id || undefined;
+}
+
+/**
+ * Report sibling elements that claim the same `:key`.
+ *
+ * Duplicate keys are the failure mode that looks like a framework bug: morphdom
+ * matches the first node for both, so one row's DOM state (focus, cursor,
+ * scroll, an open `<details>`) silently migrates onto another. Detection is
+ * dev-only — it costs a Set per element with keyed children — and never blocks
+ * the render, matching the acceptance criterion "still render".
+ */
+function reportDuplicateKeys(el: Element, ctx: SemaWebContext, tagName: string): void {
+  const seen = new Set<string>();
+  for (const child of Array.from(el.children)) {
+    const key = child.getAttribute(SIP_KEY_ATTR);
+    if (key == null) continue;
+    if (seen.has(key)) {
+      ctx.onerror(
+        new Error(
+          `Duplicate SIP :key ${JSON.stringify(key)} among the children of <${tagName}>. ` +
+            "Keyed siblings must be unique or DOM state will move between them.",
+        ),
+        `sip-render:duplicate-key:${tagName}`,
+      );
+      continue;
+    }
+    seen.add(key);
+  }
+}
+
+/** Does this element declare a `.once` handler for any event? */
+function declaresOnce(el: Element): boolean {
+  for (const attr of Array.from(el.attributes)) {
+    if (!attr.name.startsWith(SIP_EVENT_MODS_PREFIX)) continue;
+    if (attr.value.split(" ").includes("once")) return true;
+  }
+  return false;
+}
+
+/**
+ * Report a `.once` handler on an unkeyed element that has an unkeyed twin.
+ *
+ * `.once` is spent per DOM element, and morphdom matches unkeyed children by
+ * position and tag name — so a list that reorders hands one row's element to a
+ * different item, carrying the spent mark with it: the row the user clicked
+ * fires again and the row they never touched is permanently dead. The
+ * framework cannot recover item identity here; only a `:key` can supply it,
+ * which is why this is a dev diagnostic and not a fix.
+ *
+ * Deliberately narrow — same tag, both unkeyed — because that is exactly the
+ * condition under which morphdom reuses one element for another item. One
+ * report per parent: a hundred-row list has one bug, not a hundred.
+ */
+function reportKeylessOnce(el: Element, ctx: SemaWebContext, tagName: string): void {
+  const children = Array.from(el.children);
+  if (children.length < 2) return;
+  const unkeyedTags = new Map<string, number>();
+  for (const child of children) {
+    if (child.hasAttribute(SIP_KEY_ATTR) || child.id) continue;
+    unkeyedTags.set(child.tagName, (unkeyedTags.get(child.tagName) ?? 0) + 1);
+  }
+  for (const child of children) {
+    if (child.hasAttribute(SIP_KEY_ATTR) || child.id) continue;
+    if ((unkeyedTags.get(child.tagName) ?? 0) < 2) continue;
+    if (!declaresOnce(child)) continue;
+    ctx.onerror(
+      new Error(
+        `A .once handler on an unkeyed <${child.tagName.toLowerCase()}> with unkeyed siblings of ` +
+          `the same tag, among the children of <${tagName}>. .once is spent per DOM element and ` +
+          "morphdom matches unkeyed siblings by position, so reordering moves the spent handler " +
+          "onto a different item. Give each sibling a :key.",
+      ),
+      `sip-render:once-without-key:${tagName}`,
+    );
+    return;
+  }
+}
+
 function classListToString(values: unknown[]): string {
   let joined = "";
   let hasToken = false;
@@ -85,7 +432,9 @@ const BOOLEAN_ATTRS = new Set([
  * - children: strings, numbers, booleans, or nested SIP vectors
  *
  * Special attribute handling:
- * - `on-*` attributes are event handlers (value = Sema function name string)
+ * - `on-*` attributes are event handlers (value = Sema function name string),
+ *   optionally carrying dotted modifiers (`:on-submit.prevent`) — see
+ *   {@link EVENT_MODIFIERS}
  * - `style` can be a string or a map of CSS properties
  * - `class` sets the class attribute (accepts a string or an array of
  *   strings, space-joined; falsy/nil entries are dropped)
@@ -192,6 +541,11 @@ function renderSipNode(
       el.appendChild(renderSipNode(node[i], interp, ctx, childNamespace));
     }
 
+    if (ctx.diagnostics.enabled) {
+      reportDuplicateKeys(el, ctx, tagName);
+      reportKeylessOnce(el, ctx, tagName);
+    }
+
     return el;
   }
 
@@ -208,7 +562,10 @@ function renderSipNode(
  * Apply attributes from a SIP attrs map to an Element.
  *
  * Handles:
- * - `on-*` -> event listeners (value is a Sema function name)
+ * - `on-*` -> event listeners (value is a Sema function name); dotted
+ *   modifiers on the key (`:on-click.stop.once`) are validated here and
+ *   encoded into a sibling `data-sema-mods-<event>` attribute for the
+ *   delegator to read
  * - `style` -> CSS (string, or a map of properties -> values)
  * - `class` -> the `class` attribute (string, or an array of strings —
  *   space-joined, dropping falsy/nil entries)
@@ -258,9 +615,15 @@ function applyAttributes(
       try {
         if (key.startsWith("on-")) {
           // Event handler: set data attribute for delegated event handling
-          const eventName = key.slice(3);
-          if (!EVENT_NAME_RE.test(eventName)) {
-            ctx.onerror(new Error(`Invalid event handler attribute: ${key}`), "sip-render:on-handler");
+          const parsed = parseEventAttrKey(key);
+          if (!parsed.ok) {
+            ctx.onerror(new Error(parsed.error), "sip-render:on-handler");
+            continue;
+          }
+          const eventName = parsed.event;
+          const unroutable = delegationError(eventName, key);
+          if (unroutable) {
+            ctx.onerror(new Error(unroutable), "sip-render:on-handler");
             continue;
           }
           if (typeof value === "string") {
@@ -269,12 +632,24 @@ function applyAttributes(
               continue;
             }
             el.setAttribute(`data-sema-on-${eventName}`, value);
+            // Written only when there are modifiers, so the delegator can treat
+            // "attribute absent" as the zero-allocation fast path, and a
+            // rejected handler never leaves an orphan modifier attribute.
+            if (parsed.modifiers.length > 0) {
+              el.setAttribute(eventModsAttr(eventName), parsed.modifiers.join(" "));
+              if (parsed.modifiers.includes("capture")) ctx.captureEvents.add(eventName);
+            }
           } else {
             ctx.onerror(
               new Error(`Event handler value for "${key}" must be a string function name, got: ${typeof value}`),
               "sip-render:on-handler",
             );
           }
+        } else if (key === "key") {
+          // Stable identity for diffing. Stringified because Sema keys are
+          // commonly numeric ids, and morphdom compares keys as strings — a
+          // number and its string form must name the same node.
+          el.setAttribute(SIP_KEY_ATTR, String(value));
         } else if (key === "style") {
           if (typeof value === "string") {
             el.setAttribute("style", value);

@@ -1,0 +1,150 @@
+;; Event modifiers and form helpers, driven end to end.
+;;
+;; This is the only place the whole chain is real: a dotted keyword in the
+;; source (`:on-submit.prevent`) survives the reader, crosses the WASM map-key
+;; marshalling, is encoded as a DOM attribute, is decoded by the delegator, and
+;; the extracted form fields come back as a keyword-keyed Sema map. jsdom can
+;; check every link separately; only a browser can check the chain.
+;;
+;; Everything that reads the DOM happens inside an event HANDLER rather than
+;; inside a render, because that is where reading the DOM belongs — not because
+;; a render cannot make host calls. It could not until 2026-07-28 (the WASM trap
+;; recorded as docs/limitations.md 38, now RESOLVED); the rows list below
+;; renders modified `on-*` attributes from inside a `map` callback, the shape
+;; that used to trap, and it has been exercising the restored contract in real
+;; Chrome ever since.
+
+;; ── State ───────────────────────────────────────────────────────────
+
+(def title-field (state ""))
+(def tag-field (state ""))
+(def action-field (state ""))
+(def skipped-field (state "absent"))
+(def once-count (state 0))
+(def once-submits (state 0))
+(def row-hits (state 0))
+(def stop-hits (state 0))
+(def backdrop-hits (state 0))
+(def capture-log (state ""))
+(def checked-text (state ""))
+(def picked (state ""))
+(def rows (state (list 1 2 3)))
+
+;; ── Helpers (handler-side only) ─────────────────────────────────────
+
+(define (join-strings items sep)
+  (if (null? items)
+    ""
+    (if (null? (cdr items))
+      (car items)
+      (string-append (car items) sep (join-strings (cdr items) sep)))))
+
+;; A field that occurs once is a bare string; a repeated one is a list.
+(define (field-text v)
+  (if (string? v) v (join-strings v "|")))
+
+;; ── Handlers ────────────────────────────────────────────────────────
+
+(define (save ev)
+  (let ((fields (dom/event-form-data ev)))
+    (put! title-field (:title fields))
+    (put! tag-field (field-text (:tag fields)))
+    (put! action-field (:action fields))
+    (put! skipped-field (if (:skipped fields) "present" "absent"))))
+
+(define (bump-once ev) (put! once-count (+ @once-count 1)))
+(define (save-once ev) (update! once-submits (fn (n) (+ n 1))))
+(define (row-click ev) (put! row-hits (+ @row-hits 1)))
+(define (stop-click ev) (put! stop-hits (+ @stop-hits 1)))
+(define (backdrop-click ev) (put! backdrop-hits (+ @backdrop-hits 1)))
+
+(define (capture-outer ev)
+  (put! capture-log (string-append @capture-log "outer;")))
+
+(define (capture-inner ev)
+  (put! capture-log (string-append @capture-log "inner;")))
+
+(define (toggle-box ev)
+  (put! checked-text (if (dom/event-checked ev) "on" "off")))
+
+(define (pick-sizes ev)
+  (put! picked (join-strings (dom/event-selected-values ev) ",")))
+
+;; ── View ────────────────────────────────────────────────────────────
+
+(defcomponent app ()
+  [:main
+   ;; `.prevent` on a form that really would navigate.
+   [:form {:data-testid "form"
+           :action "/navigated.html"
+           :method "get"
+           :on-submit.prevent "save"}
+    [:input {:name "title" :value "hello" :data-testid "title"}]
+    [:input {:name "tag" :value "a"}]
+    [:input {:name "tag" :value "b"}]
+    [:input {:name "skipped" :value "x" :disabled #t}]
+    [:input {:value "unnamed"}]
+    [:button {:type "submit" :name "action" :value "save" :data-testid "submit"} "Save"]]
+
+   [:p {:data-testid "title-field"} @title-field]
+   [:p {:data-testid "tag-field"} @tag-field]
+   [:p {:data-testid "action-field"} @action-field]
+   [:p {:data-testid "skipped-field"} @skipped-field]
+
+   ;; The control: the same form without the modifier, which must navigate.
+   [:form {:data-testid "plain-form" :action "/navigated.html" :method "get"}
+    [:input {:name "q" :value "1"}]
+    [:button {:type "submit" :data-testid "plain-submit"} "Go"]]
+
+   ;; `.stop` inside a clickable row, rendered from a map callback.
+   [:ul {:data-testid "rows"}
+    (map (fn (n)
+           [:li {:key n
+                 :data-testid "row"
+                 :data-row (number->string n)
+                 :on-click "row-click"}
+            [:span {:data-testid "row-label"} (number->string n)]
+            [:button {:data-testid "row-stop" :on-click.stop "stop-click"} "stop"]])
+         @rows)]
+   [:p {:data-testid "row-hits"} (number->string @row-hits)]
+   [:p {:data-testid "stop-hits"} (number->string @stop-hits)]
+
+   ;; `.once` across reactive re-renders.
+   [:button {:data-testid "once" :on-click.once "bump-once"} "once"]
+   [:p {:data-testid "once-count"} (number->string @once-count)]
+
+   ;; `.prevent.once` on a form that really would navigate. The handler is
+   ;; spent after the first submit; the prevention is not.
+   [:form {:data-testid "once-form"
+           :action "/navigated.html"
+           :method "get"
+           :on-submit.prevent.once "save-once"}
+    [:input {:type "hidden" :name "q" :value "1"}]
+    [:button {:type "submit" :data-testid "once-submit"} "Go"]]
+   [:p {:data-testid "once-submits"} (number->string @once-submits)]
+
+   ;; `.self` — only a click on the backdrop itself closes it.
+   ;; The padding gives the spec somewhere to click that is the backdrop
+   ;; itself rather than the button it contains.
+   [:div {:data-testid "backdrop"
+          :style "padding: 24px"
+          :on-click.self "backdrop-click"}
+    [:button {:data-testid "backdrop-inner"} "inner"]]
+   [:p {:data-testid "backdrop-hits"} (number->string @backdrop-hits)]
+
+   ;; `.capture` — the ancestor sees the click first.
+   [:div {:data-testid "capture-outer" :on-click.capture "capture-outer"}
+    [:button {:data-testid "capture-inner" :on-click "capture-inner"} "inner"]]
+   [:p {:data-testid "capture-log"} @capture-log]
+
+   ;; Checkbox and multi-select readers.
+   [:input {:type "checkbox" :data-testid "box" :on-change "toggle-box"}]
+   [:p {:data-testid "checked-text"} @checked-text]
+
+   [:select {:multiple #t :data-testid "sizes" :on-change "pick-sizes"}
+    [:option {:value "s"} "small"]
+    [:option {:value "m"} "medium"]
+    [:option {:value "l"} "large"]]
+   [:p {:data-testid "picked"} @picked]])
+
+(mount! "#app" app)

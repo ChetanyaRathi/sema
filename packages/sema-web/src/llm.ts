@@ -50,7 +50,7 @@
 
 import { signal } from "@preact/signals-core";
 import type { SemaWebContext } from "./context.js";
-import { getCurrentOwnerId } from "./context.js";
+import { getCurrentOwnerId, registerStream, unregisterStream } from "./context.js";
 import { openSseStream } from "./sse.js";
 
 interface SemaInterpreterLike {
@@ -86,6 +86,168 @@ export interface LlmProxyOptions {
   timeout?: number;
 }
 
+/** The reactive value a `llm/chat-stream` signal holds. */
+export interface LlmStreamState {
+  text: string;
+  done: boolean;
+  error: string | null;
+}
+
+/**
+ * Build the header set sent on every proxy request.
+ *
+ * Precedence, from weakest to strongest:
+ * 1. `Content-Type: application/json` — the proxy contract, but overridable
+ *    (a proxy may want an explicit charset).
+ * 2. `opts.headers` — caller-supplied.
+ * 3. `Authorization: Bearer <token>` — **wins** whenever a token is configured.
+ *
+ * Auth deliberately sits on top. A caller who sets both a `token` and their own
+ * `Authorization` header has expressed a contradiction, and the safe reading is
+ * that the explicitly-named credential is the intended one — silently
+ * downgrading it to whatever happened to be in a generic header bag is how
+ * requests end up unauthenticated in production. With no token configured a
+ * custom `Authorization` header passes through untouched, so proxies using a
+ * non-Bearer scheme still work.
+ *
+ * Exported for testing and for callers that need to reproduce the exact header
+ * set (a service worker, a custom fetch wrapper).
+ */
+export function buildProxyHeaders(opts: LlmProxyOptions): Record<string, string> {
+  const headers: Record<string, string> = { "Content-Type": "application/json" };
+
+  for (const [key, value] of Object.entries(opts.headers ?? {})) {
+    headers[key] = value;
+  }
+
+  if (opts.token) {
+    const overridden = Object.keys(opts.headers ?? {}).find(
+      (k) => k.toLowerCase() === "authorization",
+    );
+    if (overridden) {
+      console.warn(
+        `[sema-web] llmProxy: both \`token\` and a custom \`${overridden}\` header were ` +
+          "provided. The token wins. Drop one to silence this warning.",
+      );
+      delete headers[overridden];
+    }
+    headers["Authorization"] = `Bearer ${opts.token}`;
+  }
+
+  return headers;
+}
+
+/**
+ * Serialize the proxy headers as a Sema map literal.
+ *
+ * Every key and value goes through {@link escapeSemaString}: these strings are
+ * interpolated into Sema *source*, so an unescaped quote in a token or a custom
+ * header would close the string literal and let the remainder be parsed as
+ * code. Exported so tests exercise this exact serializer rather than a
+ * re-implementation that would quietly diverge from it.
+ */
+export function buildProxyHeadersMap(opts: LlmProxyOptions): string {
+  const headers = buildProxyHeaders(opts);
+  return `{${Object.entries(headers)
+    .map(([k, v]) => `"${escapeSemaString(k)}" "${escapeSemaString(v)}"`)
+    .join(" ")}}`;
+}
+
+/**
+ * Accumulate the proxy's streaming protocol into a signal value.
+ *
+ * The protocol is newline-delimited JSON over SSE:
+ * `{"type":"token","text":"..."}`, `{"type":"done"}`, `{"type":"error","error":"..."}`.
+ * The OpenAI-style `[DONE]` sentinel is also accepted, because proxies that
+ * pass a provider stream straight through emit it and `JSON.parse` would
+ * otherwise report it as a corrupt payload.
+ *
+ * **Terminal states latch.** Once the stream reports done or error, later
+ * events are ignored. Without this a trailing token after an error would reset
+ * `error` to `null` and `done` to `false` — the UI would clear the error
+ * message it just showed and hang on a stream that already finished.
+ *
+ * Exported for testing: this is the whole protocol contract, and it is worth
+ * being able to exercise without a network.
+ */
+export function createStreamAccumulator(emit: (state: LlmStreamState) => void) {
+  let text = "";
+  let error: string | null = null;
+  let terminal = false;
+
+  const state = (): LlmStreamState => ({ text, done: terminal, error });
+
+  return {
+    get state(): LlmStreamState {
+      return state();
+    },
+
+    /** Handle one SSE `data:` payload. */
+    event(data: string): void {
+      if (terminal || !data) return;
+
+      // Provider passthrough sentinel — a valid end-of-stream marker, not JSON.
+      if (data.trim() === "[DONE]") {
+        terminal = true;
+        emit(state());
+        return;
+      }
+
+      let parsed: any;
+      try {
+        parsed = JSON.parse(data);
+      } catch {
+        terminal = true;
+        error = "Invalid stream payload";
+        emit(state());
+        return;
+      }
+
+      if (parsed?.type === "token" && typeof parsed.text === "string") {
+        text += parsed.text;
+        emit(state());
+        return;
+      }
+      if (parsed?.type === "done") {
+        terminal = true;
+        emit(state());
+        return;
+      }
+      if (parsed?.type === "error") {
+        terminal = true;
+        error = typeof parsed.error === "string" ? parsed.error : "Stream error";
+        emit(state());
+        return;
+      }
+      // Unknown frame types are ignored rather than treated as corruption:
+      // proxies add metadata frames (usage, model echo) and an app should not
+      // break because its proxy got more informative.
+    },
+
+    /** Handle a transport-level failure. */
+    fail(message: string): void {
+      if (terminal) return;
+      terminal = true;
+      error = message;
+      emit(state());
+    },
+
+    /**
+     * Handle the stream closing.
+     *
+     * A close with no prior terminal frame means the connection ended without
+     * a `done` — mark it finished so consumers stop waiting, but do not invent
+     * an error: a proxy that closes cleanly after its last token is behaving
+     * acceptably, just tersely.
+     */
+    close(): void {
+      if (terminal) return;
+      terminal = true;
+      emit(state());
+    },
+  };
+}
+
 /**
  * Register all `llm/*` namespace functions that proxy to a backend server.
  *
@@ -112,18 +274,15 @@ export function registerLlmBindings(
 ): void {
   const proxyUrl = opts.url.replace(/\/+$/, "");
 
-  // Build the headers map as a Sema literal expression
-  const headerPairs: string[] = [];
-  headerPairs.push(`"Content-Type" "application/json"`);
-  if (opts.token) {
-    headerPairs.push(`"Authorization" "Bearer ${escapeSemaString(opts.token)}"`);
-  }
-  if (opts.headers) {
-    for (const [k, v] of Object.entries(opts.headers)) {
-      headerPairs.push(`"${escapeSemaString(k)}" "${escapeSemaString(v)}"`);
-    }
-  }
-  const headersMap = `{${headerPairs.join(" ")}}`;
+  // One header set for both transports. These used to be built twice — a Sema
+  // map literal for the `http/post` path and a JS object for the streaming
+  // path — with *opposite* precedence: custom headers overrode the token in
+  // one and lost to it in the other. Identical config therefore authenticated
+  // differently depending on whether the call streamed. Building once removes
+  // the class of bug, and dedupes keys for free (the literal could previously
+  // emit `"Authorization"` twice).
+  const proxyHeaders = buildProxyHeaders(opts);
+  const headersMap = buildProxyHeadersMap(opts);
 
   // Register a simple JS function for the proxy URL (sync, no HTTP needed)
   interp.registerFunction("llm/proxy-url", () => proxyUrl);
@@ -145,21 +304,12 @@ export function registerLlmBindings(
     const streamOpts = optsJson ? JSON.parse(optsJson) : {};
 
     const id = ctx.nextSignalId++;
-    const s = signal<{ text: string; done: boolean; error: string | null }>({
+    const s = signal<LlmStreamState>({
       text: "",
       done: false,
       error: null,
     });
     ctx.signals.set(id, s as any);
-
-    // Build request headers
-    const headers: Record<string, string> = {
-      "Content-Type": "application/json",
-      ...(opts.headers || {}),
-    };
-    if (opts.token) {
-      headers["Authorization"] = `Bearer ${opts.token}`;
-    }
 
     // Strip colon prefixes from Sema keyword keys (":role" → "role")
     function stripColonKeys(obj: any): any {
@@ -181,50 +331,24 @@ export function registerLlmBindings(
       stream: true,
     });
 
-    let accumulated = "";
+    const accumulator = createStreamAccumulator((state) => {
+      s.value = state;
+    });
+
     const managedStream = openSseStream({
       url: `${proxyUrl}/stream`,
       method: "POST",
-      headers,
+      headers: proxyHeaders,
       body,
-      onEvent: (event) => {
-        if (!event.data) return;
-        try {
-          const parsed = JSON.parse(event.data);
-          if (parsed.type === "token" && typeof parsed.text === "string") {
-            accumulated += parsed.text;
-            s.value = { text: accumulated, done: false, error: null };
-            return;
-          }
-          if (parsed.type === "done") {
-            s.value = { text: accumulated, done: true, error: null };
-            return;
-          }
-          if (parsed.type === "error") {
-            s.value = {
-              text: accumulated,
-              done: true,
-              error: typeof parsed.error === "string" ? parsed.error : "Stream error",
-            };
-          }
-        } catch {
-          s.value = { text: accumulated, done: true, error: "Invalid stream payload" };
-        }
-      },
-      onError: (error) => {
-        s.value = { text: accumulated, done: true, error: error.message };
-      },
+      onEvent: (event) => accumulator.event(event.data),
+      onError: (error) => accumulator.fail(error.message),
       onClose: () => {
-        ctx.streams.delete(id);
-        s.value = {
-          text: accumulated,
-          done: true,
-          error: s.value.error,
-        };
+        unregisterStream(ctx, id);
+        accumulator.close();
       },
     });
 
-    ctx.streams.set(id, {
+    registerStream(ctx, id, {
       kind: "llm-stream",
       close: managedStream.close,
     });
@@ -239,7 +363,7 @@ export function registerLlmBindings(
     const stream = ctx.streams.get(signalId);
     if (stream) {
       stream.close();
-      ctx.streams.delete(signalId);
+      unregisterStream(ctx, signalId);
       for (const component of ctx.mountedComponents.values()) {
         component.ownedStreamIds.delete(signalId);
       }
@@ -247,46 +371,125 @@ export function registerLlmBindings(
 
     const current = ctx.signals.get(signalId) as any;
     if (current) {
+      // Always emit the full `{text, done, error}` shape. Spreading whatever
+      // was there could yield a bare `{done: true}` for a signal that never
+      // received a frame, and Sema code doing `(:text (deref s))` would get
+      // nil instead of the empty string it gets everywhere else.
+      const previous: Partial<LlmStreamState> = current.value ?? {};
       current.value = {
-        ...(current.value ?? {}),
+        text: typeof previous.text === "string" ? previous.text : "",
         done: true,
-      };
+        error: previous.error ?? null,
+      } satisfies LlmStreamState;
     }
     return null;
   });
 
-  // Define all LLM proxy functions as Sema code.
-  // These use http/post which the WASM async loop intercepts for fetch().
-  const semaCode = `
+  const semaCode = buildLlmProxySema(proxyUrl, headersMap);
+
+  const result = interp.evalStr(semaCode);
+  if (result.error) {
+    throw new Error(`[sema-web] Failed to register LLM bindings: ${result.error}`);
+  }
+}
+
+/**
+ * Escape a string for safe embedding in Sema code.
+ * Handles backslashes, double quotes, newlines, carriage returns, and tabs.
+ */
+function escapeSemaString(s: string): string {
+  return s
+    .replace(/\\/g, "\\\\")
+    .replace(/"/g, '\\"')
+    .replace(/\n/g, "\\n")
+    .replace(/\r/g, "\\r")
+    .replace(/\t/g, "\\t");
+}
+
+/**
+ * Build the Sema half of the proxy client.
+ *
+ * Extracted from `registerLlmBindings` so it can be validated on its own. This
+ * is ~75 lines of Sema embedded in a TypeScript string: nothing in the type
+ * checker, the bundler, or the unit suite can see a typo in it, and the only
+ * previous signal was a thrown error at `SemaWeb.create()` time in a browser.
+ * `llm-proxy-sema.test.ts` now loads the output into the real `sema` binary.
+ *
+ * @param proxyUrl - Base URL, trailing slashes already stripped.
+ * @param headersMap - A Sema map literal, pre-built by {@link buildProxyHeaders}.
+ */
+export function buildLlmProxySema(proxyUrl: string, headersMap: string): string {
+  return `
 ;; --- LLM proxy internals ---
 
 (define __llm-proxy-url "${escapeSemaString(proxyUrl)}")
 (define __llm-proxy-headers ${headersMap})
 
+;; Normalize a raw http/* response into decoded JSON, or raise.
+;;
+;; Both transports must fail the same way. Previously this returned the decoded
+;; body regardless of status, so a proxy 500 with a JSON error body came back
+;; as an ordinary value and (llm/chat ...) handed the caller an error map
+;; where it expected a string — the failure surfaced later, somewhere else, as
+;; a type confusion. Streaming already reported errors properly through the
+;; signal's :error field; this brings the request path in line.
+(define (__llm-proxy-normalize endpoint resp)
+  (if (not (map? resp))
+    resp
+    (let ((status (or (:status resp) 200))
+          (body (:body resp)))
+      (cond
+        ((>= status 400)
+          (error (format "llm proxy ~a failed: HTTP ~a~a" endpoint status
+                   (if (and (string? body) (> (string-length body) 0))
+                     (format " - ~a" body)
+                     ""))))
+        ((not (string? body)) resp)
+        ((= (string-length body) 0) {})
+        (else
+          (try
+            (json/decode body)
+            (catch e
+              (error (format "llm proxy ~a returned a body that is not valid JSON"
+                       endpoint)))))))))
+
 ;; Helper: POST to the proxy and decode the JSON response body.
 (define (__llm-proxy-post endpoint body-map)
-  (let ((url (string-append __llm-proxy-url "/" endpoint))
-        (resp (http/post url
-                {:headers __llm-proxy-headers
-                 :body (json/encode body-map)})))
-    (if (and (map? resp) (:body resp))
-      (json/decode (:body resp))
-      resp)))
+  (let ((url (string-append __llm-proxy-url "/" endpoint)))
+    (__llm-proxy-normalize endpoint
+      (http/post url
+        {:headers __llm-proxy-headers
+         :body (json/encode body-map)}))))
 
 ;; Helper: GET from the proxy.
 (define (__llm-proxy-get endpoint)
-  (let ((url (string-append __llm-proxy-url "/" endpoint))
-        (resp (http/get url {:headers __llm-proxy-headers})))
-    (if (and (map? resp) (:body resp))
-      (json/decode (:body resp))
-      resp)))
+  (let ((url (string-append __llm-proxy-url "/" endpoint)))
+    (__llm-proxy-normalize endpoint
+      (http/get url {:headers __llm-proxy-headers}))))
+
+;; --- Message normalization ---
+;;
+;; (message :user "hi") is a SPECIAL FORM in the Sema core, and a special form
+;; always wins in operator position - see limitations.md #36. A
+;; (define (message ...)) here therefore never takes effect; this module used to
+;; ship one anyway, so every caller silently got the core form instead. That
+;; form produces a :message value, and json/encode refuses to encode it
+;; ("cannot encode message as JSON"), which broke the documented usage
+;; (llm/chat (list (message :user "Hi"))) outright.
+;;
+;; So: don't fight the special form, convert its output. Every request path
+;; funnels messages through here before encoding.
+(define (__llm-message->map m)
+  (if (= (type-of m) :message)
+    {:role (message/role m) :content (message/content m)}
+    m))
+
+(define (__llm-normalize-messages messages)
+  (if (list? messages)
+    (map __llm-message->map messages)
+    (__llm-message->map messages)))
 
 ;; --- Public API ---
-
-;; (message role content) — build a chat message map
-(define (message role content)
-  {:role (if (keyword? role) (keyword->string role) (->string role))
-   :content content})
 
 ;; (llm/complete prompt) or (llm/complete prompt opts)
 ;; Send a simple prompt for completion.
@@ -302,7 +505,8 @@ export function registerLlmBindings(
 ;; Chat with a list of message maps.
 (define (llm/chat messages . rest)
   (let ((opts (if (null? rest) {} (car rest))))
-    (let ((body (merge {:messages messages} (if (map? opts) opts {}))))
+    (let ((body (merge {:messages (__llm-normalize-messages messages)}
+                  (if (map? opts) opts {}))))
       (let ((result (__llm-proxy-post "chat" body)))
         (if (map? result)
           (or (:content result) (:text result) result)
@@ -313,7 +517,8 @@ export function registerLlmBindings(
 (define (llm/send prompt . rest)
   (let ((opts (if (null? rest) {} (car rest))))
     (let ((messages (if (list? prompt) prompt (list prompt))))
-      (let ((body (merge {:messages messages} (if (map? opts) opts {}))))
+      (let ((body (merge {:messages (__llm-normalize-messages messages)}
+                    (if (map? opts) opts {}))))
         (let ((result (__llm-proxy-post "chat" body)))
           (if (map? result)
             (or (:content result) (:text result) result)
@@ -351,28 +556,10 @@ export function registerLlmBindings(
 (define (llm/chat-stream messages . rest)
   (let ((opts (if (null? rest) {} (car rest))))
     (__llm/chat-stream-raw
-      (json/encode messages)
+      (json/encode (__llm-normalize-messages messages))
       (json/encode (if (map? opts) opts {})))))
 
 (define (llm/close-stream signal-id)
   (__llm/close-stream signal-id))
 `;
-
-  const result = interp.evalStr(semaCode);
-  if (result.error) {
-    throw new Error(`[sema-web] Failed to register LLM bindings: ${result.error}`);
-  }
-}
-
-/**
- * Escape a string for safe embedding in Sema code.
- * Handles backslashes, double quotes, newlines, carriage returns, and tabs.
- */
-function escapeSemaString(s: string): string {
-  return s
-    .replace(/\\/g, "\\\\")
-    .replace(/"/g, '\\"')
-    .replace(/\n/g, "\\n")
-    .replace(/\r/g, "\\r")
-    .replace(/\t/g, "\\t");
 }

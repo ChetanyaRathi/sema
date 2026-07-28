@@ -10,7 +10,7 @@
 
 import { signal } from "@preact/signals-core";
 import type { SemaWebContext } from "./context.js";
-import { getCurrentOwnerId } from "./context.js";
+import { getCurrentOwnerId, registerStream, unregisterStream } from "./context.js";
 import { openSseStream } from "./sse.js";
 
 interface SemaInterpreterLike {
@@ -86,7 +86,7 @@ function closeManagedStream(ctx: SemaWebContext, signalId: number): void {
   const stream = ctx.streams.get(signalId);
   if (!stream) return;
   stream.close();
-  ctx.streams.delete(signalId);
+  unregisterStream(ctx, signalId);
   for (const component of ctx.mountedComponents.values()) {
     component.ownedStreamIds.delete(signalId);
   }
@@ -151,7 +151,7 @@ export function registerHttpBindings(interp: SemaInterpreterLike, ctx: SemaWebCo
         };
       },
       onClose: () => {
-        ctx.streams.delete(id);
+        unregisterStream(ctx, id);
         s.value = {
           ...s.value,
           done: true,
@@ -160,7 +160,7 @@ export function registerHttpBindings(interp: SemaInterpreterLike, ctx: SemaWebCo
       },
     });
 
-    ctx.streams.set(id, {
+    registerStream(ctx, id, {
       kind: "event-source",
       close: managedStream.close,
     });

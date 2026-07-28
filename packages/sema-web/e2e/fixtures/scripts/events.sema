@@ -1,0 +1,59 @@
+;; Event ROUTING: which `on-*` names reach a handler, and which are refused.
+;;
+;; Kept apart from forms.sema because half of this fixture is about failures
+;; that must be reported — that fixture asserts an empty error list.
+;;
+;; Two things only a browser can show. A misspelled event name renders an
+;; attribute that looks right in devtools and can never fire, so the form it
+;; was meant to guard really does navigate away; the diagnostic is the only
+;; signal there will ever be. And `mouseenter` has no delegated form at all —
+;; it is synthesized from `mouseover` plus `relatedTarget`, which needs a real
+;; pointer crossing real geometry to exercise.
+
+(def hover-log (state ""))
+(def keys-seen (state 0))
+
+(define (note s) (put! hover-log (string-append @hover-log s ";")))
+
+(define (card-enter ev) (note "card-enter"))
+(define (card-leave ev) (note "card-leave"))
+(define (btn-enter ev) (note "btn-enter"))
+(define (btn-leave ev) (note "btn-leave"))
+
+;; Delegated on an event that used to install a dead attribute.
+(define (count-mousedown ev) (update! keys-seen (fn (n) (+ n 1))))
+
+(defcomponent app ()
+  [:main
+   ;; A misspelled event name: `sumbit`, one transposition. The `.prevent` it
+   ;; carries can never run, so the form would navigate.
+   [:form {:data-testid "typo-form"
+           :action "/navigated.html"
+           :method "get"
+           :on-sumbit.prevent "note"}
+    [:input {:type "hidden" :name "q" :value "1"}]
+    [:button {:type "submit" :data-testid "typo-submit"} "Go"]]
+
+   ;; A non-bubbling event that cannot be delegated from the mount root.
+   [:input {:data-testid "focus-input" :on-focus "note"}]
+
+   ;; Nested hover: one pointer move from outside the card onto the button
+   ;; enters both, and both handlers must run.
+   [:div {:data-testid "card"
+          :id "card"
+          :style "width: 240px; padding: 40px; background: #eee"
+          :on-mouseenter "card-enter"
+          :on-mouseleave "card-leave"}
+    [:button {:data-testid "hover-btn"
+              :id "hover-btn"
+              :style "width: 160px; height: 60px"
+              :on-mouseenter "btn-enter"
+              :on-mouseleave "btn-leave"}
+     "buy"]]
+   [:p {:data-testid "hover-log"} @hover-log]
+
+   ;; Delegation for an event outside the original hardcoded list.
+   [:button {:data-testid "mousedown-btn" :on-mousedown "count-mousedown"} "press"]
+   [:p {:data-testid "mousedown-count"} (number->string @keys-seen)]])
+
+(mount! "#app" app)

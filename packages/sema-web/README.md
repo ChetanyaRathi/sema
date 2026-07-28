@@ -36,6 +36,12 @@ Add Sema to any HTML page:
 npm install @sema-lang/sema-web
 ```
 
+The package is ESM-only. It targets browsers and bundlers, and the interpreter
+it wraps (`@sema-lang/sema`) is ESM-only too, so there is no CommonJS build to
+`require()` — on Node 22.12 or newer `require("@sema-lang/sema-web")` still
+works through Node's own `require(esm)` support; older Node needs
+`await import(...)`. TypeScript consumers want `"module": "nodenext"`.
+
 Or use from a CDN:
 
 ```html
@@ -158,7 +164,23 @@ instead of evaluating source in the browser.
 (dom/on! el "click" "my-handler")
 (dom/off! el "click" my-handler)
 (dom/prevent-default! event)
+(dom/event-current-target event)   ;; → the element that declared the handler
+
+;; Forms
+(dom/event-form-data event)        ;; → {:title "hi" :tag ("a" "b")} or nil
+(dom/form-data el)                 ;; → the same, from a form (or any element in one)
+(dom/event-form event)             ;; → the owning <form> handle or nil
+
+;; Checkbox / radio / select
+(dom/event-checked event)          ;; → #t / #f / nil
+(dom/checked? el)                  ;; → #t or #f
+(dom/selected-values select-el)    ;; → ("s" "l")
+(dom/event-selected-values event)  ;; → the same, from an event
 ```
+
+A field name that occurs once is a string; a repeated one is a list. File
+inputs come back as `{:name … :size … :type …}`. Unchecked, disabled, and
+unnamed controls are absent, as in a real submission.
 
 ### `store/*` — Persistent Storage
 
@@ -209,6 +231,52 @@ streaming SSE API for long-lived responses.
 `EventSource`, so it supports headers, credentials, and POST bodies. Streams created in
 components are automatically closed on unmount.
 
+### `resource` — Async Data in a Signal
+
+A resource wraps one request in a reactive signal, so a component renders
+loading, error, and success from a single dereference and never touches a
+promise.
+
+```sema
+(defcomponent user-card (props)
+  (def u (resource "user" (fn () (string-append "/api/users/" (:id props)))))
+
+  (cond
+    ((:loading @u) [:p "Loading..."])
+    ((:error @u)   [:p {:class "error"} (:error @u)])
+    (else          [:h2 (:name (:value @u))])))
+```
+
+The spec function **describes** the request — a URL string, or a map with
+`:url`, `:method`, `:headers`, `:body`, `:with-credentials`, `:as` — and the
+runtime performs it: every `http/*` native rejects on the synchronous path a
+host-invoked Sema callback always runs on. Dereferencing gives
+`{:loading :value :error :status}`, and a refetch keeps the previous `:value`
+and `:status` on screen rather than blanking the UI.
+
+A resource **refetches when the request its spec resolves to changes**. The spec
+is re-resolved on a clean stack whenever the owning component re-renders, and a
+moved URL, method, header, or body starts a fresh attempt; an identical request
+does nothing. The comparison is on the request and never on the closure, since a
+render allocates a new closure every time. A spec reading state the view does
+not read has nothing to re-render it — read the value in the view, or refresh
+explicitly with `(effect (list @uid) (fn () (resource/refresh! "user")))`.
+
+```sema
+(resource/refresh! "user")   ;; revalidate, keeping the current value
+(resource/cancel! "user")    ;; abort the in-flight attempt; not a failure
+```
+
+`(resource "name" …)` is memoized per component instance — including per
+composed child — which is what stops "response writes signal → re-render → new
+resource → new request" from looping. The unnamed form `(resource spec-fn)` is
+for module top level; inside a component (render, effect body, event handler,
+timer) it is rejected, because each of those runs again and would allocate a new
+request and signal every time. Unmounting aborts the request and releases
+everything it owned.
+
+Full documentation: [Async Resources](https://sema-lang.com/docs/web/resources).
+
 ### `console/*` — Browser Console
 
 ```sema
@@ -242,6 +310,13 @@ Reactive state is built around signals.
 
 Use `(watch signal callback)` to observe changes and `(unwatch! watch-id)` to dispose a watch.
 
+`watch` and `computed` belong somewhere that runs once — module top level,
+`on-mount`, or an `effect` body. Called from a component's **render body** they
+run again on every render, so the runtime keeps them bounded: a watch is
+memoized per render site (one subscription, callback swapped each render, and
+one `onerror` note per component), and a computed is disposed and rebuilt so its
+value always matches the render that read it.
+
 ### SIP — Declarative DOM
 
 Describe UI as data using vectors and maps (the hiccup convention):
@@ -258,7 +333,7 @@ Describe UI as data using vectors and maps (the hiccup convention):
 **Attributes:**
 - `class` — sets className
 - `style` — CSS string or property map: `{:color "red" :font-size "14px"}`
-- `on-*` — SIP delegated event handlers use a Sema function name string: `{:on-click "my-handler"}`
+- `on-*` — SIP delegated event handlers use a Sema function name string: `{:on-click "my-handler"}`, optionally with dotted modifiers: `.prevent`, `.stop`, `.once`, `.capture`, `.self` (`{:on-submit.prevent "save"}`, `{:on-click.stop.once "buy"}`). `.prevent` runs before the handler — and keeps running after a `.once` is spent, so a `.prevent.once` form never navigates — while `.stop` runs after it. An unknown modifier **or an event name the delegator does not listen for** is reported through `onerror` and the handler is not installed: `{:on-sumbit.prevent "save"}` would otherwise render an attribute that can never fire, and the form would navigate away with no signal at all. For an event outside the delegated set (a custom element's, or a non-bubbling one like `scroll`), attach it with `dom/on!` from an `on-mount` callback
 - `value`, `checked`, `disabled` — form element properties
 - All other attributes use `setAttribute`
 
@@ -306,7 +381,107 @@ The component **automatically re-renders** when signals it reads during render c
 **Component functions:**
 - `(mount! selector fn-name)` — mount a component to a CSS selector
 - `(component/unmount! selector)` — remove a mounted component
-- `(component/force-render! selector)` — force re-render
+- `(component/force-render! selector)` — force re-render. Refused and reported
+  as `force-render:<component>` if that component is already rendering, so it
+  belongs in an event handler, not in a render or effect body.
+
+**Lifecycle (inside a component body):**
+- `(local name initial)` — component-scoped state, keyed by name
+- `(on-mount fn)` — run once after the first render; may return a cleanup
+- `(effect deps fn)` — run after render, re-run when `deps` change; may return a
+  cleanup that runs before each re-run and at teardown. `deps` is a list —
+  `(list)` for "once", `nil` for "every render" — compared structurally.
+- `(on-unmount fn)` — run once at teardown
+
+```sema
+(defcomponent clock ()
+  (let ((now (local "now" 0)))
+    (effect (list)
+      (fn ()
+        (let ((id (js/set-interval (fn () (put! now (+ @now 1))) 1000)))
+          (fn () (js/clear-interval id)))))
+    [:time (number->string @now)]))
+```
+
+Effects and `on-unmount` are matched across renders by **call order**, so
+register them unconditionally at the top level of the body; a render that
+changes the sequence is reported as `lifecycle:<component>#<slot>`, and an
+`on-unmount` hook a render stops registering never runs (hooks run at teardown
+only, never because a slot was re-keyed).
+
+Everything an effect creates — intervals, watches, streams, state — is owned by
+the component and disposed **with the component**. That is a teardown
+guarantee, not a re-run guarantee: an effect whose deps change must return a
+cleanup that undoes what its body created, or the next run adds a second
+interval/watch alongside the first. Errors in a body or a cleanup are reported
+through [`onerror`](#onerror) without aborting teardown.
+
+### `router/*` — SPA Routing
+
+The router keeps the current route in a signal, so a component that reads it
+re-renders on navigation like any other reactive value.
+
+```sema
+(router/init!
+  {:mode :hash                    ;; :hash (default) or :history
+   :not-found "missing-page"      ;; handler for an unmatched path
+   :scroll-to-top true            ;; scroll to the top on navigation
+   :focus "#main"                 ;; move focus there on navigation
+   :routes {"/" "home-page"
+            "/todos" "todo-list-page"
+            "/todos/:id" "todo-detail-page"}})
+
+(defcomponent app-view ()
+  (let ((r (router/current-route)))
+    [:main {:id "main"}
+     [:nav (router/link "/todos" "Todos" {:class "nav-link"})]
+     (cond ((equal? (:handler r) "home-page") (component/render home-page {:route r}))
+           ((equal? (:handler r) "todo-detail-page") (component/render todo-detail-page {:route r}))
+           (else (component/render missing-page {:route r})))]))
+```
+
+**Functions:**
+- `(router/init! routes-or-options)` — register routes. Accepts either a bare
+  `{pattern handler}` map or the options map above; a `:routes` key holding a
+  *map* is read as options, while a `:routes` key holding a handler name is the
+  ordinary route `/routes`.
+- `(router/current-route)` — `{:path "/todos/42" :params {:id "42"} :query {:tab "open"} :handler "todo-detail-page"}`,
+  or `nil` when nothing matched and no `:not-found` handler is registered
+- `(router/push! path)` — navigate, adding a history entry
+- `(router/replace! path)` — navigate without adding one
+- `(router/back!)` — go back
+- `(router/link path label attrs)` — SIP data for an accessible anchor
+- `(router/href path)` — the `href` a link to `path` needs in the active mode
+- `(router/current)` — the route signal id, for `deref`/`watch`
+
+**Routes and paths:**
+- `:id`-style segments become `:params`, percent-decoded.
+- The query string is parsed into `:query`: `?tab=open&tag=a&tag=b` reads as
+  `{:tab "open" :tag ("a" "b")}` — a repeated key collects into a list, a key
+  with no `=` gets `""`, and `+` decodes to a space. A malformed escape keeps its
+  raw text rather than failing the route.
+- Patterns match the **path only**. A `?` in a pattern starts a query string
+  there, too, and is ignored.
+- Paths are normalized to a leading `/`, so `"todos"` and `"/todos"` are one
+  route.
+- A pattern may hold any character a URL segment can. `{"/søk" "search-page"}`
+  matches even though the browser stores that URL percent-encoded
+  (`#/s%C3%B8k`), because each literal character is compiled to accept both
+  forms.
+
+**Links:** `router/link` renders an `<a>` whose clicks are intercepted, so
+navigation never reloads the page, and adds `aria-current="page"` when it points
+at the current path. Modified clicks (cmd/ctrl/shift/alt), middle clicks,
+`:target`, and `:download` are left to the browser. A path that leaves the app
+(`https://…`, `//host`, `javascript:`, and the backslash spellings `/\host`,
+`\\host`, `\host` that a browser resolves to the same cross-origin URL) is
+refused: the link renders as an inert `<span>` and the failure is reported
+through [`onerror`](#onerror). `router/push!`, `router/replace!` and
+`router/href` admit paths by the same rule.
+
+`:mode :history` uses real paths via `pushState`, which requires the host server
+to serve the app shell for every route. `:hash` needs nothing from the host and
+is the default.
 
 ### `llm/*` — LLM Proxy
 
@@ -419,8 +594,201 @@ const web = await SemaWeb.create({
 
   // Sandbox capabilities to deny
   deny: ["network"],
+
+  // Application-level error hook (default: logs to console.error)
+  onerror(error, context) {
+    reportToSentry(error, { context });
+  },
+
+  // Dev mode: record a bounded event timeline (default: false)
+  dev: false,
 });
 ```
+
+## Diagnostics and Dev Mode
+
+### `onerror`
+
+Every failure the runtime catches — a component render, a delegated event
+handler, an effect cleanup, a stream, a script load — is routed to one hook:
+
+```js
+const web = await SemaWeb.create({
+  onerror(error, context) {
+    // context names the source: "component:todo-list",
+    // "listener-cleanup:click", "inline-script:2", "event-source-cleanup"
+    reportToSentry(error, { tags: { context } });
+  },
+});
+```
+
+Installing your own handler replaces the `console.error` default. It does not
+disable diagnostics recording — entries are captured first, then your handler
+runs, so a custom reporter and the dev timeline coexist.
+
+### `dev`
+
+Dev mode records a bounded timeline of what the runtime is doing:
+
+```js
+const web = await SemaWeb.create({ dev: true });
+
+web.diagnostics.all();            // every retained entry, oldest first
+web.diagnostics.byKind("error");  // just the failures
+web.diagnostics.byKind("route");  // navigation history
+web.diagnostics.slowRenders();    // renders at/over the threshold
+web.diagnostics.dropped;          // entries evicted by the size bound
+```
+
+Recorded kinds:
+
+| Kind | Recorded when |
+| --- | --- |
+| `error` | any failure reaching the error hook |
+| `render` | a component finishes rendering (carries `durationMs`) |
+| `route` | the route changes, including "no match" |
+| `stream` | an SSE or LLM stream opens or closes |
+| `script` | a `<script type="text/sema">` loads, evaluates, or fails |
+
+Tune it with an object:
+
+```js
+await SemaWeb.create({
+  dev: {
+    limit: 500,        // ring size (default: 100)
+    slowRenderMs: 8,   // slow-render threshold (default: 16, one 60fps frame)
+    overlay: true,     // mount the on-page dev panel (default: false)
+  },
+});
+```
+
+**Dev mode is off by default and free when off.** Entries are built lazily, so
+with `dev` unset nothing is allocated on the render path — no object, no string
+interpolation. The ring is bounded and reports what it evicted, so a component
+stuck in a render loop cannot grow it without limit.
+
+The overlay lives in its own module, pulled in by a dynamic `import()` only
+when `overlay: true`, so it is a separate chunk (`dist/devtools-*.js`) that a
+production bundle never loads.
+
+`web.dispose()` removes the overlay and drops every diagnostics subscriber; the
+recorded entries stay readable, which is usually when you most want them.
+
+## Testing Components
+
+`@sema-lang/sema-web/testing` mounts a component into JSDOM with a **real**
+interpreter and the full set of bindings, then hands back helpers for driving
+and inspecting it:
+
+```js
+import { renderSema, disposeAllScreens } from "@sema-lang/sema-web/testing";
+
+afterEach(() => disposeAllScreens());
+
+it("counts up", async () => {
+  const screen = await renderSema(
+    `(def count (state 0))
+     (defcomponent view () [:button {:on-click "inc"} (str @count)])
+     (define (inc ev) (update! count (fn (n) (+ n 1))))`,
+    { mount: "view" },
+  );
+
+  screen.click("button");
+
+  expect(screen.text("button")).toBe("1");
+  expect(screen.errors).toEqual([]);
+  screen.unmount();
+  expect(screen.leaks()).toEqual({});
+});
+```
+
+Requires the `jsdom` test environment (Vitest: `environment: "jsdom"`) and a
+Node test runner — the helper reads the WASM binary off disk.
+
+Pass `{ url: "#/todos/42" }` (or a history-mode `"/todos/42?tab=open"`) to boot
+a screen on a route. Every screen resets the location, to `/` when `url` is
+omitted: JSDOM shares one `window` across a test file, so without that a screen
+that navigated would decide which route the next one mounts on.
+
+### What the screen gives you
+
+| Group | Members |
+| --- | --- |
+| Markup | `html()`, `text()`, `find()`, `query()`, `findAll()` — all scoped to the mount container |
+| Events | `click()`, `fill()`, `select()`, `check()`, `submit()`, `press()`, `fire()`, `focus()` |
+| Sema | `eval()` (raw result, never throws), `run()` (value, throws the interpreter's message), `output` |
+| State | `signal(name)`, `setSignal(name, value)` |
+| Lifecycle | `mount()`, `unmount()`, `flush()`, `dispose()` |
+| Failures | `errors`, `errorContexts()`, `diagnostics` |
+| Cleanup | `leaks()`, `snapshot()` |
+
+`renderSema` replaces the runtime's `console.error` default with a collector, so
+every caught failure lands in `screen.errors` as `{error, context, message}`
+instead of in your test output. Dev mode is **on** by default, so
+`screen.diagnostics` has a render timeline and dev-only checks (duplicate SIP
+keys) report; pass `{ web: { dev: false } }` for a production-shaped run.
+
+### Proving nothing leaked
+
+`leaks()` returns only the registries that grew — `{}` means clean, and a
+failure names what is still live:
+
+```js
+screen.unmount();
+expect(screen.leaks()).toEqual({});   // → e.g. { intervals: 1 } when it is not
+```
+
+It counts handles, signals, listeners, watches, intervals, streams, resources,
+sockets, cleanup hooks, mounted components, and lifecycle slots, relative to a
+baseline taken **after** `source` was evaluated and **before** anything was
+mounted. Module-level state a fixture defines is therefore the app's, not the
+component's, and does not read as a leak. Call it after `unmount()`: that is
+what proves component teardown. After `dispose()` the whole context is
+force-drained, so a clean report there says much less.
+
+### Options
+
+```js
+await renderSema(source, {
+  mount: "view",              // component to mount (omit to only evaluate source)
+  props: { title: "Hello" },  // ":title" keys work too
+  target: "#app",             // mount selector
+  html: '<div id="app"></div>',
+  web: { dev: false },        // merged over the harness defaults
+  onerror(error, context) {}, // also forward captured errors here
+  wasmUrl: "...",             // or set SEMA_WASM_PATH
+});
+```
+
+Gate a suite with `semaWasmAvailable()` so a checkout without the WASM build
+skips rather than failing:
+
+```js
+import { semaWasmAvailable } from "@sema-lang/sema-web/testing";
+const describeWithSema = semaWasmAvailable() ? describe : describe.skip;
+```
+
+The testing utilities are a **separate entry point** and are never imported by
+the runtime, so `node:fs` cannot reach a browser bundle.
+
+### The suites check the VM they load
+
+`renderSema` and every browser fixture boot the real Sema VM out of
+`packages/sema-wasm/pkg`, which is gitignored and which no JS entry point
+builds. So both suites first compare that binary against a fingerprint of the
+Rust sources in the tree, and fail with
+
+```
+packages/sema-wasm/pkg/sema_wasm_bg.wasm was built from different Rust sources
+than the ones in this tree.
+Rebuild it from the repo root:  npm run build:wasm
+```
+
+rather than reporting green about a VM of unknown vintage. Any build refreshes
+the fingerprint — `npm run build:wasm`, `jake wasm.build`, a raw `wasm-pack`, or
+CI restoring its content-keyed cache — so nothing has to remember to stamp it.
+A checkout with no WASM build at all only fails the browser suite; the vitest
+suites that need the VM gate themselves with `semaWasmAvailable()` and skip.
 
 ## Example: Interactive Counter
 

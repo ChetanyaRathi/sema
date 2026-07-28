@@ -33,6 +33,36 @@ export interface LoaderOptions {
 }
 
 /**
+ * The slice of `SemaWebContext` the loader needs.
+ *
+ * Kept structural rather than importing the class so `loadScripts` stays
+ * usable standalone (it is a public export, and several tests drive it with a
+ * bare mock interpreter and no context at all).
+ */
+export interface LoaderReporter {
+  diagnostics: {
+    record(build: () => {
+      kind: "script";
+      at: number;
+      context: string;
+      detail?: string;
+    }): void;
+  };
+}
+
+/**
+ * Identify a script for error messages and diagnostics.
+ *
+ * External scripts get their `src`; inline scripts get their position among
+ * the *inline* scripts on the page. Position matters: "Error in inline script"
+ * is useless on a page with six of them, which is the common case for the
+ * `<script type="text/sema">` style this loader exists to support.
+ */
+function scriptLabel(src: string | null, inlineIndex: number): string {
+  return src ? `script:${src}` : `inline-script:${inlineIndex}`;
+}
+
+/**
  * Discover and evaluate all `<script type="text/sema">` tags in the document.
  *
  * Scripts are evaluated in document order:
@@ -51,13 +81,25 @@ export interface LoaderOptions {
 export async function loadScripts(
   interp: SemaInterpreterLike,
   opts?: LoaderOptions,
+  reporter?: LoaderReporter,
 ): Promise<Array<{ value: string | null; output: string[]; error: string | null }>> {
   const mimeType = opts?.type ?? "text/sema";
   const scripts = document.querySelectorAll(`script[type="${mimeType}"]`);
   const results: Array<{ value: string | null; output: string[]; error: string | null }> = [];
 
+  let inlineIndex = 0;
+  const note = (context: string, detail: string) => {
+    reporter?.diagnostics.record(() => ({
+      kind: "script",
+      at: Date.now(),
+      context,
+      detail,
+    }));
+  };
+
   for (const script of scripts) {
     const src = script.getAttribute("src");
+    const label = scriptLabel(src, src ? -1 : inlineIndex++);
     let code: string;
 
     if (src) {
@@ -66,6 +108,7 @@ export async function loadScripts(
         if (!resp.ok) {
           const err = `Failed to fetch ${src}: ${resp.status} ${resp.statusText}`;
           console.error(`[sema-web] ${err}`);
+          note(label, err);
           results.push({ value: null, output: [], error: err });
           continue;
         }
@@ -74,6 +117,7 @@ export async function loadScripts(
           if (!interp.loadArchive || (!interp.runEntry && !interp.runEntryAsync)) {
             const err = `Runtime does not support compiled web archives: ${src}`;
             console.error(`[sema-web] ${err}`);
+            note(label, err);
             results.push({ value: null, output: [], error: err });
             continue;
           }
@@ -85,6 +129,7 @@ export async function loadScripts(
           } catch (e) {
             const err = `Failed to load archive ${src}: ${e instanceof Error ? e.message : String(e)}`;
             console.error(`[sema-web] ${err}`);
+            note(label, err);
             results.push({ value: null, output: [], error: err });
             continue;
           }
@@ -92,6 +137,7 @@ export async function loadScripts(
           if (!archiveInfo.ok) {
             const err = archiveInfo.error || `Failed to load archive ${src}`;
             console.error(`[sema-web] ${err}`);
+            note(label, err);
             results.push({ value: null, output: [], error: err });
             continue;
           }
@@ -99,6 +145,7 @@ export async function loadScripts(
           if (!archiveInfo.entryPoint) {
             const err = `Archive ${src} did not provide an entry point`;
             console.error(`[sema-web] ${err}`);
+            note(label, err);
             results.push({ value: null, output: [], error: err });
             continue;
           }
@@ -112,7 +159,10 @@ export async function loadScripts(
           }
 
           if (result.error) {
-            console.error(`[sema-web] Error in ${src}: ${result.error}`);
+            console.error(`[sema-web] Error in ${label}: ${result.error}`);
+            note(label, result.error);
+          } else {
+            note(label, `loaded archive ${archiveInfo.entryPoint}`);
           }
 
           results.push(result);
@@ -123,6 +173,7 @@ export async function loadScripts(
       } catch (e) {
         const err = `Failed to fetch ${src}: ${e instanceof Error ? e.message : String(e)}`;
         console.error(`[sema-web] ${err}`);
+        note(label, err);
         results.push({ value: null, output: [], error: err });
         continue;
       }
@@ -146,13 +197,17 @@ export async function loadScripts(
       }
 
       if (result.error) {
-        console.error(`[sema-web] Error in ${src ?? "inline script"}: ${result.error}`);
+        console.error(`[sema-web] Error in ${label}: ${result.error}`);
+        note(label, result.error);
+      } else {
+        note(label, "evaluated");
       }
 
       results.push(result);
     } catch (e) {
-      const err = `Evaluation error: ${e instanceof Error ? e.message : String(e)}`;
+      const err = `Evaluation error in ${label}: ${e instanceof Error ? e.message : String(e)}`;
       console.error(`[sema-web] ${err}`);
+      note(label, err);
       results.push({ value: null, output: [], error: err });
     }
   }

@@ -1,0 +1,78 @@
+;; Lifecycle in a real browser — effects, deps, cleanup, and on-unmount.
+;;
+;; The unit suite proves the slot machinery against jsdom and a mock
+;; interpreter. This exists for one thing jsdom cannot see: whether calling a
+;; host function (js/set-interval) from inside an effect body, while the WASM
+;; instance is already nested several frames deep, survives in the real VM. It
+;; did not until 2026-07-28, when a host call nested inside a host-invoked Sema
+;; call aborted the instance with "RuntimeError: unreachable"
+;; (docs/limitations.md 38, since resolved — a Vec::pop() inside a
+;; debug_assert_eq! that release builds stripped).
+;;
+;; Two mount points on purpose. #app holds the component under test; #status
+;; holds the observers and the buttons, so they survive #app being unmounted
+;; and can report on what its cleanup did.
+
+(def ticks (state 0))
+(def topic (state "a"))
+(def runs (state 0))
+(def cleanups (state 0))
+(def unmounted (state "no"))
+
+;; `update!` deliberately. It is defined in terms of `apply`, and `apply`
+;; inside a host-invoked Sema call — a render, an on-mount callback, a watch,
+;; an interval callback — used to trap the WASM VM (docs/limitations.md 38,
+;; resolved 2026-07-28). This fixture is where that contract is proved in the
+;; only place that can prove it, so it uses the form that used to break rather
+;; than the `put!`-with-an-explicit-read workaround that hid it.
+(define (bump-ticks) (update! ticks (fn (n) (+ n 1))))
+
+;; ── The component under test ────────────────────────────────────────
+
+(defcomponent clock-view ()
+  ;; Runs once. Its cleanup is the only thing that can stop the timer, so a
+  ;; ticking counter after unmount is a leak the spec can see.
+  (effect (list)
+    (fn ()
+      (let ((id (js/set-interval bump-ticks 50)))
+        (fn () (js/clear-interval id)))))
+
+  ;; Keyed by a dep the page can change. Writing state the OTHER component
+  ;; reads is deliberate: it is how an effect is normally useful, and it
+  ;; exercises the render/effect feedback path.
+  (effect (list @topic)
+    (fn ()
+      (put! runs (+ @runs 1))
+      (fn () (put! cleanups (+ @cleanups 1)))))
+
+  (on-unmount (fn () (put! unmounted "yes")))
+
+  [:div {:data-testid "clock"}
+   [:span {:data-testid "clock-topic"} @topic]])
+
+;; ── The observer, never unmounted ───────────────────────────────────
+
+(defcomponent status-view ()
+  [:div
+   [:span {:data-testid "ticks"} (number->string @ticks)]
+   [:span {:data-testid "runs"} (number->string @runs)]
+   [:span {:data-testid "cleanups"} (number->string @cleanups)]
+   [:span {:data-testid "unmounted"} @unmounted]
+   [:button {:data-testid "switch" :on-click "switch-topic"} "switch"]
+   [:button {:data-testid "nudge" :on-click "nudge"} "nudge"]
+   [:button {:data-testid "unmount" :on-click "unmount-clock"} "unmount"]])
+
+;; ── Handlers ────────────────────────────────────────────────────────
+
+(define (switch-topic ev)
+  (put! topic (if (equal? @topic "a") "b" "a")))
+
+;; Re-render without touching any dep — the effect must stay put.
+(define (nudge ev)
+  (component/force-render! "#app"))
+
+(define (unmount-clock ev)
+  (component/unmount! "#app"))
+
+(mount! "#app" clock-view)
+(mount! "#status" status-view)

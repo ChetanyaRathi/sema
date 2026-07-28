@@ -1,0 +1,72 @@
+;; Lifecycle re-entrancy in a real browser.
+;;
+;; Three shapes that a jsdom suite can model but cannot prove, because all
+;; three end at the WASM callback boundary or in the JS stack:
+;;
+;;   1. `component/force-render!` called from inside an effect body — used to
+;;      recurse ~174 renders deep into "Maximum call stack size exceeded" and
+;;      leave a render effect that kept firing after unmount;
+;;   2. `component/unmount!` called from inside an effect body — used to
+;;      discard the cleanup that body returned;
+;;   3. two components sharing ONE named `on-unmount` function — the wasm side
+;;      hands out one handle per identical Sema value, so the first teardown
+;;      used to release the handle the second was still holding.
+;;
+;; The observers live in #status, which is never unmounted, so they survive the
+;; components under test and can report what their teardown did.
+
+(def log (state (list)))
+(define (note msg) (put! log (append @log (list msg))))
+
+(def gen (state 0))
+
+;; ── 1. force-render! from an effect body ────────────────────────────
+
+(defcomponent boom ()
+  (effect (list) (fn () (component/force-render! "#app")))
+  [:div {:data-testid "boom"} (number->string @gen)])
+
+;; ── 2. unmount! from an effect body ─────────────────────────────────
+
+(defcomponent selfdestruct ()
+  (effect (list)
+    (fn ()
+      (component/unmount! "#selfd")
+      (fn () (note "d-cleanup"))))
+  [:div {:data-testid "selfd"} "d"])
+
+;; ── 3. one named teardown, two mounted components ───────────────────
+
+(define (shared-teardown) (note "down"))
+
+(defcomponent leaf ()
+  (on-unmount shared-teardown)
+  [:div {:data-testid "leaf"} "leaf"])
+
+;; ── The observer, never unmounted ───────────────────────────────────
+
+(defcomponent status-view ()
+  [:div
+   [:span {:data-testid "log"} (string-join @log ";")]
+   [:span {:data-testid "gen"} (number->string @gen)]
+   [:button {:data-testid "bump" :on-click "bump"} "bump"]
+   [:button {:data-testid "unmount-app" :on-click "unmount-app"} "unmount app"]
+   [:button {:data-testid "mount-selfd" :on-click "mount-selfd"} "mount selfdestruct"]
+   [:button {:data-testid "unmount-a" :on-click "unmount-a"} "unmount a"]
+   [:button {:data-testid "unmount-b" :on-click "unmount-b"} "unmount b"]])
+
+;; ── Handlers ────────────────────────────────────────────────────────
+
+;; `update!` deliberately: it goes through `apply`, which host-invoked Sema
+;; calls once trapped the WASM VM (docs/limitations.md 38, resolved 2026-07-28).
+(define (bump ev) (update! gen (fn (n) (+ n 1))))
+
+(define (unmount-app ev) (component/unmount! "#app"))
+(define (mount-selfd ev) (mount! "#selfd" selfdestruct))
+(define (unmount-a ev) (component/unmount! "#leaf-a"))
+(define (unmount-b ev) (component/unmount! "#leaf-b"))
+
+(mount! "#app" boom)
+(mount! "#leaf-a" leaf)
+(mount! "#leaf-b" leaf)
+(mount! "#status" status-view)

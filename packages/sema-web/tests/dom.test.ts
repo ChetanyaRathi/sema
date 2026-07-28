@@ -32,6 +32,9 @@ describe("registerDomBindings", () => {
       "dom/stop-propagation!", "dom/event-value", "dom/event-key",
       "dom/event-target", "dom/event-target-closest", "dom/focus!",
       "dom/render", "dom/render-into!",
+      "dom/event-current-target", "dom/event-form-data", "dom/form-data",
+      "dom/event-form", "dom/event-checked", "dom/checked?",
+      "dom/selected-values", "dom/event-selected-values",
     ];
     for (const name of expected) {
       expect(interp.getFunction(name), `${name} should be registered`).toBeDefined();

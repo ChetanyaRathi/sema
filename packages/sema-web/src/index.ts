@@ -36,6 +36,9 @@
 import { SemaInterpreter } from "@sema-lang/sema";
 import type { InterpreterOptions } from "@sema-lang/sema";
 import { SemaWebContext, disposeContextResources } from "./context.js";
+import type { ErrorHandler } from "./context.js";
+import { resolveDevOptions } from "./diagnostics.js";
+import type { Diagnostics, DevOptions } from "./diagnostics.js";
 import { registerDomBindings } from "./dom.js";
 import { registerStoreBindings } from "./store.js";
 import { registerReactiveBindings } from "./reactive.js";
@@ -46,6 +49,7 @@ import type { LlmProxyOptions } from "./llm.js";
 import { registerRouterBindings } from "./router.js";
 import { registerCssBindings } from "./css.js";
 import { registerHttpBindings } from "./http.js";
+import { registerResourceBindings } from "./resource.js";
 import { registerWsBindings } from "./ws.js";
 import { loadScripts } from "./loader.js";
 import type { LoaderOptions } from "./loader.js";
@@ -121,6 +125,16 @@ export interface SemaWebOptions extends InterpreterOptions {
   http?: boolean;
 
   /**
+   * Whether to register the async resource primitive (`resource`,
+   * `resource/refresh!`, `resource/cancel!`).
+   *
+   * A resource is read with `deref`, so it is only useful with `reactive`
+   * enabled (which it is by default).
+   * Default: `true`.
+   */
+  resources?: boolean;
+
+  /**
    * Whether to register the browser `ws/*` WebSocket client
    * (`ws/connect`, `ws/send`, `ws/close`, `ws/connected?`, `ws/listen`).
    * Default: `true`.
@@ -152,6 +166,44 @@ export interface SemaWebOptions extends InterpreterOptions {
    * ```
    */
   llmProxy?: string | LlmProxyOptions;
+
+  /**
+   * Application-level error hook. Receives every failure the runtime catches —
+   * component render, delegated event handler, effect cleanup, stream, script
+   * load — as `(error, context)`, where `context` names the source
+   * (`component:todo-list`, `listener-cleanup:click`, `inline-script:2`).
+   *
+   * Replaces the default, which logs to `console.error`. Installing your own
+   * does not disable diagnostics recording: entries are captured first, then
+   * your handler runs.
+   *
+   * @example
+   * ```js
+   * await SemaWeb.create({
+   *   onerror(error, context) {
+   *     Sentry.captureException(error, { tags: { context } });
+   *   },
+   * });
+   * ```
+   */
+  onerror?: ErrorHandler;
+
+  /**
+   * Enable dev mode: record a bounded timeline of errors, component renders
+   * (with durations), route changes, stream lifecycle, and script loads,
+   * readable through `web.diagnostics`.
+   *
+   * Off by default and free when off — nothing is recorded and no entry
+   * objects are allocated. `true` uses defaults; pass an object to tune the
+   * ring size, the slow-render threshold, or to mount the on-page overlay.
+   *
+   * @example
+   * ```js
+   * const web = await SemaWeb.create({ dev: { overlay: true, slowRenderMs: 8 } });
+   * web.diagnostics.slowRenders(); // → entries at/over 8ms
+   * ```
+   */
+  dev?: boolean | DevOptions;
 }
 
 /** Result of evaluating Sema code. */
@@ -189,6 +241,7 @@ export interface EvalResult {
 export class SemaWeb {
   private _interp: SemaInterpreter;
   private _ctx: SemaWebContext;
+  private _disposeOverlay: (() => void) | null = null;
 
   private constructor(interp: SemaInterpreter, ctx: SemaWebContext) {
     this._interp = interp;
@@ -205,6 +258,18 @@ export class SemaWeb {
     const interp = await SemaInterpreter.create(opts);
     const ctx = new SemaWebContext();
     const web = new SemaWeb(interp, ctx);
+
+    // Diagnostics and the error hook are configured BEFORE any binding is
+    // registered or any script runs, so a failure during setup is already
+    // observable. Wiring them afterwards would blind the runtime during the
+    // exact window where a misconfigured app is most likely to break.
+    const dev = resolveDevOptions(opts?.dev);
+    ctx.diagnostics.enabled = dev.enabled;
+    ctx.diagnostics.limit = dev.limit;
+    ctx.diagnostics.slowRenderMs = dev.slowRenderMs;
+    if (opts?.onerror) {
+      ctx.onerror = opts.onerror;
+    }
 
     // Register browser bindings
     if (opts?.dom !== false) {
@@ -251,6 +316,11 @@ export class SemaWeb {
       registerHttpBindings(interp, ctx);
     }
 
+    // Async data resources (loading/value/error signal over one fetch)
+    if (opts?.resources !== false) {
+      registerResourceBindings(interp, ctx);
+    }
+
     // WebSocket client bindings (browser-native WebSocket)
     if (opts?.websocket !== false) {
       registerWsBindings(interp, ctx);
@@ -265,9 +335,23 @@ export class SemaWeb {
       registerLlmBindings(interp, proxyOpts, ctx);
     }
 
+    // Dev overlay, mounted before scripts run so their failures are visible in
+    // it. Dynamically imported: with `overlay` off (the default) a bundler
+    // never pulls `devtools.js` into the main chunk, which is the difference
+    // between "does not activate" and "does not ship".
+    if (dev.overlay) {
+      try {
+        const { mountDevOverlay } = await import("./devtools.js");
+        web._disposeOverlay = mountDevOverlay(ctx);
+      } catch (e) {
+        // A missing/blocked overlay chunk must not take the app down with it.
+        ctx.onerror(e instanceof Error ? e : new Error(String(e)), "dev-overlay");
+      }
+    }
+
     // Auto-discover and evaluate <script type="text/sema"> tags
     if (opts?.autoLoad !== false) {
-      await loadScripts(interp, opts?.loader);
+      await loadScripts(interp, opts?.loader, ctx);
     }
 
     return web;
@@ -345,6 +429,24 @@ export class SemaWeb {
   }
 
   /**
+   * The dev-mode diagnostics ring.
+   *
+   * Always present; records nothing unless `dev` was enabled at create time.
+   * Reading it without dev mode returns an empty timeline rather than
+   * throwing, so instrumentation code does not need to branch.
+   *
+   * @example
+   * ```js
+   * web.diagnostics.byKind("error");   // what failed
+   * web.diagnostics.slowRenders();     // which components are over budget
+   * web.diagnostics.dropped;           // entries evicted by the size bound
+   * ```
+   */
+  get diagnostics(): Diagnostics {
+    return this._ctx.diagnostics;
+  }
+
+  /**
    * Get the Sema interpreter version.
    */
   version(): string {
@@ -356,6 +458,14 @@ export class SemaWeb {
    * The instance cannot be used after calling this method.
    */
   dispose(): void {
+    if (this._disposeOverlay) {
+      try {
+        this._disposeOverlay();
+      } catch (e) {
+        this._ctx.onerror(e instanceof Error ? e : new Error(String(e)), "dev-overlay-cleanup");
+      }
+      this._disposeOverlay = null;
+    }
     disposeAllComponents(this._ctx);
     disposeContextResources(this._ctx);
     this._interp.dispose();
@@ -411,14 +521,33 @@ function registerConsoleBindings(interp: SemaInterpreter): void {
 export type { LoaderOptions } from "./loader.js";
 export type { LlmProxyOptions } from "./llm.js";
 export { SemaWebContext } from "./context.js";
-export type { MountedComponent, ErrorHandler } from "./context.js";
+export type {
+  MountedComponent,
+  ErrorHandler,
+  LifecycleKind,
+  PendingLifecycle,
+  LifecycleSlot,
+  ResourceRegistration,
+} from "./context.js";
+export { Diagnostics, DEFAULT_DEV_LIMIT, DEFAULT_SLOW_RENDER_MS } from "./diagnostics.js";
+export type { DiagnosticEntry, DiagnosticKind, DevOptions } from "./diagnostics.js";
 export { registerDomBindings } from "./dom.js";
 export { registerStoreBindings } from "./store.js";
 export { registerReactiveBindings } from "./reactive.js";
 export { registerSipBindings, renderSip } from "./sip.js";
 export { registerComponentBindings } from "./component.js";
 export { registerLlmBindings } from "./llm.js";
-export { registerRouterBindings } from "./router.js";
+export {
+  registerRouterBindings,
+  parseQuery,
+  normalizeRoutePath,
+  splitPathQuery,
+  routeHref,
+  ROUTER_LINK_ATTR,
+} from "./router.js";
+export type { RouteMatch, RouteQuery, RouterMode } from "./router.js";
 export { registerCssBindings } from "./css.js";
 export { registerHttpBindings } from "./http.js";
+export { registerResourceBindings, normalizeResourceRequest, decodeResourceBody } from "./resource.js";
+export type { ResourceState, ResourceRequest } from "./resource.js";
 export { loadScripts } from "./loader.js";

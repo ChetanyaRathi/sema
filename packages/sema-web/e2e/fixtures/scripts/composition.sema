@@ -1,0 +1,140 @@
+;; Composition stress test — props, children, and keyed lists.
+;;
+;; A real (small) app rather than isolated probes, because the failure modes
+;; these features have only show up under composition: props threaded two
+;; levels deep, a layout wrapping arbitrary children, a keyed list reordering
+;; while one of its inputs holds focus and an uncommitted value.
+;;
+;; Every interactive element carries a data-testid; composition.spec.ts drives
+;; it in a real browser against real WASM.
+
+;; ── State ───────────────────────────────────────────────────────────
+
+(def rows
+  (state (list {:id 1 :name "alpha" :tag "T1"}
+               {:id 2 :name "beta"  :tag "T2"}
+               {:id 3 :name "gamma" :tag "T3"})))
+
+(def next-id (state 4))
+(def explode (state #f))
+
+;; ── Leaf: receives props only ───────────────────────────────────────
+
+(defcomponent badge (props)
+  [:span {:class "badge" :data-testid "badge"} (:text props)])
+
+;; ── Layout: receives CHILDREN and wraps them ────────────────────────
+;;
+;; The reusable-shell case. It knows nothing about what it wraps.
+
+(defcomponent panel (props)
+  [:section {:class "panel" :data-testid "panel"}
+   [:h2 {:data-testid "panel-title"} (:title props)]
+   [:div {:class "panel-body" :data-testid "panel-body"}
+    (:children props)]])
+
+;; ── A child that throws, to prove failures stay local ───────────────
+
+(defcomponent unstable (props)
+  (if (:boom props)
+    (error "unstable child exploded")
+    [:span {:data-testid "unstable-ok"} "stable"]))
+
+;; ── Row: props + a grandchild + its own children ────────────────────
+
+(defcomponent row (props)
+  [:li {:key (:id props) :data-testid "row" :data-row-id (number->string (:id props))}
+   [:span {:data-testid "row-name"} (:name props)]
+   ;; grandchild — props threaded one level further down
+   (component/render badge {:text (:tag props)})
+   ;; a per-row input: the thing that must survive a reorder
+   [:input {:type "text"
+            :data-testid "row-input"
+            :data-row-input (number->string (:id props))
+            :value (:name props)
+            :on-input "note-input"}]
+   [:button {:data-testid "row-up" :data-row-up (number->string (:id props))
+             :on-click "move-up"} "up"]
+   [:button {:data-testid "row-remove" :data-row-remove (number->string (:id props))
+             :on-click "remove-row"} "x"]
+   (:children props)])
+
+;; ── Root: mounted WITH props ────────────────────────────────────────
+
+(defcomponent app-root (props)
+  ;; NOTE: deliberately no render counter here. Writing to a signal during a
+  ;; render that also reads it makes the effect re-trigger itself — an infinite
+  ;; render loop that hangs the tab rather than failing. Count renders through
+  ;; the diagnostics timeline instead.
+  [:main {:data-testid "root" :class (:theme props)}
+   [:h1 {:data-testid "heading"} (:heading props)]
+
+   ;; A layout component receiving literal children
+   (component/render panel {:title "Nested children"}
+     [:p {:data-testid "child-a"} "first child"]
+     [:p {:data-testid "child-b"} "second child"])
+
+   ;; A failing child next to healthy siblings.
+   ;;
+   ;; No try here on purpose — component/render guards each child itself, so a
+   ;; thrower renders as nothing, is reported under its own name, and leaves
+   ;; the siblings alone.
+   [:div {:data-testid "isolation"}
+    [:span {:data-testid "before-unstable"} "before"]
+    (component/render unstable {:boom @explode})
+    [:span {:data-testid "after-unstable"} "after"]]
+
+   ;; The keyed list
+   [:ul {:data-testid "rows"}
+    (map (fn (r)
+           (component/render row r
+             [:small {:data-testid "row-slot"} "slot"]))
+         @rows)]
+
+   [:div
+    [:button {:data-testid "add" :on-click "add-row"} "add"]
+    [:button {:data-testid "shuffle" :on-click "reverse-rows"} "reverse"]
+    [:button {:data-testid "toggle-explode" :on-click "toggle-explode"} "explode"]]])
+
+;; ── Handlers ────────────────────────────────────────────────────────
+
+(define (note-input ev) nil)
+
+(define (row-id-from ev attr)
+  (let ((el (dom/event-target ev)))
+    (string->number (dom/get-attribute el attr))))
+
+(define (move-up ev)
+  (let ((id (row-id-from ev "data-row-up")))
+    (put! rows (move-row-up @rows id))))
+
+(define (move-row-up items id)
+  (if (or (null? items) (null? (cdr items)))
+    items
+    (let ((a (car items))
+          (b (car (cdr items)))
+          (tail (cdr (cdr items))))
+      (if (equal? (:id b) id)
+        (cons b (cons a tail))
+        (cons a (move-row-up (cdr items) id))))))
+
+(define (remove-row ev)
+  (let ((id (row-id-from ev "data-row-remove")))
+    (put! rows (filter (fn (r) (not (equal? (:id r) id))) @rows))))
+
+(define (add-row ev)
+  (let ((id @next-id))
+    (put! next-id (+ id 1))
+    (put! rows (append @rows (list {:id id
+                                    :name (string-append "row" (number->string id))
+                                    :tag (string-append "T" (number->string id))})))))
+
+(define (reverse-rows ev)
+  (put! rows (reverse @rows)))
+
+(define (toggle-explode ev)
+  (put! explode (not @explode)))
+
+;; ── Mount with props ────────────────────────────────────────────────
+
+(mount! "#app" app-root {:heading "Composition" :theme "light"})

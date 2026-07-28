@@ -42,10 +42,34 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+      # The WASM binary is gitignored, and three suites — component-sema,
+      # resource-sema, and the `renderSema` harness — gate themselves on it
+      # rather than failing a checkout that has not been built. Without this
+      # step they would skip here and report green having run nothing. Same
+      # cache key as the e2e job, and `e2e` needs this job, so the workflow
+      # still pays for at most one wasm build.
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: actions/cache@v4
+        id: wasm-cache
+        with:
+          path: packages/sema-wasm/pkg
+          key: wasm-${{ hashFiles('Cargo.toml', 'Cargo.lock', 'crates/sema-core/**', 'crates/sema-eval/**', 'crates/sema-fmt/**', 'crates/sema-otel/**', 'crates/sema-reader/**', 'crates/sema-stdlib/**', 'crates/sema-vm/**', 'crates/sema-wasm/**') }}
+      - if: steps.wasm-cache.outputs.cache-hit != 'true'
+        run: |
+          cargo install wasm-pack
+          wasm-pack build crates/sema-wasm --target web --out-dir ../../packages/sema-wasm/pkg
       - uses: actions/setup-node@v4
         with:
           node-version: 22
       - run: npm ci
+      # `dist/` is gitignored too, and `tests/testing-entry.test.ts` reads it to
+      # prove the runtime bundle stayed free of the test-only entry point.
+      - run: npm run build --workspace=@sema-lang/sema
+      - run: npm run build --workspace=@sema-lang/sema-web
+      - run: npx tsc --noEmit -p tsconfig.json
+        working-directory: packages/sema-web
       - run: npx vitest run
         working-directory: packages/sema-web
 

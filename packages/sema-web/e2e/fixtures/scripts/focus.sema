@@ -1,8 +1,30 @@
+;; Focus preservation across re-renders, in a real browser.
+;;
+;; A focused INPUT / TEXTAREA / SELECT is exempted from morphdom's own patch,
+;; because morphdom would assign `value` and `selectedIndex` from the freshly
+;; rendered clone and throw away what the user typed or picked. Everything else
+;; that patch would have done is then the renderer's job — and only a real
+;; browser has a real focus model to prove it against.
+
 (def label (state "Type here"))
 (def counter (state 0))
+(def armed (state #t))
+(def keys-seen (state 0))
+(def sizes (state (list "s")))
 
 (define (update-label ev) (put! label (dom/event-value ev)))
 (define (bump ev) (update! counter (fn (n) (+ n 1))))
+
+;; Disarms itself on the first keypress, so the second keypress lands on a
+;; render that declares neither the handler nor the styling attributes.
+(define (count-key ev)
+  (update! keys-seen (fn (n) (+ n 1)))
+  (put! armed #f))
+
+;; Grows the option list from a keypress, so the select is focused when its
+;; options change — the dependent-dropdown shape.
+(define (grow-sizes ev)
+  (put! sizes (list "s" "m" "l")))
 
 (define (focus-view)
   [:div
@@ -17,6 +39,23 @@
     "Bump counter"]
    [:p
     {:id "counter-display" :data-testid "counter-display"}
-    (number->string @counter)]])
+    (number->string @counter)]
+
+   ;; Attributes a later render drops must leave the focused element, the
+   ;; handler attribute included.
+   (if @armed
+     [:input {:id "armed-input"
+              :data-testid "armed-input"
+              :on-keydown "count-key"
+              :class "armed"
+              :required #t
+              :aria-invalid "true"}]
+     [:input {:id "armed-input" :data-testid "armed-input"}])
+   [:p {:data-testid "keys-seen"} (number->string @keys-seen)]
+
+   ;; Options are ordinary markup, not live state: a focused select still has
+   ;; to receive them.
+   [:select {:id "sizes" :data-testid "sizes" :on-keydown "grow-sizes"}
+    (map (fn (s) [:option {:value s} s]) @sizes)]])
 
 (mount! "#app" "focus-view")

@@ -1,0 +1,57 @@
+;; Async resources in a real browser — real fetch, real WASM VM.
+;;
+;; The unit suites drive `resource` against jsdom with a stubbed `fetch`, which
+;; can prove the state machine but not that the feature works where it lives:
+;; a spec function is a Sema closure the host calls back into, its result
+;; crosses the bridge as a map, and the response writes a signal that re-renders
+;; a mounted component. All of that is browser-and-VM behaviour.
+;;
+;; The URL is built from state the view renders, which is the shape the docs
+;; prescribe. A resource that adopts a new spec without refetching renders the
+;; previous response with `:loading` false and `:error` nil — wrong data with
+;; nothing anywhere saying so — so the fetch log is the real assertion here.
+
+(def uid (state "1"))
+
+;; ── The component under test ────────────────────────────────────────
+
+(defcomponent user-card ()
+  (def u (resource "user" (fn () (string-append "/api/user/" @uid))))
+
+  [:div {:data-testid "card"}
+   [:span {:data-testid "uid"} @uid]
+   [:span {:data-testid "state"} (if (:loading @u) "loading" "settled")]
+   [:span {:data-testid "name"} (if (:value @u) (:name (:value @u)) "-")]
+   [:span {:data-testid "error"} (if (:error @u) (:error @u) "-")]
+   [:span {:data-testid "http-status"}
+    (if (:status @u) (number->string (:status @u)) "-")]
+   ;; Inside the card on purpose: a resource name resolves against the
+   ;; component that owns it, and a handler declared by another component
+   ;; would be a different owner.
+   [:button {:data-testid "refresh" :on-click "refresh-user"} "refresh"]])
+
+;; ── The controls, never unmounted ───────────────────────────────────
+
+(defcomponent controls ()
+  [:div
+   [:button {:data-testid "next" :on-click "next-user"} "next"]
+   [:button {:data-testid "broken" :on-click "show-broken"} "broken"]
+   [:button {:data-testid "garbage" :on-click "show-garbage"} "garbage"]
+   [:button {:data-testid "unmount" :on-click "unmount-card"} "unmount"]])
+
+;; ── Handlers ────────────────────────────────────────────────────────
+
+(define (refresh-user ev) (resource/refresh! "user"))
+
+(define (next-user ev) (put! uid (if (equal? @uid "1") "2" "1")))
+
+;; Answers 500, so the error path carries a status a component can branch on.
+(define (show-broken ev) (put! uid "boom"))
+
+;; Answers 200 with a body that is not the JSON its content type promises.
+(define (show-garbage ev) (put! uid "garbage"))
+
+(define (unmount-card ev) (component/unmount! "#app"))
+
+(mount! "#app" user-card)
+(mount! "#controls" controls)

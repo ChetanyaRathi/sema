@@ -1,0 +1,120 @@
+;; Routing in a real browser — query strings, links, the fallback route,
+;; navigation side effects, and component cleanup across navigation.
+;;
+;; The unit suite drives the router against jsdom and a mock interpreter, where
+;; every value is already a plain JS object. This fixture exists for what that
+;; setup structurally cannot see:
+;;
+;;   - the route crossing the real WASM boundary, so (:path r), (:params r) and
+;;     (:query r) have to be readable Sema maps, with a repeated query key
+;;     arriving as a Sema list;
+;;   - an anchor built by router/link surviving real morphdom re-renders and a
+;;     real click reaching the delegated document listener;
+;;   - focus and scroll effects against a real layout and a real focus model.
+
+(router/init!
+  {:mode :hash
+   :not-found "missing-page"
+   :scroll-to-top true
+   :focus "#main"
+   :routes {"/" "home-page"
+            "/todos" "todo-list-page"
+            "/todos/:id" "todo-detail-page"
+            ;; A literal segment the browser will not leave alone: writing
+            ;; "#/søk" makes location.hash read back "#/s%C3%B8k", so this
+            ;; route is only reachable if the pattern matches the encoded form.
+            "/søk" "search-page"
+            "/hostile" "hostile-page"}})
+
+;; ── Observers ───────────────────────────────────────────────────────
+;;
+;; `enters` counts effect runs and `cleanups` their teardowns: one navigation
+;; must produce exactly one of each, which is how the spec sees that leaving a
+;; route released what it owned.
+
+(def enters (state 0))
+(def cleanups (state 0))
+
+;; ── Route views ─────────────────────────────────────────────────────
+
+(defcomponent home-page (props)
+  [:p {:data-testid "view"} "home"])
+
+(defcomponent todo-list-page (props)
+  [:p {:data-testid "view"} "todos"])
+
+(define (tags-label tags)
+  (cond ((null? tags) "none")
+        ((list? tags) (string/join tags ","))
+        (else tags)))
+
+(defcomponent todo-detail-page (props)
+  (let ((r (:route props)))
+    [:div
+     [:p {:data-testid "view"} "detail"]
+     [:p {:data-testid "todo-id"} (:id (:params r))]
+     [:p {:data-testid "todo-tab"} (or (:tab (:query r)) "none")]
+     [:p {:data-testid "todo-tags"} (tags-label (:tag (:query r)))]]))
+
+(defcomponent missing-page (props)
+  [:div
+   [:p {:data-testid "view"} "missing"]
+   [:p {:data-testid "missing-path"} (:path (:route props))]])
+
+(defcomponent search-page (props)
+  [:div
+   [:p {:data-testid "view"} "search"]
+   [:p {:data-testid "search-path"} (:path (:route props))]])
+
+;; Paths the router must refuse. Each renders as a span with no href, so the
+;; click that follows cannot take the app off-site. The backslash forms matter
+;; as much as the scheme form: a browser resolves href="/\evil.example" to
+;; http://evil.example/, exactly as it does href="//evil.example".
+(defcomponent hostile-page (props)
+  [:div
+   [:p {:data-testid "view"} "hostile"]
+   (router/link "https://evil.example/pwned" "Off-site" {:data-testid "link-offsite"})
+   (router/link "/\\evil.example" "Backslash" {:data-testid "link-backslash"})])
+
+(define (render-route r)
+  (let ((handler (:handler r)))
+    (cond ((equal? handler "home-page") (component/render home-page {:route r}))
+          ((equal? handler "todo-list-page") (component/render todo-list-page {:route r}))
+          ((equal? handler "todo-detail-page") (component/render todo-detail-page {:route r}))
+          ((equal? handler "search-page") (component/render search-page {:route r}))
+          ((equal? handler "hostile-page") (component/render hostile-page {:route r}))
+          (else (component/render missing-page {:route r})))))
+
+;; ── Shell ───────────────────────────────────────────────────────────
+
+(defcomponent app-view ()
+  (let ((r (router/current-route)))
+    ;; Keyed on the path, and registered unconditionally — lifecycle slots are
+    ;; matched by call order, so a conditional effect would re-key every slot
+    ;; after it.
+    (effect (list (:path r))
+      (fn ()
+        (put! enters (+ @enters 1))
+        (fn () (put! cleanups (+ @cleanups 1)))))
+    [:main {:id "main"}
+     [:nav
+      (router/link "/" "Home" {:data-testid "link-home"})
+      (router/link "/todos" "Todos" {:data-testid "link-todos"})
+      (router/link "/todos/42?tab=open&tag=a&tag=b" "Todo 42" {:data-testid "link-detail"})
+      (router/link "/todos/7" "Todo 7" {:data-testid "link-detail-7"})
+      (router/link "/nowhere" "Nowhere" {:data-testid "link-missing"})
+      (router/link "/søk" "Søk" {:data-testid "link-search"})
+      (router/link "/hostile" "Hostile" {:data-testid "link-hostile"})]
+     [:p {:data-testid "route-path"} (:path r)]
+     [:p {:data-testid "route-handler"} (:handler r)]
+     [:p {:data-testid "enters"} (number->string @enters)]
+     [:p {:data-testid "cleanups"} (number->string @cleanups)]
+     [:button {:data-testid "push" :on-click "go-detail"} "push"]
+     (render-route r)]))
+
+;; ── Handlers ────────────────────────────────────────────────────────
+
+(define (go-detail ev)
+  (router/push! "/todos/99?tab=done"))
+
+(mount! "#app" app-view)

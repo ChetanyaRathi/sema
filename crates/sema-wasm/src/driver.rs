@@ -152,7 +152,13 @@ struct PromiseDebugDrive<'a> {
 impl<'a> PromiseDebugDrive<'a> {
     fn begin(driver: &'a PromiseDriver) -> Self {
         let session = driver.debug_session.borrow_mut().take();
-        debug_assert!(driver.debug_stop_requested.replace(None).is_none());
+        // The clear is a statement, not an argument to the assertion: a release
+        // build strips the whole `debug_assert!` macro, and with it any side
+        // effect written inside one — so stale re-entrancy state would survive
+        // in exactly the builds `wasm-pack` produces and every browser runs.
+        // The next line has always done the same job unconditionally.
+        let stale_stop = driver.debug_stop_requested.replace(None);
+        debug_assert!(stale_stop.is_none());
         driver.debug_breakpoints_pending.borrow_mut().take();
         Self { driver, session }
     }

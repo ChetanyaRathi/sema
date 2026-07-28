@@ -2,6 +2,11 @@ import { defineConfig, devices } from "@playwright/test";
 
 export default defineConfig({
   testDir: "./e2e/tests",
+  // Every fixture boots the real VM out of packages/sema-wasm/pkg, which is
+  // gitignored and which no JS entry point built. Without this, editing a crate
+  // and running the browser suite reported green against whatever binary
+  // happened to be there.
+  globalSetup: "./scripts/wasm-freshness-browser-setup.ts",
   fullyParallel: true,
   forbidOnly: !!process.env.CI,
   retries: process.env.CI ? 2 : 0,

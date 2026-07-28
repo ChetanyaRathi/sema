@@ -3,13 +3,20 @@
   "version": "1.9.0",
   "description": "Sema as an embedded web scripting language — DOM bindings, store API, and <script type=\"text/sema\"> support",
   "type": "module",
-  "main": "dist/index.js",
-  "types": "dist/index.d.ts",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
   "exports": {
     ".": {
+      "types": "./dist/index.d.ts",
       "import": "./dist/index.js",
-      "types": "./dist/index.d.ts"
-    }
+      "default": "./dist/index.js"
+    },
+    "./testing": {
+      "types": "./dist/testing.d.ts",
+      "import": "./dist/testing.js",
+      "default": "./dist/testing.js"
+    },
+    "./package.json": "./package.json"
   },
   "files": [
     "dist/",
@@ -19,7 +26,7 @@
   "scripts": {
     "bench": "tsx bench/perf.ts",
     "bench:browser": "playwright test -c bench/browser/playwright.bench.config.ts --workers=1 --reporter=line",
-    "build": "tsup",
+    "build": "rm -rf dist && tsup",
     "test": "vitest run",
     "test:coverage": "vitest run --coverage",
     "test:watch": "vitest",
@@ -33,6 +40,7 @@
   },
   "devDependencies": {
     "@playwright/test": "^1.58.2",
+    "@types/node": "^26.1.2",
     "@vitest/coverage-v8": "^4.1.2",
     "@vitest/ui": "^4.1.2",
     "jsdom": "^29.0.1",

@@ -1,0 +1,23 @@
+;; A smoke test for the *built* bundle, not for any one feature.
+;;
+;; It touches one binding from each registration group the bundle stitches
+;; together — reactive state, SIP markup, the component runtime, event
+;; delegation and the router — because the failure this fixture guards against
+;; is a packaging one: a tree-shaken or mis-ordered bundle that boots and then
+;; turns out to be missing a whole namespace.
+
+(def count (state 0))
+
+(router/init! {"/" "home" "/second" "second"})
+
+(define (handle-inc ev) (update! count (fn (n) (+ n 1))))
+
+(defcomponent bundle-view ()
+  (let ((r (router/current-route)))
+    [:div
+     [:p {:data-testid "count"} (number->string @count)]
+     [:p {:data-testid "route"} (:handler r)]
+     [:button {:data-testid "inc" :on-click "handle-inc"} "+"]
+     (router/link "/second" "Second" {:data-testid "link-second"})]))
+
+(mount! "#app" bundle-view)

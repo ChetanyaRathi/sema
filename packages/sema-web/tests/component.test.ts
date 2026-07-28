@@ -27,10 +27,11 @@ vi.mock("@preact/signals-core", () => ({
     return () => {};
   },
   batch: (fn: () => void) => fn(),
+  untracked: <T>(fn: () => T): T => fn(),
 }));
 
 // Import after mocks are set up
-const { registerComponentBindings, disposeAllComponents } = await import("../src/component.js");
+const { registerComponentBindings, disposeAllComponents, localCell } = await import("../src/component.js");
 const { registerHttpBindings } = await import("../src/http.js");
 const morphdom = (await import("morphdom")).default as any;
 
@@ -92,7 +93,7 @@ describe("registerComponentBindings", () => {
     const second = ctx.mountedComponents.get("#app2")!;
 
     expect(first.instanceId).not.toBe(second.instanceId);
-    expect(first.localState.get("count")).not.toBe(second.localState.get("count"));
+    expect(localCell(first, "count")).not.toBe(localCell(second, "count"));
   });
 
   it("remounting runs mount cleanup and tears down delegated listeners", () => {
