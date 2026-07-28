@@ -1297,3 +1297,77 @@ servers).
    `suspended_sse_handler_resumes_and_closes_stream`.
 
 ---
+
+## PG-1 — Playground → downloadable native binary — DECIDED AGAINST
+
+**Decided against 2026-07-28.** The browser could assemble a runnable native
+binary with no compiler (`sema build` is concatenation: stock runtime + VFS
+archive + trailer), feasibility high, effort ~half a day — but it was a
+demand-less proof-of-concept and is not wanted. Resume material, if ever:
+`docs/plans/archive/2026-06-19-playground-binary-export.md` ("Smallest
+proof-of-concept" section).
+
+---
+
+## ASYNC-2 — Debugger stepping across the scheduler boundary — CLOSED (won't do)
+
+**Closed 2026-07-28.** Breakpoints, continue, and inspection inside async tasks
+fully work; per-task stepping stays within the task's slice. Cross-task
+stepping would need the stepper to model the scheduler's task graph — a
+distinct design that no real debugging workflow has asked for. Closed rather
+than parked; reopen only against a concrete ask.
+
+---
+
+## VFS — clones on every read — CLOSED (won't do at current scale)
+
+**Closed 2026-07-28.** `vfs_read` clones file contents per call
+(`sema-core/src/vfs.rs`). Not a hotspot — the embedded-binary VFS serves
+interactive reads, not bundles. The `Cow`/`Arc` reshape is recorded here if
+the notebook ever serves real bundles.
+
+---
+
+## WASM-4 — `register_wasm_io` monolith — CLOSED (won't do unless the crash recurs)
+
+**Closed 2026-07-28 (originally decided 2026-06-18).** The ~1093-line
+registration function carries a latent V8 Turboshaft ARM64 risk that has not
+been observed since; the split is a large diff on a hot path. Revive only if
+the playground crash recurs.
+
+---
+
+## R10B — PDF parser terminal isolation — CLOSED (accepted disposition)
+
+**Closed 2026-07-28.** The offloaded `lopdf`/`pdf-extract` parse stays bounded
+by the quarantine hard-deadline cleanup net, not a terminal finite-work cap —
+truly terminal bounding needs a killable subprocess parser (rlimit/cgroup +
+IPC), a separate design nobody is building. The ledger row R10B already
+records the honest NON-terminal disposition; the standalone backlog entry is
+retired. (The fuller technical record also lives in the terminal-inventory
+residuals section that remains in `deferred.md`.)
+
+---
+
+## Historical verification notes (moved from deferred.md, 2026-07-28)
+
+These re-verification and fixed-entry annotations lived inline in
+`deferred.md` between entries; they are resolution records, so they belong
+here:
+
+Verified 2026-06-09: U6 ("did you mean" hints — shipped via `suggest_similar` in sema-core, attached in both backends) and U9 (REPL completeness check — replaced by the lexer-based `SemaValidator` in `crates/sema/src/repl/validator.rs`) were removed because they have since been fixed. Remaining entries re-verified as still open.
+
+Verified 2026-07-01: **LEX-1** (scientific/exponential number literals — `1e19`, `2e-5`, `1E10` now parse), **VM-1** (VM stack traces on runtime errors — the VM now captures the call stack at error time and serializes it as `:stack-trace`), and **N7** (`sort` on heterogeneous types — comparator-free `sort` now raises a type error on mixed types and compares ints/floats numerically, `crates/sema-stdlib/src/list.rs`) were removed because they are fixed. Remaining entries re-verified as still open.
+
+Fixed 2026-07-02: **ASYNC-3** (`async/all` early-reject stranding a span-owning
+`IoHandle` to teardown) — `cancel_abandoned_combinator_siblings` in the scheduler
+transitively cancels + IO-aborts a combinator's still-pending siblings when
+`async/all` rejects or `async/race` settles, on the VM thread with the OTel
+thread-locals alive. Commit `a2c8a0ad`; gates `async_all_reject_cancels_pending_sibling`,
+`async_race_cancels_losing_siblings`, `combinator_short_circuit_spares_unrelated_task`
+in `crates/sema/tests/vm_async_test.rs`. (This entry lingered here for a week after
+the fix landed — the fix shipped the same day the entry was written.)
+
+Fixed 2026-07-02: **ASYNC-1** (dynamic-scope flags vs deferred async tasks) — `llm/with-cache`/`llm/with-budget`/per-call `:tags` are now captured per task and swapped in/out at each scheduler step (a third per-task context beside the otel + usage-scope swaps), with the active budget frame shared by `Rc` so a concurrent `with-budget` fan-out charges one aggregate. See ADR #67, `docs/plans/2026-07-02-async-1-dynamic-scope-per-task.md`; gates `async_cache_miss_is_counted` + `async_budget_gates_concurrent_fanout` in `crates/sema/tests/complete_async_test.rs`. (The follow-up teardown gap it surfaced is now tracked as ASYNC-3 above.)
+
+---

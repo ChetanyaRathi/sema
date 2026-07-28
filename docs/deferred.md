@@ -21,27 +21,6 @@ Things that came out of the May 2026 quality sweep (Wave 6 audit) but were inten
 
 Also noted from the PR #59 merge review as low-priority, not-yet-done: capping the device-flow `slow_down` interval growth (the `+5` itself is RFC 8628-correct), and auto-reconnecting a Streamable-HTTP session on a mid-session `404` (currently surfaced as a `reconnect required` error rather than transparently re-initializing).
 
-## ASYNC-2 — Stepping across the scheduler boundary into sibling async tasks
-
-**Found 2026-06-23; residual of the async-breakpoints fix.** Breakpoints inside async tasks now fully work under both the native DAP and the WASM playground: a breakpoint in an `(async …)` / `(async/spawn …)` body stops, `Continue` resumes, inspection (stack/scopes/variables) targets the paused **task's** VM frames, and Step Over/Out follow the task's own call depth (gate tests: `crates/sema/tests/dap_async_breakpoint_test.rs`, `crates/sema/tests/wasm_async_debug_test.rs`, `playground/tests/debugger-async.spec.ts`). The one remaining gap: stepping (Step Into/Over/Out) does **not** follow control *across* the scheduler boundary into sibling tasks or back to the main VM — while a task is paused, siblings stay parked and a step stays within the current task slice. **Deferred because** cross-task stepping is a distinct design problem (the stepper would have to model the cooperative scheduler's task graph, not just one VM's frame depth), it's an enhancement rather than the reported bug, and the STOP+CONTINUE+inspect slice already covers the common debugging need. Revisit if async stepping across tasks becomes a real workflow ask.
-
----
-
-Verified 2026-06-09: U6 ("did you mean" hints — shipped via `suggest_similar` in sema-core, attached in both backends) and U9 (REPL completeness check — replaced by the lexer-based `SemaValidator` in `crates/sema/src/repl/validator.rs`) were removed because they have since been fixed. Remaining entries re-verified as still open.
-
-Verified 2026-07-01: **LEX-1** (scientific/exponential number literals — `1e19`, `2e-5`, `1E10` now parse), **VM-1** (VM stack traces on runtime errors — the VM now captures the call stack at error time and serializes it as `:stack-trace`), and **N7** (`sort` on heterogeneous types — comparator-free `sort` now raises a type error on mixed types and compares ints/floats numerically, `crates/sema-stdlib/src/list.rs`) were removed because they are fixed. Remaining entries re-verified as still open.
-
-Fixed 2026-07-02: **ASYNC-3** (`async/all` early-reject stranding a span-owning
-`IoHandle` to teardown) — `cancel_abandoned_combinator_siblings` in the scheduler
-transitively cancels + IO-aborts a combinator's still-pending siblings when
-`async/all` rejects or `async/race` settles, on the VM thread with the OTel
-thread-locals alive. Commit `a2c8a0ad`; gates `async_all_reject_cancels_pending_sibling`,
-`async_race_cancels_losing_siblings`, `combinator_short_circuit_spares_unrelated_task`
-in `crates/sema/tests/vm_async_test.rs`. (This entry lingered here for a week after
-the fix landed — the fix shipped the same day the entry was written.)
-
-Fixed 2026-07-02: **ASYNC-1** (dynamic-scope flags vs deferred async tasks) — `llm/with-cache`/`llm/with-budget`/per-call `:tags` are now captured per task and swapped in/out at each scheduler step (a third per-task context beside the otel + usage-scope swaps), with the active budget frame shared by `Rc` so a concurrent `with-budget` fan-out charges one aggregate. See ADR #67, `docs/plans/2026-07-02-async-1-dynamic-scope-per-task.md`; gates `async_cache_miss_is_counted` + `async_budget_gates_concurrent_fanout` in `crates/sema/tests/complete_async_test.rs`. (The follow-up teardown gap it surfaced is now tracked as ASYNC-3 above.)
-
 ---
 
 
@@ -56,26 +35,6 @@ Fixed 2026-07-02: **ASYNC-1** (dynamic-scope flags vs deferred async tasks) — 
 **Why deferred:** non-trivial language design. Affects reader (new pattern in catch clause), special-form lowering in both backends, and prelude macros that use `try`. Needs an ADR before code.
 
 **Workaround today:** users can do `(try ... (catch e (if (= (:type e) :user) (handle e) (throw e))))` to re-raise unexpected errors. That's a documented pattern in special-forms.md.
-
----
-
-## VFS — clones on every read
-
-**Today (updated 2026-06-09):** `vfs_read` returns `Option<Vec<u8>>`, cloning file contents on each call — the function now lives in `crates/sema-core/src/vfs.rs:15` (the embedded-binary VFS). The originally-cited `crates/sema-notebook/src/vfs.rs` has since become a different thing (disk-backed path-sandboxed shim) and is no longer relevant to this entry.
-
-**Proposed fix:** return `Cow<'_, [u8]>` so cached reads can be borrowed, or back the VFS with `Arc<HashMap>` so the file table can hand out cheap reference-counted handles.
-
-**Why deferred:** identified in PR #14 review (severity: medium). VFS read isn't a current hotspot — the notebook is interactive, not a high-throughput file server. Revisit if the notebook starts serving real bundles.
-
----
-
-## WASM-4 — `register_wasm_io` is a single ~1093-line function
-
-**Today:** `crates/sema-wasm/src/lib.rs` registers all WASM I/O builtins in one ~1093-line function. Large WASM functions carry a known V8 Turboshaft miscompilation/crash risk on ARM64 (see the chromium-wasm-crash note in MEMORY).
-
-**Proposed fix:** split into smaller per-area registration functions (pure refactor, no behavior change).
-
-**Why deferred (decided 2026-06-18):** latent risk only; the crash has not been observed since. Revisit if it recurs in the playground. Large diff on a hot path, not worth the churn now.
 
 ---
 
@@ -138,28 +97,6 @@ What's left:
   fixture task + cassette in CI. Explicitly deferred by owner; reuses FakeProvider/cassettes.
 
 (Cassette CI corpus — plan's 6.4 — is tracked separately as CASS-1.)
-
----
-
-## PG-1 — Playground → downloadable native binary
-
-**Deferred (revisit later) — 2026-06-23.** Captured 2026-06-19 as a curiosity and
-archived to `docs/plans/archive/2026-06-19-playground-binary-export.md`. The
-playground runs the WASM build, but `sema build` isn't compilation — it's
-concatenation (`[stock runtime] + [VFS archive] + [trailer]`), so the browser
-could produce a byte-identical runnable native binary with **no compiler**: pick a
-target, fetch the stock runtime (ideally mirrored same-origin on sema.run), append
-the archive built from the editor contents, write the `SEMAEXEC` trailer, download.
-
-**Feasibility high, effort low (~half a day)** — mostly UI + hosting the runtime
-mirror. Preferred first step: factor archive-writing into a lib and expose a
-`sema-wasm` binding returning `Uint8Array` (avoids format drift vs. reimplementing
-the format in JS). Pointers: `crates/sema/src/archive.rs` (format),
-`crates/sema/src/cross_compile.rs` (`SUPPORTED_TARGETS`, runtime download/cache),
-`crates/sema/src/main.rs` `Commands::Build` + `pkg.rs`.
-
-**Why deferred:** not scheduled — no demand pull, just an attractive proof-of-concept.
-Resume from the plan's "Smallest proof-of-concept" section.
 
 ---
 
@@ -292,30 +229,3 @@ Both are honest **narrowed-terminal** dispositions, not gaps to silently close.
   stdin, a file read inside a quantum is legal when offloaded, so the
   zero-tolerance stdin model does not transfer.)
 
-## R10B — PDF parser terminal isolation (subprocess/parser isolation deferred)
-
-**Recorded 2026-07-22 (Commit B9).** R10 splits into a terminal admission arm
-and a non-terminal parser arm. **R10A** (input-byte admission) is genuinely
-terminal: `pdf.rs`'s `open_pdf_runtime_input`/`check_pdf_limit` `stat`s the file
-and rejects an oversized PDF on the VM thread BEFORE any worker runs — no worker
-allocation. **R10B** (the offloaded parse) is NOT terminally bounded and is
-deliberately left that way:
-
-- The page and returned-text caps (`check_pdf_pages`/`check_pdf_text_output`) run
-  **post-parse**. `lopdf::Document::load_mem` and `pdf_extract::extract_text_*`
-  can allocate and decompress object/content streams while loading — before the
-  page count or output size is known — so a hostile PDF can drive unbounded
-  intermediate allocation on the worker even though the *input* bytes are capped.
-- Consequently R10B keeps the `hard_deadline` cleanup net (via
-  `quarantined_compute`), **not** a `QuarantineBound::finite_work` descriptor. Its
-  ledger row states a documented NON-terminal parser bound rather than claiming
-  BOUNDED — the honest disposition (contrast R02 archive, whose caps are enforced
-  incrementally on the worker and so declares `finite_work`).
-- **Terminally bounding the PDF parser needs isolation the in-process design
-  can't provide.** `lopdf`/`pdf-extract` expose no incremental-allocation or
-  interrupt hook, so the only way to cap their peak allocation/CPU terminally is
-  to run the parse in a **subprocess** (rlimit/cgroup-bounded, killable) or behind
-  a parser that streams with a hard allocation budget. That is a separate design
-  (process pool, IPC of the byte snapshot and the extracted text/metadata,
-  cross-platform kill+reap) and is deferred. Until then the `pdf/*` ops remain
-  available and offloaded under the hard cleanup deadline.
