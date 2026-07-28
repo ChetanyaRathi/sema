@@ -1,3 +1,10 @@
+> **ARCHIVED — DEAD AS WRITTEN (2026-07-28).** The editor-verification tier
+> (items 4/5, `editors/intellij/SMOKE.md`) became impossible when the editor
+> plugins left the monorepo (4c25273c, 2026-07-05); nothing else from the
+> design landed, and it predates the sema-lsp crate split. The server-side
+> invariant/oracle harness idea is still sound — re-propose it fresh against
+> the current crate layout if wanted.
+
 # LSP Audit Harness — Design
 
 **Status:** Approved design, awaiting implementation plan

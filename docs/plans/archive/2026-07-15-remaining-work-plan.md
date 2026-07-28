@@ -7,7 +7,7 @@ TaskId = spawn order). P6-1 (host API) and P6-3 (wasm Promise roots) are now als
 see `docs/plans/archive/2026-07-16-p6-1-host-api.md` and
 `docs/plans/archive/2026-07-16-wasm-promise-driven-roots.md`. Open remainder: SRV-1, Step-G
 (nested `eval` + multimethod-async dispatch). See
-`docs/plans/2026-07-16-post-migration-doc-reconciliation-and-p6-roadmap.md` for sequencing.
+`docs/plans/archive/2026-07-16-post-migration-doc-reconciliation-and-p6-roadmap.md` for sequencing.
 (Original round-0 status: VERIFIED by two independent Opus reviewers; corrections applied below.)
 
 ## Verification round-0 outcome (2 independent Opus reviewers) + applied corrections

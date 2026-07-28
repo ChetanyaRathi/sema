@@ -27,7 +27,7 @@ or owns a private scheduler.
   roots) are both complete — see `docs/plans/archive/2026-07-16-p6-1-host-api.md` and
   `docs/plans/archive/2026-07-16-wasm-promise-driven-roots.md`. Only SRV-1 (concurrent
   `http/serve`) remains open; see
-  `docs/plans/2026-07-16-post-migration-doc-reconciliation-and-p6-roadmap.md` Slice C.
+  `docs/plans/archive/2026-07-16-post-migration-doc-reconciliation-and-p6-roadmap.md` Slice C.
   Original: Ready only after Task 06 is accepted and committed.
 - **Dependencies:** Final runtime/language/resource/context/orchestration APIs and
   clean Task 01–06 review evidence.

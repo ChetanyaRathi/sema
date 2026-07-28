@@ -1,3 +1,11 @@
+> **ARCHIVED — SUPERSEDED (2026-07-28).** M1/M2/M4 shipped (ADR #68, PR #99);
+> the residue (M3 cancellation completeness, M5 fan-out fairness) was absorbed
+> by the unified cooperative runtime rewrite, which replaced this design's
+> machinery wholesale (`scheduler.rs`/`async_signal.rs`/`async_rt.rs` no longer
+> exist). Canonical successors:
+> [`archive/2026-07-13-unified-cooperative-runtime.md`](2026-07-13-unified-cooperative-runtime.md)
+> and `docs/internals/async-runtime-inventory.md`.
+
 # Cooperative Scheduling & Async Concurrency (canonical)
 
 **Status:** living design — the single source of truth for Sema's async /

@@ -44,6 +44,27 @@ Fixed 2026-07-02: **ASYNC-1** (dynamic-scope flags vs deferred async tasks) — 
 
 ---
 
+## LSP-CI-1 — LSP e2e suite not in CI; no positionEncoding/UTF-16 wire coverage
+
+**Today:** the 17-file Python e2e suite under `crates/sema-lsp/tests/e2e/` runs
+only locally (`jake test.lsp` → `uv run pytest`); no GitHub workflow invokes it,
+so a protocol-level regression (initialize handshake, diagnostics push, code
+lens) ships silently if nobody ran it. Separately, the server does no
+`positionEncoding` negotiation and has no astral-plane UTF-16 wire tests.
+
+**Proposed fix:** a CI job that installs `uv` and runs the pytest suite against
+the debug binary; a `positionEncoding` capability + one surrogate-pair
+regression test.
+
+**Why deferred:** demoted from the archived
+`plans/archive/2026-06-09-lsp-e2e-compliance-testing.md` (its larger in-process
+harness design went stale when the editor plugins left the monorepo). These two
+facts are the surviving actionable part.
+
+**Workaround today:** run `jake test.lsp` locally before LSP releases.
+
+---
+
 ## D5 — Typed `try`/`catch` form
 
 **Today:** `(try expr (catch e ...))` catches *every* error type, including `:unbound`, `:arity`, `:type-error` — the kind of errors that usually mean a typo. The docs (`website/docs/language/special-forms.md` near "Re-throw errors you don't intend to handle") explicitly warn about this.

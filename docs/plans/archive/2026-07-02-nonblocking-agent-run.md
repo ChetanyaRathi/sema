@@ -2,7 +2,7 @@
 
 **Status:** design approved (adversarial doc-review panel, 2026-07-02) → implementing.
 Supersedes the "yield-internally in one native" sketch in
-`docs/plans/2026-07-01-cooperative-scheduling.md` §3a. ADR #68.
+`docs/plans/archive/2026-07-01-cooperative-scheduling.md` §3a. ADR #68.
 
 ## Problem
 

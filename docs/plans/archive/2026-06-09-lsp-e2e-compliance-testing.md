@@ -1,3 +1,10 @@
+> **ARCHIVED — STALE (2026-07-28).** Layers 2/3 were never started and the
+> plan's revisit gate ("after the IntelliJ-plugin integration test track
+> lands") became unreachable when the editor plugins left the monorepo
+> (4c25273c). The two still-live facts moved to `docs/deferred.md`: the Python
+> LSP e2e suite runs only locally (`jake test.lsp`), not in CI, and there is no
+> `positionEncoding` negotiation / UTF-16 astral-plane wire coverage.
+
 # In-Crate Rust E2E + LSP Spec-Compliance Suite for sema-lsp
 
 **Date:** 2026-06-09
