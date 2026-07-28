@@ -11,15 +11,18 @@ pointer here) until fixed.
 
 ## 1. `sema build` executables never find their embedded payload (severity: high)
 
-A `sema build`-produced `.exe` boots as the plain sema CLI/REPL instead of the
-bundled program — `try_run_embedded()` (crates/sema/src/main.rs:2063,
-`libsui::find_section("semaexec")`) returns `None`. The build side succeeds;
-the run side falls through to clap. Prime suspect: `write_executable_platform`'s
-PE branch (main.rs ~3183–3202) runs libsui `write_resource` + `set_icon`, then
-an editpe `set_windows_version_info` pass that REBUILDS the PE resource
-directory — likely dropping or reordering the libsui RCDATA entry that
-`find_section` needs. Verify on Windows by dumping the built exe's resource
-table, or bisecting with the editpe pass skipped.
+**FIXED (wave B2, pending Windows CI confirmation), with a known cosmetic
+cost.** A `sema build`-produced `.exe` booted as the plain sema CLI/REPL —
+`try_run_embedded()` (crates/sema/src/main.rs, `libsui::find_section
+("semaexec")`) returned `None`. Root cause: both PE writers rebuild the
+resource tree exclusively — the editpe `set_windows_version_info` pass that
+ran AFTER libsui dropped/broke the libsui RCDATA entry. Fix: editpe brands
+first, libsui (payload + icon) writes last. Verified structurally via pefile
+on a cross-built exe: RT_RCDATA/SEMAEXEC + icons present. Cost: RT_VERSION is
+now absent (libsui drops resources it doesn't manage) — Explorer's Details
+tab loses the version block until a single writer carries all three
+(candidates: teach libsui versioninfo, or an editpe-only pipeline whose
+output find_section can read, verified on real Windows).
 Detected by: 10 `sema build` integration tests + the run-step of
 `output_into_existing_directory` (integration_test.rs) + mcp_suite's
 `standalone_binary_mode` (spawns a `sema build` binary as an MCP server).
