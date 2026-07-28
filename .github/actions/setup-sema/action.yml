@@ -15,9 +15,6 @@ inputs:
   apt-packages:
     description: "apt packages to install"
     default: "libudev-dev pkg-config"
-  cache-workspace-crates:
-    description: "Have rust-cache keep workspace-member artifacts too (needed by jobs that run `jake examples`, whose release build rust-cache would otherwise prune)"
-    default: "false"
   install-nextest:
     description: "Install cargo-nextest"
     default: "true"
@@ -42,16 +39,17 @@ runs:
 
     # Smart Rust cache (partial-restores across Cargo.lock changes) instead of
     # an exact-match key that cold-rebuilds the whole workspace each time.
-    # prefix-key rotated off the default: rust-cache never saves on an exact
-    # primary-key hit, so caches written before cache-workspace-crates existed
-    # would exact-hit forever and the workspace release artifacts (what makes
-    # `jake examples` cheap) could never enter the cache. Bump the suffix if
-    # the cache layout changes again.
+    # Note: workspace-member artifacts are NOT worth caching — a fresh checkout
+    # gives every source file a new mtime, which invalidates cargo's
+    # fingerprints for workspace crates, so they rebuild every run regardless
+    # (third-party deps stay fresh because ~/.cargo sources restore with their
+    # archived mtimes). prefix-key is rotated off the default because
+    # rust-cache never saves on an exact primary-key hit — bump the suffix if
+    # the cache layout needs to change again.
     - name: Cache cargo + target
       uses: Swatinem/rust-cache@v2
       with:
         prefix-key: v1-rust-sema
-        cache-workspace-crates: ${{ inputs.cache-workspace-crates }}
 
     - name: Install cargo-nextest
       if: inputs.install-nextest == 'true'

@@ -36,15 +36,11 @@ jobs:
 
       # ripgrep: the unified-runtime conformance tests scan with `rg`.
       # shfmt: `jake scripts.check`.
-      # cache-workspace-crates: `jake examples` needs a release build of the
-      # workspace crates; without it rust-cache prunes them and every run pays
-      # a ~4-minute cold release rebuild to execute ~2s of examples.
       - name: Set up toolchain, cache, jake
         uses: ./.github/actions/setup-sema
         with:
           components: rustfmt, clippy
           apt-packages: libudev-dev pkg-config ripgrep shfmt
-          cache-workspace-crates: "true"
 
       # Gate the publish on a complete crate list: every publishable workspace
       # crate must be in the publish order, so a release can't half-publish on
@@ -77,11 +73,30 @@ jobs:
       - name: Smoke test bytecode
         run: jake smoke-bytecode
 
-      - name: Smoke test examples
-        run: jake examples
-
       - name: Smoke test packaged web runtime
         run: jake release.packaged-web
+
+  # Runs every example against the RELEASE binary — the gate's only native
+  # release-profile execution (release-only bug classes exist: a debug_assert
+  # side-effect compiled out of release once shipped a broken browser VM), and
+  # skipping the examples run at all is how a regression once shipped past four
+  # releases. Its own job because the ~4-minute release rebuild of the
+  # workspace crates is unavoidable per run (fresh-checkout mtimes invalidate
+  # cargo's fingerprints for workspace members, so caching cannot absorb it) —
+  # in here it runs parallel to the test suite instead of extending it.
+  examples:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up toolchain, cache, jake
+        uses: ./.github/actions/setup-sema
+        with:
+          install-nextest: "false"
+
+      - name: Smoke test examples
+        run: jake examples
 
   # Fail if the committed `sema web` browser runtime is stale, so an out-of-date
   # runtime can NEVER be published. The runtime under crates/sema/src/web/assets
