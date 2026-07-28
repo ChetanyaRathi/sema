@@ -3606,7 +3606,11 @@ fn run_fmt(
     // literal path prefix (file or directory). Paths are matched relative to
     // the working directory, `./`-stripped.
     let is_ignored = |path: &str| -> bool {
-        let normalized = path.strip_prefix("./").unwrap_or(path);
+        // Walked paths carry the host separator (`\` on Windows) while ignore
+        // entries are written with `/`; compare in `/` form or literal-prefix
+        // entries never match there (globs matched either way).
+        let unified = path.replace('\\', "/");
+        let normalized = unified.strip_prefix("./").unwrap_or(&unified);
         ignore.iter().any(|pat| {
             if pat.contains('*') || pat.contains('?') || pat.contains('[') {
                 glob::Pattern::new(pat)

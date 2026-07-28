@@ -2,9 +2,12 @@
 
 The Windows test leg's first honest run (nightly harness, PR #135) reduced 189
 failures to a handful of root causes. Most were test-portability issues, fixed
-in the same PR. These five are REAL product bugs on Windows; the tests that
-detect each one are deliberately left red (or cfg-gated with a pointer here)
-until the bug is fixed. None reproduce on Unix.
+in the same PR. These five were REAL product bugs on Windows; none reproduce
+on Unix. **Bugs 2, 3, and 4 are fixed in this PR's wave B** (tarball
+`has_root` rejection; fmt separator normalization; rollback via a write-mode
+handle) with their detector tests re-enabled cross-platform. Bugs 1 and 5
+remain open; their detector tests stay red on Windows (or cfg-gated with a
+pointer here) until fixed.
 
 ## 1. `sema build` executables never find their embedded payload (severity: high)
 
@@ -18,7 +21,8 @@ directory — likely dropping or reordering the libsui RCDATA entry that
 `find_section` needs. Verify on Windows by dumping the built exe's resource
 table, or bisecting with the editpe pass skipped.
 Detected by: 10 `sema build` integration tests + the run-step of
-`output_into_existing_directory` (integration_test.rs).
+`output_into_existing_directory` (integration_test.rs) + mcp_suite's
+`standalone_binary_mode` (spawns a `sema build` binary as an MCP server).
 
 ## 2. `extract_tarball` path-escape: rooted driveless entries (severity: high, security)
 

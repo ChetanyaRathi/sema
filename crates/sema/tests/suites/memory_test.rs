@@ -492,14 +492,9 @@ fn memory_open_requires_fs_write_cap() {
 /// A flush that fails MID-WRITE (partial bytes on disk) must roll back, so the
 /// retry appends each turn exactly once — no duplicated lines, no torn JSON
 /// mashed with the next line. Driven by the flush fault-injection seam.
-///
-/// Unix-only: the rollback (`write_lines`' `file.set_len(pre_len)`) runs on a
-/// handle opened with `.append(true)`, which on Windows has `FILE_APPEND_DATA`
-/// but not the `FILE_WRITE_DATA` right truncation needs — the set_len fails,
-/// the partial prefix survives, and the retry produces exactly the torn line
-/// this test forbids. The rollback itself needs a Windows-capable fix before
-/// this oracle can run there.
-#[cfg(unix)]
+/// Also the cross-platform oracle for the rollback path itself: `write_lines`
+/// truncates via a fresh write-mode handle because an append-mode handle
+/// lacks the `FILE_WRITE_DATA` right on Windows.
 #[test]
 fn memory_partial_flush_failure_retries_without_duplicates() {
     let dir = TempMemDir::new("partial-flush");

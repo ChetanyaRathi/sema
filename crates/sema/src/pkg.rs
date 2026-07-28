@@ -1334,16 +1334,26 @@ fn extract_tarball(data: &[u8], dest: &Path) -> Result<(), String> {
             .map_err(|e| format!("Invalid entry path: {e}"))?
             .into_owned();
 
-        if path.is_absolute() {
+        // `has_root`, not `is_absolute`: on Windows a drive-less rooted entry
+        // (`/tmp/x`) is not "absolute", yet `dest.join` re-roots it onto
+        // dest's drive and writes outside the extraction dir.
+        if path.has_root() {
             return Err(format!("Tar entry has absolute path: {}", path.display()));
         }
 
         for component in path.components() {
-            if matches!(component, std::path::Component::ParentDir) {
-                return Err(format!(
-                    "Tar entry contains path traversal: {}",
-                    path.display()
-                ));
+            match component {
+                std::path::Component::ParentDir => {
+                    return Err(format!(
+                        "Tar entry contains path traversal: {}",
+                        path.display()
+                    ));
+                }
+                // A drive-relative entry (`C:x`) also re-roots `dest.join`.
+                std::path::Component::Prefix(_) => {
+                    return Err(format!("Tar entry has absolute path: {}", path.display()));
+                }
+                _ => {}
             }
         }
 
@@ -2910,6 +2920,13 @@ name = "myproject"
 
         let result = extract_tarball(&malicious, &dest);
         assert!(result.is_err(), "absolute paths should be rejected");
+
+        // Rooted-but-driveless spelling: on Windows `is_absolute()` is false
+        // for this, yet `dest.join` re-roots it onto dest's drive — the
+        // `has_root()` check must reject it on every platform.
+        let rooted = make_malicious_tarball("/tmp/pwned.txt", b"pwned!");
+        let result = extract_tarball(&rooted, &dest);
+        assert!(result.is_err(), "rooted driveless paths should be rejected");
         let _ = fs::remove_dir_all(&dir);
     }
 
