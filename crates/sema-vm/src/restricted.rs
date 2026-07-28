@@ -286,7 +286,15 @@ impl RestrictedOwner {
     fn pop(&mut self) -> Option<RestrictedFrame> {
         let frame = self.frames.pop()?;
         if matches!(frame, RestrictedFrame::VmResume(_)) {
-            debug_assert_eq!(self.vm_frame_indices.pop(), Some(self.frames.len()));
+            // The pop MUST be its own statement. `debug_assert_eq!` is compiled
+            // out entirely in release, so passing the pop to it as an argument
+            // (as this once did) left the index behind in exactly the builds
+            // users run: the next `call_env` /
+            // `parked_parent_vm_mut` then resolved a stale index onto a frame
+            // that had since become a Continuation and hit the `unreachable!`,
+            // which surfaces in the browser as `RuntimeError: unreachable`.
+            let popped = self.vm_frame_indices.pop();
+            debug_assert_eq!(popped, Some(self.frames.len()));
         }
         Some(frame)
     }
@@ -1707,6 +1715,31 @@ mod tests {
         assert_eval_message(&error, "test evaluation exceeded deadline");
         assert_eq!(starts.load(Ordering::SeqCst), 1);
         assert_eq!(steps.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn restricted_owner_pops_its_vm_index_in_release_builds_too() {
+        // Regression: the pop used to live inside `debug_assert_eq!`, so it
+        // vanished under `cargo build --release` — which is what wasm-pack
+        // produces and therefore what every browser user runs. The stale index
+        // then aimed `call_env` at a Continuation frame and tripped the
+        // `unreachable!`, reaching JS as `RuntimeError: unreachable`.
+        //
+        // Asserting on the SOURCE rather than on behaviour is deliberate: a
+        // behavioural test compiled in debug (as `cargo test` does by default)
+        // cannot observe the difference at all, so it would pass in both the
+        // fixed and the broken tree and prove nothing.
+        let source = include_str!("restricted.rs");
+        let assert_with_pop = ["debug_assert_eq!(self.vm_frame_indices.", "pop()"].concat();
+        assert!(
+            !source.contains(&assert_with_pop),
+            "vm_frame_indices.pop() must not be an argument to debug_assert_eq! — \
+             release builds strip the whole macro, taking the pop with it"
+        );
+        assert!(
+            source.contains("let popped = self.vm_frame_indices.pop();"),
+            "the pop must be an unconditional statement"
+        );
     }
 
     #[test]

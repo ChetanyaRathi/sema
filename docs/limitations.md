@@ -327,11 +327,15 @@ Guarded by `restricted_owner_pops_its_vm_index_in_release_builds_too`
 behavioural test compiled in debug cannot observe the difference at all, so it
 would pass against both the fixed and the broken tree.
 
-**Consumers of this section should be revisited.** `component/render` in
-`packages/sema-web/src/component.ts` deliberately dropped per-child error
-isolation to route around the trap, and
-`packages/sema-web/e2e/fixtures/scripts/composition.sema` avoids `try` for the
-same reason. Both restrictions are now unnecessary.
+**Consumers of this section have been revisited (2026-07-28).**
+`component/render` in `packages/sema-web/src/component.ts` had dropped per-child
+error isolation to route around the trap; the `try`/`catch` guard is restored in
+`__component-render-guarded`, covered by
+`packages/sema-web/tests/component-sema.test.ts` ("isolates a throwing child
+inside a map callback") and by `e2e/tests/composition.spec.ts` in real Chrome.
+`packages/sema-web/e2e/fixtures/scripts/composition.sema` no longer needs its own
+`try` for the same reason. Any remaining comment in that package that describes
+the trap does so in the past tense.
 
 ---
 

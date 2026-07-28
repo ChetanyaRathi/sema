@@ -778,8 +778,8 @@ C16	crates/sema-vm/src/lower.rs:15:thread_local! {
 C16	crates/sema-vm/src/lower.rs:325:thread_local! {
 C16	crates/sema-vm/src/lower.rs:328:    /// `Spur` ids are only meaningful within the `thread_local!` interner that
 C16	crates/sema-vm/src/lower.rs:391:    thread_local! {
-F28	crates/sema-vm/src/restricted.rs:1679:                    std::thread::sleep(Duration::from_millis(150));
-F28	crates/sema-vm/src/restricted.rs:1730:                std::thread::sleep(Duration::from_millis(150));
+F28	crates/sema-vm/src/restricted.rs:1687:                    std::thread::sleep(Duration::from_millis(150));
+F28	crates/sema-vm/src/restricted.rs:1763:                std::thread::sleep(Duration::from_millis(150));
 F09B	crates/sema-vm/src/runtime/host.rs:306:            match guard.recv() {
 F09B	crates/sema-vm/src/runtime/host.rs:346:        ExecutorDispatch::Async(async_dispatch) => block_on(async_dispatch.into_future()),
 F09B	crates/sema-vm/src/runtime/host.rs:370:fn block_on<F: Future>(future: F) -> F::Output {
@@ -880,8 +880,8 @@ F29	crates/sema-vm/src/vm.rs:4333:        let result = sema_core::call_callback(
 F29	crates/sema-vm/src/vm.rs:4708:    /// foreign stack (an `async/spawn` task, a fresh fallback VM, an inline-task
 C17	crates/sema-vm/src/vm.rs:687:thread_local! {
 F28	crates/sema-vm/src/vm.rs:81:    /// (an `async/spawn` task VM, a fresh fallback VM, an inline-task HOF)
-H10A	crates/sema-wasm/src/driver.rs:422:    // immediate turn here, a cancelled `(async/sleep 5000)` would sit
-H10A	crates/sema-wasm/src/driver.rs:769:/// honor a pending `WaitKind::Timer` deadline (`async/sleep`) instead of
+H10A	crates/sema-wasm/src/driver.rs:428:    // immediate turn here, a cancelled `(async/sleep 5000)` would sit
+H10A	crates/sema-wasm/src/driver.rs:775:/// honor a pending `WaitKind::Timer` deadline (`async/sleep`) instead of
 H09	crates/sema-wasm/src/driver.rs:82:thread_local! {
 H09	crates/sema-wasm/src/lib.rs:132:thread_local! {
 H09	crates/sema-wasm/src/lib.rs:16:thread_local! {
