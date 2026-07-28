@@ -55,9 +55,13 @@ task _vendor-runtime: [build]
     cp node_modules/@preact/signals-core/dist/signals-core.module.js {{$1}}/signals-core.module.js
     cp node_modules/morphdom/dist/morphdom-esm.js {{$1}}/morphdom-esm.js
 
-# Vendor the browser runtime the `sema web` dev server embeds. build.rs picks
-# these up (web_runtime cfg) and include_bytes! embeds them. Rebuild the sema
-# binary afterward to embed. Artifacts are gitignored (built, multi-MB).
+# Vendor the browser runtime the `sema web` dev server embeds (rust_embed over
+# crates/sema/src/web/assets). The assets are COMMITTED generated artifacts —
+# `cargo package` ships only git-tracked files, so gitignoring them is how
+# `sema web` once shipped broken (see AGENTS.md shipping invariant). They are
+# guarded by crates/sema/web-runtime.lock; check-web-runtime-fresh.sh --write
+# (invoked below) is the only sanctioned lock writer. Rebuild the sema binary
+# afterward to embed.
 # Incremental vendoring (file recipes). Deps are the inputs `_vendor-runtime`
 # does NOT rewrite — the WASM VM pkg (itself an incremental file recipe) plus
 # the JS package sources. The npm-built `dist/` is deliberately NOT a dep: the

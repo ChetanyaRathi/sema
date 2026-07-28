@@ -1,0 +1,66 @@
+# Shared Linux CI setup: system packages, Rust toolchain, rust-cache,
+# cargo-nextest, and the pinned jake release binary. Used by verify.yml and
+# nightly.yml so tool versions and install steps live in exactly one place.
+# Linux-only (apt); the Windows leg in nightly.yml sets itself up directly.
+name: Setup Sema CI
+description: apt packages + Rust toolchain + rust-cache + nextest + pinned jake
+
+inputs:
+  components:
+    description: "Rust toolchain components, comma-separated (e.g. 'rustfmt, clippy')"
+    default: ""
+  targets:
+    description: "Extra Rust targets, comma-separated (e.g. 'wasm32-unknown-unknown')"
+    default: ""
+  apt-packages:
+    description: "apt packages to install"
+    default: "libudev-dev pkg-config"
+  cache-workspace-crates:
+    description: "Have rust-cache keep workspace-member artifacts too (needed by jobs that run `jake examples`, whose release build rust-cache would otherwise prune)"
+    default: "false"
+  install-nextest:
+    description: "Install cargo-nextest"
+    default: "true"
+  install-jake:
+    description: "Install the pinned jake release binary"
+    default: "true"
+
+runs:
+  using: composite
+  steps:
+    - name: Install system dependencies
+      shell: bash
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y ${{ inputs.apt-packages }}
+
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        components: ${{ inputs.components }}
+        targets: ${{ inputs.targets }}
+
+    # Smart Rust cache (partial-restores across Cargo.lock changes) instead of
+    # an exact-match key that cold-rebuilds the whole workspace each time.
+    - name: Cache cargo + target
+      uses: Swatinem/rust-cache@v2
+      with:
+        cache-workspace-crates: ${{ inputs.cache-workspace-crates }}
+
+    - name: Install cargo-nextest
+      if: inputs.install-nextest == 'true'
+      uses: taiki-e/install-action@nextest
+
+    # Pinned (not `latest`): this runs inside the publish gate, so an unpinned
+    # external tool is both a repro and a supply-chain wobble.
+    - name: Install jake
+      if: inputs.install-jake == 'true'
+      shell: bash
+      env:
+        JAKE_VERSION: v0.9.6
+      run: |
+        mkdir -p "$HOME/.local/bin"
+        curl -fsSL "https://github.com/HelgeSverre/jake/releases/download/${JAKE_VERSION}/jake-linux-x86_64" -o "$HOME/.local/bin/jake"
+        chmod +x "$HOME/.local/bin/jake"
+        echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+        "$HOME/.local/bin/jake" --version

@@ -1,8 +1,6 @@
 # Rust / cargo — the daily drivers. Imported UNnamespaced so `jake build`,
 # `jake test`, `jake lint` work bare, exactly like the old `make` targets.
 
-# Crates that must stay clippy-clean with -D warnings (excludes optional/plugin crates).
-clippy_crates = "-p sema-core -p sema-reader -p sema-eval -p sema-llm -p sema-stdlib -p sema-vm -p sema-lang -p sema-wasm"
 
 # ── Build ────────────────────────────────────────────────────────────
 
@@ -90,10 +88,12 @@ task test:
 task lint: [fmt-check, clippy]
     echo "lint clean"
 
+# --workspace, matching CI exactly: a crate subset here once let `jake lint`
+# pass locally while CI failed on the excluded crates.
 @group lint
-@desc "clippy with -D warnings across the core crates"
+@desc "clippy with -D warnings across the whole workspace"
 task clippy:
-    cargo clippy {{clippy_crates}} -- -D warnings
+    cargo clippy --workspace -- -D warnings
 
 @group lint
 @desc "Format the workspace"

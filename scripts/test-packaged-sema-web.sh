@@ -188,7 +188,15 @@ mkdir -p "$PACKAGE_DIR/.cargo"
   done
 } >"$PACKAGE_DIR/.cargo/config.toml"
 
-BUILD_TARGET="$TMP/build-target"
+# A stable target dir under the repo's own target/ (not a throwaway mktemp
+# dir) so CI's rust-cache warms the third-party dependency builds across runs
+# (~1-1.5 min per run). This cannot weaken the package-boundary property: what
+# the gate proves is WHERE the sema-lang source comes from (the unpacked
+# .crate, whose mktemp path changes every run, so its own artifacts are never
+# reused), not whether registry deps compile cold. The binary is removed first
+# so a stale cached `sema` can never be served by mistake.
+BUILD_TARGET="$ROOT/target/packaged-smoke"
+rm -f "$BUILD_TARGET/debug/sema"
 (
   cd "$PACKAGE_DIR"
   CARGO_TARGET_DIR="$BUILD_TARGET" cargo build --bin sema

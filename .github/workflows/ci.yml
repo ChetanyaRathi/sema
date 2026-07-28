@@ -1,127 +1,39 @@
+# Thin caller: the actual gate lives in verify.yml (one definition, shared with
+# the publish workflow) so push CI and the publish gate cannot drift. The
+# Windows and coverage legs run on a schedule instead (nightly.yml) — neither
+# gates anything, and together they tripled this workflow's wall clock.
 name: CI
 
 on:
   push:
     branches: [main]
+    # Docs/website-only pushes can't affect the gate. Deliberately NOT a
+    # blanket `**.md` ignore: crates/sema-docs/entries/*.md are inputs to the
+    # `jake docs-check` gate and must keep triggering.
+    paths-ignore:
+      - "docs/**"
+      - "website/**"
+      - "CHANGELOG.md"
+      - "README.md"
   pull_request:
+    paths-ignore:
+      - "docs/**"
+      - "website/**"
+      - "CHANGELOG.md"
+      - "README.md"
 
-env:
-  CARGO_TERM_COLOR: always
+# Superseded pushes stop burning runners. Scoped to this workflow only — the
+# publish workflow's verify call runs inside its own run and must never be
+# cancelled mid-publish.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
 
 jobs:
-  playground-runtime:
+  verify:
     permissions:
       contents: read
-    uses: ./.github/workflows/playground-runtime.yml
-
-  test:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-
-      - name: Install system dependencies
-        # libudev-dev is required by `serialport` (transitive `libudev-sys`)
-        # on Linux. The release workflow installs this via cargo-dist's
-        # apt dependency hook (see dist-workspace.toml); CI needs to do it
-        # explicitly. ripgrep is required by the unified-runtime conformance
-        # tests (they drive scripts/check-unified-runtime-*.sh, which scan
-        # with `rg`).
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libudev-dev ripgrep
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
-
-      # Smart Rust cache (partial-restores across Cargo.lock changes) instead of
-      # the old exact-match key that cold-rebuilt the whole workspace each time.
-      - name: Cache cargo + target
-        uses: Swatinem/rust-cache@v2
-
-      - name: Install jake
-        run: |
-          mkdir -p "$HOME/.local/bin"
-          curl -fsSL https://github.com/HelgeSverre/jake/releases/latest/download/jake-linux-x86_64 -o "$HOME/.local/bin/jake"
-          chmod +x "$HOME/.local/bin/jake"
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-      - name: Verify jake
-        run: jake --version
-
-      - name: Check formatting
-        run: cargo fmt -- --check
-
-      - name: Clippy
-        run: cargo clippy --workspace -- -D warnings
-
-      # Before docs-check: `jake docs-check` runs the LSP builtin-doc-coverage
-      # test through cargo nextest.
-      - name: Install cargo-nextest
-        uses: taiki-e/install-action@nextest
-
-      - name: Check builtin docs (committed index fresh + fully documented)
-        run: jake docs-check
-
-      - name: Run tests
-        run: cargo nextest run --workspace --profile ci
-
-      - name: Smoke test examples
-        run: jake examples
-
-      - name: Smoke test bytecode
-        run: jake smoke-bytecode
-
-      - name: Install uv
-        uses: astral-sh/setup-uv@v5
-
-      # LSP protocol-level e2e suite (pytest-lsp over stdio): initialize
-      # handshake, capabilities, diagnostics push, UTF-16 positions — coverage
-      # the in-crate tests cannot see. Reuses the debug `sema` binary the test
-      # build above already produced (cargo build is an incremental no-op).
-      - name: LSP e2e suite (pytest)
-        run: |
-          cargo build -p sema-lang
-          cd crates/sema-lsp/tests/e2e && SEMA_BIN="$GITHUB_WORKSPACE/target/debug/sema" uv run pytest -q
-
-      - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@cargo-llvm-cov
-
-      # Advisory: coverage re-runs the suite through plain `cargo test` under
-      # instrumentation (slower, no nextest retries), so a timing-sensitive
-      # test can flake here after the real gate above already passed. Metrics
-      # must not paint the run red.
-      - name: Generate coverage
-        continue-on-error: true
-        run: cargo llvm-cov --workspace --lcov --output-path lcov.info
-
-      - name: Upload coverage reports to Codecov
-        continue-on-error: true
-        uses: codecov/codecov-action@v5
-        with:
-          token: ${{ secrets.CODECOV_TOKEN }}
-
-  # Windows leg (advisory until first green, then drop continue-on-error and
-  # treat as required). The nextest `ci` profile's slow-timeout
-  # (120s x terminate-after 3) is the hang watchdog: a wedged async-runtime
-  # test surfaces as a terminated slow test, not a silent 6h job. Known
-  # platform limitation: subprocess eager-cancel (`group_sigkill_abort`) is a
-  # documented no-op off Unix, so cancel tests that assert child teardown are
-  # expected to need `cfg(unix)` gating in the first fix wave.
-  test-windows:
-    runs-on: windows-latest
-    continue-on-error: true
-    steps:
-      - uses: actions/checkout@v7
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache cargo + target
-        uses: Swatinem/rust-cache@v2
-
-      - name: Install cargo-nextest
-        uses: taiki-e/install-action@nextest
-
-      - name: Run tests
-        run: cargo nextest run --workspace --profile ci
+    uses: ./.github/workflows/verify.yml
