@@ -1,24 +1,101 @@
-name: Publish to npm
+# Publish to crates.io + npm when a version tag is pushed — one pipeline, one
+# verify gate.
+#
+# NOTE: npm Trusted Publishing (OIDC) whitelists this workflow's *filename*.
+# The file MUST stay `publish-npm.yml` even though it now publishes both
+# registries — renaming it breaks the OIDC match (the npm publish 404s with
+# "you do not have permission"). crates.io uses a token and has no filename
+# constraint, which is why its job could move in here (it used to be a separate
+# publish.yml whose own verify call doubled the gate cost per tag).
+#
+# Usage:
+#   1. Bump the version in Cargo.toml (workspace.package.version + dependency pins)
+#   2. Commit and push
+#   3. Tag and push:  git tag v1.6.2 && git push origin v1.6.2
+#
+# Recover a partially-failed publish:  re-run via workflow_dispatch against main
+# (the crates publish loop is idempotent — already-published crates are skipped —
+# and the npm publishes skip already-published versions).
+#
+# Setup: crates.io API token -> secret CARGO_REGISTRY_TOKEN.
 
-# NOTE: npm Trusted Publishing (OIDC) whitelists this workflow's *filename*. Keep npm
-# publishing in `publish-npm.yml` — moving it into another file breaks the OIDC match
-# (the publish 404s with "you do not have permission"). crates.io uses a token, so it
-# lives separately in `publish.yml`.
+name: Publish
 
 on:
   push:
     tags:
       - 'v*'
-  workflow_dispatch: # allow re-publishing against main (version read from Cargo.toml)
+  workflow_dispatch: # allow re-running a partially-failed publish against main
 
 jobs:
-  # Gate: tests/lint/examples must pass before publishing to npm.
+  # A red suite blocks BOTH publishes.
   verify:
     uses: ./.github/workflows/verify.yml
+
+  publish-crates:
+    needs: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      # sema-stdlib pulls in serialport -> libudev-sys, whose `cargo publish`
+      # verify-build needs libudev. Without this the last three crates fail to
+      # publish (and the old loop masked it as "already published").
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y libudev-dev pkg-config
+
+      # Warms the third-party deps for the 16 sequential `cargo publish`
+      # verify-builds, which ran fully cold before (~7 min).
+      - name: Cache cargo + target
+        uses: Swatinem/rust-cache@v2
+
+      - name: Publish crates
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          set -e
+
+          # Idempotent: skip crates already on crates.io, but FAIL LOUDLY on any
+          # other error (a real publish failure must not look like success).
+          # `cargo publish` already blocks until the new version is available on
+          # the index, so no extra sleep is needed between crates.
+          publish() {
+            echo "Publishing $1..."
+            out=$(cargo publish -p "$1" 2>&1) && { echo "$out"; return 0; }
+            if echo "$out" | grep -qiE "already (uploaded|exists)"; then
+              echo "$1 already published, skipping"
+            else
+              echo "$out"
+              echo "::error::Publishing $1 failed"
+              exit 1
+            fi
+          }
+
+          # Dependency order: a crate's path-deps must already be on crates.io.
+          publish sema-core
+          publish sema-io
+          publish sema-reader
+          publish sema-fmt
+          publish sema-vm
+          publish sema-otel
+          publish sema-workflow
+          publish sema-llm
+          publish sema-stdlib
+          publish sema-eval
+          publish sema-docs
+          publish sema-dap
+          publish sema-notebook
+          publish sema-lsp
+          publish sema-mcp
+          publish sema-lang
 
   publish-npm:
     needs: verify
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     permissions:
       contents: read
       id-token: write  # Required for npm Trusted Publishing (OIDC)
@@ -29,8 +106,16 @@ jobs:
         with:
           targets: wasm32-unknown-unknown
 
-      - name: Install wasm-pack
-        run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
+      # Warms the wasm release deps (the build ran fully cold before, ~2.5 min).
+      - name: Cache cargo + target
+        uses: Swatinem/rust-cache@v2
+
+      # Pinned binary install, matching every other workflow (the curl
+      # installer floated whatever version was current).
+      - name: Install pinned wasm-pack
+        uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-pack@0.15.0
 
       - uses: actions/setup-node@v6
         with:
@@ -57,13 +142,13 @@ jobs:
             echo "version=$v" >> "$GITHUB_OUTPUT"
           fi
 
+      # Through the shared script with the same flags as `jake wasm.js-lib-build`
+      # (the build every suite tests): --remap-path-prefix so the published wasm
+      # doesn't embed the runner's absolute paths, and opt-level=s like every
+      # other shipped wasm artifact. The old raw `wasm-pack build` here shipped
+      # a fourth flag-variant no suite exercised, with builder paths leaked in.
       - name: Build WASM package
-        run: |
-          wasm-pack build crates/sema-wasm \
-            --target web \
-            --release \
-            --scope sema-lang \
-            --out-dir ../../packages/sema-wasm/pkg
+        run: ./scripts/wasm-build.sh crates/sema-wasm --target web --release --scope sema-lang --out-dir ../../packages/sema-wasm/pkg -- --config 'profile.release.package.sema-wasm.opt-level="s"'
 
       - name: Prepare sema-wasm package
         working-directory: packages/sema-wasm/pkg
