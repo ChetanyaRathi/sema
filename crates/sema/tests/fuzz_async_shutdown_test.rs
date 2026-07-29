@@ -160,7 +160,9 @@ fn drive_root_scoped_to_settlement(
         match handle.poll_result() {
             RootPoll::Ready(settlement) => return settlement,
             RootPoll::Pending => {}
-            RootPoll::Aborted(fault) => panic!("{what}: root aborted with runtime fault: {fault:?}"),
+            RootPoll::Aborted(fault) => {
+                panic!("{what}: root aborted with runtime fault: {fault:?}")
+            }
             RootPoll::RuntimeDropped => panic!("{what}: runtime dropped while driving"),
             RootPoll::InvariantViolation => panic!("{what}: runtime invariant violation"),
         }
@@ -196,7 +198,9 @@ fn drive_root_scoped_to_settlement(
                 // the deadlock error rather than a bare hang.
                 let settled = runtime
                     .settle_deadlocked_root(handle.id())
-                    .unwrap_or_else(|fault| panic!("{what}: settle_deadlocked_root fault: {fault:?}"));
+                    .unwrap_or_else(|fault| {
+                        panic!("{what}: settle_deadlocked_root fault: {fault:?}")
+                    });
                 assert!(settled, "{what}: fully idle but root would not settle");
             }
             other => panic!("{what}: unexpected drive state while pending: {other:?}"),
