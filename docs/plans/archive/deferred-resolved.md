@@ -1371,3 +1371,27 @@ the fix landed — the fix shipped the same day the entry was written.)
 Fixed 2026-07-02: **ASYNC-1** (dynamic-scope flags vs deferred async tasks) — `llm/with-cache`/`llm/with-budget`/per-call `:tags` are now captured per task and swapped in/out at each scheduler step (a third per-task context beside the otel + usage-scope swaps), with the active budget frame shared by `Rc` so a concurrent `with-budget` fan-out charges one aggregate. See ADR #67, `docs/plans/2026-07-02-async-1-dynamic-scope-per-task.md`; gates `async_cache_miss_is_counted` + `async_budget_gates_concurrent_fanout` in `crates/sema/tests/complete_async_test.rs`. (The follow-up teardown gap it surfaced is now tracked as ASYNC-3 above.)
 
 ---
+
+## WIN-1 — Windows follow-ups from the 2026-07-29 test-porting wave
+
+The wave took the Windows leg from 189 failures + 9 hangs to fully green
+(7193/7193) and fixed four product bugs; full history in
+`docs/bugs/archive/2026-07-29-windows-product-bugs.md`. The follow-up pass
+(fix/windows-followups) closed the rest: MCP HTTP `mcp/close` cancel now
+severs deterministically (transport jobs run as tasks on the shared I/O
+runtime instead of relying on drop-timing from a blocking thread; detector
+un-gated), the stdio liveness probe is a real check on Windows
+(OpenProcess/GetExitCodeProcess instead of the process-killing os.kill), root
+`.gitattributes` pins `*.sema`/`*.sh` to LF and fixtures to -text,
+`docs-search-gate.sh` runs in nightly.yml, `sema_path`/`sema_str` live once
+in `crates/sema/tests/common/`, and the windows-leg placement decision is
+recorded in nightly.yml (deliberately nightly). RESOLVED 2026-07-29 (#138): the last item below shipped as the offload-split — OAuth legs run inside io_offload_blocking, call/connect route through run_transport_task, two HTTP detectors green on Windows (7196/7196). Originally still open:
+
+- **`mcp/call` / `mcp/connect` HTTP mid-cancel severing** rides the old
+  blocking-thread drop chain: their job futures are non-`Send`
+  (`Box<dyn RedirectDriver>` held across awaits in the oauth seam), so they
+  can't route through `run_transport_task` without adding `Send` bounds
+  through `RedirectDriver` and the credential store. Their Windows detectors
+  are stdio-based (green via child-kill); no failing test pins the HTTP
+  case. Do the `Send`-bound refactor, then route them through the helper.
+

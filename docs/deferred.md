@@ -230,25 +230,3 @@ Both are honest **narrowed-terminal** dispositions, not gaps to silently close.
   zero-tolerance stdin model does not transfer.)
 
 
-## WIN-1 — Windows follow-ups from the 2026-07-29 test-porting wave
-
-The wave took the Windows leg from 189 failures + 9 hangs to fully green
-(7193/7193) and fixed four product bugs; full history in
-`docs/bugs/archive/2026-07-29-windows-product-bugs.md`. The follow-up pass
-(fix/windows-followups) closed the rest: MCP HTTP `mcp/close` cancel now
-severs deterministically (transport jobs run as tasks on the shared I/O
-runtime instead of relying on drop-timing from a blocking thread; detector
-un-gated), the stdio liveness probe is a real check on Windows
-(OpenProcess/GetExitCodeProcess instead of the process-killing os.kill), root
-`.gitattributes` pins `*.sema`/`*.sh` to LF and fixtures to -text,
-`docs-search-gate.sh` runs in nightly.yml, `sema_path`/`sema_str` live once
-in `crates/sema/tests/common/`, and the windows-leg placement decision is
-recorded in nightly.yml (deliberately nightly). Still open:
-
-- **`mcp/call` / `mcp/connect` HTTP mid-cancel severing** rides the old
-  blocking-thread drop chain: their job futures are non-`Send`
-  (`Box<dyn RedirectDriver>` held across awaits in the oauth seam), so they
-  can't route through `run_transport_task` without adding `Send` bounds
-  through `RedirectDriver` and the credential store. Their Windows detectors
-  are stdio-based (green via child-kill); no failing test pins the HTTP
-  case. Do the `Send`-bound refactor, then route them through the helper.
