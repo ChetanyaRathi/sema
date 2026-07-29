@@ -30,11 +30,31 @@ const SLEEP_COMPLETION_KIND: u64 = 1;
 /// keeps an out-of-range duration from wedging a worker for years.
 const MAX_SLEEP_MS: u64 = 86_400_000; // 1 day
 
-/// Cancel hook for the blocking `sleep` worker. A `thread::sleep` cannot be
-/// interrupted mid-flight, so cancellation reports the resource reaped: the
-/// runtime drops it immediately and the worker's eventual (now unowned)
-/// completion is discarded as a late completion.
-struct SleepCancelHook;
+/// Wake signal shared between the VM-thread cancel hook and the pool worker
+/// running a blocking `sleep`: the worker parks on the condvar (bounded by the
+/// sleep deadline) instead of an uninterruptible `std::thread::sleep`, so a
+/// cancelled sleep releases its worker immediately. Without this, every
+/// cancelled blocking sleep pinned one executor worker for the sleep's full
+/// nominal duration — enough of them exhausted the blocking pool, and
+/// interpreter shutdown's bounded executor drain always ran to its whole
+/// deadline (a constant ~2 s exit grace).
+type SleepWake = std::sync::Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>;
+
+/// Cancel hook for the blocking `sleep` worker. Cancellation reports the
+/// resource reaped — the runtime settles the promise immediately and the
+/// worker's (now unowned) completion is discarded as a late completion — and
+/// wakes the parked worker so it exits instead of sleeping out the remainder.
+struct SleepCancelHook {
+    wake: SleepWake,
+}
+
+impl SleepCancelHook {
+    fn signal(&self) {
+        let (cancelled, condvar) = &*self.wake;
+        *cancelled.lock().expect("sleep wake lock") = true;
+        condvar.notify_all();
+    }
+}
 
 impl Trace for SleepCancelHook {
     fn trace(&self, _sink: &mut dyn FnMut(GcEdge<'_>)) -> bool {
@@ -44,9 +64,11 @@ impl Trace for SleepCancelHook {
 
 impl CancelHook for SleepCancelHook {
     fn cancel(&mut self) -> Result<CancelDisposition, CancelHookError> {
+        self.signal();
         Ok(CancelDisposition::Reaped)
     }
     fn reap(&mut self) -> Result<CancelDisposition, CancelHookError> {
+        self.signal();
         Ok(CancelDisposition::Reaped)
     }
 }
@@ -112,12 +134,33 @@ fn sleep_via_executor(ms: u64) -> NativeResult {
     let ms = ms.min(MAX_SLEEP_MS);
     let kind = CompletionKind::try_from_raw(SLEEP_COMPLETION_KIND)
         .expect("sleep completion kind is nonzero");
+    let wake: SleepWake = std::sync::Arc::default();
+    let worker_wake = std::sync::Arc::clone(&wake);
     let prepared = PreparedExternalOperation::interruptible_blocking(
         kind,
         Box::new(SleepDecoder),
-        InterruptibleResource::new("sleep", Box::new(SleepCancelHook)),
+        InterruptibleResource::new("sleep", Box::new(SleepCancelHook { wake })),
         move || {
-            std::thread::sleep(std::time::Duration::from_millis(ms));
+            // Park on the shared condvar bounded by the sleep deadline (see
+            // `SleepWake`): the cancel hook's signal ends the park early, and a
+            // spurious wakeup just re-parks for the remainder.
+            let (cancelled, condvar) = &*worker_wake;
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(ms);
+            let mut cancelled = cancelled.lock().expect("sleep wake lock");
+            loop {
+                if *cancelled {
+                    break;
+                }
+                let now = std::time::Instant::now();
+                if now >= deadline {
+                    break;
+                }
+                let (guard, _timeout) = condvar
+                    .wait_timeout(cancelled, deadline - now)
+                    .expect("sleep wake wait");
+                cancelled = guard;
+            }
+            drop(cancelled);
             Ok(Box::new(()) as SendPayload)
         },
     );

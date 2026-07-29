@@ -736,14 +736,13 @@ R16A	crates/sema-stdlib/src/sqlite.rs:8://! thread for the operation's whole dur
 R17A	crates/sema-stdlib/src/stream.rs:4://! always synchronous, even inside `async/spawn`, no offload needed. File-backed
 R17A	crates/sema-stdlib/src/stream.rs:630:            std::thread::sleep(Duration::from_millis(ms));
 R22B	crates/sema-stdlib/src/string.rs:141:thread_local! {
-R18C	crates/sema-stdlib/src/system.rs:120:            std::thread::sleep(std::time::Duration::from_millis(ms));
 R18C	crates/sema-stdlib/src/system.rs:29:/// Clamp for a blocking sleep routed to a worker thread (mirrors `async/sleep`):
-R18C	crates/sema-stdlib/src/system.rs:33:/// Cancel hook for the blocking `sleep` worker. A `thread::sleep` cannot be
-R18C	crates/sema-stdlib/src/system.rs:642:/// executor's blocking worker (via `io_block_on` inside `runtime_offload`). It
-R18A	crates/sema-stdlib/src/system.rs:687:/// Cancel hook for the runtime `shell` op. On `async/cancel`/`async/timeout` it
-R18C	crates/sema-stdlib/src/system.rs:887:    // VM thread — two `async/spawn`ed sleeps then overlap instead of serializing
-R18C	crates/sema-stdlib/src/system.rs:888:    // on the VM thread (unlike `async/sleep`, which is a virtual timer). Outside
-R18C	crates/sema-stdlib/src/system.rs:901:                std::thread::sleep(std::time::Duration::from_millis(ms as u64));
+R18C	crates/sema-stdlib/src/system.rs:35:/// sleep deadline) instead of an uninterruptible `std::thread::sleep`, so a
+R18C	crates/sema-stdlib/src/system.rs:685:/// executor's blocking worker (via `io_block_on` inside `runtime_offload`). It
+R18A	crates/sema-stdlib/src/system.rs:730:/// Cancel hook for the runtime `shell` op. On `async/cancel`/`async/timeout` it
+R18C	crates/sema-stdlib/src/system.rs:930:    // VM thread — two `async/spawn`ed sleeps then overlap instead of serializing
+R18C	crates/sema-stdlib/src/system.rs:931:    // on the VM thread (unlike `async/sleep`, which is a virtual timer). Outside
+R18C	crates/sema-stdlib/src/system.rs:944:                std::thread::sleep(std::time::Duration::from_millis(ms as u64));
 R19	crates/sema-stdlib/src/terminal.rs:84:    /// bare `thread::sleep` frame loop, whose sleeping thread could only be
 R23B	crates/sema-stdlib/src/workflow.rs:249:/// `async/spawn`, an offloaded `llm/chat` tool loop, `channel/*`) parks on the active
 R23B	crates/sema-stdlib/src/workflow.rs:283:                // The host arm resolves `:mcp` synchronously (its `io_block_on` is legal

@@ -895,6 +895,38 @@ fn gc_pass_while_promise_set_wait_parked_keeps_settled_members_resolvable() {
     );
 }
 
+// A blocking `sleep` runs as an offloaded worker job (finding 1 of
+// docs/bugs/async-fuzz-findings.md). Cancelling it settles the promise
+// immediately, but the worker used to stay in an uninterruptible
+// `std::thread::sleep` for the sleep's full nominal duration — pinning one
+// executor worker per cancelled sleep and holding interpreter-drop's bounded
+// executor drain to its whole 2 s deadline. The worker parks on a condvar the
+// cancel hook signals, so a cancelled sleep releases its worker (and
+// interpreter shutdown) promptly. The 1 s bound leaves load headroom: with a
+// pinned worker this deterministically took the full 2 s drain deadline.
+#[test]
+fn cancelled_blocking_sleep_releases_worker_and_shutdown_promptly() {
+    let interp = sema_eval::Interpreter::new();
+    let result = interp
+        .eval_str_compiled(
+            r#"
+            (let ((p (async (sleep 60000))))
+              (async/sleep 3)
+              (async/cancel p)
+              (try (async/await p) (catch e (:type e))))
+            "#,
+        )
+        .expect("cancelled sleep program evaluates");
+    assert_eq!(result, Value::keyword("cancelled"));
+    let start = std::time::Instant::now();
+    drop(interp);
+    let elapsed = start.elapsed();
+    assert!(
+        elapsed < std::time::Duration::from_secs(1),
+        "interpreter drop waited on a cancelled sleep worker: {elapsed:?}"
+    );
+}
+
 // === async/race edge cases ===
 
 #[test]
