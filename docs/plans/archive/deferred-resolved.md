@@ -135,6 +135,12 @@ feature, not part of the numeric tower's scope. Applications needing arbitrary-p
 arithmetic use general lists or other dynamic collections; applications needing arrays use
 typed arrays with appropriately-in-range inputs.
 
+## MCP-2 — `sema mcp list` — RESOLVED (2026-07-29)
+
+**Found 2026-07-01 (PR #59).** No CLI command surfaces which remote servers have cached credentials or their token status. A `sema mcp list` would show authenticated/known servers (and, ideally, which script or config declared each — which depends on MCP-1). **Deferred because** it's additive tooling; the "which script declared it" part needs the alias registry from MCP-1 first.
+
+**Resolved 2026-07-29:** `sema mcp list` shipped — enumerates the default token store (canonical-URL-keyed; the keychain backend reports enumeration as unsupported) and prints one line per server with `token present`/`token expired` status, no network calls; the declared-by/alias column still waits on MCP-1.
+
 ## MCP-4 — `mcp/call` blocks the cooperative scheduler (RESOLVED 2026-07-10)
 
 **Found 2026-07-10 during the workflow `:mcp` work; resolved the same day**

@@ -83,6 +83,19 @@ pub trait TokenStore {
     fn load(&self, server_url: &str) -> Option<StoredCredentials>;
     fn save(&self, creds: &StoredCredentials) -> Result<(), String>;
     fn delete(&self, server_url: &str) -> Result<(), String>;
+
+    /// Enumerate every stored credential set, sorted by server URL (for
+    /// `sema mcp list`). Defaulted to a plain "unsupported" error because most
+    /// backends have nothing to enumerate with — the OS keychain exposes no
+    /// per-service listing API — and pretending such a store is empty would be
+    /// worse than saying so.
+    fn list(&self) -> Result<Vec<StoredCredentials>, String> {
+        Err(
+            "this credential store cannot enumerate servers (the OS keychain has no \
+             listing API); only the file backend (SEMA_MCP_TOKEN_STORE=file) can be listed"
+                .to_string(),
+        )
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -186,6 +199,11 @@ impl TokenStore for FileStore {
         let mut doc = self.read_doc()?;
         doc.servers.remove(server_url);
         self.write_doc(&doc)
+    }
+
+    // `servers` is a BTreeMap keyed by URL, so the order is stable for free.
+    fn list(&self) -> Result<Vec<StoredCredentials>, String> {
+        Ok(self.read_doc()?.servers.into_values().collect())
     }
 }
 
@@ -366,6 +384,32 @@ mod tests {
         store.save(&b).unwrap();
         assert_eq!(store.load("https://a.example.com/mcp"), Some(a));
         assert_eq!(store.load("https://b.example.com/mcp"), Some(b));
+    }
+
+    #[test]
+    fn file_store_lists_servers_in_url_order() {
+        let store = FileStore::new(temp_path());
+        assert_eq!(store.list().unwrap(), vec![]);
+        store.save(&sample("https://b.example.com/mcp")).unwrap();
+        store.save(&sample("https://a.example.com/mcp")).unwrap();
+        let urls: Vec<String> = store
+            .list()
+            .unwrap()
+            .into_iter()
+            .map(|c| c.server_url)
+            .collect();
+        assert_eq!(
+            urls,
+            ["https://a.example.com/mcp", "https://b.example.com/mcp"]
+        );
+    }
+
+    #[test]
+    fn keychain_list_is_unsupported_not_empty() {
+        // No keychain access needed: the default trait impl answers before any
+        // backend call, and the message must steer at the file backend.
+        let err = KeychainStore::new().list().unwrap_err();
+        assert!(err.contains("SEMA_MCP_TOKEN_STORE=file"), "{err}");
     }
 
     #[cfg(unix)]

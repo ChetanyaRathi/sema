@@ -9,21 +9,15 @@
 //! tool-error-recovery contract (a tool that errors → fed back as a tool result →
 //! the loop recovers), mirroring `mcp_builtin_test`.
 
-//! CONCURRENCY-OVERLAP TESTS ARE WALL-CLOCK UPPER BOUNDS (noted 2026-07-28).
+//! CONCURRENCY ORACLE: `io_peak_inflight() >= 2`, never a wall-clock ceiling.
 //!
-//! The `concurrent_agents_overlap_*` tests assert `wall_ms < N` to prove agents
-//! ran concurrently rather than serially. An upper bound on elapsed time is
-//! load-sensitive by construction: it holds in isolation (measured 5/5 and
-//! 20/20) and fails intermittently under `cargo nextest run --workspace`, where
-//! 7300 tests contend for the same cores. Two different tests of this shape
-//! failed on two consecutive full runs and both passed in isolation.
-//!
-//! A single failure here, in a full-workspace run, on a machine doing other
-//! work, is contention — re-run the test alone before believing it. A failure
-//! in isolation is real: the runtime agent round is blocking the VM thread.
-//!
-//! The lower-bound assertion in the same tests (`io_peak_inflight() >= 2`) is
-//! the load-safe half and can be trusted either way.
+//! The `concurrent_agents_overlap_*` tests prove overlap with that lower bound
+//! alone: serial execution can never have two offloaded provider rounds in
+//! flight at once, and a lower bound holds no matter how loaded the machine
+//! is. They deliberately assert no `wall_ms < N` upper bound — an elapsed-time
+//! ceiling is load-sensitive by construction and fails intermittently under a
+//! full-workspace `cargo nextest run` while passing in isolation (see
+//! docs/bugs/2026-07-28-sibling-interleaving-tests-are-load-sensitive.md).
 
 #![cfg(not(target_arch = "wasm32"))]
 
@@ -396,10 +390,11 @@ fn failed_tool_schema_validation_emits_end_error_via_runtime() {
 
 // GATE (full-flip blocker 1): two `agent/run`s spawned concurrently through the
 // UNIFIED RUNTIME must OVERLAP across their provider rounds — not serialize. Each
-// round now offloads the provider call to the executor IO pool and suspends the
-// task on an External wait, so sibling agents run during every inter-round park.
-// Proven two ways: peak offloaded futures in flight >= 2 AND a max-not-sum wall
-// clock (3 agents × 3 rounds × 120 ms ⇒ serial floor ~1080 ms, overlapped ~360 ms).
+// round offloads the provider call to the executor IO pool and suspends the task
+// on an External wait, so sibling agents run during every inter-round park.
+// Proven by the load-safe lower bound: peak offloaded futures in flight >= 2,
+// impossible under serial rounds (a wall-clock ceiling would be load-sensitive;
+// see the module note).
 #[test]
 #[serial]
 fn concurrent_agents_overlap_via_runtime() {
@@ -418,26 +413,19 @@ fn concurrent_agents_overlap_via_runtime() {
     let program = r#"
         (deftool ping "ping" {:n {:type :number}} (fn (n) "pong"))
         (defagent bot {:model "fake-model" :tools [ping] :max-turns 6})
-        (let ((t0 (sys/elapsed)))
-          (async/all
-            (map (fn (i) (async/spawn (fn () (agent/run bot "go"))))
-                 (list 1 2 3)))
-          (floor (/ (- (sys/elapsed) t0) 1000000)))
+        (async/all
+          (map (fn (i) (async/spawn (fn () (agent/run bot "go"))))
+               (list 1 2 3)))
     "#;
-    let wall = interp
+    interp
         .eval_str_via_runtime(program)
         .expect("3 concurrent agents evaluated through the runtime");
-    let wall_ms = wall.as_int().expect("wall ms");
 
     assert!(
         io_peak_inflight() >= 2,
         "expected peak offloaded futures in flight >= 2 (agents overlapping across \
          rounds), got {} — the runtime agent round still blocks the VM thread",
         io_peak_inflight()
-    );
-    assert!(
-        wall_ms < 700,
-        "expected overlapped wall < 700 ms (serial floor ~1080 ms), got {wall_ms} ms"
     );
 }
 

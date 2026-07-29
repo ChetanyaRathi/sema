@@ -1,4 +1,4 @@
-//! CLI entry points for MCP client authentication (`sema mcp login/logout`),
+//! CLI entry points for MCP client authentication (`sema mcp login/logout/list`),
 //! plus [`login_interactive`] — the same browser-loopback flow, returned to
 //! the caller instead of persisted, for embedders that own their own
 //! credential placement (the workflow run-start interactive auth path in the
@@ -138,5 +138,28 @@ pub fn mcp_login_token(url: &str, token: &str, expires_in: Option<u64>) -> Resul
 pub fn mcp_logout(url: &str) -> Result<(), String> {
     oauth::store::default_store().delete(url)?;
     eprintln!("Cleared cached credentials for {url}.");
+    Ok(())
+}
+
+/// Print every server with cached credentials in the default store, one line
+/// per server: the canonical URL and its token status (`token present`, or
+/// `token expired` when the stored expiry has passed). Purely local — never
+/// touches the network — and the keychain backend surfaces its no-enumeration
+/// limitation as an error rather than an empty listing.
+pub fn mcp_list() -> Result<(), String> {
+    let servers = oauth::store::default_store().list()?;
+    if servers.is_empty() {
+        println!("no known servers");
+        return Ok(());
+    }
+    let now = oauth::store::now_unix();
+    for creds in servers {
+        let status = if creds.tokens.is_expired(now, 0) {
+            "token expired"
+        } else {
+            "token present"
+        };
+        println!("{}  {status}", creds.server_url);
+    }
     Ok(())
 }

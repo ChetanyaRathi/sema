@@ -9,11 +9,7 @@ Things that came out of the May 2026 quality sweep (Wave 6 audit) but were inten
 
 ## MCP-1 — Named/aliased MCP servers
 
-**Found 2026-07-01, during the MCP client PR (#59).** Every `mcp/connect` and `sema mcp login/logout` repeats the full server config (`:url`/`:command`). A convenience layer would let you declare a server once — a `name → {:url …}`/`{:command …}` mapping (in a script or a small config file) — and refer to it by name (`(mcp/connect "asana")`, `sema mcp login asana`). Pairs naturally with the token store, which already keys by canonical URL. **Deferred because** it's a pure ergonomics feature with a design choice (script-level form vs. a config file), orthogonal to the client's correctness, and best done after the base client lands.
-
-## MCP-2 — `sema mcp list`
-
-**Found 2026-07-01 (PR #59).** No CLI command surfaces which remote servers have cached credentials or their token status. A `sema mcp list` would show authenticated/known servers (and, ideally, which script or config declared each — which depends on MCP-1). **Deferred because** it's additive tooling; the "which script declared it" part needs the alias registry from MCP-1 first.
+**Found 2026-07-01, during the MCP client PR (#59).** Every `mcp/connect` and `sema mcp login/logout` repeats the full server config (`:url`/`:command`). A convenience layer would let you declare a server once — a `name → {:url …}`/`{:command …}` mapping (in a script or a small config file) — and refer to it by name (`(mcp/connect "asana")`, `sema mcp login asana`). Pairs naturally with the token store, which already keys by canonical URL. **Deferred because** it's a pure ergonomics feature with a design choice (script-level form vs. a config file), orthogonal to the client's correctness, and best done after the base client lands. Note: `sema mcp list` exists (MCP-2, resolved 2026-07-29) but has no alias/declared-by column — the alias registry here would supply it.
 
 ## MCP-3 — Fully-offline agent replay (cassette `tools/list` + `connect` skip)
 

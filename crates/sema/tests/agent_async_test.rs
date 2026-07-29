@@ -11,28 +11,22 @@
 //! Deterministic + keyless: a `FakeProvider` with `tool_loop` (a request-keyed
 //! multi-round script that stays reproducible under ANY interleaving — see
 //! `FakeProvider::tool_loop`) plus an injected `chat_delay` per round. Overlap is
-//! proven three ways: peak offloaded futures in flight ≥ 2, a max-not-sum wall
-//! clock, and a sibling ticker that advances *during* the agent's rounds.
+//! proven two ways: peak offloaded futures in flight ≥ 2, and a sibling ticker
+//! that advances *during* the agent's rounds.
 //!
 //! Own binary — the `IO_INFLIGHT` instrumentation atomics and the provider registry
 //! are process-global, so these `#[serial]` tests must not share a process with
 //! unrelated inflight capture.
 
-//! CONCURRENCY-OVERLAP TESTS ARE WALL-CLOCK UPPER BOUNDS (noted 2026-07-28).
+//! CONCURRENCY ORACLE: `io_peak_inflight() >= 2`, never a wall-clock ceiling.
 //!
-//! The `concurrent_agents_overlap_*` tests assert `wall_ms < N` to prove agents
-//! ran concurrently rather than serially. An upper bound on elapsed time is
-//! load-sensitive by construction: it holds in isolation (measured 5/5 and
-//! 20/20) and fails intermittently under `cargo nextest run --workspace`, where
-//! 7300 tests contend for the same cores. Two different tests of this shape
-//! failed on two consecutive full runs and both passed in isolation.
-//!
-//! A single failure here, in a full-workspace run, on a machine doing other
-//! work, is contention — re-run the test alone before believing it. A failure
-//! in isolation is real: the runtime agent round is blocking the VM thread.
-//!
-//! The lower-bound assertion in the same tests (`io_peak_inflight() >= 2`) is
-//! the load-safe half and can be trusted either way.
+//! The `concurrent_agents_overlap_*` tests prove overlap with that lower bound
+//! alone: serial execution can never have two offloaded provider rounds in
+//! flight at once, and a lower bound holds no matter how loaded the machine
+//! is. They deliberately assert no `wall_ms < N` upper bound — an elapsed-time
+//! ceiling is load-sensitive by construction and fails intermittently under a
+//! full-workspace `cargo nextest run` while passing in isolation (see
+//! docs/bugs/2026-07-28-sibling-interleaving-tests-are-load-sensitive.md).
 
 #![cfg(not(target_arch = "wasm32"))]
 
@@ -45,10 +39,11 @@ use sema_llm::fake::FakeProvider;
 use serial_test::serial;
 
 /// N agents, each a 2-tool-round conversation (3 provider calls) with a 120 ms
-/// delay per round, spawned concurrently. Blocking today: each agent hogs the VM
-/// thread through all its rounds, so they run serially (peak in-flight = 1, wall ≈
-/// N·3·120). Non-blocking: every round offloads + yields, so the agents overlap
-/// (peak in-flight ≥ 2, wall ≈ 3·120 — the single-agent critical path).
+/// delay per round, spawned concurrently. Blocking would mean each agent hogs
+/// the VM thread through all its rounds, so they run serially and peak
+/// in-flight stays at 1. Non-blocking: every round offloads + yields, so the
+/// agents overlap and peak in-flight reaches ≥ 2 — the load-safe concurrency
+/// oracle (a wall-clock ceiling would be load-sensitive; see the module note).
 #[test]
 #[serial]
 fn concurrent_agents_overlap_and_peak_inflight() {
@@ -66,31 +61,23 @@ fn concurrent_agents_overlap_and_peak_inflight() {
     reset_runtime_state();
     register_test_provider(Box::new(fake));
 
-    // 3 agents × (2 tool rounds + 1 final) × 120 ms:
-    //   serial floor ≈ 1080 ms; overlapped ≈ 360 ms.
+    // 3 agents × (2 tool rounds + 1 final) × 120 ms per round.
     let program = r#"
         (deftool ping "ping" {:n {:type :number}} (fn (n) "pong"))
         (defagent bot {:model "fake-model" :tools [ping] :max-turns 6})
-        (let ((t0 (sys/elapsed)))
-          (async/all
-            (map (fn (i) (async/spawn (fn () (agent/run bot "go"))))
-                 (list 1 2 3)))
-          (floor (/ (- (sys/elapsed) t0) 1000000)))
+        (async/all
+          (map (fn (i) (async/spawn (fn () (agent/run bot "go"))))
+               (list 1 2 3)))
     "#;
-    let wall = interp
+    interp
         .eval_str_compiled(program)
         .expect("3 concurrent agents evaluated");
-    let wall_ms = wall.as_int().expect("wall ms");
 
     assert!(
         io_peak_inflight() >= 2,
         "expected peak offloaded futures in flight >= 2 (agents overlapping across \
          rounds), got {} — agent/run still blocks per round",
         io_peak_inflight()
-    );
-    assert!(
-        wall_ms < 700,
-        "expected overlapped wall < 700 ms (serial floor ~1080 ms), got {wall_ms} ms"
     );
 }
 

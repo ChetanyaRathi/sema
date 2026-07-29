@@ -16225,3 +16225,73 @@ fn test_u8_repl_bare_quit_exits() {
     let output = run_repl_with_input(":q\n");
     assert!(output.status.success(), ":q should exit cleanly");
 }
+
+/// `sema mcp list` reads only the local credential store — keyless, no network.
+/// Runs against the file backend (`SEMA_MCP_TOKEN_STORE=file`) under a
+/// throwaway HOME so the developer's real store is never touched. Unix-only:
+/// on Windows `directories` resolves the config dir via the known-folder API
+/// and ignores `$HOME`, so the redirection would silently read the real store.
+#[cfg(unix)]
+#[test]
+fn test_mcp_list_reads_the_file_store() {
+    let home = std::env::temp_dir().join(format!("sema-mcp-list-test-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(&home).unwrap();
+
+    let run = |home: &std::path::Path| {
+        std::process::Command::new(env!("CARGO_BIN_EXE_sema"))
+            .args(["mcp", "list"])
+            .env("HOME", home)
+            .env("XDG_CONFIG_HOME", home.join(".config"))
+            .env("SEMA_MCP_TOKEN_STORE", "file")
+            .output()
+            .expect("failed to run sema mcp list")
+    };
+
+    // Empty store: a friendly line, exit 0.
+    let output = run(&home);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "no known servers\n"
+    );
+
+    // Seed two servers straight into the store file (the same JSON the file
+    // backend writes): one non-expiring token, one long expired.
+    #[cfg(target_os = "macos")]
+    let config_dir = home.join("Library").join("Application Support");
+    #[cfg(not(target_os = "macos"))]
+    let config_dir = home.join(".config");
+    let store_dir = config_dir.join("sema");
+    std::fs::create_dir_all(&store_dir).unwrap();
+    std::fs::write(
+        store_dir.join("mcp-auth.json"),
+        r#"{"servers": {
+            "https://b.example.com/mcp": {"server_url": "https://b.example.com/mcp",
+                "tokens": {"access_token": "tok-b", "expires_at": 1}},
+            "https://a.example.com/mcp": {"server_url": "https://a.example.com/mcp",
+                "tokens": {"access_token": "tok-a"}}}}"#,
+    )
+    .unwrap();
+
+    // One line per server, URL-sorted, expiry reflected — and never the token.
+    let output = run(&home);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(
+        stdout,
+        "https://a.example.com/mcp  token present\n\
+         https://b.example.com/mcp  token expired\n"
+    );
+    assert!(!stdout.contains("tok-"), "tokens must never be printed");
+
+    let _ = std::fs::remove_dir_all(&home);
+}
