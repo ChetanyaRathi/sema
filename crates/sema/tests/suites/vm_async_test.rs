@@ -869,6 +869,32 @@ fn async_all_empty_list() {
     assert_eq!(eval("(async/all (list))"), Value::list(vec![]));
 }
 
+// A registered promise-set wait (`async/all`/`race`/`timeout`/`await`) holds its
+// members as raw `PromiseId`s, invisible to the cycle collector. Once a member
+// settles, `PromiseRegistry::settle` consumes its waiter entry, so if that
+// member's handle was a temporary (here: `(async 1)`, alive only inside the
+// argument list) a GC pass while the wait is still parked used to evict the
+// settled record. The wait's next re-poll then hit `RegistryError::Unknown` —
+// an uncatchable `RuntimeFault::Invariant` ("registered promise wait became
+// invalid: Unknown") that killed the whole root. Found by the async grammar
+// fuzzer (docs/bugs/async-fuzz-findings.md finding 3). The sequence is causal,
+// not timing-based: the sidekick's `gc/collect` runs while the root is parked
+// on the `async/all`, and the channel send releases `slow` only afterwards.
+#[test]
+fn gc_pass_while_promise_set_wait_parked_keeps_settled_members_resolvable() {
+    assert_eq!(
+        eval(
+            r#"
+            (let ((ch (channel/new 1)))
+              (let ((slow (async (channel/recv ch))))
+                (async (async/sleep 10) (gc/collect) (channel/send ch 2))
+                (async/all (list (async 1) slow))))
+            "#
+        ),
+        eval("'(1 2)")
+    );
+}
+
 // === async/race edge cases ===
 
 #[test]
