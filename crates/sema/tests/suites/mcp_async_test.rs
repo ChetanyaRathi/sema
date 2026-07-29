@@ -26,20 +26,7 @@ fn unique_temp_path(tag: &str) -> PathBuf {
     ))
 }
 
-/// Sema string-literal-encode a Rust string (for interpolating into a
-/// generated Sema program, e.g. a marker file path).
-fn sema_str(s: &str) -> String {
-    let encoded = serde_json::to_string(s).expect("string encodes to JSON");
-    // JSON string syntax is a valid Sema string literal.
-    encoded
-}
-
-/// Embed a filesystem path inside a quoted Sema string literal: `\` there
-/// starts an escape (`C:\Users…` begins a `\U` unicode escape), so Windows
-/// separators go in as `/` — std's fs API accepts either.
-fn sema_path(path: &Path) -> String {
-    path.to_string_lossy().replace('\\', "/")
-}
+use crate::common::{sema_path, sema_str};
 
 // ── Scenario 1: cross-connection overlap ────────────────────────────────────
 //

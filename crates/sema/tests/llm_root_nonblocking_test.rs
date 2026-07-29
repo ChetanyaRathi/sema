@@ -13,12 +13,8 @@ use sema_llm::types::LlmError;
 use serial_test::serial;
 use std::time::{Duration, Instant};
 
-/// Embed a filesystem path in generated Sema source. A Sema string literal
-/// treats `\` as an escape (`C:\Users…` begins a `\U` unicode escape), so
-/// Windows separators go in as `/` — std's fs API accepts either.
-fn sema_path(path: &std::path::Path) -> String {
-    path.to_string_lossy().replace('\\', "/")
-}
+mod common;
+use common::sema_path;
 
 fn strings(value: &sema_core::Value) -> Vec<String> {
     value

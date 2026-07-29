@@ -1,13 +1,19 @@
-# Advisory legs that don't belong on the per-push critical path:
+# Legs that don't belong on the per-push critical path:
 #
-#  - test-windows: has never been green (the known first fix wave — cfg(unix)
-#    gating for subprocess eager-cancel and pty tests — hasn't landed; see the
-#    P7 plan referenced from the old ci.yml leg, beb6108d). Per-push it burned
-#    ~44 Windows runner-minutes to produce a permanently red X. It runs here
-#    until near-green, then moves back to the per-push gate as a required job.
+#  - test-windows: DELIBERATELY nightly, not per-push (decision 2026-07-29,
+#    made when the leg first went fully green after the test-porting wave).
+#    Per-push it would cost ~12 Windows runner-minutes on every push; nightly
+#    means a Windows regression surfaces next-day, which is the accepted
+#    trade for fast pushes. Revisit only if a Windows regression actually
+#    ships — the leg is green and a red nightly is the honest signal.
 #  - coverage: instrumented re-run of the suite under plain `cargo test`; known
 #    to flake after the real gate already passed (2046c907). Metrics must not
 #    extend or redden the gating path, so they ride the schedule instead.
+#  - docs-search-gate: hermetic embedded-asset gate (FROM-scratch container,
+#    --network none) proving the MCP docs_search corpus+index are baked into
+#    the binary — the same works-from-checkout/broken-installed class as the
+#    packaged-web smoke. Nightly because its docker build compiles a musl
+#    release binary from cold (~20m) — too heavy per-push, cheap once a day.
 name: Nightly
 
 on:
@@ -53,6 +59,15 @@ jobs:
       # filtered out via default-filter.
       - name: Run tests
         run: cargo nextest run --workspace --profile ci-windows
+
+  docs-search-gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Hermetic embedded docs_search gate
+        run: ./scripts/docs-search-gate.sh
 
   coverage:
     runs-on: ubuntu-latest

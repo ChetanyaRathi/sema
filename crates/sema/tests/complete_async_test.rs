@@ -28,12 +28,8 @@ use sema_llm::cassette::{Cassette, CassetteMode};
 use sema_llm::fake::FakeProvider;
 use serial_test::serial;
 
-/// Embed a filesystem path in generated Sema source. A Sema string literal
-/// treats `\` as an escape (`C:\Users…` begins a `\U` unicode escape), so
-/// Windows separators go in as `/` — std's fs API accepts either.
-fn sema_path(path: &std::path::Path) -> String {
-    path.to_string_lossy().replace('\\', "/")
-}
+mod common;
+use common::sema_path;
 
 /// `(async/pool-map llm/complete prompts 3)` over a delayed fake: results correct
 /// and in INPUT order, with overlap proven by both peak in-flight ≥ 2 and a

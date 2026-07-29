@@ -19,11 +19,8 @@ use sema_core::{Sandbox, Value};
 use sema_eval::Interpreter as EvalInterpreter;
 use sema_vm::runtime::RootOptions;
 
-/// Sema string-literal-encode a Rust string (JSON string syntax is a valid Sema
-/// string literal), for interpolating a marker path / server script.
-fn sema_str(s: &str) -> String {
-    serde_json::to_string(s).expect("string encodes to JSON")
-}
+mod common;
+use common::sema_str;
 
 fn unique_temp_path(tag: &str) -> std::path::PathBuf {
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -329,29 +326,65 @@ enum CancellationResourceOracle {
 }
 
 /// One probe: true if the stdio server process is interrupted — gone entirely,
-/// or killed but not yet reaped (a zombie). Cancellation SIGKILLs the transport
+/// or killed but not yet reaped (a zombie). Cancellation kills the transport
 /// child and leaves reaping to tokio's background best-effort, so a plain
-/// `kill(pid, 0)` probe — which succeeds on zombies — would misread an
+/// existence probe — which succeeds on zombies — would misread an
 /// interrupted-but-unreaped child as alive (observed on Linux CI, where the
 /// reap consistently lags the probe window).
+///
+/// The probe must only OBSERVE — it must never signal or kill the target on
+/// any platform. POSIX has `kill(pid, 0)` (existence check, delivers nothing)
+/// plus `ps` to classify zombies. Windows has no signal-0 analogue — python's
+/// `os.kill(pid, 0)` there TERMINATES a live pid (CTRL/terminate semantics) —
+/// so the Windows branch opens a query-only process handle and reads the exit
+/// code instead. Where the truth is unknowable (e.g. an access-denied handle),
+/// the probe reports ALIVE: a false "exited" would make the cancellation
+/// oracle pass vacuously, while a false "alive" only makes the test fail loud.
 fn stdio_server_exited(entered: &std::path::Path) -> bool {
     let Ok(pid) = std::fs::read_to_string(entered) else {
         return false;
     };
     let probe = r#"
-import os, subprocess, sys
+import sys
 pid = int(sys.argv[1])
-try:
-    os.kill(pid, 0)
-except OSError:
-    raise SystemExit(1)  # process gone
-state = subprocess.run(
-    ["ps", "-o", "stat=", "-p", str(pid)],
-    capture_output=True, text=True,
-).stdout.strip()
-if not state or state.startswith("Z"):
-    raise SystemExit(1)  # reaped mid-probe, or a kill-pending zombie
-raise SystemExit(0)  # genuinely still running
+if sys.platform == "win32":
+    import ctypes
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.restype = ctypes.c_void_p
+    kernel32.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
+    kernel32.GetExitCodeProcess.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_ulong)]
+    kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    ERROR_INVALID_PARAMETER = 87
+    STILL_ACTIVE = 259
+    handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    if not handle:
+        # No such pid opens nothing with ERROR_INVALID_PARAMETER; any other
+        # failure (e.g. access denied) means the pid still exists.
+        gone = ctypes.get_last_error() == ERROR_INVALID_PARAMETER
+        raise SystemExit(1 if gone else 0)
+    try:
+        code = ctypes.c_ulong()
+        if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+            raise SystemExit(0)  # unknowable: report alive, keep the oracle honest
+        # A killed-but-unreaped process still opens; anything but STILL_ACTIVE
+        # in its exit code slot means it is dead.
+        raise SystemExit(0 if code.value == STILL_ACTIVE else 1)
+    finally:
+        kernel32.CloseHandle(handle)
+else:
+    import os, subprocess
+    try:
+        os.kill(pid, 0)  # signal 0: existence check only, delivers nothing
+    except OSError:
+        raise SystemExit(1)  # process gone
+    state = subprocess.run(
+        ["ps", "-o", "stat=", "-p", str(pid)],
+        capture_output=True, text=True,
+    ).stdout.strip()
+    if not state or state.startswith("Z"):
+        raise SystemExit(1)  # reaped mid-probe, or a kill-pending zombie
+    raise SystemExit(0)  # genuinely still running
 "#;
     !Command::new("python3")
         .args(["-c", probe, pid.trim()])
@@ -383,9 +416,10 @@ fn wait_for_peer_outcome(markers: &Markers, oracle: CancellationResourceOracle) 
         if markers.finished.exists() || markers.timed_out.exists() {
             return;
         }
-        // The liveness probe forks a python + ps, so it is thousands of times
-        // more expensive. Only the SIGKILL case needs it (a killed peer writes
-        // no marker), and that case is not latency-sensitive, so probe it
+        // The liveness probe forks a whole python (plus ps on POSIX), so it
+        // is thousands of times more expensive. Only the kill case needs it
+        // (a killed peer writes no marker), and that case is not
+        // latency-sensitive, so probe it
         // sparingly: spamming it here would add load to the very machine whose
         // scheduling delays this function exists to tolerate.
         if matches!(oracle, CancellationResourceOracle::StdioServerExit)
@@ -976,12 +1010,6 @@ fn runtime_generated_mcp_handler_wait_is_promptly_cancellable() {
     assert_connection_tombstoned(&interp, "cancelled mid-call");
 }
 
-// Unix-only: on Windows, cancelling the root does not sever the in-flight
-// DELETE — the HTTP peer keeps its connection (CI observed the root settle
-// cancelled while the peer reported no disconnect within the 30s window).
-// The transport-interrupt invariant this test pins needs a Windows-side fix
-// in the cancellation path before the oracle can run there.
-#[cfg(unix)]
 #[test]
 fn runtime_mcp_close_wait_is_promptly_cancellable() {
     let markers = Markers::new("close-cancel");

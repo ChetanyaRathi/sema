@@ -38,9 +38,12 @@
 //! **Cancellation semantics.** If a task is cancelled (`async/cancel`,
 //! `async/timeout` expiry) while it holds a connection's checkout, the slot is
 //! tombstoned by the External wait's cancellation hook. That hook also fires a
-//! pre-armed one-shot; the worker's biased select drops the transport future,
-//! and the connection itself — the `McpClient`, hence any child process/socket
-//! — drops on the worker thread. Any late completion is discarded by the
+//! pre-armed one-shot; the job's biased select drops the transport future, and
+//! the connection itself — the `McpClient`, hence any child process/socket —
+//! drops with it. Connection ops run those drops inside a task spawned on the
+//! shared I/O runtime (see [`run_transport_task`]) so an HTTP transport's
+//! socket-owning dispatcher tasks observe them; a stdio drop is a synchronous
+//! child kill either way. Any late completion is discarded by the
 //! runtime. A *later* use of that handle fails fast with a
 //! `SemaError` naming the reason and a reconnect hint; a task that was merely
 //! *queued* (never actually held the checkout) when cancelled leaves the slot
@@ -958,8 +961,9 @@ fn fire_cancel_signal(signal: &mut Option<McpCancelSignal>) {
 /// process — stays alive. Measured before this existed: the child still running
 /// 30s after cancellation while the runtime reported zero live tasks and zero
 /// resource gates, i.e. a leaked subprocess the runtime believed it had cleaned
-/// up. Dropping here, on the worker thread, kills it the moment cancellation is
-/// observed, independent of what the runtime does with the late completion.
+/// up. Dropping here, inside the transport job, kills it the moment
+/// cancellation is observed, independent of what the runtime does with the
+/// late completion.
 ///
 /// Only cancellation gets this treatment. An operation that merely FAILED still
 /// returns its connection: the decoder checks it back in and the handle stays
@@ -970,6 +974,41 @@ fn conn_unless_cancelled(conn: McpConnection, cancelled: bool) -> Option<McpConn
         return None;
     }
     Some(conn)
+}
+
+/// Drive an established-connection transport job as a task SPAWNED on the
+/// shared I/O runtime, awaited from the calling blocking-tier worker.
+///
+/// The placement is the HTTP cancellation-severing mechanism, not an
+/// optimization. An HTTP connection's socket is owned by hyper's detached
+/// dispatcher task on the shared runtime; dropping an in-flight request future
+/// or the transport's `reqwest::Client` only closes channel handles, and the
+/// socket dies when the woken dispatcher next polls. A job spawned here takes
+/// its cancel arm ON a runtime worker, so the teardown drops — the `select!`'s
+/// dropped transport future, then [`conn_unless_cancelled`] — run inside the
+/// runtime with the scheduler contract behind their wake edges, the same shape
+/// as the async I/O tier (whose cancel-severing the stdlib `http/get` oracle
+/// pins on every platform). Teardown drops performed on a plain blocking
+/// thread carry no such contract: on Windows the HTTP peer of a cancelled
+/// `mcp/close` observed no disconnect at all (detector:
+/// `runtime_mcp_close_wait_is_promptly_cancellable`). Stdio is indifferent to
+/// placement — its sever is a synchronous kill in `StdioTransport::drop` — so
+/// every connection op routes through here uniformly.
+///
+/// A panicking job resumes its unwind on the worker, so the blocking dispatch
+/// reports the same worker-panic completion as a panic in the closure itself.
+async fn run_transport_task<T, F>(job: F) -> T
+where
+    F: Future<Output = T> + Send + 'static,
+    T: Send + 'static,
+{
+    match tokio::spawn(job).await {
+        Ok(value) => value,
+        Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
+        // Nothing aborts these tasks (no `AbortHandle` escapes), so a
+        // non-panic `JoinError` has no defined meaning here.
+        Err(error) => panic!("mcp transport task failed: {error}"),
+    }
 }
 
 struct McpConnectCancelHook {
@@ -2213,40 +2252,44 @@ impl McpGatedAction for McpConnectionAction {
             }),
         );
         PreparedExternalOperation::interruptible_blocking(kind, decoder, resource, move || {
-            let mut conn = conn;
             // `None` from a select is cancellation, distinct from an operation
             // that ran and returned `Err` — only the former releases the
             // connection (see `conn_unless_cancelled`).
-            let (result, cancelled) = match operation {
+            let payload = match operation {
                 McpConnectionOperation::ListTools => {
-                    let list = list_tools_async(&mut conn);
-                    let completed = sema_io::io_block_on(async move {
-                        tokio::select! {
+                    sema_io::io_block_on(run_transport_task(async move {
+                        let mut conn = conn;
+                        let completed = tokio::select! {
                             biased;
                             _ = cancel_rx => None,
-                            result = list => Some(result),
+                            result = list_tools_async(&mut conn) => Some(result),
+                        };
+                        let conn = conn_unless_cancelled(conn, completed.is_none());
+                        let result = completed.unwrap_or_else(|| Err("cancelled".to_string()));
+                        McpConnectionOperationPayload {
+                            conn,
+                            result: McpConnectionOperationResult::Tools(result),
                         }
-                    });
-                    let cancelled = completed.is_none();
-                    let result = completed.unwrap_or_else(|| Err("cancelled".to_string()));
-                    (McpConnectionOperationResult::Tools(result), cancelled)
+                    }))
                 }
                 McpConnectionOperation::Close => {
-                    let close = close_async(&mut conn);
-                    let completed = sema_io::io_block_on(async move {
-                        tokio::select! {
+                    sema_io::io_block_on(run_transport_task(async move {
+                        let mut conn = conn;
+                        let completed = tokio::select! {
                             biased;
                             _ = cancel_rx => None,
-                            result = close => Some(result),
+                            result = close_async(&mut conn) => Some(result),
+                        };
+                        let conn = conn_unless_cancelled(conn, completed.is_none());
+                        let result = completed.unwrap_or_else(|| Err("cancelled".to_string()));
+                        McpConnectionOperationPayload {
+                            conn,
+                            result: McpConnectionOperationResult::Close(result),
                         }
-                    });
-                    let cancelled = completed.is_none();
-                    let result = completed.unwrap_or_else(|| Err("cancelled".to_string()));
-                    (McpConnectionOperationResult::Close(result), cancelled)
+                    }))
                 }
             };
-            let conn = conn_unless_cancelled(conn, cancelled);
-            Ok(Box::new(McpConnectionOperationPayload { conn, result }) as SendPayload)
+            Ok(Box::new(payload) as SendPayload)
         })
     }
 }
@@ -2541,7 +2584,7 @@ fn foreign_runtime_close(
     entry: Rc<ConnEntry>,
     gate: ResourceGateHandle,
 ) -> NativeResult {
-    let mut conn = try_checkout(&entry)?.ok_or_else(|| busy_sync_error(handle, "mcp/close"))?;
+    let conn = try_checkout(&entry)?.ok_or_else(|| busy_sync_error(handle, "mcp/close"))?;
     if let Err(error) = close_gate_through_owner(&gate) {
         checkin(&entry, conn);
         return Err(error);
@@ -2566,20 +2609,21 @@ fn foreign_runtime_close(
         decoder,
         resource,
         move || {
-            let close = close_async(&mut conn);
-            let completed = sema_io::io_block_on(async move {
-                tokio::select! {
+            let payload = sema_io::io_block_on(run_transport_task(async move {
+                let mut conn = conn;
+                let completed = tokio::select! {
                     biased;
                     _ = cancel_rx => None,
-                    result = close => Some(result),
+                    result = close_async(&mut conn) => Some(result),
+                };
+                let conn = conn_unless_cancelled(conn, completed.is_none());
+                let result = completed.unwrap_or_else(|| Err("cancelled".to_string()));
+                McpConnectionOperationPayload {
+                    conn,
+                    result: McpConnectionOperationResult::Close(result),
                 }
-            });
-            let conn = conn_unless_cancelled(conn, completed.is_none());
-            let result = completed.unwrap_or_else(|| Err("cancelled".to_string()));
-            Ok(Box::new(McpConnectionOperationPayload {
-                conn,
-                result: McpConnectionOperationResult::Close(result),
-            }) as SendPayload)
+            }));
+            Ok(Box::new(payload) as SendPayload)
         },
     );
     Ok(NativeOutcome::Suspend(NativeSuspend {

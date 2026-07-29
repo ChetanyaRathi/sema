@@ -36,12 +36,9 @@ impl TempDir {
         std::fs::create_dir_all(&dir).unwrap();
         TempDir(dir)
     }
-    /// The joined path as a string safe to embed in Sema source: forward
-    /// slashes, because backslashes in a Windows path read as string escapes
-    /// inside a Sema string literal (`\Users` starts a `\U` unicode escape),
-    /// and every platform accepts `/` separators.
+    /// The joined path in Sema-source-embeddable (forward-slash) form.
     fn path(&self, name: &str) -> String {
-        self.0.join(name).to_string_lossy().replace('\\', "/")
+        crate::common::sema_path(&self.0.join(name))
     }
 }
 

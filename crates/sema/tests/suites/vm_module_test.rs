@@ -25,10 +25,8 @@ fn temp_dir(tag: &str) -> PathBuf {
 fn write(dir: &std::path::Path, name: &str, src: &str) -> String {
     let p = dir.join(name);
     std::fs::write(&p, src).expect("write module file");
-    // The returned path is spliced into Sema string literals, where `\` starts
-    // an escape (`C:\Users\…` reads as a `\U` unicode escape). Forward slashes
-    // are valid path separators on every platform, including Windows.
-    p.to_string_lossy().replace('\\', "/")
+    // The returned path is spliced into Sema string literals.
+    crate::common::sema_path(&p)
 }
 
 /// Evaluate on the VM (the sole evaluator).

@@ -36,12 +36,9 @@ impl TempDb {
         let path = std::env::temp_dir().join(format!("sema-db-async-{tag}-{nanos}.sqlite3"));
         TempDb(path)
     }
-    /// The path as a string safe to embed in Sema source: forward slashes,
-    /// because backslashes in a Windows path read as string escapes inside a
-    /// Sema string literal (`\Users` starts a `\U` unicode escape), and every
-    /// platform accepts `/` separators.
+    /// The path in Sema-source-embeddable (forward-slash) form.
     fn path(&self) -> String {
-        self.0.to_string_lossy().replace('\\', "/")
+        crate::common::sema_path(&self.0)
     }
 }
 

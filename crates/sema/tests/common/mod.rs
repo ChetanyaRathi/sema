@@ -4,6 +4,24 @@ use sema_eval::Interpreter;
 
 pub mod watchdog;
 
+/// Embed a host filesystem path in generated Sema source, in forward-slash
+/// form. Inside a Sema string literal `\` starts an escape (`C:\Users\…`
+/// begins a `\U` unicode escape), so a raw Windows path mis-reads or fails to
+/// parse; `/` is a valid separator on every platform (std's fs API accepts it
+/// on Windows too), so the forward-slash form is safe to splice verbatim
+/// between quotes. Returns BARE text — the caller supplies the quotes.
+pub fn sema_path(path: &std::path::Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
+}
+
+/// Sema string-literal-encode arbitrary text (JSON string syntax is a valid
+/// Sema string literal), for splicing server scripts / marker paths into
+/// generated source. Unlike `sema_path` this returns the QUOTED literal, with
+/// every escape the content needs.
+pub fn sema_str(s: &str) -> String {
+    serde_json::to_string(s).expect("string encodes to JSON")
+}
+
 /// Evaluate Sema source on the VM (the sole evaluator), panicking on error. Used both to
 /// run a test's input and to turn an expected Sema literal into a `Value`
 /// (e.g. `=> common::eval("'(2 4 6)")`).

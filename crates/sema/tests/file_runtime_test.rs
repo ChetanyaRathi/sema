@@ -27,6 +27,9 @@ use sema_stdlib::{
 };
 use serial_test::serial;
 
+mod common;
+use common::sema_path;
+
 /// A unique temp dir for one test, removed on drop (also on panic).
 struct TempDir(std::path::PathBuf);
 
@@ -41,8 +44,7 @@ impl TempDir {
         TempDir(dir)
     }
     fn path(&self, name: &str) -> String {
-        // Forward slashes keep the path a clean Sema string literal on every OS.
-        self.0.join(name).to_string_lossy().replace('\\', "/")
+        sema_path(&self.0.join(name))
     }
 }
 

@@ -1,1 +1,8 @@
-*.sema linguist-language=Scheme
+# Line endings are load-bearing: Windows autocrlf checkouts once mangled two
+# CRLF-sensitive test inputs (an all-ASCII PDF fixture whose xref offsets
+# shifted, and a golden journal whose content hashes changed) — git's text
+# heuristic sees no NUL bytes and "helpfully" converts. Pin the file classes
+# that must stay byte-exact on every platform.
+*.sema text eol=lf linguist-language=Scheme
+*.sh text eol=lf
+crates/sema/tests/fixtures/** -text
