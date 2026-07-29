@@ -406,8 +406,12 @@ Prefer to authenticate ahead of time (recommended, and required on a headless bo
 sema mcp login  https://mcp.example.com/mcp             # opens a browser
 sema mcp login  https://mcp.example.com/mcp --device    # RFC 8628 device-code flow (headless)
 sema mcp login  https://mcp.example.com/mcp --client-id ID   # pre-registered client
+sema mcp login  https://mcp.example.com/mcp --token T   # install a pre-issued token (CI)
 sema mcp logout https://mcp.example.com/mcp             # clear cached credentials
+sema mcp list                                           # what's cached, per server
 ```
+
+`sema mcp list` prints one line per server with cached credentials — the canonical URL plus `token present` or `token expired` — reading only the local store (no network, and token values are never printed). It can only enumerate the file backend: the OS keychain has no listing API, so `list` says so and points at `SEMA_MCP_TOKEN_STORE=file` rather than pretending the store is empty.
 
 **Token storage.** Credentials are kept per server URL in the OS keychain by default, falling back to a `0600`-permission `mcp-auth.json` in the platform config directory on headless boxes (Linux: `$XDG_CONFIG_HOME` or `~/.config/sema/`; macOS: `~/Library/Application Support/sema/`; Windows: `%APPDATA%\sema\`). Override the backend with an environment variable:
 
@@ -461,7 +465,7 @@ A call is keyed by a hash of the server identity + tool name + arguments; a repl
 
 ### Troubleshooting
 
-- **`OAuth login failed` / no browser opens** — on a headless machine, use `sema mcp login <url> --device` (device-code flow) or pass a token directly via `:headers {"Authorization" "Bearer …"}`.
+- **`OAuth login failed` / no browser opens** — on a headless machine, use `sema mcp login <url> --device` (device-code flow), `sema mcp login <url> --token <token>` (pre-issued token), or pass a token directly via `:headers {"Authorization" "Bearer …"}`.
 - **Repeated macOS Keychain prompts while developing** — expected for a frequently-rebuilt dev binary; set `SEMA_MCP_TOKEN_STORE=file`.
 - **`mcp/connect requires a :command or :url entry`** — the config map needs one of `:command` (stdio) or `:url` (http).
 - Errors surface as `SemaError` values, so wrap `mcp/connect`/`mcp/call` in your usual error handling.
