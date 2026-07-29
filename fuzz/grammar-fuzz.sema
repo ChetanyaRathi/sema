@@ -1177,11 +1177,127 @@
               (mk (list 'async/spawn-all (cons 'list (reverse thunks)))
                 (reverse vals)))))))))
 
+;; Insert x into xs at index i (0 <= i <= (length xs)).
+(define (insert-at xs i x)
+  (append (take i xs) (cons x (drop i xs))))
+
+;; Select-like: async/race over exactly one settleable task and 1-3 losers
+;; parked forever (recv on a never-sent channel, or a 60 s virtual timer), so
+;; the winner is deterministic by construction whatever its list position. The
+;; observational race leaves losers running, so the root cancels them
+;; explicitly; the owned variant (async/race-owned, over thunks) cancels them
+;; itself. The winner body may still sleep a few ms — no loser can ever settle
+;; first. There is deliberately no timed-race variant: two timers racing is a
+;; wall-clock bound, and those are untrustworthy under load
+;; (docs/bugs/2026-07-28-sibling-interleaving-tests-are-load-sensitive.md).
+(define (gen-async-race env depth)
+  (let* ((ch (gensym "ch"))
+         (w (gen-int env (- depth 1)))
+         (nl (rng-range! 1 3))
+         (owned (rng-bool!)))
+    (let loop ((i 0) (losers (list)))
+      (if (< i nl)
+        (loop (+ i 1)
+          (cons
+            (if (rng-bool!)
+              (if owned
+                (list 'lambda (list) (list 'channel/recv ch))
+                (list 'async (list 'channel/recv ch)))
+              (if owned
+                (list 'lambda (list) (list 'async/sleep 60000) 0)
+                (list 'async (list 'async/sleep 60000) 0)))
+            losers))
+        (if owned
+          (let* ((winner (list 'lambda (list) (cons 'begin (with-sleeps (list (gf w))))))
+                 (thunks (insert-at losers (rng-int! (+ nl 1)) winner)))
+            (mk
+              (list 'let
+                (list (list ch (list 'channel/new 1)))
+                (list 'async/race-owned (cons 'list thunks)))
+              (gv w)))
+          (let* ((names
+                   (let nloop ((j 0) (acc (list)))
+                     (if (< j nl) (nloop (+ j 1) (cons (gensym "l") acc)) acc)))
+                 (wname (gensym "w"))
+                 (binds (map (lambda (nm t) (list nm t)) names losers))
+                 (wtask (mk-task (list (gf w))))
+                 (pos (rng-int! (+ nl 1)))
+                 (all-binds (insert-at binds pos (list wname wtask)))
+                 (all-names (insert-at names pos wname))
+                 (v (gensym "v")))
+            (mk
+              (list 'let
+                (list (list ch (list 'channel/new 1)))
+                (list 'let
+                  all-binds
+                  (cons 'let
+                    (cons
+                      (list (list v (list 'async/race (cons 'list all-names))))
+                      (append
+                        (map (lambda (nm) (list 'async/cancel nm)) names)
+                        (list v))))))
+              (gv w))))))))
+
+;; async/with-timeout: either the body settles immediately (value wins; the
+;; deadline is 60 s so no wall-clock bound is asserted) or the body parks
+;; forever on a never-sent channel (the 1-5 ms deadline wins, the child is
+;; cancelled, and the :timeout condition is caught as a marker).
+(define (gen-async-with-timeout env depth)
+  (let ((ch (gensym "ch"))
+        (body (gen-int env (- depth 1))))
+    (if (rng-bool!)
+      (mk
+        (list 'async/with-timeout
+          60000
+          (list 'lambda (list) (cons 'begin (with-sleeps (list (gf body))))))
+        (gv body))
+      (let ((mark (rng-range! 100 999)))
+        (mk
+          (list 'let
+            (list (list ch (list 'channel/new 1)))
+            (list 'try
+              (list 'async/with-timeout
+                (rng-range! 1 5)
+                (list 'lambda (list) (list 'channel/recv ch)))
+              (list 'catch
+                'e
+                (list 'if (list '= (list ':type 'e) ':timeout) mark -1))))
+          mark)))))
+
+;; Causal ordering (park-vs-pin): the root parks — virtual timer or offloaded
+;; blocking sleep — while a zero-delay sibling sends its marker; the root sends
+;; its own marker after resuming. Draining must observe sibling-before-root.
+;; This is the load-safe oracle shape from the sibling-interleaving write-up:
+;; a causal ordering, not a wall-clock bound.
+(define (gen-async-causal env depth)
+  (let* ((out (gensym "out"))
+         (sib (gensym "sib"))
+         (surv (gen-int env (- depth 1)))
+         (park
+           (if (rng-bool!)
+             (list 'async/sleep (rng-range! 1 5))
+             (list 'sleep (rng-range! 1 3)))))
+    (mk
+      (list 'let
+        (list (list out (list 'channel/new 8)))
+        (list 'let
+          (list (list sib (list 'async (list 'channel/send out 1))))
+          park
+          (list 'channel/send out 2)
+          (list 'async/await sib)
+          (list 'if
+            (list 'and
+              (list '= 1 (list 'channel/recv out))
+              (list '= 2 (list 'channel/recv out)))
+            (gf surv)
+            -1)))
+      (gv surv))))
+
 ;; Dispatch for the gated async productions.
 (define (gen-async env depth)
   (if (<= depth 0)
     (gen-async-leaf env)
-    (let ((c (rng-int! 11)))
+    (let ((c (rng-int! 14)))
       (cond
         ((= c 0) (gen-async-chan-pipeline env depth))
         ((= c 1) (gen-async-chan-recvfirst env depth))
@@ -1193,7 +1309,10 @@
         ((= c 7) (gen-async-spawn-tree env depth))
         ((= c 8) (gen-async-cancel env depth))
         ((= c 9) (gen-async-owned-fail env depth))
-        (else (gen-async-owned-ok env depth))))))
+        ((= c 10) (gen-async-owned-ok env depth))
+        ((= c 11) (gen-async-race env depth))
+        ((= c 12) (gen-async-with-timeout env depth))
+        (else (gen-async-causal env depth))))))
 
 ;; ── metamorphic / differential laws (independent oracle for native ops) ──────
 ;; The plain value oracle computes `expected` by calling the SAME builtin the
