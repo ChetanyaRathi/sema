@@ -11,7 +11,9 @@ pointer here) until fixed.
 
 ## 1. `sema build` executables never find their embedded payload (severity: high)
 
-**FIXED (wave B2, pending Windows CI confirmation).** A `sema build` `.exe`
+**FIXED — confirmed on Windows CI (run 30411862087: all 12 detector tests
+green; FindResourceW returns valid handles; probe exes execute their embedded
+programs).** A `sema build` `.exe`
 booted as the plain sema CLI/REPL — `try_run_embedded()`
 (`libsui::find_section("semaexec")`) returned `None`. Diagnosis chain: the
 resource was structurally present (pefile parses it) but `FindResourceW`

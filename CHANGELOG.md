@@ -2,6 +2,28 @@
 
 ## Unreleased
 
+### Windows fixes — `sema build` works, plus three more
+
+- **`sema build` executables finally run on Windows.** Since the feature
+  shipped, every built `.exe` booted as the plain sema REPL: the embedded
+  payload's PE resource directory was serialized in insertion order, which
+  linear parsers read fine but the Win32 `FindResource` binary search (the
+  spec requires sorted entries) could never see. The final branding pass now
+  re-serializes the tree sorted (editpe 0.2) — payload, icon, and version
+  info are all API-visible. Verified end-to-end on Windows CI.
+- **Security: tarball extraction rejects rooted driveless entries.** On
+  Windows, a tar entry like `/tmp/pwned.txt` isn't "absolute", passed the
+  old check, and re-rooted onto the destination drive — writing outside the
+  extraction directory.
+- **`sema fmt`'s non-glob `[fmt] ignore` entries now match on Windows**
+  (separator mismatch made them silently inert).
+- **Memory-store flush rollback works on Windows** (append-mode handles
+  can't truncate; a failed flush left a torn JSONL line that survived retry).
+- The Windows test suite went from 189 failures + 9 hangs to a single known
+  test-infra failure (7192/7193); Unix-only suites are cfg-gated and the
+  rest of the failures were test portability, fixed. See
+  docs/bugs/2026-07-29-windows-product-bugs.md.
+
 ### CI overhaul — one gate, fail fast, release-path fixes
 
 - **Push CI drops from ~44 to 8.5 minutes wall clock** (measured steady-state
