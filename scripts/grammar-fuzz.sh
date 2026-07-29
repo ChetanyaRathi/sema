@@ -158,6 +158,32 @@ report_crash() {
   exit 2
 }
 
+# Exit status 1 is ambiguous: the fuzzer's controlled failure path (mismatches
+# were reported, the run completed, the breadcrumb was cleared to "ok"), or an
+# error the oracle's try could not catch (e.g. a runtime invariant fault) that
+# aborted the fuzzer mid-iteration, leaving the in-flight seed in the
+# breadcrumb. The second is crash-class: report it and exit 2. Such faults can
+# depend on runtime state left by earlier iterations in the same process, so
+# the reproduction runs from the batch's base seed up through the aborting
+# seed, not COUNT=1. Takes the batch base seed; returns 0 when the status was
+# a controlled mismatch.
+classify_status_1() {
+  local base="$1"
+  local last count
+  last="$(cat "$CRASH_FILE" 2>/dev/null || true)"
+  if [ -n "$last" ] && [ "$last" != "ok" ]; then
+    count=$((last - base + 1))
+    echo "" >&2
+    echo "ABORT: an uncatchable eval error ended the run mid-iteration (seed $last)" >&2
+    echo "  reproduce with: ${REPRO_ENV}SEMA_FUZZ_SEED=$base SEMA_FUZZ_COUNT=$count SEMA_FUZZ_DEPTH=$DEPTH \\" >&2
+    echo "                  $BIN $FUZZ_PROG   # may need state from earlier seeds in the batch" >&2
+    echo "  aborting program: ${REPRO_ENV}SEMA_FUZZ_MODE=emit SEMA_FUZZ_SEED=$last SEMA_FUZZ_COUNT=1 SEMA_FUZZ_DEPTH=$DEPTH \\" >&2
+    echo "                  $BIN $FUZZ_PROG" >&2
+    exit 2
+  fi
+  return 0
+}
+
 if [ "$ASYNC" != "1" ]; then
   # Deterministic sweep: one subprocess, no watchdog (the async grammar is off,
   # so no generated program can park).
@@ -166,7 +192,8 @@ if [ "$ASYNC" != "1" ]; then
   if [ "$status" -eq 0 ]; then
     exit 0
   elif [ "$status" -eq 1 ]; then
-    # Deterministic mismatch; the sema program already printed reproduction info.
+    classify_status_1 "$SEED"
+    # Controlled mismatch; the sema program already printed reproduction info.
     exit 1
   else
     report_crash "$status"
@@ -211,7 +238,10 @@ while [ "$remaining" -gt 0 ]; do
   fi
   case "$status" in
     0) ;;
-    1) mismatch=1 ;; # mismatch already reported with its seed; keep fuzzing later batches
+    1)
+      classify_status_1 "$batch_seed"
+      mismatch=1 # mismatch already reported with its seed; keep fuzzing later batches
+      ;;
     *) report_crash "$status" ;;
   esac
   batch_seed=$((batch_seed + n))

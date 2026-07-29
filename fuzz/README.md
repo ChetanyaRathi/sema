@@ -106,7 +106,12 @@ jake fuzz.async-emit n=10                   # print sample async programs
 
 The driver exits `0` on success, `1` on a deterministic mismatch (round-trip or
 value oracle), `2` on a hard crash, and `3` on a hang (async watchdog). In every
-failure case it prints the exact reproduction command.
+failure case it prints the exact reproduction command. An eval error the
+oracle's `try` cannot catch (a runtime invariant fault) aborts the fuzzer
+mid-iteration; the driver detects that via the breadcrumb, reports it as
+`ABORT`, and exits `2`. Such faults can depend on runtime state left by earlier
+iterations in the same process, so their reproduction line replays the batch
+from its base seed instead of `COUNT=1`.
 
 ### Reproducing and minimizing a finding
 
