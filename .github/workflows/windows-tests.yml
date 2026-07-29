@@ -76,3 +76,24 @@ jobs:
           cargo run -p sema-lang -- build --runtime "$RT" -o probe-rel.exe probe.sema || true
           ./probe-rel.exe < /dev/null || true
           python dumpres.py probe-rel.exe || true
+          # Does the WIN32 API (what try_run_embedded uses via FindResource)
+          # see the resource that pefile's linear parse sees? Distinguishes a
+          # directory that is structurally present but malformed for the
+          # loader's sorted walk.
+          cat > apiprobe.py <<'PY'
+          import ctypes, sys
+          from ctypes import wintypes
+          k32 = ctypes.WinDLL('kernel32', use_last_error=True)
+          k32.LoadLibraryExW.restype = wintypes.HMODULE
+          k32.LoadLibraryExW.argtypes = [wintypes.LPCWSTR, wintypes.HANDLE, wintypes.DWORD]
+          k32.FindResourceW.restype = ctypes.c_void_p
+          k32.FindResourceW.argtypes = [wintypes.HMODULE, wintypes.LPCWSTR, wintypes.LPCWSTR]
+          for flags in (0x2, 0x22):  # DATAFILE, DATAFILE|IMAGE_RESOURCE
+              h = k32.LoadLibraryExW(sys.argv[1], None, flags)
+              print('flags', hex(flags), 'mod', h, 'err', ctypes.get_last_error())
+              if not h: continue
+              r = k32.FindResourceW(h, 'SEMAEXEC', ctypes.cast(ctypes.c_void_p(10), wintypes.LPCWSTR))
+              print('  FindResourceW SEMAEXEC ->', r, 'err', ctypes.get_last_error())
+          PY
+          python apiprobe.py probe-debug.exe || true
+          python apiprobe.py probe-rel.exe || true
