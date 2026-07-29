@@ -91,6 +91,11 @@ bound and is trustworthy either way.
 The general rule: **lower bounds and orderings are load-safe; upper bounds are
 not.**
 
+**Update 2026-07-29:** the `wall_ms < 700` upper bounds were removed from both
+`concurrent_agents_overlap_*` tests — the likely trigger for runs 1–2 above —
+leaving `io_peak_inflight() >= 2` as each test's concurrency oracle (that
+answers open question 2 below).
+
 ## Open questions, in priority order
 
 1. What did the four failures actually assert? Nothing proceeds without this.

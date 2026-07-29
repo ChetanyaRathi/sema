@@ -325,7 +325,7 @@ enum Commands {
     Lsp,
     /// Start the Debug Adapter Protocol (DAP) server
     Dap,
-    /// Start the Model Context Protocol (MCP) server, or manage client auth (`login`/`logout`)
+    /// Start the Model Context Protocol (MCP) server, or manage client auth (`login`/`logout`/`list`)
     #[command(args_conflicts_with_subcommands = true)]
     Mcp {
         /// Client-auth subcommand; when omitted, runs the MCP server
@@ -468,6 +468,8 @@ enum McpAuthCommands {
         /// The MCP server URL whose cached credentials to clear
         url: String,
     },
+    /// List servers with cached credentials and each token's status (local only)
+    List,
 }
 
 #[derive(Subcommand)]
@@ -1016,6 +1018,7 @@ fn main() {
                             ..
                         } => sema_mcp::mcp_login(&url, device, client_id.as_deref()),
                         McpAuthCommands::Logout { url } => sema_mcp::mcp_logout(&url),
+                        McpAuthCommands::List => sema_mcp::mcp_list(),
                     };
                     if let Err(e) = result {
                         eprintln!("mcp: {e}");

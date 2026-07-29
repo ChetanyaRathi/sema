@@ -1,5 +1,21 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- **`sema mcp list`** — lists every MCP server with cached credentials, one
+  line per server with its token status (`token present` / `token expired`).
+  Reads only the local credential store (never the network); the keychain
+  backend, which has no enumeration API, says so and points at
+  `SEMA_MCP_TOKEN_STORE=file` instead of pretending the store is empty.
+
+### Improved
+
+- De-flaked the concurrent-agent overlap tests: the load-sensitive
+  `wall_ms < 700` ceilings are gone, leaving the load-safe
+  `io_peak_inflight() >= 2` lower bound as the concurrency oracle.
+
 ## 1.32.1
 
 ### Fixed

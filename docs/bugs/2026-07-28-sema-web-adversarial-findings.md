@@ -8,15 +8,15 @@ Severity as found: 3 critical, 11 high, 13 medium, 10 low.
 
 ## Status after the harden phase (reconciled 2026-07-28)
 
-**34 FIXED, 2 PARTIALLY FIXED, 1 OPEN by decision.** Every finding below carries
+**34 FIXED, 1 PARTIALLY FIXED, 2 CLOSED BY DECISION.** Every finding below carries
 its own `**Status …**` line naming the regression test that covers it; this table
 is only the roll-up.
 
 | Verdict | Findings |
 | --- | --- |
 | FIXED | 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 30, 31, 32, 33, 35, 36, 37 |
-| PARTIALLY FIXED | 11 (every re-rendering shape refetches; a spec reading a signal the view never reads still does not, and the documented answer is `resource/refresh!` from an `effect`), 29 (the diagnosis names the cause; the ~100 wasted renders remain) |
-| OPEN by decision | 34 (`.once` migration in an unkeyed list — fixing it would re-arm a spent `.once` whenever a label changes, which is worse; shipped as a dev diagnostic plus docs instead) |
+| PARTIALLY FIXED | 29 (the diagnosis names the cause; the ~100 wasted renders remain) |
+| CLOSED BY DECISION | 11 (every re-rendering shape refetches; for a spec reading a signal the view never reads, the documented answer is `resource/refresh!` from an `effect` — docs shipped), 34 (`.once` migration in an unkeyed list — fixing it would re-arm a spent `.once` whenever a label changes, which is worse; the `sip-render:once-without-key` dev diagnostic and docs shipped instead) |
 
 Three of those are answered by *documentation* rather than by a behaviour change,
 each because this ledger's own **Expected** offered that as an alternative and the
@@ -25,6 +25,11 @@ code change was judged worse than the defect: **20** (effect re-run ownership),
 called out individually below rather than being quietly folded into "FIXED", and
 **20**'s two tests are flagged in place as contract coverage rather than as a
 regression witness — they pass before and after by construction.
+
+(**11**'s residual and **34** were reclassified CLOSED BY DECISION on
+2026-07-29: everything they resolve to has shipped — the docs in each case, and
+for **34** the `once-without-key` dev diagnostic, live at
+`packages/sema-web/src/sip.ts:389`.)
 
 Verification behind this reconciliation, exit codes checked (2026-07-28):
 `npm test` 996 passed / 39 files; `tsc --noEmit` clean; `npm run build` clean;
@@ -49,7 +54,11 @@ both recorded here so the next reader does not re-derive them:
   iteration reaches `number/to-string` first. The stdlib really does register
   both names (`crates/sema-stdlib/src/string.rs:515,1633`), so the fix is to
   merge the two entries — an editorial call for a Rust/docs owner, not a
-  sema-web change. Left open deliberately.
+  sema-web change. **Closed** by commit `146f7654` (2026-07-28): the alias
+  declaration was removed from
+  `crates/sema-docs/entries/stdlib/strings/number-to-string.md`, leaving the
+  `math` entry as the one canonical `number->string`; the previously flaky
+  test passed 20/20 after.
 
 One environmental flake, also not a product defect: with the default worker count
 on a loaded machine the Playwright suite can lose a single `composition.spec.ts`
@@ -225,9 +234,9 @@ Also `router/href` and `router/push!`/`router/replace!` with the same argument. 
 
 ### 11. [HIGH] A spec whose URL depends on props or signals never refetches when they change — the new spec is adopted but no attempt is scheduled
 
-**Status 2026-07-28 (harden phase): PARTIALLY FIXED.** Every shape where the component re-renders now refetches (props from a parent, a signal the view reads, a route param) via the finding-6 fingerprint check - including the plan's own `(fn () (http/get (string-append "/api/users/" (:id props))))`. Witness: `tests/resource.test.ts` -> "re-checks a spec whose closure identity never changes", "refetches when only the method, headers, or body move"; `tests/resource-sema.test.ts` and `e2e/tests/resource.spec.ts` drive it end to end.
+**Status 2026-07-28 (harden phase): FIXED for every re-rendering shape; residual CLOSED BY DECISION (2026-07-29).** Every shape where the component re-renders now refetches (props from a parent, a signal the view reads, a route param) via the finding-6 fingerprint check - including the plan's own `(fn () (http/get (string-append "/api/users/" (:id props))))`. Witness: `tests/resource.test.ts` -> "re-checks a spec whose closure identity never changes", "refetches when only the method, headers, or body move"; `tests/resource-sema.test.ts` and `e2e/tests/resource.spec.ts` drive it end to end.
 
-**Residual, stated plainly.** This finding's *literal* repro renders `(:name (:value @u))` and never reads `@uid` in the view, so `(put! uid "2")` re-renders nothing and a re-render-driven check cannot see it. Making the spec's signal reads *tracked* was designed and rejected: a spec that writes a signal becomes self-triggering, and two specs that read each other's writes produce a microtask loop no fingerprint can break (a frozen tab). For that shape the documented answer is the ledger's own second Expected - `(effect (list @uid) (fn () (resource/refresh! "user")))` - now in the module docstring, `README.md` and `website/docs/web/resources.md`.
+**Residual, stated plainly - closed by decision.** This finding's *literal* repro renders `(:name (:value @u))` and never reads `@uid` in the view, so `(put! uid "2")` re-renders nothing and a re-render-driven check cannot see it. Making the spec's signal reads *tracked* was designed and rejected: a spec that writes a signal becomes self-triggering, and two specs that read each other's writes produce a microtask loop no fingerprint can break (a frozen tab). For that shape the documented answer is the ledger's own second Expected - `(effect (list @uid) (fn () (resource/refresh! "user")))` - now in the module docstring, `README.md` and `website/docs/web/resources.md`. With those docs shipped, nothing here remains open.
 
 **Repro.** renderSema (real WASM): `(def uid (state "1"))` + `(defcomponent view () (def u (resource "user" (fn () (string-append "/api/user/" @uid)))) [:p (if (:loading @u) "..." (:name (:value @u)))])`, mounted; resolve the first response as {"name":"one"}; then `(put! uid "2")` and flush.
 
@@ -468,7 +477,7 @@ i.e. Sema `(router/init! {"routes" "routes-page"})` — a bare `pattern -> handl
 
 ### 34. [LOW] `.once` state migrates to the wrong row in an unkeyed list
 
-**Status 2026-07-28 (harden phase): OPEN - deliberate non-change, diagnosed and documented.** The behaviour is unchanged **on purpose**. The ledger's Expected is "either both reordered rows fire or neither does"; the only way to make both fire is to clear the spent mark when morphdom patches the element, and that destroys what `.once` is for - `[:button {:on-click.once "save"} (if @saving "Saving..." "Save")]` would re-arm the moment its label changes, so a double-click submits twice. That is a worse defect than the one being fixed and it would invert two existing contracts. Item identity genuinely is not recoverable from an unkeyed list; only a `:key` supplies it. What shipped instead: a dev-mode diagnostic `sip-render:once-without-key:<parent>` on exactly the hazardous shape (an unkeyed element declaring `.once` with unkeyed same-tag siblings), plus the `.once` bullet in `website/docs/web/sip-markup.md`. Witness: `tests/sip-keys.test.ts` -> the ".once on unkeyed siblings" block (8 tests, incl. "says nothing once the rows carry a :key" and "reports once per parent, not once per row") and a characterization test in `tests/event-modifiers.test.ts` reproducing the ledger's exact migration.
+**Status 2026-07-28 (harden phase, reclassified 2026-07-29): CLOSED BY DECISION - deliberate non-change, diagnosed and documented.** The behaviour is unchanged **on purpose**. The ledger's Expected is "either both reordered rows fire or neither does"; the only way to make both fire is to clear the spent mark when morphdom patches the element, and that destroys what `.once` is for - `[:button {:on-click.once "save"} (if @saving "Saving..." "Save")]` would re-arm the moment its label changes, so a double-click submits twice. That is a worse defect than the one being fixed and it would invert two existing contracts. Item identity genuinely is not recoverable from an unkeyed list; only a `:key` supplies it. What shipped instead: a dev-mode diagnostic `sip-render:once-without-key:<parent>` on exactly the hazardous shape (an unkeyed element declaring `.once` with unkeyed same-tag siblings), live at `packages/sema-web/src/sip.ts:389`, plus the `.once` bullet in `website/docs/web/sip-markup.md`. Witness: `tests/sip-keys.test.ts` -> the ".once on unkeyed siblings" block (8 tests, incl. "says nothing once the rows carry a :key" and "reports once per parent, not once per row") and a characterization test in `tests/event-modifiers.test.ts` reproducing the ledger's exact migration.
 
 **Repro.** jsdom with the real morphdom and real signals. `[:ul (map (fn (r) [:li {:on-click.once "h"} r]) @rows)]` with `rows` = `("a" "b")`. Click row 0 ("a"), then set `rows` to `("b" "a")`, then click both rows. Cause: `firedOnce` is a `WeakMap<Element, Set<string>>` keyed by node identity (src/component.ts:612), and morphdom reuses the position-0 node for a different item when the list is unkeyed.
 
