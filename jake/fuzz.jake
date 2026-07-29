@@ -41,3 +41,21 @@ task grammar n="5000" depth="4" seed="": [release]
 @desc "Print sample generated programs from the grammar fuzzer"
 task grammar-emit n="5" depth="4": [release]
     ./scripts/grammar-fuzz.sh emit -n {{n}} -d {{depth}}
+
+# Async mode: enables the async/channel/cancellation productions and runs
+# batches under an external watchdog, so a runtime hang becomes a finding
+# (exit 3 + reproducing seed) instead of a stuck run.
+#   jake fuzz.async n=5000 depth=4 seed=123
+@group fuzz
+@desc "In-Sema grammar fuzzer, async mode (params: n depth seed)"
+task async n="5000" depth="4" seed="": [release]
+    @if eq({{seed}}, "")
+        ./scripts/grammar-fuzz.sh check --async -n {{n}} -d {{depth}}
+    @else
+        ./scripts/grammar-fuzz.sh check --async -n {{n}} -d {{depth}} -s {{seed}}
+    @end
+
+@group fuzz
+@desc "Print sample generated async programs from the grammar fuzzer"
+task async-emit n="10" depth="4": [release]
+    ./scripts/grammar-fuzz.sh emit --async -n {{n}} -d {{depth}}

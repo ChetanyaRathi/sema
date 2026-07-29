@@ -10,13 +10,24 @@
 # breadcrumb so every finding is reproducible from one integer seed.
 #
 # Usage:
-#   scripts/grammar-fuzz.sh [check] [-n COUNT] [-d DEPTH] [-s SEED] [-v]
-#   scripts/grammar-fuzz.sh emit  [-n COUNT] [-d DEPTH] [-s SEED] [-o FILE]
+#   scripts/grammar-fuzz.sh [check] [--async] [-n COUNT] [-d DEPTH] [-s SEED] [-b BATCH] [-t BUDGET] [-v]
+#   scripts/grammar-fuzz.sh emit  [--async] [-n COUNT] [-d DEPTH] [-s SEED] [-o FILE]
 #
 # Options:
+#   --async    enable the async productions (SEMA_FUZZ_ASYNC=1). Check mode then
+#              runs seeds in batches of BATCH per subprocess, each batch under an
+#              external watchdog: a program that never settles is killed and
+#              reported as a HANG finding with its seed (from the breadcrumb).
+#              The watchdog is external on purpose — an in-program async/timeout
+#              rides the same timer wheel whose wedging is one of the bug shapes
+#              under test.
 #   -n COUNT   iterations / programs (default: 5000 for check, 20 for emit)
 #   -d DEPTH   max generation depth (default: 4)
 #   -s SEED    base seed (default: random)
+#   -b BATCH   async check mode: seeds per subprocess batch (default: 100)
+#   -t BUDGET  async check mode: per-program time budget in seconds (default: 5).
+#              A batch of N seeds gets a deadline of N*BUDGET. This is only a
+#              net for runtime hangs, never a performance bound.
 #   -o FILE    emit mode: write programs to FILE instead of stdout
 #   -v         verbose (check mode: also print passing forms)
 #
@@ -24,6 +35,7 @@
 #   0  all checks passed
 #   1  a deterministic mismatch was found (round-trip or value oracle)
 #   2  a hard crash (VM panic) was found; reproducing seed is printed
+#   3  a hang was found (async watchdog); reproducing seed is printed
 
 set -uo pipefail # no -e: inspect the fuzzer's 0/1/2 exit status instead of aborting
 
@@ -38,21 +50,33 @@ case "${1:-}" in
     ;;
 esac
 
+# Strip the long --async flag before getopts (getopts only handles short options).
+ASYNC="0"
+args=()
+for a in "$@"; do
+  if [ "$a" = "--async" ]; then ASYNC="1"; else args+=("$a"); fi
+done
+set -- ${args[@]+"${args[@]}"}
+
 COUNT=""
 DEPTH="4"
 SEED=""
 OUT=""
 VERBOSE="0"
+BATCH="100"
+BUDGET="5"
 
-while getopts "n:d:s:o:v" opt; do
+while getopts "n:d:s:o:b:t:v" opt; do
   case "$opt" in
     n) COUNT="$OPTARG" ;;
     d) DEPTH="$OPTARG" ;;
     s) SEED="$OPTARG" ;;
     o) OUT="$OPTARG" ;;
+    b) BATCH="$OPTARG" ;;
+    t) BUDGET="$OPTARG" ;;
     v) VERBOSE="1" ;;
     *)
-      echo "usage: $0 [check|emit] [-n COUNT] [-d DEPTH] [-s SEED] [-o FILE] [-v]" >&2
+      echo "usage: $0 [check|emit] [--async] [-n COUNT] [-d DEPTH] [-s SEED] [-b BATCH] [-t BUDGET] [-o FILE] [-v]" >&2
       exit 64
       ;;
   esac
@@ -89,11 +113,20 @@ export SEMA_FUZZ_COUNT="$COUNT"
 export SEMA_FUZZ_DEPTH="$DEPTH"
 export SEMA_FUZZ_SEED="$SEED"
 export SEMA_FUZZ_VERBOSE="$VERBOSE"
+[ "$ASYNC" = "1" ] && export SEMA_FUZZ_ASYNC="1"
+
+# The fuzzer program is overridable so the watchdog machinery can be tested with
+# a hand-written hanging/crashing program without touching the real fuzzer.
+FUZZ_PROG="${SEMA_FUZZ_PROG:-$ROOT/fuzz/grammar-fuzz.sema}"
+
+# Env-var prefix for reproduction lines (async findings need the gate re-enabled).
+REPRO_ENV=""
+[ "$ASYNC" = "1" ] && REPRO_ENV="SEMA_FUZZ_ASYNC=1 "
 
 if [ "$MODE" = "emit" ]; then
   export SEMA_FUZZ_MODE="emit"
   [ -n "$OUT" ] && export SEMA_FUZZ_OUT="$OUT"
-  exec "$BIN" "$ROOT/fuzz/grammar-fuzz.sema"
+  exec "$BIN" "$FUZZ_PROG"
 fi
 
 # check mode: use a crash breadcrumb so a hard panic is still reproducible.
@@ -101,26 +134,87 @@ CRASH_FILE="$(mktemp)"
 trap 'rm -f "$CRASH_FILE"' EXIT
 export SEMA_FUZZ_CRASH_FILE="$CRASH_FILE"
 
-"$BIN" "$ROOT/fuzz/grammar-fuzz.sema"
-status=$?
+# Print the reproduction commands for the breadcrumb seed.
+print_repro() {
+  local seed="$1"
+  echo "  reproduce with: ${REPRO_ENV}SEMA_FUZZ_SEED=$seed SEMA_FUZZ_COUNT=1 SEMA_FUZZ_DEPTH=$DEPTH \\" >&2
+  echo "                  $BIN $FUZZ_PROG" >&2
+  echo "  or:             ${REPRO_ENV}SEMA_FUZZ_MODE=emit SEMA_FUZZ_SEED=$seed SEMA_FUZZ_COUNT=1 SEMA_FUZZ_DEPTH=$DEPTH \\" >&2
+  echo "                  $BIN $FUZZ_PROG   # to see the offending program" >&2
+}
 
-if [ "$status" -eq 0 ]; then
-  exit 0
-elif [ "$status" -eq 1 ]; then
-  # Deterministic mismatch; the sema program already printed reproduction info.
-  exit 1
-else
-  # Hard crash (e.g. SIGABRT from panic=abort). Recover the in-flight seed.
+# Report a hard crash (e.g. SIGABRT from panic=abort) and exit 2.
+report_crash() {
+  local status="$1"
+  local last
   last="$(cat "$CRASH_FILE" 2>/dev/null || true)"
   echo "" >&2
   echo "CRASH: sema exited with status $status (likely a VM panic)" >&2
   if [ -n "$last" ] && [ "$last" != "ok" ]; then
-    echo "  reproduce with: SEMA_FUZZ_SEED=$last SEMA_FUZZ_COUNT=1 SEMA_FUZZ_DEPTH=$DEPTH \\" >&2
-    echo "                  $BIN $ROOT/fuzz/grammar-fuzz.sema" >&2
-    echo "  or:             SEMA_FUZZ_MODE=emit SEMA_FUZZ_SEED=$last SEMA_FUZZ_COUNT=1 SEMA_FUZZ_DEPTH=$DEPTH \\" >&2
-    echo "                  $BIN $ROOT/fuzz/grammar-fuzz.sema   # to see the offending program" >&2
+    print_repro "$last"
   else
     echo "  (no breadcrumb captured; rerun with the same -s SEED to reproduce)" >&2
   fi
   exit 2
+}
+
+if [ "$ASYNC" != "1" ]; then
+  # Deterministic sweep: one subprocess, no watchdog (the async grammar is off,
+  # so no generated program can park).
+  "$BIN" "$FUZZ_PROG"
+  status=$?
+  if [ "$status" -eq 0 ]; then
+    exit 0
+  elif [ "$status" -eq 1 ]; then
+    # Deterministic mismatch; the sema program already printed reproduction info.
+    exit 1
+  else
+    report_crash "$status"
+  fi
 fi
+
+# Async check mode: run seeds in batches of BATCH per subprocess, each batch
+# under an external watchdog. If the batch exceeds its deadline the subprocess
+# is killed and the breadcrumb seed is reported as a HANG finding (exit 3).
+mismatch=0
+remaining="$COUNT"
+batch_seed="$SEED"
+while [ "$remaining" -gt 0 ]; do
+  n="$BATCH"
+  [ "$n" -gt "$remaining" ] && n="$remaining"
+  deadline=$((n * BUDGET))
+  SEMA_FUZZ_SEED="$batch_seed" SEMA_FUZZ_COUNT="$n" "$BIN" "$FUZZ_PROG" &
+  pid=$!
+  waited=0
+  hung=0
+  while kill -0 "$pid" 2>/dev/null; do
+    if [ "$waited" -ge "$deadline" ]; then
+      hung=1
+      kill -KILL "$pid" 2>/dev/null
+      break
+    fi
+    sleep 1
+    waited=$((waited + 1))
+  done
+  wait "$pid" 2>/dev/null
+  status=$?
+  if [ "$hung" -eq 1 ]; then
+    last="$(cat "$CRASH_FILE" 2>/dev/null || true)"
+    echo "" >&2
+    echo "HANG: batch (seeds $batch_seed..$((batch_seed + n - 1))) exceeded its ${deadline}s deadline; killed" >&2
+    if [ -n "$last" ] && [ "$last" != "ok" ]; then
+      print_repro "$last"
+    else
+      echo "  (no breadcrumb captured; rerun with -s $batch_seed to reproduce)" >&2
+    fi
+    exit 3
+  fi
+  case "$status" in
+    0) ;;
+    1) mismatch=1 ;; # mismatch already reported with its seed; keep fuzzing later batches
+    *) report_crash "$status" ;;
+  esac
+  batch_seed=$((batch_seed + n))
+  remaining=$((remaining - n))
+done
+exit "$mismatch"
