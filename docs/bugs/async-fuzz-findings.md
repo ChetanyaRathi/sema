@@ -1,9 +1,11 @@
-# Async grammar-fuzzer findings (phase 1)
+# Async grammar-fuzzer findings
 
 Findings from building and running the async fuzzing mode
-(`SEMA_FUZZ_ASYNC=1`, plan `docs/plans/2026-07-29-async-grammar-fuzzer.md`).
-Phase 1 records findings; it does not fix the runtime. Each entry has a
-reproduction that needs no fuzzer state.
+(`SEMA_FUZZ_ASYNC=1`, plan
+`docs/plans/archive/2026-07-29-async-grammar-fuzzer.md`). Phase 1 recorded
+findings 1-3; phase 2 fixed them (Resolutions below); phase 3 added the
+shutdown-leak harness. Each entry has a reproduction that needs no fuzzer
+state.
 
 ## 1. Cancelling an offloaded blocking `sleep` pins its executor worker
 
@@ -216,3 +218,24 @@ the same wording when next touched.
 | 2026-07-30 | finding-3 fix | 200000..201999 (2000) | 6 | PASS |
 | 2026-07-30 | finding-3 fix | 500000..500499 (500) | 6 | PASS |
 | 2026-07-30 | finding-1 fix | 200000..200499 (500) | 6 | PASS |
+| 2026-07-30 | phase 3 | 810000..810999 (1000) | 5 | PASS (watchdog + value + twin) |
+| 2026-07-30 | phase 3 | 910000..910999 (1000) | 6 | PASS (watchdog + value + twin) |
+
+## Phase 3 (2026-07-30): shutdown-leak harness — no findings
+
+The Rust harness (`crates/sema/tests/fuzz_async_shutdown_test.rs`) asserts
+zero live tasks, resource gates at baseline, and a clean `ShutdownReport`
+after every generated program, in both drive modes (fresh interpreter per
+seed on `drive()`; seed pairs on one interpreter under selection-scoped
+`drive_roots` with an undriven gap and a timer probe). Runs, all clean:
+
+| Seeds | Depth | Modes |
+| --- | --- | --- |
+| 0..99 (100) | 4 | both |
+| 200000..200299 (300) | 6 | both |
+| 500150..500549 (400) | 6 | both |
+| 17161000..17161199 (200) | 5 | both |
+
+One non-runtime issue surfaced while building the harness: emit mode printed
+a bare-string program in display form (unquoted), so the emitted text did not
+read back. Fixed in the fuzzer (`program->source`), not a runtime bug.

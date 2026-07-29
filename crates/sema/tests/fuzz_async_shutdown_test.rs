@@ -1,5 +1,5 @@
 //! Shutdown-leak harness over the async grammar fuzzer — phase 3 of the plan
-//! `docs/plans/2026-07-29-async-grammar-fuzzer.md`.
+//! `docs/plans/archive/2026-07-29-async-grammar-fuzzer.md`.
 //!
 //! Each test generates async programs with the fuzzer's emit mode
 //! (`SEMA_FUZZ_MODE=emit SEMA_FUZZ_ASYNC=1`; emit runs no oracle and consumes

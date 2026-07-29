@@ -131,6 +131,46 @@ per subprocess with an **external watchdog** (`-b` batch size, default 100;
 finding. The watchdog is external on purpose: an in-program `async/timeout`
 rides the same timer wheel whose wedging is one of the bug shapes under test.
 
+### Shutdown-leak harness (Rust)
+
+The runtime introspection the shutdown oracle needs (`runtime_live_task_count`,
+`runtime_resource_gate_count`, `Interpreter::shutdown` → `ShutdownReport`) is
+not a Sema builtin, so that oracle lives in a Rust integration test:
+`crates/sema/tests/fuzz_async_shutdown_test.rs` (`#[ignore]` by default — run
+it via `jake fuzz.async-shutdown`). It generates programs with emit mode (same
+seed-to-program mapping as check mode), evals each in-process, and asserts:
+
+- zero live tasks after settlement plus a bounded drain of leftover detached
+  work (a task still live after the drain is a leak, not by-design
+  persistence — generated detached children are value-neutral sleeps);
+- the resource-gate count back to its pre-eval baseline;
+- `shutdown` reports `clean` with no invariant failures.
+
+It runs each seed range twice, in two drive modes:
+
+- **Fresh interpreter per seed, default `drive()`** — the native CLI shape.
+- **Paired roots under `drive_roots`** — seed pairs (A, B) on one shared
+  interpreter, each root driven only through the selection-scoped
+  `drive_roots`, natively reproducing the wasm driving shape and the v1.31.1
+  orphaned-pending-stage recipe: A's leftover detached state stays parked
+  across a deliberate undriven wall-clock gap, then B is submitted with an
+  `async/sleep` appended as its final form (a timer probe). A timer wheel
+  wedged by A's leftovers hangs B, and the harness's per-root deadline turns
+  the hang into a failure naming both seeds.
+
+The harness reads `SEMA_FUZZ_SEED`/`SEMA_FUZZ_COUNT`/`SEMA_FUZZ_DEPTH` from
+the environment (defaults 0/100/4); every failure message carries the seed,
+the generated program, and the emit repro line.
+
+### Nightly CI
+
+`.github/workflows/nightly.yml` (`grammar-fuzz` job) runs the deterministic
+20000-seed sync sweep, a 5000-seed async batch at depth 5 and another at
+depth 6 (both with the watchdog and all oracles), and the shutdown harness at
+500 seeds. The seed base rotates with the workflow run id and is printed by
+every step and echoed into the job summary with the per-batch twin-oracle
+stat lines, so a red night reproduces from the logged base.
+
 ## Running
 
 ```bash
@@ -139,6 +179,7 @@ jake fuzz.grammar seed=123 n=20000 depth=5
 jake fuzz.grammar-emit n=10                 # print sample generated programs
 jake fuzz.async n=5000                      # async mode (watchdog, exit 3 on hang)
 jake fuzz.async-emit n=10                   # print sample async programs
+jake fuzz.async-shutdown n=500 depth=5      # Rust shutdown-leak harness
 
 # jake exposes n/depth/seed; verbose, emit-to-file, and the watchdog knobs are
 # driver-only (no rebuild):
@@ -210,11 +251,12 @@ The generator is small and self-contained. To add a production:
 
 ## Known limitations / deliberate exclusions
 
-- **String escaping.** The current printer renders strings without escaping `"`
-  and `\`, so generated strings draw from a safe alphabet (`*str-alpha*`). This is
-  a real, separate printer gap; including those characters would mask structural
-  findings. Re-enable them once the printer escapes — that itself becomes a
-  round-trip test.
+- **String alphabet.** Generated strings draw from `*str-alpha*`, which
+  includes `"`, `\`, newline, and tab (the printer escapes them inside
+  containers, and that round-trips) but not the full character space. One
+  printer asymmetry remains: `str` renders a *top-level* string in display
+  form (unquoted), so emit mode renders bare-string programs with
+  `(format "~s" f)` to keep the output readable (`program->source`).
 - **No reference interpreter.** The value oracle compares the VM against
   *incremental* evaluation using the same primitives, so on its own it targets the
   compiler/optimizer/VM rather than the primitives themselves (it self-masks bugs
