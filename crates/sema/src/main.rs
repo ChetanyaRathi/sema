@@ -3180,10 +3180,17 @@ fn write_executable_platform(
                 .build_and_sign(&mut out)?;
         }
         cross_compile::BinaryFormat::Pe => {
-            // libsui writes the payload + multi-resolution icon; a second editpe pass
-            // (same crate libsui uses internally) adds the VERSIONINFO resource that
-            // Explorer's Details tab reads. Both are branding — the payload embed
-            // above them is what makes the binary work.
+            // Ordering invariant: the LAST writer must be one that serializes
+            // the resource directory SORTED (named-before-ID, ascending) —
+            // the PE spec requirement behind FindResource's binary search.
+            // libsui's own writer emits insertion order, which the Win32 API
+            // cannot see (ERROR_RESOURCE_TYPE_NOT_FOUND) even though linear
+            // parsers can — every `sema build` exe booted as the bare REPL on
+            // Windows (docs/bugs/2026-07-29-windows-product-bugs.md bug 1).
+            // So: libsui embeds the payload + icon first, and the editpe
+            // (>=0.2, sorting) version-info pass runs last, re-serializing
+            // the whole tree — payload, icons, and VERSIONINFO all survive
+            // and are API-visible.
             let mut branded = Vec::with_capacity(runtime.len() + archive_bytes.len());
             libsui::PortableExecutable::from(&runtime)?
                 .write_resource("semaexec", archive_bytes.to_vec())?
@@ -3606,7 +3613,11 @@ fn run_fmt(
     // literal path prefix (file or directory). Paths are matched relative to
     // the working directory, `./`-stripped.
     let is_ignored = |path: &str| -> bool {
-        let normalized = path.strip_prefix("./").unwrap_or(path);
+        // Walked paths carry the host separator (`\` on Windows) while ignore
+        // entries are written with `/`; compare in `/` form or literal-prefix
+        // entries never match there (globs matched either way).
+        let unified = path.replace('\\', "/");
+        let normalized = unified.strip_prefix("./").unwrap_or(&unified);
         ignore.iter().any(|pat| {
             if pat.contains('*') || pat.contains('?') || pat.contains('[') {
                 glob::Pattern::new(pat)
@@ -4467,7 +4478,12 @@ mod tests {
     #[test]
     fn build_output_default_name_adds_exe_for_windows_targets() {
         let src = std::path::Path::new("examples/game-of-life.sema");
-        assert_eq!(default_output_name(src, None), "game-of-life");
+        // No --target builds for the host, so the default name carries the
+        // HOST's exe suffix (".exe" on a Windows host, "" elsewhere).
+        assert_eq!(
+            default_output_name(src, None),
+            format!("game-of-life{}", std::env::consts::EXE_SUFFIX)
+        );
         assert_eq!(
             default_output_name(src, Some("windows")),
             "game-of-life.exe"
@@ -4485,7 +4501,10 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let src = std::path::Path::new("hello.sema");
         let out = resolve_output_path(Some(dir.to_str().unwrap()), src, None);
-        assert_eq!(out, dir.join("hello"));
+        assert_eq!(
+            out,
+            dir.join(format!("hello{}", std::env::consts::EXE_SUFFIX))
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -4493,7 +4512,10 @@ mod tests {
     fn build_output_trailing_slash_means_directory_even_if_missing() {
         let src = std::path::Path::new("hello.sema");
         let out = resolve_output_path(Some("no/such/dir/"), src, None);
-        assert_eq!(out, std::path::Path::new("no/such/dir/hello"));
+        assert_eq!(
+            out,
+            std::path::PathBuf::from(format!("no/such/dir/hello{}", std::env::consts::EXE_SUFFIX))
+        );
     }
 
     #[test]

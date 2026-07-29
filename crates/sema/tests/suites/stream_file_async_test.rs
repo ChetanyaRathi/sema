@@ -39,6 +39,14 @@
 use sema_core::{NativeFn, NodePtr, Value};
 use sema_eval::Interpreter;
 
+/// A path as a string safe to embed in Sema source: forward slashes, because
+/// backslashes in a Windows path read as string escapes inside a Sema string
+/// literal (`\Users` starts a `\U` unicode escape), and every platform
+/// accepts `/` separators.
+fn sema_path(p: &std::path::Path) -> String {
+    p.to_string_lossy().replace('\\', "/")
+}
+
 /// A unique temp file path for one test, removed on drop (also on panic).
 struct TempFile(std::path::PathBuf);
 
@@ -57,7 +65,7 @@ impl TempFile {
         f
     }
     fn path(&self) -> String {
-        self.0.to_string_lossy().to_string()
+        sema_path(&self.0)
     }
 }
 
@@ -323,7 +331,7 @@ fn stream_file_async_write_flush_close_matches_sync() {
                  (stream/write-string s "world")
                  (stream/flush s)
                  (stream/close s))"#,
-            path = sync_path.display()
+            path = sema_path(&sync_path)
         ))
         .expect("sync write chain");
     interp
@@ -334,7 +342,7 @@ fn stream_file_async_write_flush_close_matches_sync() {
                    (stream/write-string s "world")
                    (stream/flush s)
                    (stream/close s)))))"#,
-            path = async_path.display()
+            path = sema_path(&async_path)
         ))
         .expect("async write chain");
 
@@ -408,7 +416,7 @@ fn stream_file_async_copy_bytebuffer_to_file_matches_sync() {
                    (let ((n (stream/copy src dst)))
                      (stream/close dst)
                      n)))))"#,
-            path = dst_path.display()
+            path = sema_path(&dst_path)
         ))
         .expect("async copy buffer->file");
     assert_eq!(result, Value::int(11));
@@ -662,7 +670,7 @@ fn stream_file_async_copy_file_to_file_fails_fast_with_chunk_guidance() {
                   (with-stream (d (stream/open-output "{dst}"))
                     (stream/copy s d 1024)))"#,
             src = src.path(),
-            dst = dst_path.display()
+            dst = sema_path(&dst_path)
         ))
         .expect_err("runtime file->file copy must fail instead of blocking the VM thread");
     let message = error.to_string();

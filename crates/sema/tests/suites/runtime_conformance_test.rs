@@ -12,9 +12,17 @@
 //! `new_multi_thread(`, …) so a `use tokio::runtime::Builder;` import doesn't
 //! evade the scan. Test code is exempt: `crates/*/tests/**` isn't scanned, and
 //! in-file `#[cfg(test)]` fixtures are carried as counted allowlist entries.
+//!
+//! The tests that drive `scripts/check-unified-runtime-*.sh` are `#[cfg(unix)]`:
+//! they exec the bash scripts directly, which relies on shebang handling the
+//! Windows loader doesn't have (`CreateProcess` on a shell script fails with
+//! ERROR_BAD_EXE_FORMAT, os error 193), and the scripts assume a POSIX
+//! toolchain. The property they enforce is source-tree conformance —
+//! platform-independent and fully covered by the Linux CI gate.
 
 use std::fs;
 use std::path::{Path, PathBuf};
+#[cfg(unix)]
 use std::process::Command;
 
 /// Forbidden tokens (post comment-stripping). Path-free so imports can't evade.
@@ -215,6 +223,8 @@ fn no_adhoc_tokio_runtimes_outside_allowlist() {
 /// the legacy `async_signal.rs` seams are DELETED, so their identifiers must have
 /// ZERO hits in shipped, comment-stripped code. `--check` fails on any
 /// reintroduction outside the script's exact-file allowlist (currently empty).
+// Script-driven (see module docs for the unix gate).
+#[cfg(unix)]
 #[test]
 fn unified_runtime_purged_legacy_symbols_absent() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
@@ -268,6 +278,8 @@ fn signal_callbacks_use_interpreter_owned_structural_dispatch() {
     }
 }
 
+// Script-driven (see module docs for the unix gate).
+#[cfg(unix)]
 #[test]
 fn unified_runtime_scanner_detects_raw_blocking_recv_fixture() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
@@ -296,6 +308,8 @@ fn unified_runtime_scanner_detects_raw_blocking_recv_fixture() {
     );
 }
 
+// Script-driven (see module docs for the unix gate).
+#[cfg(unix)]
 #[test]
 fn unified_runtime_inventory_mapping_covers_exact_current_matches() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
@@ -314,6 +328,8 @@ fn unified_runtime_inventory_mapping_covers_exact_current_matches() {
     );
 }
 
+// Script-driven (see module docs for the unix gate).
+#[cfg(unix)]
 #[test]
 fn unified_runtime_inventory_checker_rejects_invalid_fixture_states() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
@@ -452,6 +468,8 @@ fn unified_runtime_inventory_checker_rejects_invalid_fixture_states() {
     fs::remove_dir_all(&fixture_dir).expect("remove inventory checker fixture directory");
 }
 
+// Script-driven (see module docs for the unix gate).
+#[cfg(unix)]
 #[test]
 fn unified_runtime_inventory_writer_preserves_reviews_and_marks_only_new_matches() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
@@ -519,6 +537,8 @@ fn unified_runtime_inventory_writer_preserves_reviews_and_marks_only_new_matches
     fs::remove_dir_all(&fixture_dir).expect("remove inventory writer fixture directory");
 }
 
+// Script-driven (see module docs for the unix gate).
+#[cfg(unix)]
 #[test]
 fn unified_runtime_inventory_checker_rejects_discovery_scan_failure() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");

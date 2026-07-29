@@ -39,8 +39,12 @@ impl TempDir {
         std::fs::create_dir_all(&dir).unwrap();
         TempDir(dir)
     }
+    /// The joined path as a string safe to embed in Sema source: forward
+    /// slashes, because backslashes in a Windows path read as string escapes
+    /// inside a Sema string literal (`\Users` starts a `\U` unicode escape),
+    /// and every platform accepts `/` separators.
     fn path(&self, name: &str) -> String {
-        self.0.join(name).to_string_lossy().to_string()
+        self.0.join(name).to_string_lossy().replace('\\', "/")
     }
 }
 
@@ -50,11 +54,23 @@ impl Drop for TempDir {
     }
 }
 
-fn pdf_fixture() -> String {
-    format!(
-        "{}/tests/fixtures/sample-invoice.pdf",
-        env!("CARGO_MANIFEST_DIR")
-    )
+/// The PDF fixture, materialized under `dir` in its canonical LF-only form.
+/// The checked-in file is all-ASCII with no NUL bytes, so git's text
+/// heuristic CRLF-converts it on an autocrlf checkout (Windows CI) — which
+/// shifts every xref byte offset and invalidates the trailer. The canonical
+/// bytes contain no CR at all, so stripping CR restores them exactly and is
+/// the identity on a clean checkout.
+fn pdf_fixture(dir: &TempDir) -> String {
+    let checkout =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/sample-invoice.pdf");
+    let bytes: Vec<u8> = std::fs::read(checkout)
+        .expect("read sample-invoice.pdf fixture")
+        .into_iter()
+        .filter(|&b| b != b'\r')
+        .collect();
+    let path = dir.path("sample-invoice.pdf");
+    std::fs::write(&path, bytes).expect("materialize LF-only pdf fixture");
+    path
 }
 
 const QUARANTINE_INPUT_LIMIT_ONE_OVER: u64 = 256 * 1024 * 1024 + 1;
@@ -240,7 +256,8 @@ fn archive_async_rejects_oversized_source_before_creating_output() {
 
 #[test]
 fn pdf_async_lets_sibling_run_first() {
-    let path = pdf_fixture();
+    let dir = TempDir::new("pdf-sib-order");
+    let path = pdf_fixture(&dir);
     let program = format!(
         r#"
         (let ((out (channel/new 8)))
@@ -260,7 +277,8 @@ fn pdf_async_lets_sibling_run_first() {
 #[test]
 fn pdf_async_matches_sync() {
     let interp = Interpreter::new();
-    let path = pdf_fixture();
+    let dir = TempDir::new("pdf-parity");
+    let path = pdf_fixture(&dir);
 
     let sync_v = interp
         .eval_str_compiled(&format!(

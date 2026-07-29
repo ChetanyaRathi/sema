@@ -1,0 +1,5 @@
+# The PDF fixtures contain no NUL bytes, so git's text heuristic would treat
+# them as text and a CRLF-converting checkout (Windows CI) would rewrite their
+# line endings, breaking the byte offsets in the xref table ("invalid file
+# trailer" from the parser). Byte-exact checkout is required.
+*.pdf binary

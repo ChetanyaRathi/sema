@@ -424,9 +424,15 @@ fn write_lines(path: &PathBuf, lines: &[String], fail_after: Option<usize>) -> R
         None => file.write_all(buf.as_bytes()).map_err(io_err),
     };
     if let Err(e) = write_result {
-        // Roll the partial append back; if even the truncate fails the disk is
-        // gone anyway and the retry-duplication hazard is moot.
-        let _ = file.set_len(pre_len);
+        // Roll the partial append back via a fresh write-mode handle: the
+        // append-mode handle lacks FILE_WRITE_DATA on Windows, so set_len on
+        // it fails silently and the torn line would survive. If even this
+        // fails the disk is gone anyway and the retry-duplication hazard is
+        // moot.
+        drop(file);
+        if let Ok(f) = std::fs::OpenOptions::new().write(true).open(path) {
+            let _ = f.set_len(pre_len);
+        }
         return Err(e);
     }
     Ok(())

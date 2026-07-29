@@ -5,7 +5,8 @@ use sema_core::Value;
 // ============================================================
 
 eval_tests! {
-    path_join: r#"(path/join "usr" "local" "bin")"# => Value::string("usr/local/bin"),
+    // path/join joins with the host separator (`\` on Windows).
+    path_join: r#"(path/join "usr" "local" "bin")"# => Value::string_owned(["usr", "local", "bin"].join(std::path::MAIN_SEPARATOR_STR)),
     path_dirname: r#"(path/dirname "/a/b/c")"# => Value::string("/a/b"),
     path_basename: r#"(path/basename "/a/b/c.txt")"# => Value::string("c.txt"),
     path_extension: r#"(path/extension "foo.txt")"# => Value::string("txt"),
@@ -21,9 +22,19 @@ eval_tests! {
     path_dirname_alias_no_parent: r#"(path/dirname "x")"# => Value::string(""),
     path_dirname_alias: r#"(path/dirname "/a/b/c.txt")"# => Value::string("/a/b"),
     path_absolute_is_string: r#"(string? (path/absolute "."))"# => Value::bool(true),
-    path_is_absolute: r#"(path/absolute? "/usr/bin")"# => Value::bool(true),
     path_not_absolute: r#"(path/absolute? "relative/path")"# => Value::bool(false),
-    path_join_multi: r#"(path/join "a" "b" "c" "d")"# => Value::string("a/b/c/d"),
+    path_join_multi: r#"(path/join "a" "b" "c" "d")"# => Value::string_owned(["a", "b", "c", "d"].join(std::path::MAIN_SEPARATOR_STR)),
+}
+
+// Absolute-path spelling is per-platform: Windows has no drive-less absolute
+// paths ("/usr/bin" is drive-relative there), unix has no drive prefixes.
+#[cfg(unix)]
+eval_tests! {
+    path_is_absolute: r#"(path/absolute? "/usr/bin")"# => Value::bool(true),
+}
+#[cfg(windows)]
+eval_tests! {
+    path_is_absolute: r#"(path/absolute? "C:/usr/bin")"# => Value::bool(true),
 }
 
 // ============================================================
@@ -174,6 +185,12 @@ eval_tests! {
     io_flush_returns_nil: "(nil? (io/flush))" => Value::bool(true),
     // io/eof? starts false in a normal eval context
     io_eof_initially_false: "(io/eof?)" => Value::bool(false),
+}
+
+// The termios raw-mode/keystroke builtins are registered under #[cfg(unix)]
+// in sema-stdlib (no Windows implementation), so they are unbound elsewhere.
+#[cfg(unix)]
+eval_tests! {
     // io/tty-raw! returns nil (not a TTY) or an integer token (is a TTY); if a token is returned,
     // restore it so we don't leave the terminal in raw mode.
     io_tty_raw_returns_nil_or_int: "(let ((tok (io/tty-raw!))) (if (nil? tok) #t (begin (io/tty-restore! tok) #t)))" => Value::bool(true),

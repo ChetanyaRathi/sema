@@ -22,6 +22,14 @@ use serial_test::serial;
 use std::path::PathBuf;
 use std::time::Duration;
 
+/// A path as a string safe to embed in Sema source: forward slashes, because
+/// backslashes in a Windows path read as string escapes inside a Sema string
+/// literal (`\Users` starts a `\U` unicode escape), and every platform —
+/// including the `sh` the markers are touched through — accepts `/`.
+fn sema_path(p: &std::path::Path) -> String {
+    p.to_string_lossy().replace('\\', "/")
+}
+
 /// A unique marker path under the system temp dir for one test (removed up front).
 fn marker(name: &str) -> PathBuf {
     let mut p = std::env::temp_dir();
@@ -40,6 +48,11 @@ fn marker(name: &str) -> PathBuf {
 /// the marker never appears. This specifically distinguishes a group kill from a
 /// kill of only the direct `sh` pid (which would orphan the grandchild, leaving it
 /// to `touch` the marker after its sleep).
+// Unix-only: this proves the process-GROUP kill (`process_group(0)` +
+// `killpg` in the shell cancel hook), which has no Windows counterpart —
+// there, cancel `kill_on_drop`s only the direct child, so the backgrounded
+// grandchild survives and the marker appears.
+#[cfg(unix)]
 #[test]
 #[serial]
 fn subprocess_group_is_killed_after_explicit_cancel() {
@@ -50,7 +63,7 @@ fn subprocess_group_is_killed_after_explicit_cancel() {
              (async/spawn (fn () (shell "sh" "-c" "(sleep 3; touch {}) & wait"))))
            (async/spawn (fn () (async/sleep 200) (async/cancel p)))
            (try (async/await p) (catch e :caught))"#,
-        m.display()
+        sema_path(&m)
     );
     let result = interp
         .eval_str_compiled(&program)
@@ -76,6 +89,9 @@ fn subprocess_group_is_killed_after_explicit_cancel() {
 /// inner task must not survive as an un-reaped orphan. Before transitive cancel, the
 /// outer-task cancellation did not reach the inner `Blocked(AwaitIo)` shell task, which
 /// ran to completion (marker appeared) AND lingered in the scheduler.
+// Unix-only: the no-marker proof relies on the process-GROUP kill reaping the
+// backgrounded grandchild — on Windows only the direct child is killed.
+#[cfg(unix)]
 #[test]
 #[serial]
 fn indirectly_awaited_subprocess_is_killed_after_explicit_cancel() {
@@ -88,7 +104,7 @@ fn indirectly_awaited_subprocess_is_killed_after_explicit_cancel() {
                  (async/spawn (fn () (shell "sh" "-c" "(sleep 3; touch {}) & wait")))))))
            (async/spawn (fn () (async/sleep 200) (async/cancel p)))
            (try (async/await p) (catch e :caught))"#,
-        m.display()
+        sema_path(&m)
     );
     let result = interp
         .eval_str_compiled(&program)
@@ -123,6 +139,9 @@ fn indirectly_awaited_subprocess_is_killed_after_explicit_cancel() {
 /// is still alive after `eval` yet holds ZERO live tasks (the child was cancelled,
 /// aborted, settled, and reaped during the post-settle drain), and the subprocess
 /// group is dead (its survival marker never appears).
+// Unix-only: the no-marker proof relies on the process-GROUP kill reaping the
+// backgrounded grandchild — on Windows only the direct child is killed.
+#[cfg(unix)]
 #[test]
 #[serial]
 fn one_shot_cancel_flushes_subprocess_abort_before_returning() {
@@ -133,7 +152,7 @@ fn one_shot_cancel_flushes_subprocess_abort_before_returning() {
              (async/spawn (fn () (shell "sh" "-c" "(sleep 3; touch {}) & wait"))))
            (async/spawn (fn () (async/cancel p)))
            :done"#,
-        m.display()
+        sema_path(&m)
     );
     let result = interp
         .eval_str_compiled(&program)
@@ -172,7 +191,7 @@ fn subprocess_completes_without_cancel() {
     let program = format!(
         r#"(async/await
              (async/spawn (fn () (shell "sh" "-c" "sleep 1; touch {}"))))"#,
-        m.display()
+        sema_path(&m)
     );
     interp
         .eval_str_compiled(&program)

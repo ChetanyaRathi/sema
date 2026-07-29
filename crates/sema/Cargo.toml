@@ -54,7 +54,11 @@ serde_json.workspace = true
 libsui = "0.16"
 # Same PE resource editor libsui uses internally (zero extra compile cost): adds
 # the VERSIONINFO resource to `sema build` Windows executables.
-editpe = "0.1"
+# 0.2+ is load-bearing: it re-serializes the resource directory SORTED
+# (named-before-ID, ascending), which the Win32 FindResource binary search
+# requires. 0.1 emitted IndexMap insertion order and every resource in the
+# final image became invisible to the API (ERROR_RESOURCE_TYPE_NOT_FOUND).
+editpe = "0.2"
 toml.workspace = true
 toml_edit.workspace = true
 serde.workspace = true

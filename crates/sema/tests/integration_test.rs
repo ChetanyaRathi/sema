@@ -3324,7 +3324,9 @@ fn test_file_write_lines() {
 #[test]
 fn test_file_for_each_line() {
     let dir = unique_temp_dir("foreach-line");
-    let dir = dir.display().to_string();
+    // Forward-slash form: the path is embedded in Sema string literals below,
+    // where Windows backslashes would be read as string escapes.
+    let dir = dir.to_string_lossy().replace('\\', "/");
     let dir = dir.as_str();
     eval(&format!(
         r#"(file/write "{dir}/data.txt" "alpha\nbeta\ngamma")"#
@@ -3405,7 +3407,9 @@ fn test_file_for_each_line() {
 #[test]
 fn test_file_fold_lines() {
     let dir = unique_temp_dir("fold-lines");
-    let dir = dir.display().to_string();
+    // Forward-slash form: the path is embedded in Sema string literals below,
+    // where Windows backslashes would be read as string escapes.
+    let dir = dir.to_string_lossy().replace('\\', "/");
     let dir = dir.as_str();
     eval(&format!(r#"(file/write "{dir}/nums.txt" "10\n20\n30")"#));
 
@@ -3488,7 +3492,9 @@ fn test_file_fold_lines() {
 #[test]
 fn test_file_fold_lines_bytes() {
     let dir = unique_temp_dir("fold-lines-bytes");
-    let dir = dir.display().to_string();
+    // Forward-slash form: the path is embedded in Sema string literals below,
+    // where Windows backslashes would be read as string escapes.
+    let dir = dir.to_string_lossy().replace('\\', "/");
     let dir = dir.as_str();
     // Mixed \n / \r\n endings and one-decimal / no-decimal temperatures —
     // the exact shape of a 1BRC measurements file.
@@ -6580,7 +6586,7 @@ fn interpreter_drop_closes_kv_serial_sqlite_slots_and_gates() {
                  (db/open-memory "c6db")
                  (db/exec-batch "c6db" "CREATE TABLE t (v INTEGER)")
                  (list (kv/get "c6store" "k") (db/tables "c6db")))"#,
-            kv = kv_path.display()
+            kv = lisp_path(&kv_path)
         );
         let opened = interp
             .eval_str_compiled(&program)
@@ -6644,7 +6650,7 @@ fn interpreter_drop_does_not_disturb_another_thread_registry() {
         let interp = Interpreter::new();
         let program = format!(
             r#"(begin (kv/open "shared" "{p}") (kv/set "shared" "k" 42) :ok)"#,
-            p = path_b_thread.display()
+            p = lisp_path(&path_b_thread)
         );
         interp
             .eval_str_compiled(&program)
@@ -6672,7 +6678,7 @@ fn interpreter_drop_does_not_disturb_another_thread_registry() {
         let interp = Interpreter::new();
         let program = format!(
             r#"(begin (kv/open "shared" "{p}") (kv/set "shared" "k" 7) :ok)"#,
-            p = path_a.display()
+            p = lisp_path(&path_a)
         );
         interp
             .eval_str_compiled(&program)
@@ -8013,8 +8019,12 @@ fn test_message_with_image_role() {
 #[test]
 fn test_file_glob() {
     let interp = Interpreter::new();
-    // Use absolute path to workspace root for reliable globbing
-    let workspace = env!("CARGO_MANIFEST_DIR").replace("/crates/sema", "");
+    // Use absolute path to workspace root for reliable globbing. Normalize to
+    // forward slashes first so the `/crates/sema` suffix strips on Windows too
+    // and the result embeds cleanly in a Sema string literal.
+    let workspace = env!("CARGO_MANIFEST_DIR")
+        .replace('\\', "/")
+        .replace("/crates/sema", "");
     let expr = format!(r#"(length (file/glob "{workspace}/crates/*/Cargo.toml"))"#);
     let result = interp.eval_str(&expr).unwrap();
     let count = result.as_int().unwrap();
@@ -8104,8 +8114,12 @@ fn test_path_join_multi() {
 #[test]
 fn test_path_absolute_predicate() {
     let interp = Interpreter::new();
+    // A path that is absolute on the host platform: a bare "/tmp/..." has no
+    // drive prefix, so Path::is_absolute (backing path/absolute?) rejects it
+    // on Windows.
+    let abs = env!("CARGO_MANIFEST_DIR").replace('\\', "/");
     let result = interp
-        .eval_str(r#"(path/absolute? "/tmp/data.csv")"#)
+        .eval_str(&format!(r#"(path/absolute? "{abs}")"#))
         .unwrap();
     assert_eq!(result, Value::bool(true));
     let result = interp.eval_str(r#"(path/absolute? "data.csv")"#).unwrap();
@@ -8756,9 +8770,8 @@ fn test_vector_store_not_found() {
 
 #[test]
 fn test_vector_store_save_and_open() {
-    let tmp = std::env::temp_dir().join("sema-vs-test-save.json");
-    let path = tmp.to_str().unwrap();
-    let _ = std::fs::remove_file(&tmp);
+    let path = temp_path("sema-vs-test-save.json");
+    let _ = std::fs::remove_file(&path);
 
     // Create, add docs, save
     {
@@ -8806,14 +8819,13 @@ fn test_vector_store_save_and_open() {
             "d1"
         );
     }
-    let _ = std::fs::remove_file(&tmp);
+    let _ = std::fs::remove_file(&path);
 }
 
 #[test]
 fn test_vector_store_open_nonexistent_creates_empty() {
-    let tmp = std::env::temp_dir().join("sema-vs-test-open-new.json");
-    let path = tmp.to_str().unwrap();
-    let _ = std::fs::remove_file(&tmp);
+    let path = temp_path("sema-vs-test-open-new.json");
+    let _ = std::fs::remove_file(&path);
 
     let interp = Interpreter::new();
     interp
@@ -8825,15 +8837,14 @@ fn test_vector_store_open_nonexistent_creates_empty() {
     );
     // Save should work (path is associated)
     interp.eval_str(r#"(vector-store/save "empty")"#).unwrap();
-    assert!(std::path::Path::new(path).exists());
-    let _ = std::fs::remove_file(&tmp);
+    assert!(std::path::Path::new(&path).exists());
+    let _ = std::fs::remove_file(&path);
 }
 
 #[test]
 fn test_vector_store_open_then_save_implicit_path() {
-    let tmp = std::env::temp_dir().join("sema-vs-test-implicit.json");
-    let path = tmp.to_str().unwrap();
-    let _ = std::fs::remove_file(&tmp);
+    let path = temp_path("sema-vs-test-implicit.json");
+    let _ = std::fs::remove_file(&path);
 
     let interp = Interpreter::new();
     interp
@@ -8844,8 +8855,8 @@ fn test_vector_store_open_then_save_implicit_path() {
         .unwrap();
     // Save without explicit path — should use the path from open
     interp.eval_str(r#"(vector-store/save "imp")"#).unwrap();
-    assert!(std::path::Path::new(path).exists());
-    let _ = std::fs::remove_file(&tmp);
+    assert!(std::path::Path::new(&path).exists());
+    let _ = std::fs::remove_file(&path);
 }
 
 #[test]
@@ -9291,22 +9302,20 @@ fn test_llm_compare_arity() {
 #[test]
 fn test_kv_open_and_close() {
     let interp = Interpreter::new();
-    let tmp = std::env::temp_dir().join("sema-kv-test-oc.json");
-    let path = tmp.to_str().unwrap();
-    let _ = std::fs::remove_file(&tmp);
+    let path = temp_path("sema-kv-test-oc.json");
+    let _ = std::fs::remove_file(&path);
     interp
         .eval_str(&format!(r#"(kv/open "test" "{path}")"#))
         .unwrap();
     interp.eval_str(r#"(kv/close "test")"#).unwrap();
-    let _ = std::fs::remove_file(&tmp);
+    let _ = std::fs::remove_file(&path);
 }
 
 #[test]
 fn test_kv_set_and_get() {
     let interp = Interpreter::new();
-    let tmp = std::env::temp_dir().join("sema-kv-test-sg.json");
-    let path = tmp.to_str().unwrap();
-    let _ = std::fs::remove_file(&tmp);
+    let path = temp_path("sema-kv-test-sg.json");
+    let _ = std::fs::remove_file(&path);
     interp
         .eval_str(&format!(r#"(kv/open "sg" "{path}")"#))
         .unwrap();
@@ -9314,30 +9323,28 @@ fn test_kv_set_and_get() {
     let result = interp.eval_str(r#"(kv/get "sg" "name")"#).unwrap();
     assert_eq!(result, Value::string("Alice"));
     interp.eval_str(r#"(kv/close "sg")"#).unwrap();
-    let _ = std::fs::remove_file(&tmp);
+    let _ = std::fs::remove_file(&path);
 }
 
 #[test]
 fn test_kv_get_missing() {
     let interp = Interpreter::new();
-    let tmp = std::env::temp_dir().join("sema-kv-test-gm.json");
-    let path = tmp.to_str().unwrap();
-    let _ = std::fs::remove_file(&tmp);
+    let path = temp_path("sema-kv-test-gm.json");
+    let _ = std::fs::remove_file(&path);
     interp
         .eval_str(&format!(r#"(kv/open "gm" "{path}")"#))
         .unwrap();
     let result = interp.eval_str(r#"(kv/get "gm" "missing")"#).unwrap();
     assert!(result.is_nil());
     interp.eval_str(r#"(kv/close "gm")"#).unwrap();
-    let _ = std::fs::remove_file(&tmp);
+    let _ = std::fs::remove_file(&path);
 }
 
 #[test]
 fn test_kv_delete() {
     let interp = Interpreter::new();
-    let tmp = std::env::temp_dir().join("sema-kv-test-del.json");
-    let path = tmp.to_str().unwrap();
-    let _ = std::fs::remove_file(&tmp);
+    let path = temp_path("sema-kv-test-del.json");
+    let _ = std::fs::remove_file(&path);
     interp
         .eval_str(&format!(r#"(kv/open "del" "{path}")"#))
         .unwrap();
@@ -9346,15 +9353,14 @@ fn test_kv_delete() {
     let result = interp.eval_str(r#"(kv/get "del" "k")"#).unwrap();
     assert!(result.is_nil());
     interp.eval_str(r#"(kv/close "del")"#).unwrap();
-    let _ = std::fs::remove_file(&tmp);
+    let _ = std::fs::remove_file(&path);
 }
 
 #[test]
 fn test_kv_keys() {
     let interp = Interpreter::new();
-    let tmp = std::env::temp_dir().join("sema-kv-test-keys.json");
-    let path = tmp.to_str().unwrap();
-    let _ = std::fs::remove_file(&tmp);
+    let path = temp_path("sema-kv-test-keys.json");
+    let _ = std::fs::remove_file(&path);
     interp
         .eval_str(&format!(r#"(kv/open "keys" "{path}")"#))
         .unwrap();
@@ -9364,14 +9370,13 @@ fn test_kv_keys() {
     let keys = result.as_list().unwrap();
     assert_eq!(keys.len(), 2);
     interp.eval_str(r#"(kv/close "keys")"#).unwrap();
-    let _ = std::fs::remove_file(&tmp);
+    let _ = std::fs::remove_file(&path);
 }
 
 #[test]
 fn test_kv_persistence() {
-    let tmp = std::env::temp_dir().join("sema-kv-test-persist.json");
-    let path = tmp.to_str().unwrap();
-    let _ = std::fs::remove_file(&tmp);
+    let path = temp_path("sema-kv-test-persist.json");
+    let _ = std::fs::remove_file(&path);
     {
         let interp = Interpreter::new();
         interp
@@ -9389,15 +9394,14 @@ fn test_kv_persistence() {
         assert_eq!(result, Value::string("value"));
         interp.eval_str(r#"(kv/close "p")"#).unwrap();
     }
-    let _ = std::fs::remove_file(&tmp);
+    let _ = std::fs::remove_file(&path);
 }
 
 #[test]
 fn test_kv_set_and_get_map() {
     let interp = Interpreter::new();
-    let tmp = std::env::temp_dir().join("sema-kv-test-map.json");
-    let path = tmp.to_str().unwrap();
-    let _ = std::fs::remove_file(&tmp);
+    let path = temp_path("sema-kv-test-map.json");
+    let _ = std::fs::remove_file(&path);
     interp
         .eval_str(&format!(r#"(kv/open "m" "{path}")"#))
         .unwrap();
@@ -9415,15 +9419,14 @@ fn test_kv_set_and_get_map() {
         30
     );
     interp.eval_str(r#"(kv/close "m")"#).unwrap();
-    let _ = std::fs::remove_file(&tmp);
+    let _ = std::fs::remove_file(&path);
 }
 
 #[test]
 fn test_kv_set_and_get_list() {
     let interp = Interpreter::new();
-    let tmp = std::env::temp_dir().join("sema-kv-test-list.json");
-    let path = tmp.to_str().unwrap();
-    let _ = std::fs::remove_file(&tmp);
+    let path = temp_path("sema-kv-test-list.json");
+    let _ = std::fs::remove_file(&path);
     interp
         .eval_str(&format!(r#"(kv/open "l" "{path}")"#))
         .unwrap();
@@ -9435,15 +9438,14 @@ fn test_kv_set_and_get_list() {
     assert_eq!(items.len(), 3);
     assert_eq!(items[0].as_int().unwrap(), 1);
     interp.eval_str(r#"(kv/close "l")"#).unwrap();
-    let _ = std::fs::remove_file(&tmp);
+    let _ = std::fs::remove_file(&path);
 }
 
 #[test]
 fn test_kv_set_nested_map_with_nan() {
     let interp = Interpreter::new();
-    let tmp = std::env::temp_dir().join("sema-kv-test-nan.json");
-    let path = tmp.to_str().unwrap();
-    let _ = std::fs::remove_file(&tmp);
+    let path = temp_path("sema-kv-test-nan.json");
+    let _ = std::fs::remove_file(&path);
     interp
         .eval_str(&format!(r#"(kv/open "n" "{path}")"#))
         .unwrap();
@@ -9464,14 +9466,13 @@ fn test_kv_set_nested_map_with_nan() {
         "NaN should round-trip through KV as nil"
     );
     interp.eval_str(r#"(kv/close "n")"#).unwrap();
-    let _ = std::fs::remove_file(&tmp);
+    let _ = std::fs::remove_file(&path);
 }
 
 #[test]
 fn test_kv_persistence_with_nested_data() {
-    let tmp = std::env::temp_dir().join("sema-kv-test-nested-persist.json");
-    let path = tmp.to_str().unwrap();
-    let _ = std::fs::remove_file(&tmp);
+    let path = temp_path("sema-kv-test-nested-persist.json");
+    let _ = std::fs::remove_file(&path);
     {
         let interp = Interpreter::new();
         interp
@@ -9509,7 +9510,7 @@ fn test_kv_persistence_with_nested_data() {
         assert_eq!(tags.len(), 2);
         interp.eval_str(r#"(kv/close "np")"#).unwrap();
     }
-    let _ = std::fs::remove_file(&tmp);
+    let _ = std::fs::remove_file(&path);
 }
 
 // --- Document metadata tests ---
@@ -11145,7 +11146,12 @@ fn test_casing_roundtrip() {
 // --- PDF processing tests ---
 
 fn pdf_fixture(name: &str) -> String {
-    format!("{}/tests/fixtures/{name}", env!("CARGO_MANIFEST_DIR"))
+    // Forward-slash form: the fixture path is embedded in Sema string literals,
+    // where Windows backslashes would be read as string escapes.
+    format!(
+        "{}/tests/fixtures/{name}",
+        env!("CARGO_MANIFEST_DIR").replace('\\', "/")
+    )
 }
 
 #[test]
@@ -11659,9 +11665,8 @@ fn test_json_encode_string() {
 #[test]
 fn test_kv_delete_returns_bool() {
     let interp = Interpreter::new();
-    let tmp = std::env::temp_dir().join("sema-kv-test-delbool.json");
-    let path = tmp.to_str().unwrap();
-    let _ = std::fs::remove_file(&tmp);
+    let path = temp_path("sema-kv-test-delbool.json");
+    let _ = std::fs::remove_file(&path);
     interp
         .eval_str(&format!(r#"(kv/open "db" "{path}")"#))
         .unwrap();
@@ -11671,15 +11676,14 @@ fn test_kv_delete_returns_bool() {
     let not_existed = interp.eval_str(r#"(kv/delete "db" "k")"#).unwrap();
     assert_eq!(not_existed, Value::bool(false));
     interp.eval_str(r#"(kv/close "db")"#).unwrap();
-    let _ = std::fs::remove_file(&tmp);
+    let _ = std::fs::remove_file(&path);
 }
 
 #[test]
 fn test_kv_set_numeric_value() {
     let interp = Interpreter::new();
-    let tmp = std::env::temp_dir().join("sema-kv-test-num.json");
-    let path = tmp.to_str().unwrap();
-    let _ = std::fs::remove_file(&tmp);
+    let path = temp_path("sema-kv-test-num.json");
+    let _ = std::fs::remove_file(&path);
     interp
         .eval_str(&format!(r#"(kv/open "num" "{path}")"#))
         .unwrap();
@@ -11687,15 +11691,14 @@ fn test_kv_set_numeric_value() {
     let result = interp.eval_str(r#"(kv/get "num" "count")"#).unwrap();
     assert_eq!(result, Value::int(42));
     interp.eval_str(r#"(kv/close "num")"#).unwrap();
-    let _ = std::fs::remove_file(&tmp);
+    let _ = std::fs::remove_file(&path);
 }
 
 #[test]
 fn test_kv_set_boolean_value() {
     let interp = Interpreter::new();
-    let tmp = std::env::temp_dir().join("sema-kv-test-bool.json");
-    let path = tmp.to_str().unwrap();
-    let _ = std::fs::remove_file(&tmp);
+    let path = temp_path("sema-kv-test-bool.json");
+    let _ = std::fs::remove_file(&path);
     interp
         .eval_str(&format!(r#"(kv/open "bv" "{path}")"#))
         .unwrap();
@@ -11703,15 +11706,14 @@ fn test_kv_set_boolean_value() {
     let result = interp.eval_str(r#"(kv/get "bv" "flag")"#).unwrap();
     assert_eq!(result, Value::bool(true));
     interp.eval_str(r#"(kv/close "bv")"#).unwrap();
-    let _ = std::fs::remove_file(&tmp);
+    let _ = std::fs::remove_file(&path);
 }
 
 #[test]
 fn test_kv_set_nil_value() {
     let interp = Interpreter::new();
-    let tmp = std::env::temp_dir().join("sema-kv-test-nil.json");
-    let path = tmp.to_str().unwrap();
-    let _ = std::fs::remove_file(&tmp);
+    let path = temp_path("sema-kv-test-nil.json");
+    let _ = std::fs::remove_file(&path);
     interp
         .eval_str(&format!(r#"(kv/open "nv" "{path}")"#))
         .unwrap();
@@ -11719,15 +11721,14 @@ fn test_kv_set_nil_value() {
     let result = interp.eval_str(r#"(kv/get "nv" "empty")"#).unwrap();
     assert!(result.is_nil());
     interp.eval_str(r#"(kv/close "nv")"#).unwrap();
-    let _ = std::fs::remove_file(&tmp);
+    let _ = std::fs::remove_file(&path);
 }
 
 #[test]
 fn test_kv_keys_empty() {
     let interp = Interpreter::new();
-    let tmp = std::env::temp_dir().join("sema-kv-test-kempty.json");
-    let path = tmp.to_str().unwrap();
-    let _ = std::fs::remove_file(&tmp);
+    let path = temp_path("sema-kv-test-kempty.json");
+    let _ = std::fs::remove_file(&path);
     interp
         .eval_str(&format!(r#"(kv/open "ek" "{path}")"#))
         .unwrap();
@@ -11735,15 +11736,14 @@ fn test_kv_keys_empty() {
     let keys = result.as_list().unwrap();
     assert_eq!(keys.len(), 0);
     interp.eval_str(r#"(kv/close "ek")"#).unwrap();
-    let _ = std::fs::remove_file(&tmp);
+    let _ = std::fs::remove_file(&path);
 }
 
 #[test]
 fn test_kv_overwrite_value() {
     let interp = Interpreter::new();
-    let tmp = std::env::temp_dir().join("sema-kv-test-overwrite.json");
-    let path = tmp.to_str().unwrap();
-    let _ = std::fs::remove_file(&tmp);
+    let path = temp_path("sema-kv-test-overwrite.json");
+    let _ = std::fs::remove_file(&path);
     interp
         .eval_str(&format!(r#"(kv/open "ow" "{path}")"#))
         .unwrap();
@@ -11752,21 +11752,20 @@ fn test_kv_overwrite_value() {
     let result = interp.eval_str(r#"(kv/get "ow" "k")"#).unwrap();
     assert_eq!(result, Value::string("new"));
     interp.eval_str(r#"(kv/close "ow")"#).unwrap();
-    let _ = std::fs::remove_file(&tmp);
+    let _ = std::fs::remove_file(&path);
 }
 
 #[test]
 fn test_kv_open_returns_name() {
     let interp = Interpreter::new();
-    let tmp = std::env::temp_dir().join("sema-kv-test-ret.json");
-    let path = tmp.to_str().unwrap();
-    let _ = std::fs::remove_file(&tmp);
+    let path = temp_path("sema-kv-test-ret.json");
+    let _ = std::fs::remove_file(&path);
     let result = interp
         .eval_str(&format!(r#"(kv/open "mystore" "{path}")"#))
         .unwrap();
     assert_eq!(result, Value::string("mystore"));
     interp.eval_str(r#"(kv/close "mystore")"#).unwrap();
-    let _ = std::fs::remove_file(&tmp);
+    let _ = std::fs::remove_file(&path);
 }
 
 // --- Bytevector additional coverage ---
@@ -11916,9 +11915,8 @@ fn test_json_pretty_map() {
 #[test]
 fn test_kv_set_get_roundtrip() {
     let interp = Interpreter::new();
-    let tmp = std::env::temp_dir().join("sema-kv-test-rt.json");
-    let path = tmp.to_str().unwrap();
-    let _ = std::fs::remove_file(&tmp);
+    let path = temp_path("sema-kv-test-rt.json");
+    let _ = std::fs::remove_file(&path);
     interp
         .eval_str(&format!(r#"(kv/open "rt" "{path}")"#))
         .unwrap();
@@ -11938,7 +11936,7 @@ fn test_kv_set_get_roundtrip() {
         Value::bool(true)
     );
     interp.eval_str(r#"(kv/close "rt")"#).unwrap();
-    let _ = std::fs::remove_file(&tmp);
+    let _ = std::fs::remove_file(&path);
 }
 
 #[test]
@@ -11993,7 +11991,7 @@ fn test_allowed_paths_read_inside() {
 
     let sandbox = sema_core::Sandbox::allow_all().with_allowed_paths(vec![dir.clone()]);
     let interp = Interpreter::new_with_sandbox(&sandbox);
-    let result = interp.eval_str(&format!(r#"(file/read "{}")"#, file.display()));
+    let result = interp.eval_str(&format!(r#"(file/read "{}")"#, lisp_path(&file)));
     assert!(
         result.is_ok(),
         "should read inside allowed path: {result:?}"
@@ -12051,7 +12049,7 @@ fn test_allowed_paths_traversal_denied() {
 
     let sandbox = sema_core::Sandbox::allow_all().with_allowed_paths(vec![dir.clone()]);
     let interp = Interpreter::new_with_sandbox(&sandbox);
-    let evil = format!("{}/../../../etc/passwd", dir.display());
+    let evil = format!("{}/../../../etc/passwd", lisp_path(&dir));
     let result = interp.eval_str(&format!(r#"(file/read "{evil}")"#));
     assert!(result.is_err(), "path traversal should be denied");
 
@@ -12066,7 +12064,7 @@ fn test_allowed_paths_write_inside() {
     let sandbox = sema_core::Sandbox::allow_all().with_allowed_paths(vec![dir.clone()]);
     let interp = Interpreter::new_with_sandbox(&sandbox);
     let file = dir.join("output.txt");
-    let result = interp.eval_str(&format!(r#"(file/write "{}" "written")"#, file.display()));
+    let result = interp.eval_str(&format!(r#"(file/write "{}" "written")"#, lisp_path(&file)));
     assert!(
         result.is_ok(),
         "should write inside allowed path: {result:?}"
@@ -13676,7 +13674,9 @@ fn test_sema_build_output_into_existing_directory() {
         "sema build failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let exe = out_dir.join("hello");
+    // Directory outputs get the default filename, which carries the host exe
+    // suffix (default_output_name): ".exe" on Windows, "" elsewhere.
+    let exe = out_dir.join(format!("hello{}", std::env::consts::EXE_SUFFIX));
     assert!(exe.exists(), "expected {} to exist", exe.display());
     let run = std::process::Command::new(&exe).output().unwrap();
     assert_eq!(String::from_utf8_lossy(&run.stdout).trim(), "in dir");
@@ -13735,7 +13735,9 @@ fn test_sema_build_output_trailing_slash_creates_directory() {
         "sema build failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let exe = out_dir.join("hello");
+    // Directory outputs get the default filename, which carries the host exe
+    // suffix (default_output_name): ".exe" on Windows, "" elsewhere.
+    let exe = out_dir.join(format!("hello{}", std::env::consts::EXE_SUFFIX));
     assert!(exe.exists(), "expected {} to exist", exe.display());
 
     let _ = std::fs::remove_dir_all(&dir);
@@ -15315,7 +15317,7 @@ fn test_stream_file_roundtrip() {
     let dir = std::env::temp_dir().join("sema-stream-roundtrip");
     let _ = std::fs::create_dir_all(&dir);
     let path = dir.join("roundtrip.txt");
-    let path_str = path.display();
+    let path_str = lisp_path(&path);
 
     // Write via stream
     eval(&format!(
@@ -15344,7 +15346,7 @@ fn test_stream_file_read_line() {
     let _ = std::fs::create_dir_all(&dir);
     let path = dir.join("lines.txt");
     std::fs::write(&path, "line1\nline2\nline3\n").unwrap();
-    let path_str = path.display();
+    let path_str = lisp_path(&path);
 
     assert_eq!(
         eval(&format!(
@@ -15371,7 +15373,7 @@ fn test_stream_file_read_line_crlf() {
     let _ = std::fs::create_dir_all(&dir);
     let path = dir.join("crlf.txt");
     std::fs::write(&path, "a\r\nb\r\n").unwrap();
-    let path_str = path.display();
+    let path_str = lisp_path(&path);
 
     assert_eq!(
         eval(&format!(
@@ -15393,8 +15395,8 @@ fn test_stream_copy() {
     let src = dir.join("copy-src.txt");
     let dst = dir.join("copy-dst.txt");
     std::fs::write(&src, "copy me").unwrap();
-    let src_str = src.display();
-    let dst_str = dst.display();
+    let src_str = lisp_path(&src);
+    let dst_str = lisp_path(&dst);
 
     eval(&format!(
         r#"(let ((in (stream/open-input "{src_str}"))
@@ -15429,7 +15431,7 @@ fn test_stream_read_closed_file() {
     let _ = std::fs::create_dir_all(&dir);
     let path = dir.join("closed.txt");
     std::fs::write(&path, "data").unwrap();
-    let path_str = path.display();
+    let path_str = lisp_path(&path);
 
     let interp = Interpreter::new();
     let result = interp.eval_str(&format!(
@@ -15447,7 +15449,7 @@ fn test_stream_write_string_to_file() {
     let dir = std::env::temp_dir().join("sema-stream-writestr");
     let _ = std::fs::create_dir_all(&dir);
     let path = dir.join("write-string.txt");
-    let path_str = path.display();
+    let path_str = lisp_path(&path);
 
     eval(&format!(
         r#"(let ((s (stream/open-output "{path_str}")))
@@ -15467,7 +15469,7 @@ fn test_with_stream_file() {
     let _ = std::fs::create_dir_all(&dir);
     let path = dir.join("with.txt");
     std::fs::write(&path, "via macro").unwrap();
-    let path_str = path.display();
+    let path_str = lisp_path(&path);
 
     assert_eq!(
         eval(&format!(
@@ -15487,7 +15489,7 @@ fn test_with_stream_error_cleanup() {
     let _ = std::fs::create_dir_all(&dir);
     let path = dir.join("err.txt");
     std::fs::write(&path, "data").unwrap();
-    let path_str = path.display();
+    let path_str = lisp_path(&path);
 
     let interp = Interpreter::new();
     // The body throws, but with-stream should still close the stream
@@ -15692,9 +15694,8 @@ fn test_db_null_values() {
 
 #[test]
 fn test_db_open_file() {
-    let tmp = std::env::temp_dir().join("sema-db-test-file.db");
-    let path = tmp.to_str().unwrap();
-    let _ = std::fs::remove_file(&tmp);
+    let path = temp_path("sema-db-test-file.db");
+    let _ = std::fs::remove_file(&path);
     let interp = Interpreter::new();
     interp.eval_str(&format!(r#"(db/open "{path}")"#)).unwrap();
     interp
@@ -15717,7 +15718,7 @@ fn test_db_open_file() {
         &Value::string("hello")
     );
     interp.eval_str(&format!(r#"(db/close "{path}")"#)).unwrap();
-    let _ = std::fs::remove_file(&tmp);
+    let _ = std::fs::remove_file(&path);
 }
 
 #[test]
@@ -16080,20 +16081,28 @@ fn test_u2_notebook_without_subcommand_shows_error_and_help() {
 
 #[test]
 fn test_u3_build_preflight_permission_denied() {
-    // Use a path that almost certainly cannot be written from a normal user
-    // process: /sema-u3-output. On a sandboxed test runner /no-such-parent
-    // returning "output directory does not exist" is equivalent — either
-    // message should be emitted before any [1/5] step.
+    // An output path whose ancestor is a regular file: create_dir_all on the
+    // parent fails on every platform. (A root-anchored path like /no/such/dir
+    // is not a reliable failure — on Windows it resolves against the current
+    // drive, where an elevated CI runner can create it.) Either pre-flight
+    // message must be emitted before any [1/5] step.
     let dir = std::env::temp_dir().join(format!("sema-u3-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let src = dir.join("hello.sema");
     std::fs::write(&src, r#"(println "x")"#).unwrap();
 
-    let unwritable_out = "/no/such/parent/dir/u3-out";
+    let blocker = dir.join("blocker");
+    std::fs::write(&blocker, "not a directory").unwrap();
+    let unwritable_out = blocker.join("deep").join("u3-out");
 
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_sema"))
-        .args(["build", src.to_str().unwrap(), "-o", unwritable_out])
+        .args([
+            "build",
+            src.to_str().unwrap(),
+            "-o",
+            unwritable_out.to_str().unwrap(),
+        ])
         .output()
         .expect("failed to spawn sema build");
     assert!(

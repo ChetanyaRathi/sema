@@ -18,6 +18,13 @@ use std::sync::Mutex;
 
 use sema_eval::Interpreter;
 
+/// Embed a filesystem path in generated Sema source. A Sema string literal
+/// treats `\` as an escape (`C:\Users…` begins a `\U` unicode escape), so
+/// Windows separators go in as `/` — std's fs API accepts either.
+fn sema_path(path: &std::path::Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
+}
+
 /// Wraps the system allocator, tracking net live bytes. Coarse but exactly
 /// what the leak needs: a cycle keeps its allocations live forever, so net
 /// growth across a churn workload measures the leak directly.
@@ -250,7 +257,7 @@ fn interpreter_teardown_with_import_frees_module_env() {
     .expect("write module");
     let program = format!(
         r#"(begin (import "{}" public-api) (public-api 3))"#,
-        path.display()
+        sema_path(&path)
     );
     let grown = interpreter_teardown_growth(&[&program]);
     assert_bounded_teardown(

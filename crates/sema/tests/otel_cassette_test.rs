@@ -7,6 +7,13 @@ use sema_eval::Interpreter;
 use sema_llm::builtins::{register_test_provider, reset_runtime_state};
 use sema_llm::fake::FakeProvider;
 
+/// Embed a filesystem path in generated Sema source. A Sema string literal
+/// treats `\` as an escape (`C:\Users…` begins a `\U` unicode escape), so
+/// Windows separators go in as `/` — std's fs API accepts either.
+fn sema_path(path: &std::path::Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
+}
+
 fn run(src: &str, fake: FakeProvider) -> Result<sema_core::Value, sema_core::SemaError> {
     let interp = Interpreter::new();
     reset_runtime_state();
@@ -29,7 +36,7 @@ fn replay_emits_chat_span_with_recorded_tokens() {
         &format!(
             r#"(llm/with-cassette "{}" {{:mode :record}}
                  (fn () (llm/complete "p" {{:model "otel-model"}})))"#,
-            path.display()
+            sema_path(&path)
         ),
         rec,
     )
@@ -46,7 +53,7 @@ fn replay_emits_chat_span_with_recorded_tokens() {
         &format!(
             r#"(llm/with-cassette "{}" {{:mode :replay}}
                  (fn () (llm/complete "p" {{:model "otel-model"}})))"#,
-            path.display()
+            sema_path(&path)
         ),
         replay_fake,
     )

@@ -149,7 +149,12 @@ fn test_mcp_e2e_standalone_binary_mode() {
     let sema_bin = env!("CARGO_BIN_EXE_sema");
     let tmp_dir = unique_temp_dir("mcp-standalone-e2e");
     let src_path = tmp_dir.join("tools.sema");
-    let out_path = tmp_dir.join("standalone_mcp_tool");
+    // The built artifact is spawned below; Windows' CreateProcess resolves
+    // extensionless program paths by appending ".exe", so name it that way.
+    let out_path = tmp_dir.join(format!(
+        "standalone_mcp_tool{}",
+        std::env::consts::EXE_SUFFIX
+    ));
 
     let sema_code = r#"
 (deftool my-embedded-tool

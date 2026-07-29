@@ -28,6 +28,13 @@ use sema_llm::cassette::{Cassette, CassetteMode};
 use sema_llm::fake::FakeProvider;
 use serial_test::serial;
 
+/// Embed a filesystem path in generated Sema source. A Sema string literal
+/// treats `\` as an escape (`C:\Users…` begins a `\U` unicode escape), so
+/// Windows separators go in as `/` — std's fs API accepts either.
+fn sema_path(path: &std::path::Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
+}
+
 /// `(async/pool-map llm/complete prompts 3)` over a delayed fake: results correct
 /// and in INPUT order, with overlap proven by both peak in-flight ≥ 2 and a
 /// max-not-sum wall clock.
@@ -420,7 +427,7 @@ fn async_cassette_replay_serves_recorded_without_provider() {
                          (async/spawn
                            (fn () (llm/complete "the prompt" {{:model "m"}}))))))
                    (async/await pending)"#,
-                path.display()
+                sema_path(&path)
             ))
             .expect("deferred record task should retain and flush its cassette scope");
     }
@@ -445,7 +452,7 @@ fn async_cassette_replay_serves_recorded_without_provider() {
                      (async/spawn
                        (fn () (llm/complete "the prompt" {{:model "m"}}))))))
                (async/await pending)"#,
-            path.display()
+            sema_path(&path)
         ))
         .expect("deferred replay task should retain its cassette scope");
     assert_eq!(val.as_str(), Some("taped"));
@@ -486,7 +493,7 @@ fn async_embed_cassette_outlives_dynamic_scope() {
                      (async/spawn
                        (fn () (llm/embed "deferred text" {{:model "m"}}))))))
                (async/await pending)"#,
-            path.display()
+            sema_path(&path)
         ))
         .expect("deferred embedding should record after its dynamic scope unwinds");
     assert_eq!(recorded.type_name(), "bytevector");
@@ -501,7 +508,7 @@ fn async_embed_cassette_outlives_dynamic_scope() {
                      (async/spawn
                        (fn () (llm/embed "deferred text" {{:model "m"}}))))))
                (async/await pending)"#,
-            path.display()
+            sema_path(&path)
         ))
         .expect("deferred embedding replay should not reach the provider");
     assert_eq!(replayed.type_name(), "bytevector");
@@ -546,7 +553,7 @@ fn async_stream_cassette_outlives_dynamic_scope() {
                            {{:model "m"}}))))))
                (async/await pending)
                out"#,
-            path.display()
+            sema_path(&path)
         ))
         .expect("deferred stream should record after its dynamic scope unwinds");
     assert_eq!(recorded.as_str(), Some("deferred stream"));
@@ -574,7 +581,7 @@ fn async_stream_cassette_outlives_dynamic_scope() {
                            {{:model "m"}}))))))
                (async/await pending)
                out"#,
-            path.display()
+            sema_path(&path)
         ))
         .expect("deferred stream replay should not reach the provider");
     assert_eq!(replayed.as_str(), Some("deferred stream"));
@@ -679,8 +686,8 @@ fn async_cassette_scopes_are_isolated_between_siblings() {
                      (fn () (llm/complete "prompt-a" {{:model "m"}})))
                    (llm/with-cassette "{}" {{:mode :record}}
                      (fn () (llm/complete "prompt-b" {{:model "m"}})))"#,
-                path_a.display(),
-                path_b.display()
+                sema_path(&path_a),
+                sema_path(&path_b)
             ))
             .expect("record sibling cassette fixtures");
     }
@@ -706,8 +713,8 @@ fn async_cassette_scopes_are_isolated_between_siblings() {
                    (fn () (async/spawn
                             (fn () (llm/complete "prompt-b" {{:model "m"}}))))))
                (async/all (list a b))"#,
-            path_a.display(),
-            path_b.display()
+            sema_path(&path_a),
+            sema_path(&path_b)
         ))
         .expect("sibling replay tasks should retain distinct cassette scopes");
     let values = value.as_list().expect("two replay results");
@@ -749,8 +756,8 @@ fn async_cassette_siblings_append_to_one_tape() {
                    (fn () (async/spawn
                             (fn () (llm/complete "prompt-b" {{:model "m"}}))))))
                (async/all (list a b))"#,
-            path.display(),
-            path.display()
+            sema_path(&path),
+            sema_path(&path)
         ))
         .expect("both sibling recorders should finish");
 
@@ -770,7 +777,7 @@ fn async_cassette_siblings_append_to_one_tape() {
                  (fn ()
                    (list (llm/complete "prompt-a" {{:model "m"}})
                          (llm/complete "prompt-b" {{:model "m"}}))))"#,
-            path.display()
+            sema_path(&path)
         ))
         .expect("one tape should retain both sibling recordings");
     let values = replayed.as_list().expect("two replayed values");
@@ -1119,7 +1126,7 @@ fn extract_reask_uses_spawn_captured_cassette_scope() {
                         {{:retries 1}}))))))
             (:n (async/await pending))
             "#,
-            path.display()
+            sema_path(&path)
         ))
         .expect("spawned extraction records both attempts");
     assert_eq!(recorded.as_int(), Some(2));
@@ -1149,7 +1156,7 @@ fn extract_reask_uses_spawn_captured_cassette_scope() {
                         {{:retries 1}}))))))
             (:n (async/await pending))
             "#,
-            path.display()
+            sema_path(&path)
         ))
         .expect("spawned extraction replays both attempts");
     assert_eq!(replayed.as_int(), Some(2));

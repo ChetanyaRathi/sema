@@ -313,8 +313,9 @@ eval_tests! {
 
 eval_tests! {
     // path/relative-to is pure path math (no fs).
-    path_relative_to_descendant: r#"(path/relative-to "/a/b" "/a/b/c/d")"# => Value::string("c/d"),
-    path_relative_to_sibling: r#"(path/relative-to "/a/b/c" "/a/x")"# => Value::string("../../x"),
+    // path/relative-to answers with host separators (`\` on Windows).
+    path_relative_to_descendant: r#"(path/relative-to "/a/b" "/a/b/c/d")"# => Value::string_owned(["c", "d"].join(std::path::MAIN_SEPARATOR_STR)),
+    path_relative_to_sibling: r#"(path/relative-to "/a/b/c" "/a/x")"# => Value::string_owned(["..", "..", "x"].join(std::path::MAIN_SEPARATOR_STR)),
     path_relative_to_same: r#"(path/relative-to "/a/b" "/a/b")"# => Value::string("."),
     // path/within? — containment after resolving `.`/`..` (lexical for non-existent paths).
     path_within_descendant: r#"(path/within? "/a/b" "/a/b/c")"# => Value::bool(true),
@@ -355,7 +356,6 @@ eval_tests! {
     // Terminal setup/teardown guard macros return the body value and re-raise
     // after restoring (teardown always runs — the emitted escapes go to stdout).
     guard_alt_screen_returns_body: "(term/with-alt-screen 1 2 3)" => Value::int(3),
-    guard_raw_mode_returns_body: "(io/with-raw-mode 42)" => Value::int(42),
     guard_mouse_returns_body: "(term/with-mouse 7)" => Value::int(7),
     guard_bracketed_paste_returns_body: "(term/with-bracketed-paste 1 2 3)" => Value::int(3),
     guard_focus_events_returns_body: "(term/with-focus-events 7)" => Value::int(7),
@@ -368,6 +368,13 @@ eval_tests! {
     // (regression: the error was being wrapped, dropping the code + span).
     check_string_syntax_code: r#"(:code (car (:diagnostics (sema/check-string "(+ 1 2"))))"# => Value::string("syntax"),
     check_string_has_span: r#"(map? (:span (car (:diagnostics (sema/check-string "(+ 1 2")))))"# => Value::bool(true),
+}
+
+// io/with-raw-mode enters raw mode via io/tty-raw!, which sema-stdlib registers
+// under #[cfg(unix)] only (termios; no Windows implementation).
+#[cfg(unix)]
+eval_tests! {
+    guard_raw_mode_returns_body: "(io/with-raw-mode 42)" => Value::int(42),
 }
 
 // ============================================================

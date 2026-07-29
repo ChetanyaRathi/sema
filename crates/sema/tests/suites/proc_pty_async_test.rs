@@ -17,7 +17,11 @@
 //! second (`sh -c 'exit N'` / `sh -c 'sleep 0.2; exit N'`) per the WP's
 //! anti-hang rule — none read stdin or wait on a signal.
 
-#![cfg(not(target_arch = "wasm32"))]
+// unix-only (which also excludes wasm32): every child is `sh -c ...`, and the
+// cancelled-wait paths rely on the process-group SIGKILL abort hook — a
+// documented no-op off Unix, so on Windows these can only ever hang to the
+// slow-timeout watchdog.
+#![cfg(unix)]
 
 use sema_core::Value;
 use sema_eval::Interpreter;

@@ -751,28 +751,42 @@ fn test_example_pattern_defmacro_with_named_let() {
     );
 }
 
+/// A temp-dir path spliceable into a Sema string literal: `\` would start an
+/// escape there (`C:\Users\…` reads as a `\U` unicode escape), and forward
+/// slashes are valid path separators on every platform, including Windows.
+fn temp_path_literal(name: &str) -> String {
+    std::env::temp_dir()
+        .join(format!("sema-vm-test-{name}-{}.sema", std::process::id()))
+        .to_string_lossy()
+        .replace('\\', "/")
+}
+
 #[test]
 fn test_example_pattern_modules_import() {
     // Sema modules are file-path-based (Decision #19)
-    assert_evals(
+    let path = temp_path_literal("mod");
+    assert_evals(&format!(
         "(begin
-           (file/write \"/tmp/sema-vm-test-mod.sema\"
+           (file/write \"{path}\"
              \"(module math (export square) (define (square x) (* x x)))\")
-           (import \"/tmp/sema-vm-test-mod.sema\")
-           (square 5))",
-    );
+           (import \"{path}\")
+           (square 5))"
+    ));
+    let _ = std::fs::remove_file(&path);
 }
 
 #[test]
 fn test_example_pattern_modules_selective_import() {
     // Selective import: (import "path" sym1 sym2) with bare symbols
-    assert_evals(
+    let path = temp_path_literal("sel");
+    assert_evals(&format!(
         "(begin
-           (file/write \"/tmp/sema-vm-test-sel.sema\"
+           (file/write \"{path}\"
              \"(module sel (export square cube) (define (square x) (* x x)) (define (cube x) (* x x x)))\")
-           (import \"/tmp/sema-vm-test-sel.sema\" square)
-           (square 5))",
-    );
+           (import \"{path}\" square)
+           (square 5))"
+    ));
+    let _ = std::fs::remove_file(&path);
 }
 
 // ============================================================================
