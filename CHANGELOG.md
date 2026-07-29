@@ -1,5 +1,27 @@
 # Changelog
 
+## 1.32.1
+
+### Fixed
+
+- **Cancelling MCP operations over HTTP now disconnects promptly on Windows.**
+  `mcp/close` (and `tools/list`) teardown relied on dropping in-flight request
+  futures from a blocking thread, which left the connection's fate to
+  internal HTTP-stack wake timing — on Windows the peer could see no
+  disconnect for 30+ seconds after the cancel settled. Transport jobs now run
+  as tasks on the shared I/O runtime, where cancellation drops the request
+  deterministically on both platforms. Verified by the previously
+  Windows-gated cancellation test, now running (and passing) on Windows CI.
+
+### Improved
+
+- Windows test suite fully green (7194/7194) with the last gated oracle
+  restored; the stdio liveness probe now genuinely checks process state on
+  Windows instead of passing vacuously.
+- Repo hygiene that protects future releases: `.gitattributes` pins
+  `*.sema`/`*.sh` to LF and test fixtures to raw bytes (autocrlf checkouts
+  once corrupted fixtures), and the hermetic embedded-docs gate runs nightly.
+
 ## 1.32.0
 
 ### Windows fixes — `sema build` works, plus three more
