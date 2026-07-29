@@ -43,7 +43,10 @@
 //! drops with it. Connection ops run those drops inside a task spawned on the
 //! shared I/O runtime (see [`run_transport_task`]) so an HTTP transport's
 //! socket-owning dispatcher tasks observe them; a stdio drop is a synchronous
-//! child kill either way. Any late completion is discarded by the
+//! child kill either way. OAuth legs (connect login, mid-call reauth) run on
+//! the blocking tier with their own throwaway HTTP client, so a cancel during
+//! auth severs the connection immediately — the orphaned flow completes in the
+//! background and at most persists a token. Any late completion is discarded by the
 //! runtime. A *later* use of that handle fails fast with a
 //! `SemaError` naming the reason and a reconnect hint; a task that was merely
 //! *queued* (never actually held the checkout) when cancelled leaves the slot
@@ -608,31 +611,50 @@ async fn obtain_access_token_async(
     preconfigured_client_id: Option<&str>,
     browser_authority: BrowserAuthority,
 ) -> Result<String, SemaError> {
-    use crate::oauth::{discovery, login, store};
+    let url = url.to_string();
+    let challenge_header = challenge_header.to_string();
+    let preconfigured_client_id = preconfigured_client_id.map(str::to_string);
+    // The OAuth objects (token store, redirect driver) are not `Send`, so they
+    // are built, used, and dropped entirely inside this blocking-tier closure;
+    // that keeps this future — and every connect job awaiting it — `Send`, so
+    // the job can be spawned on the shared I/O runtime (see
+    // [`run_transport_task`]). Errors cross back as the thread-safe
+    // [`ConnectErrorPayload`], hint intact.
+    sema_io::io_offload_blocking(move || {
+        sema_io::io_block_on(async move {
+            use crate::oauth::{discovery, login, store};
 
-    let challenge = discovery::parse_www_authenticate(challenge_header);
-    crate::ensure_crypto_provider();
-    let http = reqwest::Client::new();
-    let credential_store = store::default_store();
-    let driver = browser_authority
-        .redirect_driver(std::time::Duration::from_secs(300))
-        .map_err(|e| SemaError::eval(format!("mcp/connect: {e}")))?;
+            let challenge = discovery::parse_www_authenticate(&challenge_header);
+            crate::ensure_crypto_provider();
+            let http = reqwest::Client::new();
+            let credential_store = store::default_store();
+            let driver = browser_authority
+                .redirect_driver(std::time::Duration::from_secs(300))
+                .map_err(|e| {
+                    ConnectErrorPayload::from_sema(SemaError::eval(format!("mcp/connect: {e}")))
+                })?;
 
-    let config = login::LoginConfig {
-        mcp_url: url,
-        resource_metadata_url: challenge.resource_metadata.as_deref(),
-        requested_scope: challenge.scope.as_deref(),
-        preconfigured_client_id,
-    };
+            let config = login::LoginConfig {
+                mcp_url: &url,
+                resource_metadata_url: challenge.resource_metadata.as_deref(),
+                requested_scope: challenge.scope.as_deref(),
+                preconfigured_client_id: preconfigured_client_id.as_deref(),
+            };
 
-    login::ensure_access_token(&http, credential_store.as_ref(), &config, driver.as_ref())
-        .await
-        .map_err(|e| {
-            SemaError::eval(format!("mcp/connect: OAuth login failed: {e}")).with_hint(
-                "a browser should have opened to complete login; or pass a token via \
-                 :headers {\"Authorization\" \"Bearer …\"}",
-            )
+            login::ensure_access_token(&http, credential_store.as_ref(), &config, driver.as_ref())
+                .await
+                .map_err(|e| {
+                    ConnectErrorPayload::from_sema(
+                        SemaError::eval(format!("mcp/connect: OAuth login failed: {e}")).with_hint(
+                            "a browser should have opened to complete login; or pass a token via \
+                             :headers {\"Authorization\" \"Bearer …\"}",
+                        ),
+                    )
+                })
         })
+    })
+    .await
+    .map_err(ConnectErrorPayload::into_sema)
 }
 
 /// Dispatch on transport and connect (no sandbox gate — the caller runs
@@ -1119,7 +1141,7 @@ fn connect_runtime_outcome(
     );
     let prepared =
         PreparedExternalOperation::interruptible_blocking(kind, decoder, resource, move || {
-            let result = sema_io::io_block_on(async move {
+            let result = sema_io::io_block_on(run_transport_task(async move {
                 tokio::select! {
                     biased;
                     _ = cancel_rx => ConnectPayloadResult::Cancelled,
@@ -1140,7 +1162,7 @@ fn connect_runtime_outcome(
                         ),
                     },
                 }
-            });
+            }));
             Ok(Box::new(McpConnectPayload(result)) as SendPayload)
         });
     Ok(NativeOutcome::Suspend(NativeSuspend {
@@ -1330,36 +1352,46 @@ async fn reauthorize_async(
     interactive_auth: bool,
     browser_authority: BrowserAuthority,
 ) -> Result<Option<String>, String> {
-    crate::ensure_crypto_provider();
-    let http = reqwest::Client::new();
-    let store = crate::oauth::store::default_store();
-    let result = if interactive_auth {
-        let driver = browser_authority
-            .redirect_driver(Duration::from_secs(300))
-            .map_err(|e| format!("mcp/call: {e}"))?;
-        crate::oauth::login::reauth_on_challenge(
-            &http,
-            store.as_ref(),
-            url,
-            status,
-            challenge,
-            None,
-            driver.as_ref(),
-        )
-        .await
-    } else {
-        crate::oauth::login::reauth_on_challenge(
-            &http,
-            store.as_ref(),
-            url,
-            status,
-            challenge,
-            None,
-            &NoInteractiveDriver,
-        )
-        .await
-    };
-    result.map_err(|e| format!("mcp/call: re-authorization failed: {e}"))
+    let url = url.to_string();
+    let challenge = challenge.map(str::to_string);
+    // Same offload split as [`obtain_access_token_async`]: the non-`Send` OAuth
+    // objects live and die inside the blocking-tier closure, keeping the
+    // `mcp/call` transport job `Send`-spawnable on the shared I/O runtime.
+    sema_io::io_offload_blocking(move || {
+        sema_io::io_block_on(async move {
+            crate::ensure_crypto_provider();
+            let http = reqwest::Client::new();
+            let store = crate::oauth::store::default_store();
+            let result = if interactive_auth {
+                let driver = browser_authority
+                    .redirect_driver(Duration::from_secs(300))
+                    .map_err(|e| format!("mcp/call: {e}"))?;
+                crate::oauth::login::reauth_on_challenge(
+                    &http,
+                    store.as_ref(),
+                    &url,
+                    status,
+                    challenge.as_deref(),
+                    None,
+                    driver.as_ref(),
+                )
+                .await
+            } else {
+                crate::oauth::login::reauth_on_challenge(
+                    &http,
+                    store.as_ref(),
+                    &url,
+                    status,
+                    challenge.as_deref(),
+                    None,
+                    &NoInteractiveDriver,
+                )
+                .await
+            };
+            result.map_err(|e| format!("mcp/call: re-authorization failed: {e}"))
+        })
+    })
+    .await
 }
 
 /// Async core of one `tools/call`, including the mid-session reauth-on-401/403
@@ -1774,26 +1806,26 @@ impl McpGatedAction for McpCallAction {
             }),
         );
         PreparedExternalOperation::interruptible_blocking(kind, decoder, resource, move || {
-            let mut conn = conn;
-            let call = call_tool_async(
-                &mut conn,
-                &tool_name,
-                arguments_json,
-                interactive_auth,
-                BrowserAuthority::from_allowed(browser_allowed),
-            );
             // `None` from the select is cancellation, distinct from a call that
             // ran and returned `Err` — only the former releases the connection.
-            let completed = sema_io::io_block_on(async move {
-                tokio::select! {
+            let payload = sema_io::io_block_on(run_transport_task(async move {
+                let mut conn = conn;
+                let completed = tokio::select! {
                     biased;
                     _ = cancel_rx => None,
-                    result = call => Some(result),
-                }
-            });
-            let conn = conn_unless_cancelled(conn, completed.is_none());
-            let result = completed.unwrap_or_else(|| Err("cancelled".to_string()));
-            Ok(Box::new(McpCallPayload { conn, result }) as SendPayload)
+                    result = call_tool_async(
+                        &mut conn,
+                        &tool_name,
+                        arguments_json,
+                        interactive_auth,
+                        BrowserAuthority::from_allowed(browser_allowed),
+                    ) => Some(result),
+                };
+                let conn = conn_unless_cancelled(conn, completed.is_none());
+                let result = completed.unwrap_or_else(|| Err("cancelled".to_string()));
+                McpCallPayload { conn, result }
+            }));
+            Ok(Box::new(payload) as SendPayload)
         })
     }
 }

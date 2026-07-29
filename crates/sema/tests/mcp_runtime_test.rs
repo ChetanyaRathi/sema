@@ -213,7 +213,7 @@ const DELAYED_HTTP_SERVER: &str = r#"
 import json, os, select, socket, sys, time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-release, entered, timed_out, finished = sys.argv[1:5]
+mode, release, entered, timed_out, finished = sys.argv[1:6]
 
 def touch(path):
     open(path, "w").close()
@@ -230,6 +230,24 @@ def peer_closed(connection):
         return connection.recv(1, socket.MSG_PEEK) == b""
     except (ConnectionResetError, OSError):
         return True
+
+def stall(connection):
+    # True when the stall was released (or the leak guard fired) and the
+    # handler should still answer; False when the peer disconnected.
+    touch(entered)
+    # See the stdio fixture: this bound is a leak guard, never the oracle.
+    deadline = time.monotonic() + 120
+    while time.monotonic() < deadline:
+        if os.path.exists(release):
+            finish("released")
+            return True
+        if peer_closed(connection):
+            finish("closed")
+            return False
+        time.sleep(0.005)
+    touch(timed_out)
+    finish("leak-guard")
+    return True
 
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *args):
@@ -253,11 +271,18 @@ class Handler(BaseHTTPRequestHandler):
             self.reply(202)
             return
         method = request.get("method")
+        stalled = (mode == "connect" and method == "initialize") or (
+            mode == "call" and method == "tools/call")
+        if stalled and not stall(self.connection):
+            return
         if method == "initialize":
             result = {"protocolVersion": "2025-11-25", "capabilities": {},
                       "serverInfo": {"name": "delayed-http", "version": "1"}}
         elif method == "tools/list":
             result = {"tools": []}
+        elif method == "tools/call":
+            result = {"content": [{"type": "text", "text": "called"}],
+                      "isError": False}
         else:
             result = {}
         body = json.dumps({"jsonrpc": "2.0", "id": request_id,
@@ -266,20 +291,8 @@ class Handler(BaseHTTPRequestHandler):
                                "Mcp-Session-Id": "delayed-session"})
 
     def do_DELETE(self):
-        touch(entered)
-        # See the stdio fixture: this bound is a leak guard, never the oracle.
-        deadline = time.monotonic() + 120
-        while time.monotonic() < deadline:
-            if os.path.exists(release):
-                finish("released")
-                self.reply(200)
-                return
-            if peer_closed(self.connection):
-                finish("closed")
-                return
-            time.sleep(0.005)
-        touch(timed_out)
-        finish("leak-guard")
+        if mode == "close" and not stall(self.connection):
+            return
         self.reply(200)
 
 server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
@@ -298,11 +311,12 @@ impl Drop for HttpServerGuard {
     }
 }
 
-fn start_delayed_http_server(markers: &Markers) -> (HttpServerGuard, u16) {
+fn start_delayed_http_server(mode: &str, markers: &Markers) -> (HttpServerGuard, u16) {
     let mut child = Command::new("python3")
         .args([
             "-c",
             DELAYED_HTTP_SERVER,
+            mode,
             &markers.release.to_string_lossy(),
             &markers.entered.to_string_lossy(),
             &markers.timed_out.to_string_lossy(),
@@ -849,7 +863,7 @@ fn public_close_handle_closes_a_runtime_created_connection_gate() {
 #[test]
 fn foreign_runtime_mcp_close_is_offloaded_and_closes_owner_gate() {
     let markers = Markers::new("foreign-runtime-close");
-    let (_server, port) = start_delayed_http_server(&markers);
+    let (_server, port) = start_delayed_http_server("close", &markers);
     let release = sema_str(&markers.release.to_string_lossy());
     let owner = mcp_eval_interpreter();
     let caller = mcp_eval_interpreter();
@@ -932,7 +946,7 @@ fn runtime_generated_mcp_handler_wait_allows_sibling_progress() {
 #[test]
 fn runtime_mcp_close_wait_allows_sibling_progress() {
     let markers = Markers::new("close-progress");
-    let (_server, port) = start_delayed_http_server(&markers);
+    let (_server, port) = start_delayed_http_server("close", &markers);
     let release = sema_str(&markers.release.to_string_lossy());
     let interp = Interpreter::new();
     interp
@@ -1013,7 +1027,7 @@ fn runtime_generated_mcp_handler_wait_is_promptly_cancellable() {
 #[test]
 fn runtime_mcp_close_wait_is_promptly_cancellable() {
     let markers = Markers::new("close-cancel");
-    let (_server, port) = start_delayed_http_server(&markers);
+    let (_server, port) = start_delayed_http_server("close", &markers);
     let interp = mcp_eval_interpreter();
     interp
         .eval_str_via_runtime(&format!(
@@ -1023,6 +1037,38 @@ fn runtime_mcp_close_wait_is_promptly_cancellable() {
     assert_cancelled_before_server_fallback(
         &interp,
         "(mcp/close server)",
+        &markers,
+        CancellationResourceOracle::HttpPeerDisconnect,
+    );
+}
+
+#[test]
+fn runtime_mcp_call_http_wait_is_promptly_cancellable() {
+    let markers = Markers::new("call-http-cancel");
+    let (_server, port) = start_delayed_http_server("call", &markers);
+    let interp = mcp_eval_interpreter();
+    interp
+        .eval_str_via_runtime(&format!(
+            "(define server (mcp/connect {{:url \"http://127.0.0.1:{port}/mcp\"}}))"
+        ))
+        .expect("connect delayed call server");
+    assert_cancelled_before_server_fallback(
+        &interp,
+        r#"(mcp/call server "echo" {})"#,
+        &markers,
+        CancellationResourceOracle::HttpPeerDisconnect,
+    );
+    assert_connection_tombstoned(&interp, "cancelled mid-call");
+}
+
+#[test]
+fn runtime_mcp_connect_http_wait_is_promptly_cancellable() {
+    let markers = Markers::new("connect-http-cancel");
+    let (_server, port) = start_delayed_http_server("connect", &markers);
+    let interp = mcp_eval_interpreter();
+    assert_cancelled_before_server_fallback(
+        &interp,
+        &format!("(mcp/connect {{:url \"http://127.0.0.1:{port}/mcp\"}})"),
         &markers,
         CancellationResourceOracle::HttpPeerDisconnect,
     );
