@@ -99,6 +99,27 @@ Dependency flow (arrows = "depends on"): `sema-core ← sema-reader ← sema-vm 
 - **Keywords as functions** — `(:name person)` works like `(get person :name)`, handled in `eval_step` when a `Value::Keyword` appears in head position.
 - **Invariant I2 (CORE-2 GC)** — a `NativeFn`'s boxed closure must not strongly capture anything that can transitively hold a `Value` or `Env` (that would form an uncollectable cycle the collector cannot trace). Traceable state belongs in `NativeFn.payload` (traced via a registered payload tracer); host infrastructure (e.g. the `__vm-*` delegates) captures `Weak` and upgrades at call time. See `docs/plans/2026-07-02-core2-gc.md` §2.
 
+## Writing style — plain technical English (MANDATORY)
+
+Applies to chat replies, code comments, commit messages, PR text, and docs.
+Follow the sentence rules of ASD-STE100 where practical. Do not restrict the
+technical vocabulary software engineering needs (Rust, async, CI, wasm, PE,
+OAuth terms are all fine).
+
+- Use common words. Prefer short, direct sentences.
+- Use one term per concept, and reuse it. Do not rotate synonyms for the same
+  thing. Use names from the code verbatim.
+- State the problem, the cause, and the fix, explicitly and in that order.
+- Do not use metaphors, invented idioms, or rhetorical language. Do not use
+  "load-bearing", "sharp edge", "seam", "beachhead", "north star", "maiden",
+  "wave", "papercut", "surface" (as a verb), "journey", or "story" unless the
+  word has a literal technical meaning in context.
+- Terms with a fixed technical meaning in this repo stay: "gate" (a CI check
+  that blocks a release), "oracle" (the expected value a test compares
+  against), "trampoline", "quantum" (scheduler slice).
+- Do not narrate work as drama. Report what changed, why it changed, and what
+  test or measurement proves it.
+
 ## Code Style
 
 - Rust 2021, single-threaded (`Rc`, not `Arc`), `hashbrown::HashMap` for `Env` bindings, `BTreeMap` for user-facing sorted maps.
