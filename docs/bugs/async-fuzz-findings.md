@@ -105,6 +105,21 @@ What is established (all deterministic, 3/3 runs):
 This matches bug shape 1 from the plan (orphaned/leftover pending state
 corrupting later work in the same runtime) even under native `drive()`.
 
+**Second instance** (independent seed range, same fault message,
+deterministic):
+
+```bash
+SEMA_FUZZ_ASYNC=1 SEMA_FUZZ_SEED=500150 SEMA_FUZZ_COUNT=48 SEMA_FUZZ_DEPTH=6 \
+  ./target/debug/sema fuzz/grammar-fuzz.sema
+# aborts evaluating seed 500197
+```
+
+P(500197) is a different shape from P(200050): a `<=` comparison whose operand
+contains the always-on capacity-64 channel fan-in nested in ordinary code. So
+the trigger is not one production; any async-using eval can hit the fault once
+the leftover state exists. Frequency at depth 6: 2 aborts in ~3500 seeds.
+Depth 4 batches (thousands of seeds) have not hit it.
+
 ## Batch log
 
 | Date | Commit stage | Seeds | Depth | Result |
@@ -113,3 +128,9 @@ corrupting later work in the same runtime) even under native `drive()`.
 | 2026-07-29 | + spawn/cancel/owned | 9000..9199 (200) | 4 | PASS |
 | 2026-07-29 | + race/timeout/causal | 13000..13199 (200) | 4 | PASS |
 | 2026-07-29 | + offload leaves | 17000..17199 (200) | 4 | PASS |
+| 2026-07-29 | all families | 100000..101999 (2000) | 4 | PASS |
+| 2026-07-29 | all families | 200000..200999 (1000) | 6 | ABORT at 200050 (finding 3) |
+| 2026-07-29 | all families | 300000..300499 (500) | 6 | PASS |
+| 2026-07-29 | all families | 400000..400499 (500) | 6 | PASS |
+| 2026-07-29 | all families | 500000..500499 (500) | 6 | ABORT at 500197 (finding 3, second instance) |
+| 2026-07-30 | all families, final verification | 700000..700499 (500) | 4 | PASS (watchdog active, 6 s) |
