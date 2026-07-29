@@ -2029,6 +2029,13 @@
       (newline)
       (exit 1))))
 
+;; Render a generated program in read syntax. A program that is a bare string
+;; literal needs `~s` (quoted + escaped): `str` renders a top-level string in
+;; display form, which cannot be read back. Every other program is a form
+;; whose `str` already prints nested strings readably.
+(define (program->source f)
+  (if (string? f) (format "~s" f) (str f)))
+
 (define (run-emit)
   (let loop ((i 0) (acc (list)))
     (if (>= i iterations)
@@ -2062,7 +2069,7 @@
                 " => "
                 (str (gv p))
                 "\n"
-                (str (gf p)))
+                (program->source (gf p)))
               acc)))))))
 
 (if (= mode "emit") (run-emit) (run-check))
