@@ -1293,11 +1293,52 @@
             -1)))
       (gv surv))))
 
+;; OS temp dir with a trailing slash, for the offload-leaf files.
+(define *tmp-dir*
+  (let ((d (env "TMPDIR")))
+    (if (null? d)
+      "/tmp/"
+      (if (string/ends-with? d "/") d (string-append d "/")))))
+
+;; Counter making every offload production in a run use a distinct file, even
+;; when several nest inside one generated program (same seed). Deterministic:
+;; generation order is fixed by the seed.
+(define *file-ctr* 0)
+
+;; Offload leaves: file/write then file/read of a per-seed file under the OS
+;; temp dir, inside a task — puts External waits (the executor's blocking tier)
+;; and their completion path in play. Path and content both derive from
+;; seed + counter, so the read-back value is deterministic and even a path
+;; collision between concurrent fuzzer runs writes identical bytes.
+;; Cancel-during-offload is covered by gen-async-cancel's blocking-sleep
+;; target (a park the generator controls); file-op cancellation timing is racy
+;; by nature, so file tasks are never cancelled.
+(define (gen-async-offload env depth)
+  (set! *file-ctr* (+ *file-ctr* 1))
+  (let* ((stem
+           (string-append
+             "sema-grammar-fuzz-"
+             (number->string *cur-seed*)
+             "-"
+             (number->string *file-ctr*)))
+         (path (string-append *tmp-dir* stem ".txt"))
+         (r (gensym "r")))
+    (mk
+      (list 'let
+        (list
+          (list r
+            (list 'async/await
+              (mk-task
+                (list (list 'file/write path stem) (list 'file/read path))))))
+        (list 'file/delete path)
+        r)
+      stem)))
+
 ;; Dispatch for the gated async productions.
 (define (gen-async env depth)
   (if (<= depth 0)
     (gen-async-leaf env)
-    (let ((c (rng-int! 14)))
+    (let ((c (rng-int! 15)))
       (cond
         ((= c 0) (gen-async-chan-pipeline env depth))
         ((= c 1) (gen-async-chan-recvfirst env depth))
@@ -1312,7 +1353,8 @@
         ((= c 10) (gen-async-owned-ok env depth))
         ((= c 11) (gen-async-race env depth))
         ((= c 12) (gen-async-with-timeout env depth))
-        (else (gen-async-causal env depth))))))
+        ((= c 13) (gen-async-causal env depth))
+        (else (gen-async-offload env depth))))))
 
 ;; ── metamorphic / differential laws (independent oracle for native ops) ──────
 ;; The plain value oracle computes `expected` by calling the SAME builtin the
@@ -1738,6 +1780,10 @@
         (when (not (null? crash-file))
           (file/write crash-file (number->string seed)))
         (rng-seed! seed)
+        ;; Per-iteration reset: offload file paths must depend only on the seed,
+        ;; not on how many iterations ran before it, or a single-seed repro
+        ;; would generate a different program than the batch run.
+        (set! *file-ctr* 0)
         ;; round-trip property on a random datum
         (let ((d (gen-datum max-depth)))
           (let ((ok (check-roundtrip d)))
@@ -1789,7 +1835,15 @@
             (display out-file)
             (newline))))
       (begin
+        ;; Mirror run-check's per-iteration state exactly: same *cur-seed* and
+        ;; *file-ctr* (gen-async-offload derives file paths from them), and the
+        ;; same RNG stream position — check generates a round-trip datum before
+        ;; the typed program, so emit must generate and discard one too, or it
+        ;; shows a different program than the one check ran for the seed.
+        (set! *cur-seed* (+ base-seed i))
         (rng-seed! (+ base-seed i))
+        (set! *file-ctr* 0)
+        (gen-datum max-depth)
         (let ((p (gen-typed max-depth)))
           (loop (+ i 1)
             (cons
