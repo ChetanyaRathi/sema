@@ -20,12 +20,7 @@ fn tape_path(name: &str) -> std::path::PathBuf {
     ))
 }
 
-/// Embed a filesystem path in generated Sema source. A Sema string literal
-/// treats `\` as an escape (`C:\Users…` begins a `\U` unicode escape), so
-/// Windows separators go in as `/` — std's fs API accepts either.
-fn sema_path(path: &std::path::Path) -> String {
-    path.to_string_lossy().replace('\\', "/")
-}
+use crate::common::sema_path;
 
 /// Run `src` against a fresh interpreter with `fake` installed as the default provider.
 fn run(src: &str, fake: FakeProvider) -> Result<sema_core::Value, sema_core::SemaError> {

@@ -7,12 +7,8 @@ use sema_eval::Interpreter;
 use sema_llm::builtins::{register_test_provider, reset_runtime_state};
 use sema_llm::fake::FakeProvider;
 
-/// Embed a filesystem path in generated Sema source. A Sema string literal
-/// treats `\` as an escape (`C:\Users…` begins a `\U` unicode escape), so
-/// Windows separators go in as `/` — std's fs API accepts either.
-fn sema_path(path: &std::path::Path) -> String {
-    path.to_string_lossy().replace('\\', "/")
-}
+mod common;
+use common::sema_path;
 
 fn run(src: &str, fake: FakeProvider) -> Result<sema_core::Value, sema_core::SemaError> {
     let interp = Interpreter::new();

@@ -22,13 +22,7 @@ use serial_test::serial;
 use std::path::PathBuf;
 use std::time::Duration;
 
-/// A path as a string safe to embed in Sema source: forward slashes, because
-/// backslashes in a Windows path read as string escapes inside a Sema string
-/// literal (`\Users` starts a `\U` unicode escape), and every platform —
-/// including the `sh` the markers are touched through — accepts `/`.
-fn sema_path(p: &std::path::Path) -> String {
-    p.to_string_lossy().replace('\\', "/")
-}
+use crate::common::sema_path;
 
 /// A unique marker path under the system temp dir for one test (removed up front).
 fn marker(name: &str) -> PathBuf {

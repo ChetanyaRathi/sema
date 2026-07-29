@@ -931,7 +931,7 @@ fn test_http_router_static_route() {
     let _ = std::fs::remove_dir_all(&tmp);
     std::fs::create_dir_all(&tmp).unwrap();
     std::fs::write(tmp.join("hello.txt"), "hello world").unwrap();
-    let dir = tmp.to_string_lossy().replace('\\', "/");
+    let dir = crate::common::sema_path(&tmp);
 
     let result = eval(&format!(
         r#"
@@ -960,7 +960,7 @@ fn test_http_router_static_fallthrough() {
     let _ = std::fs::remove_dir_all(&tmp);
     std::fs::create_dir_all(&tmp).unwrap();
     std::fs::write(tmp.join("exists.txt"), "yes").unwrap();
-    let dir = tmp.to_string_lossy().replace('\\', "/");
+    let dir = crate::common::sema_path(&tmp);
 
     let result = eval(&format!(
         r#"
@@ -988,7 +988,7 @@ fn test_http_router_static_path_traversal() {
     let _ = std::fs::remove_dir_all(&tmp);
     std::fs::create_dir_all(&tmp).unwrap();
     std::fs::write(tmp.join("safe.txt"), "safe").unwrap();
-    let dir = tmp.to_string_lossy().replace('\\', "/");
+    let dir = crate::common::sema_path(&tmp);
 
     let result = eval(&format!(
         r#"
@@ -1012,7 +1012,7 @@ fn test_http_router_static_post_rejected() {
     let _ = std::fs::remove_dir_all(&tmp);
     std::fs::create_dir_all(&tmp).unwrap();
     std::fs::write(tmp.join("file.txt"), "content").unwrap();
-    let dir = tmp.to_string_lossy().replace('\\', "/");
+    let dir = crate::common::sema_path(&tmp);
 
     let result = eval(&format!(
         r#"
@@ -1050,7 +1050,7 @@ fn test_http_serve_static_files() {
                [[:static "/static" "{dir}"]
                 [:get "/*" (fn (_) (http/file "{dir}/index.html"))]])
              {{:port 19895}})"#,
-        dir = tmp.to_string_lossy().replace('\\', "/")
+        dir = crate::common::sema_path(&tmp)
     );
 
     let mut child = Command::new(env!("CARGO_BIN_EXE_sema"))
@@ -1145,7 +1145,7 @@ fn test_static_index_html_for_directory() {
     let _ = std::fs::remove_dir_all(&tmp);
     std::fs::create_dir_all(tmp.join("sub")).unwrap();
     std::fs::write(tmp.join("sub/index.html"), "<h1>Index</h1>").unwrap();
-    let dir = tmp.to_string_lossy().replace('\\', "/");
+    let dir = crate::common::sema_path(&tmp);
 
     let result = eval(&format!(
         r#"(let ((router (http/router [[:static "/s" "{dir}"]])))
@@ -1176,7 +1176,7 @@ fn test_static_nested_path_traversal_double_dot() {
     let _ = std::fs::remove_dir_all(&tmp);
     std::fs::create_dir_all(&tmp).unwrap();
     std::fs::write(tmp.join("safe.txt"), "safe").unwrap();
-    let dir = tmp.to_string_lossy().replace('\\', "/");
+    let dir = crate::common::sema_path(&tmp);
 
     // Various traversal attempts
     for path in &[
@@ -1219,7 +1219,7 @@ fn test_static_mime_types() {
     for (name, _) in &files {
         std::fs::write(tmp.join(name), "content").unwrap();
     }
-    let dir = tmp.to_string_lossy().replace('\\', "/");
+    let dir = crate::common::sema_path(&tmp);
 
     for (name, expected_mime) in &files {
         let result = eval(&format!(

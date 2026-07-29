@@ -39,13 +39,7 @@
 use sema_core::{NativeFn, NodePtr, Value};
 use sema_eval::Interpreter;
 
-/// A path as a string safe to embed in Sema source: forward slashes, because
-/// backslashes in a Windows path read as string escapes inside a Sema string
-/// literal (`\Users` starts a `\U` unicode escape), and every platform
-/// accepts `/` separators.
-fn sema_path(p: &std::path::Path) -> String {
-    p.to_string_lossy().replace('\\', "/")
-}
+use crate::common::sema_path;
 
 /// A unique temp file path for one test, removed on drop (also on panic).
 struct TempFile(std::path::PathBuf);

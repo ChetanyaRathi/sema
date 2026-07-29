@@ -234,36 +234,21 @@ Both are honest **narrowed-terminal** dispositions, not gaps to silently close.
 
 The wave took the Windows leg from 189 failures + 9 hangs to fully green
 (7193/7193) and fixed four product bugs; full history in
-`docs/bugs/archive/2026-07-29-windows-product-bugs.md`. What's consciously
-still open:
+`docs/bugs/archive/2026-07-29-windows-product-bugs.md`. The follow-up pass
+(fix/windows-followups) closed the rest: MCP HTTP `mcp/close` cancel now
+severs deterministically (transport jobs run as tasks on the shared I/O
+runtime instead of relying on drop-timing from a blocking thread; detector
+un-gated), the stdio liveness probe is a real check on Windows
+(OpenProcess/GetExitCodeProcess instead of the process-killing os.kill), root
+`.gitattributes` pins `*.sema`/`*.sh` to LF and fixtures to -text,
+`docs-search-gate.sh` runs in nightly.yml, `sema_path`/`sema_str` live once
+in `crates/sema/tests/common/`, and the windows-leg placement decision is
+recorded in nightly.yml (deliberately nightly). Still open:
 
-- **MCP HTTP cancel teardown** (the one unfixed product bug): cancelling an
-  in-flight `mcp/close` DELETE settles the root but the peer sees no
-  disconnect within 30s on Windows — on Unix, dropping the request future
-  closes the connection. Needs Windows-side investigation of reqwest/hyper
-  teardown (`interruptible_blocking` in sema-mcp builtins; Http `shutdown` in
-  client.rs). Detector test `runtime_mcp_close_wait_is_promptly_cancellable`
-  is `#[cfg(unix)]` with a pointer here. The proven iteration loop is a
-  `fix/windows*` PR branch with a temporary PR-triggered Windows workflow
-  (see the deleted `.github/workflows/windows-tests.yml` in git history).
-- **Vacuous stdio liveness probe**: `stdio_server_exited`
-  (mcp_runtime_test.rs) probes with python `os.kill(pid, 0)` + `ps`; on
-  Windows `os.kill(pid, 0)` unconditionally kills a live pid and `ps` doesn't
-  exist, so the StdioServerExit cancellation oracles pass vacuously there.
-  Fix: a portable liveness probe (ctypes OpenProcess/GetExitCodeProcess on
-  Windows).
-- **Root `.gitattributes` hardening**: `*.sema`/`*.sh` `text eol=lf` and
-  `crates/sema/tests/fixtures/** -text` would close the CRLF-checkout class
-  permanently (two instances fixed in-test during the wave; a scoped
-  `*.pdf binary` landed in the fixtures dir). Deferred to its own commit —
-  normalization changes shouldn't ride along with other work.
-- **Windows leg placement**: nightly (current) vs back into the per-push gate
-  as required. Decide after a few green nights; per-push costs ~12 Windows
-  runner-minutes per push and the leg was moved off the push path for speed.
-- **`docs-search-gate.sh` has no workflow**: the hermetic embedded-asset gate
-  (scratch container, --network none) runs only manually (run green
-  2026-07-29 pre-1.32.0). Wire into nightly.yml (cheap) or verify.yml
-  (strongest); docker rebuild is ~2-4 min per CI run.
-- **Test-helper consolidation**: `sema_path()` (embed a host path into Sema
-  source in forward-slash form) is duplicated across ~6 test files; one
-  canonical copy belongs in `crates/sema/tests/common/`.
+- **`mcp/call` / `mcp/connect` HTTP mid-cancel severing** rides the old
+  blocking-thread drop chain: their job futures are non-`Send`
+  (`Box<dyn RedirectDriver>` held across awaits in the oauth seam), so they
+  can't route through `run_transport_task` without adding `Send` bounds
+  through `RedirectDriver` and the credential store. Their Windows detectors
+  are stdio-based (green via child-kill); no failing test pins the HTTP
+  case. Do the `Send`-bound refactor, then route them through the helper.

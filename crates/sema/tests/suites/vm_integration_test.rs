@@ -751,14 +751,11 @@ fn test_example_pattern_defmacro_with_named_let() {
     );
 }
 
-/// A temp-dir path spliceable into a Sema string literal: `\` would start an
-/// escape there (`C:\Users\…` reads as a `\U` unicode escape), and forward
-/// slashes are valid path separators on every platform, including Windows.
+/// A temp-dir path spliceable into a Sema string literal.
 fn temp_path_literal(name: &str) -> String {
-    std::env::temp_dir()
-        .join(format!("sema-vm-test-{name}-{}.sema", std::process::id()))
-        .to_string_lossy()
-        .replace('\\', "/")
+    crate::common::sema_path(
+        &std::env::temp_dir().join(format!("sema-vm-test-{name}-{}.sema", std::process::id())),
+    )
 }
 
 #[test]
