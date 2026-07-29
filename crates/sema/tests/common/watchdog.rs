@@ -29,25 +29,39 @@ struct BoundedDrain {
     stop: Arc<AtomicBool>,
     #[cfg(windows)]
     started: Arc<AtomicBool>,
+    // Raw pipe HANDLE (as usize so the struct stays Send), captured before the
+    // reader moves into the drain thread. Cancellation must target the FILE:
+    // std's child-stdio pipes are named pipes opened FILE_FLAG_OVERLAPPED, so
+    // their reads are overlapped I/O, which CancelSynchronousIo (thread-
+    // targeted) can never cancel — it returned ERROR_NOT_FOUND forever and
+    // the join waited for the pipe to break instead (~3s per straggler).
+    #[cfg(windows)]
+    pipe: usize,
 }
 
 impl BoundedDrain {
     fn finish(self) -> Vec<u8> {
         #[cfg(windows)]
         {
-            use std::os::windows::io::AsRawHandle;
-            use windows_sys::Win32::Foundation::ERROR_NOT_FOUND;
-            use windows_sys::Win32::System::IO::CancelSynchronousIo;
+            use windows_sys::Win32::Foundation::{ERROR_INVALID_HANDLE, ERROR_NOT_FOUND};
+            use windows_sys::Win32::System::IO::CancelIoEx;
 
             while !self.started.load(Ordering::Acquire) && !self.handle.is_finished() {
                 thread::yield_now();
             }
             self.stop.store(true, Ordering::Release);
             while !self.handle.is_finished() {
-                let cancelled = unsafe { CancelSynchronousIo(self.handle.as_raw_handle()) };
+                // ERROR_NOT_FOUND: no read in flight this instant (loop again).
+                // ERROR_INVALID_HANDLE: the drain thread finished and dropped
+                // the reader between our is_finished check and this call —
+                // benign shutdown race.
+                let cancelled = unsafe { CancelIoEx(self.pipe as _, std::ptr::null()) };
                 if cancelled == 0 {
                     let error = io::Error::last_os_error();
-                    if error.raw_os_error() != Some(ERROR_NOT_FOUND as i32) {
+                    let raw = error.raw_os_error();
+                    if raw != Some(ERROR_NOT_FOUND as i32)
+                        && raw != Some(ERROR_INVALID_HANDLE as i32)
+                    {
                         panic!("cancel watchdog diagnostic read: {error}");
                     }
                 }
@@ -75,7 +89,7 @@ where
 #[cfg(windows)]
 fn drain_bounded<R>(reader: R) -> BoundedDrain
 where
-    R: Read + Send + 'static,
+    R: std::os::windows::io::AsRawHandle + Read + Send + 'static,
 {
     spawn_windows_pipe_drain(reader)
 }
@@ -123,8 +137,10 @@ where
 #[cfg(windows)]
 fn spawn_windows_pipe_drain<R>(mut reader: R) -> BoundedDrain
 where
-    R: Read + Send + 'static,
+    R: std::os::windows::io::AsRawHandle + Read + Send + 'static,
 {
+    use std::os::windows::io::AsRawHandle;
+    let pipe = reader.as_raw_handle() as usize;
     let stop = Arc::new(AtomicBool::new(false));
     let drain_stop = Arc::clone(&stop);
     let started = Arc::new(AtomicBool::new(false));
@@ -170,6 +186,7 @@ where
         handle,
         stop,
         started,
+        pipe,
     }
 }
 
