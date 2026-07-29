@@ -81,6 +81,49 @@ Two construction rules keep the value oracle exact:
   are ≤ 5 ms; capacities are 1–3 — small enough to park senders, never enough
   to deadlock a balanced program.
 
+### Confluent-value twin oracle
+
+The generation-time expected value is a model, and a bug in the model could
+agree with a buggy runtime. In async mode, every generated program whose async
+constructs are all mechanically de-asyncable is therefore also checked against
+an independent **sequential twin**, derived by a structural rewrite:
+
+| construct                      | twin                    |
+| ------------------------------ | ----------------------- |
+| `(async B …)`                  | `(begin B …)`           |
+| `(async/await X)`              | `X`                     |
+| `(async/all (list E …))`       | `(list E …)`            |
+| `(async/map F XS)`             | `(map F XS)`            |
+| `(async/pool-map F XS W)`      | `(map F XS)`            |
+| `(async/spawn-all (list T …))` | `(list (T) …)`          |
+| `(async/sleep K)`, `(sleep K)` | `nil` (effect position) |
+
+The async program, its sequential twin, and the model must all produce the
+same value, so a bug in the generation-time model cannot self-mask. Programs
+containing a construct with no mechanical twin — any `channel/*` op,
+cancellation, race, timeout, the offload file ops, or a `throw` inside an
+owned combinator (fail-fast cancels siblings; plain `map` does not) — skip the
+twin and are covered by the generation-time model plus the `#t` laws embedded
+in their forms (`cancelled?`, `closed?`, caught error markers, race-winner
+identity). The oracle class of every async production is recorded in a comment
+table in `grammar-fuzz.sema` above the productions; a new production must add
+a row there. Unknown `async/*` and `channel/*` ops block twinning by default,
+so a future production cannot be silently mistwinned.
+
+Each async check batch ends with a stat line that proves the twin oracle ran
+instead of passing vacuously:
+
+```
+twin-oracle: checked=11 non-mechanical=28 rewrites: async=24 await=10 all=5 map=2 pool-map=3 spawn-all=0
+```
+
+`checked` counts programs whose twin was derived and evaluated (a program with
+no async construct twins to itself and is not counted); `non-mechanical`
+counts programs skipped because of a blocked construct; the rewrite counts
+show which construct rewrites fired. The twin walker consumes no RNG and no
+gensym, so the seed-to-program mapping is identical with and without the
+oracle.
+
 Because generated programs may park, async check mode runs seeds in batches
 per subprocess with an **external watchdog** (`-b` batch size, default 100;
 `-t` per-program budget in seconds, default 5). A batch that exceeds
