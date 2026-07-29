@@ -52,5 +52,5 @@ IO_BLOCK_ON	crates/sema-stdlib/src/runtime_offload.rs	2	offload machinery drives
 IO_BLOCK_ON	crates/sema-stdlib/src/http.rs	1	top-level synchronous http path on a host thread (non-quantum); runtime http suspends structurally
 IO_BLOCK_ON	crates/sema-stdlib/src/ws.rs	5	host synchronous websocket connect/send/recv/close on a host thread (non-quantum)
 IO_BLOCK_ON	crates/sema-stdlib/src/server.rs	4	host synchronous server request/response ops on a host thread (non-quantum)
-IO_BLOCK_ON	crates/sema-mcp/src/builtins.rs	8	host/worker MCP connection ops (connect/list-tools/call/close/login) driven off the VM thread on a plain worker
+IO_BLOCK_ON	crates/sema-mcp/src/builtins.rs	10	host/worker MCP connection ops (connect/list-tools/call/close/login/reauth) driven off the VM thread on a plain worker; the two OAuth legs run io_block_on inside blocking-tier offload closures
 IO_BLOCK_ON	crates/sema/src/workflow_mcp.rs	3	workflow MCP connect/refresh driven via io_block_on on a plain worker, off the VM thread

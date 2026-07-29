@@ -497,35 +497,37 @@ H05	crates/sema-lsp/src/server.rs:758:    // `blocking_recv` observes channel cl
 H05	crates/sema-lsp/src/server.rs:778:            rx.blocking_recv()
 H05	crates/sema-lsp/src/server.rs:869:                    handle.block_on(async {
 H05	crates/sema-lsp/src/server.rs:879:                    handle.block_on(async {
-C13	crates/sema-mcp/src/builtins.rs:1122:            let result = sema_io::io_block_on(async move {
-C13	crates/sema-mcp/src/builtins.rs:1487:    let result = block_on(call_tool_async(
-C13	crates/sema-mcp/src/builtins.rs:1787:            let completed = sema_io::io_block_on(async move {
-C13	crates/sema-mcp/src/builtins.rs:2260:                    sema_io::io_block_on(run_transport_task(async move {
-C13	crates/sema-mcp/src/builtins.rs:2276:                    sema_io::io_block_on(run_transport_task(async move {
-C13	crates/sema-mcp/src/builtins.rs:2490:    let result = block_on(list_tools_async(&mut conn));
+C13	crates/sema-mcp/src/builtins.rs:1144:            let result = sema_io::io_block_on(run_transport_task(async move {
+C13	crates/sema-mcp/src/builtins.rs:1361:        sema_io::io_block_on(async move {
+C13	crates/sema-mcp/src/builtins.rs:1519:    let result = block_on(call_tool_async(
+C13	crates/sema-mcp/src/builtins.rs:1811:            let payload = sema_io::io_block_on(run_transport_task(async move {
+C13	crates/sema-mcp/src/builtins.rs:2292:                    sema_io::io_block_on(run_transport_task(async move {
+C13	crates/sema-mcp/src/builtins.rs:2308:                    sema_io::io_block_on(run_transport_task(async move {
 C13	crates/sema-mcp/src/builtins.rs:24://! the same transport futures through [`block_on`].
-C13	crates/sema-mcp/src/builtins.rs:2612:            let payload = sema_io::io_block_on(run_transport_task(async move {
-C13	crates/sema-mcp/src/builtins.rs:2677:/// `io_block_on` would hit its active-quantum guard AND block the cooperative
-C13	crates/sema-mcp/src/builtins.rs:2686:        let _ = block_on(close_async(&mut conn));
-C13	crates/sema-mcp/src/builtins.rs:2691:/// where `io_block_on` is legal (no active runtime quantum on that thread). Kept
-C13	crates/sema-mcp/src/builtins.rs:2693:/// the `io_block_on` lives on the worker, not the VM thread, so it must not sit
-C13	crates/sema-mcp/src/builtins.rs:2699:        let _ = sema_io::io_block_on(close_async(&mut conn));
-C13	crates/sema-mcp/src/builtins.rs:2732:    let result = block_on(close_async(&mut conn));
-C13	crates/sema-mcp/src/builtins.rs:2856:        let error = sema_io::io_block_on(crate::oauth::login::login(
-C13	crates/sema-mcp/src/builtins.rs:318:/// non-runtime) path. Routes through `sema_io::io_block_on`, the ADR
-C13	crates/sema-mcp/src/builtins.rs:323:/// offered both: "keep TOKIO_RT/block_on... or route through the sanctioned
-C13	crates/sema-mcp/src/builtins.rs:331:/// from inside `async/spawn` could not be driven on a private runtime). Routing every
-C13	crates/sema-mcp/src/builtins.rs:336:/// behavior is unchanged: `io_block_on` blocks the calling thread until the
-C13	crates/sema-mcp/src/builtins.rs:338:fn block_on<F: Future>(future: F) -> F::Output {
-C13	crates/sema-mcp/src/builtins.rs:339:    sema_io::io_block_on(future)
+C13	crates/sema-mcp/src/builtins.rs:2522:    let result = block_on(list_tools_async(&mut conn));
+C13	crates/sema-mcp/src/builtins.rs:2644:            let payload = sema_io::io_block_on(run_transport_task(async move {
+C13	crates/sema-mcp/src/builtins.rs:2709:/// `io_block_on` would hit its active-quantum guard AND block the cooperative
+C13	crates/sema-mcp/src/builtins.rs:2718:        let _ = block_on(close_async(&mut conn));
+C13	crates/sema-mcp/src/builtins.rs:2723:/// where `io_block_on` is legal (no active runtime quantum on that thread). Kept
+C13	crates/sema-mcp/src/builtins.rs:2725:/// the `io_block_on` lives on the worker, not the VM thread, so it must not sit
+C13	crates/sema-mcp/src/builtins.rs:2731:        let _ = sema_io::io_block_on(close_async(&mut conn));
+C13	crates/sema-mcp/src/builtins.rs:2764:    let result = block_on(close_async(&mut conn));
+C13	crates/sema-mcp/src/builtins.rs:2888:        let error = sema_io::io_block_on(crate::oauth::login::login(
+C13	crates/sema-mcp/src/builtins.rs:321:/// non-runtime) path. Routes through `sema_io::io_block_on`, the ADR
+C13	crates/sema-mcp/src/builtins.rs:326:/// offered both: "keep TOKIO_RT/block_on... or route through the sanctioned
+C13	crates/sema-mcp/src/builtins.rs:334:/// from inside `async/spawn` could not be driven on a private runtime). Routing every
+C13	crates/sema-mcp/src/builtins.rs:339:/// behavior is unchanged: `io_block_on` blocks the calling thread until the
+C13	crates/sema-mcp/src/builtins.rs:341:fn block_on<F: Future>(future: F) -> F::Output {
+C13	crates/sema-mcp/src/builtins.rs:342:    sema_io::io_block_on(future)
 C13	crates/sema-mcp/src/builtins.rs:38://! **Cancellation semantics.** If a task is cancelled (`async/cancel`,
 C13	crates/sema-mcp/src/builtins.rs:39://! `async/timeout` expiry) while it holds a connection's checkout, the slot is
-C13	crates/sema-mcp/src/builtins.rs:413:/// access — legal to drive via the sync `block_on` or `sema_io::io_block_on`.
-C13	crates/sema-mcp/src/builtins.rs:738:/// only (drives [`connect_dispatch_async`] via the blocking [`block_on`]) —
-C13	crates/sema-mcp/src/builtins.rs:748:    let (client, identity) = block_on(connect_dispatch_async(
-C13	crates/sema-mcp/src/builtins.rs:76:thread_local! {
-C13	crates/sema-mcp/src/builtins.rs:773:/// `async/spawn`) — see `docs/plans/2026-06-24-workflow-mcp-auth.md` §3.
-C13	crates/sema-mcp/src/builtins.rs:801:/// executor worker where `io_block_on` is legal — WITHOUT touching the
+C13	crates/sema-mcp/src/builtins.rs:416:/// access — legal to drive via the sync `block_on` or `sema_io::io_block_on`.
+C13	crates/sema-mcp/src/builtins.rs:624:        sema_io::io_block_on(async move {
+C13	crates/sema-mcp/src/builtins.rs:760:/// only (drives [`connect_dispatch_async`] via the blocking [`block_on`]) —
+C13	crates/sema-mcp/src/builtins.rs:770:    let (client, identity) = block_on(connect_dispatch_async(
+C13	crates/sema-mcp/src/builtins.rs:795:/// `async/spawn`) — see `docs/plans/2026-06-24-workflow-mcp-auth.md` §3.
+C13	crates/sema-mcp/src/builtins.rs:79:thread_local! {
+C13	crates/sema-mcp/src/builtins.rs:823:/// executor worker where `io_block_on` is legal — WITHOUT touching the
 C13	crates/sema-mcp/src/client_auth.rs:35:        rt.block_on(async {
 C13	crates/sema-mcp/src/client_auth.rs:89:/// `block_on` already active on the same thread.
 C13	crates/sema-mcp/src/client_auth.rs:96:    rt.block_on(async {
