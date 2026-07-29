@@ -134,3 +134,85 @@ Depth 4 batches (thousands of seeds) have not hit it.
 | 2026-07-29 | all families | 400000..400499 (500) | 6 | PASS |
 | 2026-07-29 | all families | 500000..500499 (500) | 6 | ABORT at 500197 (finding 3, second instance) |
 | 2026-07-30 | all families, final verification | 700000..700499 (500) | 4 | PASS (watchdog active, 6 s) |
+
+## Resolutions (phase 2, 2026-07-30)
+
+### Finding 3 — FIXED (commit `f70321bd`)
+
+**Root cause** (`crates/sema-vm/src/runtime/state.rs`): a registered
+promise-set wait (`async/await`/`all`/`race`/`timeout`) holds its members as
+raw `PromiseId`s, invisible to the cycle collector. Once a member settles,
+`PromiseRegistry::settle` consumes that member's waiter entry, so the
+registry's "no waiters" eviction guard (`PromiseRegistry::gc_evict`,
+`crates/sema-vm/src/runtime/promise.rs:189`) no longer saw the wait's
+interest. If the member's handle was a temporary (nothing else kept the
+`Value` alive), the collector's dead-handle candidate prune
+(`crates/sema-core/src/cycle.rs`, `evict_dead_registry_record`) evicted the
+settled record while the wait was still parked. The wait's next re-poll —
+`consume_promise_wake` → `promise_set_response`
+(`crates/sema-vm/src/runtime/state.rs`) — then hit `RegistryError::Unknown`
+and raised the uncatchable `RuntimeFault::Invariant`.
+
+The state-dependence decodes fully: the detached spawn tree (P(200001)) and
+async load supply allocation churn so a GC pass lands while a later eval's
+`async/all` is parked with an already-settled temporary member. Minimal
+repro (deterministic, no fuzzer state — faulted 3/3 pre-fix):
+
+```sema
+(let ((ch (channel/new 1)))
+  (let ((slow (async (channel/recv ch))))
+    (async (async/sleep 10) (gc/collect) (channel/send ch 2))
+    (async/all (list (async 1) slow))))
+```
+
+**Fix**: `RuntimeState::gc_evict_promise` defers the eviction of any id a
+registered `Promises` wait still lists (the collector prunes a dead handle's
+candidate exactly once, so the runtime owns the retry);
+`teardown_promise_set_wait` replays the deferred eviction at all four
+`Promises`-wait teardown sites (completion, timeout deadline, cancellation,
+deadlock deregistration) once no registered wait references the id. The
+invariant itself is sound and stays.
+
+**Test**:
+`vm_async_test::gc_pass_while_promise_set_wait_parked_keeps_settled_members_resolvable`.
+Both repro recipes (200000×51, 500150×48) and the batches below now pass.
+
+### Finding 1 — FIXED (commit `290b0dba`)
+
+The blocking `sleep` worker now parks on a condvar bounded by the sleep
+deadline (`SleepWake` in `crates/sema-stdlib/src/system.rs`) instead of an
+uninterruptible `std::thread::sleep`; `SleepCancelHook::cancel`/`reap`
+signal it. A cancelled blocking sleep releases its worker immediately — no
+pool exhaustion from dead workers, and interpreter shutdown's executor
+drain no longer runs to its full 2 s deadline (the CLI repro exits in
+~30 ms). Non-cancelled sleeps are unchanged (`wait_timeout` expires at the
+same deadline). Test:
+`vm_async_test::cancelled_blocking_sleep_releases_worker_and_shutdown_promptly`.
+The generator's 1500 ms cancel-target cap is no longer load-bearing.
+
+### Finding 2 — doc gap, not a bug (docs fixed)
+
+`async/cancel` is deliberately a request (sticky cancellation observed at
+settlement, UCR-1): a not-yet-started task has nothing to unwind and
+settles synchronously, while a parked task settles when the runtime tears
+its wait down on a later drive turn — settling it synchronously inside the
+builtin would require running wait teardown re-entrantly mid-quantum,
+against the staged-teardown design (`pending_cancel_waits`, the UCR-3
+wake-in-flight guard). Post-settle reads are deterministic for every wait
+kind (fuzzer-verified), so the model is coherent; only the docs were wrong:
+`async-cancel.md` claimed `#t` means the promise "actually transitioned"
+to `Cancelled`, which is false for the parked case (`#t` = request
+recorded). Both entries
+(`crates/sema-docs/entries/stdlib/concurrency/async-cancel.md`,
+`async-cancelled-p.md`) now state the request model and the
+await-then-read discipline. The website async docs
+(`website/docs/stdlib/concurrency.md`, outside this task's file scope) should pick up
+the same wording when next touched.
+
+### Post-fix batch log
+
+| Date | Commit stage | Seeds | Depth | Result |
+| --- | --- | --- | --- | --- |
+| 2026-07-30 | finding-3 fix | 200000..201999 (2000) | 6 | PASS |
+| 2026-07-30 | finding-3 fix | 500000..500499 (500) | 6 | PASS |
+| 2026-07-30 | finding-1 fix | 200000..200499 (500) | 6 | PASS |

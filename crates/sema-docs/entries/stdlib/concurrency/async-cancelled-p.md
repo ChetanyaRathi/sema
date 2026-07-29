@@ -13,3 +13,5 @@ section: "Promises"
 ```sema
 (async/cancelled? (async/rejected "cancelled"))  ;; => #f
 ```
+
+Reads the settled state only. `async/cancel` is a request: a task cancelled before it started settles immediately (`async/cancelled?` is `#t` right away), but a task parked on a wait settles only when the runtime tears the wait down, so this read can be `#f` immediately after a successful cancel. Await the promise (under `try`) first for a deterministic answer — see `async/cancel`.
