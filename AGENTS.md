@@ -111,7 +111,7 @@ OAuth terms are all fine).
   thing. Use names from the code verbatim.
 - State the problem, the cause, and the fix, explicitly and in that order.
 - Do not use metaphors, invented idioms, or rhetorical language. Do not use
-  "load-bearing", "sharp edge", "seam", "beachhead", "north star", "maiden",
+  "load-bearing", "sharp edge", "seam", "beachhead", "north star", "maiden", "substrate",
   "wave", "papercut", "surface" (as a verb), "journey", or "story" unless the
   word has a literal technical meaning in context.
 - Terms with a fixed technical meaning in this repo stay: "gate" (a CI check
