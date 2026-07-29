@@ -22,7 +22,7 @@
 - The Windows test suite went from 189 failures + 9 hangs to a single known
   test-infra failure (7192/7193); Unix-only suites are cfg-gated and the
   rest of the failures were test portability, fixed. See
-  docs/bugs/2026-07-29-windows-product-bugs.md.
+  docs/bugs/archive/2026-07-29-windows-product-bugs.md.
 
 ### CI overhaul — one gate, fail fast, release-path fixes
 

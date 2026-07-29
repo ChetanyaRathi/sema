@@ -3186,7 +3186,7 @@ fn write_executable_platform(
             // libsui's own writer emits insertion order, which the Win32 API
             // cannot see (ERROR_RESOURCE_TYPE_NOT_FOUND) even though linear
             // parsers can — every `sema build` exe booted as the bare REPL on
-            // Windows (docs/bugs/2026-07-29-windows-product-bugs.md bug 1).
+            // Windows (docs/bugs/archive/2026-07-29-windows-product-bugs.md bug 1).
             // So: libsui embeds the payload + icon first, and the editpe
             // (>=0.2, sorting) version-info pass runs last, re-serializing
             // the whole tree — payload, icons, and VERSIONINFO all survive

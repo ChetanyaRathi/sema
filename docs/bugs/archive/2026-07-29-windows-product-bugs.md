@@ -1,3 +1,6 @@
+> ARCHIVED 2026-07-29: all product bugs fixed except the MCP HTTP cancel
+> teardown, tracked with the other leftovers as WIN-1 in docs/deferred.md.
+
 # Windows product bugs surfaced by the test-porting wave (2026-07-29)
 
 The Windows test leg's first honest run (nightly harness, PR #135) reduced 189
@@ -79,13 +82,11 @@ Detected by: `runtime_mcp_close_wait_is_promptly_cancellable`
 
 ## Test-infra debt (not product)
 
-- `tests/common/watchdog.rs` `BoundedDrain::finish` cancels reads with
-  `CancelSynchronousIo`, but std's child-stdio pipes are overlapped named
-  pipes — it can never cancel them (perpetual `ERROR_NOT_FOUND`); the join
-  waits for pipe break instead (~3.3s observed). Fix: duplicate the pipe
-  handle before moving the reader into the drain thread and `CancelIoEx` it;
-  the drain loop's `ERROR_OPERATION_ABORTED` arm already handles the wakeup.
-  Detected by: `windows_inherited_pipe_writer_does_not_block_drain_join`.
+- **FIXED (#136, leg fully green 7193/7193):** `tests/common/watchdog.rs`
+  `BoundedDrain::finish` cancelled reads with `CancelSynchronousIo`, but
+  std's child-stdio pipes are overlapped named pipes it can never cancel;
+  now targets the FILE with `CancelIoEx` on a handle captured before the
+  reader moves into the drain thread.
 - `stdio_server_exited` (mcp_runtime_test.rs) probes liveness with python
   `os.kill(pid, 0)` + `ps`: on Windows `os.kill(pid, 0)` KILLS the process and
   `ps` doesn't exist, so the probe reports "exited" vacuously.
