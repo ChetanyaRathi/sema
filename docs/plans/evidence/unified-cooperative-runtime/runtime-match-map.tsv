@@ -906,11 +906,11 @@ H02	crates/sema/src/main.rs:1432:        std::thread::sleep(std::time::Duration:
 H02	crates/sema/src/main.rs:1502:            std::thread::sleep(std::time::Duration::from_secs(3600));
 H02	crates/sema/src/main.rs:1607:                .block_on(sema_notebook::serve(path, &host, port));
 H02	crates/sema/src/main.rs:2153:        // Same no-ambient-runtime rule as the CLI mcp arm (llm/* + io_block_on).
-H02	crates/sema/src/main.rs:3586:    // runtime, the sole async engine, so async/await, channels, and timers work
+H02	crates/sema/src/main.rs:3593:    // runtime, the sole async engine, so async/await, channels, and timers work
 H02	crates/sema/src/main.rs:987:                    .block_on(sema_lsp::run_server());
 H02	crates/sema/src/main.rs:994:                    .block_on(sema_dap::run_server());
-H02	crates/sema/src/pkg.rs:1529:                std::thread::sleep(jittered(wait));
-H02	crates/sema/src/pkg.rs:1542:                std::thread::sleep(jittered(backoff));
+H02	crates/sema/src/pkg.rs:1539:                std::thread::sleep(jittered(wait));
+H02	crates/sema/src/pkg.rs:1552:                std::thread::sleep(jittered(backoff));
 H03	crates/sema/src/repl/completer.rs:16:thread_local! {
 H08	crates/sema/src/web/mod.rs:154:            std::thread::sleep(std::time::Duration::from_millis(100));
 H13	crates/sema/src/web/runtime.rs:414:            "installAtomicsSleep",
