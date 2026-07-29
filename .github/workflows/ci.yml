@@ -4,23 +4,30 @@
 # gates anything, and together they tripled this workflow's wall clock.
 name: CI
 
+# Docs/website-only pushes can't affect the gate, with two carve-outs for
+# docs-located files that tests consume: crates/sema-docs/entries/*.md feeds
+# the docs-check gate (covered — crates/** isn't ignored) and
+# docs/plans/evidence/** holds the runtime-conformance inventory TSVs (the
+# `!`-exception below; `paths` with negations, not `paths-ignore`, because
+# only `paths` supports exceptions).
 on:
   push:
     branches: [main]
-    # Docs/website-only pushes can't affect the gate. Deliberately NOT a
-    # blanket `**.md` ignore: crates/sema-docs/entries/*.md are inputs to the
-    # `jake docs-check` gate and must keep triggering.
-    paths-ignore:
-      - "docs/**"
-      - "website/**"
-      - "CHANGELOG.md"
-      - "README.md"
+    paths:
+      - "**"
+      - "!docs/**"
+      - "docs/plans/evidence/**"
+      - "!website/**"
+      - "!CHANGELOG.md"
+      - "!README.md"
   pull_request:
-    paths-ignore:
-      - "docs/**"
-      - "website/**"
-      - "CHANGELOG.md"
-      - "README.md"
+    paths:
+      - "**"
+      - "!docs/**"
+      - "docs/plans/evidence/**"
+      - "!website/**"
+      - "!CHANGELOG.md"
+      - "!README.md"
 
 # Superseded pushes stop burning runners. Scoped to this workflow only — the
 # publish workflow's verify call runs inside its own run and must never be
