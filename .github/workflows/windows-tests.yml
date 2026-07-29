@@ -53,8 +53,26 @@ jobs:
         shell: bash
         run: |
           set -x
+          pip install pefile
+          cat > dumpres.py <<'PY'
+          import sys, pefile
+          pe = pefile.PE(sys.argv[1])
+          for t in pe.DIRECTORY_ENTRY_RESOURCE.entries:
+              tname = str(t.name) if t.name else pefile.RESOURCE_TYPE.get(t.id, t.id)
+              names = [str(e.name) if e.name else str(e.id) for e in t.directory.entries]
+              print("RES", tname, names)
+          PY
           printf '(display "carrier-ok")' > probe.sema
+          # Carrier 1: the debug test binary (what the failing tests use).
           cargo run -p sema-lang -- build -o probe-debug.exe probe.sema || true
           ./probe-debug.exe < /dev/null || true
-          cargo run -p sema-lang -- build --target windows -o probe-release.exe probe.sema || true
-          ./probe-release.exe < /dev/null || true
+          python dumpres.py probe-debug.exe || true
+          # Carrier 2: the released v1.31.5 sema.exe (what end users get) —
+          # --target windows on a Windows host short-circuits to "this
+          # executable", so force the release carrier via --runtime.
+          curl -sL -o rel.zip https://github.com/sema-lisp/sema/releases/download/v1.31.5/sema-lang-x86_64-pc-windows-msvc.zip
+          unzip -o -q rel.zip -d rel
+          RT=$(find rel -name 'sema.exe' | head -1)
+          cargo run -p sema-lang -- build --runtime "$RT" -o probe-rel.exe probe.sema || true
+          ./probe-rel.exe < /dev/null || true
+          python dumpres.py probe-rel.exe || true
