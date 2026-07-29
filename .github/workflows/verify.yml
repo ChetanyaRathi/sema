@@ -1,19 +1,28 @@
-# Reusable verification gate — the same correctness checks CI runs, callable from
-# the publish workflows so a release can NEVER ship when tests are red.
-# (CI runs on branch pushes; the tag-triggered publishes call this to gate.)
+# The single verification gate — every correctness check that must pass before
+# code ships. ci.yml calls this on every push/PR and the publish workflow calls
+# it on tags, so push CI and the publish gate are one definition and cannot
+# drift (the old duplicated ci.yml/verify.yml bodies drifted destructively
+# twice: nextest-installed-after-docs-check broke every push for weeks, and a
+# missing ripgrep silently failed the conformance tests).
 name: Verify
 
 on:
   workflow_call:
-  # Run the gate on demand, without cutting a release. `workflow_call` alone
-  # means this only ever executes on a tag push, so a break in it stays
-  # invisible until someone tries to publish — which is exactly what happened:
-  # the packaged-crate check landed 2026-07-10 and its failure was not seen
-  # until the next release, 16 days later, by which point it had also hidden a
-  # genuine packaging bug behind it. Exercise this before tagging.
+  # Run the gate on demand, without cutting a release. Historically this only
+  # executed on tag pushes, so a break in it stayed invisible until someone
+  # tried to publish — which is exactly what happened: the packaged-crate check
+  # landed 2026-07-10 and its failure was not seen until the next release, 16
+  # days later, by which point it had also hidden a genuine packaging bug
+  # behind it. ci.yml calling this per-push closes that hole; the dispatch
+  # trigger stays as the on-demand path.
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
+  # Proves the WASM runtime still builds (and passes its focused browser
+  # regressions) — the "broken WASM build must never reach a release" gate.
   playground-runtime:
     permissions:
       contents: read
@@ -21,65 +30,73 @@ jobs:
 
   verify:
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v7
 
-      - name: Install system dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libudev-dev pkg-config ripgrep
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+      # ripgrep: the unified-runtime conformance tests scan with `rg`.
+      # shfmt: `jake scripts.check`.
+      - name: Set up toolchain, cache, jake
+        uses: ./.github/actions/setup-sema
         with:
           components: rustfmt, clippy
-
-      # Smart Rust cache: derives its key from the toolchain + Cargo.lock and
-      # partial-restores on changes (vs. the old exact-match key that cold-rebuilt
-      # the whole workspace whenever Cargo.lock moved — i.e. every release).
-      - name: Cache cargo + target
-        uses: Swatinem/rust-cache@v2
-
-      - name: Install jake
-        run: |
-          mkdir -p "$HOME/.local/bin"
-          curl -fsSL https://github.com/HelgeSverre/jake/releases/latest/download/jake-linux-x86_64 -o "$HOME/.local/bin/jake"
-          chmod +x "$HOME/.local/bin/jake"
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-      - name: Verify jake
-        run: jake --version
+          apt-packages: libudev-dev pkg-config ripgrep shfmt
 
       # Gate the publish on a complete crate list: every publishable workspace
-      # crate must be in publish.yml's order, so a release can't half-publish on a
-      # newly-added crate (as happened with sema-otel in 1.22.0).
+      # crate must be in the publish order, so a release can't half-publish on
+      # a newly-added crate (as happened with sema-otel in 1.22.0).
       - name: Check publish list is complete
-        run: ./scripts/check-publish-list.sh
+        run: jake release.check-publish-list
 
-      - name: Check formatting
-        run: cargo fmt -- --check
+      - name: Lint (fmt-check + clippy --workspace)
+        run: jake lint
 
-      - name: Clippy
-        run: cargo clippy --workspace -- -D warnings
+      - name: Shell-script hygiene (shellcheck + shfmt)
+        run: jake scripts.check
 
-      # Before docs-check: `jake docs-check` runs the LSP builtin-doc-coverage
-      # test through cargo nextest.
-      - name: Install cargo-nextest
-        uses: taiki-e/install-action@nextest
-
-      - name: Check builtin docs
+      - name: Check builtin docs (committed index fresh + fully documented)
         run: jake docs-check
 
       - name: Run tests
-        run: cargo nextest run --workspace --profile ci
+        run: jake test.ci
 
-      - name: Smoke test packaged web runtime
-        run: ./scripts/test-packaged-sema-web.sh
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
 
-      - name: Smoke test examples
-        run: jake examples
+      # LSP protocol-level e2e suite (pytest-lsp over stdio): initialize
+      # handshake, capabilities, diagnostics push, UTF-16 positions — coverage
+      # the in-crate tests cannot see. Reuses the debug binary the test build
+      # above already produced (the cargo build inside is an incremental no-op).
+      - name: LSP e2e suite (pytest)
+        run: jake test.lsp-e2e
 
       - name: Smoke test bytecode
         run: jake smoke-bytecode
+
+      - name: Smoke test packaged web runtime
+        run: jake release.packaged-web
+
+  # Runs every example against the RELEASE binary — the gate's only native
+  # release-profile execution (release-only bug classes exist: a debug_assert
+  # side-effect compiled out of release once shipped a broken browser VM), and
+  # skipping the examples run at all is how a regression once shipped past four
+  # releases. Its own job because the ~4-minute release rebuild of the
+  # workspace crates is unavoidable per run (fresh-checkout mtimes invalidate
+  # cargo's fingerprints for workspace members, so caching cannot absorb it) —
+  # in here it runs parallel to the test suite instead of extending it.
+  examples:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up toolchain, cache, jake
+        uses: ./.github/actions/setup-sema
+        with:
+          install-nextest: "false"
+
+      - name: Smoke test examples
+        run: jake examples
 
   # Fail if the committed `sema web` browser runtime is stale, so an out-of-date
   # runtime can NEVER be published. The runtime under crates/sema/src/web/assets
@@ -100,6 +117,7 @@ jobs:
   # sema-web-tests.yml (Playwright).
   web-runtime:
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@v7
 

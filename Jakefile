@@ -51,12 +51,15 @@
 task all: [lint, test, build]
     echo "all: lint + test + build complete"
 
-# Full CI-equivalent gate (mirrors AGENTS.md release step 1). Runs the checks
-# plain `cargo test` skips: example + bytecode smoke suites. Dependencies run
-# in listed order (run serial, i.e. without -j, so the gate reads top-to-bottom).
+# Full CI-equivalent gate — the SAME checks verify.yml runs (verify.yml calls
+# these recipes, so the local gate and CI cannot drift). Runs everything plain
+# `cargo test` skips: example + bytecode smokes, shell hygiene, the LSP
+# protocol e2e, the web-runtime freshness guard, and the packaged-crate
+# boundary test. Dependencies run in listed order (run serial, i.e. without
+# -j, so the gate reads top-to-bottom, cheap checks first).
 @group ci
-@desc "Full local CI gate: workspace tests + examples + bytecode smoke + lint + docs"
-task ci: [test.workspace, examples, smoke-bytecode, lint, docs-check]
+@desc "Full local CI gate: everything verify.yml runs"
+task ci: [lint, scripts.check, docs-check, test.workspace, test.lsp-e2e, smoke-bytecode, examples, release.runtime-fresh, release.packaged-web]
     echo "CI gate green"
 
 # Runs the full CI gate, then prints the manual release steps from AGENTS.md.

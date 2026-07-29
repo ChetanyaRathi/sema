@@ -2,6 +2,30 @@
 
 ## Unreleased
 
+### CI overhaul — one gate, fail fast, release-path fixes
+
+- **Push CI drops from ~44 to 8.5 minutes wall clock** (measured steady-state
+  on the branch): the advisory Windows leg (0-for-37 green, 44 min/run,
+  cold-compiling every time) and the flaky coverage tail moved to a nightly
+  schedule; the examples smoke runs as a parallel job (its ~4m release rebuild
+  is mtime-bound, not cacheable); superseded pushes cancel in progress;
+  docs/website-only pushes skip CI entirely.
+- **One gate definition.** ci.yml is a thin caller of verify.yml, and both run
+  the same jake recipes (`jake ci` locally = CI). The packaged-crate boundary
+  test, web-runtime freshness check, and publish-list guard now run on every
+  push instead of only at tag time — the "invisible until release" failure
+  mode (16 days red once) is structurally gone. jake's clippy widened to
+  `--workspace` to match CI; the shell-hygiene gate (`jake scripts.check`) now
+  runs in CI.
+- **Release-path fixes:** the MCPB bundle workflow never fired (GITHUB_TOKEN-
+  created releases suppress `release:` events — zero runs ever); it now chains
+  off the Release workflow. The npm wasm was built outside
+  `scripts/wasm-build.sh`, shipping runner paths and missing `opt-level=s` —
+  fixed. cargo-dist artifacts (GitHub archives / installer / Homebrew) gain a
+  fail-hard web-runtime freshness gate. The two publish workflows merged into
+  one (`publish-npm.yml`, name pinned by npm OIDC) so a tag runs verify once,
+  not twice.
+
 ### Browser runtime (`sema-wasm`) — critical fix
 
 - **Host-invoked Sema calls no longer abort the WASM instance.** A `Vec::pop()`

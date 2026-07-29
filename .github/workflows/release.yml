@@ -39,7 +39,6 @@ permissions:
 # If there's a prerelease-style suffix to the version, then the release(s)
 # will be marked as a prerelease.
 on:
-  pull_request:
   push:
     tags:
       - '**[0-9]+.[0-9]+.[0-9]+*'
@@ -127,6 +126,10 @@ jobs:
             curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
             echo "$HOME/.cargo/bin" >> $GITHUB_PATH
           fi
+      - name: "Gate: committed web runtime is fresh"
+        if: "runner.os != 'Windows'"
+        run: "./scripts/check-web-runtime-fresh.sh"
+        shell: "bash"
       - name: "PGO: generate profile (native targets only)"
         run: |
           set +e

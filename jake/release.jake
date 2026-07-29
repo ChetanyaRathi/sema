@@ -1,10 +1,25 @@
 # Coverage, mutation testing, and release guards. Namespaced as `release`.
 
-# Fail if a publishable workspace crate is missing from publish.yml's order.
+# Fail if a publishable workspace crate is missing from the crates.io publish
+# order (the publish-crates job in publish-npm.yml).
 @group release
-@desc "Guard: every publishable crate is in publish.yml's order"
+@desc "Guard: every publishable crate is in the crates.io publish order"
 task check-publish-list:
     ./scripts/check-publish-list.sh
+
+# ── Package-boundary gates ───────────────────────────────────────────
+# Both wrap CI's release gates so the local `jake ci` and verify.yml run the
+# same commands (no inline-CI-bash drift).
+
+@group release
+@desc "Packaged-crate gate: build `sema web` from the packed .crate and serve it"
+task packaged-web:
+    ./scripts/test-packaged-sema-web.sh
+
+@group release
+@desc "Guard: committed sema-web browser runtime is fresh (input fingerprint)"
+task runtime-fresh:
+    ./scripts/check-web-runtime-fresh.sh
 
 # ── Coverage ─────────────────────────────────────────────────────────
 

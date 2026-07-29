@@ -14,3 +14,20 @@ slow-timeout = { period = "120s", terminate-after = 3 }
 
 [profile.ci.junit]
 path = "junit.xml"
+
+# Windows leg (nightly.yml). retries=0: while the leg is red, retrying hung
+# tests doubles the timeout tail (9 pty timeouts x 2 tries once cost ~36 min of
+# a 44-minute job). default-filter drops the Unix-only pty suites — the
+# `proc_pty_async_test` module of the async_suite binary and sema-stdlib's
+# `pty::` unit tests — since subprocess eager-cancel is a documented no-op off
+# Unix, they can only ever time out there (anchored regexes: a bare /pty/
+# would also exclude every test with "empty" in its name). Keeps the
+# slow-timeout hang watchdog.
+[profile.ci-windows]
+retries = 0
+fail-fast = false
+slow-timeout = { period = "120s", terminate-after = 2 }
+default-filter = "not (test(/^proc_pty_async_test::/) | (package(sema-stdlib) & test(/^pty::/)))"
+
+[profile.ci-windows.junit]
+path = "junit.xml"

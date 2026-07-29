@@ -9,6 +9,7 @@ permissions:
 jobs:
   focused-e2e:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
 
@@ -30,6 +31,12 @@ jobs:
       - name: Install playground dependencies
         working-directory: playground
         run: npm ci
+
+      - name: Cache Playwright browsers
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ hashFiles('playground/package-lock.json') }}
 
       - name: Install Chromium
         working-directory: playground

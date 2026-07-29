@@ -1,0 +1,80 @@
+# Advisory legs that don't belong on the per-push critical path:
+#
+#  - test-windows: has never been green (the known first fix wave — cfg(unix)
+#    gating for subprocess eager-cancel and pty tests — hasn't landed; see the
+#    P7 plan referenced from the old ci.yml leg, beb6108d). Per-push it burned
+#    ~44 Windows runner-minutes to produce a permanently red X. It runs here
+#    until near-green, then moves back to the per-push gate as a required job.
+#  - coverage: instrumented re-run of the suite under plain `cargo test`; known
+#    to flake after the real gate already passed (2046c907). Metrics must not
+#    extend or redden the gating path, so they ride the schedule instead.
+name: Nightly
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  # A red job here is the honest signal that the Windows port still has debt —
+  # it blocks nothing. No continue-on-error: hiding the failure is how the old
+  # leg stayed red for 37 straight runs without anyone acting on it.
+  test-windows:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+
+      # The unified-runtime conformance tests drive
+      # scripts/check-unified-runtime-*.sh, which scan with `rg`. The old
+      # per-push leg never installed it, so those tests could never pass.
+      - name: Install ripgrep
+        run: choco install ripgrep -y --no-progress
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      # cache-on-failure: while the leg is red, the default (save only on
+      # success) means no cache is ever written and every run recompiles the
+      # workspace cold (~6 minutes).
+      - name: Cache cargo + target
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
+
+      # ci-windows profile (.config/nextest.toml): retries=0 (retrying hung
+      # tests doubled a ~36-minute timeout tail) and the Unix-only pty suites
+      # filtered out via default-filter.
+      - name: Run tests
+        run: cargo nextest run --workspace --profile ci-windows
+
+  coverage:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up toolchain, cache, jake
+        uses: ./.github/actions/setup-sema
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+
+      # Advisory: instrumentation re-runs the suite through plain `cargo test`
+      # (no nextest retries), so a timing-sensitive test can flake here after
+      # the real gate already passed. Metrics must not paint the run red.
+      - name: Generate coverage
+        continue-on-error: true
+        run: jake release.coverage
+
+      - name: Upload coverage reports to Codecov
+        continue-on-error: true
+        uses: codecov/codecov-action@v5
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}

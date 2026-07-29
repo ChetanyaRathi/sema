@@ -7,12 +7,26 @@
 task workspace:
     cargo nextest run --workspace
 
+# What CI runs (verify.yml): the ci nextest profile adds retries=1,
+# fail-fast=false, and JUnit output (.config/nextest.toml).
+@group test
+@desc "Workspace suite with the CI nextest profile (retries + junit)"
+task ci:
+    cargo nextest run --workspace --profile ci
+
+# The protocol-level e2e suite alone (pytest-lsp over stdio) — what verify.yml
+# runs; the sema-lsp unit tests are already part of the workspace suite. Uses
+# the debug binary so it reuses the test build's artifacts.
+@group test
+@desc "LSP protocol e2e suite (pytest over stdio, debug binary)"
+task lsp-e2e: [build]
+    @needs uv
+    cd crates/sema-lsp/tests/e2e && SEMA_BIN="$(git rev-parse --show-toplevel)/target/debug/sema" uv run pytest -q
+
 @group test
 @desc "LSP unit + e2e (pytest) tests"
-task lsp: [release]
-    @needs uv
+task lsp: [lsp-e2e]
     cargo nextest run -p sema-lsp
-    cd crates/sema-lsp/tests/e2e && uv run pytest -v
 
 @group test
 @desc "Embedding benchmark (ignored) test"

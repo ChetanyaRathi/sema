@@ -12,6 +12,17 @@
 # cross-compiled targets (instrumented binary can't run) it skips and falls back
 # to a normal LTO build. PGO is FAIL-SAFE: any error skips PGO rather than
 # failing the release — worst case is a non-PGO build.
+# Unlike the PGO step below, this is deliberately FAIL-HARD: a stale committed
+# browser runtime must not ship in the GitHub-release / shell-installer /
+# Homebrew binaries either (crates.io and npm are gated by verify.yml; this
+# closes the cargo-dist origin — one red matrix leg blocks `host`, which blocks
+# the release). Skipped on Windows only because the check needs bash+python3;
+# the freshness property is host-independent, so the four Unix legs enforce it.
+- name: "Gate: committed web runtime is fresh"
+  if: runner.os != 'Windows'
+  shell: bash
+  run: ./scripts/check-web-runtime-fresh.sh
+
 - name: "PGO: generate profile (native targets only)"
   shell: bash
   env:

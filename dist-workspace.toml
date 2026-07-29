@@ -21,6 +21,9 @@ features = ["otel-grpc"]
 # PGO: instrument+train+profile-use on native targets before `dist build`.
 # Steps live in .github/pgo-setup.yml; run `dist generate` after editing them.
 github-build-setup = "../pgo-setup.yml"
+# Don't run the `plan` job on every PR — verify.yml is the real PR gate, and
+# dist config changes are rare enough to be exercised at tag time.
+pr-run-mode = "skip"
 
 # System dependencies — libudev is required by `serialport` (transitively libudev-sys) on Linux.
 [dist.dependencies.apt]

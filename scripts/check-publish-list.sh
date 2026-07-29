@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-# Guard: every publishable workspace crate appears in publish.yml's crates.io order.
+# Guard: every publishable workspace crate appears in publish-npm.yml's crates.io order.
 #
 # Catches the "added a new crate but forgot the publish list" mistake — which once
 # half-published a release (sema-llm failed: "no matching package named sema-otel")
@@ -10,7 +10,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-WF="$ROOT/.github/workflows/publish.yml"
+WF="$ROOT/.github/workflows/publish-npm.yml"
 
 # Publishable crates = workspace members without `publish = false` (publish != []).
 # sema-wasm is publish=false (it ships to npm, not crates.io) and is excluded here.
@@ -30,7 +30,7 @@ fi
 
 extra=$(comm -13 <(echo "$publishable") <(echo "$listed") || true)
 if [ -n "$extra" ]; then
-  echo "::warning::publish.yml lists crates that aren't publishable workspace members:"
+  echo "::warning::$WF lists crates that aren't publishable workspace members:"
   echo "$extra" | sed 's/^/  - /'
 fi
 
