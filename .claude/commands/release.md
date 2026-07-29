@@ -48,6 +48,22 @@ grep -c "$NEW" Cargo.toml   # expect 13
 grep -c "$OLD" Cargo.toml   # expect 0
 ```
 
+## Step 3.5 — Re-vendor the web runtime (REQUIRED after any version bump)
+
+The embedded `sema web` browser runtime's freshness fingerprint includes
+Cargo.toml and Cargo.lock, and the wasm embeds the version string — so every
+version bump makes the committed runtime stale, and BOTH the Publish gate and
+the Release build fail hard on it (this blocked v1.32.0's first tag). After
+bumping:
+
+```bash
+jake wasm.web-runtime                  # rebuild + vendor + refresh the lock
+./scripts/check-web-runtime-fresh.sh   # must print "current ✓"
+```
+
+Include `crates/sema/src/web/assets/*` and `crates/sema/web-runtime.lock` in
+the release commit.
+
 ## Step 4 — CHANGELOG
 
 Prepend a `## X.Y.Z` section at the top of `CHANGELOG.md`. Group as
