@@ -3180,19 +3180,19 @@ fn write_executable_platform(
                 .build_and_sign(&mut out)?;
         }
         cross_compile::BinaryFormat::Pe => {
-            // Ordering invariant: each writer REBUILDS the PE resource tree
-            // and drops entries it doesn't manage, so whichever runs last
-            // wins. editpe-last broke the payload lookup at runtime
-            // (`find_section("semaexec")` -> None — every `sema build` exe
-            // booted as the bare REPL on Windows; docs/bugs/
-            // 2026-07-29-windows-product-bugs.md bug 1). libsui runs last so
-            // the payload + icon survive; the cost is that the VERSIONINFO
-            // branding is dropped from the final binary (verified via pefile:
-            // RT_RCDATA/SEMAEXEC + icons present, RT_VERSION absent) until
-            // there's a single writer that can carry all three.
-            let branded = set_windows_version_info(runtime.clone(), output_path)?;
-            let mut out_bytes = Vec::with_capacity(branded.len() + archive_bytes.len());
-            libsui::PortableExecutable::from(&branded)?
+            // Ordering invariant: the LAST writer must be one that serializes
+            // the resource directory SORTED (named-before-ID, ascending) —
+            // the PE spec requirement behind FindResource's binary search.
+            // libsui's own writer emits insertion order, which the Win32 API
+            // cannot see (ERROR_RESOURCE_TYPE_NOT_FOUND) even though linear
+            // parsers can — every `sema build` exe booted as the bare REPL on
+            // Windows (docs/bugs/2026-07-29-windows-product-bugs.md bug 1).
+            // So: libsui embeds the payload + icon first, and the editpe
+            // (>=0.2, sorting) version-info pass runs last, re-serializing
+            // the whole tree — payload, icons, and VERSIONINFO all survive
+            // and are API-visible.
+            let mut branded = Vec::with_capacity(runtime.len() + archive_bytes.len());
+            libsui::PortableExecutable::from(&runtime)?
                 .write_resource("semaexec", archive_bytes.to_vec())?
                 // The rounded mark carries its own dark tile, so it reads correctly on
                 // both light and dark backgrounds — PE icons cannot adapt to theme.
@@ -3201,8 +3201,9 @@ fn write_executable_platform(
                 // boundary compiles here and breaks the published crate. Synced from
                 // canonical by `scripts/gen-icon-assets.py` (`jake icons-assets`).
                 .set_icon(include_bytes!("../assets/sema-mark-rounded-512.png"))?
-                .build(&mut out_bytes)?;
-            std::fs::write(output_path, out_bytes)?;
+                .build(&mut branded)?;
+            let branded = set_windows_version_info(branded, output_path)?;
+            std::fs::write(output_path, branded)?;
         }
         cross_compile::BinaryFormat::Elf => {
             archive::write_bundled_executable_from_bytes(&runtime, output_path, archive_bytes)?;

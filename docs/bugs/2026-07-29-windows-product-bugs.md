@@ -11,18 +11,21 @@ pointer here) until fixed.
 
 ## 1. `sema build` executables never find their embedded payload (severity: high)
 
-**FIXED (wave B2, pending Windows CI confirmation), with a known cosmetic
-cost.** A `sema build`-produced `.exe` booted as the plain sema CLI/REPL —
-`try_run_embedded()` (crates/sema/src/main.rs, `libsui::find_section
-("semaexec")`) returned `None`. Root cause: both PE writers rebuild the
-resource tree exclusively — the editpe `set_windows_version_info` pass that
-ran AFTER libsui dropped/broke the libsui RCDATA entry. Fix: editpe brands
-first, libsui (payload + icon) writes last. Verified structurally via pefile
-on a cross-built exe: RT_RCDATA/SEMAEXEC + icons present. Cost: RT_VERSION is
-now absent (libsui drops resources it doesn't manage) — Explorer's Details
-tab loses the version block until a single writer carries all three
-(candidates: teach libsui versioninfo, or an editpe-only pipeline whose
-output find_section can read, verified on real Windows).
+**FIXED (wave B2, pending Windows CI confirmation).** A `sema build` `.exe`
+booted as the plain sema CLI/REPL — `try_run_embedded()`
+(`libsui::find_section("semaexec")`) returned `None`. Diagnosis chain: the
+resource was structurally present (pefile parses it) but `FindResourceW`
+failed with ERROR_RESOURCE_TYPE_NOT_FOUND (1813) — the PE resource directory
+was serialized in *insertion* order, while the Win32 API's binary search
+requires the spec's sorted order (named-before-ID, ascending). Both writers
+in the old pipeline emit unsorted trees: libsui 0.16's own writer, and
+editpe 0.1 (IndexMap insertion order). editpe 0.2 serializes sorted
+(resource.rs `sorted_keys`), so the fix is: bump editpe to 0.2 and keep
+`set_windows_version_info` as the FINAL pass — it re-serializes the whole
+tree sorted, and payload + icons + VERSIONINFO all survive API-visible.
+Verified structurally on a cross-built exe: root type IDs [3, 10, 14, 16] in
+file order (sorted), RT_RCDATA/SEMAEXEC + icons + RT_VERSION present. This
+affected every release to date; not a regression from the test wave.
 Detected by: 10 `sema build` integration tests + the run-step of
 `output_into_existing_directory` (integration_test.rs) + mcp_suite's
 `standalone_binary_mode` (spawns a `sema build` binary as an MCP server).
