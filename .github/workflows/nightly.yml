@@ -14,6 +14,12 @@
 #    the binary — the same works-from-checkout/broken-installed class as the
 #    packaged-web smoke. Nightly because its docker build compiles a musl
 #    release binary from cold (~20m) — too heavy per-push, cheap once a day.
+#  - grammar-fuzz: the in-Sema grammar fuzzer (deterministic sweep + async
+#    watchdog/value/twin batches) and the Rust shutdown-leak harness. Nightly
+#    because its value is fresh random seeds each night, not per-diff
+#    regression, and it needs both a release build (the fuzzer binary) and a
+#    debug test build (the harness) — ~20 runner-minutes per-push would buy
+#    nothing a nightly rotation doesn't.
 name: Nightly
 
 on:
@@ -68,6 +74,83 @@ jobs:
 
       - name: Hermetic embedded docs_search gate
         run: ./scripts/docs-search-gate.sh
+
+  # Randomized long-run testing of the compiler/VM and the async runtime.
+  # The seed base rotates with the run id so each night covers fresh seeds,
+  # and every tool logs its base (the scripts print seed/count/depth at
+  # startup; the harness prints its seed/count/depth line to stderr), so any
+  # red night reproduces from the logged numbers. No continue-on-error: a red
+  # job is the signal, same policy as test-windows.
+  #
+  # Budget (measured 2026-07-30 on an M-series dev machine, DEBUG binary —
+  # the release binary CI runs is faster per program, the CI runner ~2-3x
+  # slower per core; the two roughly cancel): sync 20000 seeds 46s; async
+  # depth 5 n=1000 11s, depth 6 n=1000 17s (~1s/100-seed batch of that is
+  # watchdog poll granularity); harness ~35ms/seed. At the sizes below the
+  # fuzz steps cost ~5-6 CI minutes; the release build (~4-5m), the debug
+  # test build for the harness (~6-8m), and setup dominate the job.
+  grammar-fuzz:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      # Rotating but reproducible: unique per run, printed by every step's
+      # tool, and recorded in the job summary.
+      FUZZ_SEED_BASE: ${{ github.run_id }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up toolchain, cache, jake
+        uses: ./.github/actions/setup-sema
+
+      # The fuzzer runs the release binary: release is panic=abort, so a VM
+      # panic is a hard crash the driver classifies via the seed breadcrumb.
+      - name: Build release binary
+        run: cargo build --release -p sema-lang
+
+      - name: Deterministic sweep (sync grammar, round-trip + value + laws)
+        run: ./scripts/grammar-fuzz.sh check -n 20000 -s "$FUZZ_SEED_BASE"
+
+      # The async batches run under the driver's external watchdog (exit 3 on
+      # hang) with the generation-time value oracle, the embedded #t laws, and
+      # the sequential-twin oracle all active.
+      - name: Async batch, depth 5
+        shell: bash
+        run: ./scripts/grammar-fuzz.sh check --async -n 5000 -d 5 -s "$FUZZ_SEED_BASE" | tee async-d5.log
+
+      # Depth 6 is where both instances of the state-dependent invariant
+      # fault lived (docs/bugs/async-fuzz-findings.md finding 3); depth-4
+      # batches of thousands of seeds never hit it.
+      - name: Async batch, depth 6
+        shell: bash
+        run: ./scripts/grammar-fuzz.sh check --async -n 5000 -d 6 -s "$FUZZ_SEED_BASE" | tee async-d6.log
+
+      # The per-batch twin-oracle stat lines prove the twin oracle ran instead
+      # of passing vacuously (checked= would be 0 across the board).
+      - name: Twin-oracle stats into the job summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "### grammar-fuzz nightly"
+            echo ""
+            echo "Seed base: \`$FUZZ_SEED_BASE\` — reproduce any step with \`-s $FUZZ_SEED_BASE\` and its \`-n\`/\`-d\` (harness: \`SEMA_FUZZ_SEED=$FUZZ_SEED_BASE\`)."
+            for f in async-d5.log async-d6.log; do
+              [ -f "$f" ] || continue
+              echo ""
+              echo "#### ${f%.log}"
+              echo '```'
+              grep -h "^twin-oracle:" "$f" || echo "(no twin-oracle lines — batch died before finishing)"
+              echo '```'
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # Rust-side oracle the .sema fuzzer cannot reach: zero live tasks and a
+      # clean ShutdownReport after every generated program, on both the
+      # default drive path and the selection-scoped drive_roots pair mode.
+      # Builds the debug test profile (separate from the release build above;
+      # both are per-run costs — see the cache note in setup-sema).
+      - name: Shutdown-leak harness (500 seeds, depth 5)
+        run: SEMA_FUZZ_SEED="$FUZZ_SEED_BASE" SEMA_FUZZ_COUNT=500 SEMA_FUZZ_DEPTH=5 cargo nextest run -p sema-lang --test fuzz_async_shutdown_test --run-ignored ignored-only
 
   coverage:
     runs-on: ubuntu-latest

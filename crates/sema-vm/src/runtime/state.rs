@@ -502,6 +502,14 @@ pub(super) struct RuntimeState {
     pending: VecDeque<PendingStage>,
     protocol_waits: HashMap<super::WaitKey, ProtocolWait>,
     task_promises: HashMap<TaskId, sema_core::runtime::PromiseId>,
+    /// Promise ids whose handle-death GC eviction was deferred because a
+    /// registered promise-set wait still listed them (see
+    /// [`RuntimeState::gc_evict_promise`]). The collector prunes a dead handle's
+    /// candidate exactly once, so the runtime owns the retry:
+    /// [`teardown_promise_set_wait`] re-runs the eviction when the last wait
+    /// referencing the id is removed. Ids only enter this set when their handle
+    /// `Weak` is already dead, so no user code can re-observe them.
+    deferred_promise_evictions: hashbrown::HashSet<sema_core::runtime::PromiseId>,
     /// Dirty queue of tasks that had a cancellation recorded
     /// (`TaskRecord::request_cancellation` returned `true`). `cancel_waiting`
     /// pops candidates from here instead of scanning `tasks` — every site that
@@ -590,6 +598,38 @@ pub(super) struct RuntimeState {
 }
 
 impl RuntimeState {
+    /// Whether any registered promise-set wait (`async/await`/`all`/`race`/
+    /// `timeout`) still lists `id` among its member promises. Registered waits
+    /// hold raw `PromiseId`s, so this membership is invisible to the cycle
+    /// collector — it is the runtime's own resolvability contract:
+    /// `consume_promise_wake` → `promise_set_response` re-polls EVERY member of
+    /// a registered wait against the promise registry, and treats an
+    /// unresolvable id as an uncatchable `RuntimeFault::Invariant`.
+    fn promise_registered_in_wait(&self, id: sema_core::runtime::PromiseId) -> bool {
+        self.protocol_waits.values().any(|wait| {
+            matches!(&wait.kind, ProtocolWaitKind::Promises(set) if set.promises.contains(&id))
+        })
+    }
+
+    /// GC eviction of a promise record whose handle `Weak` went dead
+    /// (`interior_evict_promise`). A registered promise-set wait keeps its
+    /// members as raw ids, and once a member settles,
+    /// `PromiseRegistry::settle` consumes that member's waiter entry — so the
+    /// registry's own "no waiters" eviction guard can no longer see the wait's
+    /// interest. If the member's handle was a temporary (e.g. `(async/all
+    /// (list (async 1) slow))`), evicting its settled record here would make
+    /// the wait's next re-poll hit `RegistryError::Unknown`, killing the whole
+    /// root. Defer instead: the record stays until the last wait listing the
+    /// id is torn down, where [`teardown_promise_set_wait`] replays this exact
+    /// eviction call.
+    fn gc_evict_promise(&mut self, id: sema_core::runtime::PromiseId) {
+        if self.promise_registered_in_wait(id) {
+            self.deferred_promise_evictions.insert(id);
+        } else {
+            self.promises.gc_evict(id);
+        }
+    }
+
     pub(super) fn snapshot_dynamic_root_context(&self) -> TaskContextHandle {
         let context = TaskContextHandle::default();
         context
@@ -801,7 +841,7 @@ fn interior_sever_promise(id: sema_core::runtime::PromiseId) -> Vec<sema_core::V
 fn interior_evict_promise(id: sema_core::runtime::PromiseId) {
     if let Some(state) = current_runtime_state() {
         if let Ok(mut state) = state.try_borrow_mut() {
-            state.promises.gc_evict(id);
+            state.gc_evict_promise(id);
         }
     }
 }
@@ -864,6 +904,7 @@ impl Runtime {
                 pending: VecDeque::new(),
                 protocol_waits: HashMap::new(),
                 task_promises: HashMap::new(),
+                deferred_promise_evictions: hashbrown::HashSet::new(),
                 pending_cancel_waits: VecDeque::new(),
                 drive_cursor: 0,
                 drive_active: false,
@@ -1751,9 +1792,7 @@ impl Runtime {
                 .remove(&key)
                 .expect("protocol timer wait was just observed");
             if let ProtocolWaitKind::Promises(set) = &wait.kind {
-                for promise in &set.promises {
-                    let _ = state.promises.cancel_observation(*promise, key);
-                }
+                teardown_promise_set_wait(&mut state, set, key);
             }
             state
                 .tasks
@@ -1915,9 +1954,7 @@ impl Runtime {
                         .expect("selected protocol wait exists");
                     match &wait.kind {
                         ProtocolWaitKind::Promises(set) => {
-                            for promise in &set.promises {
-                                let _ = state.promises.cancel_observation(*promise, key);
-                            }
+                            teardown_promise_set_wait(&mut state, set, key);
                             if matches!(set.mode, sema_core::runtime::PromiseSetMode::Timeout(_)) {
                                 state.timers.cancel(key);
                             }
@@ -4984,9 +5021,7 @@ impl Runtime {
             if let Some(wait) = state.protocol_waits.remove(&key) {
                 match wait.kind {
                     ProtocolWaitKind::Promises(set) => {
-                        for promise in set.promises {
-                            let _ = state.promises.cancel_observation(promise, key);
-                        }
+                        teardown_promise_set_wait(&mut state, &set, key);
                         if matches!(set.mode, sema_core::runtime::PromiseSetMode::Timeout(_)) {
                             state.timers.cancel(key);
                         }
@@ -6051,9 +6086,7 @@ fn finish_protocol_wait_now(
         return Ok(None);
     }
     if let ProtocolWaitKind::Promises(set) = &wait.kind {
-        for promise in &set.promises {
-            let _ = state.promises.cancel_observation(*promise, key);
-        }
+        teardown_promise_set_wait(state, set, key);
         // A `Timeout` armed a deadline timer under this key; the observed
         // promise won, so deregister the timer before it fires stale.
         if matches!(set.mode, sema_core::runtime::PromiseSetMode::Timeout(_)) {
@@ -6135,6 +6168,30 @@ enum ChannelHandoffOutcome {
         sema_core::runtime::ChannelWait,
         Box<dyn sema_core::runtime::NativeContinuation>,
     ),
+}
+
+/// Teardown for a `ProtocolWaitKind::Promises` entry that has just been removed
+/// from `protocol_waits` (completion, timeout deadline, cancellation, deadlock
+/// deregistration): drop the wait's member observations, then replay any
+/// handle-death evictions [`RuntimeState::gc_evict_promise`] deferred because
+/// this wait was still referencing the member. A member another registered wait
+/// still lists stays deferred; the last such wait's teardown evicts it.
+fn teardown_promise_set_wait(
+    state: &mut RuntimeState,
+    set: &sema_core::runtime::PromiseSetWait,
+    key: super::WaitKey,
+) {
+    for promise in &set.promises {
+        let _ = state.promises.cancel_observation(*promise, key);
+    }
+    for promise in &set.promises {
+        if state.deferred_promise_evictions.contains(promise)
+            && !state.promise_registered_in_wait(*promise)
+        {
+            state.deferred_promise_evictions.remove(promise);
+            state.promises.gc_evict(*promise);
+        }
+    }
 }
 
 fn promise_set_response(

@@ -45,10 +45,16 @@
 ;;   SEMA_FUZZ_OUT         emit mode: file to write to (default: stdout)
 ;;   SEMA_FUZZ_CRASH_FILE  check mode: file to record the in-flight seed (crash breadcrumb)
 ;;   SEMA_FUZZ_VERBOSE     "1" to print every passing form too
+;;   SEMA_FUZZ_ASYNC       "1" to enable the async productions (channels with
+;;                         small capacities, cancellation, timers, race/timeout)
+;;                         and the confluent-value twin oracle (see check-twin).
+;;                         Run via scripts/grammar-fuzz.sh --async, which adds an
+;;                         external watchdog so a runtime hang becomes a finding.
 ;;
 ;; Iteration i uses seed (base + i), and each iteration re-seeds the PRNG, so a
 ;; failure reported at a given seed reproduces exactly with
 ;;   SEMA_FUZZ_SEED=<seed> SEMA_FUZZ_COUNT=1
+;; (plus SEMA_FUZZ_ASYNC=1 when the async productions were enabled).
 
 ;; ─────────────────────────────────────────────────────────────────────────
 ;; PRNG — PCG-style LCG over wrapping 64-bit integers (deterministic, seedable)
@@ -203,10 +209,21 @@
       (let ((b (rng-pick! cands))) (mk (nth b 0) (nth b 1)))
       nil)))
 
-;; The set of value types the program generator understands (LLM/IO/time/random
-;; are deliberately excluded — no deterministic oracle).
+;; Whether the async productions are enabled (SEMA_FUZZ_ASYNC=1). Read here
+;; (before *types*) because the type pool depends on it.
+(define *async*
+  (let ((v (env "SEMA_FUZZ_ASYNC")))
+    (and (not (null? v)) (= v "1"))))
+
+;; The set of value types the program generator understands (LLM/network/time/
+;; random are deliberately excluded — no deterministic oracle). With the async
+;; gate on, 'async entries join the pool, so async programs appear both at the
+;; top level and nested anywhere a let binds a random-typed init.
 (define *types*
-  (list 'int 'int 'bool 'list 'float 'string 'vec 'map 'law 'law 'law))
+  (let ((base (list 'int 'int 'bool 'list 'float 'string 'vec 'map 'law 'law 'law)))
+    (if *async*
+      (append base (list 'async 'async 'async 'async 'async))
+      base)))
 
 ;; Dispatch generation by type.
 (define (gen-of t env depth)
@@ -218,6 +235,7 @@
     ((= t 'string) (gen-str env depth))
     ((= t 'vec) (gen-vec env depth))
     ((= t 'law) (gen-law env depth))
+    ((= t 'async) (gen-async env depth))
     (else (gen-map-v env depth))))
 
 ;; Nonzero divisor literals for mod (avoids division-by-zero, which raises).
@@ -791,6 +809,588 @@
         (let ((t (gen-int env (- depth 1))))
           (loop (+ i 1) (cons (list 'async (gf t)) tasks) (cons (gv t) vals)))))))
 
+;; ── gated async productions (SEMA_FUZZ_ASYNC=1) ─────────────────────────────
+;; These exercise the runtime paths the always-on async productions above avoid:
+;; small-capacity channels that park senders and receivers, channel/close waking
+;; parked tasks, cancellation, timers, race/timeout, and offloaded blocking ops.
+;; Every production keeps two invariants (docs/plans/archive/2026-07-29-async-grammar-fuzzer.md):
+;;
+;;   * Confluence by construction — the value is independent of interleaving:
+;;     order-independent reductions (sum), deterministic winners (exactly one
+;;     non-parked candidate), value-neutral effects (sleeps, cancelled losers),
+;;     and post-settle reads only. In particular `async/cancelled?` is read only
+;;     AFTER awaiting the cancelled promise: `async/cancel` is a request, and
+;;     immediately after it the predicate's answer depends on whether the target
+;;     had started yet (verified against the binary: a cancel of a parked task
+;;     reads #f before the await and #t after).
+;;   * Termination by construction — sends and recvs are balanced, or the
+;;     imbalance is resolved by a close or cancel the generator also emits;
+;;     sleeps are <= 5 ms; capacities are 1-3 (small enough to park senders,
+;;     never enough to deadlock a balanced program). The driver watchdog is a
+;;     net for runtime bugs, not a crutch for generator bugs.
+;;
+;; Oracle class per async production (phase 2 of the plan). A "twin" production
+;; is also checked by the confluent-value twin oracle (check-twin below): the
+;; program is mechanically de-asynced and the sequential twin must produce the
+;; same expected value, so a bug in the generation-time model cannot self-mask.
+;; A "model" production has no mechanical sequential twin — its oracle is the
+;; generation-time expected value plus the #t laws embedded in the form
+;; (cancelled?, closed?, the caught error marker, the race-winner identity).
+;; Twinning is whole-program: one non-mechanical construct anywhere in a
+;; generated program skips the twin for that program (counted as
+;; non-mechanical in the end-of-run stat line). New productions must add a row
+;; here and, if they introduce a new async op, teach the walker about it —
+;; unknown async/* and channel/* heads block by default, never mistwin.
+;;
+;;   production                 class  twin rationale
+;;   gen-int-asyncsum           twin   async/all over (async ...) tasks -> list of bodies
+;;   gen-list-asyncall          twin   async/all over (async ...) tasks -> list of bodies
+;;   gen-async-leaf             twin   await of a spawned pure body -> the body
+;;   gen-async-spawn-tree       twin   spawn + await tree of pure bodies -> direct calls
+;;   gen-async-owned-ok         twin   async/map, async/pool-map -> map; spawn-all -> called thunks
+;;   gen-int-asyncchan          model  channel ops park; no sequential equivalent
+;;   gen-async-chan-pipeline    model  same
+;;   gen-async-chan-recvfirst   model  same
+;;   gen-async-chan-fanin       model  same
+;;   gen-async-chan-close       model  close/closed? law is about channel state
+;;   gen-async-chan-closewake   model  close-wakes-receiver law
+;;   gen-async-chan-closesend   model  close-fails-parked-send error path
+;;   gen-async-tryrecv          model  try-recv reads channel state
+;;   gen-async-cancel           model  cancellation has no sequential equivalent
+;;   gen-async-owned-fail       model  fail-fast cancels siblings; plain map would not
+;;   gen-async-race             model  a race needs a scheduler
+;;   gen-async-with-timeout     model  same
+;;   gen-async-causal           model  the law is about interleaving itself
+;;   gen-async-offload          model  twin would repeat file I/O side effects
+
+;; Optionally prefix task body forms with a value-neutral sleep. `async/sleep`
+;; parks on a virtual timer; blocking `sleep` parks via the offload executor —
+;; two distinct wait kinds.
+(define (with-sleeps body-forms)
+  (let ((c (rng-int! 4)))
+    (cond
+      ((= c 0) (cons (list 'async/sleep (rng-int! 6)) body-forms))
+      ((= c 1) (cons (list 'sleep (rng-int! 4)) body-forms))
+      (else body-forms))))
+
+;; A task form: (async <maybe-sleep> body...).
+(define (mk-task body-forms)
+  (cons 'async (with-sleeps body-forms)))
+
+;; Form draining exactly k values from channel ch (a symbol) and summing them.
+(define (drain-sum-form ch k)
+  (let ((lp (gensym "dr")) (i (gensym "i")) (acc (gensym "acc")))
+    (list 'let
+      lp
+      (list (list i 0) (list acc 0))
+      (list 'if
+        (list '>= i k)
+        acc
+        (list lp (list '+ i 1) (list '+ acc (list 'channel/recv ch)))))))
+
+;; Leaf: the smallest async form, used when depth is exhausted.
+(define (gen-async-leaf env)
+  (let ((t (gen-int env 0)))
+    (mk (list 'async/await (list 'async (gf t))) (gv t))))
+
+;; Blocking pipeline, sender variant: one sender task pushes k ints through a
+;; capacity-cap channel (cap is often < k, so the sender parks on a full
+;; buffer); the root drains exactly k, sums, then reaps the sender. Draining
+;; BEFORE awaiting keeps the program deadlock-free: awaiting first would block
+;; the only consumer while the sender is parked (the runtime's deadlock
+;; detector rightly rejects that shape).
+(define (gen-async-chan-pipeline env depth)
+  (let ((cap (rng-range! 1 3))
+        (k (rng-range! 1 5))
+        (ch (gensym "ch"))
+        (s (gensym "s"))
+        (total (gensym "t")))
+    (let loop ((j 0) (sends (list)) (sum 0))
+      (if (< j k)
+        (let ((v (gen-int env (- depth 1))))
+          (loop (+ j 1) (cons (list 'channel/send ch (gf v)) sends) (+ sum (gv v))))
+        (mk
+          (list 'let
+            (list (list ch (list 'channel/new cap)))
+            (list 'let
+              (list (list s (mk-task (reverse sends))))
+              (list 'let
+                (list (list total (drain-sum-form ch k)))
+                (list 'async/await s)
+                total)))
+          sum)))))
+
+;; Blocking pipeline, receiver variant: the task drains k values (parking first
+;; on the empty channel) while the root sends; with cap < k the ROOT parks on a
+;; full buffer mid-send. Awaiting the receiver returns the sum.
+(define (gen-async-chan-recvfirst env depth)
+  (let ((cap (rng-range! 1 3))
+        (k (rng-range! 1 5))
+        (ch (gensym "ch"))
+        (r (gensym "r")))
+    (let loop ((j 0) (sends (list)) (sum 0))
+      (if (< j k)
+        (let ((v (gen-int env (- depth 1))))
+          (loop (+ j 1) (cons (list 'channel/send ch (gf v)) sends) (+ sum (gv v))))
+        (mk
+          (list 'let
+            (list (list ch (list 'channel/new cap)))
+            (cons 'let
+              (cons (list (list r (mk-task (list (drain-sum-form ch k)))))
+                (append (reverse sends) (list (list 'async/await r))))))
+          sum)))))
+
+;; Multi-sender fan-in: m sender tasks share one small channel; the root drains
+;; the combined count and sums. The recv order across senders is scheduler-
+;; dependent, so the reduction must stay order-independent (sum). Senders are
+;; awaited only after the drain, for the same deadlock-freedom reason as the
+;; pipeline.
+(define (gen-async-chan-fanin env depth)
+  (let ((cap (rng-range! 1 3))
+        (m (rng-range! 2 3))
+        (ch (gensym "ch"))
+        (total (gensym "t")))
+    (let sloop ((si 0) (names (list)) (tasks (list)) (kk 0) (sum 0))
+      (if (< si m)
+        (let ((k (rng-range! 1 3)))
+          (let vloop ((j 0) (sends (list)) (s2 sum))
+            (if (< j k)
+              (let ((v (gen-int env (- depth 1))))
+                (vloop (+ j 1) (cons (list 'channel/send ch (gf v)) sends) (+ s2 (gv v))))
+              (let ((nm (gensym "s")))
+                (sloop (+ si 1)
+                  (cons nm names)
+                  (cons (list nm (mk-task (reverse sends))) tasks)
+                  (+ kk k)
+                  s2)))))
+        (mk
+          (list 'let
+            (list (list ch (list 'channel/new cap)))
+            (list 'let
+              (reverse tasks)
+              (cons 'let
+                (cons (list (list total (drain-sum-form ch kk)))
+                  (append
+                    (map (lambda (nm) (list 'async/await nm)) (reverse names))
+                    (list total))))))
+          sum)))))
+
+;; Producer sends k then closes; the root drains exactly k, awaits the producer
+;; (so the close has settled), then checks the close is observable:
+;; `channel/closed?` is #t and a recv on the closed, empty channel is nil.
+(define (gen-async-chan-close env depth)
+  (let ((cap (rng-range! 1 3))
+        (k (rng-range! 1 4))
+        (ch (gensym "ch"))
+        (s (gensym "s"))
+        (total (gensym "t")))
+    (let loop ((j 0) (sends (list)) (sum 0))
+      (if (< j k)
+        (let ((v (gen-int env (- depth 1))))
+          (loop (+ j 1) (cons (list 'channel/send ch (gf v)) sends) (+ sum (gv v))))
+        (mk
+          (list 'let
+            (list (list ch (list 'channel/new cap)))
+            (list 'let
+              (list
+                (list s
+                  (mk-task
+                    (append (reverse sends) (list (list 'channel/close ch))))))
+              (list 'let
+                (list (list total (drain-sum-form ch k)))
+                (list 'async/await s)
+                (list 'if
+                  (list 'and
+                    (list 'channel/closed? ch)
+                    (list 'nil? (list 'channel/recv ch)))
+                  total
+                  -1))))
+          sum)))))
+
+;; channel/close wakes a parked receiver with nil (the closed-and-empty
+;; sentinel). The optional sleep varies WHEN the close lands: with it the
+;; receiver has parked; without it the close reaches the channel before the
+;; receiver runs. Either way the recv settles with nil.
+(define (gen-async-chan-closewake env depth)
+  (let* ((ch (gensym "ch"))
+         (r (gensym "r"))
+         (surv (gen-int env (- depth 1))))
+    (mk
+      (list 'let
+        (list (list ch (list 'channel/new (rng-range! 1 3))))
+        (cons 'let
+          (cons (list (list r (list 'async (list 'channel/recv ch))))
+            (append
+              (if (rng-bool!) (list (list 'async/sleep (rng-int! 3))) (list))
+              (list
+                (list 'channel/close ch)
+                (list 'if (list 'nil? (list 'async/await r)) (gf surv) -1))))))
+      (gv surv))))
+
+;; channel/close wakes a parked sender by failing its send: the task rejects
+;; with the closed-send error and awaiting it raises, caught as a marker int.
+;; The marker is deterministic whether the close lands before the task's first
+;; send or while the task is parked on a full capacity-1 buffer.
+(define (gen-async-chan-closesend env depth)
+  (let ((ch (gensym "ch"))
+        (s (gensym "s"))
+        (mark (rng-range! 100 999))
+        (a (rng-range! -9 9))
+        (b (rng-range! -9 9)))
+    (mk
+      (list 'let
+        (list (list ch (list 'channel/new 1)))
+        (cons 'let
+          (cons
+            (list
+              (list s
+                (list 'async
+                  (list 'channel/send ch a)
+                  (list 'channel/send ch b)
+                  0)))
+            (append
+              (if (rng-bool!) (list (list 'async/sleep (rng-int! 3))) (list))
+              (list
+                (list 'channel/close ch)
+                (list 'try (list 'async/await s) (list 'catch 'e mark)))))))
+      mark)))
+
+;; channel/try-recv, only in deterministic positions: a miss on a fresh channel
+;; (nil), or a hit right after the sender was awaited (the value is buffered).
+(define (gen-async-tryrecv env depth)
+  (let ((ch (gensym "ch"))
+        (v (gen-int env (- depth 1))))
+    (if (rng-bool!)
+      (mk
+        (list 'let
+          (list (list ch (list 'channel/new (rng-range! 1 3))))
+          (list 'if (list 'nil? (list 'channel/try-recv ch)) (gf v) -1))
+        (gv v))
+      (mk
+        (list 'let
+          (list (list ch (list 'channel/new (rng-range! 1 3))))
+          (list 'async/await (list 'async (list 'channel/send ch (gf v))))
+          (list 'channel/try-recv ch))
+        (gv v)))))
+
+;; Spawn tree: spawn `fan` children concurrently, then await each and sum.
+;; Child bodies recurse into a smaller tree, so spawns nest inside spawned
+;; tasks (tree depth <= 3). Occasionally an extra DETACHED child is spawned
+;; and never awaited: its body is value-neutral (small sleep, then 0), so it
+;; only seeds leftover runtime state alongside the surrounding program —
+;; leftover unobserved state is what bug shape 1 (orphaned pending stages)
+;; feeds on.
+(define (spawn-tree-expr env depth)
+  (if (<= depth 0)
+    (gen-int env 0)
+    (let ((fan (rng-range! 1 3)))
+      (let loop ((i 0) (binds (list)) (names (list)) (sum 0))
+        (if (< i fan)
+          (let ((child (spawn-tree-expr env (- depth 1)))
+                (p (gensym "p")))
+            (loop (+ i 1)
+              (cons (list p (mk-task (list (gf child)))) binds)
+              (cons p names)
+              (+ sum (gv child))))
+          (let ((awaits (map (lambda (nm) (list 'async/await nm)) (reverse names)))
+                (detach
+                  (if (= 0 (rng-int! 3))
+                    (list (list 'async (list 'async/sleep (rng-int! 4)) 0))
+                    (list))))
+            (mk
+              (cons 'let
+                (cons (reverse binds) (append detach (list (cons '+ awaits)))))
+              sum)))))))
+
+(define (gen-async-spawn-tree env depth)
+  (spawn-tree-expr env (min (max depth 1) 3)))
+
+;; Cancel a task parked in each wait kind: virtual timer (async/sleep), channel
+;; recv on a never-sent channel, channel send into a full capacity-1 buffer,
+;; and an offloaded blocking sleep. The root optionally parks first so the
+;; target is genuinely parked when the cancel lands (cancel-during-park) rather
+;; than still queued (cancel-before-start); both settle the promise as
+;; cancelled. Oracle reads are post-settle only: await under try must give the
+;; :cancelled condition, and async/cancelled? must be #t after that await. The
+;; surviving computation's value is the program's value.
+;; The blocking-sleep target uses 1500 ms, not a forever value: the executor
+;; worker cannot be interrupted mid-sleep, so a cancelled 60 s blocking sleep
+;; would pin an executor thread for 60 s even though the promise settles
+;; immediately (verified against the binary; the ~2 s shutdown grace at
+;; process exit is the visible symptom).
+(define (gen-async-cancel env depth)
+  (let* ((kind (rng-int! 4))
+         (ch (gensym "ch"))
+         (p (gensym "p"))
+         (m (gensym "m"))
+         (surv (gen-int env (- depth 1)))
+         (target
+           (cond
+             ((= kind 0) (list 'async (list 'async/sleep 60000) 1))
+             ((= kind 1) (list 'async (list 'channel/recv ch)))
+             ((= kind 2)
+               (list 'async
+                 (list 'channel/send ch 1)
+                 (list 'channel/send ch 2)
+                 0))
+             (else (list 'async (list 'sleep 1500) 2)))))
+    (mk
+      (list 'let
+        (list (list ch (list 'channel/new 1)))
+        (cons 'let
+          (cons (list (list p target))
+            (append
+              (if (rng-bool!) (list (list 'async/sleep (rng-int! 3))) (list))
+              (list
+                (list 'async/cancel p)
+                (list 'let
+                  (list
+                    (list m
+                      (list 'try
+                        (list 'async/await p)
+                        (list 'catch 'e (list ':type 'e)))))
+                  (list 'if
+                    (list 'and
+                      (list '= m ':cancelled)
+                      (list 'async/cancelled? p))
+                    (gf surv)
+                    -1)))))))
+      (gv surv))))
+
+;; Owned-combinator failure: async/map or async/pool-map over 1..n where
+;; EXACTLY ONE item makes the worker throw a marker int. The owned combinator
+;; settles fail-fast with that error and cancels the sibling workers
+;; (__owned-all + __cancel-all); catching it yields the marker.
+(define (gen-async-owned-fail env depth)
+  (let* ((n (rng-range! 2 6))
+         (bad (rng-range! 1 n))
+         (mark (rng-range! 1000 9999))
+         (x (gensym "x"))
+         (items (cons 'list (range 1 (+ n 1))))
+         (worker
+           (list 'lambda
+             (list x)
+             (list 'if (list '= x bad) (list 'throw mark) x)))
+         (call
+           (if (rng-bool!)
+             (list 'async/map worker items)
+             (list 'async/pool-map worker items (rng-range! 1 4)))))
+    (mk (list 'try call (list 'catch 'e (list ':value 'e))) mark)))
+
+;; Owned combinators, success path: async/map / async/pool-map with a pure
+;; worker over 1..n (deterministic, input-ordered result list; pool-map also
+;; exercises the channel-backed semaphore), and async/spawn-all over closed
+;; thunks of generated int programs.
+(define (gen-async-owned-ok env depth)
+  (let ((c (rng-int! 3)))
+    (cond
+      ((= c 0)
+        (let* ((n (rng-range! 1 8))
+               (k (rng-range! -5 5))
+               (x (gensym "x"))
+               (items (range 1 (+ n 1)))
+               (body (cons 'begin (with-sleeps (list (list '+ x k))))))
+          (mk (list 'async/map (list 'lambda (list x) body) (cons 'list items))
+            (map (lambda (i) (+ i k)) items))))
+      ((= c 1)
+        (let* ((n (rng-range! 1 8))
+               (w (rng-range! 1 4))
+               (x (gensym "x"))
+               (items (range 1 (+ n 1)))
+               (body (cons 'begin (with-sleeps (list (list '* x x))))))
+          (mk
+            (list 'async/pool-map (list 'lambda (list x) body) (cons 'list items) w)
+            (map (lambda (i) (* i i)) items))))
+      (else
+        (let ((kk (rng-range! 1 3)))
+          (let loop ((i 0) (thunks (list)) (vals (list)))
+            (if (< i kk)
+              (let ((t (gen-int env (- depth 1))))
+                (loop (+ i 1)
+                  (cons (list 'lambda (list) (gf t)) thunks)
+                  (cons (gv t) vals)))
+              (mk (list 'async/spawn-all (cons 'list (reverse thunks)))
+                (reverse vals)))))))))
+
+;; Insert x into xs at index i (0 <= i <= (length xs)).
+(define (insert-at xs i x)
+  (append (take i xs) (cons x (drop i xs))))
+
+;; Select-like: async/race over exactly one settleable task and 1-3 losers
+;; parked forever (recv on a never-sent channel, or a 60 s virtual timer), so
+;; the winner is deterministic by construction whatever its list position. The
+;; observational race leaves losers running, so the root cancels them
+;; explicitly; the owned variant (async/race-owned, over thunks) cancels them
+;; itself. The winner body may still sleep a few ms — no loser can ever settle
+;; first. There is deliberately no timed-race variant: two timers racing is a
+;; wall-clock bound, and those are untrustworthy under load
+;; (docs/bugs/2026-07-28-sibling-interleaving-tests-are-load-sensitive.md).
+(define (gen-async-race env depth)
+  (let* ((ch (gensym "ch"))
+         (w (gen-int env (- depth 1)))
+         (nl (rng-range! 1 3))
+         (owned (rng-bool!)))
+    (let loop ((i 0) (losers (list)))
+      (if (< i nl)
+        (loop (+ i 1)
+          (cons
+            (if (rng-bool!)
+              (if owned
+                (list 'lambda (list) (list 'channel/recv ch))
+                (list 'async (list 'channel/recv ch)))
+              (if owned
+                (list 'lambda (list) (list 'async/sleep 60000) 0)
+                (list 'async (list 'async/sleep 60000) 0)))
+            losers))
+        (if owned
+          (let* ((winner (list 'lambda (list) (cons 'begin (with-sleeps (list (gf w))))))
+                 (thunks (insert-at losers (rng-int! (+ nl 1)) winner)))
+            (mk
+              (list 'let
+                (list (list ch (list 'channel/new 1)))
+                (list 'async/race-owned (cons 'list thunks)))
+              (gv w)))
+          (let* ((names
+                   (let nloop ((j 0) (acc (list)))
+                     (if (< j nl) (nloop (+ j 1) (cons (gensym "l") acc)) acc)))
+                 (wname (gensym "w"))
+                 (binds (map (lambda (nm t) (list nm t)) names losers))
+                 (wtask (mk-task (list (gf w))))
+                 (pos (rng-int! (+ nl 1)))
+                 (all-binds (insert-at binds pos (list wname wtask)))
+                 (all-names (insert-at names pos wname))
+                 (v (gensym "v")))
+            (mk
+              (list 'let
+                (list (list ch (list 'channel/new 1)))
+                (list 'let
+                  all-binds
+                  (cons 'let
+                    (cons
+                      (list (list v (list 'async/race (cons 'list all-names))))
+                      (append
+                        (map (lambda (nm) (list 'async/cancel nm)) names)
+                        (list v))))))
+              (gv w))))))))
+
+;; async/with-timeout: either the body settles immediately (value wins; the
+;; deadline is 60 s so no wall-clock bound is asserted) or the body parks
+;; forever on a never-sent channel (the 1-5 ms deadline wins, the child is
+;; cancelled, and the :timeout condition is caught as a marker).
+(define (gen-async-with-timeout env depth)
+  (let ((ch (gensym "ch"))
+        (body (gen-int env (- depth 1))))
+    (if (rng-bool!)
+      (mk
+        (list 'async/with-timeout
+          60000
+          (list 'lambda (list) (cons 'begin (with-sleeps (list (gf body))))))
+        (gv body))
+      (let ((mark (rng-range! 100 999)))
+        (mk
+          (list 'let
+            (list (list ch (list 'channel/new 1)))
+            (list 'try
+              (list 'async/with-timeout
+                (rng-range! 1 5)
+                (list 'lambda (list) (list 'channel/recv ch)))
+              (list 'catch
+                'e
+                (list 'if (list '= (list ':type 'e) ':timeout) mark -1))))
+          mark)))))
+
+;; Causal ordering (park-vs-pin): the root parks — virtual timer or offloaded
+;; blocking sleep — while a zero-delay sibling sends its marker; the root sends
+;; its own marker after resuming. Draining must observe sibling-before-root.
+;; This is the load-safe oracle shape from the sibling-interleaving write-up:
+;; a causal ordering, not a wall-clock bound.
+(define (gen-async-causal env depth)
+  (let* ((out (gensym "out"))
+         (sib (gensym "sib"))
+         (surv (gen-int env (- depth 1)))
+         (park
+           (if (rng-bool!)
+             (list 'async/sleep (rng-range! 1 5))
+             (list 'sleep (rng-range! 1 3)))))
+    (mk
+      (list 'let
+        (list (list out (list 'channel/new 8)))
+        (list 'let
+          (list (list sib (list 'async (list 'channel/send out 1))))
+          park
+          (list 'channel/send out 2)
+          (list 'async/await sib)
+          (list 'if
+            (list 'and
+              (list '= 1 (list 'channel/recv out))
+              (list '= 2 (list 'channel/recv out)))
+            (gf surv)
+            -1)))
+      (gv surv))))
+
+;; OS temp dir with a trailing slash, for the offload-leaf files.
+(define *tmp-dir*
+  (let ((d (env "TMPDIR")))
+    (if (null? d)
+      "/tmp/"
+      (if (string/ends-with? d "/") d (string-append d "/")))))
+
+;; Counter making every offload production in a run use a distinct file, even
+;; when several nest inside one generated program (same seed). Deterministic:
+;; generation order is fixed by the seed.
+(define *file-ctr* 0)
+
+;; Offload leaves: file/write then file/read of a per-seed file under the OS
+;; temp dir, inside a task — puts External waits (the executor's blocking tier)
+;; and their completion path in play. Path and content both derive from
+;; seed + counter, so the read-back value is deterministic and even a path
+;; collision between concurrent fuzzer runs writes identical bytes.
+;; Cancel-during-offload is covered by gen-async-cancel's blocking-sleep
+;; target (a park the generator controls); file-op cancellation timing is racy
+;; by nature, so file tasks are never cancelled.
+(define (gen-async-offload env depth)
+  (set! *file-ctr* (+ *file-ctr* 1))
+  (let* ((stem
+           (string-append
+             "sema-grammar-fuzz-"
+             (number->string *cur-seed*)
+             "-"
+             (number->string *file-ctr*)))
+         (path (string-append *tmp-dir* stem ".txt"))
+         (r (gensym "r")))
+    (mk
+      (list 'let
+        (list
+          (list r
+            (list 'async/await
+              (mk-task
+                (list (list 'file/write path stem) (list 'file/read path))))))
+        (list 'file/delete path)
+        r)
+      stem)))
+
+;; Dispatch for the gated async productions.
+(define (gen-async env depth)
+  (if (<= depth 0)
+    (gen-async-leaf env)
+    (let ((c (rng-int! 15)))
+      (cond
+        ((= c 0) (gen-async-chan-pipeline env depth))
+        ((= c 1) (gen-async-chan-recvfirst env depth))
+        ((= c 2) (gen-async-chan-fanin env depth))
+        ((= c 3) (gen-async-chan-close env depth))
+        ((= c 4) (gen-async-chan-closewake env depth))
+        ((= c 5) (gen-async-chan-closesend env depth))
+        ((= c 6) (gen-async-tryrecv env depth))
+        ((= c 7) (gen-async-spawn-tree env depth))
+        ((= c 8) (gen-async-cancel env depth))
+        ((= c 9) (gen-async-owned-fail env depth))
+        ((= c 10) (gen-async-owned-ok env depth))
+        ((= c 11) (gen-async-race env depth))
+        ((= c 12) (gen-async-with-timeout env depth))
+        ((= c 13) (gen-async-causal env depth))
+        (else (gen-async-offload env depth))))))
+
 ;; ── metamorphic / differential laws (independent oracle for native ops) ──────
 ;; The plain value oracle computes `expected` by calling the SAME builtin the
 ;; form uses, so a bug in a native op (reverse/sort/map/filter/…) masks itself —
@@ -1142,7 +1742,9 @@
   (display "  actual:   ")
   (display (str b))
   (newline)
-  (display "  reproduce: SEMA_FUZZ_SEED=")
+  (display "  reproduce: ")
+  (when *async* (display "SEMA_FUZZ_ASYNC=1 "))
+  (display "SEMA_FUZZ_SEED=")
   (display (number->string *cur-seed*))
   (display " SEMA_FUZZ_COUNT=1")
   (newline)
@@ -1163,13 +1765,165 @@
           (report-fail "roundtrip" wrapped s d2)))
       (catch e (report-fail "roundtrip-read-error" wrapped s e)))))
 
+;; ── confluent-value twin oracle (async mode only) ──────────────────────────
+;; The value oracle's `expected` comes from the generation-time model, so a bug
+;; in the model itself could agree with a buggy runtime. For the mechanically
+;; de-asyncable constructs the checker derives an independent sequential twin
+;; of the whole generated program and requires it to evaluate to the same
+;; expected value (the async form already matched, so async form, sequential
+;; twin, and model must all agree). The walker is a pure structural rewrite —
+;; no RNG, no gensym — so the seed-to-program mapping is untouched:
+;;
+;;   (async B ...)                 -> (begin B ...)
+;;   (async/await X)               -> X
+;;   (async/all (list E ...))      -> (list E ...)
+;;   (async/map F Xs)              -> (map F Xs)
+;;   (async/pool-map F Xs W)       -> (map F Xs)
+;;   (async/spawn-all (list T ...)) -> (list (T) ...)
+;;   (async/sleep K), (sleep K)    -> nil   (generated only in effect position)
+;;
+;; Anything without a mechanical sequential twin blocks the whole program from
+;; twinning (the walker throws :twin-blocked): every channel/* op, every other
+;; async/* op, the offload file ops, and a `throw` inside an owned combinator's
+;; arguments (fail-fast cancels siblings; plain map does not). See the oracle
+;; class table above the async productions.
+
+(define *twin-checks* 0)  ; programs where a twin was derived and evaluated
+(define *twin-blocked* 0) ; programs skipped: a non-mechanical construct
+(define *tw-async* 0)     ; (async ...) task rewrites
+(define *tw-await* 0)     ; (async/await ...) rewrites
+(define *tw-all* 0)       ; (async/all ...) rewrites
+(define *tw-map* 0)       ; (async/map ...) rewrites
+(define *tw-pool* 0)      ; (async/pool-map ...) rewrites
+(define *tw-spawnall* 0)  ; (async/spawn-all ...) rewrites
+
+(define (twin-blocked!) (throw :twin-blocked))
+
+;; #t when a throw form occurs anywhere inside f.
+(define (contains-throw? f)
+  (if (pair? f)
+    (if (= (first f) 'throw)
+      #t
+      (let loop ((xs f))
+        (if (pair? xs)
+          (if (contains-throw? (first xs)) #t (loop (rest xs)))
+          #f)))
+    #f))
+
+;; Non-mechanical head symbols. The prefix rules keep future productions safe
+;; by default: an async/* or channel/* op the walker does not rewrite above
+;; blocks the program instead of being silently mistwinned.
+(define (twin-blocker? h)
+  (and (symbol? h)
+    (let ((s (symbol->string h)))
+      (or (string/starts-with? s "channel/")
+        (string/starts-with? s "async/")
+        (= s "file/write")
+        (= s "file/read")
+        (= s "file/delete")))))
+
+;; The literal (list E ...) argument of async/all: each element is an
+;; (async ...) form the recursion rewrites to its body value. Any other
+;; argument shape is not mechanical.
+(define (twin-all-arg arg)
+  (if (and (pair? arg) (= (first arg) 'list))
+    (cons 'list (map twin (rest arg)))
+    (twin-blocked!)))
+
+;; The literal (list T ...) thunk argument of async/spawn-all: the twin calls
+;; each thunk in order.
+(define (twin-spawn-all-arg arg)
+  (if (and (pair? arg) (= (first arg) 'list))
+    (cons 'list (map (lambda (th) (list (twin th))) (rest arg)))
+    (twin-blocked!)))
+
+(define (twin form)
+  (if (not (pair? form))
+    form
+    (let ((h (first form)))
+      (cond
+        ;; value-neutral sleeps: the generator emits them only in effect position
+        ((= h 'async/sleep) nil)
+        ((= h 'sleep) nil)
+        ((= h 'async)
+          (begin
+            (set! *tw-async* (+ *tw-async* 1))
+            (cons 'begin (map twin (rest form)))))
+        ((= h 'async/await)
+          (begin
+            (set! *tw-await* (+ *tw-await* 1))
+            (twin (nth form 1))))
+        ((= h 'async/all)
+          (begin
+            (set! *tw-all* (+ *tw-all* 1))
+            (twin-all-arg (nth form 1))))
+        ((= h 'async/map)
+          (if (contains-throw? form)
+            (twin-blocked!)
+            (begin
+              (set! *tw-map* (+ *tw-map* 1))
+              (list 'map (twin (nth form 1)) (twin (nth form 2))))))
+        ((= h 'async/pool-map)
+          (if (contains-throw? form)
+            (twin-blocked!)
+            (begin
+              (set! *tw-pool* (+ *tw-pool* 1))
+              (list 'map (twin (nth form 1)) (twin (nth form 2))))))
+        ((= h 'async/spawn-all)
+          (if (contains-throw? form)
+            (twin-blocked!)
+            (begin
+              (set! *tw-spawnall* (+ *tw-spawnall* 1))
+              (twin-spawn-all-arg (nth form 1)))))
+        ((twin-blocker? h) (twin-blocked!))
+        (else (map twin form))))))
+
+;; Derive and evaluate the twin. Counted only when the rewrite changed the
+;; form: a program with no async construct twins to itself and proves nothing.
+;; On a blocked walk the rewrite counters roll back to their pre-walk values,
+;; so the stat line counts only rewrites whose twin was actually evaluated.
+(define (check-twin form expected)
+  (if (not *async*)
+    #t
+    (let ((s-async *tw-async*)
+          (s-await *tw-await*)
+          (s-all *tw-all*)
+          (s-map *tw-map*)
+          (s-pool *tw-pool*)
+          (s-spawnall *tw-spawnall*))
+      (try
+        (let ((tw (twin form)))
+          (if (= tw form)
+            #t
+            (begin
+              (set! *twin-checks* (+ *twin-checks* 1))
+              (try
+                (let ((got (eval tw)))
+                  (if (= expected got)
+                    #t
+                    (report-fail "twin-oracle" tw expected got)))
+                (catch e (report-fail "twin-eval-error" tw expected e))))))
+        (catch e
+          (if (= (:value e) :twin-blocked)
+            (begin
+              (set! *tw-async* s-async)
+              (set! *tw-await* s-await)
+              (set! *tw-all* s-all)
+              (set! *tw-map* s-map)
+              (set! *tw-pool* s-pool)
+              (set! *tw-spawnall* s-spawnall)
+              (set! *twin-blocked* (+ *twin-blocked* 1))
+              #t)
+            ;; an error in the walker itself — report it, never mask it
+            (report-fail "twin-derivation-error" form expected e)))))))
+
 (define (check-oracle pair)
   (let ((form (gf pair))
         (expected (gv pair)))
     (try
       (let ((got (eval form)))
         (if (= expected got)
-          #t
+          (check-twin form expected)
           (report-fail "oracle" form expected got)))
       (catch e (report-fail "oracle-eval-error" form expected e)))))
 
@@ -1213,6 +1967,10 @@
         (when (not (null? crash-file))
           (file/write crash-file (number->string seed)))
         (rng-seed! seed)
+        ;; Per-iteration reset: offload file paths must depend only on the seed,
+        ;; not on how many iterations ran before it, or a single-seed repro
+        ;; would generate a different program than the batch run.
+        (set! *file-ctr* 0)
         ;; round-trip property on a random datum
         (let ((d (gen-datum max-depth)))
           (let ((ok (check-roundtrip d)))
@@ -1235,6 +1993,29 @@
   ;; success: clear the crash breadcrumb so the driver knows we exited cleanly
   (when (not (null? crash-file)) (file/write crash-file "ok"))
   (newline)
+  ;; Async mode: prove the twin oracle ran. checked= is the number of programs
+  ;; whose sequential twin was derived and evaluated (a zero here would mean
+  ;; the oracle passed vacuously); non-mechanical= is the number skipped
+  ;; because the program contained a construct with no mechanical twin. The
+  ;; rewrite counts show every twin-class production family was exercised.
+  (when *async*
+    (display "twin-oracle: checked=")
+    (display (number->string *twin-checks*))
+    (display " non-mechanical=")
+    (display (number->string *twin-blocked*))
+    (display " rewrites: async=")
+    (display (number->string *tw-async*))
+    (display " await=")
+    (display (number->string *tw-await*))
+    (display " all=")
+    (display (number->string *tw-all*))
+    (display " map=")
+    (display (number->string *tw-map*))
+    (display " pool-map=")
+    (display (number->string *tw-pool*))
+    (display " spawn-all=")
+    (display (number->string *tw-spawnall*))
+    (newline))
   (if (= *failures* 0)
     (begin
       (display "PASS: ")
@@ -1247,6 +2028,13 @@
       (display (number->string *failures*))
       (newline)
       (exit 1))))
+
+;; Render a generated program in read syntax. A program that is a bare string
+;; literal needs `~s` (quoted + escaped): `str` renders a top-level string in
+;; display form, which cannot be read back. Every other program is a form
+;; whose `str` already prints nested strings readably.
+(define (program->source f)
+  (if (string? f) (format "~s" f) (str f)))
 
 (define (run-emit)
   (let loop ((i 0) (acc (list)))
@@ -1264,7 +2052,15 @@
             (display out-file)
             (newline))))
       (begin
+        ;; Mirror run-check's per-iteration state exactly: same *cur-seed* and
+        ;; *file-ctr* (gen-async-offload derives file paths from them), and the
+        ;; same RNG stream position — check generates a round-trip datum before
+        ;; the typed program, so emit must generate and discard one too, or it
+        ;; shows a different program than the one check ran for the seed.
+        (set! *cur-seed* (+ base-seed i))
         (rng-seed! (+ base-seed i))
+        (set! *file-ctr* 0)
+        (gen-datum max-depth)
         (let ((p (gen-typed max-depth)))
           (loop (+ i 1)
             (cons
@@ -1273,7 +2069,7 @@
                 " => "
                 (str (gv p))
                 "\n"
-                (str (gf p)))
+                (program->source (gf p)))
               acc)))))))
 
 (if (= mode "emit") (run-emit) (run-check))

@@ -6,6 +6,14 @@
 # Surface slow tests instead of letting them silently dominate the tail.
 slow-timeout = { period = "60s", terminate-after = 3 }
 
+# The nightly fuzz-shutdown harness (crates/sema/tests/fuzz_async_shutdown_test.rs,
+# #[ignore] by default) runs hundreds of generated async programs inside one
+# test; its own per-root deadlines are the hang detector, so give it headroom
+# past the generic slow-test watchdog while keeping a terminal bound.
+[[profile.default.overrides]]
+filter = "test(fuzz_async_shutdown)"
+slow-timeout = { period = "300s", terminate-after = 2 }
+
 [profile.ci]
 # Emit JUnit XML for CI test reporting.
 retries = 1

@@ -869,6 +869,64 @@ fn async_all_empty_list() {
     assert_eq!(eval("(async/all (list))"), Value::list(vec![]));
 }
 
+// A registered promise-set wait (`async/all`/`race`/`timeout`/`await`) holds its
+// members as raw `PromiseId`s, invisible to the cycle collector. Once a member
+// settles, `PromiseRegistry::settle` consumes its waiter entry, so if that
+// member's handle was a temporary (here: `(async 1)`, alive only inside the
+// argument list) a GC pass while the wait is still parked used to evict the
+// settled record. The wait's next re-poll then hit `RegistryError::Unknown` —
+// an uncatchable `RuntimeFault::Invariant` ("registered promise wait became
+// invalid: Unknown") that killed the whole root. Found by the async grammar
+// fuzzer (docs/bugs/async-fuzz-findings.md finding 3). The sequence is causal,
+// not timing-based: the sidekick's `gc/collect` runs while the root is parked
+// on the `async/all`, and the channel send releases `slow` only afterwards.
+#[test]
+fn gc_pass_while_promise_set_wait_parked_keeps_settled_members_resolvable() {
+    assert_eq!(
+        eval(
+            r#"
+            (let ((ch (channel/new 1)))
+              (let ((slow (async (channel/recv ch))))
+                (async (async/sleep 10) (gc/collect) (channel/send ch 2))
+                (async/all (list (async 1) slow))))
+            "#
+        ),
+        eval("'(1 2)")
+    );
+}
+
+// A blocking `sleep` runs as an offloaded worker job (finding 1 of
+// docs/bugs/async-fuzz-findings.md). Cancelling it settles the promise
+// immediately, but the worker used to stay in an uninterruptible
+// `std::thread::sleep` for the sleep's full nominal duration — pinning one
+// executor worker per cancelled sleep and holding interpreter-drop's bounded
+// executor drain to its whole 2 s deadline. The worker parks on a condvar the
+// cancel hook signals, so a cancelled sleep releases its worker (and
+// interpreter shutdown) promptly. The 1 s bound leaves load headroom: with a
+// pinned worker this deterministically took the full 2 s drain deadline.
+#[test]
+fn cancelled_blocking_sleep_releases_worker_and_shutdown_promptly() {
+    let interp = sema_eval::Interpreter::new();
+    let result = interp
+        .eval_str_compiled(
+            r#"
+            (let ((p (async (sleep 60000))))
+              (async/sleep 3)
+              (async/cancel p)
+              (try (async/await p) (catch e (:type e))))
+            "#,
+        )
+        .expect("cancelled sleep program evaluates");
+    assert_eq!(result, Value::keyword("cancelled"));
+    let start = std::time::Instant::now();
+    drop(interp);
+    let elapsed = start.elapsed();
+    assert!(
+        elapsed < std::time::Duration::from_secs(1),
+        "interpreter drop waited on a cancelled sleep worker: {elapsed:?}"
+    );
+}
+
 // === async/race edge cases ===
 
 #[test]

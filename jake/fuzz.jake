@@ -41,3 +41,33 @@ task grammar n="5000" depth="4" seed="": [release]
 @desc "Print sample generated programs from the grammar fuzzer"
 task grammar-emit n="5" depth="4": [release]
     ./scripts/grammar-fuzz.sh emit -n {{n}} -d {{depth}}
+
+# Async mode: enables the async/channel/cancellation productions and runs
+# batches under an external watchdog, so a runtime hang becomes a finding
+# (exit 3 + reproducing seed) instead of a stuck run.
+#   jake fuzz.async n=5000 depth=4 seed=123
+@group fuzz
+@desc "In-Sema grammar fuzzer, async mode (params: n depth seed)"
+task async n="5000" depth="4" seed="": [release]
+    @if eq({{seed}}, "")
+        ./scripts/grammar-fuzz.sh check --async -n {{n}} -d {{depth}}
+    @else
+        ./scripts/grammar-fuzz.sh check --async -n {{n}} -d {{depth}} -s {{seed}}
+    @end
+
+@group fuzz
+@desc "Print sample generated async programs from the grammar fuzzer"
+task async-emit n="10" depth="4": [release]
+    ./scripts/grammar-fuzz.sh emit --async -n {{n}} -d {{depth}}
+
+# Shutdown-leak harness (Rust, crates/sema/tests/fuzz_async_shutdown_test.rs):
+# evals emit-mode async programs in-process and asserts zero live tasks plus a
+# clean ShutdownReport, on both the default drive path and the selection-scoped
+# drive_roots pair mode. #[ignore]d in normal test runs; this recipe is the
+# explicit entry point. Seeds base..base+n; a failure prints its seed + program.
+#   jake fuzz.async-shutdown n=500 depth=4 seed=123
+@group fuzz
+@desc "Async shutdown-leak harness (params: n depth seed)"
+task async-shutdown n="100" depth="4" seed="0":
+    SEMA_FUZZ_SEED={{seed}} SEMA_FUZZ_COUNT={{n}} SEMA_FUZZ_DEPTH={{depth}} \
+      cargo nextest run -p sema-lang --test fuzz_async_shutdown_test --run-ignored ignored-only

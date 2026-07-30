@@ -1,5 +1,14 @@
 # Async grammar fuzzer — plan
 
+**Status: complete (2026-07-30).** Phase 1 (async productions + external
+watchdog + jake recipes) landed `e2ce4c5f`..`10d42dac`; phase 2 (sequential
+twin oracle) `86fd9e2a`/`a92449aa`, plus the two runtime fixes it forced
+(`f70321bd` promise-set GC eviction, `290b0dba` cancelled blocking sleep);
+phase 3 (Rust shutdown-leak harness with the paired-roots `drive_roots` mode,
+`jake fuzz.async-shutdown`, the nightly `grammar-fuzz` job) `4896a17a`,
+`02d592a0`, `49c8b3ce`, `bf2cdd83`. Findings and resolutions:
+`docs/bugs/async-fuzz-findings.md`; usage: `fuzz/README.md`.
+
 Extend the in-Sema grammar fuzzer (`fuzz/grammar-fuzz.sema`) to generate and
 check async programs. Today the fuzzer deliberately excludes almost the entire
 async surface ("no stable value oracle"). The unified runtime's bug history
