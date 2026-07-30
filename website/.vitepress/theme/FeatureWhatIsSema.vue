@@ -32,7 +32,7 @@ import CustomPageLayout from './CustomPageLayout.vue'
             <button class="copy" @click="copyText('i1', $event)">copy</button>
           </span>
         </div>
-        <p class="req">v1.27.1 · MIT · Rust 2021 · 16 crates · ~125k lines</p>
+        <p class="req">v1.33.0 · MIT · Rust 2021 · 17 crates</p>
       </div>
     </header>
 
@@ -111,7 +111,10 @@ import CustomPageLayout from './CustomPageLayout.vue'
             <div class="type-group-label">Scalars</div>
             <div class="type-tags">
               <span class="type-tag">Integer</span>
+              <span class="type-tag">BigInt</span>
+              <span class="type-tag">Rational</span>
               <span class="type-tag">Float</span>
+              <span class="type-tag">Complex</span>
               <span class="type-tag">String</span>
               <span class="type-tag">Boolean</span>
               <span class="type-tag">Nil</span>
@@ -234,7 +237,7 @@ import CustomPageLayout from './CustomPageLayout.vue'
               of its idea.
             </p>
             <ul class="feature-list">
-              <li><strong>Eight chat providers.</strong> Anthropic, OpenAI, Gemini, Groq, xAI, Mistral, Moonshot, Ollama — auto-configured from environment variables. Plus Jina, Voyage, and Cohere for embeddings.</li>
+              <li><strong>Broad provider support.</strong> Anthropic, OpenAI, Gemini, Ollama, and configured OpenAI-compatible services such as Groq, Mistral, OpenRouter, and DeepSeek. OpenAI, Jina, Voyage, Cohere, Nomic, Together, and Fireworks cover embeddings or reranking.</li>
               <li><strong>Tools &amp; agents.</strong> <code>deftool</code> defines a function with a schema. <code>defagent</code> defines a system prompt + tools + turn limit. <code>agent/run</code> handles the loop.</li>
               <li><strong>Conversations as data.</strong> Immutable, forkable, inspectable. <code>conversation/say</code> returns a new value — the old one is untouched.</li>
               <li><strong>Cassettes.</strong> Record LLM calls to a file, replay them forever. Deterministic tests without API keys.</li>
@@ -344,9 +347,9 @@ import CustomPageLayout from './CustomPageLayout.vue'
               paths. No tree-walking interpreter.
             </p>
             <ul class="feature-list">
-              <li><strong>Single-threaded.</strong> <code>Rc</code>-based values, no cross-thread sharing. Parallelism is at the LLM-call level, not the compute level.</li>
-              <li><strong>No GC.</strong> Deterministic destruction via reference counting. Memory is freed the moment the last reference drops.</li>
-              <li><strong>16 crates.</strong> Strict dependency ordering: <code>sema-core ← sema-reader ← sema-vm ← sema-eval ← sema</code>. Stdlib and LLM depend on core, not eval — dependency inversion via callbacks.</li>
+              <li><strong>Single-threaded.</strong> <code>Rc</code>-based values, no cross-thread sharing. Async work runs on a deterministic cooperative scheduler.</li>
+              <li><strong>Reference-counted.</strong> Acyclic values are destroyed when their last reference drops. A synchronous Bacon–Rajan collector reclaims reference cycles.</li>
+              <li><strong>17 crates.</strong> Strict dependency ordering: <code>sema-core ← sema-reader ← sema-vm ← sema-eval ← sema</code>. Stdlib and LLM depend on core, not eval — dependency inversion via callbacks.</li>
               <li><strong>Bytecode format.</strong> <code>.semac</code> files with a 24-byte header, string table, function table, main chunk. <code>sema build</code> embeds the runtime + bytecode into a standalone binary.</li>
             </ul>
             <p class="sub" style="margin-top:18px">
@@ -379,8 +382,8 @@ import CustomPageLayout from './CustomPageLayout.vue'
                     <span class="bc-hex-note">magic</span>
                   </div>
                   <div class="bc-hex-group">
-                    <span class="bc-hex-byte">04</span><span class="bc-hex-byte">00</span>
-                    <span class="bc-hex-note">v4</span>
+                    <span class="bc-hex-byte">05</span><span class="bc-hex-byte">00</span>
+                    <span class="bc-hex-note">v5</span>
                   </div>
                   <div class="bc-hex-group">
                     <span class="bc-hex-byte">00</span><span class="bc-hex-byte">00</span>
