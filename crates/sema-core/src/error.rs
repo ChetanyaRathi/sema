@@ -230,6 +230,21 @@ pub enum SemaError {
     #[error("{0}")]
     PolicyDenied(Box<PolicyDenial>),
 
+    /// Internal workflow control transfer emitted after a durable approval request has
+    /// been created. This is deliberately not catchable by Sema `try`/`catch`; only the
+    /// enclosing `workflow/run` consumes it and returns a `:needs-approval` envelope.
+    #[error("workflow approval required: {approval_id}")]
+    WorkflowApprovalRequired { approval_id: String },
+
+    /// Internal workflow control transfer emitted when a durable rejection is observed.
+    /// Like [`Self::WorkflowApprovalRequired`], user code cannot catch it and continue
+    /// past the protected action.
+    #[error("workflow approval rejected: {approval_id}")]
+    WorkflowApprovalRejected {
+        approval_id: String,
+        reason: Option<String>,
+    },
+
     #[error("Internal error: {0}")]
     Internal(String),
 
@@ -484,6 +499,15 @@ impl SemaError {
     pub fn policy_denied(denial: PolicyDenial) -> Self {
         let rule = denial.rule.clone();
         SemaError::PolicyDenied(Box::new(denial)).with_note(format!("policy rule: {rule}"))
+    }
+
+    /// Whether this error is a host-owned control transfer that language-level exception
+    /// handlers must not intercept.
+    pub fn is_uncatchable(&self) -> bool {
+        matches!(
+            self.inner(),
+            SemaError::WorkflowApprovalRequired { .. } | SemaError::WorkflowApprovalRejected { .. }
+        )
     }
 
     pub fn internal(message: impl Into<String>) -> Self {
@@ -765,6 +789,16 @@ impl SemaError {
                 "Permission denied: {function} — path '{path}' is outside allowed directories"
             ),
             SemaError::PolicyDenied(denial) => denial.to_string(),
+            SemaError::WorkflowApprovalRequired { approval_id } => {
+                format!("workflow approval required: {approval_id}")
+            }
+            SemaError::WorkflowApprovalRejected {
+                approval_id,
+                reason,
+            } => reason.as_ref().map_or_else(
+                || format!("workflow approval rejected: {approval_id}"),
+                |reason| format!("workflow approval rejected: {approval_id}: {reason}"),
+            ),
             SemaError::Internal(message) => format!("Internal error: {message}"),
             SemaError::UserException(value) => format!("User exception: {value}"),
             SemaError::Condition(condition) => condition_message(condition),

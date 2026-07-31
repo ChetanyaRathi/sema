@@ -171,8 +171,8 @@ pub enum WorkflowEvent {
     },
 
     /// Last line of every run. `status` mirrors the `{:status …}` envelope's status
-    /// (`"success"` / `"failed"` / `"needs-auth"`); `reason` carries the failure
-    /// reason when failed.
+    /// (`"success"`, `"failed"`, `"needs-auth"`, `"needs-approval"`, or
+    /// `"rejected"`); `reason` carries the terminal reason when present.
     #[serde(rename = "run.ended")]
     RunEnded {
         seq: u64,
@@ -347,6 +347,61 @@ pub enum WorkflowEvent {
         reason: String,
         source: String,
     },
+
+    /// A durable explicit approval request stopped workflow evaluation.
+    #[serde(rename = "approval.requested")]
+    ApprovalRequested {
+        seq: u64,
+        ts: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        phase_seq: Option<u64>,
+        approval_id: String,
+        request_digest: String,
+        key: String,
+        reason: String,
+        subject_digest: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        preview: Option<String>,
+    },
+
+    /// An approved durable decision was observed while replaying the gate.
+    #[serde(rename = "approval.granted")]
+    ApprovalGranted {
+        seq: u64,
+        ts: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        phase_seq: Option<u64>,
+        approval_id: String,
+        decision_id: String,
+        actor: String,
+        provenance: String,
+    },
+
+    /// A rejected durable decision was observed while replaying the gate.
+    #[serde(rename = "approval.rejected")]
+    ApprovalRejected {
+        seq: u64,
+        ts: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        phase_seq: Option<u64>,
+        approval_id: String,
+        decision_id: String,
+        actor: String,
+        provenance: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
+
+    /// Execution crossed an explicit gate after observing an approved decision.
+    #[serde(rename = "approval.applied")]
+    ApprovalApplied {
+        seq: u64,
+        ts: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        phase_seq: Option<u64>,
+        approval_id: String,
+        decision_id: String,
+    },
 }
 
 impl WorkflowEvent {
@@ -370,6 +425,10 @@ impl WorkflowEvent {
             Self::PolicyRedacted { .. } => "policy.redacted",
             Self::PolicyViolation { .. } => "policy.violation",
             Self::PolicyBypassed { .. } => "policy.bypassed",
+            Self::ApprovalRequested { .. } => "approval.requested",
+            Self::ApprovalGranted { .. } => "approval.granted",
+            Self::ApprovalRejected { .. } => "approval.rejected",
+            Self::ApprovalApplied { .. } => "approval.applied",
         }
     }
 }

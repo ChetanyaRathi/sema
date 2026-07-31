@@ -138,6 +138,46 @@ are readable in a later phase. Each checkpoint emits a `checkpoint` event
 with a `content_key`, an opaque value digest, and a capped display value; the
 memo sidecar stores the canonical value for resume.
 
+### `approval`
+
+Stops before a sensitive action until a host records an approve or reject
+decision. The subject is used only to bind the decision; the request sidecar
+stores its SHA-256 digest, not the raw value. Put only operator-safe text in
+`:preview`.
+
+```sema
+(approval :release-signoff
+  {:reason "Publish the release"
+   :subject {:kind :external-action
+             :target "pkg.sema-lang.com"
+             :digest package-digest}
+   :preview "Publish sema-policies@1.0.0"})
+
+;; This does not run until the request is approved.
+(publish-package)
+```
+
+The default `auto` mode prompts when stdin and stderr are terminals and `CI`
+is unset. Otherwise the run ends with `:needs-approval` and exit code 3. The
+request remains pending if the prompt gets EOF, `q`, or Ctrl-C.
+
+```bash
+# Force headless behavior.
+sema workflow run release.sema --approval-mode pause
+
+# Inspect and decide from another terminal or process.
+sema workflow approvals <run-id>
+sema workflow approve <run-id> <approval-id> --comment "verified"
+sema workflow reject <run-id> <approval-id> --reason "not ready"
+
+# A standalone decision is applied when the same run resumes.
+sema workflow run release.sema --resume <run-id>
+```
+
+Decisions are immutable and bound to the run, workflow code and arguments,
+phase, key, occurrence, and subject digest. Editing any binding creates a new
+request. Sema `try`/`catch` cannot continue past a pending or rejected gate.
+
 ### `parallel`
 
 Runs a list of zero-arg thunks concurrently with bounded concurrency (default
@@ -180,6 +220,9 @@ Every `sema workflow run` creates a run directory under `.sema/runs/<run-id>/`:
   memo/                     # per-leaf resume cache
     3f13d37d3df7b337_0.json #   content-key → memoized value
     7b03b1d77c616601_0.json
+  approvals/                # authoritative human approval protocol
+    apr_….request.json
+    apr_….decision.json
   metadata.json             # workflow name, code version, budget, permissions
   result.json               # the final {:status …} envelope
 ```
@@ -201,6 +244,10 @@ Old runs stay readable forever.
 | `policy.checked` | `policy`, `boundary`, `subject`, `rule`, `source` | A policy layer allowed a protected boundary |
 | `policy.violation` | `policy`, `boundary`, `subject`, `rule`, `action`, `source` | A policy layer denied a protected boundary |
 | `policy.bypassed` | `policy`, `boundary`, `subject`, `reason`, `source` | A lexical `policy/without` scope bypassed a protected boundary |
+| `approval.requested` | `approval_id`, `request_digest`, `key`, `reason`, `subject_digest` | A durable request stopped the run |
+| `approval.granted` | `approval_id`, `decision_id`, `actor`, `provenance` | An approved decision was observed on resume |
+| `approval.rejected` | `approval_id`, `decision_id`, `actor`, `reason` | A rejected decision was observed on resume |
+| `approval.applied` | `approval_id`, `decision_id` | Execution crossed an approved gate |
 | `checkpoint` | `key`, `content_key`, `value_digest`, `value` | A checkpoint was recorded |
 | `budget` | `agent_id`, `input_tokens`, `output_tokens`, `cost_usd`, `budget_limit` | A per-leaf budget observation |
 | `run.ended` | `status`, `reason`, `dur_ms` | Last line of every run |
@@ -617,7 +664,12 @@ sema workflow run examples/workflows/content-pipeline.sema --view
 
 ```bash
 # Run a workflow file
-sema workflow run <file> [--args <json>] [--run-dir <dir>] [--view] [--port <n>] [--resume <run-id>]
+sema workflow run <file> [--args <json>] [--run-dir <dir>] [--view] [--port <n>] [--resume <run-id>] [--approval-mode auto|prompt|pause|deny]
+
+# Inspect or decide durable approval requests
+sema workflow approvals <run-id> [--json]
+sema workflow approve <run-id> <approval-id> [--comment <text>]
+sema workflow reject <run-id> <approval-id> --reason <text>
 
 # Statically validate a workflow file
 sema workflow check <file> [--strict] [--json]
@@ -632,7 +684,7 @@ sema workflow view [--run-dir <dir>] [--host <addr>] [--port <n>]
 ## Internal API
 
 The builtins that back the DSL are registered in `sema-stdlib/src/workflow.rs`.
-The macros (`defworkflow`, `phase`, `step`) are in `sema-eval/src/prelude.rs`.
+The macros (`defworkflow`, `phase`, `step`, `approval`) are in `sema-eval/src/prelude.rs`.
 The runtime crate (`sema-workflow`) is a leaf — it depends only on
 `sema-core` + `sema-otel` + serde, never on `sema-eval`.
 
@@ -642,4 +694,5 @@ The runtime crate (`sema-workflow`) is a leaf — it depends only on
 | `workflow/phase` | Marker — close the prior phase, open a new one |
 | `workflow/step` | Run a leaf as a journaled step (started/result + budget) |
 | `workflow/tool-call` | Journal a tool call by the current agent |
+| `workflow/approval` | Create/read a durable approval request and decision |
 | `checkpoint` | Record or read a keyed step value |

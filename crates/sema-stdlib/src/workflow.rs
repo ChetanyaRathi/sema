@@ -22,16 +22,17 @@
 
 use sema_core::cycle::GcEdge;
 use sema_core::runtime::{
-    CancelDisposition, CancelHook, CancelHookError, CompletionDecoder, CompletionKind,
-    DecodedCompletion, ExternalFailure, InterruptibleResource, NativeCall, NativeCallContext,
-    NativeContinuation, NativeOutcome, NativeResult, NativeSuspend, PreparedExternalOperation,
-    ResumeInput, SendPayload, TaskContextHandle, Trace, WaitKind,
+    downcast_send_payload, CancelDisposition, CancelHook, CancelHookError, CompletionDecoder,
+    CompletionKind, DecodedCompletion, ExternalFailure, InterruptibleResource, NativeCall,
+    NativeCallContext, NativeContinuation, NativeOutcome, NativeResult, NativeSuspend,
+    PreparedExternalOperation, ResumeInput, SendPayload, TaskContextHandle, Trace, WaitKind,
 };
 use sema_core::{PolicyDenial, SemaError, Value};
 use sema_llm::builtins::{
     PolicyAttributionScope, PolicyBypassScope, PolicyDecisionSink, PolicyObservation,
     PolicyObservationKind, PolicyScope,
 };
+use sema_workflow::approval::{ApprovalRequest, ApprovalResolution, NewApprovalRequest};
 use sema_workflow::context;
 use sema_workflow::event::WorkflowEvent;
 use std::collections::BTreeMap;
@@ -62,6 +63,332 @@ fn opt_str(v: &Value, key: &str) -> String {
 fn opt_value(v: &Value, key: &str) -> Option<Value> {
     v.as_map_rc()
         .and_then(|m| m.get(&Value::keyword(key)).cloned())
+}
+
+const APPROVAL_TEXT_MAX_CHARS: usize = 1024;
+const APPROVAL_SUBJECT_MAX_BYTES: usize = 1 << 20;
+
+fn approval_request(
+    task_context: Option<&TaskContextHandle>,
+    args: &[Value],
+) -> Result<(std::path::PathBuf, ApprovalRequest), SemaError> {
+    if args.len() != 2 {
+        return Err(SemaError::arity("workflow/approval", "2", args.len()));
+    }
+    let key = as_name(&args[0]).ok_or_else(|| {
+        SemaError::argument_type_with_value("workflow/approval", 1, "keyword or string", &args[0])
+    })?;
+    let opts = args[1].as_map_rc().ok_or_else(|| {
+        SemaError::argument_type_with_value("workflow/approval", 2, "map", &args[1])
+    })?;
+    let reason = opts
+        .get(&Value::keyword("reason"))
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| SemaError::eval("approval :reason must be a nonempty string"))?
+        .to_string();
+    if reason.chars().count() > APPROVAL_TEXT_MAX_CHARS {
+        return Err(SemaError::eval(format!(
+            "approval :reason must not exceed {APPROVAL_TEXT_MAX_CHARS} characters"
+        )));
+    }
+    let subject = opts
+        .get(&Value::keyword("subject"))
+        .ok_or_else(|| SemaError::eval("approval requires a :subject value"))?;
+    let (subject_repr, truncated) = context::compact_capped(subject, APPROVAL_SUBJECT_MAX_BYTES);
+    if truncated {
+        return Err(SemaError::eval(format!(
+            "approval :subject must not exceed {APPROVAL_SUBJECT_MAX_BYTES} rendered bytes"
+        )));
+    }
+    let subject_digest = sema_workflow::approval::sha256_bytes(subject_repr.as_bytes());
+    let preview = opts
+        .get(&Value::keyword("preview"))
+        .map(|value| {
+            value
+                .as_str()
+                .ok_or_else(|| SemaError::eval("approval :preview must be a string"))
+                .map(str::trim)
+                .map(str::to_string)
+        })
+        .transpose()?;
+    if preview
+        .as_ref()
+        .is_some_and(|value| value.chars().count() > APPROVAL_TEXT_MAX_CHARS)
+    {
+        return Err(SemaError::eval(format!(
+            "approval :preview must not exceed {APPROVAL_TEXT_MAX_CHARS} characters"
+        )));
+    }
+    let ctx = context::current_for(task_context)
+        .ok_or_else(|| SemaError::eval("approval outside a workflow/run"))?;
+    let code_version = ctx.approval_code_version();
+    if code_version.trim().is_empty() {
+        return Err(SemaError::eval(
+            "approval requires a stable workflow code version; run the file with `sema workflow run` or set SEMA_WORKFLOW_APPROVAL_CODE_VERSION",
+        ));
+    }
+    let phase = ctx.cur_phase_label();
+    let occurrence = ctx.approval_occurrence(&key, &subject_digest, &phase);
+    let request = ApprovalRequest::new(NewApprovalRequest {
+        run_id: ctx.run_id(),
+        workflow: ctx.workflow_name(),
+        code_version,
+        args_digest: ctx.approval_args_digest(),
+        phase,
+        key,
+        occurrence,
+        subject_digest,
+        reason,
+        preview,
+        requested_at: ctx.ts(),
+    });
+    Ok((ctx.run_dir(), request))
+}
+
+fn approval_resolution_value(resolution: ApprovalResolution) -> Value {
+    let mut map = BTreeMap::new();
+    match resolution {
+        ApprovalResolution::Pending(request) => {
+            map.insert(Value::keyword("status"), Value::keyword("pending"));
+            insert_approval_request_fields(&mut map, &request);
+        }
+        ApprovalResolution::Approved(request, decision) => {
+            map.insert(Value::keyword("status"), Value::keyword("approved"));
+            insert_approval_request_fields(&mut map, &request);
+            insert_approval_decision_fields(&mut map, &decision);
+        }
+        ApprovalResolution::Rejected(request, decision) => {
+            map.insert(Value::keyword("status"), Value::keyword("rejected"));
+            insert_approval_request_fields(&mut map, &request);
+            insert_approval_decision_fields(&mut map, &decision);
+        }
+    }
+    Value::map(map)
+}
+
+fn insert_approval_request_fields(map: &mut BTreeMap<Value, Value>, request: &ApprovalRequest) {
+    map.insert(
+        Value::keyword("approval-id"),
+        Value::string(&request.approval_id),
+    );
+    map.insert(
+        Value::keyword("request-digest"),
+        Value::string(&request.request_digest),
+    );
+    map.insert(Value::keyword("key"), Value::string(&request.key));
+    map.insert(Value::keyword("reason"), Value::string(&request.reason));
+    map.insert(
+        Value::keyword("subject-digest"),
+        Value::string(&request.subject_digest),
+    );
+    if let Some(preview) = &request.preview {
+        map.insert(Value::keyword("preview"), Value::string(preview));
+    }
+}
+
+fn insert_approval_decision_fields(
+    map: &mut BTreeMap<Value, Value>,
+    decision: &sema_workflow::approval::ApprovalDecision,
+) {
+    map.insert(
+        Value::keyword("decision-id"),
+        Value::string(&decision.decision_id),
+    );
+    map.insert(Value::keyword("actor"), Value::string(&decision.actor));
+    map.insert(
+        Value::keyword("provenance"),
+        Value::string(&decision.provenance),
+    );
+    if let Some(reason) = &decision.reason {
+        map.insert(Value::keyword("decision-reason"), Value::string(reason));
+    }
+}
+
+fn approval_field(map: &BTreeMap<Value, Value>, key: &str) -> String {
+    map.get(&Value::keyword(key))
+        .and_then(|value| value.as_str())
+        .unwrap_or_default()
+        .to_string()
+}
+
+fn apply_approval_resolution(
+    task_context: Option<&TaskContextHandle>,
+    value: Value,
+) -> Result<Value, SemaError> {
+    let map = value
+        .as_map_rc()
+        .ok_or_else(|| SemaError::internal("approval worker returned a non-map result"))?;
+    let status = map
+        .get(&Value::keyword("status"))
+        .and_then(|value| value.as_keyword())
+        .unwrap_or_default();
+    let approval_id = approval_field(&map, "approval-id");
+    let ctx = context::current_for(task_context)
+        .ok_or_else(|| SemaError::eval("approval outside a workflow/run"))?;
+    match status.as_str() {
+        "pending" => {
+            ctx.emit(WorkflowEvent::ApprovalRequested {
+                seq: ctx.next_seq(),
+                ts: ctx.ts(),
+                phase_seq: ctx.phase_seq(),
+                approval_id: approval_id.clone(),
+                request_digest: approval_field(&map, "request-digest"),
+                key: approval_field(&map, "key"),
+                reason: approval_field(&map, "reason"),
+                subject_digest: approval_field(&map, "subject-digest"),
+                preview: map
+                    .get(&Value::keyword("preview"))
+                    .and_then(|value| value.as_str())
+                    .map(str::to_string),
+            });
+            Err(SemaError::WorkflowApprovalRequired { approval_id })
+        }
+        "approved" => {
+            let decision_id = approval_field(&map, "decision-id");
+            ctx.emit(WorkflowEvent::ApprovalGranted {
+                seq: ctx.next_seq(),
+                ts: ctx.ts(),
+                phase_seq: ctx.phase_seq(),
+                approval_id: approval_id.clone(),
+                decision_id: decision_id.clone(),
+                actor: approval_field(&map, "actor"),
+                provenance: approval_field(&map, "provenance"),
+            });
+            ctx.emit(WorkflowEvent::ApprovalApplied {
+                seq: ctx.next_seq(),
+                ts: ctx.ts(),
+                phase_seq: ctx.phase_seq(),
+                approval_id,
+                decision_id,
+            });
+            Ok(Value::bool(true))
+        }
+        "rejected" => {
+            let reason = map
+                .get(&Value::keyword("decision-reason"))
+                .and_then(|value| value.as_str())
+                .map(str::to_string);
+            ctx.emit(WorkflowEvent::ApprovalRejected {
+                seq: ctx.next_seq(),
+                ts: ctx.ts(),
+                phase_seq: ctx.phase_seq(),
+                approval_id: approval_id.clone(),
+                decision_id: approval_field(&map, "decision-id"),
+                actor: approval_field(&map, "actor"),
+                provenance: approval_field(&map, "provenance"),
+                reason: reason.clone(),
+            });
+            Err(SemaError::WorkflowApprovalRejected {
+                approval_id,
+                reason,
+            })
+        }
+        _ => Err(SemaError::internal(format!(
+            "approval worker returned unknown status {status:?}"
+        ))),
+    }
+}
+
+const APPROVAL_COMPLETION_KIND: u64 = 0x7761_7070; // "wapp"
+
+struct ApprovalDecoder;
+
+impl Trace for ApprovalDecoder {
+    fn trace(&self, _sink: &mut dyn FnMut(GcEdge<'_>)) -> bool {
+        true
+    }
+}
+
+impl CompletionDecoder for ApprovalDecoder {
+    fn decode(
+        self: Box<Self>,
+        _context: &mut NativeCallContext<'_>,
+        result: Result<SendPayload, ExternalFailure>,
+    ) -> DecodedCompletion {
+        match result {
+            Ok(payload) => match downcast_send_payload::<Result<ApprovalResolution, String>>(
+                payload,
+                "workflow/approval",
+            ) {
+                Ok(Ok(resolution)) => Ok(approval_resolution_value(resolution)),
+                Ok(Err(message)) => Err(SemaError::Io(message)),
+                Err(failure) => Err(SemaError::eval(failure.message().to_string())),
+            },
+            Err(failure) => Err(SemaError::eval(format!(
+                "workflow/approval: {}",
+                failure.message()
+            ))),
+        }
+    }
+}
+
+struct ApprovalContinuation;
+
+impl Trace for ApprovalContinuation {
+    fn trace(&self, _sink: &mut dyn FnMut(GcEdge<'_>)) -> bool {
+        true
+    }
+}
+
+impl NativeContinuation for ApprovalContinuation {
+    fn resume(
+        self: Box<Self>,
+        context: &mut NativeCallContext<'_>,
+        input: ResumeInput,
+    ) -> NativeResult {
+        match input {
+            ResumeInput::Returned(value) => {
+                let task_context = context.task_context.clone();
+                apply_approval_resolution(Some(&task_context), value).map(NativeOutcome::Return)
+            }
+            ResumeInput::Failed(error) => Err(error),
+            ResumeInput::Cancelled(reason) => Err(SemaError::eval(format!(
+                "workflow/approval was cancelled ({reason:?})"
+            ))),
+            ResumeInput::Runtime(_) => Err(SemaError::internal(
+                "workflow/approval received an unexpected runtime response",
+            )),
+        }
+    }
+}
+
+struct ApprovalCancelHook;
+
+impl Trace for ApprovalCancelHook {
+    fn trace(&self, _sink: &mut dyn FnMut(GcEdge<'_>)) -> bool {
+        true
+    }
+}
+
+impl CancelHook for ApprovalCancelHook {
+    fn cancel(&mut self) -> Result<CancelDisposition, CancelHookError> {
+        Ok(CancelDisposition::Reaped)
+    }
+
+    fn reap(&mut self) -> Result<CancelDisposition, CancelHookError> {
+        Ok(CancelDisposition::Reaped)
+    }
+}
+
+fn approval_suspend(run_dir: PathBuf, request: ApprovalRequest) -> NativeResult {
+    let kind = CompletionKind::try_from_raw(APPROVAL_COMPLETION_KIND)
+        .expect("approval completion kind is nonzero");
+    let prepared = PreparedExternalOperation::interruptible_blocking(
+        kind,
+        Box::new(ApprovalDecoder),
+        InterruptibleResource::new("workflow/approval-store", Box::new(ApprovalCancelHook)),
+        move || {
+            let result = sema_workflow::approval::ensure_request(&run_dir, &request)
+                .map_err(|error| error.to_string());
+            Ok(Box::new(result) as SendPayload)
+        },
+    );
+    Ok(NativeOutcome::Suspend(NativeSuspend {
+        wait: WaitKind::External(Box::new(prepared)),
+        continuation: Box::new(ApprovalContinuation),
+    }))
 }
 
 fn compile_policy(
@@ -401,6 +728,24 @@ fn failed_envelope(msg: &str) -> Value {
     m.insert(Value::keyword("status"), Value::keyword("failed"));
     m.insert(Value::keyword("error"), Value::string(msg));
     Value::map(m)
+}
+
+fn needs_approval_envelope(approval_id: &str) -> Value {
+    Value::map(BTreeMap::from([
+        (Value::keyword("status"), Value::keyword("needs-approval")),
+        (Value::keyword("approval-id"), Value::string(approval_id)),
+    ]))
+}
+
+fn rejected_approval_envelope(approval_id: &str, reason: Option<&str>) -> Value {
+    let mut map = BTreeMap::from([
+        (Value::keyword("status"), Value::keyword("rejected")),
+        (Value::keyword("approval-id"), Value::string(approval_id)),
+    ]);
+    if let Some(reason) = reason {
+        map.insert(Value::keyword("reason"), Value::string(reason));
+    }
+    Value::map(map)
 }
 
 /// The envelope for a run that a budget cap stopped. Distinct `:reason` (not `:error`)
@@ -979,16 +1324,39 @@ fn finish_run(
             let status = envelope_status(&envelope).unwrap_or_else(|| "success".to_string());
             (status, envelope, None)
         }
-        Err(e) => (
-            "failed".to_string(),
-            failed_envelope(&e.to_string()),
-            Some("workflow body returned an error".to_string()),
-        ),
+        Err(e) => match e.inner() {
+            SemaError::WorkflowApprovalRequired { approval_id } => (
+                "needs-approval".to_string(),
+                needs_approval_envelope(approval_id),
+                Some("human approval required".to_string()),
+            ),
+            SemaError::WorkflowApprovalRejected {
+                approval_id,
+                reason,
+            } => (
+                "rejected".to_string(),
+                rejected_approval_envelope(approval_id, reason.as_deref()),
+                Some("human approval rejected".to_string()),
+            ),
+            _ => (
+                "failed".to_string(),
+                failed_envelope(&e.to_string()),
+                Some("workflow body returned an error".to_string()),
+            ),
+        },
     };
     // Close any resolved MCP handles exactly once, regardless of how the body exited.
     teardown.close_mcp();
     let ctx = context::current_for(task_context);
     let ack = if let Some(ctx) = &ctx {
+        if matches!(status.as_str(), "needs-approval" | "rejected") {
+            let mut map = envelope
+                .as_map_rc()
+                .map(|map| (*map).clone())
+                .unwrap_or_default();
+            map.insert(Value::keyword("run-id"), Value::string(&ctx.run_id()));
+            envelope = Value::map(map);
+        }
         // A tripped budget cap fails the run regardless of the body's own outcome.
         if ctx.over_budget() {
             status = "failed".to_string();
@@ -1576,6 +1944,27 @@ pub fn register(env: &sema_core::Env) {
         run_plan,
         finish_run,
         trace_run_teardown,
+    );
+
+    // (workflow/approval key opts) — atomically create/read the host-owned request and
+    // decision sidecars. The runtime arm offloads filesystem I/O; pending/rejected
+    // outcomes raise uncatchable workflow control transfers consumed by workflow/run.
+    env.set(
+        sema_core::intern("workflow/approval"),
+        Value::native_fn(sema_core::NativeFn::simple_with_runtime(
+            "workflow/approval",
+            |args| {
+                let (run_dir, request) = approval_request(None, args)?;
+                let resolution = sema_workflow::approval::ensure_request(&run_dir, &request)
+                    .map_err(|error| SemaError::Io(error.to_string()))?;
+                apply_approval_resolution(None, approval_resolution_value(resolution))
+            },
+            |context, args| {
+                let task_context = context.task_context.clone();
+                let (run_dir, request) = approval_request(Some(&task_context), args)?;
+                approval_suspend(run_dir, request)
+            },
+        )),
     );
 
     // (workflow/phase label) — a MARKER (workflow.js semantics), not a wrapper. Closes

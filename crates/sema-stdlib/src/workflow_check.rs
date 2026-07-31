@@ -483,6 +483,63 @@ fn walk_markers(form: &Value, spans: &SpanMap, out: &mut Vec<Diag>) {
                     ));
                 }
             }
+            "approval" => {
+                if items.len() != 3 {
+                    out.push(Diag::error(
+                        span,
+                        "E-APPROVAL-ARITY",
+                        format!(
+                            "approval takes a key and an options map, got {} arguments",
+                            items.len() - 1
+                        ),
+                    ));
+                } else {
+                    if items[1].as_keyword().is_none() && items[1].as_str().is_none() {
+                        out.push(Diag::warn(
+                            span,
+                            "W-APPROVAL-KEY",
+                            "approval key should be a keyword or string",
+                        ));
+                    }
+                    match items[2].as_map_ref() {
+                        Some(opts) => {
+                            if opts
+                                .get(&Value::keyword("reason"))
+                                .and_then(|value| value.as_str())
+                                .is_none_or(|reason| reason.trim().is_empty())
+                            {
+                                out.push(Diag::error(
+                                    span,
+                                    "E-APPROVAL-REASON",
+                                    "approval :reason must be a nonempty string",
+                                ));
+                            }
+                            if !opts.contains_key(&Value::keyword("subject")) {
+                                out.push(Diag::error(
+                                    span,
+                                    "E-APPROVAL-SUBJECT",
+                                    "approval requires a :subject value",
+                                ));
+                            }
+                            if opts
+                                .get(&Value::keyword("preview"))
+                                .is_some_and(|value| value.as_str().is_none())
+                            {
+                                out.push(Diag::error(
+                                    span,
+                                    "E-APPROVAL-PREVIEW",
+                                    "approval :preview must be a string",
+                                ));
+                            }
+                        }
+                        None => out.push(Diag::error(
+                            span,
+                            "E-APPROVAL-OPTS",
+                            "approval options must be a literal map",
+                        )),
+                    }
+                }
+            }
             // step needs at least a prompt; if opts are given, validate the map.
             "step" => {
                 if items.len() < 2 {
@@ -764,6 +821,19 @@ mod tests {
             "got {:?}",
             codes(bad_arity)
         );
+    }
+
+    #[test]
+    fn approval_shape_is_checked() {
+        let c = codes(
+            r#"(defworkflow d "d" {}
+                  (approval 42 {:reason "" :preview 1})
+                  {:status :ok})"#,
+        );
+        assert!(c.contains(&"W-APPROVAL-KEY"));
+        assert!(c.contains(&"E-APPROVAL-REASON"));
+        assert!(c.contains(&"E-APPROVAL-SUBJECT"));
+        assert!(c.contains(&"E-APPROVAL-PREVIEW"));
     }
 
     #[test]

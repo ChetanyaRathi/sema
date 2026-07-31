@@ -360,6 +360,12 @@ pub const PRELUDE: &str = r#"
 (defmacro phase (label)
   `(workflow/phase ,label))
 
+;; approval: a durable host-controlled workflow gate. `opts` requires a human-readable
+;; :reason and an identity-only :subject; optional :preview is the only subject text
+;; written to the request sidecar. Pending/rejected gates stop the enclosing workflow.
+(defmacro approval (key opts)
+  `(workflow/approval ,key ,opts))
+
 ;; checkpoint: a run-scoped state write/read. The write form delays its value
 ;; expression so `workflow/checkpoint` can return a resume memo before evaluating
 ;; expensive or side-effecting work.

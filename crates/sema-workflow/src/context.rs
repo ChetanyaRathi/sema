@@ -126,6 +126,9 @@ thread_local! {
 pub struct WorkflowCtx {
     /// Stable identifier for this run; names the run dir (`./.sema/runs/<run_id>/`).
     pub run_id: String,
+    /// Declared `defworkflow` name. Stored separately from the run id so approval
+    /// requests can bind decisions to the workflow definition that produced them.
+    workflow_name: RefCell<String>,
     /// Append-only JSONL journal sink. `RefCell` because `emit` needs `&mut` access
     /// to the underlying writer while the ctx itself is shared `Rc`.
     journal: Rc<RefCell<Journal>>,
@@ -174,7 +177,11 @@ pub struct WorkflowCtx {
     /// mints a per-base occurrence ordinal so identical-prompt repeats in source order
     /// line up across runs.
     resuming: Cell<bool>,
+    /// Existing short resume fingerprint. Kept stable for memo compatibility.
     code_version: RefCell<String>,
+    /// Collision-resistant source fingerprint used to bind human decisions. The CLI
+    /// supplies SHA-256; library callers fall back to `code_version`.
+    approval_code_version: RefCell<String>,
     resume_memos: RefCell<HashMap<String, Value>>,
     key_seen: RefCell<HashMap<String, u32>>,
     /// Number of memos stored this run, capped at [`MEMO_MAX_COUNT`] so an unbounded fan-out
@@ -237,6 +244,7 @@ impl WorkflowCtx {
             .map(|i| i as u64);
         Rc::new(WorkflowCtx {
             run_id,
+            workflow_name: RefCell::new(String::new()),
             journal: Rc::new(RefCell::new(journal)),
             state: Rc::new(RefCell::new(BTreeMap::new())),
             seq: Cell::new(0),
@@ -252,6 +260,7 @@ impl WorkflowCtx {
             agent_n: RefCell::new(BTreeMap::new()),
             resuming: Cell::new(false),
             code_version: RefCell::new(String::new()),
+            approval_code_version: RefCell::new(String::new()),
             resume_memos: RefCell::new(HashMap::new()),
             key_seen: RefCell::new(HashMap::new()),
             memo_count: Cell::new(0),
@@ -266,6 +275,40 @@ impl WorkflowCtx {
     /// The run's `--args` JSON string (empty if none).
     pub fn args_json(&self) -> &str {
         &self.args_json
+    }
+
+    /// Bind this context to its declared workflow name. Called once while opening the
+    /// scope, before the body can evaluate an approval gate.
+    pub fn set_workflow_name(&self, name: impl Into<String>) {
+        *self.workflow_name.borrow_mut() = name.into();
+    }
+
+    pub fn workflow_name(&self) -> String {
+        self.workflow_name.borrow().clone()
+    }
+
+    /// Collision-resistant workflow revision used by durable approval requests.
+    pub fn approval_code_version(&self) -> String {
+        self.approval_code_version.borrow().clone()
+    }
+
+    /// Full SHA-256 of canonicalized workflow arguments for approval bindings. Resume
+    /// keeps its historical short content-key fingerprint; approvals use the full digest.
+    pub fn approval_args_digest(&self) -> String {
+        let normalized = if self.args_json.trim().is_empty() {
+            String::new()
+        } else {
+            serde_json::from_str::<serde_json::Value>(&self.args_json)
+                .ok()
+                .and_then(|json| serde_json::to_string(&json).ok())
+                .unwrap_or_else(|| self.args_json.clone())
+        };
+        crate::approval::sha256_bytes(normalized.as_bytes())
+    }
+
+    /// Run directory containing the approval authority sidecars.
+    pub fn run_dir(&self) -> std::path::PathBuf {
+        self.journal.borrow().dir().to_path_buf()
     }
 
     /// Open a marker-style phase: record its `phase.started` seq AND label so the next
@@ -445,6 +488,10 @@ impl WorkflowCtx {
         *self.code_version.borrow_mut() = v;
     }
 
+    pub fn set_approval_code_version(&self, v: String) {
+        *self.approval_code_version.borrow_mut() = v;
+    }
+
     /// Enter resume mode with the prior run's memos (content-key → value).
     pub fn enter_resume(&self, memos: HashMap<String, Value>) {
         self.resuming.set(true);
@@ -504,6 +551,22 @@ impl WorkflowCtx {
         let cv = self.code_version.borrow().clone();
         let base = hash_fields(&["checkpoint", &cv, &self.args_fingerprint, phase, key]);
         format!("{base}_{}", self.next_occurrence(&base))
+    }
+
+    /// Next occurrence for an explicit approval gate. The base binds the same inputs as
+    /// the durable request, so repeated identical gates in deterministic body order get
+    /// distinct request ids that line up on resume.
+    pub fn approval_occurrence(&self, key: &str, subject_digest: &str, phase: &str) -> u32 {
+        let cv = self.approval_code_version.borrow().clone();
+        let base = crate::approval::sha256_fields(&[
+            "approval",
+            &cv,
+            &self.args_fingerprint,
+            phase,
+            key,
+            subject_digest,
+        ]);
+        self.next_occurrence(&base)
     }
 
     /// Look up a memoized value by content-key (only meaningful while `resuming`).
@@ -874,6 +937,8 @@ pub fn set_workflow_scope(
 ) -> io::Result<WorkflowGuard> {
     let runs_root = resolve_runs_root();
     let code_version = std::env::var(CODE_VERSION_ENV).unwrap_or_default();
+    let approval_code_version =
+        std::env::var(APPROVAL_CODE_VERSION_ENV).unwrap_or_else(|_| code_version.clone());
     let resuming = std::env::var(RESUME_ENV).map(|v| v == "1").unwrap_or(false);
 
     // An explicit run id (the `SEMA_WORKFLOW_RUN_ID` seam, or a future library caller) is
@@ -927,6 +992,7 @@ pub fn set_workflow_scope(
         "doc": doc,
         "run_id": run_id,
         "code_version": code_version,
+        "approval_code_version": approval_code_version,
         "meta": redact_meta_secrets(sema_core::json::value_to_json_lossy(meta)),
     });
     journal.write_metadata(&metadata);
@@ -934,7 +1000,9 @@ pub fn set_workflow_scope(
     // The CLI sets SEMA_WORKFLOW_ARGS_JSON to the verbatim `--args` string.
     let args_json = std::env::var("SEMA_WORKFLOW_ARGS_JSON").unwrap_or_default();
     let ctx = WorkflowCtx::new_with_args(run_id.clone(), journal, parse_budget(meta), args_json);
+    ctx.set_workflow_name(name);
     ctx.set_code_version(code_version);
+    ctx.set_approval_code_version(approval_code_version);
     if resuming {
         let memos: HashMap<String, Value> = crate::journal::load_memos(&runs_root, &run_id)
             .into_iter()
@@ -998,6 +1066,8 @@ fn canonical_args_fingerprint(args_json: &str) -> String {
 const RESUME_ENV: &str = "SEMA_WORKFLOW_RESUME";
 /// Env seam: a stable hash of the workflow source, folded into every content-key.
 const CODE_VERSION_ENV: &str = "SEMA_WORKFLOW_CODE_VERSION";
+/// Env seam: collision-resistant source fingerprint for durable approval binding.
+const APPROVAL_CODE_VERSION_ENV: &str = "SEMA_WORKFLOW_APPROVAL_CODE_VERSION";
 
 /// Process-wide monotonic nonce folded into every generated run id, so two runs started
 /// in one process — even within the same nanosecond — never collide on a run directory.
@@ -1120,7 +1190,7 @@ fn annotate_fresh_open(err: io::Error, run_id: &str) -> io::Error {
 /// Format `SystemTime::now()` as an RFC3339 / ISO-8601 UTC string (`YYYY-MM-DDTHH:MM:SSZ`)
 /// without pulling in `chrono`. Civil-date conversion via the standard
 /// days-since-epoch algorithm (Howard Hinnant's `civil_from_days`).
-fn rfc3339_now() -> String {
+pub(crate) fn rfc3339_now() -> String {
     let dur = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default();

@@ -4988,7 +4988,10 @@ impl VM {
                 }
             }
 
-            if let Some(entry) = found {
+            // Workflow approval is a host-owned control transfer, not a language
+            // exception. It must unwind through user `try`/`catch` blocks so workflow
+            // code cannot continue past a pending or rejected gate.
+            if let Some(entry) = found.filter(|_| !err.is_uncatchable()) {
                 // Close open upvalues above the handler's stack depth
                 let base = frame.base;
                 if let Some(ref mut open) = self.frames.last_mut().unwrap().open_upvalues {
@@ -5891,6 +5894,34 @@ fn error_to_value(err: &SemaError) -> Value {
             map.insert(Value::keyword("reason"), Value::string(&denial.reason));
             map.insert(Value::keyword("action"), Value::keyword(&denial.action));
             map.insert(Value::keyword("source"), Value::keyword(&denial.source));
+        }
+        SemaError::WorkflowApprovalRequired { approval_id } => {
+            map.insert(
+                Value::keyword("type"),
+                Value::keyword("workflow-approval-required"),
+            );
+            map.insert(
+                Value::keyword("message"),
+                Value::string(&inner.user_message()),
+            );
+            map.insert(Value::keyword("approval-id"), Value::string(approval_id));
+        }
+        SemaError::WorkflowApprovalRejected {
+            approval_id,
+            reason,
+        } => {
+            map.insert(
+                Value::keyword("type"),
+                Value::keyword("workflow-approval-rejected"),
+            );
+            map.insert(
+                Value::keyword("message"),
+                Value::string(&inner.user_message()),
+            );
+            map.insert(Value::keyword("approval-id"), Value::string(approval_id));
+            if let Some(reason) = reason {
+                map.insert(Value::keyword("reason"), Value::string(reason));
+            }
         }
         SemaError::Internal(message) => {
             map.insert(Value::keyword("type"), Value::keyword("internal"));

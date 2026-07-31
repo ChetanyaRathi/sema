@@ -13854,6 +13854,17 @@
       "syntax": "(agent opts)"
     },
     {
+      "name": "approval",
+      "module": "workflow",
+      "section": "Dynamic Workflows",
+      "summary": "Stop a workflow at a durable, host-controlled human approval gate. `key` is a keyword or string. `:reason` explains why approval is required, `:subject` identifies the exact action and is stored only as a SHA-256 digest, and optional `:preview` is operator-safe text that may be written to the request sidecar and shown in a prompt.",
+      "examples": [
+        "(approval :release-signoff\n  {:reason \"Publish the release\"\n   :subject {:kind :external-action\n             :target \"pkg.sema-lang.com\"\n             :digest package-digest}\n   :preview \"Publish sema-policies@1.0.0\"})"
+      ],
+      "body": "Stop a workflow at a durable, host-controlled human approval gate. `key` is a keyword or string. `:reason` explains why approval is required, `:subject` identifies the exact action and is stored only as a SHA-256 digest, and optional `:preview` is operator-safe text that may be written to the request sidecar and shown in a prompt.\n\n```sema\n(approval :release-signoff\n  {:reason \"Publish the release\"\n   :subject {:kind :external-action\n             :target \"pkg.sema-lang.com\"\n             :digest package-digest}\n   :preview \"Publish sema-policies@1.0.0\"})\n```\n\nWith no decision, the run ends `{:status :needs-approval …}` before later forms execute. `sema workflow run` prompts on a terminal by default, or exits 3 headlessly. Approve or reject with `sema workflow approve` / `sema workflow reject`, then resume the same run. An approval decision is bound to the run, workflow code and arguments, phase, key, occurrence, and subject digest; changing any binding creates a new request. Pending and rejected gates cannot be bypassed with Sema `try`/`catch`.\n\nSee also: `workflow/approval`, `defworkflow`, `checkpoint`, `workflow/run`.",
+      "syntax": "(approval key {:reason string :subject value [:preview string]})"
+    },
+    {
       "name": "checkpoint",
       "module": "workflow",
       "section": "Dynamic Workflows",
@@ -13918,6 +13929,14 @@
       ],
       "body": "Macro: a journaled **step** — a workflow's atomic orchestration unit (Claude Code\n`workflow.js` `step(prompt, {…})` semantics). A step is an anonymous, workflow-owned call\nsite; the named, reusable counterpart is an `agent`. Runs `prompt` through the configured\nprovider and returns **typed data** when `opts` carries a `:schema` (validated via\n`llm/extract`), or the completion text otherwise — so the next stage of a `pipeline`\ncan consume the result directly without re-parsing. `opts` also carries `:name`, the role\nlabel shown in the dashboard (default `\"step\"`), and `:policy`, which adds a policy layer\nfor this step. A step policy can tighten an enclosing workflow policy but cannot loosen it.\n\nThe call is wrapped by `workflow/step`, which emits `agent.started`/`agent.result`\nplus a per-step `budget` event, so each invocation becomes a correlated row under the\ncurrent phase. (The `agent.*` event names are the journal's frozen internal contract and\npredate the step rename.) Outside a `workflow/run` the journaling is transparent — the LLM\ncall still runs.\n\nRouting on `opts` (`:agent` and inline `:tools`/`:model` are mutually exclusive — the agent\nowns those):\n\n- `:agent A` — run the configured `defagent` `A` **as** this step via `agent/run` (its\n  own system prompt + tools + model + max-turns), with `prompt` as the user message. The\n  agent's genuine tool calls still journal as `agent.tool_call`. `:name` defaults to `A`'s\n  own name. With `:schema`, `A`'s text is validated.\n- `:tools [...]` (a list of `deftool` values) — run the real multi-round tool loop and\n  journal **each genuine tool call** as an `agent.tool_call` event (a tool twig in the\n  drill-in). With no `:schema` it returns the loop's final text; with `:schema` the text is\n  validated. Per-step budget for a multi-round tool loop is best-effort (the Budget event\n  reflects the final round's usage).\n- `:schema S` — `llm/extract` (typed data).\n- `:policy P` — add model and tool restrictions for this step.\n- otherwise — `llm/complete` (text).\n\n```sema\n;; typed: returns the parsed list of strings\n(step \"List the auth-relevant source files under src/.\"\n      {:name \"scout\" :schema [:list :string]})\n\n;; untyped: returns completion text\n(step \"Summarize the changelog in one line.\")\n\n;; run a configured defagent as a step\n(step \"Review file Y\" {:agent code-reviewer :schema verdict})\n\n;; fanned out — one row per item, two stages overlapping across items\n(pipeline files\n  (fn (f) (step (str \"Audit \" f) {:name \"auditor\" :schema finding}))\n  (fn (x) (step (str \"Verify \" (:claim x)) {:name \"verifier\" :schema verdict})))\n```\n\nSee also: `agent`, `workflow/step`, `pipeline`, `parallel`, `defworkflow`, `defpolicy`, `checkpoint`.",
       "syntax": "(step prompt [opts])"
+    },
+    {
+      "name": "workflow/approval",
+      "module": "workflow",
+      "section": "Dynamic Workflows",
+      "summary": "Backend for the `approval` macro. Atomically creates or reads the approval request and immutable decision sidecars under the active run's `approvals/` directory. Filesystem work is offloaded from the cooperative VM. A pending or rejected decision stops the workflow with an internal, uncatchable control transfer that the enclosing `workflow/run` converts to a `:needs-approval` or `:rejected` envelope. An approved decision emits `approval.granted` and `approval.applied`, then returns `#t`.",
+      "body": "Backend for the `approval` macro. Atomically creates or reads the approval request and immutable decision sidecars under the active run's `approvals/` directory. Filesystem work is offloaded from the cooperative VM. A pending or rejected decision stops the workflow with an internal, uncatchable control transfer that the enclosing `workflow/run` converts to a `:needs-approval` or `:rejected` envelope. An approved decision emits `approval.granted` and `approval.applied`, then returns `#t`.\n\nUse the public `approval` macro in workflow source.\n\nSee also: `approval`, `workflow/run`, `defworkflow`.",
+      "syntax": "(workflow/approval key opts)"
     },
     {
       "name": "workflow/check",
