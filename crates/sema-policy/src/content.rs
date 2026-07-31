@@ -164,7 +164,7 @@ fn luhn_valid(digits: &str) -> bool {
             digit
         })
         .sum();
-    sum % 10 == 0
+    sum.is_multiple_of(10)
 }
 
 fn merge_findings(findings: impl IntoIterator<Item = Finding>) -> Vec<Finding> {

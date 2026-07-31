@@ -208,11 +208,12 @@ fn find_workflows_and_policies(form: &Value, spans: &SpanMap, out: &mut Vec<Diag
 
 fn check_literal_policy(policy: &Value, span: Option<Span>, out: &mut Vec<Diag>) {
     if let Err(error) = sema_policy::CompiledPolicy::compile(policy) {
-        out.push(Diag::error(
-            span,
-            "E-POLICY",
-            format!("invalid policy: {error}"),
-        ));
+        let hint = error.hint().map(str::to_string);
+        let diagnostic = Diag::error(span, "E-POLICY", format!("invalid policy: {error}"));
+        out.push(match hint {
+            Some(hint) => diagnostic.with_hint(hint),
+            None => diagnostic,
+        });
     }
 }
 

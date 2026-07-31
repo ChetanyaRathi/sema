@@ -400,6 +400,29 @@ cannot loosen it. The strictest denial action across active layers wins.
 | Tool | `:fail` (default) | Preflight the whole requested batch and run none when any call is denied |
 | Tool | `:tool-error` | In an agent loop, return a correlated tool error for the denied call while allowed siblings run |
 
+`:fail` raises a `:policy-denied` condition. Its message names the policy,
+boundary, and denied subject. Catch the condition when code needs the exact
+decision:
+
+```sema
+(try
+  (llm/complete "Review this change.")
+  (catch denial
+    {:type (:type denial)         ; :policy-denied
+     :policy (:policy denial)     ; "safe-agent"
+     :boundary (:boundary denial) ; "model"
+     :subject (:subject denial)
+     :rule (:rule denial)
+     :reason (:reason denial)
+     :action (:action denial)     ; :fail
+     :source (:source denial)}))  ; :request, :cache, or :cassette
+```
+
+For example, a denied model reports:
+`Policy 'safe-agent' denied model 'openai/unlisted': model openai/unlisted is not allowlisted`.
+Tool errors returned to a model contain only the tool name and safe denial
+reason. They do not include an extra CLI `Error:` prefix.
+
 The model gate covers completion, chat, extraction, classification, streaming,
 fallbacks, embeddings, and reranking. The tool gate covers `ToolDefinition`
 dispatch through agents and direct `tool/invoke`, including tools discovered
@@ -438,6 +461,10 @@ Statically validate a workflow file **without evaluating it or calling any
 LLM**. Catches arity traps, bad options, invalid literal policy maps,
 `defpolicy` shape errors, unsafe matcher syntax, and invalid
 `policy/without` reasons before you spend a token.
+
+Policy diagnostics identify the invalid field or one-based list entry. Unknown
+keys include a suggested replacement when one is close, or list the valid keys.
+Invalid enum values list the accepted Sema keywords.
 
 ```bash
 $ sema workflow check audit.sema

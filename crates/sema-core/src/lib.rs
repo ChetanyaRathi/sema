@@ -50,7 +50,7 @@ pub use cycle::{
     GcPassEvent, GcStats, GcTrigger, NodePtr, OpaqueSeverFn, OpaqueTraceFn, PayloadTracer,
     RuntimeInteriorHooks,
 };
-pub use error::{CallFrame, SemaError, Span, SpanMap, StackTrace};
+pub use error::{suggest_similar, CallFrame, PolicyDenial, SemaError, Span, SpanMap, StackTrace};
 pub use home::sema_home;
 pub use io_backend::{
     io_backend, io_block_on, io_spawn, io_spawn_blocking, set_io_backend, AbortHook, BoxIoFuture,

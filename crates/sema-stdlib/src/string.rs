@@ -245,7 +245,7 @@ pub fn register(env: &sema_core::Env) {
         check_arity!(args, "string-length", 1);
         let s = args[0]
             .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
+            .ok_or_else(|| SemaError::argument_type("string-length", 1, "string", &args[0]))?;
         Ok(Value::int(s.chars().count() as i64))
     });
 
@@ -253,10 +253,10 @@ pub fn register(env: &sema_core::Env) {
         check_arity!(args, "string-ref", 2);
         let s = args[0]
             .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
+            .ok_or_else(|| SemaError::argument_type("string-ref", 1, "string", &args[0]))?;
         let idx_signed = args[1]
             .as_int()
-            .ok_or_else(|| SemaError::type_error("int", args[1].type_name()))?;
+            .ok_or_else(|| SemaError::argument_type("string-ref", 2, "int", &args[1]))?;
         if idx_signed < 0 {
             return Err(SemaError::eval(format!(
                 "string-ref: index {idx_signed} must be non-negative"
@@ -276,10 +276,10 @@ pub fn register(env: &sema_core::Env) {
         check_arity!(args, "substring", 2..=3);
         let s = args[0]
             .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
+            .ok_or_else(|| SemaError::argument_type("substring", 1, "string", &args[0]))?;
         let start_signed = args[1]
             .as_int()
-            .ok_or_else(|| SemaError::type_error("int", args[1].type_name()))?;
+            .ok_or_else(|| SemaError::argument_type("substring", 2, "int", &args[1]))?;
         if start_signed < 0 {
             return Err(SemaError::eval(format!(
                 "substring: start index {start_signed} must be non-negative"
@@ -290,7 +290,7 @@ pub fn register(env: &sema_core::Env) {
         let end = if args.len() == 3 {
             let end_signed = args[2]
                 .as_int()
-                .ok_or_else(|| SemaError::type_error("int", args[2].type_name()))?;
+                .ok_or_else(|| SemaError::argument_type("substring", 3, "int", &args[2]))?;
             if end_signed < 0 {
                 return Err(SemaError::eval(format!(
                     "substring: end index {end_signed} must be non-negative"
@@ -320,10 +320,10 @@ pub fn register(env: &sema_core::Env) {
         check_arity!(args, "string/split", 2);
         let s = args[0]
             .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
+            .ok_or_else(|| SemaError::argument_type("string/split", 1, "string", &args[0]))?;
         let sep = args[1]
             .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[1].type_name()))?;
+            .ok_or_else(|| SemaError::argument_type("string/split", 2, "string", &args[1]))?;
         let parts: Vec<Value> = s.split(sep).map(Value::string).collect();
         Ok(Value::list(parts))
     });
@@ -334,7 +334,7 @@ pub fn register(env: &sema_core::Env) {
         check_arity!(args, "string/lines", 1);
         let s = args[0]
             .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
+            .ok_or_else(|| SemaError::argument_type("string/lines", 1, "string", &args[0]))?;
         Ok(Value::list(s.lines().map(Value::string).collect()))
     });
 
@@ -342,7 +342,7 @@ pub fn register(env: &sema_core::Env) {
         check_arity!(args, "string/trim", 1);
         let s = args[0]
             .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
+            .ok_or_else(|| SemaError::argument_type("string/trim", 1, "string", &args[0]))?;
         Ok(Value::string(s.trim()))
     });
 
@@ -350,21 +350,21 @@ pub fn register(env: &sema_core::Env) {
         check_arity!(args, "string/contains?", 2);
         let s = args[0]
             .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
+            .ok_or_else(|| SemaError::argument_type("string/contains?", 1, "string", &args[0]))?;
         let sub = args[1]
             .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[1].type_name()))?;
+            .ok_or_else(|| SemaError::argument_type("string/contains?", 2, "string", &args[1]))?;
         Ok(Value::bool(s.contains(sub)))
     });
 
     register_fn(env, "string/starts-with?", |args| {
         check_arity!(args, "string/starts-with?", 2);
-        let s = args[0]
-            .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
-        let prefix = args[1]
-            .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[1].type_name()))?;
+        let s = args[0].as_str().ok_or_else(|| {
+            SemaError::argument_type("string/starts-with?", 1, "string", &args[0])
+        })?;
+        let prefix = args[1].as_str().ok_or_else(|| {
+            SemaError::argument_type("string/starts-with?", 2, "string", &args[1])
+        })?;
         Ok(Value::bool(s.starts_with(prefix)))
     });
 
@@ -372,10 +372,10 @@ pub fn register(env: &sema_core::Env) {
         check_arity!(args, "string/ends-with?", 2);
         let s = args[0]
             .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
+            .ok_or_else(|| SemaError::argument_type("string/ends-with?", 1, "string", &args[0]))?;
         let suffix = args[1]
             .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[1].type_name()))?;
+            .ok_or_else(|| SemaError::argument_type("string/ends-with?", 2, "string", &args[1]))?;
         Ok(Value::bool(s.ends_with(suffix)))
     });
 
@@ -383,7 +383,7 @@ pub fn register(env: &sema_core::Env) {
         check_arity!(args, "string/upper", 1);
         let s = args[0]
             .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
+            .ok_or_else(|| SemaError::argument_type("string/upper", 1, "string", &args[0]))?;
         Ok(Value::string_owned(s.to_uppercase()))
     });
 
@@ -391,7 +391,7 @@ pub fn register(env: &sema_core::Env) {
         check_arity!(args, "string/lower", 1);
         let s = args[0]
             .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
+            .ok_or_else(|| SemaError::argument_type("string/lower", 1, "string", &args[0]))?;
         Ok(Value::string_owned(s.to_lowercase()))
     });
 

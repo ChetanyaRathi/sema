@@ -407,7 +407,7 @@ fn pmap_preserves_exact_arity_errors() {
     assert!(zero_args
         .expect_err("zero-argument pmap must fail")
         .to_string()
-        .contains("llm/pmap expects 2-3 args, got 0"));
+        .contains("llm/pmap expects 2 to 3 arguments, got 0"));
     assert_eq!(recorder.call_count(), 0);
 
     let fake = FakeProvider::builder("fake").model("fake-chat").build();
@@ -415,7 +415,7 @@ fn pmap_preserves_exact_arity_errors() {
     assert!(four_args
         .expect_err("four-argument pmap must fail")
         .to_string()
-        .contains("llm/pmap expects 2-3 args, got 4"));
+        .contains("llm/pmap expects 2 to 3 arguments, got 4"));
     assert_eq!(recorder.call_count(), 0);
 }
 

@@ -611,6 +611,19 @@ enum WorkflowCommands {
         #[arg(long, default_value = ".sema/runs")]
         run_dir: String,
     },
+    /// Export a deterministic evidence bundle for one completed workflow run.
+    Export {
+        /// Run id (the single directory name under `--run-dir`).
+        run_id: String,
+
+        /// Base directory holding `<run-id>/events.jsonl` run journals.
+        #[arg(long, default_value = ".sema/runs")]
+        run_dir: String,
+
+        /// Output directory. Defaults to `<run-dir>/<run-id>/evidence`.
+        #[arg(long)]
+        out_dir: Option<String>,
+    },
     /// Open the web viewer for a run directory's workflow journals
     View {
         /// Base directory holding `<run-id>/events.jsonl` run journals.
@@ -843,7 +856,7 @@ fn main() {
 
     let sandbox = match &cli.sandbox {
         Some(value) => sema_core::Sandbox::parse_cli(value).unwrap_or_else(|e| {
-            eprintln!("Error: {e}");
+            print_cli_error(e);
             std::process::exit(1);
         }),
         None => sema_core::Sandbox::allow_all(),
@@ -897,7 +910,7 @@ fn main() {
                     docs::PagerMode::Auto
                 };
                 if let Err(msg) = run_doc(command, symbol, pager) {
-                    eprintln!("Error: {msg}");
+                    print_cli_error(msg);
                     std::process::exit(1);
                 }
             }
@@ -928,7 +941,7 @@ fn main() {
                     }
                 };
                 if let Err(e) = result {
-                    eprintln!("Error: {e}");
+                    print_cli_error(e);
                     std::process::exit(1);
                 }
             }
@@ -957,7 +970,7 @@ fn main() {
                     no_cache,
                     BuildOutputOpts { verbose, json },
                 ) {
-                    eprintln!("Error: {e}");
+                    print_cli_error(e);
                     std::process::exit(1);
                 }
             }
@@ -1021,7 +1034,7 @@ fn main() {
                         McpAuthCommands::List => sema_mcp::mcp_list(),
                     };
                     if let Err(e) = result {
-                        eprintln!("mcp: {e}");
+                        print_cli_error(format!("MCP command failed: {e}"));
                         std::process::exit(1);
                     }
                     return;
@@ -1043,7 +1056,7 @@ fn main() {
                 // exactly that behavior.
                 let sandbox = match mcp_sandbox.as_deref() {
                     Some(value) => sema_core::Sandbox::parse_cli(value).unwrap_or_else(|e| {
-                        eprintln!("mcp: invalid --sandbox: {e}");
+                        print_cli_error(format!("invalid MCP --sandbox value: {e}"));
                         std::process::exit(1);
                     }),
                     None => sandbox,
@@ -1056,12 +1069,12 @@ fn main() {
                     match read_source_file(&file) {
                         Ok(content) => {
                             if let Err(e) = interpreter.eval_str_compiled(&content) {
-                                eprintln!("Error loading tool file {file}: {e}");
+                                print_cli_error(format!("could not load tool file {file}: {e}"));
                                 std::process::exit(1);
                             }
                         }
                         Err(e) => {
-                            eprintln!("Error reading tool file {file}: {e}");
+                            print_cli_error(format!("could not read tool file {file}: {e}"));
                             std::process::exit(1);
                         }
                     }
@@ -1071,7 +1084,7 @@ fn main() {
                 // runtime, llm/* builtins hit io_block_on's runtime-in-runtime
                 // panic and killed the server on the first LLM tool call.
                 if let Err(e) = sema_mcp::run_mcp_server_sync(interpreter, inc_tools, exc_tools) {
-                    eprintln!("MCP server error: {e}");
+                    print_cli_error(format!("MCP server failed: {e}"));
                     std::process::exit(1);
                 }
             }
@@ -1086,7 +1099,7 @@ fn main() {
                 no_llm,
             } => {
                 if let Err(e) = web::run(&file, &host, port, !no_open, !no_llm) {
-                    eprintln!("sema web: {e}");
+                    print_cli_error(format!("sema web failed: {e}"));
                     std::process::exit(1);
                 }
             }
@@ -1115,7 +1128,7 @@ fn main() {
                     yes,
                 };
                 if let Err(e) = update::run(opts) {
-                    eprintln!("Error: {e}");
+                    print_cli_error(e);
                     std::process::exit(1);
                 }
             }
@@ -1173,7 +1186,7 @@ fn main() {
                 }
             }
             Err(msg) => {
-                eprintln!("error: {msg}");
+                print_cli_error(msg);
                 std::process::exit(1);
             }
         }
@@ -1264,11 +1277,13 @@ fn main() {
                 }
             }
             Err(msg) if msg.starts_with("file not found:") => {
-                eprintln!("error: file not found: '{file}' (not a file or command)\n\nRun 'sema --help' for available commands.");
+                print_cli_error(format!(
+                    "file not found: '{file}' (not a file or command)\n\nRun 'sema --help' for available commands."
+                ));
                 std::process::exit(1);
             }
             Err(msg) => {
-                eprintln!("error: {msg}");
+                print_cli_error(msg);
                 std::process::exit(1);
             }
         }
@@ -1319,11 +1334,37 @@ fn run_workflow_command(command: WorkflowCommands, sandbox: &sema_core::Sandbox)
                             rows.len(),
                             root.join(sema_workflow::INDEX_DB).display()
                         ),
-                        Err(e) => eprintln!("warning: index summary: {e}"),
+                        Err(e) => print_cli_warning(format!("could not summarize index: {e}")),
                     }
                 }
                 Err(e) => {
-                    eprintln!("error: cannot open index db: {e}");
+                    print_cli_error(format!("cannot open index database: {e}"));
+                    std::process::exit(1);
+                }
+            }
+            return;
+        }
+        WorkflowCommands::Export {
+            run_id,
+            run_dir,
+            out_dir,
+        } => {
+            match sema::workflow_evidence::export(
+                &PathBuf::from(run_dir),
+                &run_id,
+                out_dir.as_deref().map(std::path::Path::new),
+            ) {
+                Ok(bundle) => {
+                    println!(
+                        "exported workflow evidence → {}",
+                        bundle.directory.display()
+                    );
+                    println!("  {}", bundle.evidence_json.display());
+                    println!("  {}", bundle.evidence_markdown.display());
+                    println!("  {}", bundle.manifest_json.display());
+                }
+                Err(error) => {
+                    print_cli_error(format!("cannot export workflow evidence: {error}"));
                     std::process::exit(1);
                 }
             }
@@ -1333,7 +1374,7 @@ fn run_workflow_command(command: WorkflowCommands, sandbox: &sema_core::Sandbox)
             let src = match read_source_file(&file) {
                 Ok(s) => s,
                 Err(msg) => {
-                    eprintln!("error: {msg}");
+                    print_cli_error(msg);
                     std::process::exit(2);
                 }
             };
@@ -1366,12 +1407,14 @@ fn run_workflow_command(command: WorkflowCommands, sandbox: &sema_core::Sandbox)
             || run_id.contains('\\')
             || run_id.contains("..")
         {
-            eprintln!("error: --resume run-id must be a bare directory name (no path separators)");
+            print_cli_error(
+                "--resume run-id must be a bare directory name without path separators",
+            );
             std::process::exit(1);
         }
         let prior = PathBuf::from(&run_dir).join(run_id).join("events.jsonl");
         if !prior.exists() {
-            eprintln!("error: no prior run to resume at {}", prior.display());
+            print_cli_error(format!("no prior run to resume at {}", prior.display()));
             std::process::exit(1);
         }
         std::env::set_var("SEMA_WORKFLOW_RUN_ID", run_id);
@@ -1383,7 +1426,7 @@ fn run_workflow_command(command: WorkflowCommands, sandbox: &sema_core::Sandbox)
     let content = match read_source_file(&file) {
         Ok(c) => c,
         Err(msg) => {
-            eprintln!("error: {msg}");
+            print_cli_error(msg);
             std::process::exit(1);
         }
     };
@@ -1392,13 +1435,13 @@ fn run_workflow_command(command: WorkflowCommands, sandbox: &sema_core::Sandbox)
     let permission_specs = match workflow_check::declared_permission_specs(&content) {
         Ok(specs) => specs,
         Err(e) => {
-            eprintln!("error: invalid workflow permissions: {e}");
+            print_cli_error(format!("invalid workflow permissions: {e}"));
             std::process::exit(1);
         }
     };
     for spec in permission_specs {
         let declared = sema_core::Sandbox::parse_cli(&spec).unwrap_or_else(|e| {
-            eprintln!("error: invalid defworkflow :permissions {spec:?}: {e}");
+            print_cli_error(format!("invalid defworkflow :permissions {spec:?}: {e}"));
             std::process::exit(1);
         });
         effective_sandbox = effective_sandbox.with_more_denied(declared.denied);
@@ -1424,7 +1467,7 @@ fn run_workflow_command(command: WorkflowCommands, sandbox: &sema_core::Sandbox)
                     )
                     .await
                     {
-                        eprintln!("warning: --view could not start the viewer: {e}");
+                        print_cli_warning(format!("--view could not start the viewer: {e}"));
                     }
                 });
         });
@@ -1447,7 +1490,7 @@ fn run_workflow_command(command: WorkflowCommands, sandbox: &sema_core::Sandbox)
     let args_value = match serde_json::from_str::<serde_json::Value>(&args) {
         Ok(json) => sema_core::json::json_to_value(&json),
         Err(e) => {
-            eprintln!("error: --args is not valid JSON: {e}");
+            print_cli_error(format!("--args is not valid JSON: {e}"));
             std::process::exit(1);
         }
     };
@@ -1477,7 +1520,7 @@ fn run_workflow_command(command: WorkflowCommands, sandbox: &sema_core::Sandbox)
                 .and_then(|s| s.as_keyword());
             match status.as_deref() {
                 Some("failed") => {
-                    eprintln!("workflow failed: {}", pretty_print(&envelope, 80));
+                    print_cli_error(format!("workflow failed: {}", pretty_print(&envelope, 80)));
                     1
                 }
                 // The headless-precursor gate (docs/plans/2026-06-24-workflow-mcp-auth.md
@@ -1614,7 +1657,7 @@ fn run_notebook_command(command: NotebookCommands) {
             let mut engine = match sema_notebook::Engine::from_file(path) {
                 Ok(e) => e,
                 Err(e) => {
-                    eprintln!("Error: {e}");
+                    print_cli_error(e);
                     std::process::exit(1);
                 }
             };
@@ -1668,7 +1711,7 @@ fn run_notebook_command(command: NotebookCommands) {
                         }
                     }
                     Err(e) => {
-                        eprintln!("[{}/{}] Error: {e}", i + 1, total);
+                        print_cli_error(format!("[{}/{}] {e}", i + 1, total));
                         had_error = true;
                     }
                 }
@@ -1676,7 +1719,7 @@ fn run_notebook_command(command: NotebookCommands) {
 
             // Save updated outputs back to the file
             if let Err(e) = engine.notebook.save(path) {
-                eprintln!("Warning: failed to save: {e}");
+                print_cli_warning(format!("could not save: {e}"));
             }
 
             if had_error {
@@ -1692,7 +1735,7 @@ fn run_notebook_command(command: NotebookCommands) {
             let notebook = match sema_notebook::Notebook::load(path) {
                 Ok(nb) => nb,
                 Err(e) => {
-                    eprintln!("Error: {e}");
+                    print_cli_error(e);
                     std::process::exit(1);
                 }
             };
@@ -1700,7 +1743,9 @@ fn run_notebook_command(command: NotebookCommands) {
             let content = match format.as_str() {
                 "md" | "markdown" => sema_notebook::render::export_markdown(&notebook),
                 other => {
-                    eprintln!("Unknown export format: {other}. Supported: md");
+                    print_cli_error(format!(
+                        "unknown export format: {other}; supported format: md"
+                    ));
                     std::process::exit(1);
                 }
             };
@@ -1708,7 +1753,7 @@ fn run_notebook_command(command: NotebookCommands) {
             match output {
                 Some(out_path) => {
                     if let Err(e) = std::fs::write(&out_path, &content) {
-                        eprintln!("Error writing {out_path}: {e}");
+                        print_cli_error(format!("could not write {out_path}: {e}"));
                         std::process::exit(1);
                     }
                     eprintln!("Exported to {out_path}");
@@ -1727,7 +1772,7 @@ fn run_notebook_command(command: NotebookCommands) {
             // Add a starter code cell
             notebook.add_code_cell("; Welcome to your Sema notebook!\n(+ 1 2)");
             if let Err(e) = notebook.save(path) {
-                eprintln!("Error: {e}");
+                print_cli_error(e);
                 std::process::exit(1);
             }
             eprintln!("Created notebook: {file}");
@@ -1764,7 +1809,7 @@ fn run_eval(
                         elapsed_ms: 0,
                     });
                 } else {
-                    eprintln!("Error reading stdin: {e}");
+                    print_cli_error(format!("could not read stdin: {e}"));
                 }
                 std::process::exit(1);
             });
@@ -1785,7 +1830,7 @@ fn run_eval(
                 elapsed_ms: 0,
             });
         } else {
-            eprintln!("Error: either --stdin or --expr is required");
+            print_cli_error("either --stdin or --expr is required");
         }
         std::process::exit(1);
     };
@@ -1806,7 +1851,7 @@ fn run_eval(
                     elapsed_ms: 0,
                 });
             } else {
-                eprintln!("Error: {e}");
+                print_cli_error(e);
             }
             std::process::exit(1);
         }),
@@ -1885,7 +1930,7 @@ fn run_eval(
         }
         Err(e) => {
             let inner = e.inner();
-            let msg = inner.to_string();
+            let msg = e.user_message();
             let hint = e.hint().map(|s| s.to_string());
             // Extract line+col from Reader span or first stack trace frame
             let (line, col) = match inner {
@@ -2023,7 +2068,7 @@ fn run_compile(file: &str, output: Option<&str>) {
     let source = match read_source_file(path) {
         Ok(s) => s,
         Err(msg) => {
-            eprintln!("error: {msg}");
+            print_cli_error(msg);
             std::process::exit(1);
         }
     };
@@ -2038,7 +2083,7 @@ fn run_compile(file: &str, output: Option<&str>) {
     let result = match interpreter.compile_to_bytecode(&source) {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("Compile error: {}", e.inner());
+            print_cli_error(format!("compilation failed: {}", e.format_plain()));
             std::process::exit(1);
         }
     };
@@ -2047,7 +2092,7 @@ fn run_compile(file: &str, output: Option<&str>) {
     let bytes = match sema_vm::serialize_to_bytes(&result, source_hash) {
         Ok(b) => b,
         Err(e) => {
-            eprintln!("Serialization error: {}", e.inner());
+            print_cli_error(format!("serialization failed: {}", e.format_plain()));
             std::process::exit(1);
         }
     };
@@ -2058,7 +2103,7 @@ fn run_compile(file: &str, output: Option<&str>) {
         None => path.with_extension("semac"),
     };
     if let Err(e) = std::fs::write(&out_path, &bytes) {
-        eprintln!("Error writing {}: {e}", out_path.display());
+        print_cli_error(format!("could not write {}: {e}", out_path.display()));
         std::process::exit(1);
     }
 }
@@ -2087,7 +2132,7 @@ fn try_run_embedded() -> Option<i32> {
     let arch = match archive::deserialize_archive_from_bytes(&archive_data) {
         Ok(a) => a,
         Err(e) => {
-            eprintln!("Error: failed to load embedded archive: {e}");
+            print_cli_error(format!("could not load embedded archive: {e}"));
             return Some(1);
         }
     };
@@ -2102,7 +2147,9 @@ fn try_run_embedded() -> Option<i32> {
     let bytecode = match arch.files.get(&entry_point) {
         Some(b) => b.clone(),
         None => {
-            eprintln!("Error: entry point '{entry_point}' not found in embedded archive");
+            print_cli_error(format!(
+                "entry point '{entry_point}' was not found in the embedded archive"
+            ));
             return Some(1);
         }
     };
@@ -2155,7 +2202,7 @@ fn try_run_embedded() -> Option<i32> {
 
         // Same no-ambient-runtime rule as the CLI mcp arm (llm/* + io_block_on).
         if let Err(e) = sema_mcp::run_mcp_server_sync(interpreter, inc_tools, exc_tools) {
-            eprintln!("MCP server error: {e}");
+            print_cli_error(format!("MCP server failed: {e}"));
             std::process::exit(1);
         }
         Some(0)
@@ -2392,9 +2439,9 @@ fn build_archive(
 
     let result = interpreter
         .compile_to_bytecode(&source)
-        .map_err(|e| format!("compile error: {}", e.inner()))?;
+        .map_err(|e| format!("compile failed: {}", e.format_plain()))?;
     let bytecode = sema_vm::serialize_to_bytes(&result, source_hash)
-        .map_err(|e| format!("serialization error: {}", e.inner()))?;
+        .map_err(|e| format!("serialization failed: {}", e.format_plain()))?;
 
     if opts.verbose {
         eprintln!("[2/4] Tracing imports...");
@@ -2410,7 +2457,7 @@ fn build_archive(
 
     for (rel_path, contents) in &imports {
         if let Err(e) = sema_core::vfs::validate_vfs_path(rel_path) {
-            eprintln!("Warning: skipping import with invalid VFS path: {e}");
+            print_cli_warning(format!("skipping import with invalid VFS path: {e}"));
             continue;
         }
         files.insert(rel_path.clone(), contents.clone());
@@ -2432,7 +2479,7 @@ fn build_archive(
                 .to_string_lossy()
                 .to_string();
             if let Err(e) = sema_core::vfs::validate_vfs_path(&rel) {
-                eprintln!("Warning: skipping {include}: {e}");
+                print_cli_warning(format!("skipping {include}: {e}"));
                 continue;
             }
             match std::fs::read(inc_path) {
@@ -2440,11 +2487,11 @@ fn build_archive(
                     files.insert(rel, data);
                 }
                 Err(e) => {
-                    eprintln!("Warning: cannot read {include}: {e}");
+                    print_cli_warning(format!("cannot read {include}: {e}"));
                 }
             }
         } else {
-            eprintln!("Warning: --include path not found: {include}");
+            print_cli_warning(format!("--include path not found: {include}"));
         }
     }
 
@@ -2802,12 +2849,12 @@ fn compile_source_to_bytecode(source: &str) -> Result<Vec<u8>, String> {
     let interpreter = Interpreter::new_with_sandbox(&sandbox);
     interpreter
         .eval_str_in_global(include_str!("web_prelude.sema"))
-        .map_err(|e| format!("web prelude error: {}", e.inner()))?;
+        .map_err(|e| format!("web prelude failed: {}", e.format_plain()))?;
     let result = interpreter
         .compile_to_bytecode(source)
-        .map_err(|e| format!("compile error: {}", e.inner()))?;
+        .map_err(|e| format!("compile failed: {}", e.format_plain()))?;
     sema_vm::serialize_to_bytes(&result, source_hash)
-        .map_err(|e| format!("serialization error: {}", e.inner()))
+        .map_err(|e| format!("serialization failed: {}", e.format_plain()))
 }
 
 fn should_compile_traced_import(rel_path: &str) -> bool {
@@ -2865,7 +2912,7 @@ pub(crate) fn build_web_archive(
 
     for (rel_path, contents) in &imports {
         if let Err(e) = sema_core::vfs::validate_vfs_path(rel_path) {
-            eprintln!("Warning: skipping import with invalid VFS path: {e}");
+            print_cli_warning(format!("skipping import with invalid VFS path: {e}"));
             continue;
         }
 
@@ -2900,7 +2947,7 @@ pub(crate) fn build_web_archive(
                 .to_string_lossy()
                 .to_string();
             if let Err(e) = sema_core::vfs::validate_vfs_path(&rel) {
-                eprintln!("Warning: skipping {include}: {e}");
+                print_cli_warning(format!("skipping {include}: {e}"));
                 continue;
             }
             match std::fs::read(inc_path) {
@@ -2908,11 +2955,11 @@ pub(crate) fn build_web_archive(
                     files.insert(rel, data);
                 }
                 Err(e) => {
-                    eprintln!("Warning: cannot read {include}: {e}");
+                    print_cli_warning(format!("cannot read {include}: {e}"));
                 }
             }
         } else {
-            eprintln!("Warning: --include path not found: {include}");
+            print_cli_warning(format!("--include path not found: {include}"));
         }
     }
 
@@ -3233,7 +3280,7 @@ fn collect_directory_files(
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
         Err(e) => {
-            eprintln!("Warning: cannot read directory {}: {e}", dir.display());
+            print_cli_warning(format!("cannot read directory {}: {e}", dir.display()));
             return;
         }
     };
@@ -3251,7 +3298,7 @@ fn collect_directory_files(
             collect_directory_files(&entry_path, &vfs_path, files);
         } else if entry_path.is_file() {
             if let Err(e) = sema_core::vfs::validate_vfs_path(&vfs_path) {
-                eprintln!("Warning: skipping {}: {e}", entry_path.display());
+                print_cli_warning(format!("skipping {}: {e}", entry_path.display()));
                 continue;
             }
             match std::fs::read(&entry_path) {
@@ -3259,7 +3306,7 @@ fn collect_directory_files(
                     files.insert(vfs_path, data);
                 }
                 Err(e) => {
-                    eprintln!("Warning: cannot read {}: {e}", entry_path.display());
+                    print_cli_warning(format!("cannot read {}: {e}", entry_path.display()));
                 }
             }
         }
@@ -3278,13 +3325,13 @@ fn run_check(file: &str) {
     let bytes = match std::fs::read(file) {
         Ok(b) => b,
         Err(e) => {
-            eprintln!("✗ {file}: {e}");
+            print_cli_error(format!("could not read {file}: {e}"));
             std::process::exit(1);
         }
     };
 
     if !sema_vm::is_bytecode_file(&bytes) {
-        eprintln!("✗ {file}: not a valid .semac bytecode file");
+        print_cli_error(format!("{file} is not a valid .semac bytecode file"));
         std::process::exit(1);
     }
 
@@ -3304,7 +3351,7 @@ fn run_check(file: &str) {
             );
         }
         Err(e) => {
-            eprintln!("✗ {file}: {}", e.inner());
+            print_cli_error(format!("{file} is invalid: {}", e.format_plain()));
             std::process::exit(1);
         }
     }
@@ -3319,20 +3366,20 @@ fn run_disasm(file: &str, json: bool) {
                 std::io::ErrorKind::PermissionDenied => format!("permission denied: {file}"),
                 _ => format!("reading {file}: {e}"),
             };
-            eprintln!("error: {msg}");
+            print_cli_error(msg);
             std::process::exit(1);
         }
     };
 
     if !sema_vm::is_bytecode_file(&bytes) {
-        eprintln!("Error: {file} is not a valid .semac bytecode file");
+        print_cli_error(format!("{file} is not a valid .semac bytecode file"));
         std::process::exit(1);
     }
 
     let result = match sema_vm::deserialize_from_bytes(&bytes) {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("Deserialization error: {}", e.inner());
+            print_cli_error(format!("deserialization failed: {}", e.format_plain()));
             std::process::exit(1);
         }
     };
@@ -3652,7 +3699,7 @@ fn run_fmt(
                     })
                 );
             } else {
-                eprintln!("Error reading stdin: {e}");
+                print_cli_error(format!("could not read stdin: {e}"));
             }
             std::process::exit(1);
         }
@@ -3680,7 +3727,7 @@ fn run_fmt(
                         })
                     );
                 } else {
-                    eprintln!("Error formatting stdin: {e}");
+                    print_cli_error(format!("could not format stdin: {e}"));
                 }
                 std::process::exit(1);
             }
@@ -3698,7 +3745,7 @@ fn run_fmt(
                 .filter(|p| !is_ignored(p))
                 .collect::<Vec<_>>(),
             Err(e) => {
-                eprintln!("Error: invalid glob pattern: {e}");
+                print_cli_error(format!("invalid glob pattern: {e}"));
                 std::process::exit(1);
             }
         }
@@ -3718,7 +3765,7 @@ fn run_fmt(
                         }
                     }
                     Err(e) => {
-                        eprintln!("Error: invalid glob pattern '{pattern}': {e}");
+                        print_cli_error(format!("invalid glob pattern '{pattern}': {e}"));
                         std::process::exit(1);
                     }
                 }
@@ -3755,7 +3802,7 @@ fn run_fmt(
                         })
                     );
                 } else {
-                    eprintln!("error: {msg}");
+                    print_cli_error(msg);
                 }
                 errors += 1;
                 continue;
@@ -3775,7 +3822,7 @@ fn run_fmt(
                         })
                     );
                 } else {
-                    eprintln!("Error formatting {file}: {e}");
+                    print_cli_error(format!("could not format {file}: {e}"));
                 }
                 errors += 1;
                 continue;
@@ -3810,7 +3857,7 @@ fn run_fmt(
             } else {
                 // Write formatted output back
                 if let Err(e) = std::fs::write(file, &formatted) {
-                    eprintln!("Error writing {file}: {e}");
+                    print_cli_error(format!("could not write {file}: {e}"));
                     errors += 1;
                     continue;
                 }
@@ -3841,7 +3888,7 @@ fn run_fmt(
     }
 
     if errors > 0 {
-        eprintln!("{errors} error(s)");
+        print_cli_error(format!("{errors} file(s) could not be formatted"));
         std::process::exit(1);
     }
 
@@ -3890,17 +3937,17 @@ fn run_ast(file: Option<String>, eval: Option<String>, json: bool) {
         (Some(path), None) => match read_source_file(path) {
             Ok(content) => content,
             Err(msg) => {
-                eprintln!("error: {msg}");
+                print_cli_error(msg);
                 std::process::exit(1);
             }
         },
         (None, Some(expr)) => expr.clone(),
         (Some(_), Some(_)) => {
-            eprintln!("Error: cannot specify both a file and --eval");
+            print_cli_error("cannot specify both a file and --eval");
             std::process::exit(1);
         }
         (None, None) => {
-            eprintln!("Error: provide a file or --eval expression");
+            print_cli_error("provide a file or --eval expression");
             std::process::exit(1);
         }
     };
@@ -3908,7 +3955,7 @@ fn run_ast(file: Option<String>, eval: Option<String>, json: bool) {
     let exprs = match sema_reader::read_many(&source) {
         Ok(exprs) => exprs,
         Err(e) => {
-            eprintln!("Parse error: {}", e.inner());
+            print_cli_error(format!("parsing failed: {}", e.format_plain()));
             std::process::exit(1);
         }
     };
@@ -4150,9 +4197,17 @@ pub(crate) fn format_source_snippet(
     Some(out)
 }
 
+pub(crate) fn print_cli_error(message: impl std::fmt::Display) {
+    eprintln!("{} {message}", colors::red_bold("Error:"));
+}
+
+pub(crate) fn print_cli_warning(message: impl std::fmt::Display) {
+    eprintln!("{} {message}", colors::yellow("Warning:"));
+}
+
 pub(crate) fn print_error(e: &SemaError) {
     let inner = e.inner();
-    eprintln!("{} {}", colors::red_bold("Error:"), inner);
+    print_cli_error(e.user_message());
 
     // Show source snippet for reader errors
     if let SemaError::Reader { span, .. } = inner {
@@ -4370,7 +4425,7 @@ fn install_completions(shell: Shell) {
     let home = match std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")) {
         Ok(h) => PathBuf::from(h),
         Err(_) => {
-            eprintln!("Error: could not determine home directory");
+            print_cli_error("could not determine the home directory");
             std::process::exit(1);
         }
     };
@@ -4381,28 +4436,31 @@ fn install_completions(shell: Shell) {
         Shell::Fish => home.join(".config/fish/completions/sema.fish"),
         Shell::Elvish => home.join(".config/elvish/lib/sema.elv"),
         Shell::PowerShell => {
-            eprintln!(
+            print_cli_error(
                 "Auto-install is not supported for PowerShell.\n\
-                 Run manually: sema completions powershell >> $PROFILE"
+                 Run manually: sema completions powershell >> $PROFILE",
             );
             std::process::exit(1);
         }
         _ => {
-            eprintln!("Auto-install is not supported for this shell.");
+            print_cli_error("auto-install is not supported for this shell");
             std::process::exit(1);
         }
     };
 
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).unwrap_or_else(|e| {
-            eprintln!("Error creating directory {}: {e}", parent.display());
+            print_cli_error(format!(
+                "could not create directory {}: {e}",
+                parent.display()
+            ));
             std::process::exit(1);
         });
     }
 
     let completions = generate_completions(shell);
     std::fs::write(&path, completions).unwrap_or_else(|e| {
-        eprintln!("Error writing {}: {e}", path.display());
+        print_cli_error(format!("could not write {}: {e}", path.display()));
         std::process::exit(1);
     });
 

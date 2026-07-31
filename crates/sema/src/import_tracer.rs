@@ -37,8 +37,13 @@ pub fn trace_imports(root_file: &Path) -> Result<HashMap<String, Vec<u8>>, Strin
     let source = std::fs::read_to_string(&root_file)
         .map_err(|e| format!("cannot read root file {}: {e}", root_file.display()))?;
 
-    let exprs = sema_reader::read_many(&source)
-        .map_err(|e| format!("parse error in {}: {}", root_file.display(), e.inner()))?;
+    let exprs = sema_reader::read_many(&source).map_err(|e| {
+        format!(
+            "parse failed in {}: {}",
+            root_file.display(),
+            e.format_plain()
+        )
+    })?;
 
     trace_file_imports(&exprs, &root_file, &root_dir, &mut visited, &mut result)?;
 
@@ -86,12 +91,12 @@ fn extract_imports(
                         process_import(path_str, current_file, root_dir, visited, result)?;
                     } else {
                         // Dynamic import -- cannot resolve statically.
-                        eprintln!(
-                            "warning: dynamic {} in {} cannot be resolved statically; \
+                        crate::print_cli_warning(format!(
+                            "dynamic {} in {} cannot be resolved statically; \
                              use --include to add it manually",
                             head,
                             current_file.display()
-                        );
+                        ));
                     }
                 }
                 // Don't recurse further into import/load forms.
@@ -148,12 +153,12 @@ fn process_import(
     let canonical = match resolved.canonicalize() {
         Ok(c) => c,
         Err(_) => {
-            eprintln!(
-                "  warning: import \"{}\" (from {}) couldn't be resolved at build time; \
+            crate::print_cli_warning(format!(
+                "import \"{}\" (from {}) could not be resolved at build time; \
                  not bundled — it will be resolved at runtime (filesystem/VFS)",
                 import_path,
                 current_file.display()
-            );
+            ));
             return Ok(());
         }
     };
@@ -168,11 +173,11 @@ fn process_import(
     let contents = match std::fs::read(&canonical) {
         Ok(c) => c,
         Err(_) => {
-            eprintln!(
-                "  warning: import \"{}\" couldn't be read at build time; not bundled \
+            crate::print_cli_warning(format!(
+                "import \"{}\" could not be read at build time; not bundled \
                  (resolved at runtime)",
                 canonical.display()
-            );
+            ));
             return Ok(());
         }
     };
@@ -190,21 +195,21 @@ fn process_import(
             } else if let Ok(rel) = canonical.strip_prefix(root_dir) {
                 rel.to_string_lossy().replace('\\', "/")
             } else {
-                eprintln!(
-                    "  warning: imported file {} is outside the project and packages \
+                crate::print_cli_warning(format!(
+                    "imported file {} is outside the project and packages \
                      directories; not bundled (resolved at runtime)",
                     canonical.display()
-                );
+                ));
                 return Ok(());
             }
         } else if let Ok(rel) = canonical.strip_prefix(root_dir) {
             rel.to_string_lossy().replace('\\', "/")
         } else {
-            eprintln!(
-                "  warning: imported file {} is outside the project directory; not \
+            crate::print_cli_warning(format!(
+                "imported file {} is outside the project directory; not \
                  bundled (resolved at runtime)",
                 canonical.display()
-            );
+            ));
             return Ok(());
         }
     };

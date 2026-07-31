@@ -9,7 +9,7 @@ pub mod content;
 
 use globset::{GlobBuilder, GlobMatcher};
 use regex::Regex;
-use sema_core::{FileAccess, ToolPolicySubject, Value};
+use sema_core::{suggest_similar, FileAccess, ToolPolicySubject, Value};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
@@ -20,9 +20,16 @@ const POLICY_VERSION: i64 = 1;
 
 /// A policy definition or matcher compilation error.
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
-pub enum PolicyError {
-    #[error("{0}")]
-    Invalid(String),
+#[error("{message}")]
+pub struct PolicyError {
+    message: String,
+    hint: Option<String>,
+}
+
+impl PolicyError {
+    pub fn hint(&self) -> Option<&str> {
+        self.hint.as_deref()
+    }
 }
 
 /// The default effect when no explicit rule matches.
@@ -138,6 +145,8 @@ pub struct CompiledPolicy {
     subjects: Option<SubjectPolicy>,
     input: Option<DetectorPolicy>,
     output: Option<OutputPolicy>,
+    metadata: Option<MetadataPolicy>,
+    completion: Option<CompletionPolicy>,
 }
 
 impl CompiledPolicy {
@@ -154,6 +163,8 @@ impl CompiledPolicy {
                 "subjects",
                 "input",
                 "output",
+                "metadata",
+                "completion",
             ],
             "policy",
         )?;
@@ -185,6 +196,12 @@ impl CompiledPolicy {
             .map(|value| DetectorPolicy::compile(value, ":input", true))
             .transpose()?;
         let output = get(map, "output").map(OutputPolicy::compile).transpose()?;
+        let metadata = get(map, "metadata")
+            .map(MetadataPolicy::compile)
+            .transpose()?;
+        let completion = get(map, "completion")
+            .map(CompletionPolicy::compile)
+            .transpose()?;
         let fingerprint = fingerprint(value, &name);
 
         Ok(Self {
@@ -195,6 +212,8 @@ impl CompiledPolicy {
             subjects,
             input,
             output,
+            metadata,
+            completion,
         })
     }
 
@@ -267,6 +286,80 @@ impl CompiledPolicy {
             .as_ref()
             .map_or_else(ContentOutcome::allow, |policy| policy.check(text, stage))
     }
+
+    pub fn required_metadata(&self) -> impl Iterator<Item = &str> {
+        self.metadata
+            .iter()
+            .flat_map(|policy| policy.required.iter().map(String::as_str))
+    }
+
+    pub fn required_completion_events(&self) -> impl Iterator<Item = &str> {
+        self.completion
+            .iter()
+            .flat_map(|policy| policy.required_events.iter().map(String::as_str))
+    }
+}
+
+#[derive(Debug)]
+struct MetadataPolicy {
+    required: BTreeSet<String>,
+}
+
+impl MetadataPolicy {
+    fn compile(value: &Value) -> Result<Self, PolicyError> {
+        let map = require_map(value, ":metadata")?;
+        reject_unknown_keys(map, &["require"], ":metadata")?;
+        let required = parse_name_set(get(map, "require"), ":metadata :require")?;
+        if required.is_empty() {
+            return Err(invalid(":metadata :require must not be empty"));
+        }
+        Ok(Self { required })
+    }
+}
+
+#[derive(Debug)]
+struct CompletionPolicy {
+    required_events: BTreeSet<String>,
+}
+
+impl CompletionPolicy {
+    fn compile(value: &Value) -> Result<Self, PolicyError> {
+        let map = require_map(value, ":completion")?;
+        reject_unknown_keys(map, &["require-events"], ":completion")?;
+        let required_events =
+            parse_name_set(get(map, "require-events"), ":completion :require-events")?;
+        if required_events.is_empty() {
+            return Err(invalid(":completion :require-events must not be empty"));
+        }
+        const SUPPORTED_EVENTS: &[&str] = &[
+            "run.started",
+            "phase.started",
+            "phase.ended",
+            "agent.started",
+            "agent.result",
+            "agent.tool_call",
+            "agent.tool_result",
+            "checkpoint",
+            "budget",
+            "auth.required",
+            "auth.granted",
+            "auth.failed",
+            "policy.checked",
+            "policy.flagged",
+            "policy.redacted",
+            "policy.violation",
+            "policy.bypassed",
+        ];
+        for event in &required_events {
+            if !SUPPORTED_EVENTS.contains(&event.as_str()) {
+                return Err(invalid_with_hint(
+                    format!(":completion requires unsupported event {event:?}"),
+                    format!("valid events are {}", SUPPORTED_EVENTS.join(", ")),
+                ));
+            }
+        }
+        Ok(Self { required_events })
+    }
 }
 
 #[derive(Debug)]
@@ -285,14 +378,24 @@ impl ModelPolicy {
             default: parse_default(get(map, "default"), ":models")?,
             allow: parse_model_patterns(get(map, "allow"), ":models :allow")?,
             deny: parse_model_patterns(get(map, "deny"), ":models :deny")?,
-            on_deny: match get(map, "on-deny").and_then(value_name).as_deref() {
-                None | Some("fail") => ModelDenyAction::Fail,
-                Some("skip") => ModelDenyAction::Skip,
-                Some(other) => {
-                    return Err(invalid(format!(
-                        ":models :on-deny must be :fail or :skip, got {other:?}"
-                    )))
-                }
+            on_deny: match get(map, "on-deny") {
+                None => ModelDenyAction::Fail,
+                Some(value) => match value_name(value).as_deref() {
+                    Some("fail") => ModelDenyAction::Fail,
+                    Some("skip") => ModelDenyAction::Skip,
+                    Some(other) => {
+                        return Err(invalid_with_hint(
+                            format!(":models :on-deny has unsupported value :{other}"),
+                            "valid values are :fail and :skip",
+                        ))
+                    }
+                    None => {
+                        return Err(invalid(format!(
+                            ":models :on-deny must be a keyword or string, got {}",
+                            value.type_name()
+                        )))
+                    }
+                },
             },
         })
     }
@@ -495,7 +598,11 @@ impl OutputPolicy {
                     .as_int()
                     .and_then(|value| usize::try_from(value).ok())
                     .filter(|value| *value > 0)
-                    .ok_or_else(|| invalid(":output :max-length must be a positive integer"))
+                    .ok_or_else(|| {
+                        invalid(format!(
+                            ":output :max-length must be a positive integer, got {value}"
+                        ))
+                    })
             })
             .transpose()?;
         Ok(Self {
@@ -607,7 +714,7 @@ struct ForbidRule {
 
 impl ForbidRule {
     fn compile(value: &Value, index: usize) -> Result<Self, PolicyError> {
-        let context = format!(":output :forbid[{index}]");
+        let context = format!(":output :forbid entry {}", index + 1);
         let map = require_map(value, &context)?;
         reject_unknown_keys(map, &["id", "contains", "regex"], &context)?;
         let id = get(map, "id")
@@ -799,7 +906,8 @@ fn parse_detectors(
     };
     require_seq(value, context)?
         .iter()
-        .map(|value| parse_detector(value, context))
+        .enumerate()
+        .map(|(index, value)| parse_detector(value, &format!("{context} entry {}", index + 1)))
         .collect()
 }
 
@@ -810,10 +918,14 @@ fn parse_detector(value: &Value, context: &str) -> Result<content::DetectorKind,
         Some("phone") => Ok(content::DetectorKind::Phone),
         Some("ipv4") => Ok(content::DetectorKind::Ipv4),
         Some("payment-card") => Ok(content::DetectorKind::PaymentCard),
-        Some(other) => Err(invalid(format!(
-            "{context} has unsupported detector {other:?}"
+        Some(other) => Err(invalid_with_hint(
+            format!("{context} has unsupported detector :{other}"),
+            "valid detectors are :secret, :email, :phone, :ipv4, and :payment-card",
+        )),
+        None => Err(invalid(format!(
+            "{context} must be a keyword or string, got {}",
+            value.type_name()
         ))),
-        None => Err(invalid(format!("{context} entries must be detector names"))),
     }
 }
 
@@ -823,10 +935,14 @@ fn parse_content_action(value: &Value, context: &str) -> Result<ContentAction, P
         Some("audit") => Ok(ContentAction::Audit),
         Some("redact") => Ok(ContentAction::Redact),
         Some("block") => Ok(ContentAction::Block),
-        Some(other) => Err(invalid(format!(
-            "{context} action must be :audit, :redact, or :block, got {other:?}"
+        Some(other) => Err(invalid_with_hint(
+            format!("{context} action has unsupported value :{other}"),
+            "valid actions are :allow, :audit, :redact, and :block",
+        )),
+        None => Err(invalid(format!(
+            "{context} action must be a keyword or string, got {}",
+            value.type_name()
         ))),
-        None => Err(invalid(format!("{context} action must be a name"))),
     }
 }
 
@@ -861,14 +977,24 @@ impl ToolPolicy {
             }
         };
         let deny = parse_string_set(get(map, "deny"), ":tools :deny")?;
-        let on_deny = match get(map, "on-deny").and_then(value_name).as_deref() {
-            None | Some("fail") => ToolDenyAction::Fail,
-            Some("tool-error") => ToolDenyAction::ToolError,
-            Some(other) => {
-                return Err(invalid(format!(
-                    ":tools :on-deny must be :fail or :tool-error, got {other:?}"
-                )))
-            }
+        let on_deny = match get(map, "on-deny") {
+            None => ToolDenyAction::Fail,
+            Some(value) => match value_name(value).as_deref() {
+                Some("fail") => ToolDenyAction::Fail,
+                Some("tool-error") => ToolDenyAction::ToolError,
+                Some(other) => {
+                    return Err(invalid_with_hint(
+                        format!(":tools :on-deny has unsupported value :{other}"),
+                        "valid values are :fail and :tool-error",
+                    ))
+                }
+                None => {
+                    return Err(invalid(format!(
+                        ":tools :on-deny must be a keyword or string, got {}",
+                        value.type_name()
+                    )))
+                }
+            },
         };
         Ok(Self {
             default: parse_default(get(map, "default"), ":tools")?,
@@ -996,11 +1122,13 @@ impl SubjectKind {
             Some("network-request") => Ok(Self::NetworkRequest),
             Some("command") => Ok(Self::Command),
             Some("external-action") => Ok(Self::ExternalAction),
-            Some(other) => Err(invalid(format!(
-                "{context} has unsupported :kind {other:?}"
-            ))),
+            Some(other) => Err(invalid_with_hint(
+                format!("{context} has unsupported :kind :{other}"),
+                "valid kinds are :file-read, :file-write, :file-delete, :network-request, :command, and :external-action",
+            )),
             None => Err(invalid(format!(
-                "{context} :kind must be a keyword or string"
+                "{context} :kind must be a keyword or string, got {}",
+                value.type_name()
             ))),
         }
     }
@@ -1754,11 +1882,19 @@ fn fingerprint(value: &Value, name: &str) -> String {
 }
 
 fn parse_default(value: Option<&Value>, context: &str) -> Result<DefaultEffect, PolicyError> {
-    match value.and_then(value_name).as_deref() {
-        None | Some("deny") => Ok(DefaultEffect::Deny),
+    let Some(value) = value else {
+        return Ok(DefaultEffect::Deny);
+    };
+    match value_name(value).as_deref() {
+        Some("deny") => Ok(DefaultEffect::Deny),
         Some("allow") => Ok(DefaultEffect::Allow),
-        Some(other) => Err(invalid(format!(
-            "{context} :default must be :allow or :deny, got {other:?}"
+        Some(other) => Err(invalid_with_hint(
+            format!("{context} :default has unsupported value :{other}"),
+            "valid values are :allow and :deny",
+        )),
+        None => Err(invalid(format!(
+            "{context} :default must be a keyword or string, got {}",
+            value.type_name()
         ))),
     }
 }
@@ -1783,9 +1919,15 @@ fn parse_name_set(value: Option<&Value>, context: &str) -> Result<BTreeSet<Strin
     };
     require_seq(value, context)?
         .iter()
-        .map(|value| {
-            value_name(value)
-                .ok_or_else(|| invalid(format!("{context} entries must be names or strings")))
+        .enumerate()
+        .map(|(index, value)| {
+            value_name(value).ok_or_else(|| {
+                invalid(format!(
+                    "{context} entry {} must be a keyword or string, got {}",
+                    index + 1,
+                    value.type_name()
+                ))
+            })
         })
         .collect()
 }
@@ -1796,29 +1938,38 @@ fn parse_string_list(value: Option<&Value>, context: &str) -> Result<Vec<String>
     };
     require_seq(value, context)?
         .iter()
-        .map(|value| {
-            value
-                .as_str()
-                .map(str::to_string)
-                .ok_or_else(|| invalid(format!("{context} entries must be strings")))
+        .enumerate()
+        .map(|(index, value)| {
+            value.as_str().map(str::to_string).ok_or_else(|| {
+                invalid(format!(
+                    "{context} entry {} must be a string, got {}",
+                    index + 1,
+                    value.type_name()
+                ))
+            })
         })
         .collect()
 }
 
 fn require_seq(value: &Value, context: &str) -> Result<Vec<Value>, PolicyError> {
-    value
-        .as_seq()
-        .map(|values| values.to_vec())
-        .ok_or_else(|| invalid(format!("{context} must be a list or vector")))
+    value.as_seq().map(|values| values.to_vec()).ok_or_else(|| {
+        invalid(format!(
+            "{context} must be a list or vector, got {}",
+            value.type_name()
+        ))
+    })
 }
 
 fn require_map<'a>(
     value: &'a Value,
     context: &str,
 ) -> Result<&'a BTreeMap<Value, Value>, PolicyError> {
-    value
-        .as_map_ref()
-        .ok_or_else(|| invalid(format!("{context} must be a map")))
+    value.as_map_ref().ok_or_else(|| {
+        invalid(format!(
+            "{context} must be a map, got {}",
+            value.type_name()
+        ))
+    })
 }
 
 fn get<'a>(map: &'a BTreeMap<Value, Value>, key: &str) -> Option<&'a Value> {
@@ -1842,23 +1993,49 @@ fn reject_unknown_keys(
 ) -> Result<(), PolicyError> {
     let mut seen = BTreeSet::new();
     for key in map.keys() {
-        let key = value_name(key).ok_or_else(|| {
+        let key_name = value_name(key).ok_or_else(|| {
             invalid(format!(
-                "{context} keys must be keywords, strings, or symbols"
+                "{context} keys must be keywords, strings, or symbols, got {}",
+                key.type_name()
             ))
         })?;
-        if !allowed.contains(&key.as_str()) {
-            return Err(invalid(format!("{context} has unknown key :{key}")));
+        if !allowed.contains(&key_name.as_str()) {
+            let hint = suggest_similar(&key_name, allowed)
+                .map(|candidate| format!("did you mean :{candidate}?"))
+                .unwrap_or_else(|| {
+                    format!(
+                        "valid keys are {}",
+                        allowed
+                            .iter()
+                            .map(|key| format!(":{key}"))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
+                });
+            return Err(invalid_with_hint(
+                format!("{context} has unknown key :{key_name}"),
+                hint,
+            ));
         }
-        if !seen.insert(key.clone()) {
-            return Err(invalid(format!("{context} has duplicate key {key:?}")));
+        if !seen.insert(key_name.clone()) {
+            return Err(invalid(format!("{context} has duplicate key :{key_name}")));
         }
     }
     Ok(())
 }
 
 fn invalid(message: impl Into<String>) -> PolicyError {
-    PolicyError::Invalid(message.into())
+    PolicyError {
+        message: message.into(),
+        hint: None,
+    }
+}
+
+fn invalid_with_hint(message: impl Into<String>, hint: impl Into<String>) -> PolicyError {
+    PolicyError {
+        message: message.into(),
+        hint: Some(hint.into()),
+    }
 }
 
 #[cfg(test)]
@@ -2074,6 +2251,39 @@ mod tests {
     }
 
     #[test]
+    fn metadata_and_completion_requirements_are_strict_and_stable() {
+        let policy = CompiledPolicy::compile(&named_policy([
+            (
+                "metadata",
+                map([("require", strings(&["owner", "risk-tier"]))]),
+            ),
+            (
+                "completion",
+                map([(
+                    "require-events",
+                    strings(&["agent.tool_result", "checkpoint"]),
+                )]),
+            ),
+        ]))
+        .unwrap();
+        assert_eq!(
+            policy.required_metadata().collect::<Vec<_>>(),
+            vec!["owner", "risk-tier"]
+        );
+        assert_eq!(
+            policy.required_completion_events().collect::<Vec<_>>(),
+            vec!["agent.tool_result", "checkpoint"]
+        );
+
+        let error = CompiledPolicy::compile(&named_policy([(
+            "completion",
+            map([("require-events", strings(&["made.up"]))]),
+        )]))
+        .unwrap_err();
+        assert!(error.to_string().contains("unsupported event"));
+    }
+
+    #[test]
     fn unknown_keys_are_rejected_instead_of_being_ignored() {
         let error = CompiledPolicy::compile(&named_policy([(
             "models",
@@ -2081,6 +2291,37 @@ mod tests {
         )]))
         .unwrap_err();
         assert!(error.to_string().contains("unknown key :alow"));
+        assert_eq!(error.hint(), Some("did you mean :allow?"));
+    }
+
+    #[test]
+    fn list_errors_include_one_based_index_and_actual_type() {
+        let error = CompiledPolicy::compile(&named_policy([(
+            "models",
+            map([(
+                "allow",
+                Value::vector(vec![Value::string("fake/*"), Value::int(42)]),
+            )]),
+        )]))
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            ":models :allow entry 2 must be a string, got int"
+        );
+    }
+
+    #[test]
+    fn enum_errors_use_keyword_notation_and_list_valid_values() {
+        let error = CompiledPolicy::compile(&named_policy([(
+            "tools",
+            map([("on-deny", Value::keyword("ignore"))]),
+        )]))
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            ":tools :on-deny has unsupported value :ignore"
+        );
+        assert_eq!(error.hint(), Some("valid values are :fail and :tool-error"));
     }
 
     #[test]

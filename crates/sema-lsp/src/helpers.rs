@@ -301,17 +301,7 @@ pub fn span_to_range(span: &Span, lines: &[&str]) -> Range {
 
 /// Build a diagnostic message from a `SemaError`, appending hint/note if present.
 pub(crate) fn format_error_message(err: &SemaError) -> String {
-    let mut message = match err.inner() {
-        SemaError::Reader { message, .. } => message.clone(),
-        other => other.to_string(),
-    };
-    if let Some(hint) = err.hint() {
-        message.push_str(&format!("\nhint: {hint}"));
-    }
-    if let Some(note) = err.note() {
-        message.push_str(&format!("\nnote: {note}"));
-    }
-    message
+    err.format_diagnostic()
 }
 
 /// Convert a SemaError into a diagnostic with the given severity.

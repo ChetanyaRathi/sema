@@ -2803,7 +2803,9 @@ mod tests {
         let err = lower(&vals[0], Some(&span_map)).expect_err("define with 3 args should fail");
 
         // Message is unchanged (WithTrace displays its inner error).
-        assert!(err.to_string().contains("define expects 2 args, got 3"));
+        assert!(err
+            .to_string()
+            .contains("define expects 2 arguments, got 3"));
 
         let trace = err.stack_trace().expect("error should carry a stack trace");
         let frame = trace.0.first().expect("trace should have a frame");
@@ -2819,7 +2821,9 @@ mod tests {
         let (vals, _span_map) = sema_reader::read_many_with_spans(input).unwrap();
         let err = lower(&vals[0], None).expect_err("define with 3 args should fail");
         assert!(err.stack_trace().is_none());
-        assert!(err.to_string().contains("define expects 2 args, got 3"));
+        assert!(err
+            .to_string()
+            .contains("define expects 2 arguments, got 3"));
     }
 
     #[test]

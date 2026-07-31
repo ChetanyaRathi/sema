@@ -27,7 +27,7 @@ use sema_core::runtime::{
     NativeContinuation, NativeOutcome, NativeResult, NativeSuspend, PreparedExternalOperation,
     ResumeInput, SendPayload, TaskContextHandle, Trace, WaitKind,
 };
-use sema_core::{SemaError, Value};
+use sema_core::{PolicyDenial, SemaError, Value};
 use sema_llm::builtins::{
     PolicyAttributionScope, PolicyBypassScope, PolicyDecisionSink, PolicyObservation,
     PolicyObservationKind, PolicyScope,
@@ -73,9 +73,10 @@ fn compile_policy(
                 vec![policy]
             } else {
                 let policies = policy.as_seq().ok_or_else(|| {
-                    SemaError::eval(
-                        "invalid workflow policy: :policy must be a map or nonempty sequence of maps",
-                    )
+                    SemaError::eval(format!(
+                        "invalid workflow policy: :policy must be a map or nonempty sequence of maps, got {}",
+                        policy.type_name()
+                    ))
                 })?;
                 if policies.is_empty() {
                     return Err(SemaError::eval(
@@ -92,14 +93,86 @@ fn compile_policy(
                     sema_policy::CompiledPolicy::compile(value)
                         .map(Rc::new)
                         .map_err(|error| {
-                            SemaError::eval(format!(
-                                "invalid workflow policy layer {index}: {error}"
-                            ))
+                            let hint = error.hint().map(str::to_string);
+                            let error = SemaError::eval(format!(
+                                "invalid workflow policy layer {}: {error}",
+                                index + 1
+                            ));
+                            if let Some(hint) = hint {
+                                error.with_hint(hint)
+                            } else {
+                                error
+                            }
                         })
                 })
                 .collect()
         })
         .transpose()
+}
+
+fn value_is_present(value: &Value) -> bool {
+    if value.is_nil() {
+        return false;
+    }
+    if let Some(text) = value.as_str() {
+        return !text.trim().is_empty();
+    }
+    if let Some(items) = value.as_seq() {
+        return !items.is_empty();
+    }
+    if let Some(map) = value.as_map_rc() {
+        return !map.is_empty();
+    }
+    true
+}
+
+fn validate_required_metadata(
+    policies: Option<&[Rc<sema_policy::CompiledPolicy>]>,
+    meta: &Value,
+) -> Result<(), SemaError> {
+    let map = meta.as_map_rc();
+    for policy in policies.into_iter().flatten() {
+        let missing = policy
+            .required_metadata()
+            .filter(|key| {
+                map.as_ref()
+                    .and_then(|metadata| metadata.get(&Value::keyword(key)))
+                    .is_none_or(|value| !value_is_present(value))
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        if missing.is_empty() {
+            continue;
+        }
+        let missing = missing.into_iter().collect::<Vec<_>>();
+        return Err(SemaError::policy_denied(PolicyDenial {
+            policy: Some(policy.name().to_string()),
+            boundary: "workflow.metadata".to_string(),
+            subject: "workflow".to_string(),
+            rule: format!("metadata.missing.{}", missing.join(",")),
+            reason: format!(
+                "required workflow metadata is missing: {}",
+                missing
+                    .iter()
+                    .map(|key| format!(":{key}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            action: "fail".to_string(),
+            source: "request".to_string(),
+        }));
+    }
+    Ok(())
+}
+
+fn required_completion_events(policies: Option<&[Rc<sema_policy::CompiledPolicy>]>) -> Vec<String> {
+    policies
+        .into_iter()
+        .flatten()
+        .flat_map(|policy| policy.required_completion_events())
+        .map(str::to_string)
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect()
 }
 
 fn policy_sink(ctx: &Rc<context::WorkflowCtx>) -> PolicyDecisionSink {
@@ -298,6 +371,13 @@ fn success_envelope(value: Value) -> Value {
     m.insert(Value::keyword("status"), Value::keyword("success"));
     m.insert(Value::keyword("value"), value);
     Value::map(m)
+}
+
+fn envelope_status(envelope: &Value) -> Option<String> {
+    envelope
+        .as_map_rc()?
+        .get(&Value::keyword("status"))
+        .and_then(as_name)
 }
 
 /// Close the currently-open marker phase, if any, emitting its `phase.ended` with the
@@ -662,7 +742,7 @@ fn policy_bypass_plan(
     }
     let reason = args[0]
         .as_str()
-        .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?
+        .ok_or_else(|| SemaError::argument_type("policy/without", 1, "string", &args[0]))?
         .trim()
         .to_string();
     if reason.is_empty() || reason.chars().count() > 256 {
@@ -847,6 +927,7 @@ fn finish_checkpoint(
 struct RunTeardown {
     _guard: context::WorkflowGuard,
     _policy_scope: Option<PolicyScope>,
+    required_events: Vec<String>,
     mcp: Option<McpClose>,
 }
 
@@ -893,9 +974,13 @@ fn finish_run(
     durable: bool,
 ) -> NativeResult {
     let (mut status, mut envelope, mut reason) = match &result {
-        Ok(v) => ("success", success_envelope(v.clone()), None),
+        Ok(v) => {
+            let envelope = success_envelope(v.clone());
+            let status = envelope_status(&envelope).unwrap_or_else(|| "success".to_string());
+            (status, envelope, None)
+        }
         Err(e) => (
-            "failed",
+            "failed".to_string(),
             failed_envelope(&e.to_string()),
             Some("workflow body returned an error".to_string()),
         ),
@@ -906,15 +991,32 @@ fn finish_run(
     let ack = if let Some(ctx) = &ctx {
         // A tripped budget cap fails the run regardless of the body's own outcome.
         if ctx.over_budget() {
-            status = "failed";
+            status = "failed".to_string();
             envelope = budget_failed_envelope();
             reason = Some("budget exceeded".to_string());
         }
-        close_open_phase(ctx, status);
+        if status == "success" {
+            let missing = teardown
+                .required_events
+                .iter()
+                .filter(|event| !ctx.has_event(event))
+                .cloned()
+                .collect::<Vec<_>>();
+            if !missing.is_empty() {
+                status = "failed".to_string();
+                let message = format!(
+                    "completion policy missing required events: {}",
+                    missing.join(", ")
+                );
+                envelope = failed_envelope(&message);
+                reason = Some(message);
+            }
+        }
+        close_open_phase(ctx, &status);
         ctx.emit(WorkflowEvent::RunEnded {
             seq: ctx.next_seq(),
             ts: ctx.ts(),
-            status: status.into(),
+            status,
             reason,
             dur_ms: ctx.dur_ms(),
         });
@@ -1100,6 +1202,7 @@ fn run_plan(
     let meta = args[2].clone();
     let thunk = args[3].clone();
     let policy = compile_policy(&meta)?;
+    validate_required_metadata(policy.as_deref(), &meta)?;
     let workspace_root = std::env::current_dir()
         .map_err(|error| SemaError::eval(format!("workflow/run: current directory: {error}")))?;
 
@@ -1145,12 +1248,14 @@ fn run_plan(
     if decls.is_empty() {
         let ctx = context::current_for(task_context)
             .ok_or_else(|| SemaError::eval("workflow/run: scope not established"))?;
+        let required_events = required_completion_events(policy.as_deref());
         let policy_scope = open_compiled_policy(policy, &ctx, &workspace_root);
         return Ok(ThunkPlan::Run {
             thunk,
             teardown: RunTeardown {
                 _guard: guard,
                 _policy_scope: policy_scope,
+                required_events,
                 mcp: None,
             },
         });
@@ -1330,12 +1435,14 @@ fn apply_resolutions(
     // Every declared server connected: publish handles for workflow/mcp-handle, and
     // remember (resolver, handles) so `finish_run` closes them EXACTLY once.
     ctx.set_mcp_handles(connected);
+    let required_events = required_completion_events(policy.as_deref());
     let policy_scope = open_compiled_policy(policy, &ctx, &workspace_root);
     Ok(ResolveGate::Proceed {
         thunk,
         teardown: RunTeardown {
             _guard: guard,
             _policy_scope: policy_scope,
+            required_events,
             mcp: Some(McpClose {
                 resolver,
                 handles: connected_handles,
@@ -1554,6 +1661,28 @@ pub fn register(env: &sema_core::Env) {
                     agent_id,
                     tool_name,
                     args_json,
+                });
+            }
+        }
+        Ok(Value::nil())
+    });
+
+    // Successful tool completion evidence. The event deliberately carries only
+    // a gated sentinel, never the callback's result preview.
+    register_scoped_fn(env, "workflow/tool-result", |task_context, args| {
+        if args.len() != 1 {
+            return Err(SemaError::arity("workflow/tool-result", "1", args.len()));
+        }
+        let tool_name = as_name(&args[0])
+            .ok_or_else(|| SemaError::type_error("keyword or string", args[0].type_name()))?;
+        if let Some(ctx) = context::current_for(task_context) {
+            if let Some(agent_id) = context::cur_agent_for(task_context) {
+                ctx.emit(WorkflowEvent::AgentToolResult {
+                    seq: ctx.next_seq(),
+                    ts: ctx.ts(),
+                    agent_id,
+                    tool_name,
+                    result_digest: "gated".to_string(),
                 });
             }
         }

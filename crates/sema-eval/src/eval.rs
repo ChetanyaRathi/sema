@@ -19,6 +19,10 @@ pub enum Trampoline {
 
 pub type EvalResult = Result<Value, SemaError>;
 
+fn runtime_internal(message: &str, detail: impl std::fmt::Debug) -> SemaError {
+    SemaError::internal(message).with_note(format!("runtime detail: {detail:?}"))
+}
+
 /// Create an isolated module env: child of root (global/stdlib) env
 pub fn create_module_env(env: &Env) -> Env {
     // Walk parent chain to find root
@@ -447,7 +451,9 @@ impl Interpreter {
             .expect("runtime is present outside of Drop");
         runtime
             .submit_root_with_options(vm, &opts)
-            .map_err(|e| SemaError::eval(format!("root submission failed: {e:?}")))
+            .map_err(|error| {
+                runtime_internal("could not submit the evaluation to the runtime", error)
+            })
     }
 
     fn submit_exprs(
@@ -481,7 +487,9 @@ impl Interpreter {
             .expect("runtime is present outside of Drop");
         runtime
             .submit_root_with_options(vm, &opts)
-            .map_err(|e| SemaError::eval(format!("root submission failed: {e:?}")))
+            .map_err(|error| {
+                runtime_internal("could not submit the evaluation to the runtime", error)
+            })
     }
 
     /// Drive an already-submitted root (from [`submit_str`](Self::submit_str)
@@ -508,7 +516,7 @@ impl Interpreter {
         let budget = sema_vm::runtime::DriveBudget::host_default();
         runtime
             .drive(&budget)
-            .map_err(|e| SemaError::eval(format!("runtime fault: {e:?}")))
+            .map_err(|error| runtime_internal("the runtime could not drive the evaluation", error))
     }
 
     /// Drive one bounded turn while executing VM quanta only for `roots`.
@@ -525,7 +533,7 @@ impl Interpreter {
         let budget = sema_vm::runtime::DriveBudget::host_default();
         runtime
             .drive_roots(&budget, roots)
-            .map_err(|e| SemaError::eval(format!("runtime fault: {e:?}")))
+            .map_err(|error| runtime_internal("the runtime could not drive the evaluation", error))
     }
 
     /// Drain every [`OutputEvent`](sema_vm::runtime::OutputEvent) captured so
@@ -565,7 +573,7 @@ impl Interpreter {
     ) -> Result<sema_vm::runtime::ShutdownReport, SemaError> {
         let result = self.runtime().shutdown(&opts);
         let _ = self.ctx.try_run_interpreter_teardown_hooks();
-        result.map_err(|fault| SemaError::eval(format!("runtime fault during shutdown: {fault:?}")))
+        result.map_err(|fault| runtime_internal("the runtime could not shut down cleanly", fault))
     }
 
     /// Submit an already-seeded VM as a fresh root on this interpreter's
@@ -628,9 +636,9 @@ impl Interpreter {
             .as_ref()
             .expect("runtime is present outside of Drop");
         self.ensure_synchronous_runtime_entry_allowed()?;
-        let handle = runtime
-            .submit_root(vm)
-            .map_err(|e| SemaError::eval(format!("root submission failed: {e:?}")))?;
+        let handle = runtime.submit_root(vm).map_err(|error| {
+            runtime_internal("could not submit the evaluation to the runtime", error)
+        })?;
         self.drive_handle_to_settlement(&handle)
     }
 
@@ -674,9 +682,14 @@ impl Interpreter {
                     // that the common case; this keeps the drain going for any
                     // teardown the drive scan still owes.
                     loop {
-                        match drive_runtime_root(runtime, &budget, handle.id())
-                            .map_err(|e| SemaError::eval(format!("runtime fault: {e:?}")))?
-                        {
+                        match drive_runtime_root(runtime, &budget, handle.id()).map_err(
+                            |error| {
+                                runtime_internal(
+                                    "the runtime could not drive the evaluation",
+                                    error,
+                                )
+                            },
+                        )? {
                             DriveState::Progress {
                                 ready_remaining: true,
                                 ..
@@ -693,15 +706,18 @@ impl Interpreter {
                 }
                 RootPoll::Pending => {}
                 RootPoll::Aborted(fault) => {
-                    return Err(SemaError::eval(format!("root aborted: {fault:?}")));
+                    return Err(runtime_internal(
+                        "the runtime aborted the evaluation",
+                        fault,
+                    ));
                 }
                 RootPoll::RuntimeDropped | RootPoll::InvariantViolation => {
-                    return Err(SemaError::eval("runtime invariant violation"));
+                    return Err(SemaError::internal("the runtime state is inconsistent"));
                 }
             }
-            match drive_runtime_root(runtime, &budget, handle.id())
-                .map_err(|e| SemaError::eval(format!("runtime fault: {e:?}")))?
-            {
+            match drive_runtime_root(runtime, &budget, handle.id()).map_err(|error| {
+                runtime_internal("the runtime could not drive the evaluation", error)
+            })? {
                 DriveState::Progress { .. } => {}
                 #[cfg(target_arch = "wasm32")]
                 DriveState::Idle { .. } => {
@@ -715,10 +731,11 @@ impl Interpreter {
                             break;
                         }
                         if !matches!(
-                            drive_runtime_root(runtime, &budget, handle.id()).map_err(|e| {
-                                SemaError::eval(format!(
-                                    "runtime fault while cancelling suspended WASM root: {e:?}"
-                                ))
+                            drive_runtime_root(runtime, &budget, handle.id()).map_err(|error| {
+                                runtime_internal(
+                                    "the runtime could not cancel a suspended WebAssembly evaluation",
+                                    error,
+                                )
                             })?,
                             DriveState::Progress { .. }
                         ) {
@@ -747,9 +764,10 @@ impl Interpreter {
                     if !runtime.block_on_inbox(next_deadline) && next_deadline.is_none() {
                         // The inbox closed with no completion and no timer to fall
                         // back on: the parked task can never be resumed.
-                        return Err(SemaError::eval(
-                            "eval_via_runtime: external wait cannot be completed (executor inbox closed)",
-                        ));
+                        return Err(SemaError::internal(
+                            "the runtime could not complete an external wait",
+                        )
+                        .with_note("runtime detail: executor inbox closed"));
                     }
                 }
                 // The root is parked purely on a timer (`async/sleep`): the only
@@ -793,17 +811,24 @@ impl Interpreter {
                 } => {
                     if !runtime
                         .settle_deadlocked_root(handle.id())
-                        .map_err(|e| SemaError::eval(format!("runtime fault: {e:?}")))?
+                        .map_err(|error| {
+                            runtime_internal(
+                                "the runtime could not settle a deadlocked evaluation",
+                                error,
+                            )
+                        })?
                     {
-                        return Err(SemaError::eval(
-                            "eval_via_runtime: root did not settle (unsupported suspension on the runtime path)",
-                        ));
+                        return Err(SemaError::internal(
+                            "the runtime could not settle the evaluation",
+                        )
+                        .with_note("runtime detail: unsupported suspension"));
                     }
                 }
                 _ => {
-                    return Err(SemaError::eval(
-                        "eval_via_runtime: root did not settle (unsupported suspension on the runtime path)",
-                    ));
+                    return Err(
+                        SemaError::internal("the runtime could not settle the evaluation")
+                            .with_note("runtime detail: unsupported suspension"),
+                    );
                 }
             }
         }

@@ -117,6 +117,17 @@ pub enum WorkflowEvent {
         args_json: String,
     },
 
+    /// A tool handler returned successfully. The result is an opaque digest or
+    /// gated sentinel; raw tool output never enters the workflow journal.
+    #[serde(rename = "agent.tool_result")]
+    AgentToolResult {
+        seq: u64,
+        ts: String,
+        agent_id: String,
+        tool_name: String,
+        result_digest: String,
+    },
+
     /// A `checkpoint` recorded a keyed step value. The value itself is NOT stored in
     /// the event stream — only a (lossy) digest — and a `content_key` resume hash.
     #[serde(rename = "checkpoint")]
@@ -336,6 +347,31 @@ pub enum WorkflowEvent {
         reason: String,
         source: String,
     },
+}
+
+impl WorkflowEvent {
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::RunStarted { .. } => "run.started",
+            Self::PhaseStarted { .. } => "phase.started",
+            Self::PhaseEnded { .. } => "phase.ended",
+            Self::AgentStarted { .. } => "agent.started",
+            Self::AgentResult { .. } => "agent.result",
+            Self::AgentToolCall { .. } => "agent.tool_call",
+            Self::AgentToolResult { .. } => "agent.tool_result",
+            Self::Checkpoint { .. } => "checkpoint",
+            Self::Budget { .. } => "budget",
+            Self::RunEnded { .. } => "run.ended",
+            Self::AuthRequired { .. } => "auth.required",
+            Self::AuthGranted { .. } => "auth.granted",
+            Self::AuthFailed { .. } => "auth.failed",
+            Self::PolicyChecked { .. } => "policy.checked",
+            Self::PolicyFlagged { .. } => "policy.flagged",
+            Self::PolicyRedacted { .. } => "policy.redacted",
+            Self::PolicyViolation { .. } => "policy.violation",
+            Self::PolicyBypassed { .. } => "policy.bypassed",
+        }
+    }
 }
 
 #[cfg(test)]

@@ -2635,7 +2635,7 @@ pub fn register(env: &sema_core::Env, sandbox: &sema_core::Sandbox) {
         check_arity!(args, "file/read", 1);
         let path = args[0]
             .as_str()
-            .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?;
+            .ok_or_else(|| SemaError::argument_type("file/read", 1, "string", &args[0]))?;
         if let Some(data) = sema_core::vfs::vfs_read(path) {
             return String::from_utf8(data)
                 .map_err(|e| SemaError::Io(format!("file/read {path}: invalid UTF-8 in VFS: {e}")))

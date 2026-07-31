@@ -85,6 +85,47 @@ fn model_skip_still_fails_a_non_fallback_call_before_provider_access() {
 }
 
 #[test]
+fn caught_model_denial_preserves_structured_policy_details() {
+    let src = r#"
+        (defpolicy safe
+          {:models {:default :deny}})
+        (defworkflow guarded "structured model denial" {:policy safe}
+          (phase "Run")
+          (def denial
+            (try
+              (llm/complete "must not run")
+              (catch error error)))
+          {:status :success :denial denial})
+    "#;
+
+    let out = wc::run_once(
+        src,
+        fake_with_reply("unexpected"),
+        "wf_policy_structured_denial",
+    );
+    assert_eq!(out.result["status"], "success");
+    assert_eq!(
+        out.recorder.call_count(),
+        0,
+        "a denied model must not reach the provider"
+    );
+
+    let denial = &out.result["denial"];
+    assert_eq!(denial["type"], "policy-denied");
+    assert_eq!(denial["policy"], "safe");
+    assert_eq!(denial["boundary"], "model");
+    assert_eq!(denial["subject"], "fake/fake-model");
+    assert_eq!(denial["rule"], "models.default-deny");
+    assert_eq!(denial["reason"], "model fake/fake-model is not allowlisted");
+    assert_eq!(denial["action"], "fail");
+    assert_eq!(denial["source"], "request");
+    assert_eq!(
+        denial["message"],
+        "Policy 'safe' denied model 'fake/fake-model': model fake/fake-model is not allowlisted"
+    );
+}
+
+#[test]
 fn model_skip_skips_only_denied_fallback_targets() {
     let src = r#"
         (llm/define-provider :blocked
@@ -276,6 +317,187 @@ fn stream_embed_and_rerank_are_denied_before_provider_or_callback() {
     let _ = std::fs::remove_dir_all(&base);
 }
 
+#[test]
+fn input_policy_redacts_before_provider_dispatch() {
+    let src = r#"
+        (defpolicy private
+          {:input {:detect [:email]
+                   :actions {:email :redact}}})
+        (defworkflow guarded "input redaction" {:policy private}
+          (phase "Run")
+          (def result (step "Email alice@example.com" {:name "writer"}))
+          {:status :success :result result})
+    "#;
+
+    let out = wc::run_once(
+        src,
+        fake_with_reply("accepted"),
+        "wf_policy_input_redaction",
+    );
+    assert_eq!(out.result["status"], "success");
+    let requests = out.recorder.requests();
+    assert_eq!(requests.len(), 1);
+    let provider_input = requests[0].messages[0].content.to_text();
+    assert!(!provider_input.contains("alice@example.com"));
+    assert!(provider_input.contains("«redacted:email»"));
+    assert!(
+        wc::events_of(&out.events, "policy.redacted")
+            .iter()
+            .any(|event| {
+                event["boundary"] == "llm.input" && event["label"] == "email" && event["count"] == 1
+            }),
+        "the safe aggregate finding should be journaled"
+    );
+}
+
+#[test]
+fn output_policy_buffers_streams_and_blocks_before_callbacks() {
+    let base = temp_run_dir("policy-output-block");
+    let marker = base.join("stream-callback");
+    let path = marker
+        .to_string_lossy()
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"");
+    let src = format!(
+        r#"
+        (defpolicy private
+          {{:output {{:detect [:email]
+                     :actions {{:email :block}}}}}})
+        (defworkflow guarded "output block" {{:policy private}}
+          (phase "Run")
+          (def completion
+            (try (llm/complete "complete") (catch error (:type error))))
+          (def streaming
+            (try
+              (llm/stream "stream"
+                (lambda (chunk) (file/write "{path}" chunk)))
+              (catch error (:type error))))
+          {{:status :success :types (list completion streaming)}})
+        "#
+    );
+    let fake = FakeProvider::builder("fake")
+        .model("fake-model")
+        .reply("alice@example.com")
+        .stream(&["alice@", "example.com"])
+        .build();
+    let out = run_workflow(&src, fake, RunOpts::fresh("wf_policy_output_block", &base));
+
+    assert_eq!(out.result["status"], "success");
+    assert_eq!(
+        out.result["types"],
+        serde_json::json!(["policy-denied", "policy-denied"])
+    );
+    assert!(
+        !marker.exists(),
+        "a governed stream must not deliver unsafe prefixes"
+    );
+    assert_eq!(
+        wc::events_of(&out.events, "policy.violation")
+            .iter()
+            .filter(|event| event["boundary"] == "llm.output")
+            .count(),
+        2
+    );
+
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn output_policy_returns_only_redacted_content() {
+    let src = r#"
+        (defpolicy private
+          {:output {:detect [:email]
+                    :actions {:email :redact}}})
+        (defworkflow guarded "output redaction" {:policy private}
+          (phase "Run")
+          (def result (llm/complete "complete"))
+          {:status :success :result result})
+    "#;
+    let out = wc::run_once(
+        src,
+        fake_with_reply("Contact alice@example.com"),
+        "wf_policy_output_redaction",
+    );
+
+    assert_eq!(out.result["status"], "success");
+    assert_eq!(out.result["result"], "Contact «redacted:email»");
+    assert!(
+        !serde_json::to_string(&out.events)
+            .expect("events serialize")
+            .contains("alice@example.com"),
+        "journals must contain only safe finding metadata and digests"
+    );
+}
+
+#[test]
+fn completion_policy_fails_a_nominal_success_when_evidence_is_missing() {
+    let src = r#"
+        (defpolicy evidenced
+          {:metadata {:require [:owner]}
+           :completion {:require-events [:checkpoint]}})
+        (defworkflow guarded "completion evidence"
+          {:policy evidenced :owner "risk-team"}
+          (phase "Run")
+          {:status :success})
+    "#;
+    let out = wc::run_once(
+        src,
+        fake_with_reply("unused"),
+        "wf_policy_completion_missing",
+    );
+
+    assert_eq!(out.result["status"], "failed");
+    assert!(out.result["error"]
+        .as_str()
+        .is_some_and(|message| message.contains("checkpoint")));
+    let ended = &wc::events_of(&out.events, "run.ended")[0];
+    assert_eq!(ended["status"], "failed");
+    assert!(ended["reason"]
+        .as_str()
+        .is_some_and(|message| message.contains("checkpoint")));
+}
+
+#[test]
+fn successful_tool_results_satisfy_completion_evidence() {
+    let src = r#"
+        (deftool ping "Return pong" {} (lambda () "pong"))
+        (defpolicy evidenced
+          {:completion {:require-events [:agent.tool_result]}})
+        (defworkflow guarded "tool evidence" {:policy evidenced}
+          (phase "Run")
+          (def result (step "Call ping" {:tools [ping]}))
+          {:status :success :result result})
+    "#;
+    let fake = FakeProvider::builder("fake")
+        .model("fake-model")
+        .tool_call("call_1", "ping", serde_json::json!({}))
+        .reply("done")
+        .build();
+    let out = wc::run_once(src, fake, "wf_policy_tool_result_evidence");
+
+    assert_eq!(out.result["status"], "success");
+    let results = wc::events_of(&out.events, "agent.tool_result");
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0]["tool_name"], "ping");
+    assert_eq!(results[0]["result_digest"], "gated");
+}
+
+#[test]
+fn run_ended_status_mirrors_an_explicit_failed_envelope() {
+    let src = r#"
+        (defworkflow guarded "explicit failure" {}
+          (phase "Run")
+          {:status :failed :reason "review failed"})
+    "#;
+    let out = wc::run_once(src, fake_with_reply("unused"), "wf_policy_explicit_failure");
+
+    assert_eq!(out.result["status"], "failed");
+    assert_eq!(
+        wc::events_of(&out.events, "run.ended")[0]["status"],
+        "failed"
+    );
+}
+
 const BATCH_TOOLS: &str = r#"
     (deftool allowed-tool
       "Write a marker"
@@ -385,6 +607,20 @@ fn tool_error_denial_runs_allowed_siblings_without_journaling_denied_call() {
     assert!(wc::events_of(&out.events, "policy.violation")
         .iter()
         .any(|event| { event["subject"] == "blocked-tool" && event["action"] == "tool-error" }));
+    let requests = out.recorder.requests();
+    let denied_result = requests
+        .iter()
+        .flat_map(|request| request.messages.iter())
+        .find(|message| message.tool_call_id.as_deref() == Some("blocked_1"))
+        .expect("the denied call must return a correlated tool result");
+    assert_eq!(
+        denied_result.content.as_text(),
+        Some("tool 'blocked-tool' was blocked: tool blocked-tool matches an explicit deny rule")
+    );
+    assert!(
+        !denied_result.content.to_text().contains("Error:"),
+        "tool results must not embed a second presentation prefix"
+    );
 
     let _ = std::fs::remove_dir_all(&base);
 }

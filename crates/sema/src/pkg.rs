@@ -68,6 +68,81 @@ fn find_all_packages(pkg_dir: &Path) -> Vec<PathBuf> {
     packages
 }
 
+fn validate_package_manifest_sema(dir: &Path, package: &str) -> Result<(), String> {
+    let manifest = dir.join("sema.toml");
+    if !manifest.is_file() {
+        return Ok(());
+    }
+    let content = std::fs::read_to_string(&manifest)
+        .map_err(|error| format!("Failed to read {}: {error}", manifest.display()))?;
+    validate_package_manifest_sema_content(&content, &manifest.display().to_string(), package)
+}
+
+fn validate_package_manifest_sema_content(
+    content: &str,
+    source: &str,
+    package: &str,
+) -> Result<(), String> {
+    let document: toml::Value =
+        toml::from_str(content).map_err(|error| format!("Failed to parse {source}: {error}"))?;
+    let requirement = document
+        .get("package")
+        .and_then(|package| package.get("sema_version_req"))
+        .map(|value| {
+            value
+                .as_str()
+                .ok_or_else(|| format!("{source} [package].sema_version_req must be a string"))
+        })
+        .transpose()?
+        .map(str::trim)
+        .filter(|requirement| !requirement.is_empty());
+    let Some(requirement) = requirement else {
+        return Ok(());
+    };
+    if requirement.len() > 128 {
+        return Err(format!(
+            "{package} has invalid sema_version_req: must be at most 128 characters"
+        ));
+    }
+    let parsed = semver::VersionReq::parse(requirement).map_err(|error| {
+        format!("{package} has invalid sema_version_req {requirement:?}: {error}")
+    })?;
+    let current = current_sema_version();
+    if parsed.matches(&current) {
+        Ok(())
+    } else {
+        Err(format!(
+            "{package} requires Sema {requirement}, but this is Sema {current}"
+        ))
+    }
+}
+
+fn validate_git_ref_manifest(dir: &Path, git_ref: &str, package: &str) -> Result<(), String> {
+    let candidates = [
+        format!("refs/remotes/origin/{git_ref}"),
+        format!("refs/tags/{git_ref}"),
+        git_ref.to_string(),
+    ];
+    let Some(resolved) = candidates
+        .iter()
+        .find(|candidate| run_git(Some(dir), &["rev-parse", "--verify", candidate]).is_ok())
+        .cloned()
+    else {
+        // Checkout reports a missing ref with the normal git diagnostic.
+        return Ok(());
+    };
+    let object = format!("{resolved}:sema.toml");
+    if run_git(Some(dir), &["cat-file", "-e", &object]).is_err() {
+        return Ok(());
+    }
+    let content = run_git(Some(dir), &["show", &object])?;
+    validate_package_manifest_sema_content(
+        &content,
+        &format!("{package}@{git_ref}:sema.toml"),
+        package,
+    )
+}
+
 fn collect_packages(dir: &Path, packages: &mut Vec<PathBuf>) {
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
@@ -111,24 +186,28 @@ pub fn cmd_add(spec: &str, registry: Option<&str>) -> Result<(), String> {
 fn install_git(spec: &sema_core::resolve::PackageSpec) -> Result<(String, String), String> {
     let pkg_dir = packages_dir();
     let dest = spec.dest_dir(&pkg_dir);
+    let existed = dest.exists();
 
-    if dest.exists() {
+    if existed {
         run_git(Some(&dest), &["fetch", "origin"])?;
         run_git(Some(&dest), &["fetch", "--tags"])?;
-        run_git(Some(&dest), &["checkout", &spec.git_ref])?;
-        let current = current_git_ref(&dest);
-        println!("✓ Updated {} → {current}", spec.path);
     } else {
         if let Some(parent) = dest.parent() {
             std::fs::create_dir_all(parent)
                 .map_err(|e| format!("Failed to create directory: {e}"))?;
         }
         run_git(None, &["clone", &spec.clone_url(), &dest.to_string_lossy()])?;
-        run_git(Some(&dest), &["checkout", &spec.git_ref])?;
-        let current = current_git_ref(&dest);
-        println!("✓ Installed {} → {current}", spec.path);
     }
 
+    if let Err(error) = validate_git_ref_manifest(&dest, &spec.git_ref, spec.path.as_str()) {
+        if !existed {
+            let _ = std::fs::remove_dir_all(&dest);
+        }
+        return Err(error);
+    }
+    run_git(Some(&dest), &["checkout", &spec.git_ref])?;
+    let current = current_git_ref(&dest);
+    println!("✓ Installed {} → {current}", spec.path);
     let commit = run_git(Some(&dest), &["rev-parse", "HEAD"])?;
     let git_ref = spec.git_ref.clone();
     Ok((git_ref, commit))
@@ -141,8 +220,9 @@ fn install_git_locked(
 ) -> Result<(), String> {
     let pkg_dir = packages_dir();
     let dest = spec.dest_dir(&pkg_dir);
+    let existed = dest.exists();
 
-    if dest.exists() {
+    if existed {
         run_git(Some(&dest), &["fetch", "origin"])?;
         run_git(Some(&dest), &["fetch", "--tags"])?;
     } else {
@@ -153,6 +233,12 @@ fn install_git_locked(
         run_git(None, &["clone", &spec.clone_url(), &dest.to_string_lossy()])?;
     }
 
+    if let Err(error) = validate_git_ref_manifest(&dest, expected_commit, spec.path.as_str()) {
+        if !existed {
+            let _ = std::fs::remove_dir_all(&dest);
+        }
+        return Err(error);
+    }
     run_git(Some(&dest), &["checkout", "--detach", expected_commit])?;
     let actual = run_git(Some(&dest), &["rev-parse", "HEAD"])?;
     if actual != expected_commit {
@@ -174,7 +260,7 @@ fn cmd_add_git(spec: &str) -> Result<(), String> {
     match add_dep_to_toml(toml_path, spec.path.as_str(), &git_ref) {
         Ok(true) => println!("✓ Added {} = \"{}\" to sema.toml", spec.path, git_ref),
         Ok(false) => {}
-        Err(e) => eprintln!("Warning: could not update sema.toml: {e}"),
+        Err(e) => crate::print_cli_warning(format!("could not update sema.toml: {e}")),
     }
 
     match update_lock_entry(
@@ -186,7 +272,7 @@ fn cmd_add_git(spec: &str) -> Result<(), String> {
         },
     ) {
         Ok(()) => println!("✓ Updated sema.lock"),
-        Err(e) => eprintln!("Warning: could not update sema.lock: {e}"),
+        Err(e) => crate::print_cli_warning(format!("could not update sema.lock: {e}")),
     }
 
     // Pull in this package's own dependencies, if any (transitive resolution).
@@ -207,8 +293,9 @@ fn cmd_add_registry(spec: &str, registry: Option<&str>) -> Result<(), String> {
         Some(v) => v,
         None => {
             let info = registry_package_info(&name, &registry_url)?;
-            latest_version(&info)
-                .ok_or_else(|| format!("No published versions found for '{name}'"))?
+            latest_compatible_version(&name, &info)?.ok_or_else(|| {
+                format!("No non-yanked version of '{name}' supports this Sema release")
+            })?
         }
     };
 
@@ -221,7 +308,7 @@ fn cmd_add_registry(spec: &str, registry: Option<&str>) -> Result<(), String> {
     match add_dep_to_toml(toml_path, &name, &version) {
         Ok(true) => println!("✓ Added {name} = \"{version}\" to sema.toml"),
         Ok(false) => {}
-        Err(e) => eprintln!("Warning: could not update sema.toml: {e}"),
+        Err(e) => crate::print_cli_warning(format!("could not update sema.toml: {e}")),
     }
 
     match update_lock_entry(
@@ -234,7 +321,7 @@ fn cmd_add_registry(spec: &str, registry: Option<&str>) -> Result<(), String> {
         },
     ) {
         Ok(()) => println!("✓ Updated sema.lock"),
-        Err(e) => eprintln!("Warning: could not update sema.lock: {e}"),
+        Err(e) => crate::print_cli_warning(format!("could not update sema.lock: {e}")),
     }
 
     // Pull in this package's own dependencies, if any (transitive resolution).
@@ -682,7 +769,9 @@ pub fn cmd_install(locked: bool) -> Result<(), String> {
     )?;
 
     for name in &pruned {
-        eprintln!("Warning: '{name}' is no longer required, removing from sema.lock");
+        crate::print_cli_warning(format!(
+            "'{name}' is no longer required; removing it from sema.lock"
+        ));
     }
     for note in &notes {
         print_resolution_note(note);
@@ -737,7 +826,7 @@ pub fn cmd_update(name: Option<&str>) -> Result<(), String> {
                 continue;
             }
             if let Err(e) = update_single_package(&pkg_dir, dir) {
-                eprintln!("✗ Failed to update {}: {e}", rel.display());
+                crate::print_cli_error(format!("could not update {}: {e}", rel.display()));
             }
         }
     }
@@ -777,8 +866,9 @@ fn update_single_package(pkg_dir: &Path, dir: &Path) -> Result<(), String> {
             .unwrap_or(DEFAULT_REGISTRY);
 
         let info = registry_package_info(&name, registry)?;
-        let latest =
-            latest_version(&info).ok_or_else(|| format!("No versions found for '{name}'"))?;
+        let latest = latest_compatible_version(&name, &info)?.ok_or_else(|| {
+            format!("No non-yanked version of '{name}' supports this Sema release")
+        })?;
 
         if latest == current_ver {
             println!("  {} already at latest ({current_ver})", rel.display());
@@ -807,9 +897,15 @@ fn update_single_package(pkg_dir: &Path, dir: &Path) -> Result<(), String> {
     } else if dir.join(".git").is_dir() {
         // Git package — fetch and update to latest on the tracking ref
         run_git(Some(dir), &["fetch", "origin"])?;
+        run_git(Some(dir), &["fetch", "--tags"])?;
 
         // Read the tracking ref from sema.toml (needed if HEAD is detached after --locked install)
         let tracking_ref = read_dep_ref_from_toml(&rel_str);
+        validate_git_ref_manifest(
+            dir,
+            tracking_ref.as_deref().unwrap_or("FETCH_HEAD"),
+            &rel_str,
+        )?;
         if let Some(ref git_ref) = tracking_ref {
             // Checkout the branch/tag first so pull works
             let _ = run_git(Some(dir), &["checkout", git_ref]);
@@ -858,7 +954,7 @@ pub fn cmd_remove(name: &str) -> Result<(), String> {
         match remove_dep_from_toml(toml_path, &rel_path) {
             Ok(true) => removed_from_toml = true,
             Ok(false) => {}
-            Err(e) => eprintln!("Warning: could not update sema.toml: {e}"),
+            Err(e) => crate::print_cli_warning(format!("could not update sema.toml: {e}")),
         }
     }
 
@@ -916,7 +1012,7 @@ pub fn cmd_remove(name: &str) -> Result<(), String> {
     match remove_lock_entry(&rel_path) {
         Ok(true) => println!("✓ Removed {rel_path} from sema.lock"),
         Ok(false) => {}
-        Err(e) => eprintln!("Warning: could not update sema.lock: {e}"),
+        Err(e) => crate::print_cli_warning(format!("could not update sema.lock: {e}")),
     }
 
     Ok(())
@@ -1421,6 +1517,7 @@ fn install_tarball_atomic(
     // a broken tarball never leaves a corrupt tree behind.
     let build = || -> Result<(), String> {
         extract_tarball(tarball, &temp_dir)?;
+        validate_package_manifest_sema(&temp_dir, &format!("{name}@{version}"))?;
         write_pkg_meta(&temp_dir, name, version, registry_url, checksum)?;
         Ok(())
     };
@@ -1452,6 +1549,7 @@ fn registry_install(name: &str, version: &str, registry_url: &str) -> Result<Str
     // name is used as a path component (`pkg_dir.join(name)`): a name like
     // `../../etc/cron.d` would otherwise escape `~/.sema/packages/`.
     validate_package_spec(name).map_err(|e| e.to_string())?;
+    validate_registry_version(name, version, registry_url)?;
     let (tarball, checksum) = registry_download(name, version, registry_url)?;
 
     // Extract to packages dir (atomically — see install_tarball_atomic / BIN-4).
@@ -1617,6 +1715,7 @@ fn registry_install_locked(
     expected_checksum: &str,
 ) -> Result<(), String> {
     validate_package_spec(name).map_err(|e| e.to_string())?;
+    validate_registry_version(name, version, registry_url)?;
     let (tarball, checksum) = registry_download(name, version, registry_url)?;
 
     if checksum != expected_checksum {
@@ -1661,15 +1760,108 @@ fn registry_package_info(name: &str, registry_url: &str) -> Result<serde_json::V
         .map_err(|e| format!("Failed to parse response: {e}"))
 }
 
-/// Get the latest non-yanked version from a package info response.
-fn latest_version(info: &serde_json::Value) -> Option<String> {
-    info.get("versions")?
-        .as_array()?
-        .iter()
-        .filter(|v| !v.get("yanked").and_then(|y| y.as_bool()).unwrap_or(false))
-        .filter_map(|v| v.get("version").and_then(|s| s.as_str()))
-        .next()
-        .map(|s| s.to_string())
+fn current_sema_version() -> semver::Version {
+    semver::Version::parse(env!("CARGO_PKG_VERSION"))
+        .expect("the Sema crate version is valid semver")
+}
+
+fn version_metadata<'a>(
+    package: &str,
+    version: &str,
+    info: &'a serde_json::Value,
+) -> Result<&'a serde_json::Value, String> {
+    info.get("versions")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|versions| {
+            versions.iter().find(|candidate| {
+                candidate.get("version").and_then(serde_json::Value::as_str) == Some(version)
+            })
+        })
+        .ok_or_else(|| format!("Registry metadata has no version '{package}@{version}'"))
+}
+
+fn ensure_version_supports_sema(
+    package: &str,
+    version: &str,
+    metadata: &serde_json::Value,
+) -> Result<Option<String>, String> {
+    let requirement = match metadata.get("sema_version_req") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::String(requirement)) => {
+            let requirement = requirement.trim();
+            (!requirement.is_empty()).then_some(requirement)
+        }
+        Some(_) => {
+            return Err(format!(
+                "Registry metadata for {package}@{version} has invalid sema_version_req: \
+                 expected a string"
+            ))
+        }
+    };
+    let Some(requirement) = requirement else {
+        return Ok(None);
+    };
+    if requirement.len() > 128 {
+        return Err(format!(
+            "Registry metadata for {package}@{version} has invalid sema_version_req: \
+             must be at most 128 characters"
+        ));
+    }
+    let parsed = semver::VersionReq::parse(requirement).map_err(|error| {
+        format!(
+            "Registry metadata for {package}@{version} has invalid sema_version_req \
+             {requirement:?}: {error}"
+        )
+    })?;
+    let current = current_sema_version();
+    if !parsed.matches(&current) {
+        return Err(format!(
+            "{package}@{version} requires Sema {requirement}, but this is Sema {current}"
+        ));
+    }
+    Ok(Some(requirement.to_string()))
+}
+
+fn validate_registry_version(
+    package: &str,
+    version: &str,
+    registry_url: &str,
+) -> Result<Option<String>, String> {
+    let info = registry_package_info(package, registry_url)?;
+    let metadata = version_metadata(package, version, &info)?;
+    ensure_version_supports_sema(package, version, metadata)
+}
+
+/// Select the latest non-yanked version compatible with this Sema release.
+fn latest_compatible_version(
+    package: &str,
+    info: &serde_json::Value,
+) -> Result<Option<String>, String> {
+    let Some(versions) = info.get("versions").and_then(serde_json::Value::as_array) else {
+        return Ok(None);
+    };
+    let mut invalid_requirement = None;
+    for metadata in versions.iter().filter(|version| {
+        !version
+            .get("yanked")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+    }) {
+        let Some(version) = metadata.get("version").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        match ensure_version_supports_sema(package, version, metadata) {
+            Ok(_) => return Ok(Some(version.to_string())),
+            Err(error) if error.contains("invalid sema_version_req") => {
+                invalid_requirement.get_or_insert(error);
+            }
+            Err(_) => {}
+        }
+    }
+    if let Some(error) = invalid_requirement {
+        return Err(error);
+    }
+    Ok(None)
 }
 
 fn validate_version(version: &str) -> Result<semver::Version, String> {
@@ -1702,6 +1894,26 @@ pub fn cmd_publish(registry: Option<&str>) -> Result<(), String> {
         .ok_or("sema.toml [package] missing 'version'")?;
 
     validate_version(version)?;
+    let sema_version_req = pkg
+        .get("sema_version_req")
+        .map(|value| {
+            value
+                .as_str()
+                .ok_or("sema.toml [package].sema_version_req must be a string")
+        })
+        .transpose()?
+        .map(str::trim)
+        .filter(|requirement| !requirement.is_empty());
+    if let Some(requirement) = sema_version_req {
+        if requirement.len() > 128 {
+            return Err(
+                "Invalid sema_version_req in sema.toml: must be at most 128 characters".to_string(),
+            );
+        }
+        semver::VersionReq::parse(requirement).map_err(|error| {
+            format!("Invalid sema_version_req {requirement:?} in sema.toml: {error}")
+        })?;
+    }
 
     let token = read_token().ok_or("Not logged in. Run `sema pkg login --token <token>` first.")?;
     let registry_url = effective_registry(registry);
@@ -1716,7 +1928,7 @@ pub fn cmd_publish(registry: Option<&str>) -> Result<(), String> {
     let metadata = serde_json::json!({
         "description": pkg.get("description").and_then(|v| v.as_str()).unwrap_or(""),
         "repository_url": pkg.get("repository").and_then(|v| v.as_str()),
-        "sema_version_req": pkg.get("sema_version_req").and_then(|v| v.as_str()),
+        "sema_version_req": sema_version_req,
     });
 
     // Upload. The multipart Form is single-use, so rebuild it (from owned bytes)
@@ -2156,6 +2368,155 @@ mod tests {
     use serial_test::serial;
     use std::fs;
     use std::io::Write;
+
+    #[test]
+    fn registry_version_selection_skips_incompatible_releases() {
+        let current = current_sema_version();
+        let incompatible = format!(">{}.0.0", current.major + 1);
+        let compatible = format!(">={}.0.0", current.major);
+        let info = serde_json::json!({
+            "versions": [
+                {
+                    "version": "2.0.0",
+                    "yanked": false,
+                    "sema_version_req": incompatible
+                },
+                {
+                    "version": "1.0.0",
+                    "yanked": false,
+                    "sema_version_req": compatible
+                }
+            ]
+        });
+        assert_eq!(
+            latest_compatible_version("policies", &info).unwrap(),
+            Some("1.0.0".to_string())
+        );
+    }
+
+    #[test]
+    fn explicit_registry_versions_fail_closed_on_invalid_requirements() {
+        let info = serde_json::json!({
+            "versions": [{
+                "version": "1.0.0",
+                "yanked": false,
+                "sema_version_req": "definitely not semver"
+            }]
+        });
+        let metadata = version_metadata("policies", "1.0.0", &info).unwrap();
+        let error = ensure_version_supports_sema("policies", "1.0.0", metadata).unwrap_err();
+        assert!(error.contains("invalid sema_version_req"));
+    }
+
+    #[test]
+    fn explicit_registry_versions_fail_closed_on_non_string_requirements() {
+        let info = serde_json::json!({
+            "versions": [{
+                "version": "1.0.0",
+                "yanked": false,
+                "sema_version_req": 34
+            }]
+        });
+        let metadata = version_metadata("policies", "1.0.0", &info).unwrap();
+        let error = ensure_version_supports_sema("policies", "1.0.0", metadata).unwrap_err();
+        assert!(error.contains("invalid sema_version_req"));
+        assert!(error.contains("expected a string"));
+    }
+
+    #[test]
+    fn explicit_registry_versions_reject_incompatible_requirements() {
+        let current = current_sema_version();
+        let incompatible = format!(">{}.0.0", current.major + 1);
+        let info = serde_json::json!({
+            "versions": [{
+                "version": "1.0.0",
+                "yanked": false,
+                "sema_version_req": incompatible
+            }]
+        });
+        let metadata = version_metadata("policies", "1.0.0", &info).unwrap();
+        let error = ensure_version_supports_sema("policies", "1.0.0", metadata).unwrap_err();
+        assert!(error.contains("requires Sema"));
+        assert!(error.contains(&current.to_string()));
+    }
+
+    #[test]
+    fn installed_manifests_fail_closed_on_invalid_or_incompatible_requirements() {
+        let dir = tmpdir("manifest-sema-version");
+        let current = current_sema_version();
+        let incompatible = format!(">{}.0.0", current.major + 1);
+
+        fs::write(
+            dir.join("sema.toml"),
+            "[package]\nname = \"policies\"\nsema_version_req = \"not semver\"\n",
+        )
+        .unwrap();
+        let invalid = validate_package_manifest_sema(&dir, "policies").unwrap_err();
+        assert!(invalid.contains("invalid sema_version_req"));
+
+        fs::write(
+            dir.join("sema.toml"),
+            "[package]\nname = \"policies\"\nsema_version_req = 34\n",
+        )
+        .unwrap();
+        let wrong_type = validate_package_manifest_sema(&dir, "policies").unwrap_err();
+        assert!(wrong_type.contains("must be a string"));
+
+        fs::write(
+            dir.join("sema.toml"),
+            format!("[package]\nname = \"policies\"\nsema_version_req = \"{incompatible}\"\n"),
+        )
+        .unwrap();
+        let incompatible = validate_package_manifest_sema(&dir, "policies").unwrap_err();
+        assert!(incompatible.contains("requires Sema"));
+        assert!(incompatible.contains(&current.to_string()));
+
+        fs::write(
+            dir.join("sema.toml"),
+            format!(
+                "[package]\nname = \"policies\"\nsema_version_req = \">={}.0.0\"\n",
+                current.major
+            ),
+        )
+        .unwrap();
+        validate_package_manifest_sema(&dir, "policies").unwrap();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn git_refs_are_validated_before_checkout() {
+        let dir = tmpdir("git-sema-version");
+        run_git(Some(&dir), &["init"]).unwrap();
+        run_git(Some(&dir), &["config", "user.email", "test@test.com"]).unwrap();
+        run_git(Some(&dir), &["config", "user.name", "Test"]).unwrap();
+        run_git(Some(&dir), &["checkout", "-b", "main"]).unwrap();
+        fs::write(
+            dir.join("sema.toml"),
+            "[package]\nname = \"policies\"\nsema_version_req = \"*\"\n",
+        )
+        .unwrap();
+        run_git(Some(&dir), &["add", "sema.toml"]).unwrap();
+        run_git(Some(&dir), &["commit", "-m", "compatible"]).unwrap();
+        run_git(Some(&dir), &["checkout", "-b", "incompatible"]).unwrap();
+        let current = current_sema_version();
+        fs::write(
+            dir.join("sema.toml"),
+            format!(
+                "[package]\nname = \"policies\"\nsema_version_req = \">{}.0.0\"\n",
+                current.major + 1
+            ),
+        )
+        .unwrap();
+        run_git(Some(&dir), &["add", "sema.toml"]).unwrap();
+        run_git(Some(&dir), &["commit", "-m", "incompatible"]).unwrap();
+        run_git(Some(&dir), &["checkout", "main"]).unwrap();
+
+        let error = validate_git_ref_manifest(&dir, "incompatible", "policies").unwrap_err();
+        assert!(error.contains("requires Sema"));
+        assert_eq!(current_git_ref(&dir), "main");
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn registry_install_rejects_path_traversal_name() {

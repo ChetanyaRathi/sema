@@ -520,22 +520,7 @@ where
     let captured = buf.lock().map(|b| b.clone()).unwrap_or_default();
 
     match result {
-        // Keep structured hint/note: Display on WithContext is "{inner}" only,
-        // so plain "{e}" silently drops the VM's did-you-mean suggestions that
-        // the CLI prints — exactly the guidance an MCP client needs most.
-        Ok(r) => (
-            r.map_err(|e| {
-                let mut message = e.to_string();
-                if let Some(hint) = e.hint() {
-                    message.push_str(&format!("\nhint: {hint}"));
-                }
-                if let Some(note) = e.note() {
-                    message.push_str(&format!("\nnote: {note}"));
-                }
-                message
-            }),
-            captured,
-        ),
+        Ok(r) => (r.map_err(|e| e.format_plain()), captured),
         Err(panic) => std::panic::resume_unwind(panic),
     }
 }
@@ -977,12 +962,14 @@ fn call_mcp_tool_inner(
                 Interpreter::new_with_sandbox(&sema_core::Sandbox::allow_all());
             let result = match compile_interpreter.compile_to_bytecode(&source) {
                 Ok(r) => r,
-                Err(e) => return error_result(format!("Compile error: {}", e.inner())),
+                Err(e) => return error_result(format!("compilation failed: {}", e.format_plain())),
             };
 
             let bytes = match sema_vm::serialize_to_bytes(&result, source_hash) {
                 Ok(b) => b,
-                Err(e) => return error_result(format!("Serialization error: {}", e.inner())),
+                Err(e) => {
+                    return error_result(format!("serialization failed: {}", e.format_plain()))
+                }
             };
 
             let out_path = match output_path {
@@ -1126,7 +1113,12 @@ fn call_mcp_tool_inner(
             let compile_result = if sema_vm::is_bytecode_file(&bytes) {
                 match sema_vm::deserialize_from_bytes(&bytes) {
                     Ok(r) => r,
-                    Err(e) => return error_result(format!("Deserialization error: {}", e.inner())),
+                    Err(e) => {
+                        return error_result(format!(
+                            "deserialization failed: {}",
+                            e.format_plain()
+                        ))
+                    }
                 }
             } else {
                 let source = match std::str::from_utf8(&bytes) {
@@ -1137,7 +1129,9 @@ fn call_mcp_tool_inner(
                     Interpreter::new_with_sandbox(&sema_core::Sandbox::allow_all());
                 match compile_interpreter.compile_to_bytecode(source) {
                     Ok(r) => r,
-                    Err(e) => return error_result(format!("Compile error: {}", e.inner())),
+                    Err(e) => {
+                        return error_result(format!("compilation failed: {}", e.format_plain()))
+                    }
                 }
             };
 

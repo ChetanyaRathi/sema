@@ -214,11 +214,52 @@ eval_tests! {
     // A handler that suspends parks on the runtime and resumes; the raw value
     // (a keyword, which has no JSON form) passes through unstringified.
     tool_invoke_suspending_handler: r#"(begin (deftool slow "Sleep then return" {} (lambda () (async/sleep 1) :done)) (tool/invoke slow {}))"# => Value::keyword("done"),
+    string_split_type_condition_fields:
+        r#"(try (string/split 42 ",") (catch error (list (:type error) (:function error) (:argument error) (:expected error) (:got error))))"#
+        => Value::list(vec![
+            Value::keyword("type-error"),
+            Value::string("string/split"),
+            Value::int(1),
+            Value::string("string"),
+            Value::string("int"),
+        ]),
+    string_split_arity_condition_fields:
+        r#"(try (string/split "x") (catch error (list (:type error) (:function error) (:expected error) (:got error))))"#
+        => Value::list(vec![
+            Value::keyword("arity"),
+            Value::string("string/split"),
+            Value::string("2"),
+            Value::int(1),
+        ]),
 }
 
 eval_error_tests! {
     tool_invoke_invalid_args: r#"(begin (deftool calc "Add" {:x {:type :number}} (lambda (x) x)) (tool/invoke calc {}))"# => "invalid arguments for tool 'calc': missing key: x",
     tool_invoke_validate_fail: r#"(begin (deftool check "Check" {:x {:type :number :validate (lambda (v) (> v 0)) :message "must be positive"}} (lambda (x) x)) (tool/invoke check {:x -1}))"# => "invalid arguments for tool 'check': key x: must be positive",
+    deftool_options_type_has_context:
+        r#"(deftool bad "Bad" {} 42 (lambda () nil))"#
+        => "deftool: options must be a map, got int",
+    deftool_subjects_type_has_context:
+        r#"(deftool bad "Bad" {} {:policy-subjects 42} (lambda () nil))"#
+        => "deftool: :policy-subjects must be a list or vector, got int",
+    deftool_subject_missing_kind:
+        r#"(deftool bad "Bad" {} {:policy-subjects [{}]} (lambda () nil))"#
+        => "deftool: policy subject 1 is missing :kind",
+    deftool_subject_field_type_and_index:
+        r#"(deftool bad "Bad" {} {:policy-subjects [{:kind :command :command-arg :cmd} {:kind :file-read :path-arg 42}]} (lambda () nil))"#
+        => "deftool: policy subject 2 :path-arg must be a keyword or string, got int",
+    deftool_subject_kind_lists_valid_values:
+        r#"(deftool bad "Bad" {} {:policy-subjects [{:kind :database :target-arg :db}]} (lambda () nil))"#
+        => "deftool: policy subject 1 has unsupported :kind :database",
+    deftool_subject_unknown_key:
+        r#"(deftool bad "Bad" {} {:policy-subjects [{:kind :file-read :path-ag :path}]} (lambda () nil))"#
+        => "deftool: policy subject 1 has unknown key :path-ag",
+    string_split_type_names_function_and_argument:
+        r#"(string/split 42 ",")"#
+        => "string/split argument 1 expected string, got int",
+    string_split_arity_uses_readable_grammar:
+        r#"(string/split "x")"#
+        => "string/split expects 2 arguments, got 1",
 }
 
 // ============================================================

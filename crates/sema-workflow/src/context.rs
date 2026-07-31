@@ -134,6 +134,8 @@ pub struct WorkflowCtx {
     state: Rc<RefCell<BTreeMap<String, Value>>>,
     /// Monotonic event sequence counter (0-based; first `next_seq()` returns 0).
     seq: Cell<u64>,
+    /// Bounded completion ledger keyed only by the frozen event vocabulary.
+    event_counts: RefCell<BTreeMap<&'static str, u64>>,
     /// Wall-clock origin for `dur_ms`. Ignored when the fixed-ts seam is active.
     start: Instant,
     /// Parsed spend caps (absent ⇒ that dimension is unenforced). `usd` is best-effort
@@ -238,6 +240,7 @@ impl WorkflowCtx {
             journal: Rc::new(RefCell::new(journal)),
             state: Rc::new(RefCell::new(BTreeMap::new())),
             seq: Cell::new(0),
+            event_counts: RefCell::new(BTreeMap::new()),
             start: Instant::now(),
             cost_limit,
             token_limit,
@@ -334,7 +337,18 @@ impl WorkflowCtx {
     /// Append one event to the journal. Write errors are swallowed by the journal
     /// (same trust model as the OTel file exporter); journaling never aborts the run.
     pub fn emit(&self, event: WorkflowEvent) {
+        let kind = event.kind();
+        let mut counts = self.event_counts.borrow_mut();
+        *counts.entry(kind).or_insert(0) += 1;
+        drop(counts);
         self.journal.borrow().write(&event);
+    }
+
+    pub fn has_event(&self, kind: &str) -> bool {
+        self.event_counts
+            .borrow()
+            .get(kind)
+            .is_some_and(|count| *count > 0)
     }
 
     /// True under the fixed-timestamp test seam (`SEMA_WORKFLOW_FIXED_TS`). Callers

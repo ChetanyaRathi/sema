@@ -5786,14 +5786,28 @@ fn error_to_value(err: &SemaError) -> Value {
             map.insert(Value::keyword("type"), Value::keyword("eval"));
             map.insert(Value::keyword("message"), Value::string(msg));
         }
-        SemaError::Type { expected, got, .. } => {
+        SemaError::Type {
+            context,
+            expected,
+            got,
+            got_value,
+        } => {
             map.insert(Value::keyword("type"), Value::keyword("type-error"));
             map.insert(
                 Value::keyword("message"),
-                Value::string(&format!("expected {expected}, got {got}")),
+                Value::string(&inner.user_message()),
             );
             map.insert(Value::keyword("expected"), Value::string(expected));
             map.insert(Value::keyword("got"), Value::string(got));
+            if let Some(context) = context {
+                map.insert(Value::keyword("function"), Value::string(&context.function));
+                if let Some(argument) = context.argument {
+                    map.insert(Value::keyword("argument"), Value::int(argument as i64));
+                }
+            }
+            if let Some(got_value) = got_value {
+                map.insert(Value::keyword("value"), Value::string(got_value));
+            }
         }
         SemaError::Arity {
             name,
@@ -5803,8 +5817,11 @@ fn error_to_value(err: &SemaError) -> Value {
             map.insert(Value::keyword("type"), Value::keyword("arity"));
             map.insert(
                 Value::keyword("message"),
-                Value::string(&format!("{name} expects {expected} args, got {got}")),
+                Value::string(&inner.user_message()),
             );
+            map.insert(Value::keyword("function"), Value::string(name));
+            map.insert(Value::keyword("expected"), Value::string(expected));
+            map.insert(Value::keyword("got"), Value::int(*got as i64));
         }
         SemaError::Unbound(name) => {
             map.insert(Value::keyword("type"), Value::keyword("unbound"));
@@ -5859,19 +5876,28 @@ fn error_to_value(err: &SemaError) -> Value {
             map.insert(Value::keyword("function"), Value::string(function));
             map.insert(Value::keyword("path"), Value::string(path));
         }
-        SemaError::PolicyDenied {
-            boundary,
-            subject,
-            rule,
-        } => {
+        SemaError::PolicyDenied(denial) => {
             map.insert(Value::keyword("type"), Value::keyword("policy-denied"));
             map.insert(
                 Value::keyword("message"),
-                Value::string(&format!("Policy denied {boundary} '{subject}' ({rule})")),
+                Value::string(&denial.to_string()),
             );
-            map.insert(Value::keyword("boundary"), Value::string(boundary));
-            map.insert(Value::keyword("subject"), Value::string(subject));
-            map.insert(Value::keyword("rule"), Value::string(rule));
+            if let Some(policy) = &denial.policy {
+                map.insert(Value::keyword("policy"), Value::string(policy));
+            }
+            map.insert(Value::keyword("boundary"), Value::string(&denial.boundary));
+            map.insert(Value::keyword("subject"), Value::string(&denial.subject));
+            map.insert(Value::keyword("rule"), Value::string(&denial.rule));
+            map.insert(Value::keyword("reason"), Value::string(&denial.reason));
+            map.insert(Value::keyword("action"), Value::keyword(&denial.action));
+            map.insert(Value::keyword("source"), Value::keyword(&denial.source));
+        }
+        SemaError::Internal(message) => {
+            map.insert(Value::keyword("type"), Value::keyword("internal"));
+            map.insert(
+                Value::keyword("message"),
+                Value::string(&format!("Internal error: {message}")),
+            );
         }
         SemaError::WithTrace { .. } | SemaError::WithContext { .. } => {
             unreachable!("inner() already unwraps these")

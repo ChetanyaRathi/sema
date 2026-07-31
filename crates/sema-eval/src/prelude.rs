@@ -461,10 +461,15 @@ pub const PRELUDE: &str = r#"
                                                  (keys s#)))
                                           #t)))
                    ;; the `:on-tool-call` shim — journals each genuine tool call as an
-                   ;; agent.tool_call event. Shared by the `:agent` and `:tools` branches.
+                   ;; agent.tool_call event and each successful completion as
+                   ;; agent.tool_result. Shared by the `:agent` and `:tools` branches.
                    (st-on-tool# (fn (ev#)
-                                  (when (= (:event ev#) "start")
-                                    (workflow/tool-call (:tool ev#) (:args ev#))))))
+                                  (cond
+                                    ((= (:event ev#) "start")
+                                     (workflow/tool-call (:tool ev#) (:args ev#)))
+                                    ((and (= (:event ev#) "end")
+                                          (not (:error ev#)))
+                                     (workflow/tool-result (:tool ev#)))))))
                ;; validate the final text against `:schema` (no-op text passthrough when
                ;; no schema). Shared by the `:agent` and `:tools` branches.
                (let ((st-validate# (fn (txt# sch#)

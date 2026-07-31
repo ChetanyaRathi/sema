@@ -30,4 +30,21 @@ Attach a policy with workflow or step `:policy`. Active workflow and step
 policies compose with logical AND. `:permissions` and the CLI sandbox remain the
 outer capability limit.
 
+Policy denials raise a `:policy-denied` condition. The condition contains
+`:message`, `:policy`, `:boundary`, `:subject`, `:rule`, `:reason`, `:action`,
+and `:source`. This lets a `catch` handler use the exact deciding policy layer:
+
+```sema
+(try
+  (llm/complete "Review this change.")
+  (catch denial
+    {:policy (:policy denial)
+     :rule (:rule denial)
+     :reason (:reason denial)}))
+```
+
+Invalid policy maps identify the invalid field or one-based list entry. Unknown
+keys suggest a close valid key when possible. Invalid enum values list the
+accepted keywords.
+
 See also: `defworkflow`, `step`, `policy/without`, `workflow/check`.
