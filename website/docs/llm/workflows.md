@@ -211,6 +211,33 @@ sema workflow run release.sema \
   --approval-public-key-file .sema/approval.public
 ```
 
+The loopback workflow viewer can record the same signed decision. Give the
+private key only to the host process that serves the viewer:
+
+```bash
+# Inspect existing runs and enable controls for requests from this authority.
+sema workflow view \
+  --run-dir .sema/runs \
+  --approval-signing-key-file .sema/approval.private \
+  --approval-actor release-manager
+
+# Or start the viewer with the workflow. A signing key implies a durable pause
+# when the default mode is auto.
+sema workflow run release.sema \
+  --args '{"package":"sema-policies","version":"1.0.0"}' \
+  --view \
+  --approval-signing-key-file .sema/approval.private \
+  --approval-actor release-manager
+```
+
+The private key stays in the host viewer state. It is not placed in the Sema
+environment, returned by the API, or written to the run directory. The viewer
+shows validated request summaries. A pending request is inspect-only when the
+viewer has no signing key or its key does not match the request authority.
+After approve or reject, resume the same run with the exact original file,
+arguments, run directory, and authority. The viewer displays the durable winner
+when another process wins the compare-and-set race.
+
 | Mode | Behavior |
 |------|----------|
 | `auto` | Prompt on a real terminal outside CI; otherwise use `pause` behavior |
@@ -246,9 +273,8 @@ Sema `try`/`catch`, so later protected forms cannot run.
 ::: warning Platform support
 Durable approval storage and approval key generation currently fail closed on
 non-Unix platforms until Sema has a native private-directory ACL
-implementation. The workflow viewer is also read-only today: terminal and CLI
-commands can decide requests; web approve/reject controls are planned but are
-not part of this release.
+implementation. The workflow viewer remains available there, but approval
+requests are inspect-only because the store refuses unsafe writes.
 :::
 
 ### `parallel`
@@ -314,6 +340,7 @@ Old runs stay readable forever.
 | `agent.started` | `agent_id`, `agent_name`, `model` | An agent leaf began |
 | `agent.result` | `agent_id`, `status`, `output`, `dur_ms`, `model` | An agent leaf produced a result |
 | `agent.tool_call` | `agent_id`, `tool_name`, `args_json` | An agent invoked a tool |
+| `agent.tool_result` | `agent_id`, `tool_name` | An agent tool call completed successfully |
 | `policy.checked` | `policy`, `boundary`, `subject`, `rule`, `source` | A policy layer allowed a protected boundary |
 | `policy.violation` | `policy`, `boundary`, `subject`, `rule`, `action`, `source` | A policy layer denied a protected boundary |
 | `policy.bypassed` | `policy`, `boundary`, `subject`, `reason`, `source` | A lexical `policy/without` scope bypassed a protected boundary |
@@ -601,13 +628,20 @@ an ordinary library file never trips a workflow-only diagnostic.
 
 ## `sema workflow view`
 
-A read-only web viewer that renders the run journal as a live tree. Phases
-nest agents; budget events show per-leaf spend; checkpoints show their
-digests.
+A web viewer that renders the run journal as a live tree. Phases nest agents;
+budget events show per-leaf spend; checkpoints show their digests. It is
+read-only unless it starts with a private approval authority that matches a
+pending request.
 
 ```bash
 # Open the viewer for a run directory
 sema workflow view --run-dir .sema/runs --port 8899
+
+# Enable approve/reject controls for one authority
+sema workflow view \
+  --run-dir .sema/runs \
+  --approval-signing-key-file .sema/approval.private \
+  --approval-actor release-manager
 
 # Run a workflow and open the viewer simultaneously
 sema workflow run my-workflow.sema --view
@@ -616,9 +650,17 @@ sema workflow run my-workflow.sema --view
 sema workflow index --run-dir .sema/runs
 ```
 
-The viewer is loopback-only by default and has no auth — the same
-trusted-local-developer tool model as the notebook server. Binding a
-non-loopback host exposes the run directory to the network.
+The viewer is loopback-only by default. A viewer with an approval signing key
+refuses a non-loopback bind. Each process creates a random page token and
+requires it on every write request; this blocks blind cross-origin form posts,
+but it is not remote-user authentication. A viewer without a signing key can
+still bind elsewhere when the operator asks it to, which exposes run data and
+the existing MCP authorization controls to that network.
+
+Approve and reject forms use the same signed sidecar protocol and first-writer
+wins rule as the CLI commands. Actor, optional approval comment, and required
+rejection reason are stored in the signed decision. A successful decision does
+not run workflow code in the viewer; resume the same run to apply it.
 
 ## Macro cookbook
 
@@ -737,7 +779,7 @@ sema workflow run examples/workflows/content-pipeline.sema --view
 
 ```bash
 # Run a workflow file
-sema workflow run <file> [--args <json>] [--run-dir <dir>] [--view] [--port <n>] [--resume <run-id>] [--approval-mode auto|prompt|pause|deny] [--approval-public-key-file <file>]
+sema workflow run <file> [--args <json>] [--run-dir <dir>] [--view] [--port <n>] [--resume <run-id>] [--approval-mode auto|prompt|pause|deny] [--approval-public-key-file <file>] [--approval-signing-key-file <file>] [--approval-actor <name>]
 
 # Inspect or decide durable approval requests
 sema workflow approval-keygen --private-key-file <file> --public-key-file <file>
@@ -751,14 +793,15 @@ sema workflow check <file> [--strict] [--json]
 # Backfill the cross-run SQLite index
 sema workflow index [--run-dir <dir>]
 
-# Open the web viewer
-sema workflow view [--run-dir <dir>] [--host <addr>] [--port <n>]
+# Open the web viewer; signing-key and actor enable loopback decision controls
+sema workflow view [--run-dir <dir>] [--host <addr>] [--port <n>] [--approval-signing-key-file <file>] [--approval-actor <name>]
 ```
 
 ## Internal API
 
 The builtins that back the DSL are registered in `sema-stdlib/src/workflow.rs`.
-The macros (`defworkflow`, `phase`, `step`, `approval`) are in `sema-eval/src/prelude.rs`.
+The macros (`defworkflow`, `defpolicy`, `policy/without`, `phase`, `step`,
+`approval`) are in `sema-eval/src/prelude.rs`.
 The runtime crate (`sema-workflow`) is a leaf — it depends only on
 `sema-core` + `sema-otel` + serde, never on `sema-eval`.
 
@@ -768,5 +811,7 @@ The runtime crate (`sema-workflow`) is a leaf — it depends only on
 | `workflow/phase` | Marker — close the prior phase, open a new one |
 | `workflow/step` | Run a leaf as a journaled step (started/result + budget) |
 | `workflow/tool-call` | Journal a tool call by the current agent |
+| `workflow/tool-result` | Journal a successful tool result by the current agent |
 | `workflow/approval` | Create/read a durable approval request and decision |
+| `workflow/policy-without` | Run a trusted thunk with an audited policy bypass |
 | `checkpoint` | Record or read a keyed step value |

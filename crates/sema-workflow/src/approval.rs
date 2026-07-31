@@ -20,6 +20,12 @@ pub const APPROVAL_SCHEMA_VERSION: u32 = 2;
 const APPROVAL_SIDECAR_MAX_BYTES: u64 = 128 * 1024;
 const APPROVAL_TEXT_MAX_CHARS: usize = 1024;
 
+/// Whether this build can enforce the private-directory guarantees required
+/// before publishing durable approval sidecars.
+pub const fn durable_writes_supported() -> bool {
+    cfg!(unix)
+}
+
 /// Host-held Ed25519 authority used to sign immutable approval decisions. The private
 /// PKCS#8 bytes are deliberately opaque to Sema values and request sidecars.
 #[derive(Clone)]

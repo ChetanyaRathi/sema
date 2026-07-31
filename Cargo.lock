@@ -3578,6 +3578,7 @@ dependencies = [
  "toml",
  "toml_edit",
  "tungstenite 0.28.0",
+ "url",
  "windows-sys 0.61.2",
  "xz2",
  "zip",

@@ -29,7 +29,7 @@ use std::sync::{Arc, Mutex};
 use sema_mcp::oauth::loopback::BrowserOpener;
 use sema_stdlib::workflow_mcp::McpPersist;
 
-use super::{is_safe_segment, JsonResponse};
+use super::{is_safe_segment, ApprovalAuthority, JsonResponse};
 
 /// `(run_id, alias)` — a flow is scoped to one declared server within one run.
 pub(crate) type FlowKey = (String, String);
@@ -70,6 +70,7 @@ pub(crate) struct ServerState {
     /// single `Arc<ServerState>` each accepted connection clones.
     flows: Mutex<HashMap<FlowKey, FlowState>>,
     test_opener: Option<TestOpenerFn>,
+    pub(crate) approval_authority: Option<ApprovalAuthority>,
 }
 
 impl ServerState {
@@ -77,12 +78,14 @@ impl ServerState {
         run_dir: std::path::PathBuf,
         token: String,
         test_opener: Option<TestOpenerFn>,
+        approval_authority: Option<ApprovalAuthority>,
     ) -> Self {
         Self {
             run_dir,
             token,
             flows: Mutex::new(HashMap::new()),
             test_opener,
+            approval_authority,
         }
     }
 

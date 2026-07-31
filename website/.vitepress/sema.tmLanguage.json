@@ -141,7 +141,7 @@
         },
         {
           "comment": "defun/defmacro/defmulti/defmethod/defagent/deftool name",
-          "match": "(\\()\\s*(defun|defmacro|defmulti|defmethod|defagent|deftool|defn|defworkflow|define-record-type)\\s+([\\w!$%&*+\\-./:<=>?@^~][\\w!$%&*+\\-./:<=>?@^~0-9]*)",
+          "match": "(\\()\\s*(defun|defmacro|defmulti|defmethod|defagent|deftool|defn|defworkflow|defpolicy|define-record-type)\\s+([\\w!$%&*+\\-./:<=>?@^~][\\w!$%&*+\\-./:<=>?@^~0-9]*)",
           "captures": {
             "1": {
               "name": "punctuation.paren.open.sema"
@@ -172,7 +172,7 @@
       ]
     },
     "special-form": {
-      "match": "(?<=[\\s(\\[{])(?:define|async|await|defn|def|progn|dotimes|for-range|with-retry|with-session|with-span|with-stream|defworkflow|defun|lambda|fn|if|if-let|cond|case|when|when-let|unless|let\\*?|letrec|begin|do|while|and|or|set!|quote|quasiquote|unquote-splicing|unquote|define-record-type|defmacro|defmethod|defmulti|defagent|deftool|try|catch|throw|import|module|export|load|delay|force|eval|macroexpand|else|prompt|message|match\\*|match)(?=[\\s)\\]}]|$)",
+      "match": "(?<=[\\s(\\[{])(?:define|async|await|defn|def|progn|dotimes|for-range|with-retry|with-session|with-span|with-stream|defworkflow|defpolicy|defun|lambda|fn|if|if-let|cond|case|when|when-let|unless|let\\*?|letrec|begin|do|while|and|or|set!|quote|quasiquote|unquote-splicing|unquote|define-record-type|defmacro|defmethod|defmulti|defagent|deftool|try|catch|throw|import|module|export|load|delay|force|eval|macroexpand|else|prompt|message|match\\*|match)(?=[\\s)\\]}]|$)",
       "name": "keyword.control.sema"
     },
     "operator": {
@@ -387,7 +387,7 @@
         },
         {
           "comment": "Tool query functions",
-          "match": "(?<=[\\s(\\[{])(?:tool/name|tool/description|tool/parameters)(?=[\\s)\\]}]|$)",
+          "match": "(?<=[\\s(\\[{])(?:tool/name|tool/description|tool/parameters|tool/policy-subjects)(?=[\\s)\\]}]|$)",
           "name": "support.function.sema"
         },
         {
@@ -487,7 +487,7 @@
         },
         {
           "comment": "issue #12 grammar sweep: workflow builtins",
-          "match": "(?<=[\\s(\\[{])(?:settled/err\\?|settled/ok\\?|checkpoint|parallel|parallel-settled|phase|pipeline|pipeline-settled|settled-partition|step|workflow/check|workflow/checkpoint|workflow/phase|workflow/run|workflow/run-form|workflow/step|workflow/tool-call)(?=[\\s)\\]}]|$)",
+          "match": "(?<=[\\s(\\[{])(?:approval|settled/err\\?|settled/ok\\?|checkpoint|parallel|parallel-settled|phase|pipeline|pipeline-settled|policy/without|settled-partition|step|workflow/approval|workflow/check|workflow/checkpoint|workflow/phase|workflow/policy-without|workflow/run|workflow/run-form|workflow/step|workflow/tool-call|workflow/tool-result)(?=[\\s)\\]}]|$)",
           "name": "support.function.sema"
         },
         {

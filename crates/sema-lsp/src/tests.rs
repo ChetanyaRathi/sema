@@ -1618,6 +1618,20 @@ fn doc_symbols_deftool() {
     assert_eq!(symbols[0].kind, SymbolKind::METHOD);
 }
 
+#[test]
+fn doc_symbols_workflow_and_policy() {
+    let src =
+        "(defworkflow release \"Release\" {} #t)\n(defpolicy safe {:models {:default :deny}})";
+    let (ast, span_map, sym_spans) = sema_reader::read_many_with_symbol_spans(src).unwrap();
+    let lines: Vec<&str> = src.lines().collect();
+    let symbols = document_symbols_from_ast(&ast, &span_map, &sym_spans, &lines);
+    assert_eq!(symbols.len(), 2);
+    assert_eq!(symbols[0].name, "release");
+    assert_eq!(symbols[0].kind, SymbolKind::FUNCTION);
+    assert_eq!(symbols[1].name, "safe");
+    assert_eq!(symbols[1].kind, SymbolKind::VARIABLE);
+}
+
 // ── find_enclosing_call edge cases ───────────────────────────
 
 #[test]
@@ -1837,6 +1851,68 @@ fn semantic_token_start_column_is_utf16_after_astral_char() {
     assert!(
         absolute.contains(&(1, 11)),
         "token after 🎉 must start at UTF-16 column 11, got {absolute:?}"
+    );
+}
+
+#[test]
+fn workflow_approval_and_policy_forms_are_semantic_tokens() {
+    let src = "(defworkflow release \"Release\" {} (approval :ship {}))\n\
+               (defpolicy safe {})\n\
+               (policy/without \"test\" #t)\n\
+               (workflow/approval :ship {})\n\
+               (workflow/policy-without \"test\" (fn () #t))\n\
+               (workflow/tool-result \"publish\")\n\
+               (tool/policy-subjects publish)";
+    let (mut state, uri) = parsed_state("file:///workflow-semtok.sema", src);
+    state.builtin_names = BackendState::new().builtin_names;
+
+    for name in [
+        "approval",
+        "defpolicy",
+        "policy/without",
+        "tool/policy-subjects",
+        "workflow/approval",
+        "workflow/policy-without",
+        "workflow/tool-result",
+    ] {
+        assert!(
+            state.builtin_names.contains(name),
+            "missing LSP builtin {name}"
+        );
+    }
+
+    let result = state.handle_semantic_tokens_full(&uri).unwrap();
+    let SemanticTokensResult::Tokens(tokens) = result else {
+        panic!("expected token data");
+    };
+    assert!(
+        tokens
+            .data
+            .iter()
+            .filter(|token| token.token_type == crate::state::token_types::KEYWORD)
+            .count()
+            >= 2,
+        "defworkflow and defpolicy must be keyword tokens"
+    );
+    assert!(
+        tokens.data.iter().any(|token| {
+            token.token_type == crate::state::token_types::FUNCTION
+                && token.token_modifiers_bitset == 0
+        }),
+        "the workflow name must be a function token"
+    );
+    assert!(
+        tokens
+            .data
+            .iter()
+            .filter(|token| {
+                token.token_type == crate::state::token_types::FUNCTION
+                    && token.token_modifiers_bitset
+                        == crate::state::token_modifiers::DEFAULT_LIBRARY
+            })
+            .count()
+            >= 6,
+        "workflow and policy builtins must be default-library function tokens"
     );
 }
 

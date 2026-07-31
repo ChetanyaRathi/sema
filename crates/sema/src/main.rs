@@ -623,6 +623,15 @@ enum WorkflowCommands {
         /// this is omitted.
         #[arg(long)]
         approval_public_key_file: Option<String>,
+
+        /// Private approval authority exposed only to the loopback web viewer. Its
+        /// public key becomes the run authority; the private key never enters Sema.
+        #[arg(long, requires = "view")]
+        approval_signing_key_file: Option<String>,
+
+        /// Default actor recorded for decisions made in the web viewer.
+        #[arg(long, requires = "approval_signing_key_file")]
+        approval_actor: Option<String>,
     },
     /// List durable approval requests and decisions for one run.
     Approvals {
@@ -721,6 +730,15 @@ enum WorkflowCommands {
         /// Port to listen on.
         #[arg(short, long, default_value = "8899")]
         port: u16,
+
+        /// Private Ed25519 key enabling approve/reject controls. Approval-enabled
+        /// viewers are restricted to loopback hosts.
+        #[arg(long)]
+        approval_signing_key_file: Option<String>,
+
+        /// Default actor recorded for decisions made in the web viewer.
+        #[arg(long, requires = "approval_signing_key_file")]
+        approval_actor: Option<String>,
     },
     /// Statically validate a workflow `.sema` file WITHOUT evaluating it or calling any LLM
     /// — catches arity traps, bad step opts, and layout issues before a run.
@@ -991,6 +1009,7 @@ mod ctrlc_tests {
             "/tmp/work flow.sema",
             r#"{"target":"a b"}"#,
             Some("/tmp/key file.public"),
+            None,
         );
         assert!(rendered.contains("--signing-key-file \"$SEMA_APPROVAL_PRIVATE_KEY\""));
         assert!(!rendered.contains("<private-key-file>"));
@@ -2011,6 +2030,7 @@ fn format_needs_approval_guidance(
     file: &str,
     args: &str,
     public_key_file: Option<&str>,
+    signing_key_file: Option<&str>,
 ) -> String {
     let run_id = approval_envelope_field(envelope, "run-id").unwrap_or_default();
     let approval_id = approval_envelope_field(envelope, "approval-id").unwrap_or_default();
@@ -2023,7 +2043,16 @@ fn format_needs_approval_guidance(
         shell_quote(&approval_id),
         shell_quote(run_dir),
     );
-    if let Some(public_key_file) = public_key_file {
+    if let Some(signing_key_file) = signing_key_file {
+        out.push_str(&format!(
+            "or decide in the loopback viewer, then resume exactly:\n  sema workflow run {} --args {} --resume {} --run-dir {} --view --approval-signing-key-file {}\n",
+            shell_quote(file),
+            shell_quote(args),
+            shell_quote(&run_id),
+            shell_quote(run_dir),
+            shell_quote(signing_key_file),
+        ));
+    } else if let Some(public_key_file) = public_key_file {
         out.push_str(&format!(
             "then resume exactly:\n  sema workflow run {} --args {} --resume {} --run-dir {} --approval-public-key-file {}\n",
             shell_quote(file),
@@ -2054,6 +2083,8 @@ fn run_workflow_command(command: WorkflowCommands, sandbox: &sema_core::Sandbox)
         no_auth_prompt,
         approval_mode,
         approval_public_key_file,
+        approval_signing_key_file,
+        approval_actor,
     ) = match command {
         WorkflowCommands::Run {
             file,
@@ -2065,6 +2096,8 @@ fn run_workflow_command(command: WorkflowCommands, sandbox: &sema_core::Sandbox)
             no_auth_prompt,
             approval_mode,
             approval_public_key_file,
+            approval_signing_key_file,
+            approval_actor,
         } => (
             file,
             args,
@@ -2075,6 +2108,8 @@ fn run_workflow_command(command: WorkflowCommands, sandbox: &sema_core::Sandbox)
             no_auth_prompt,
             approval_mode,
             approval_public_key_file,
+            approval_signing_key_file,
+            approval_actor,
         ),
         WorkflowCommands::Approvals {
             run_id,
@@ -2152,12 +2187,34 @@ fn run_workflow_command(command: WorkflowCommands, sandbox: &sema_core::Sandbox)
             run_dir,
             host,
             port,
+            approval_signing_key_file,
+            approval_actor,
         } => {
+            let approval_authority = approval_signing_key_file
+                .as_deref()
+                .map(|path| {
+                    let signing_key = load_approval_signing_key(Path::new(path))?;
+                    workflow_view::ApprovalAuthority::new(
+                        signing_key,
+                        approval_actor.unwrap_or_else(default_approval_actor),
+                    )
+                    .map_err(|error| error.to_string())
+                })
+                .transpose()
+                .unwrap_or_else(|error| {
+                    print_cli_error(format!("cannot enable viewer approval controls: {error}"));
+                    std::process::exit(1);
+                });
             tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()
                 .expect("Failed to create tokio runtime")
-                .block_on(workflow_view::serve(PathBuf::from(run_dir), &host, port));
+                .block_on(workflow_view::serve_with_approval(
+                    PathBuf::from(run_dir),
+                    &host,
+                    port,
+                    approval_authority,
+                ));
             return;
         }
         WorkflowCommands::Index { run_dir } => {
@@ -2239,6 +2296,15 @@ fn run_workflow_command(command: WorkflowCommands, sandbox: &sema_core::Sandbox)
     });
     let file = file.to_string_lossy().to_string();
     let approval_public_key_file = approval_public_key_file.map(|value| {
+        let path = PathBuf::from(value);
+        let absolute = if path.is_absolute() {
+            path
+        } else {
+            workspace_root.join(path)
+        };
+        absolute.to_string_lossy().to_string()
+    });
+    let approval_signing_key_file = approval_signing_key_file.map(|value| {
         let path = PathBuf::from(value);
         let absolute = if path.is_absolute() {
             path
@@ -2337,37 +2403,6 @@ fn run_workflow_command(command: WorkflowCommands, sandbox: &sema_core::Sandbox)
         effective_sandbox = effective_sandbox.with_more_denied(declared.denied);
     }
 
-    // `--view`: start the live viewer on a background thread BEFORE the run, so the
-    // journal (written flush-per-event) is watchable in real time, and keep it up
-    // afterwards for inspection. A bind failure degrades to a warning (the run still
-    // proceeds). Best-effort open the browser.
-    if view {
-        let vd = run_dir.clone();
-        std::thread::spawn(move || {
-            tokio::runtime::Builder::new_multi_thread()
-                .enable_all()
-                .build()
-                .expect("Failed to create tokio runtime")
-                .block_on(async {
-                    if let Err(e) = workflow_view::serve_result(
-                        PathBuf::from(vd),
-                        "127.0.0.1",
-                        view_port,
-                        false,
-                    )
-                    .await
-                    {
-                        print_cli_warning(format!("--view could not start the viewer: {e}"));
-                    }
-                });
-        });
-        let url = format!("http://127.0.0.1:{view_port}");
-        println!("Live viewer: {url}");
-        open_in_browser(&url);
-        // Give the listener a moment to bind before the run starts producing events.
-        std::thread::sleep(std::time::Duration::from_millis(250));
-    }
-
     // Bind the parsed --args JSON object to the global `*workflow-args*` so the
     // workflow body can read its inputs.
     let args_value = match serde_json::from_str::<serde_json::Value>(&args) {
@@ -2398,30 +2433,21 @@ fn run_workflow_command(command: WorkflowCommands, sandbox: &sema_core::Sandbox)
             .ok()
             .as_deref()
             .is_none_or(str::is_empty);
-    let effective_approval_mode = match approval_mode {
-        ApprovalMode::Auto if interactive_approval => ApprovalMode::Prompt,
-        ApprovalMode::Auto => ApprovalMode::Pause,
-        mode => mode,
-    };
-    let inline_signing_key = if (effective_approval_mode == ApprovalMode::Prompt
-        && interactive_approval)
-        || effective_approval_mode == ApprovalMode::Deny
-    {
-        Some(
-            sema_workflow::approval::ApprovalSigningKey::generate().unwrap_or_else(|error| {
-                print_cli_error(format!("cannot generate interactive approval key: {error}"));
-                std::process::exit(1);
-            }),
-        )
-    } else {
-        None
-    };
-    let approval_public_key = if let Some(key) = &inline_signing_key {
+    let viewer_signing_key = approval_signing_key_file
+        .as_deref()
+        .map(|path| load_approval_signing_key(Path::new(path)))
+        .transpose()
+        .unwrap_or_else(|error| {
+            print_cli_error(format!("cannot enable viewer approval controls: {error}"));
+            std::process::exit(1);
+        });
+    let viewer_public_key = viewer_signing_key.as_ref().map(|key| {
         key.public_key_base64().unwrap_or_else(|error| {
-            print_cli_error(format!("cannot derive interactive approval key: {error}"));
+            print_cli_error(format!("cannot derive viewer approval key: {error}"));
             std::process::exit(1);
         })
-    } else if let Some(path) = &approval_public_key_file {
+    });
+    let configured_public_key = approval_public_key_file.as_deref().map(|path| {
         let encoded = read_approval_key_file(Path::new(path), false).unwrap_or_else(|error| {
             print_cli_error(error);
             std::process::exit(1);
@@ -2430,16 +2456,100 @@ fn run_workflow_command(command: WorkflowCommands, sandbox: &sema_core::Sandbox)
             print_cli_error(format!("invalid approval public key: {error}"));
             std::process::exit(1);
         })
+    });
+    if viewer_public_key
+        .as_ref()
+        .zip(configured_public_key.as_ref())
+        .is_some_and(|(viewer, configured)| viewer != configured)
+    {
+        print_cli_error("--approval-signing-key-file does not match --approval-public-key-file");
+        std::process::exit(1);
+    }
+    let effective_approval_mode = match approval_mode {
+        ApprovalMode::Auto if viewer_signing_key.is_some() => ApprovalMode::Pause,
+        ApprovalMode::Auto if interactive_approval => ApprovalMode::Prompt,
+        ApprovalMode::Auto => ApprovalMode::Pause,
+        mode => mode,
+    };
+    let inline_signing_key = if (effective_approval_mode == ApprovalMode::Prompt
+        && interactive_approval)
+        || effective_approval_mode == ApprovalMode::Deny
+    {
+        Some(viewer_signing_key.clone().unwrap_or_else(|| {
+            sema_workflow::approval::ApprovalSigningKey::generate().unwrap_or_else(|error| {
+                print_cli_error(format!("cannot generate interactive approval key: {error}"));
+                std::process::exit(1);
+            })
+        }))
+    } else {
+        None
+    };
+    let approval_public_key = if let Some(key) = &inline_signing_key {
+        key.public_key_base64().unwrap_or_else(|error| {
+            print_cli_error(format!("cannot derive interactive approval key: {error}"));
+            std::process::exit(1);
+        })
+    } else if let Some(key) = &viewer_public_key {
+        key.clone()
+    } else if let Some(key) = &configured_public_key {
+        key.clone()
     } else {
         String::new()
     };
-    // A terminal prompt uses an ephemeral private authority held only by this process,
-    // even if a public-key file was also supplied. If the operator leaves that request
-    // pending it cannot be resumed with the unrelated file authority.
-    let resumable_public_key_file = inline_signing_key
+    // An in-memory prompt authority is ephemeral unless it came from the explicit
+    // viewer key file. Guidance only promises a resumable authority when the operator
+    // supplied one of those durable files.
+    let resumable_public_key_file = viewer_signing_key
         .is_none()
         .then_some(approval_public_key_file.as_deref())
         .flatten();
+    let resumable_signing_key_file = viewer_signing_key
+        .is_some()
+        .then_some(approval_signing_key_file.as_deref())
+        .flatten();
+
+    // Start the live viewer after loading the host-only signing authority but before
+    // evaluation, so the browser can observe the flush-per-event journal immediately.
+    // The key remains in server state and is never installed in the interpreter.
+    if view {
+        let vd = run_dir.clone();
+        let viewer_authority = viewer_signing_key.clone().map(|signing_key| {
+            workflow_view::ApprovalAuthority::new(
+                signing_key,
+                approval_actor
+                    .clone()
+                    .unwrap_or_else(default_approval_actor),
+            )
+            .unwrap_or_else(|error| {
+                print_cli_error(format!("cannot enable viewer approval controls: {error}"));
+                std::process::exit(1);
+            })
+        });
+        std::thread::spawn(move || {
+            tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .expect("Failed to create tokio runtime")
+                .block_on(async {
+                    if let Err(error) = workflow_view::serve_result_with_approval(
+                        PathBuf::from(vd),
+                        "127.0.0.1",
+                        view_port,
+                        false,
+                        viewer_authority,
+                    )
+                    .await
+                    {
+                        print_cli_warning(format!("--view could not start the viewer: {error}"));
+                    }
+                });
+        });
+        let url = format!("http://127.0.0.1:{view_port}");
+        println!("Live viewer: {url}");
+        open_in_browser(&url);
+        // Give the listener a moment to bind before the run starts producing events.
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
     // Snapshot audit identity before evaluating untrusted workflow code. A workflow may
     // have env-write permission, but cannot rewrite the actor attached to a later host
     // terminal decision.
@@ -2535,6 +2645,7 @@ fn run_workflow_command(command: WorkflowCommands, sandbox: &sema_core::Sandbox)
                                 &file,
                                 &args,
                                 resumable_public_key_file,
+                                resumable_signing_key_file,
                             )
                         );
                         break 3;
@@ -2557,6 +2668,7 @@ fn run_workflow_command(command: WorkflowCommands, sandbox: &sema_core::Sandbox)
                                 &file,
                                 &args,
                                 resumable_public_key_file,
+                                resumable_signing_key_file,
                             )
                         );
                         break 3;
@@ -2611,6 +2723,7 @@ fn run_workflow_command(command: WorkflowCommands, sandbox: &sema_core::Sandbox)
                                         &file,
                                         &args,
                                         resumable_public_key_file,
+                                        resumable_signing_key_file,
                                     )
                                 );
                                 break 3;

@@ -5,7 +5,7 @@ use std::collections::HashSet;
 use tower_lsp::lsp_types::*;
 
 use crate::helpers::char_col_to_utf16;
-use crate::state::{token_modifiers, token_types, BackendState};
+use crate::state::{token_modifiers, token_types, BackendState, DEFINITION_HEADS};
 
 impl BackendState {
     pub(crate) fn handle_semantic_tokens_full(&self, uri: &Url) -> Option<SemanticTokensResult> {
@@ -15,6 +15,7 @@ impl BackendState {
         // Single pass: collect user-defined function and macro names
         let mut user_fn_names = HashSet::new();
         let mut user_macro_names = HashSet::new();
+        let mut workflow_names = HashSet::new();
         for expr in &cached.ast {
             if let Some(items) = expr.as_list() {
                 if items.len() >= 2 {
@@ -26,6 +27,9 @@ impl BackendState {
                                 }
                                 "defmacro" => {
                                     user_macro_names.insert(name);
+                                }
+                                "defworkflow" => {
+                                    workflow_names.insert(name);
                                 }
                                 "define" | "def" => {
                                     // (define (f x) ...) shorthand
@@ -54,10 +58,13 @@ impl BackendState {
 
         for (name, span) in &cached.symbol_spans {
             let (token_type, modifiers) = if sema_eval::SPECIAL_FORM_NAMES.contains(&name.as_str())
+                || DEFINITION_HEADS.contains(&name.as_str())
             {
                 (token_types::KEYWORD, 0u32)
             } else if user_macro_names.contains(name.as_str()) {
                 (token_types::MACRO, 0u32)
+            } else if workflow_names.contains(name.as_str()) {
+                (token_types::FUNCTION, 0u32)
             } else if self.builtin_names.contains(name.as_str()) {
                 (token_types::FUNCTION, token_modifiers::DEFAULT_LIBRARY)
             } else {

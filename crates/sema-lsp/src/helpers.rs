@@ -398,7 +398,7 @@ pub fn extract_symbol_at(line: &str, byte_offset: usize) -> &str {
 }
 
 /// Collect user-defined names with their spans from a pre-parsed AST.
-/// Returns (name, range) for each `define`/`defun`/`defn`/`defmacro`/`defagent`/`deftool`.
+/// Returns (name, range) for each top-level form that creates a reusable binding.
 /// When `symbol_spans` is provided, returns the precise span of just the name symbol;
 /// otherwise falls back to the span of the entire definition form.
 pub fn user_definitions_from_ast(
@@ -414,7 +414,7 @@ pub fn user_definitions_from_ast(
                 if let Some(head) = items[0].as_symbol() {
                     match head.as_str() {
                         "define" | "def" | "defun" | "defn" | "defmacro" | "defagent"
-                        | "deftool" => {
+                        | "deftool" | "defpolicy" => {
                             let form_span = expr_span(expr, span_map);
                             // (define name ...) or (defun name (...) ...)
                             if let Some(name) = items[1].as_symbol() {
@@ -1111,6 +1111,26 @@ pub fn document_symbols_from_ast(
                                 continue;
                             }
                         }
+                        "defworkflow" => {
+                            if let Some(name) = items[1].as_symbol() {
+                                let fs = expr_span(expr, span_map);
+                                let nr =
+                                    fs.and_then(|s| find_name_span(&name, s, symbol_spans, lines));
+                                (name, SymbolKind::FUNCTION, nr)
+                            } else {
+                                continue;
+                            }
+                        }
+                        "defpolicy" => {
+                            if let Some(name) = items[1].as_symbol() {
+                                let fs = expr_span(expr, span_map);
+                                let nr =
+                                    fs.and_then(|s| find_name_span(&name, s, symbol_spans, lines));
+                                (name, SymbolKind::VARIABLE, nr)
+                            } else {
+                                continue;
+                            }
+                        }
                         "define" | "def" => {
                             if let Some(name) = items[1].as_symbol() {
                                 let fs = expr_span(expr, span_map);
@@ -1164,7 +1184,7 @@ pub fn document_symbols_from_ast(
     symbols
 }
 
-/// Collect user-defined names from top-level `define`/`defun`/`defn`/`defmacro`/`defagent`/`deftool` forms.
+/// Collect reusable names from top-level definition forms.
 pub fn user_definitions(text: &str) -> Vec<String> {
     user_definitions_with_spans(text)
         .into_iter()

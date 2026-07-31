@@ -1,6 +1,6 @@
 # Durable human approval for workflows
 
-**Status:** Phase 1 implemented — 2026-07-31. Phases 2 and 3 are deferred.
+**Status:** Phases 1 and 2 implemented — 2026-07-31. Phase 3 is deferred.
 
 ## Goal
 
@@ -112,11 +112,16 @@ on resume. `approval.applied` records that execution crossed an approved gate.
 
 ### Phase 2 — web client
 
-- Project the approval events and sidecars into the workflow viewer.
-- Add pending approval details and approve/reject controls.
-- Require authenticated actor identity before non-loopback deployment.
-- Use the same compare-and-set decision API as the CLI; handle a lost race by
-  displaying the winning decision.
+- The viewer projects validated approval sidecars into request and decision
+  summaries without exposing keys, signatures, or code digests.
+- A matching host-held private key enables approve/reject controls. Missing or
+  mismatched authority keeps the request inspect-only.
+- Approval-enabled viewers refuse non-loopback binds. The existing per-process
+  page token is required on decision writes to block blind browser posts.
+- Decisions use the CLI compare-and-set protocol. A lost race displays the
+  durable winning decision.
+- The viewer records a decision only. The operator resumes the exact run to
+  apply it.
 
 ### Phase 3 — automatic policy/tool gates
 
@@ -140,5 +145,7 @@ deterministic workflow replay and memo protocol.
 - A gate placed inside `parallel`/`pipeline`/`async/spawn` is rejected before
   execution; place the gate before the concurrent work.
 - Two racing decisions produce exactly one durable winner.
+- CLI and loopback web decisions produce the same signed sidecar shape.
+- A viewer without the matching authority cannot decide a request.
 - A decision copied from another request, revision, or run is rejected.
 - `auto` never prompts in CI or without terminal input/output.

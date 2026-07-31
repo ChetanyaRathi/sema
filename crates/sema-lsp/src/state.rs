@@ -227,7 +227,15 @@ pub(crate) fn build_selection_range(mut ranges: Vec<Range>, pos: &Position) -> S
 
 /// Heads that introduce a top-level named definition.
 pub(crate) const DEFINITION_HEADS: &[&str] = &[
-    "define", "def", "defun", "defn", "defmacro", "defagent", "deftool",
+    "define",
+    "def",
+    "defun",
+    "defn",
+    "defmacro",
+    "defagent",
+    "deftool",
+    "defworkflow",
+    "defpolicy",
 ];
 
 /// If `expr` is a definition form, return its `(name, full-form range, name range)`.
