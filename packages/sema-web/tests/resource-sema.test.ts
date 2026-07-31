@@ -234,6 +234,6 @@ describeWithWasm("resource bindings under a real interpreter", () => {
     const screen = await boot('(def user (resource "user" (fn (previous) "/api/user")))');
     await screen.flush();
 
-    expect(screen.run("(:error @user)")).toMatch(/expects 1 args, got 0/);
+    expect(screen.run("(:error @user)")).toMatch(/expects 1 argument, got 0/);
   });
 });
