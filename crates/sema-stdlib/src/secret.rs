@@ -27,9 +27,9 @@
 use std::collections::BTreeMap;
 
 use sema_core::{check_arity, SemaError, Value};
-use sema_policy::content::{
-    detect_pii, detect_secrets, redact as redact_findings, Finding, INPUT_BYTE_CAP,
-};
+#[cfg(not(target_arch = "wasm32"))]
+use sema_policy::content::INPUT_BYTE_CAP;
+use sema_policy::content::{detect_pii, detect_secrets, redact as redact_findings, Finding};
 use sha2::{Digest, Sha256};
 
 use crate::register_fn;
