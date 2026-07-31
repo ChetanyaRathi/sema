@@ -220,19 +220,21 @@ impl Drop for PolicyAttributionScope {
     }
 }
 
-/// Install a compiled policy for the dynamic extent of a workflow or step.
-pub fn open_policy_scope(
-    policy: Rc<sema_policy::CompiledPolicy>,
+/// Install compiled policy layers atomically for the dynamic extent of a workflow or step.
+pub fn open_policy_scopes(
+    policies_to_add: Vec<Rc<sema_policy::CompiledPolicy>>,
     workspace_root: PathBuf,
     sink: PolicyDecisionSink,
 ) -> PolicyScope {
     let previous = ACTIVE_POLICIES.with(|policies| {
         let previous = policies.borrow().clone();
-        policies.borrow_mut().push(ActivePolicy {
-            policy,
-            workspace_root,
-            sink,
-        });
+        policies
+            .borrow_mut()
+            .extend(policies_to_add.into_iter().map(|policy| ActivePolicy {
+                policy,
+                workspace_root: workspace_root.clone(),
+                sink: sink.clone(),
+            }));
         previous
     });
     PolicyScope {

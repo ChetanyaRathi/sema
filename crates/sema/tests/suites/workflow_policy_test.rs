@@ -7,6 +7,7 @@
 use crate::workflow_common as wc;
 use crate::workflow_common::{run_workflow, temp_run_dir, RunOpts};
 
+use sema_eval::Interpreter;
 use sema_llm::fake::FakeProvider;
 use sema_llm::types::ToolCall;
 
@@ -460,6 +461,45 @@ fn step_policy_can_tighten_but_not_loosen_the_workflow_policy() {
             .any(|event| event["policy"] == "inline-policy"),
         "the step layer should deny the same boundary"
     );
+}
+
+#[test]
+fn workflow_policy_sequence_composes_without_loosening() {
+    let src = r#"
+        (defpolicy models
+          {:models {:default :deny :allow ["fake/fake-model"]}})
+        (defpolicy tools
+          {:tools {:default :deny}})
+        (defworkflow guarded "composed policy" {:policy [models tools]}
+          (phase "Run")
+          (llm/complete "hello"))
+    "#;
+
+    let out = wc::run_once(src, fake_with_reply("ok"), "wf_policy_sequence_composes");
+    assert_eq!(out.result["status"], "success");
+    assert!(out
+        .events
+        .iter()
+        .any(|event| event["event"] == "policy.checked" && event["policy"] == "models"));
+}
+
+#[test]
+fn workflow_policy_sequence_rejects_empty_and_nonmap_layers() {
+    for (suffix, policy) in [("empty", "[]"), ("nonmap", "[{:models {}} 42]")] {
+        let src = format!(
+            r#"
+                (defworkflow guarded "invalid composed policy" {{:policy {policy}}}
+                  :unreachable)
+            "#
+        );
+        let error = Interpreter::new()
+            .eval_str_compiled(&src)
+            .expect_err("invalid policy sequence");
+        assert!(
+            error.to_string().contains("invalid workflow policy"),
+            "{suffix}: {error}"
+        );
+    }
 }
 
 #[test]

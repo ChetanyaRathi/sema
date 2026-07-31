@@ -64,12 +64,40 @@ fn opt_value(v: &Value, key: &str) -> Option<Value> {
         .and_then(|m| m.get(&Value::keyword(key)).cloned())
 }
 
-fn compile_policy(container: &Value) -> Result<Option<Rc<sema_policy::CompiledPolicy>>, SemaError> {
+fn compile_policy(
+    container: &Value,
+) -> Result<Option<Vec<Rc<sema_policy::CompiledPolicy>>>, SemaError> {
     opt_value(container, "policy")
         .map(|policy| {
-            sema_policy::CompiledPolicy::compile(&policy)
-                .map(Rc::new)
-                .map_err(|error| SemaError::eval(format!("invalid workflow policy: {error}")))
+            let values = if policy.as_map_rc().is_some() {
+                vec![policy]
+            } else {
+                let policies = policy.as_seq().ok_or_else(|| {
+                    SemaError::eval(
+                        "invalid workflow policy: :policy must be a map or nonempty sequence of maps",
+                    )
+                })?;
+                if policies.is_empty() {
+                    return Err(SemaError::eval(
+                        "invalid workflow policy: :policy sequence must not be empty",
+                    ));
+                }
+                policies.to_vec()
+            };
+
+            values
+                .iter()
+                .enumerate()
+                .map(|(index, value)| {
+                    sema_policy::CompiledPolicy::compile(value)
+                        .map(Rc::new)
+                        .map_err(|error| {
+                            SemaError::eval(format!(
+                                "invalid workflow policy layer {index}: {error}"
+                            ))
+                        })
+                })
+                .collect()
         })
         .transpose()
 }
@@ -152,13 +180,13 @@ fn emit_policy_observation(ctx: &context::WorkflowCtx, observation: PolicyObserv
 }
 
 fn open_compiled_policy(
-    policy: Option<Rc<sema_policy::CompiledPolicy>>,
+    policies: Option<Vec<Rc<sema_policy::CompiledPolicy>>>,
     ctx: &Rc<context::WorkflowCtx>,
     workspace_root: &Path,
 ) -> Option<PolicyScope> {
-    policy.map(|policy| {
-        sema_llm::builtins::open_policy_scope(
-            policy,
+    policies.map(|policies| {
+        sema_llm::builtins::open_policy_scopes(
+            policies,
             workspace_root.to_path_buf(),
             policy_sink(ctx),
         )
@@ -1172,7 +1200,7 @@ fn apply_resolutions(
     thunk: Value,
     resolver: Rc<dyn WorkflowMcpResolver>,
     resolutions: Vec<ServerResolution>,
-    policy: Option<Rc<sema_policy::CompiledPolicy>>,
+    policy: Option<Vec<Rc<sema_policy::CompiledPolicy>>>,
     workspace_root: PathBuf,
 ) -> Result<ResolveGate, SemaError> {
     let ctx = context::current_for(task_context)
@@ -1307,7 +1335,7 @@ struct ResolveContinuation {
     guard: context::WorkflowGuard,
     thunk: Value,
     resolver: Rc<dyn WorkflowMcpResolver>,
-    policy: Option<Rc<sema_policy::CompiledPolicy>>,
+    policy: Option<Vec<Rc<sema_policy::CompiledPolicy>>>,
     workspace_root: PathBuf,
 }
 
