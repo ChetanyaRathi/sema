@@ -28,9 +28,14 @@ use sema_core::runtime::{
     ResumeInput, SendPayload, TaskContextHandle, Trace, WaitKind,
 };
 use sema_core::{SemaError, Value};
+use sema_llm::builtins::{
+    PolicyAttributionScope, PolicyBypassScope, PolicyDecisionSink, PolicyObservation,
+    PolicyObservationKind, PolicyScope,
+};
 use sema_workflow::context;
 use sema_workflow::event::WorkflowEvent;
 use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
@@ -52,6 +57,112 @@ fn opt_str(v: &Value, key: &str) -> String {
                 .and_then(|x| x.as_str().map(String::from))
         })
         .unwrap_or_default()
+}
+
+fn opt_value(v: &Value, key: &str) -> Option<Value> {
+    v.as_map_rc()
+        .and_then(|m| m.get(&Value::keyword(key)).cloned())
+}
+
+fn compile_policy(container: &Value) -> Result<Option<Rc<sema_policy::CompiledPolicy>>, SemaError> {
+    opt_value(container, "policy")
+        .map(|policy| {
+            sema_policy::CompiledPolicy::compile(&policy)
+                .map(Rc::new)
+                .map_err(|error| SemaError::eval(format!("invalid workflow policy: {error}")))
+        })
+        .transpose()
+}
+
+fn policy_sink(ctx: &Rc<context::WorkflowCtx>) -> PolicyDecisionSink {
+    let weak = Rc::downgrade(ctx);
+    Rc::new(move |observation| {
+        let Some(ctx) = weak.upgrade() else {
+            return;
+        };
+        emit_policy_observation(&ctx, observation);
+    })
+}
+
+fn emit_policy_observation(ctx: &context::WorkflowCtx, observation: PolicyObservation) {
+    let PolicyObservation {
+        kind,
+        policy,
+        policy_digest,
+        boundary,
+        subject,
+        subject_digest,
+        rule,
+        action,
+        reason,
+        source,
+        agent_id,
+    } = observation;
+    let seq = ctx.next_seq();
+    let ts = ctx.ts();
+    let phase_seq = ctx.phase_seq();
+    let boundary = boundary.as_str().to_string();
+    let source = source.as_str().to_string();
+
+    let event = match kind {
+        PolicyObservationKind::Checked => WorkflowEvent::PolicyChecked {
+            seq,
+            ts,
+            phase_seq,
+            agent_id,
+            policy,
+            policy_digest,
+            boundary,
+            subject,
+            subject_digest,
+            rule,
+            source,
+        },
+        PolicyObservationKind::Violation => WorkflowEvent::PolicyViolation {
+            seq,
+            ts,
+            phase_seq,
+            agent_id,
+            policy,
+            policy_digest,
+            boundary,
+            subject,
+            subject_digest,
+            rule,
+            action: action.unwrap_or_else(|| "fail".to_string()),
+            reason: reason.unwrap_or_else(|| "denied".to_string()),
+            source,
+        },
+        PolicyObservationKind::Bypassed => WorkflowEvent::PolicyBypassed {
+            seq,
+            ts,
+            phase_seq,
+            agent_id,
+            policy,
+            policy_digest,
+            boundary,
+            subject,
+            subject_digest,
+            rule,
+            reason: reason.unwrap_or_else(|| "unspecified".to_string()),
+            source,
+        },
+    };
+    ctx.emit(event);
+}
+
+fn open_compiled_policy(
+    policy: Option<Rc<sema_policy::CompiledPolicy>>,
+    ctx: &Rc<context::WorkflowCtx>,
+    workspace_root: &Path,
+) -> Option<PolicyScope> {
+    policy.map(|policy| {
+        sema_llm::builtins::open_policy_scope(
+            policy,
+            workspace_root.to_path_buf(),
+            policy_sink(ctx),
+        )
+    })
 }
 
 /// The workflow's declared phase plan from `defworkflow` meta `:phases` (a list or
@@ -93,18 +204,13 @@ fn cap_text(s: &str) -> String {
     }
 }
 
-/// Max bytes of a value's compact form the journal renders inline before truncating.
-/// Golden values are tiny (far below this), so [`capped_render`] returns `pretty_print`
-/// verbatim for them and the goldens stay byte-identical; only a pathologically large
-/// value is truncated — and it is NEVER materialized in full (the compact form is
-/// bounded-checked via `context::compact_capped`, which aborts at the cap).
+/// Maximum size of a compact journal value before truncation. The bounded
+/// renderer does not materialize an over-limit value in full.
 const RENDERED_VALUE_MAX_BYTES: usize = 8192;
 
 /// Render a value for the journal so the dashboard can show the real data, byte-budgeted
-/// so one huge value can't materialize a multi-MB string on the VM thread. A value that
-/// fits renders exactly as before (`pretty_print(v, 100)`) — keeping goldens
-/// byte-identical; an over-cap value is rendered from its bounded compact prefix + a
-/// truncation marker.
+/// so one huge value cannot materialize a multi-MB string on the VM thread. Small values
+/// use `pretty_print`; larger values use a bounded compact prefix and a truncation marker.
 fn capped_render(v: &Value) -> String {
     let (compact, truncated) = sema_workflow::context::compact_capped(v, RENDERED_VALUE_MAX_BYTES);
     if truncated {
@@ -413,6 +519,8 @@ struct StepTeardown {
     content_key: String,
     start: Instant,
     usage_scope: sema_llm::builtins::UsageScope,
+    _policy_scope: Option<PolicyScope>,
+    _attribution_scope: PolicyAttributionScope,
 }
 
 /// Journal a `workflow/step` leaf's result: emit `agent.result`, attribute usage via a
@@ -475,8 +583,49 @@ fn finish_step(
     result.map(NativeOutcome::Return)
 }
 
-/// Pre-thunk work for `workflow/step` — see the original inline documentation preserved
-/// in `finish_step` and the event emissions below.
+struct PolicyBypassTeardown {
+    _bypass_scope: PolicyBypassScope,
+}
+
+fn policy_bypass_plan(
+    task_context: Option<&TaskContextHandle>,
+    args: &[Value],
+) -> Result<ThunkPlan<PolicyBypassTeardown>, SemaError> {
+    if args.len() != 2 {
+        return Err(SemaError::arity("workflow/policy-without", "2", args.len()));
+    }
+    if context::current_for(task_context).is_none() || !sema_llm::builtins::policy_active() {
+        return Err(SemaError::eval(
+            "policy/without requires an active workflow policy",
+        ));
+    }
+    let reason = args[0]
+        .as_str()
+        .ok_or_else(|| SemaError::type_error("string", args[0].type_name()))?
+        .trim()
+        .to_string();
+    if reason.is_empty() || reason.chars().count() > 256 {
+        return Err(SemaError::eval(
+            "policy/without reason must contain 1 to 256 characters",
+        ));
+    }
+    Ok(ThunkPlan::Run {
+        thunk: args[1].clone(),
+        teardown: PolicyBypassTeardown {
+            _bypass_scope: sema_llm::builtins::open_policy_bypass(reason),
+        },
+    })
+}
+
+fn finish_policy_bypass(
+    _task_context: Option<&TaskContextHandle>,
+    _teardown: PolicyBypassTeardown,
+    result: Result<Value, SemaError>,
+    _durable: bool,
+) -> NativeResult {
+    result.map(NativeOutcome::Return)
+}
+
 fn step_plan(
     task_context: Option<&TaskContextHandle>,
     args: &[Value],
@@ -489,6 +638,11 @@ fn step_plan(
     let label = agent_role(&args[0]);
     let thunk = args[1].clone();
     let Some(ctx) = context::current_for(task_context) else {
+        if opt_value(&args[0], "policy").is_some() {
+            return Err(SemaError::eval(
+                "workflow/step: :policy requires an enclosing workflow/run",
+            ));
+        }
         // Outside a run: transparent — just call the thunk (still cooperatively, so an
         // async op inside it works), with no journaling teardown.
         return Ok(ThunkPlan::Run {
@@ -496,6 +650,10 @@ fn step_plan(
             teardown: None,
         });
     };
+    let step_policy = compile_policy(&args[0])?;
+    let workspace_root = std::env::current_dir()
+        .map_err(|error| SemaError::eval(format!("workflow/step: current directory: {error}")))?;
+    let policy_scope = open_compiled_policy(step_policy, &ctx, &workspace_root);
     // Resume short-circuit FIRST (before the budget latch): a memoized leaf replays for
     // FREE. This MUST precede the budget check: a replay makes no provider call, so a
     // tripped cap must not refuse it. The key is computed on EVERY leaf so its occurrence
@@ -513,6 +671,7 @@ fn step_plan(
         &opt_str(&args[0], "__schema-repr"),
         &label,
         &ctx.cur_phase_label(),
+        &sema_llm::builtins::effective_policy_fingerprint(),
     );
     if ctx.resuming() {
         if let Some(v) = ctx.memo_lookup(&content_key) {
@@ -525,6 +684,7 @@ fn step_plan(
     }
     // Unique per-invocation id (the dashboard correlates started→result→budget by it).
     let agent_id = ctx.next_agent_id(&label);
+    let attribution_scope = sema_llm::builtins::open_policy_attribution(agent_id.clone());
     ctx.emit(WorkflowEvent::AgentStarted {
         seq: ctx.next_seq(),
         ts: ctx.ts(),
@@ -550,6 +710,8 @@ fn step_plan(
             content_key,
             start,
             usage_scope,
+            _policy_scope: policy_scope,
+            _attribution_scope: attribution_scope,
         }),
     })
 }
@@ -621,16 +783,9 @@ fn finish_checkpoint(
     Ok(NativeOutcome::Return(value))
 }
 
-/// Post-thunk teardown state for `workflow/run`. Holds the scope guard (whose Drop
-/// removes the exact scope token, LAST — after `run.ended` + `result.json`) and, until
-/// closed exactly once, the resolver + open MCP handles (the handles are `Value`s —
-/// traced).
 struct RunTeardown {
-    // A pure RAII drop guard: never read by name (a type with a manual `Drop` cannot be
-    // destructured), it exists solely so its own `Drop` removes the exact scope token
-    // whenever the `RunTeardown` is dropped — on `finish_run`, or via the backstop.
-    #[allow(dead_code)]
-    guard: context::WorkflowGuard,
+    _guard: context::WorkflowGuard,
+    _policy_scope: Option<PolicyScope>,
     mcp: Option<McpClose>,
 }
 
@@ -866,10 +1021,7 @@ impl CancelHook for FlushCancelHook {
     }
 }
 
-/// Pre-thunk work for `workflow/run`: open the run scope, journal `run.started`, resolve
-/// any declared `:mcp` servers (a pre-body gate that can end the run before the body ever
-/// runs), and hand back the body thunk plus the teardown state. Mirrors the original
-/// inline builtin; the post-body work moved to `finish_run`.
+/// Open the run scope, journal `run.started`, and resolve declared MCP servers.
 fn run_plan(
     task_context: Option<&TaskContextHandle>,
     args: &[Value],
@@ -886,6 +1038,9 @@ fn run_plan(
     let doc = args[1].as_str().unwrap_or("").to_string();
     let meta = args[2].clone();
     let thunk = args[3].clone();
+    let policy = compile_policy(&meta)?;
+    let workspace_root = std::env::current_dir()
+        .map_err(|error| SemaError::eval(format!("workflow/run: current directory: {error}")))?;
 
     // Open the run scope: sets up the journal sink under ./.sema/runs/<run-id>/, installs
     // the thread-local WorkflowCtx, and returns a panic-safe Drop guard that reaps the
@@ -909,10 +1064,6 @@ fn run_plan(
         });
     }
 
-    // ── Implicit :mcp auth-resolution step, before the body thunk ─────────
-    // A workflow with no :mcp meta key parses to an empty Vec here (O(1) on the absent
-    // key), so every branch below is skipped and the body runs exactly as it did before
-    // this feature — byte-identical for the no-:mcp case.
     let decls = match workflow_mcp::declared_mcp(&meta) {
         Ok(d) => d,
         Err(e) => {
@@ -930,12 +1081,17 @@ fn run_plan(
         }
     };
 
-    // A workflow with no `:mcp` runs the body straight away — byte-identical to the
-    // pre-feature path.
     if decls.is_empty() {
+        let ctx = context::current_for(task_context)
+            .ok_or_else(|| SemaError::eval("workflow/run: scope not established"))?;
+        let policy_scope = open_compiled_policy(policy, &ctx, &workspace_root);
         return Ok(ThunkPlan::Run {
             thunk,
-            teardown: RunTeardown { guard, mcp: None },
+            teardown: RunTeardown {
+                _guard: guard,
+                _policy_scope: policy_scope,
+                mcp: None,
+            },
         });
     }
 
@@ -974,13 +1130,23 @@ fn run_plan(
                 guard,
                 thunk,
                 resolver,
+                policy,
+                workspace_root,
             }),
         }));
     }
 
     // Host arm (outside a runtime quantum): `io_block_on` is legal — resolve inline.
     let resolutions = resolver.resolve(&decls, &name, &run_id);
-    match apply_resolutions(task_context, guard, thunk, resolver, resolutions)? {
+    match apply_resolutions(
+        task_context,
+        guard,
+        thunk,
+        resolver,
+        resolutions,
+        policy,
+        workspace_root,
+    )? {
         ResolveGate::Exit { envelope, ack } => Ok(terminal_plan(task_context, envelope, ack)),
         ResolveGate::Proceed { thunk, teardown } => Ok(ThunkPlan::Run { thunk, teardown }),
     }
@@ -1006,6 +1172,8 @@ fn apply_resolutions(
     thunk: Value,
     resolver: Rc<dyn WorkflowMcpResolver>,
     resolutions: Vec<ServerResolution>,
+    policy: Option<Rc<sema_policy::CompiledPolicy>>,
+    workspace_root: PathBuf,
 ) -> Result<ResolveGate, SemaError> {
     let ctx = context::current_for(task_context)
         .ok_or_else(|| SemaError::eval("workflow/run: scope not established"))?;
@@ -1101,10 +1269,12 @@ fn apply_resolutions(
     // Every declared server connected: publish handles for workflow/mcp-handle, and
     // remember (resolver, handles) so `finish_run` closes them EXACTLY once.
     ctx.set_mcp_handles(connected);
+    let policy_scope = open_compiled_policy(policy, &ctx, &workspace_root);
     Ok(ResolveGate::Proceed {
         thunk,
         teardown: RunTeardown {
-            guard,
+            _guard: guard,
+            _policy_scope: policy_scope,
             mcp: Some(McpClose {
                 resolver,
                 handles: connected_handles,
@@ -1137,6 +1307,8 @@ struct ResolveContinuation {
     guard: context::WorkflowGuard,
     thunk: Value,
     resolver: Rc<dyn WorkflowMcpResolver>,
+    policy: Option<Rc<sema_policy::CompiledPolicy>>,
+    workspace_root: PathBuf,
 }
 
 impl Trace for ResolveContinuation {
@@ -1157,11 +1329,21 @@ impl NativeContinuation for ResolveContinuation {
             guard,
             thunk,
             resolver,
+            policy,
+            workspace_root,
         } = *self;
         match input {
             ResumeInput::Returned(value) => {
                 let resolutions = workflow_mcp::decode_resolutions(&value);
-                match apply_resolutions(Some(&task_context), guard, thunk, resolver, resolutions)? {
+                match apply_resolutions(
+                    Some(&task_context),
+                    guard,
+                    thunk,
+                    resolver,
+                    resolutions,
+                    policy,
+                    workspace_root,
+                )? {
                     ResolveGate::Exit { envelope, ack } => Ok(NativeOutcome::Suspend(
                         build_flush_ack_suspend(envelope, ack),
                     )),
@@ -1273,6 +1455,14 @@ pub fn register(env: &sema_core::Env) {
         |_teardown, _sink| {
             // `StepTeardown` carries only scalar/`Rc<RefCell<LeafUsage>>` state — no `Value`.
         },
+    );
+
+    register_thunk_fn(
+        env,
+        "workflow/policy-without",
+        policy_bypass_plan,
+        finish_policy_bypass,
+        |_teardown, _sink| {},
     );
 
     // (workflow/tool-call tool-name [args]) — journal a tool call by the current

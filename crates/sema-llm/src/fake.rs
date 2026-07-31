@@ -218,16 +218,31 @@ impl FakeProviderBuilder {
     /// Script an assistant turn that emits a single tool call (empty text content,
     /// `tool_use` stop reason) — mirrors how OpenAI/Anthropic return tool calls.
     pub fn tool_call(mut self, id: &str, name: &str, arguments: serde_json::Value) -> Self {
+        self.push_tool_calls(vec![ToolCall {
+            id: id.to_string(),
+            name: name.to_string(),
+            arguments,
+            thought_signature: None,
+        }]);
+        self
+    }
+
+    /// Script one assistant turn containing a batch of tool calls.
+    ///
+    /// This is useful for testing batch preflight and sibling-call behavior that
+    /// cannot be represented by repeated [`Self::tool_call`] calls (those are
+    /// separate assistant turns).
+    pub fn tool_calls(mut self, calls: Vec<ToolCall>) -> Self {
+        self.push_tool_calls(calls);
+        self
+    }
+
+    fn push_tool_calls(&mut self, calls: Vec<ToolCall>) {
         let resp = ChatResponse {
             content: String::new(),
             role: "assistant".to_string(),
             model: self.default_model.clone(),
-            tool_calls: vec![ToolCall {
-                id: id.to_string(),
-                name: name.to_string(),
-                arguments,
-                thought_signature: None,
-            }],
+            tool_calls: calls,
             usage: Usage {
                 prompt_tokens: 10,
                 completion_tokens: 5,
@@ -237,7 +252,6 @@ impl FakeProviderBuilder {
             stop_reason: Some("tool_use".to_string()),
         };
         self.script.push_back(FakeReply::Chat(resp));
-        self
     }
 
     /// Script a streamed reply: `chunks` are delivered to `on_chunk`, then the

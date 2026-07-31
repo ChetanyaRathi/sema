@@ -41,6 +41,7 @@ similar.workspace = true
 sema-io.workspace = true
 sema-workflow.workspace = true
 sema-llm.workspace = true
+sema-policy.workspace = true
 tokio.workspace = true
 reqwest.workspace = true
 # Enables rustls's `ring` feature in the unified graph: with exactly one provider

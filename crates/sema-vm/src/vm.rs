@@ -5859,6 +5859,20 @@ fn error_to_value(err: &SemaError) -> Value {
             map.insert(Value::keyword("function"), Value::string(function));
             map.insert(Value::keyword("path"), Value::string(path));
         }
+        SemaError::PolicyDenied {
+            boundary,
+            subject,
+            rule,
+        } => {
+            map.insert(Value::keyword("type"), Value::keyword("policy-denied"));
+            map.insert(
+                Value::keyword("message"),
+                Value::string(&format!("Policy denied {boundary} '{subject}' ({rule})")),
+            );
+            map.insert(Value::keyword("boundary"), Value::string(boundary));
+            map.insert(Value::keyword("subject"), Value::string(subject));
+            map.insert(Value::keyword("rule"), Value::string(rule));
+        }
         SemaError::WithTrace { .. } | SemaError::WithContext { .. } => {
             unreachable!("inner() already unwraps these")
         }

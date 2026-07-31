@@ -58,6 +58,10 @@ pub struct TapeEntry {
     /// Request hash (the matching key).
     pub key: String,
     pub content: String,
+    /// Provider that served the interaction. An empty value marks a legacy tape
+    /// entry, which an active policy rejects.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub provider: String,
     #[serde(default = "default_role")]
     pub role: String,
     pub model: String,
@@ -91,12 +95,13 @@ fn default_role() -> String {
 
 impl TapeEntry {
     /// Build a tape entry from a live response under `key`.
-    pub fn from_response(key: &str, resp: &ChatResponse) -> TapeEntry {
+    pub fn from_response(key: &str, provider: &str, resp: &ChatResponse) -> TapeEntry {
         TapeEntry {
             v: 1,
             kind: "complete".to_string(),
             key: key.to_string(),
             content: resp.content.clone(),
+            provider: provider.to_string(),
             role: resp.role.clone(),
             model: resp.model.clone(),
             tool_calls: resp.tool_calls.clone(),
@@ -119,6 +124,7 @@ impl TapeEntry {
             kind: "mcp-call".to_string(),
             key: key.to_string(),
             content: String::new(),
+            provider: String::new(),
             role: default_role(),
             model: String::new(),
             tool_calls: Vec::new(),
@@ -134,8 +140,13 @@ impl TapeEntry {
     }
 
     /// Tape entry for a streamed completion: the chunk sequence plus the final response.
-    pub fn from_stream(key: &str, chunks: &[String], resp: &ChatResponse) -> TapeEntry {
-        let mut entry = TapeEntry::from_response(key, resp);
+    pub fn from_stream(
+        key: &str,
+        provider: &str,
+        chunks: &[String],
+        resp: &ChatResponse,
+    ) -> TapeEntry {
+        let mut entry = TapeEntry::from_response(key, provider, resp);
         entry.kind = "stream".to_string();
         entry.chunks = chunks.to_vec();
         entry
@@ -144,6 +155,7 @@ impl TapeEntry {
     /// Tape entry for an embeddings call: the vectors plus the model and input tokens.
     pub fn from_embed(
         key: &str,
+        provider: &str,
         model: &str,
         embeddings: &[Vec<f64>],
         prompt_tokens: u32,
@@ -153,6 +165,7 @@ impl TapeEntry {
             kind: "embed".to_string(),
             key: key.to_string(),
             content: String::new(),
+            provider: provider.to_string(),
             role: default_role(),
             model: model.to_string(),
             tool_calls: Vec::new(),
@@ -445,7 +458,7 @@ mod tests {
     #[test]
     fn entry_round_trips_response_with_usage() {
         let r = resp("hello", 12, 34);
-        let e = TapeEntry::from_response("k1", &r);
+        let e = TapeEntry::from_response("k1", "fake", &r);
         let back = e.to_response();
         assert_eq!(back.content, "hello");
         assert_eq!(back.usage.prompt_tokens, 12);
@@ -475,7 +488,11 @@ mod tests {
             persisted_entries: 0,
         };
         assert!(matches!(cass.decide("k"), Decision::Record));
-        cass.record_entry(TapeEntry::from_response("k", &resp("recorded", 5, 6)));
+        cass.record_entry(TapeEntry::from_response(
+            "k",
+            "fake",
+            &resp("recorded", 5, 6),
+        ));
         match cass.decide("k") {
             Decision::Replay(e) => {
                 let r = e.to_response();
@@ -495,8 +512,8 @@ mod tests {
         ));
         let mut first = Cassette::load(path.clone(), CassetteMode::Record);
         let mut second = Cassette::load(path.clone(), CassetteMode::Record);
-        first.record_entry(TapeEntry::from_response("first", &resp("a", 1, 1)));
-        second.record_entry(TapeEntry::from_response("second", &resp("b", 1, 1)));
+        first.record_entry(TapeEntry::from_response("first", "fake", &resp("a", 1, 1)));
+        second.record_entry(TapeEntry::from_response("second", "fake", &resp("b", 1, 1)));
 
         first.save().expect("append first task's entry");
         second.save().expect("append second task's entry");
@@ -517,6 +534,7 @@ mod tests {
         let mut cassette = Cassette::load(path.clone(), CassetteMode::Record);
         cassette.record_entry(TapeEntry::from_response(
             "survives-retry",
+            "fake",
             &resp("answer", 1, 1),
         ));
 
@@ -540,7 +558,7 @@ mod tests {
             line!()
         ));
         let mut cass = Cassette::load(path.clone(), CassetteMode::Record);
-        cass.record_entry(TapeEntry::from_response("k", &resp("v", 1, 1)));
+        cass.record_entry(TapeEntry::from_response("k", "fake", &resp("v", 1, 1)));
 
         // The VM-thread half renders the pending NDJSON and marks it persisted.
         let (rendered_path, encoded) = cass.take_pending_append().expect("pending entry");
@@ -563,8 +581,8 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("sema-cassette-test-{}", std::process::id()));
         let path = dir.join("tape.jsonl");
         let mut tape = Tape::default();
-        tape.record(TapeEntry::from_response("a", &resp("one", 1, 2)));
-        tape.record(TapeEntry::from_response("b", &resp("two", 3, 4)));
+        tape.record(TapeEntry::from_response("a", "fake", &resp("one", 1, 2)));
+        tape.record(TapeEntry::from_response("b", "fake", &resp("two", 3, 4)));
         tape.save(&path).unwrap();
 
         let loaded = Tape::load(&path);

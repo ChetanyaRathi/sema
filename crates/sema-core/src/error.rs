@@ -187,6 +187,13 @@ pub enum SemaError {
     #[error("Permission denied: {function} — path '{path}' is outside allowed directories")]
     PathDenied { function: String, path: String },
 
+    #[error("Policy denied {boundary} '{subject}' ({rule})")]
+    PolicyDenied {
+        boundary: String,
+        subject: String,
+        rule: String,
+    },
+
     #[error("User exception: {0}")]
     UserException(Value),
 
@@ -330,6 +337,7 @@ const CONDITION_TYPES: &[&str] = &[
     "llm",
     "reader",
     "permission-denied",
+    "policy-denied",
     "cancelled",
     "timeout",
 ];
@@ -387,6 +395,18 @@ fn insert_optional_string(condition: &mut BTreeMap<Value, Value>, key: &str, val
 impl SemaError {
     pub fn eval(msg: impl Into<String>) -> Self {
         SemaError::Eval(msg.into())
+    }
+
+    pub fn policy_denied(
+        boundary: impl Into<String>,
+        subject: impl Into<String>,
+        rule: impl Into<String>,
+    ) -> Self {
+        SemaError::PolicyDenied {
+            boundary: boundary.into(),
+            subject: subject.into(),
+            rule: rule.into(),
+        }
     }
 
     #[allow(clippy::too_many_arguments)]

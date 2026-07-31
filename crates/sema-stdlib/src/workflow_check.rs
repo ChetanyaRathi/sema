@@ -5,7 +5,7 @@
 //! it is instant, side-effect-free, and safe to run on untrusted source. It exists to give
 //! a workflow author (often a coding agent) a fast feedback loop that catches the traps the
 //! runtime only surfaces at eval time — chiefly the `(phase "x" body…)` arity trap, since
-//! `phase` is a one-argument marker.
+//! `phase` is a one-argument marker, plus malformed literal workflow policies.
 //!
 //! Design (kept deliberately simple): one recursive visitor carries an `in_workflow` flag.
 //! Marker checks (`phase`/`checkpoint`/`step`/`parallel`/`pipeline`) fire ONLY inside a
@@ -108,7 +108,7 @@ pub fn check_source(src: &str) -> Vec<Diag> {
         diags.push(Diag::error(span, "E-PARSE", message));
     }
     for form in &forms {
-        find_workflows(form, &spans, &mut diags);
+        find_workflows_and_policies(form, &spans, &mut diags);
     }
     diags
 }
@@ -167,17 +167,52 @@ fn permission_spec_string(key: &str, value: &Value) -> Result<String, String> {
         .ok_or_else(|| format!("defworkflow {key} must be a sandbox string"))
 }
 
-/// Walk the top-level forms looking for `(defworkflow …)` (which may be nested inside a
-/// `(do …)` or similar), and check each one. Non-workflow code is left untouched.
-fn find_workflows(form: &Value, spans: &SpanMap, out: &mut Vec<Diag>) {
+/// Walk executable forms looking for `defworkflow`/`defpolicy` declarations (which may
+/// be nested inside a `(do …)` or similar). Quoted data is left untouched.
+fn find_workflows_and_policies(form: &Value, spans: &SpanMap, out: &mut Vec<Diag>) {
+    if head_symbol(form).is_some_and(|(head, _)| head == "quote" || head == "quasiquote") {
+        return;
+    }
     if let Some(items) = list_head(form, "defworkflow") {
         check_workflow(&items, form, spans, out);
         return;
     }
+    if let Some(items) = list_head(form, "defpolicy") {
+        let span = span_of(form, spans);
+        if items.len() != 3 || items[1].as_symbol().is_none() {
+            out.push(
+                Diag::error(
+                    span,
+                    "E-POLICY-SHAPE",
+                    "defpolicy needs a bare name and one literal policy map",
+                )
+                .with_hint("(defpolicy safe {:models {...} :tools {...}})"),
+            );
+        } else if let Some(policy) = items[2].as_map_ref() {
+            check_literal_policy(&Value::map(policy.clone()), span, out);
+        } else {
+            out.push(Diag::error(
+                span,
+                "E-POLICY-SHAPE",
+                "defpolicy rules must be a literal map",
+            ));
+        }
+        return;
+    }
     if let Some(seq) = form.as_seq() {
         for sub in seq {
-            find_workflows(sub, spans, out);
+            find_workflows_and_policies(sub, spans, out);
         }
+    }
+}
+
+fn check_literal_policy(policy: &Value, span: Option<Span>, out: &mut Vec<Diag>) {
+    if let Err(error) = sema_policy::CompiledPolicy::compile(policy) {
+        out.push(Diag::error(
+            span,
+            "E-POLICY",
+            format!("invalid policy: {error}"),
+        ));
     }
 }
 
@@ -293,6 +328,12 @@ fn check_workflow(items: &[Value], form: &Value, spans: &SpanMap, out: &mut Vec<
     // tolerance as (b)/(c) above; a computed :mcp value is left to the runtime).
     if let Some(meta) = &meta {
         check_mcp_decls(meta, wf_span, out);
+        if let Some(policy) = meta
+            .get(&Value::keyword("policy"))
+            .filter(|value| value.as_map_ref().is_some())
+        {
+            check_literal_policy(policy, wf_span, out);
+        }
     }
 
     // Marker arity/opts checks across the whole body (including nested forms).
@@ -401,6 +442,9 @@ fn check_mcp_decls(meta: &BTreeMap<Value, Value>, span: Option<Span>, out: &mut 
 /// Recursively check marker arities/opts. Only reached from within a workflow body.
 fn walk_markers(form: &Value, spans: &SpanMap, out: &mut Vec<Diag>) {
     if let Some((head, items)) = head_symbol(form) {
+        if head == "quote" || head == "quasiquote" {
+            return;
+        }
         let span = span_of(form, spans);
         match head.as_str() {
             // phase is a ONE-arg marker — the #1 trap. (phase "x" body) is an arity error.
@@ -465,6 +509,12 @@ fn walk_markers(form: &Value, spans: &SpanMap, out: &mut Vec<Diag>) {
                             ));
                         }
                     }
+                    if let Some(policy) = opts
+                        .get(&Value::keyword("policy"))
+                        .filter(|value| value.as_map_ref().is_some())
+                    {
+                        check_literal_policy(policy, span, out);
+                    }
                     // :agent runs a configured defagent and owns its own tools/model; the
                     // step must not also declare inline :tools/:model (they'd be ignored —
                     // the routing takes the :agent branch). Warn so the author picks one.
@@ -485,6 +535,24 @@ fn walk_markers(form: &Value, spans: &SpanMap, out: &mut Vec<Diag>) {
                             ));
                         }
                     }
+                }
+            }
+            "policy/without" => {
+                if items.len() < 3 {
+                    out.push(Diag::error(
+                        span,
+                        "E-POLICY-BYPASS",
+                        "policy/without needs a reason string and at least one body form",
+                    ));
+                } else if items[1]
+                    .as_str()
+                    .is_none_or(|reason| reason.trim().is_empty() || reason.chars().count() > 256)
+                {
+                    out.push(Diag::error(
+                        span,
+                        "E-POLICY-BYPASS",
+                        "policy/without reason must be a non-empty string of at most 256 characters",
+                    ));
                 }
             }
             // parallel/pipeline are structural — at least one argument beyond the head.
@@ -788,6 +856,81 @@ mod tests {
         );
         assert!(c.contains(&"W-STEP-AGENT-TOOLS"), "got {c:?}");
         assert!(c.contains(&"W-STEP-AGENT-MODEL"), "got {c:?}");
+    }
+
+    #[test]
+    fn valid_policy_declarations_and_inline_policies_are_checked() {
+        let src = r#"
+            (defpolicy safe
+              {:models {:default :deny
+                        :allow ["fake/fake-model"]}
+               :tools {:default :deny
+                       :allow {"read-file" {:paths ["src/**"]}}}})
+            (defworkflow d "d"
+              {:policy {:models {:default :deny :allow ["fake/*"]}}}
+              (phase "P")
+              (step "go"
+                {:policy {:tools {:default :deny
+                                  :allow {"read-file" {:paths ["src/**"]}}}}})
+              {:status :ok})
+        "#;
+        let c = codes(src);
+        assert!(
+            !c.iter().any(|code| code.starts_with("E-POLICY")),
+            "got {c:?}"
+        );
+    }
+
+    #[test]
+    fn malformed_policy_declarations_and_rules_error() {
+        let bad_shape = codes("(defpolicy \"safe\" [])");
+        assert!(bad_shape.contains(&"E-POLICY-SHAPE"), "got {bad_shape:?}");
+
+        let bad_rule = codes(
+            r#"(defpolicy bad
+                 {:models {:allow ["*/model"]}})
+               (defworkflow d "d" {} {:status :ok})"#,
+        );
+        assert!(bad_rule.contains(&"E-POLICY"), "got {bad_rule:?}");
+    }
+
+    #[test]
+    fn quoted_policy_forms_are_not_checked_as_declarations_or_bypasses() {
+        let c = codes(
+            r#"
+            '(defpolicy "not-a-name" {:models {:allow ["*/bad"]}})
+            (defworkflow d "d" {}
+              '(policy/without "")
+              {:status :ok})
+            "#,
+        );
+        assert!(
+            !c.iter().any(|code| code.starts_with("E-POLICY")),
+            "quoted data is not executable syntax: {c:?}"
+        );
+    }
+
+    #[test]
+    fn policy_without_requires_a_bounded_literal_reason_and_body() {
+        let missing_body = codes(
+            r#"(defworkflow d "d" {}
+                 (policy/without "maintenance")
+                 {:status :ok})"#,
+        );
+        assert!(
+            missing_body.contains(&"E-POLICY-BYPASS"),
+            "got {missing_body:?}"
+        );
+
+        let computed_reason = codes(
+            r#"(defworkflow d "d" {}
+                 (policy/without reason (step "go"))
+                 {:status :ok})"#,
+        );
+        assert!(
+            computed_reason.contains(&"E-POLICY-BYPASS"),
+            "got {computed_reason:?}"
+        );
     }
 
     #[test]

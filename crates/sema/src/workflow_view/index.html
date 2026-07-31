@@ -333,8 +333,10 @@
    item_count/, no per-agent usage inside agent.result; budget events carry an
    OPTIONAL agent_id (the only way per-agent tokens become attributable).
 
-   Frozen vocab (scoping §3.5): run.started, phase.started, phase.ended,
-   agent.started, agent.result, agent.tool_call, checkpoint, budget, run.ended.
+   Existing event shapes are frozen; additive kinds are supported. Core vocab:
+   run.started, phase.started, phase.ended, agent.started, agent.result,
+   agent.tool_call, checkpoint, budget, policy.checked, policy.violation,
+   policy.bypassed, run.ended.
    ========================================================================= */
 // Live data — fetched from the viewer server in load(); see init() at the bottom.
 let EVENTS = [];
@@ -713,6 +715,9 @@ function evGlyph(e){
     case "agent.tool_call": return `<span class="eg g-pend" data-testid="ev-glyph">${G.twig}</span>`;
     case "checkpoint":    return `<span class="eg g-pend" data-testid="ev-glyph">${G.cp}</span>`;
     case "budget":        return `<span class="eg g-pend" data-testid="ev-glyph">${G.bud}</span>`;
+    case "policy.checked": return `<span class="eg g-ok" data-testid="ev-glyph">${G.ok}</span>`;
+    case "policy.violation": return `<span class="eg g-fail" data-testid="ev-glyph">${G.fail}</span>`;
+    case "policy.bypassed": return `<span class="eg g-pend" data-testid="ev-glyph">${G.skip}</span>`;
     default: return `<span class="eg g-pend" data-testid="ev-glyph">${G.bud}</span>`;
   }
 }
@@ -727,6 +732,9 @@ function evFields(e){
     case "agent.tool_call": return `<b>${esc(e.agent_id)}</b> ${esc(e.tool_name)} args ${e.args_json==="gated"?"(gated)":esc(e.args_json)}`;
     case "checkpoint":    return `${esc(e.key)} content_key ${esc(e.content_key)} digest ${esc(e.value_digest)}`;
     case "budget":        return `${e.agent_id?esc(e.agent_id)+" ":""}in ${e.input_tokens} out ${e.output_tokens} cost ${e.cost_usd==null?"—":"$"+e.cost_usd.toFixed(4)}`;
+    case "policy.checked": return `<b>${esc(e.policy)}</b> allowed ${esc(e.boundary)} ${esc(e.subject)} · ${esc(e.rule)} · ${esc(e.source)}`;
+    case "policy.violation": return `<b>${esc(e.policy)}</b> denied ${esc(e.boundary)} ${esc(e.subject)} · ${esc(e.action)} · ${esc(e.reason)}`;
+    case "policy.bypassed": return `<b>${esc(e.policy)}</b> bypassed ${esc(e.boundary)} ${esc(e.subject)} · ${esc(e.reason)}`;
     default: return "";
   }
 }

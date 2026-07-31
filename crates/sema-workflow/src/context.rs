@@ -460,14 +460,15 @@ impl WorkflowCtx {
     }
 
     /// Content-key for an agent leaf: a stable hash over (kind, code-version, args,
-    /// phase, name, prompt, schema-repr) plus an occurrence ordinal. Length-prefixed
-    /// so `("a","bc")` and `("ab","c")` never collide.
+    /// phase, name, prompt, schema-repr, effective-policy) plus an occurrence ordinal.
+    /// Length-prefixed so `("a","bc")` and `("ab","c")` never collide.
     pub fn agent_content_key(
         &self,
         prompt: &str,
         schema_repr: &str,
         name: &str,
         phase: &str,
+        policy_fingerprint: &str,
     ) -> String {
         let cv = self.code_version.borrow().clone();
         let base = hash_fields(&[
@@ -478,6 +479,7 @@ impl WorkflowCtx {
             name,
             prompt,
             schema_repr,
+            policy_fingerprint,
         ]);
         format!("{base}_{}", self.next_occurrence(&base))
     }
@@ -1210,12 +1212,12 @@ mod tests {
         let ctx = WorkflowCtx::new("wf_t".into(), Journal::null(), BTreeMap::new());
         ctx.set_code_version("v1".into());
         // First occurrence of each distinct input is stable; differing inputs differ.
-        let k_a = ctx.agent_content_key("audit a.php", "[:list :string]", "auditor", "Audit");
-        let k_b = ctx.agent_content_key("audit b.php", "[:list :string]", "auditor", "Audit");
+        let k_a = ctx.agent_content_key("audit a.php", "[:list :string]", "auditor", "Audit", "");
+        let k_b = ctx.agent_content_key("audit b.php", "[:list :string]", "auditor", "Audit", "");
         assert_ne!(k_a, k_b, "different prompts ⇒ different keys");
         // Length-prefixing: ('a','bc') must not collide with ('ab','c').
-        let k1 = ctx.agent_content_key("a", "bc", "n", "p");
-        let k2 = ctx.agent_content_key("ab", "c", "n", "p");
+        let k1 = ctx.agent_content_key("a", "bc", "n", "p", "");
+        let k2 = ctx.agent_content_key("ab", "c", "n", "p", "");
         assert_ne!(
             k1, k2,
             "length-prefixed fields can't collide via concatenation"
@@ -1236,8 +1238,8 @@ mod tests {
         let ctx2 = WorkflowCtx::new("b".into(), Journal::null(), BTreeMap::new());
         ctx2.set_code_version("v2".into());
         assert_ne!(
-            ctx1.agent_content_key("p", "s", "n", "ph"),
-            ctx2.agent_content_key("p", "s", "n", "ph"),
+            ctx1.agent_content_key("p", "s", "n", "ph", ""),
+            ctx2.agent_content_key("p", "s", "n", "ph", ""),
             "a changed code-version produces different content-keys (auto-invalidation)"
         );
     }
