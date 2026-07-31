@@ -16,6 +16,8 @@ Stop a workflow at a durable, host-controlled human approval gate. `key` is a ke
    :preview "Publish sema-policies@1.0.0"})
 ```
 
-With no decision, the run ends `{:status :needs-approval …}` before later forms execute. `sema workflow run` prompts on a terminal by default, or exits 3 headlessly. Approve or reject with `sema workflow approve` / `sema workflow reject`, then resume the same run. An approval decision is bound to the run, workflow code and arguments, phase, key, occurrence, and subject digest; changing any binding creates a new request. Pending and rejected gates cannot be bypassed with Sema `try`/`catch`.
+With no decision, the run ends `{:status :needs-approval …}` before later forms execute. `sema workflow run` prompts on a terminal by default. For a durable headless pause, create an approval key pair, pass the public-key file to `run`, then use the private-key file only with the separate `approve` or `reject` command. Decisions are Ed25519-signed and bound to the run, complete static import/package dependency closure, arguments, phase, key, occurrence, subject digest, request timestamp, and authority key. Imports and loads execute from the exact snapshotted bytes; files outside the preflight closure fail closed.
+
+Approval is a sequential workflow gate. Put it before `parallel`, `pipeline`, async task combinators, steps, retry/timeout wrappers, resource-cleanup forms, or a nested workflow; the static checker rejects gates inside those constructs. The subject must be canonical immutable data (scalars, lists/vectors, maps, bytevectors, or typed numeric arrays). Pending, rejected, malformed, and authority-invalid gates cannot be bypassed with Sema `try`/`catch`.
 
 See also: `workflow/approval`, `defworkflow`, `checkpoint`, `workflow/run`.

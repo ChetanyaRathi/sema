@@ -118,6 +118,47 @@ thread_local! {
     /// the owning task's [`TaskContextHandle`] instead. Read only when
     /// `!sema_core::in_runtime_quantum()`.
     static WORKFLOW: Rc<WorkflowTaskState> = Rc::new(WorkflowTaskState::default());
+    /// Immutable host-owned run configuration. The CLI installs this around evaluation;
+    /// Sema code can mutate process environment variables but cannot reach this slot.
+    static HOST_CONFIG: RefCell<Option<WorkflowHostConfig>> = const { RefCell::new(None) };
+}
+
+#[derive(Debug, Clone)]
+pub struct WorkflowHostConfig {
+    pub runs_root: String,
+    pub explicit_run_id: Option<String>,
+    pub resuming: bool,
+    pub code_version: String,
+    pub approval_code_version: String,
+    pub args_json: String,
+    pub approval_public_key: String,
+    pub entry_file: String,
+    pub workspace_root: String,
+}
+
+pub struct WorkflowHostConfigGuard {
+    previous: Option<WorkflowHostConfig>,
+}
+
+impl Drop for WorkflowHostConfigGuard {
+    fn drop(&mut self) {
+        HOST_CONFIG.with(|slot| {
+            *slot.borrow_mut() = self.previous.take();
+        });
+    }
+}
+
+pub fn install_host_config(config: WorkflowHostConfig) -> WorkflowHostConfigGuard {
+    let previous = HOST_CONFIG.with(|slot| slot.borrow_mut().replace(config));
+    WorkflowHostConfigGuard { previous }
+}
+
+fn host_config() -> Option<WorkflowHostConfig> {
+    HOST_CONFIG.with(|slot| slot.borrow().clone())
+}
+
+pub fn host_workspace_root() -> Option<std::path::PathBuf> {
+    host_config().map(|config| config.workspace_root.into())
 }
 
 /// Run-scoped dynamic context. Cheap to clone-share via `Rc`; all interior state is
@@ -157,6 +198,10 @@ pub struct WorkflowCtx {
     /// `Err` propagation — because the `__fanout-tagged` engine swallows a leaf `Err`
     /// into `nil`, so an exception can't stop a concurrent batch.
     over_budget: Cell<bool>,
+    /// Sticky fail-closed latch for an approval attempted from an invalid child/nested
+    /// position. Shared with inherited tasks so the owning run cannot report success
+    /// after a detached child tried to create a gate.
+    approval_failure: RefCell<Option<String>>,
     /// `start_seq` of the currently-open phase (the phase.started event's seq), so
     /// checkpoints/agents/budget events can be attributed to their phase.
     cur_phase_seq: Cell<Option<u64>>,
@@ -182,6 +227,9 @@ pub struct WorkflowCtx {
     /// Collision-resistant source fingerprint used to bind human decisions. The CLI
     /// supplies SHA-256; library callers fall back to `code_version`.
     approval_code_version: RefCell<String>,
+    /// Ed25519 public key selected by the host before evaluation. Decisions must verify
+    /// against this authority; the matching private key is never exposed to Sema code.
+    approval_public_key: RefCell<String>,
     resume_memos: RefCell<HashMap<String, Value>>,
     key_seen: RefCell<HashMap<String, u32>>,
     /// Number of memos stored this run, capped at [`MEMO_MAX_COUNT`] so an unbounded fan-out
@@ -255,12 +303,14 @@ impl WorkflowCtx {
             cost_spent: Cell::new(0.0),
             tokens_spent: Cell::new(0),
             over_budget: Cell::new(false),
+            approval_failure: RefCell::new(None),
             cur_phase_seq: Cell::new(None),
             cur_phase_label: RefCell::new(None),
             agent_n: RefCell::new(BTreeMap::new()),
             resuming: Cell::new(false),
             code_version: RefCell::new(String::new()),
             approval_code_version: RefCell::new(String::new()),
+            approval_public_key: RefCell::new(String::new()),
             resume_memos: RefCell::new(HashMap::new()),
             key_seen: RefCell::new(HashMap::new()),
             memo_count: Cell::new(0),
@@ -290,6 +340,10 @@ impl WorkflowCtx {
     /// Collision-resistant workflow revision used by durable approval requests.
     pub fn approval_code_version(&self) -> String {
         self.approval_code_version.borrow().clone()
+    }
+
+    pub fn approval_public_key(&self) -> String {
+        self.approval_public_key.borrow().clone()
     }
 
     /// Full SHA-256 of canonicalized workflow arguments for approval bindings. Resume
@@ -479,6 +533,17 @@ impl WorkflowCtx {
         self.over_budget.get()
     }
 
+    pub fn fail_approval(&self, message: impl Into<String>) {
+        let mut failure = self.approval_failure.borrow_mut();
+        if failure.is_none() {
+            *failure = Some(message.into());
+        }
+    }
+
+    pub fn approval_failure(&self) -> Option<String> {
+        self.approval_failure.borrow().clone()
+    }
+
     // ── Resume / content-key memoization ──────────────────────────────────────
 
     /// Set the workflow's code version (folded into every content-key alongside args).
@@ -490,6 +555,10 @@ impl WorkflowCtx {
 
     pub fn set_approval_code_version(&self, v: String) {
         *self.approval_code_version.borrow_mut() = v;
+    }
+
+    pub fn set_approval_public_key(&self, v: String) {
+        *self.approval_public_key.borrow_mut() = v;
     }
 
     /// Enter resume mode with the prior run's memos (content-key → value).
@@ -747,6 +816,18 @@ impl WorkflowTaskState {
         self.inner.borrow().scopes.last().map(|s| Rc::clone(&s.ctx))
     }
 
+    fn scope_depth(&self) -> usize {
+        self.inner.borrow().scopes.len()
+    }
+
+    fn current_scope_is_owned(&self) -> bool {
+        self.inner
+            .borrow()
+            .scopes
+            .last()
+            .is_some_and(|scope| scope.token.is_some())
+    }
+
     fn cur_agent(&self) -> Option<String> {
         self.inner.borrow().cur_agent.clone()
     }
@@ -796,6 +877,12 @@ impl TaskLocalValue for WorkflowTaskState {
 
     fn as_any(&self) -> &dyn Any {
         self
+    }
+
+    fn preflight_error(&self) -> Option<sema_core::SemaError> {
+        self.current_ctx()
+            .and_then(|ctx| ctx.approval_failure())
+            .map(|message| sema_core::SemaError::WorkflowApprovalFailed { message })
     }
 }
 
@@ -870,6 +957,32 @@ pub fn current_for(task_context: Option<&TaskContextHandle>) -> Option<Rc<Workfl
     None
 }
 
+/// Approval gates are valid only on the owning root workflow task. Spawned children
+/// inherit a read-only scope (`token: None`), and nested `workflow/run` calls have depth
+/// greater than one; neither can safely suspend the outer workflow at a sequential gate.
+pub fn approval_scope_is_root_owner(task_context: Option<&TaskContextHandle>) -> bool {
+    let state = if let Some(handle) = task_context {
+        handle.get_rc::<WorkflowTaskState>()
+    } else if !sema_core::in_runtime_quantum() {
+        Some(host_state())
+    } else {
+        None
+    };
+    state.is_some_and(|state| state.scope_depth() == 1 && state.current_scope_is_owned())
+}
+
+pub fn scope_depth_for(task_context: Option<&TaskContextHandle>) -> usize {
+    if let Some(handle) = task_context {
+        return handle
+            .get_rc::<WorkflowTaskState>()
+            .map_or(0, |state| state.scope_depth());
+    }
+    if !sema_core::in_runtime_quantum() {
+        return host_state().scope_depth();
+    }
+    0
+}
+
 /// The `agent_id` of the step currently executing on `task_context` (TASK-PRIVATE
 /// attribution), for `workflow/tool-call`.
 pub fn cur_agent_for(task_context: Option<&TaskContextHandle>) -> Option<String> {
@@ -935,17 +1048,45 @@ pub fn set_workflow_scope(
     meta: &Value,
     task_context: Option<&TaskContextHandle>,
 ) -> io::Result<WorkflowGuard> {
-    let runs_root = resolve_runs_root();
-    let code_version = std::env::var(CODE_VERSION_ENV).unwrap_or_default();
-    let approval_code_version =
-        std::env::var(APPROVAL_CODE_VERSION_ENV).unwrap_or_else(|_| code_version.clone());
-    let resuming = std::env::var(RESUME_ENV).map(|v| v == "1").unwrap_or(false);
+    let host = host_config();
+    let outermost = scope_depth_for(task_context) == 0;
+    let runs_root = host
+        .as_ref()
+        .map(|config| config.runs_root.clone())
+        .unwrap_or_else(resolve_runs_root_from_env);
+    let code_version = host
+        .as_ref()
+        .map(|config| config.code_version.clone())
+        .unwrap_or_else(|| std::env::var(CODE_VERSION_ENV).unwrap_or_default());
+    let approval_code_version = host
+        .as_ref()
+        .map(|config| config.approval_code_version.clone())
+        .unwrap_or_else(|| {
+            std::env::var(APPROVAL_CODE_VERSION_ENV).unwrap_or_else(|_| code_version.clone())
+        });
+    let approval_public_key = host
+        .as_ref()
+        .map(|config| config.approval_public_key.clone())
+        .unwrap_or_default();
+    let resuming = outermost
+        && host.as_ref().map_or_else(
+            || std::env::var(RESUME_ENV).map(|v| v == "1").unwrap_or(false),
+            |config| config.resuming,
+        );
 
     // An explicit run id (the `SEMA_WORKFLOW_RUN_ID` seam, or a future library caller) is
     // validated HERE as exactly one safe path component before it is ever joined into a
     // filesystem path — the library is the authoritative gate, not just the CLI.
-    let explicit_id = match std::env::var(RUN_ID_ENV) {
-        Ok(id) if !id.is_empty() => {
+    let configured_id = if outermost {
+        host.as_ref().map_or_else(
+            || std::env::var(RUN_ID_ENV).ok(),
+            |config| config.explicit_run_id.clone(),
+        )
+    } else {
+        None
+    };
+    let explicit_id = match configured_id {
+        Some(id) if !id.is_empty() => {
             validate_explicit_run_id(&id)?;
             Some(id)
         }
@@ -993,16 +1134,22 @@ pub fn set_workflow_scope(
         "run_id": run_id,
         "code_version": code_version,
         "approval_code_version": approval_code_version,
+        "approval_authority_public_key": approval_public_key,
+        "entry_file": host.as_ref().map(|config| config.entry_file.as_str()).unwrap_or(""),
         "meta": redact_meta_secrets(sema_core::json::value_to_json_lossy(meta)),
     });
     journal.write_metadata(&metadata);
     // The `:budget` submap of meta becomes the run's enforced spend caps.
     // The CLI sets SEMA_WORKFLOW_ARGS_JSON to the verbatim `--args` string.
-    let args_json = std::env::var("SEMA_WORKFLOW_ARGS_JSON").unwrap_or_default();
+    let args_json = host
+        .as_ref()
+        .map(|config| config.args_json.clone())
+        .unwrap_or_else(|| std::env::var("SEMA_WORKFLOW_ARGS_JSON").unwrap_or_default());
     let ctx = WorkflowCtx::new_with_args(run_id.clone(), journal, parse_budget(meta), args_json);
     ctx.set_workflow_name(name);
     ctx.set_code_version(code_version);
     ctx.set_approval_code_version(approval_code_version);
+    ctx.set_approval_public_key(approval_public_key);
     if resuming {
         let memos: HashMap<String, Value> = crate::journal::load_memos(&runs_root, &run_id)
             .into_iter()
@@ -1034,6 +1181,12 @@ pub fn parse_budget(meta: &Value) -> BTreeMap<String, Value> {
 /// Resolve the run-directory base: the `SEMA_WORKFLOW_RUN_DIR` seam (set by the CLI
 /// `--run-dir`) if present, else the project-local [`RUNS_ROOT`].
 pub fn resolve_runs_root() -> String {
+    host_config()
+        .map(|config| config.runs_root)
+        .unwrap_or_else(resolve_runs_root_from_env)
+}
+
+fn resolve_runs_root_from_env() -> String {
     std::env::var(RUN_DIR_ENV).unwrap_or_else(|_| RUNS_ROOT.to_string())
 }
 

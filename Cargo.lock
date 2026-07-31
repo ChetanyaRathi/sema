@@ -3801,7 +3801,10 @@ dependencies = [
 name = "sema-workflow"
 version = "1.33.0"
 dependencies = [
+ "base64",
+ "libc",
  "md5",
+ "ring",
  "sema-core",
  "serde",
  "serde_json",

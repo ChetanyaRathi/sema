@@ -158,25 +158,98 @@ stores its SHA-256 digest, not the raw value. Put only operator-safe text in
 ```
 
 The default `auto` mode prompts when stdin and stderr are terminals and `CI`
-is unset. Otherwise the run ends with `:needs-approval` and exit code 3. The
-request remains pending if the prompt gets EOF, `q`, or Ctrl-C.
+is unset. The prompt accepts approve, reject with a reason, or quit-pending.
+Ctrl-C exits with code 130 and leaves the durable request pending; it never
+turns an interrupted prompt into a rejection.
+
+Terminal prompts use an ephemeral Ed25519 authority kept in host memory. The
+CLI records the signed decision, creates a fresh interpreter, and resumes the
+same run immediately. If you quit an ephemeral prompt without deciding, start
+a fresh run: its private authority intentionally cannot be recovered from the
+workflow or its sidecars.
+
+For CI, automation, or a decision made from another terminal, create a durable
+authority and pass only its public key to the workflow process:
 
 ```bash
-# Force headless behavior.
-sema workflow run release.sema --approval-mode pause
+# Create the authority once. The private file is created with mode 0600.
+mkdir -p .sema
+sema workflow approval-keygen \
+  --private-key-file .sema/approval.private \
+  --public-key-file .sema/approval.public
 
-# Inspect and decide from another terminal or process.
-sema workflow approvals <run-id>
-sema workflow approve <run-id> <approval-id> --comment "verified"
-sema workflow reject <run-id> <approval-id> --reason "not ready"
+# Pause at a gate and return exit code 3. Keep the exact file, args, run dir,
+# and public-key file for the later resume command.
+sema workflow run release.sema \
+  --args '{"package":"sema-policies","version":"1.0.0"}' \
+  --approval-mode pause \
+  --approval-public-key-file .sema/approval.public
 
-# A standalone decision is applied when the same run resumes.
-sema workflow run release.sema --resume <run-id>
+# The command prints the concrete run id and approval id. You can also list
+# pending requests as text or JSON.
+sema workflow approvals wf_…
+sema workflow approvals wf_… --json
+
+# Approve from a separate trusted process. The private key is never passed to
+# `workflow run` and is never visible to Sema code.
+sema workflow approve wf_… apr_… \
+  --signing-key-file .sema/approval.private \
+  --actor release-manager \
+  --comment 'verified package and version'
+
+# Or reject; a reason is required.
+sema workflow reject wf_… apr_… \
+  --signing-key-file .sema/approval.private \
+  --actor release-manager \
+  --reason 'release checks failed'
+
+# Apply the recorded decision. Reuse the exact original inputs.
+sema workflow run release.sema \
+  --args '{"package":"sema-policies","version":"1.0.0"}' \
+  --resume wf_… \
+  --approval-mode pause \
+  --approval-public-key-file .sema/approval.public
 ```
 
-Decisions are immutable and bound to the run, workflow code and arguments,
-phase, key, occurrence, and subject digest. Editing any binding creates a new
-request. Sema `try`/`catch` cannot continue past a pending or rejected gate.
+| Mode | Behavior |
+|------|----------|
+| `auto` | Prompt on a real terminal outside CI; otherwise use `pause` behavior |
+| `prompt` | Require terminal stdin/stderr and ask approve, reject, or leave pending |
+| `pause` | Publish a request and exit 3; a durable gate requires `--approval-public-key-file` |
+| `deny` | Refuse the gate without recording an approval decision and exit 1 |
+
+The request and decision JSON files under the run's `approvals/` directory are
+the protocol authority; journal events are audit evidence. Decisions use
+Ed25519 signatures and compare-and-set publication, so the first approve or
+reject wins and a conflicting decision cannot overwrite it. A decision binds
+the run, complete static import/package dependency closure, arguments, phase,
+gate key and occurrence, canonical subject digest, request timestamp, request
+revision, and public authority. Editing a binding invalidates the decision.
+The evaluator reads imports and loads from those exact snapshotted bytes;
+runtime-selected or macro-generated files outside the preflight closure fail
+closed instead of escaping the approval revision.
+
+Approval subjects must be canonical immutable data: scalars, lists, vectors,
+maps, bytevectors, or typed numeric arrays. Mutable cells, records, functions,
+promises, channels, and other runtime objects are rejected instead of being
+hashed through an ambiguous display string. The raw subject is never stored;
+only its digest is. Treat `:preview`, `:reason`, comments, and actor names as
+operator-visible text.
+
+An approval is a sequential gate in the owning workflow task. Put it before,
+not inside, `parallel`, `pipeline`, async task combinators, steps, retry/timeout forms,
+resource-cleanup forms, or a nested `workflow/run`. `sema workflow check` and
+`sema workflow run` reject those placements before execution. Pending,
+rejected, malformed, cancelled, and authority-invalid gates are uncatchable by
+Sema `try`/`catch`, so later protected forms cannot run.
+
+::: warning Platform support
+Durable approval storage and approval key generation currently fail closed on
+non-Unix platforms until Sema has a native private-directory ACL
+implementation. The workflow viewer is also read-only today: terminal and CLI
+commands can decide requests; web approve/reject controls are planned but are
+not part of this release.
+:::
 
 ### `parallel`
 
@@ -664,12 +737,13 @@ sema workflow run examples/workflows/content-pipeline.sema --view
 
 ```bash
 # Run a workflow file
-sema workflow run <file> [--args <json>] [--run-dir <dir>] [--view] [--port <n>] [--resume <run-id>] [--approval-mode auto|prompt|pause|deny]
+sema workflow run <file> [--args <json>] [--run-dir <dir>] [--view] [--port <n>] [--resume <run-id>] [--approval-mode auto|prompt|pause|deny] [--approval-public-key-file <file>]
 
 # Inspect or decide durable approval requests
-sema workflow approvals <run-id> [--json]
-sema workflow approve <run-id> <approval-id> [--comment <text>]
-sema workflow reject <run-id> <approval-id> --reason <text>
+sema workflow approval-keygen --private-key-file <file> --public-key-file <file>
+sema workflow approvals <run-id> [--run-dir <dir>] [--json]
+sema workflow approve <run-id> <approval-id> --signing-key-file <file> [--run-dir <dir>] [--actor <name>] [--comment <text>]
+sema workflow reject <run-id> <approval-id> --signing-key-file <file> --reason <text> [--run-dir <dir>] [--actor <name>]
 
 # Statically validate a workflow file
 sema workflow check <file> [--strict] [--json]

@@ -245,6 +245,12 @@ pub enum SemaError {
         reason: Option<String>,
     },
 
+    /// Fail-closed approval infrastructure or placement error. It is host-owned and
+    /// uncatchable for the same reason as pending/rejected controls: user code must not
+    /// continue to the protected action after authority validation fails.
+    #[error("workflow approval failed: {message}")]
+    WorkflowApprovalFailed { message: String },
+
     #[error("Internal error: {0}")]
     Internal(String),
 
@@ -506,7 +512,9 @@ impl SemaError {
     pub fn is_uncatchable(&self) -> bool {
         matches!(
             self.inner(),
-            SemaError::WorkflowApprovalRequired { .. } | SemaError::WorkflowApprovalRejected { .. }
+            SemaError::WorkflowApprovalRequired { .. }
+                | SemaError::WorkflowApprovalRejected { .. }
+                | SemaError::WorkflowApprovalFailed { .. }
         )
     }
 
@@ -799,6 +807,9 @@ impl SemaError {
                 || format!("workflow approval rejected: {approval_id}"),
                 |reason| format!("workflow approval rejected: {approval_id}: {reason}"),
             ),
+            SemaError::WorkflowApprovalFailed { message } => {
+                format!("workflow approval failed: {message}")
+            }
             SemaError::Internal(message) => format!("Internal error: {message}"),
             SemaError::UserException(value) => format!("User exception: {value}"),
             SemaError::Condition(condition) => condition_message(condition),

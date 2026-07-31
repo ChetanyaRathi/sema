@@ -23,9 +23,12 @@ and decision protocol; neither client is the authority.
    translates it into a `:needs-approval` result.
 3. The request is durable before `approval.requested` and `run.ended` are
    reported. The journal is evidence, not the decision authority.
-4. A decision is bound to the exact request digest and revision. Changed code,
-   arguments, phase, gate key, occurrence, or subject creates a different
-   request.
+4. A decision is Ed25519-signed by a host-selected authority and bound to the
+   exact request digest and revision. Changed entry/import/package code,
+   arguments, phase, gate key, occurrence, subject, timestamp, or authority
+   invalidates the decision.
+   Evaluation uses the exact hashed dependency bytes and rejects imports or
+   loads outside the preflight closure.
 5. Decision creation is compare-and-set: the first approve/reject wins. A
    conflicting later decision fails without overwriting evidence.
 6. Terminal EOF or Ctrl-C leaves a request pending. It is not a rejection.
@@ -45,7 +48,9 @@ The request binds the run id, workflow/code and argument fingerprints, phase,
 gate key and occurrence, subject digest, reason, revision, and request digest.
 The request stores only an optional operator-safe preview, not the raw subject.
 The decision binds the request digest and revision and records approve/reject,
-actor, provenance, optional comment/reason, and timestamp.
+actor, provenance, optional comment/reason, timestamp, and Ed25519 signature.
+The request contains only the public authority key; the workflow process never
+receives the matching private key.
 
 Sidecars are written with private permissions and atomically published. A
 decision file is never replaced.
@@ -56,15 +61,17 @@ Phase 1 provides:
 
 ```text
 sema workflow run FILE --approval-mode auto|prompt|pause|deny
+sema workflow approval-keygen --private-key-file PRIVATE --public-key-file PUBLIC
 sema workflow approvals RUN_ID
-sema workflow approve RUN_ID APPROVAL_ID [--comment TEXT]
-sema workflow reject RUN_ID APPROVAL_ID --reason TEXT
+sema workflow approve RUN_ID APPROVAL_ID --signing-key-file PRIVATE [--comment TEXT]
+sema workflow reject RUN_ID APPROVAL_ID --signing-key-file PRIVATE --reason TEXT
 ```
 
 - `auto` prompts only when stdin and stderr are terminals and `CI` is unset;
   otherwise it behaves as `pause`.
 - `prompt` requests an interactive approve/reject choice. It requires a TTY.
-- `pause` returns exit code 3 with commands for resolving the request.
+- `pause` requires `--approval-public-key-file PUBLIC` when a gate is reached,
+  then returns exit code 3 with exact resolve/resume commands.
 - `deny` records no decision and fails the run at the gate.
 - An approval entered during `run` is stored first, then the CLI resumes the
   same run id. Existing checkpoint and agent memos prevent completed leaves
@@ -96,6 +103,12 @@ on resume. `approval.applied` records that execution crossed an approved gate.
 - `:needs-approval`/`:rejected` envelopes and approval events.
 - Terminal prompt plus list/approve/reject commands.
 - Static checker, CLI integration tests, and user documentation.
+- Host-owned immutable run configuration, signed decisions, canonical subjects,
+  and full static dependency-closure binding.
+- Approval gates are sequential. Gates nested in concurrency, cleanup/retry,
+  steps, or nested workflows are rejected before execution.
+- Durable approval sidecars currently fail closed on non-Unix platforms until a
+  private platform ACL implementation is available.
 
 ### Phase 2 — web client
 
@@ -124,8 +137,8 @@ deterministic workflow replay and memo protocol.
 - Approval followed by resume crosses the gate and completes the run.
 - Rejection followed by resume ends as rejected and does not cross the gate.
 - A surrounding Sema `try`/`catch` cannot bypass a pending or rejected gate.
-- A gate reached inside `parallel` propagates to `workflow/run`; later workflow
-  forms do not execute.
+- A gate placed inside `parallel`/`pipeline`/`async/spawn` is rejected before
+  execution; place the gate before the concurrent work.
 - Two racing decisions produce exactly one durable winner.
 - A decision copied from another request, revision, or run is rejected.
 - `auto` never prompts in CI or without terminal input/output.

@@ -2440,6 +2440,9 @@ impl Runtime {
         // the same total instruction count a single quantum always was.
         let mut remaining_budget = instruction_limit;
         let action = loop {
+            if let Some(error) = task.context.preflight_error() {
+                vm.resume_with_error(error);
+            }
             let cancellation = {
                 let cancel = task.record.cancellation();
                 CancellationView::new(cancel.is_some(), cancel.map(|request| request.reason))
@@ -4257,6 +4260,9 @@ impl Runtime {
                         &current_call.args,
                     );
                 }
+            }
+            if let Some(error) = task.context.preflight_error() {
+                vm.resume_with_error(error);
             }
             if let Err(error) = vm.setup_for_call_owned(next_closure, &mut current_call.args) {
                 let mut native_context = NativeCallContext {

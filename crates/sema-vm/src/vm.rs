@@ -5923,6 +5923,13 @@ fn error_to_value(err: &SemaError) -> Value {
                 map.insert(Value::keyword("reason"), Value::string(reason));
             }
         }
+        SemaError::WorkflowApprovalFailed { message } => {
+            map.insert(
+                Value::keyword("type"),
+                Value::keyword("workflow-approval-failed"),
+            );
+            map.insert(Value::keyword("message"), Value::string(message));
+        }
         SemaError::Internal(message) => {
             map.insert(Value::keyword("type"), Value::keyword("internal"));
             map.insert(

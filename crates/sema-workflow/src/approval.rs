@@ -6,21 +6,93 @@
 
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use base64::Engine as _;
+use ring::rand::SystemRandom;
+use ring::signature::{self, KeyPair as _};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-pub const APPROVAL_SCHEMA_VERSION: u32 = 1;
+pub const APPROVAL_SCHEMA_VERSION: u32 = 2;
 const APPROVAL_SIDECAR_MAX_BYTES: u64 = 128 * 1024;
 const APPROVAL_TEXT_MAX_CHARS: usize = 1024;
+
+/// Host-held Ed25519 authority used to sign immutable approval decisions. The private
+/// PKCS#8 bytes are deliberately opaque to Sema values and request sidecars.
+#[derive(Clone)]
+pub struct ApprovalSigningKey {
+    pkcs8: Vec<u8>,
+}
+
+impl fmt::Debug for ApprovalSigningKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("ApprovalSigningKey(<redacted>)")
+    }
+}
+
+impl ApprovalSigningKey {
+    pub fn generate() -> io::Result<Self> {
+        let bytes = signature::Ed25519KeyPair::generate_pkcs8(&SystemRandom::new())
+            .map_err(|_| invalid_data("cannot generate Ed25519 approval signing key"))?;
+        Ok(Self {
+            pkcs8: bytes.as_ref().to_vec(),
+        })
+    }
+
+    pub fn from_base64(encoded: &str) -> io::Result<Self> {
+        let pkcs8 = base64::engine::general_purpose::STANDARD
+            .decode(encoded.trim())
+            .map_err(|_| invalid_data("approval signing key is not valid base64"))?;
+        signature::Ed25519KeyPair::from_pkcs8(&pkcs8)
+            .map_err(|_| invalid_data("approval signing key is not valid Ed25519 PKCS#8"))?;
+        Ok(Self { pkcs8 })
+    }
+
+    pub fn to_base64(&self) -> String {
+        base64::engine::general_purpose::STANDARD.encode(&self.pkcs8)
+    }
+
+    pub fn public_key_base64(&self) -> io::Result<String> {
+        let pair = self.key_pair()?;
+        Ok(base64::engine::general_purpose::STANDARD.encode(pair.public_key().as_ref()))
+    }
+
+    fn key_pair(&self) -> io::Result<signature::Ed25519KeyPair> {
+        signature::Ed25519KeyPair::from_pkcs8(&self.pkcs8)
+            .map_err(|_| invalid_data("approval signing key is not valid Ed25519 PKCS#8"))
+    }
+
+    fn sign(&self, message: &[u8]) -> io::Result<String> {
+        Ok(base64::engine::general_purpose::STANDARD
+            .encode(self.key_pair()?.sign(message).as_ref()))
+    }
+}
+
+fn validate_public_key(encoded: &str) -> io::Result<Vec<u8>> {
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(encoded.trim())
+        .map_err(|_| invalid_data("approval public key is not valid base64"))?;
+    if bytes.len() != 32 {
+        return Err(invalid_data(
+            "approval public key must be a 32-byte Ed25519 key",
+        ));
+    }
+    Ok(bytes)
+}
+
+pub fn normalize_public_key_base64(encoded: &str) -> io::Result<String> {
+    let bytes = validate_public_key(encoded)?;
+    Ok(base64::engine::general_purpose::STANDARD.encode(bytes))
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ApprovalRequest {
     pub schema_version: u32,
     pub approval_id: String,
+    pub identity_digest: String,
     pub request_digest: String,
     pub revision: u64,
     pub run_id: String,
@@ -35,6 +107,7 @@ pub struct ApprovalRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preview: Option<String>,
     pub requested_at: String,
+    pub authority_public_key: String,
 }
 
 #[derive(Debug, Clone)]
@@ -50,6 +123,7 @@ pub struct NewApprovalRequest {
     pub reason: String,
     pub preview: Option<String>,
     pub requested_at: String,
+    pub authority_public_key: String,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -83,6 +157,7 @@ pub struct ApprovalDecision {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
     pub decided_at: String,
+    pub signature: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -100,47 +175,32 @@ pub enum DecisionWrite {
 
 impl ApprovalRequest {
     pub fn new(input: NewApprovalRequest) -> Self {
-        let binding = serde_json::json!({
-            "schema_version": APPROVAL_SCHEMA_VERSION,
-            "revision": 1,
-            "run_id": input.run_id,
-            "workflow": input.workflow,
-            "code_version": input.code_version,
-            "args_digest": input.args_digest,
-            "phase": input.phase,
-            "key": input.key,
-            "occurrence": input.occurrence,
-            "subject_digest": input.subject_digest,
-            "reason": input.reason,
-            "preview": input.preview,
+        let identity = RequestIdentityBinding::from(&input);
+        let identity_digest = sha256_binding(&identity);
+        let approval_id = format!("apr_{}", &identity_digest[..24]);
+        let request_digest = sha256_binding(&RequestBinding {
+            identity_digest: &identity_digest,
+            requested_at: &input.requested_at,
+            authority_public_key: &input.authority_public_key,
         });
-        let request_digest = sha256_json(&binding);
-        let approval_id = format!("apr_{}", &request_digest[..24]);
         Self {
             schema_version: APPROVAL_SCHEMA_VERSION,
             approval_id,
+            identity_digest,
             request_digest,
             revision: 1,
-            run_id: binding["run_id"].as_str().unwrap_or_default().to_string(),
-            workflow: binding["workflow"].as_str().unwrap_or_default().to_string(),
-            code_version: binding["code_version"]
-                .as_str()
-                .unwrap_or_default()
-                .to_string(),
-            args_digest: binding["args_digest"]
-                .as_str()
-                .unwrap_or_default()
-                .to_string(),
-            phase: binding["phase"].as_str().unwrap_or_default().to_string(),
-            key: binding["key"].as_str().unwrap_or_default().to_string(),
-            occurrence: binding["occurrence"].as_u64().unwrap_or_default() as u32,
-            subject_digest: binding["subject_digest"]
-                .as_str()
-                .unwrap_or_default()
-                .to_string(),
-            reason: binding["reason"].as_str().unwrap_or_default().to_string(),
-            preview: binding["preview"].as_str().map(str::to_string),
+            run_id: input.run_id,
+            workflow: input.workflow,
+            code_version: input.code_version,
+            args_digest: input.args_digest,
+            phase: input.phase,
+            key: input.key,
+            occurrence: input.occurrence,
+            subject_digest: input.subject_digest,
+            reason: input.reason,
+            preview: input.preview,
             requested_at: input.requested_at,
+            authority_public_key: input.authority_public_key,
         }
     }
 
@@ -164,6 +224,7 @@ impl ApprovalRequest {
             (&self.subject_digest, "approval subject digest"),
             (&self.reason, "approval reason"),
             (&self.requested_at, "approval request timestamp"),
+            (&self.authority_public_key, "approval authority public key"),
         ] {
             validate_text(value, label, false)?;
         }
@@ -171,6 +232,7 @@ impl ApprovalRequest {
         if let Some(preview) = &self.preview {
             validate_text(preview, "approval preview", true)?;
         }
+        validate_public_key(&self.authority_public_key)?;
         let rebuilt = Self::new(NewApprovalRequest {
             run_id: self.run_id.clone(),
             workflow: self.workflow.clone(),
@@ -183,8 +245,11 @@ impl ApprovalRequest {
             reason: self.reason.clone(),
             preview: self.preview.clone(),
             requested_at: self.requested_at.clone(),
+            authority_public_key: self.authority_public_key.clone(),
         });
-        if rebuilt.request_digest != self.request_digest || rebuilt.approval_id != self.approval_id
+        if rebuilt.identity_digest != self.identity_digest
+            || rebuilt.request_digest != self.request_digest
+            || rebuilt.approval_id != self.approval_id
         {
             return Err(invalid_data(
                 "approval request digest does not match its contents",
@@ -198,44 +263,52 @@ impl ApprovalDecision {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         request: &ApprovalRequest,
+        signing_key: &ApprovalSigningKey,
         decision: ApprovalDecisionKind,
         actor: String,
         provenance: String,
         comment: Option<String>,
         reason: Option<String>,
         decided_at: String,
-    ) -> Self {
-        let binding = serde_json::json!({
-            "approval_id": request.approval_id,
-            "request_digest": request.request_digest,
-            "request_revision": request.revision,
-            "decision": decision,
-            "actor": actor,
-            "provenance": provenance,
-            "comment": comment,
-            "reason": reason,
-            "decided_at": decided_at,
-        });
-        let decision_id = format!("dec_{}", &sha256_json(&binding)[..24]);
-        Self {
+    ) -> io::Result<Self> {
+        if signing_key.public_key_base64()? != request.authority_public_key {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "approval signing key does not match the request authority",
+            ));
+        }
+        let binding = DecisionBinding {
+            schema_version: APPROVAL_SCHEMA_VERSION,
+            approval_id: &request.approval_id,
+            request_digest: &request.request_digest,
+            request_revision: request.revision,
+            decision,
+            actor: &actor,
+            provenance: &provenance,
+            comment: comment.as_deref(),
+            reason: reason.as_deref(),
+            decided_at: &decided_at,
+        };
+        let binding_bytes = binding_bytes(&binding);
+        let signature = signing_key.sign(&binding_bytes)?;
+        let decision_id = format!(
+            "dec_{}",
+            &sha256_fields(&[&sha256_bytes(&binding_bytes), &signature])[..24]
+        );
+        Ok(Self {
             schema_version: APPROVAL_SCHEMA_VERSION,
             decision_id,
             approval_id: request.approval_id.clone(),
             request_digest: request.request_digest.clone(),
             request_revision: request.revision,
             decision,
-            actor: binding["actor"].as_str().unwrap_or_default().to_string(),
-            provenance: binding["provenance"]
-                .as_str()
-                .unwrap_or_default()
-                .to_string(),
-            comment: binding["comment"].as_str().map(str::to_string),
-            reason: binding["reason"].as_str().map(str::to_string),
-            decided_at: binding["decided_at"]
-                .as_str()
-                .unwrap_or_default()
-                .to_string(),
-        }
+            actor,
+            provenance,
+            comment,
+            reason,
+            decided_at,
+            signature,
+        })
     }
 
     fn validate_for(&self, request: &ApprovalRequest) -> io::Result<()> {
@@ -269,21 +342,98 @@ impl ApprovalDecision {
         {
             return Err(invalid_data("a rejection decision requires a reason"));
         }
-        let rebuilt = Self::new(
-            request,
-            self.decision,
-            self.actor.clone(),
-            self.provenance.clone(),
-            self.comment.clone(),
-            self.reason.clone(),
-            self.decided_at.clone(),
+        let binding = DecisionBinding::from(self);
+        let binding_bytes = binding_bytes(&binding);
+        let public_key = validate_public_key(&request.authority_public_key)?;
+        let signature = base64::engine::general_purpose::STANDARD
+            .decode(&self.signature)
+            .map_err(|_| invalid_data("approval decision signature is not valid base64"))?;
+        signature::UnparsedPublicKey::new(&signature::ED25519, public_key)
+            .verify(&binding_bytes, &signature)
+            .map_err(|_| invalid_data("approval decision signature is invalid"))?;
+        let expected_id = format!(
+            "dec_{}",
+            &sha256_fields(&[&sha256_bytes(&binding_bytes), &self.signature])[..24]
         );
-        if rebuilt.decision_id != self.decision_id {
+        if expected_id != self.decision_id {
             return Err(invalid_data(
                 "approval decision digest does not match its contents",
             ));
         }
         Ok(())
+    }
+}
+
+#[derive(Serialize)]
+struct RequestIdentityBinding<'a> {
+    schema_version: u32,
+    revision: u64,
+    run_id: &'a str,
+    workflow: &'a str,
+    code_version: &'a str,
+    args_digest: &'a str,
+    phase: &'a str,
+    key: &'a str,
+    occurrence: u32,
+    subject_digest: &'a str,
+    reason: &'a str,
+    preview: Option<&'a str>,
+}
+
+impl<'a> From<&'a NewApprovalRequest> for RequestIdentityBinding<'a> {
+    fn from(value: &'a NewApprovalRequest) -> Self {
+        Self {
+            schema_version: APPROVAL_SCHEMA_VERSION,
+            revision: 1,
+            run_id: &value.run_id,
+            workflow: &value.workflow,
+            code_version: &value.code_version,
+            args_digest: &value.args_digest,
+            phase: &value.phase,
+            key: &value.key,
+            occurrence: value.occurrence,
+            subject_digest: &value.subject_digest,
+            reason: &value.reason,
+            preview: value.preview.as_deref(),
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct RequestBinding<'a> {
+    identity_digest: &'a str,
+    requested_at: &'a str,
+    authority_public_key: &'a str,
+}
+
+#[derive(Serialize)]
+struct DecisionBinding<'a> {
+    schema_version: u32,
+    approval_id: &'a str,
+    request_digest: &'a str,
+    request_revision: u64,
+    decision: ApprovalDecisionKind,
+    actor: &'a str,
+    provenance: &'a str,
+    comment: Option<&'a str>,
+    reason: Option<&'a str>,
+    decided_at: &'a str,
+}
+
+impl<'a> From<&'a ApprovalDecision> for DecisionBinding<'a> {
+    fn from(value: &'a ApprovalDecision) -> Self {
+        Self {
+            schema_version: value.schema_version,
+            approval_id: &value.approval_id,
+            request_digest: &value.request_digest,
+            request_revision: value.request_revision,
+            decision: value.decision,
+            actor: &value.actor,
+            provenance: &value.provenance,
+            comment: value.comment.as_deref(),
+            reason: value.reason.as_deref(),
+            decided_at: &value.decided_at,
+        }
     }
 }
 
@@ -321,9 +471,11 @@ pub fn ensure_request(
     let request = if path_entry_exists(&request_path)? {
         let existing: ApprovalRequest = read_json(&request_path)?;
         existing.validate(&candidate.run_id)?;
-        if existing.request_digest != candidate.request_digest {
+        if existing.identity_digest != candidate.identity_digest
+            || existing.authority_public_key != candidate.authority_public_key
+        {
             return Err(invalid_data(
-                "approval id collision: existing request has a different digest",
+                "approval id collision: existing request has a different identity or authority",
             ));
         }
         existing
@@ -333,9 +485,11 @@ pub fn ensure_request(
             Ok(false) => {
                 let existing: ApprovalRequest = read_json(&request_path)?;
                 existing.validate(&candidate.run_id)?;
-                if existing.request_digest != candidate.request_digest {
+                if existing.identity_digest != candidate.identity_digest
+                    || existing.authority_public_key != candidate.authority_public_key
+                {
                     return Err(invalid_data(
-                        "approval request changed while it was being created",
+                        "approval request identity or authority changed while it was being created",
                     ));
                 }
                 existing
@@ -361,6 +515,7 @@ pub fn decide(
     runs_root: &Path,
     run_id: &str,
     approval_id: &str,
+    signing_key: &ApprovalSigningKey,
     kind: ApprovalDecisionKind,
     actor: String,
     provenance: String,
@@ -395,13 +550,14 @@ pub fn decide(
     }
     let decision = ApprovalDecision::new(
         &request,
+        signing_key,
         kind,
         actor,
         provenance,
         comment,
         reason,
         now_timestamp(),
-    );
+    )?;
     let path = decision_path(&run_dir, approval_id);
     if publish_json_once(&path, &decision)? {
         return Ok(DecisionWrite::Created(decision));
@@ -426,15 +582,20 @@ pub fn list_requests(runs_root: &Path, run_id: &str) -> io::Result<Vec<ApprovalR
     let run_dir = runs_root.join(run_id);
     let dir = approval_dir(&run_dir);
     let mut paths = match fs::read_dir(&dir) {
-        Ok(entries) => entries
-            .filter_map(Result::ok)
-            .map(|entry| entry.path())
-            .filter(|path| {
-                path.file_name()
+        Ok(entries) => {
+            let mut paths = Vec::new();
+            for entry in entries {
+                let path = entry?.path();
+                if path
+                    .file_name()
                     .and_then(|name| name.to_str())
                     .is_some_and(|name| name.ends_with(".request.json"))
-            })
-            .collect::<Vec<_>>(),
+                {
+                    paths.push(path);
+                }
+            }
+            paths
+        }
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(error) => return Err(error),
     };
@@ -444,9 +605,29 @@ pub fn list_requests(runs_root: &Path, run_id: &str) -> io::Result<Vec<ApprovalR
         .map(|path| {
             let request: ApprovalRequest = read_json(&path)?;
             request.validate(run_id)?;
-            ensure_request(&run_dir, &request)
+            let expected_name = format!("{}.request.json", request.approval_id);
+            if path.file_name().and_then(|name| name.to_str()) != Some(expected_name.as_str()) {
+                return Err(invalid_data(format!(
+                    "approval request filename does not match {}",
+                    request.approval_id
+                )));
+            }
+            read_resolution(&run_dir, request)
         })
         .collect()
+}
+
+fn read_resolution(run_dir: &Path, request: ApprovalRequest) -> io::Result<ApprovalResolution> {
+    let path = decision_path(run_dir, &request.approval_id);
+    if !path_entry_exists(&path)? {
+        return Ok(ApprovalResolution::Pending(request));
+    }
+    let decision: ApprovalDecision = read_json(&path)?;
+    decision.validate_for(&request)?;
+    Ok(match decision.decision {
+        ApprovalDecisionKind::Approve => ApprovalResolution::Approved(request, decision),
+        ApprovalDecisionKind::Reject => ApprovalResolution::Rejected(request, decision),
+    })
 }
 
 pub fn approval_dir(run_dir: &Path) -> PathBuf {
@@ -461,14 +642,27 @@ pub fn decision_path(run_dir: &Path, approval_id: &str) -> PathBuf {
     approval_dir(run_dir).join(format!("{approval_id}.decision.json"))
 }
 
-fn sha256_json(value: &serde_json::Value) -> String {
-    let bytes = serde_json::to_vec(value).expect("approval binding is JSON serializable");
-    sha256_bytes(&bytes)
+fn binding_bytes(value: &impl Serialize) -> Vec<u8> {
+    // All protocol bindings are fixed Rust structs. Their declared field order — not a
+    // serde_json map's feature-dependent ordering — is the wire format hashed/signed.
+    serde_json::to_vec(value).expect("approval binding is JSON serializable")
+}
+
+fn sha256_binding(value: &impl Serialize) -> String {
+    sha256_bytes(&binding_bytes(value))
 }
 
 fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> io::Result<T> {
-    let metadata = fs::symlink_metadata(path)?;
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let file = options.open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
         return Err(invalid_data(format!(
             "approval sidecar {} is not a regular file",
             path.display()
@@ -481,7 +675,16 @@ fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> io::Result<T> {
             APPROVAL_SIDECAR_MAX_BYTES
         )));
     }
-    let bytes = fs::read(path)?;
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.take(APPROVAL_SIDECAR_MAX_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > APPROVAL_SIDECAR_MAX_BYTES {
+        return Err(invalid_data(format!(
+            "approval sidecar {} exceeds {} bytes",
+            path.display(),
+            APPROVAL_SIDECAR_MAX_BYTES
+        )));
+    }
     serde_json::from_slice(&bytes).map_err(|error| {
         invalid_data(format!(
             "cannot parse approval sidecar {}: {error}",
@@ -520,7 +723,7 @@ fn publish_json_once(path: &Path, value: &impl Serialize) -> io::Result<bool> {
         file.sync_all()?;
         match fs::hard_link(&tmp, path) {
             Ok(()) => {
-                sync_dir(parent);
+                sync_dir(parent)?;
                 Ok(true)
             }
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Ok(false),
@@ -532,7 +735,10 @@ fn publish_json_once(path: &Path, value: &impl Serialize) -> io::Result<bool> {
     result
 }
 
+#[cfg(unix)]
 fn create_private_dir(path: &Path) -> io::Result<()> {
+    use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
+
     if let Ok(metadata) = fs::symlink_metadata(path) {
         if metadata.file_type().is_symlink() || !metadata.is_dir() {
             return Err(invalid_data(format!(
@@ -541,7 +747,14 @@ fn create_private_dir(path: &Path) -> io::Result<()> {
             )));
         }
     }
-    fs::create_dir_all(path)?;
+    if !path_entry_exists(path)? {
+        let parent = path
+            .parent()
+            .ok_or_else(|| invalid_data("approval directory has no parent"))?;
+        let mut builder = fs::DirBuilder::new();
+        builder.mode(0o700).create(path)?;
+        sync_dir(parent)?;
+    }
     let metadata = fs::symlink_metadata(path)?;
     if metadata.file_type().is_symlink() || !metadata.is_dir() {
         return Err(invalid_data(format!(
@@ -549,12 +762,16 @@ fn create_private_dir(path: &Path) -> io::Result<()> {
             path.display()
         )));
     }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
-    }
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
     Ok(())
+}
+
+#[cfg(not(unix))]
+fn create_private_dir(_path: &Path) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "durable approvals require a platform implementation that can enforce private ACLs",
+    ))
 }
 
 fn private_create_new(path: &Path) -> io::Result<File> {
@@ -568,10 +785,8 @@ fn private_create_new(path: &Path) -> io::Result<File> {
     options.open(path)
 }
 
-fn sync_dir(path: &Path) {
-    if let Ok(dir) = File::open(path) {
-        let _ = dir.sync_all();
-    }
+fn sync_dir(path: &Path) -> io::Result<()> {
+    File::open(path)?.sync_all()
 }
 
 fn validate_component(value: &str, label: &str) -> io::Result<()> {
@@ -615,10 +830,19 @@ fn invalid_data(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message.into())
 }
 
+// Approval storage intentionally fails closed on non-Unix platforms until a
+// private-directory ACL implementation is available there.
 #[cfg(test)]
+#[cfg(unix)]
 mod tests {
     use super::*;
-    use std::sync::{Arc, Barrier};
+    use std::sync::{Arc, Barrier, OnceLock};
+
+    fn test_key() -> ApprovalSigningKey {
+        static KEY: OnceLock<ApprovalSigningKey> = OnceLock::new();
+        KEY.get_or_init(|| ApprovalSigningKey::generate().unwrap())
+            .clone()
+    }
 
     fn temp_root(label: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
@@ -644,11 +868,18 @@ mod tests {
             reason: "Publish release".into(),
             preview: Some("Publish package@1.0.0".into()),
             requested_at: "0".into(),
+            authority_public_key: test_key().public_key_base64().unwrap(),
         }
     }
 
     fn request() -> ApprovalRequest {
         ApprovalRequest::new(request_input())
+    }
+
+    fn run_dir(root: &Path) -> PathBuf {
+        let path = root.join("run-1");
+        fs::create_dir_all(&path).unwrap();
+        path
     }
 
     #[test]
@@ -674,9 +905,86 @@ mod tests {
     }
 
     #[test]
+    fn request_timestamp_changes_full_digest_but_not_lookup_identity() {
+        let original = request();
+        let later = ApprovalRequest::new(NewApprovalRequest {
+            requested_at: "later".into(),
+            ..request_input()
+        });
+        assert_eq!(original.approval_id, later.approval_id);
+        assert_eq!(original.identity_digest, later.identity_digest);
+        assert_ne!(original.request_digest, later.request_digest);
+    }
+
+    #[test]
+    fn a_different_private_key_cannot_decide_the_request() {
+        let root = temp_root("wrong-key");
+        let request = request();
+        ensure_request(&run_dir(&root), &request).unwrap();
+        let wrong = ApprovalSigningKey::generate().unwrap();
+        let error = decide(
+            &root,
+            "run-1",
+            &request.approval_id,
+            &wrong,
+            ApprovalDecisionKind::Approve,
+            "mallory".into(),
+            "test".into(),
+            None,
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert!(matches!(
+            ensure_request(&root.join("run-1"), &request).unwrap(),
+            ApprovalResolution::Pending(_)
+        ));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn listing_is_read_only_and_rejects_a_misnamed_request() {
+        let root = temp_root("misnamed");
+        let directory = run_dir(&root);
+        let request = request();
+        ensure_request(&directory, &request).unwrap();
+        let original = request_path(&directory, &request.approval_id);
+        let misnamed = approval_dir(&directory).join("apr_wrong.request.json");
+        fs::rename(&original, &misnamed).unwrap();
+
+        assert_eq!(
+            list_requests(&root, "run-1").unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert!(
+            !original.exists(),
+            "listing must not recreate request files"
+        );
+        assert!(misnamed.exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn sidecar_symlinks_are_never_followed() {
+        use std::os::unix::fs::symlink;
+
+        let root = temp_root("sidecar-symlink");
+        let directory = run_dir(&root);
+        let request = request();
+        ensure_request(&directory, &request).unwrap();
+        let original = request_path(&directory, &request.approval_id);
+        let moved = approval_dir(&directory).join("saved-request.json");
+        fs::rename(&original, &moved).unwrap();
+        symlink(&moved, &original).unwrap();
+
+        assert!(ensure_request(&directory, &request).is_err());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn request_is_idempotent_and_decision_is_bound() {
         let root = temp_root("roundtrip");
-        let run_dir = root.join("run-1");
+        let run_dir = run_dir(&root);
         let request = request();
         assert!(matches!(
             ensure_request(&run_dir, &request).unwrap(),
@@ -690,6 +998,7 @@ mod tests {
             &root,
             "run-1",
             &request.approval_id,
+            &test_key(),
             ApprovalDecisionKind::Approve,
             "alice".into(),
             "cli".into(),
@@ -707,13 +1016,14 @@ mod tests {
     #[test]
     fn conflicting_decision_cannot_overwrite_the_winner() {
         let root = temp_root("conflict");
-        let run_dir = root.join("run-1");
+        let run_dir = run_dir(&root);
         let request = request();
         ensure_request(&run_dir, &request).unwrap();
         decide(
             &root,
             "run-1",
             &request.approval_id,
+            &test_key(),
             ApprovalDecisionKind::Approve,
             "alice".into(),
             "cli".into(),
@@ -725,6 +1035,7 @@ mod tests {
             &root,
             "run-1",
             &request.approval_id,
+            &test_key(),
             ApprovalDecisionKind::Reject,
             "bob".into(),
             "web".into(),
@@ -744,7 +1055,7 @@ mod tests {
     fn racing_opposite_decisions_have_one_winner() {
         let root = temp_root("race");
         let request = request();
-        ensure_request(&root.join("run-1"), &request).unwrap();
+        ensure_request(&run_dir(&root), &request).unwrap();
         let barrier = Arc::new(Barrier::new(3));
         let handles = [ApprovalDecisionKind::Approve, ApprovalDecisionKind::Reject]
             .into_iter()
@@ -752,12 +1063,14 @@ mod tests {
                 let root = root.clone();
                 let approval_id = request.approval_id.clone();
                 let barrier = Arc::clone(&barrier);
+                let signing_key = test_key();
                 std::thread::spawn(move || {
                     barrier.wait();
                     decide(
                         &root,
                         "run-1",
                         &approval_id,
+                        &signing_key,
                         kind,
                         kind.to_string(),
                         "test".into(),
@@ -790,7 +1103,7 @@ mod tests {
     #[test]
     fn tampered_request_is_rejected() {
         let root = temp_root("tamper");
-        let run_dir = root.join("run-1");
+        let run_dir = run_dir(&root);
         let request = request();
         ensure_request(&run_dir, &request).unwrap();
         let path = request_path(&run_dir, &request.approval_id);
@@ -808,7 +1121,7 @@ mod tests {
     #[test]
     fn tampered_revision_and_copied_decision_are_rejected() {
         let root = temp_root("binding-tamper");
-        let run_dir = root.join("run-1");
+        let run_dir = run_dir(&root);
         let first = request();
         let second = ApprovalRequest::new(NewApprovalRequest {
             key: "second-signoff".into(),
@@ -840,6 +1153,7 @@ mod tests {
             &root,
             "run-1",
             &first.approval_id,
+            &test_key(),
             ApprovalDecisionKind::Approve,
             "alice".into(),
             "cli".into(),
@@ -862,13 +1176,14 @@ mod tests {
     #[test]
     fn tampered_decision_is_rejected() {
         let root = temp_root("tampered-decision");
-        let run_dir = root.join("run-1");
+        let run_dir = run_dir(&root);
         let request = request();
         ensure_request(&run_dir, &request).unwrap();
         decide(
             &root,
             "run-1",
             &request.approval_id,
+            &test_key(),
             ApprovalDecisionKind::Approve,
             "alice".into(),
             "cli".into(),

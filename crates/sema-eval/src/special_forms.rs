@@ -324,6 +324,16 @@ fn resolve_embedded_file(
     ctx: &EvalContext,
     spec: &str,
 ) -> Option<(std::path::PathBuf, std::path::PathBuf, Vec<u8>)> {
+    // Approval runs may snapshot a literal absolute import under its canonical
+    // filesystem identity. Hosts choose the embedded keys, so an exact absolute
+    // key is safe to consult before applying the portable VFS normalization.
+    let spec_path = std::path::PathBuf::from(spec);
+    if spec_path.is_absolute() {
+        if let Some(bytes) = ctx.get_embedded_file(&spec_path) {
+            return Some((spec_path.clone(), spec_path, bytes));
+        }
+    }
+
     // Archive keys are clean, lexically-normalized, root-relative paths (e.g.
     // "util.sema", "lib/util.sema"). Look the spec up in the same normalized form
     // — resolving "./", "../", and interior "." — so every spelling that names
@@ -390,6 +400,11 @@ pub(crate) fn prepare_load(
             file_path,
             bytes,
         });
+    }
+    if ctx.embedded_files_only() {
+        return Err(SemaError::Io(format!(
+            "load {path_str}: file is not in the host dependency snapshot"
+        )));
     }
 
     if sema_core::vfs::is_vfs_active() {
@@ -480,6 +495,11 @@ pub(crate) fn prepare_import(
         return Ok(prepared_import(
             path_str, identity, file_path, bytes, selective, ctx,
         ));
+    }
+    if ctx.embedded_files_only() {
+        return Err(SemaError::Io(format!(
+            "import {path_str}: file is not in the host dependency snapshot"
+        )));
     }
 
     if sema_core::vfs::is_vfs_active() {
@@ -904,6 +924,35 @@ mod tests {
         assert_eq!(
             interp.eval_str(r#"(import "./lib/u.sema") v"#).unwrap(),
             Value::int(8)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn embedded_import_absolute_identity() {
+        let interp = Interpreter::new();
+        let key = PathBuf::from("/snapshots/u.sema");
+        embed(
+            &interp,
+            key.to_str().unwrap(),
+            "(module u (export v) (define v 11))",
+        );
+        assert_eq!(
+            interp.eval_str(&format!("(import {key:?}) v")).unwrap(),
+            Value::int(11)
+        );
+    }
+
+    #[test]
+    fn embedded_only_mode_rejects_unlisted_imports() {
+        let interp = Interpreter::new();
+        interp.ctx.set_embedded_files_only(true);
+        let error = interp.eval_str(r#"(import "unlisted.sema")"#).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("file is not in the host dependency snapshot"),
+            "{error}"
         );
     }
 

@@ -113,6 +113,48 @@ pub fn check_source(src: &str) -> Vec<Diag> {
     diags
 }
 
+/// Workflow-run contract: exactly one top-level `defworkflow`, and it must be the
+/// final executable form. This makes the host-observed envelope authoritative; later
+/// top-level forms cannot replace `:needs-approval` with an unrelated value.
+pub fn check_run_source(src: &str) -> Vec<Diag> {
+    let mut diags = check_source(src);
+    let (forms, spans, _symbol_spans, parse_errors) =
+        sema_reader::read_many_with_spans_recover(src);
+    if !parse_errors.is_empty() {
+        return diags;
+    }
+    let workflows = forms
+        .iter()
+        .filter(|form| list_head(form, "defworkflow").is_some())
+        .collect::<Vec<_>>();
+    if workflows.len() != 1 {
+        diags.push(Diag::error(
+            forms.last().and_then(|form| span_of(form, &spans)),
+            "E-WF-ENTRY",
+            format!(
+                "workflow run requires exactly one top-level defworkflow, found {}",
+                workflows.len()
+            ),
+        ));
+    }
+    if forms
+        .last()
+        .is_none_or(|form| list_head(form, "defworkflow").is_none())
+    {
+        diags.push(
+            Diag::error(
+                forms.last().and_then(|form| span_of(form, &spans)),
+                "E-WF-FINAL",
+                "defworkflow must be the final top-level form",
+            )
+            .with_hint(
+                "move helper definitions/imports before defworkflow and remove forms after it",
+            ),
+        );
+    }
+    diags
+}
+
 /// Return workflow-declared permission specs from `defworkflow` metadata.
 ///
 /// The metadata key is `:permissions`. Values use the same string syntax as the CLI
@@ -340,6 +382,67 @@ fn check_workflow(items: &[Value], form: &Value, spans: &SpanMap, out: &mut Vec<
     // Marker arity/opts checks across the whole body (including nested forms).
     for f in body {
         walk_markers(f, spans, out);
+        walk_approval_placement(f, spans, None, out);
+    }
+}
+
+/// A gate may be nested in ordinary sequential control flow, but not in a construct
+/// that owns cleanup, retries, a child task, or a nested workflow. Those constructs can
+/// either skip cleanup on an uncatchable control transfer or let an outer task continue.
+fn walk_approval_placement(
+    form: &Value,
+    spans: &SpanMap,
+    restricted_by: Option<&str>,
+    out: &mut Vec<Diag>,
+) {
+    let Some((head, items)) = head_symbol(form) else {
+        return;
+    };
+    if head == "quote" || head == "quasiquote" {
+        return;
+    }
+    if head == "approval" || head == "workflow/approval" {
+        if let Some(owner) = restricted_by {
+            out.push(
+                Diag::error(
+                    span_of(form, spans),
+                    "E-APPROVAL-PLACEMENT",
+                    format!("approval cannot be nested inside {owner}"),
+                )
+                .with_hint("place the approval as a sequential gate before this construct"),
+            );
+        }
+        return;
+    }
+    const RESTRICTED: &[&str] = &[
+        "async",
+        "async/spawn",
+        "async/spawn-all",
+        "async/map",
+        "async/pool-map",
+        "async/race",
+        "async/race-owned",
+        "async/with-timeout",
+        "parallel",
+        "parallel-settled",
+        "pipeline",
+        "pipeline-settled",
+        "try",
+        "guard",
+        "retry",
+        "with-retry",
+        "with-timeout",
+        "with-open",
+        "with-stream",
+        "with-file",
+        "step",
+        "agent",
+        "workflow/run",
+    ];
+    let restricted =
+        restricted_by.or_else(|| RESTRICTED.contains(&head.as_str()).then_some(head.as_str()));
+    for sub in items.iter().skip(1) {
+        walk_approval_placement(sub, spans, restricted, out);
     }
 }
 
@@ -483,7 +586,7 @@ fn walk_markers(form: &Value, spans: &SpanMap, out: &mut Vec<Diag>) {
                     ));
                 }
             }
-            "approval" => {
+            "approval" | "workflow/approval" => {
                 if items.len() != 3 {
                     out.push(Diag::error(
                         span,
@@ -834,6 +937,44 @@ mod tests {
         assert!(c.contains(&"E-APPROVAL-REASON"));
         assert!(c.contains(&"E-APPROVAL-SUBJECT"));
         assert!(c.contains(&"E-APPROVAL-PREVIEW"));
+    }
+
+    #[test]
+    fn workflow_run_requires_one_final_top_level_entrypoint() {
+        let trailing =
+            check_run_source(r#"(defworkflow d "d" {} {:status :success}) (file/write "x" "y")"#);
+        assert!(trailing.iter().any(|diag| diag.code == "E-WF-FINAL"));
+
+        let multiple = check_run_source(
+            r#"(defworkflow a "a" {} {:status :success})
+               (defworkflow b "b" {} {:status :success})"#,
+        );
+        assert!(multiple.iter().any(|diag| diag.code == "E-WF-ENTRY"));
+    }
+
+    #[test]
+    fn approval_rejects_concurrent_cleanup_and_nested_workflow_placement() {
+        let src = r#"
+          (defworkflow d "d" {}
+            (parallel (list (fn ()
+              (approval :a {:reason "r" :subject 1}))))
+            (try (workflow/approval :b {:reason "r" :subject 2}) (catch e e))
+            (workflow/run "nested" "n" {} (fn ()
+              (approval :c {:reason "r" :subject 3})))
+            (async (approval :d {:reason "r" :subject 4}))
+            (async/race-owned (list (fn ()
+              (approval :e {:reason "r" :subject 5}))))
+            (async/with-timeout 10 (fn ()
+              (approval :f {:reason "r" :subject 6})))
+            {:status :success})
+        "#;
+        assert_eq!(
+            codes(src)
+                .into_iter()
+                .filter(|code| *code == "E-APPROVAL-PLACEMENT")
+                .count(),
+            6
+        );
     }
 
     #[test]

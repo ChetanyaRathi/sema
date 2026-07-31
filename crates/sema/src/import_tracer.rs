@@ -18,6 +18,25 @@ use sema_core::Value;
 /// dependency. The root file itself is **not** included (it is compiled to
 /// bytecode separately).
 pub fn trace_imports(root_file: &Path) -> Result<HashMap<String, Vec<u8>>, String> {
+    trace_imports_with_mode(root_file, false).map(|snapshot| snapshot.files)
+}
+
+/// Exact dependency bytes and their filesystem identities for an approval run.
+#[derive(Debug)]
+pub struct StrictImportSnapshot {
+    /// Portable VFS keys used to hash and embed the dependency closure.
+    pub files: HashMap<String, Vec<u8>>,
+    /// Filesystem spellings used to make absolute imports hit the snapshot.
+    pub filesystem_files: HashMap<PathBuf, Vec<u8>>,
+}
+
+/// Approval binding variant: every import must be literal, readable, and inside the
+/// project/package roots so the returned map is a complete executable dependency set.
+pub fn trace_imports_strict(root_file: &Path) -> Result<StrictImportSnapshot, String> {
+    trace_imports_with_mode(root_file, true)
+}
+
+fn trace_imports_with_mode(root_file: &Path, strict: bool) -> Result<StrictImportSnapshot, String> {
     let root_file = root_file
         .canonicalize()
         .map_err(|e| format!("cannot canonicalize root file {}: {e}", root_file.display()))?;
@@ -29,6 +48,7 @@ pub fn trace_imports(root_file: &Path) -> Result<HashMap<String, Vec<u8>>, Strin
 
     let mut visited: HashSet<PathBuf> = HashSet::new();
     let mut result: HashMap<String, Vec<u8>> = HashMap::new();
+    let mut filesystem_files: HashMap<PathBuf, Vec<u8>> = HashMap::new();
 
     // Mark the root file as visited so we never add it to the result map.
     visited.insert(root_file.clone());
@@ -45,9 +65,20 @@ pub fn trace_imports(root_file: &Path) -> Result<HashMap<String, Vec<u8>>, Strin
         )
     })?;
 
-    trace_file_imports(&exprs, &root_file, &root_dir, &mut visited, &mut result)?;
+    trace_file_imports(
+        &exprs,
+        &root_file,
+        &root_dir,
+        &mut visited,
+        &mut result,
+        &mut filesystem_files,
+        strict,
+    )?;
 
-    Ok(result)
+    Ok(StrictImportSnapshot {
+        files: result,
+        filesystem_files,
+    })
 }
 
 /// Parse the expressions from a single file and extract all import/load paths,
@@ -58,9 +89,19 @@ fn trace_file_imports(
     root_dir: &Path,
     visited: &mut HashSet<PathBuf>,
     result: &mut HashMap<String, Vec<u8>>,
+    filesystem_files: &mut HashMap<PathBuf, Vec<u8>>,
+    strict: bool,
 ) -> Result<(), String> {
     for expr in exprs {
-        extract_imports(expr, current_file, root_dir, visited, result)?;
+        extract_imports(
+            expr,
+            current_file,
+            root_dir,
+            visited,
+            result,
+            filesystem_files,
+            strict,
+        )?;
     }
     Ok(())
 }
@@ -74,6 +115,8 @@ fn extract_imports(
     root_dir: &Path,
     visited: &mut HashSet<PathBuf>,
     result: &mut HashMap<String, Vec<u8>>,
+    filesystem_files: &mut HashMap<PathBuf, Vec<u8>>,
+    strict: bool,
 ) -> Result<(), String> {
     let items = match expr.as_list() {
         Some(items) if !items.is_empty() => items,
@@ -88,8 +131,22 @@ fn extract_imports(
             "import" | "load" => {
                 if items.len() >= 2 {
                     if let Some(path_str) = items[1].as_str() {
-                        process_import(path_str, current_file, root_dir, visited, result)?;
+                        process_import(
+                            path_str,
+                            current_file,
+                            root_dir,
+                            visited,
+                            result,
+                            filesystem_files,
+                            strict,
+                        )?;
                     } else {
+                        if strict {
+                            return Err(format!(
+                                "dynamic {head} in {} cannot be bound to an approval revision",
+                                current_file.display()
+                            ));
+                        }
                         // Dynamic import -- cannot resolve statically.
                         crate::print_cli_warning(format!(
                             "dynamic {} in {} cannot be resolved statically; \
@@ -108,7 +165,15 @@ fn extract_imports(
                 // may be an (export ...) form in there too -- just recurse
                 // into everything after the name.
                 for item in items.iter().skip(2) {
-                    extract_imports(item, current_file, root_dir, visited, result)?;
+                    extract_imports(
+                        item,
+                        current_file,
+                        root_dir,
+                        visited,
+                        result,
+                        filesystem_files,
+                        strict,
+                    )?;
                 }
                 return Ok(());
             }
@@ -118,7 +183,15 @@ fn extract_imports(
 
     // For any other list, recurse into all children.
     for item in items.iter() {
-        extract_imports(item, current_file, root_dir, visited, result)?;
+        extract_imports(
+            item,
+            current_file,
+            root_dir,
+            visited,
+            result,
+            filesystem_files,
+            strict,
+        )?;
     }
 
     Ok(())
@@ -132,9 +205,18 @@ fn process_import(
     root_dir: &Path,
     visited: &mut HashSet<PathBuf>,
     result: &mut HashMap<String, Vec<u8>>,
+    filesystem_files: &mut HashMap<PathBuf, Vec<u8>>,
+    strict: bool,
 ) -> Result<(), String> {
     if is_package_import(import_path) {
-        return process_package_import(import_path, root_dir, visited, result);
+        return process_package_import(
+            import_path,
+            root_dir,
+            visited,
+            result,
+            filesystem_files,
+            strict,
+        );
     }
 
     // Resolve relative to the directory of the importing file.
@@ -153,6 +235,12 @@ fn process_import(
     let canonical = match resolved.canonicalize() {
         Ok(c) => c,
         Err(_) => {
+            if strict {
+                return Err(format!(
+                    "import {import_path:?} from {} cannot be resolved for approval binding",
+                    current_file.display()
+                ));
+            }
             crate::print_cli_warning(format!(
                 "import \"{}\" (from {}) could not be resolved at build time; \
                  not bundled — it will be resolved at runtime (filesystem/VFS)",
@@ -165,6 +253,9 @@ fn process_import(
 
     // Circular import protection.
     if visited.contains(&canonical) {
+        if let Some(contents) = filesystem_files.get(&canonical).cloned() {
+            filesystem_files.insert(resolved, contents);
+        }
         return Ok(());
     }
     visited.insert(canonical.clone());
@@ -173,6 +264,12 @@ fn process_import(
     let contents = match std::fs::read(&canonical) {
         Ok(c) => c,
         Err(_) => {
+            if strict {
+                return Err(format!(
+                    "import {} cannot be read for approval binding",
+                    canonical.display()
+                ));
+            }
             crate::print_cli_warning(format!(
                 "import \"{}\" could not be read at build time; not bundled \
                  (resolved at runtime)",
@@ -181,6 +278,8 @@ fn process_import(
             return Ok(());
         }
     };
+    filesystem_files.insert(resolved, contents.clone());
+    filesystem_files.insert(canonical.clone(), contents.clone());
 
     // Compute relative path for the VFS key.
     // Check packages_dir FIRST — package files must get package-relative keys
@@ -195,6 +294,12 @@ fn process_import(
             } else if let Ok(rel) = canonical.strip_prefix(root_dir) {
                 rel.to_string_lossy().replace('\\', "/")
             } else {
+                if strict {
+                    return Err(format!(
+                        "imported file {} is outside the project and packages directories",
+                        canonical.display()
+                    ));
+                }
                 crate::print_cli_warning(format!(
                     "imported file {} is outside the project and packages \
                      directories; not bundled (resolved at runtime)",
@@ -205,6 +310,12 @@ fn process_import(
         } else if let Ok(rel) = canonical.strip_prefix(root_dir) {
             rel.to_string_lossy().replace('\\', "/")
         } else {
+            if strict {
+                return Err(format!(
+                    "imported file {} is outside the project directory",
+                    canonical.display()
+                ));
+            }
             crate::print_cli_warning(format!(
                 "imported file {} is outside the project directory; not \
                  bundled (resolved at runtime)",
@@ -234,8 +345,26 @@ fn process_import(
     // Recursively trace the imported file's own imports.
     // Only parse if it looks like a text file (sema source).
     if let Ok(source) = std::str::from_utf8(&contents) {
-        if let Ok(exprs) = sema_reader::read_many(source) {
-            trace_file_imports(&exprs, &canonical, root_dir, visited, result)?;
+        match sema_reader::read_many(source) {
+            Ok(exprs) => {
+                trace_file_imports(
+                    &exprs,
+                    &canonical,
+                    root_dir,
+                    visited,
+                    result,
+                    filesystem_files,
+                    strict,
+                )?;
+            }
+            Err(error) if strict => {
+                return Err(format!(
+                    "cannot parse imported file {} for approval binding: {}",
+                    canonical.display(),
+                    error.format_plain()
+                ));
+            }
+            Err(_) => {}
         }
         // If parsing fails, we still included the file -- just don't trace deeper.
     }
@@ -250,6 +379,8 @@ fn process_package_import(
     root_dir: &Path,
     visited: &mut HashSet<PathBuf>,
     result: &mut HashMap<String, Vec<u8>>,
+    filesystem_files: &mut HashMap<PathBuf, Vec<u8>>,
+    strict: bool,
 ) -> Result<(), String> {
     let resolved = match resolve_package_import(import_path) {
         Ok(p) => p,
@@ -275,6 +406,7 @@ fn process_package_import(
 
     let contents = std::fs::read(&canonical)
         .map_err(|e| format!("cannot read {}: {e}", canonical.display()))?;
+    filesystem_files.insert(canonical.clone(), contents.clone());
 
     // Use the package path as the VFS key for portability.
     // Validate and check for collisions.
@@ -294,8 +426,25 @@ fn process_package_import(
 
     // Recursively trace the package file's own imports.
     if let Ok(source) = std::str::from_utf8(&contents) {
-        if let Ok(exprs) = sema_reader::read_many(source) {
-            trace_file_imports(&exprs, &canonical, root_dir, visited, result)?;
+        match sema_reader::read_many(source) {
+            Ok(exprs) => {
+                trace_file_imports(
+                    &exprs,
+                    &canonical,
+                    root_dir,
+                    visited,
+                    result,
+                    filesystem_files,
+                    strict,
+                )?;
+            }
+            Err(error) if strict => {
+                return Err(format!(
+                    "cannot parse package import {import_path:?} for approval binding: {}",
+                    error.format_plain()
+                ));
+            }
+            Err(_) => {}
         }
     }
 
@@ -391,6 +540,22 @@ mod tests {
         fs::write(dir.join("main.sema"), "(import some-var)").unwrap();
         let result = trace_imports(&dir.join("main.sema")).unwrap();
         assert!(result.is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn strict_trace_rejects_dynamic_and_unresolved_imports() {
+        let dir = tmpdir("strict-incomplete");
+        let main = dir.join("main.sema");
+        fs::write(&main, "(import some-var)").unwrap();
+        assert!(trace_imports_strict(&main)
+            .unwrap_err()
+            .contains("cannot be bound to an approval revision"));
+
+        fs::write(&main, r#"(import "missing.sema")"#).unwrap();
+        assert!(trace_imports_strict(&main)
+            .unwrap_err()
+            .contains("cannot be resolved for approval binding"));
         let _ = fs::remove_dir_all(&dir);
     }
 

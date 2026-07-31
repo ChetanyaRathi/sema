@@ -25,9 +25,10 @@ use sema_core::runtime::{
     downcast_send_payload, CancelDisposition, CancelHook, CancelHookError, CompletionDecoder,
     CompletionKind, DecodedCompletion, ExternalFailure, InterruptibleResource, NativeCall,
     NativeCallContext, NativeContinuation, NativeOutcome, NativeResult, NativeSuspend,
-    PreparedExternalOperation, ResumeInput, SendPayload, TaskContextHandle, Trace, WaitKind,
+    PreparedExternalOperation, QuarantineBound, ResumeInput, SendPayload, TaskContextHandle, Trace,
+    WaitKind,
 };
-use sema_core::{PolicyDenial, SemaError, Value};
+use sema_core::{PolicyDenial, SemaError, Value, ValueViewRef};
 use sema_llm::builtins::{
     PolicyAttributionScope, PolicyBypassScope, PolicyDecisionSink, PolicyObservation,
     PolicyObservationKind, PolicyScope,
@@ -72,6 +73,38 @@ fn approval_request(
     task_context: Option<&TaskContextHandle>,
     args: &[Value],
 ) -> Result<(std::path::PathBuf, ApprovalRequest), SemaError> {
+    approval_request_inner(task_context, args).map_err(|error| fail_approval(task_context, error))
+}
+
+fn fail_approval(task_context: Option<&TaskContextHandle>, error: SemaError) -> SemaError {
+    let should_latch = !matches!(
+        error.inner(),
+        SemaError::WorkflowApprovalRequired { .. } | SemaError::WorkflowApprovalRejected { .. }
+    );
+    let error = match error.inner() {
+        SemaError::WorkflowApprovalRequired { .. }
+        | SemaError::WorkflowApprovalRejected { .. }
+        | SemaError::WorkflowApprovalFailed { .. } => error,
+        _ => SemaError::WorkflowApprovalFailed {
+            message: error.to_string(),
+        },
+    };
+    if should_latch {
+        let message = match error.inner() {
+            SemaError::WorkflowApprovalFailed { message } => message.clone(),
+            _ => error.to_string(),
+        };
+        if let Some(ctx) = context::current_for(task_context) {
+            ctx.fail_approval(message);
+        }
+    }
+    error
+}
+
+fn approval_request_inner(
+    task_context: Option<&TaskContextHandle>,
+    args: &[Value],
+) -> Result<(std::path::PathBuf, ApprovalRequest), SemaError> {
     if args.len() != 2 {
         return Err(SemaError::arity("workflow/approval", "2", args.len()));
     }
@@ -96,13 +129,7 @@ fn approval_request(
     let subject = opts
         .get(&Value::keyword("subject"))
         .ok_or_else(|| SemaError::eval("approval requires a :subject value"))?;
-    let (subject_repr, truncated) = context::compact_capped(subject, APPROVAL_SUBJECT_MAX_BYTES);
-    if truncated {
-        return Err(SemaError::eval(format!(
-            "approval :subject must not exceed {APPROVAL_SUBJECT_MAX_BYTES} rendered bytes"
-        )));
-    }
-    let subject_digest = sema_workflow::approval::sha256_bytes(subject_repr.as_bytes());
+    let subject_digest = canonical_approval_subject_digest(subject)?;
     let preview = opts
         .get(&Value::keyword("preview"))
         .map(|value| {
@@ -123,10 +150,21 @@ fn approval_request(
     }
     let ctx = context::current_for(task_context)
         .ok_or_else(|| SemaError::eval("approval outside a workflow/run"))?;
+    if !context::approval_scope_is_root_owner(task_context) {
+        return Err(SemaError::eval(
+            "approval must be a sequential gate in the owning workflow task; nested, spawned, and concurrent approval gates are not supported",
+        ));
+    }
     let code_version = ctx.approval_code_version();
     if code_version.trim().is_empty() {
         return Err(SemaError::eval(
             "approval requires a stable workflow code version; run the file with `sema workflow run` or set SEMA_WORKFLOW_APPROVAL_CODE_VERSION",
+        ));
+    }
+    let authority_public_key = ctx.approval_public_key();
+    if authority_public_key.trim().is_empty() {
+        return Err(SemaError::eval(
+            "approval requires a host-selected Ed25519 public key; use --approval-public-key-file for headless runs",
         ));
     }
     let phase = ctx.cur_phase_label();
@@ -143,8 +181,164 @@ fn approval_request(
         reason,
         preview,
         requested_at: ctx.ts(),
+        authority_public_key,
     });
     Ok((ctx.run_dir(), request))
+}
+
+fn canonical_approval_subject_digest(subject: &Value) -> Result<String, SemaError> {
+    let mut bytes = Vec::new();
+    encode_approval_subject(subject, &mut bytes, 0)?;
+    Ok(sema_workflow::approval::sha256_bytes(&bytes))
+}
+
+fn append_subject_bytes(out: &mut Vec<u8>, bytes: &[u8]) -> Result<(), SemaError> {
+    let needed = 8usize.saturating_add(bytes.len());
+    if out.len().saturating_add(needed) > APPROVAL_SUBJECT_MAX_BYTES {
+        return Err(SemaError::eval(format!(
+            "approval :subject canonical encoding must not exceed {APPROVAL_SUBJECT_MAX_BYTES} bytes"
+        )));
+    }
+    out.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+    out.extend_from_slice(bytes);
+    Ok(())
+}
+
+fn encode_approval_subject(
+    value: &Value,
+    out: &mut Vec<u8>,
+    depth: usize,
+) -> Result<(), SemaError> {
+    if depth > 128 {
+        return Err(SemaError::eval(
+            "approval :subject nesting exceeds 128 levels",
+        ));
+    }
+    let tag = match value.view_ref() {
+        ValueViewRef::Nil => b"nil".as_slice(),
+        ValueViewRef::Bool(v) => {
+            append_subject_bytes(out, b"bool")?;
+            return append_subject_bytes(out, if v { b"1" } else { b"0" });
+        }
+        ValueViewRef::Int(v) => {
+            append_subject_bytes(out, b"int")?;
+            return append_subject_bytes(out, v.to_string().as_bytes());
+        }
+        ValueViewRef::BigInt(v) => {
+            append_subject_bytes(out, b"int")?;
+            return append_subject_bytes(out, v.to_string().as_bytes());
+        }
+        ValueViewRef::Rational(v) => {
+            append_subject_bytes(out, b"rational")?;
+            return append_subject_bytes(out, v.to_string().as_bytes());
+        }
+        ValueViewRef::Float(v) => {
+            append_subject_bytes(out, b"float")?;
+            return append_subject_bytes(out, &v.to_bits().to_le_bytes());
+        }
+        ValueViewRef::String(v) => {
+            append_subject_bytes(out, b"string")?;
+            return append_subject_bytes(out, v.as_bytes());
+        }
+        ValueViewRef::Symbol(_) => {
+            append_subject_bytes(out, b"symbol")?;
+            return append_subject_bytes(out, value.as_symbol().unwrap_or_default().as_bytes());
+        }
+        ValueViewRef::Keyword(_) => {
+            append_subject_bytes(out, b"keyword")?;
+            return append_subject_bytes(out, value.as_keyword().unwrap_or_default().as_bytes());
+        }
+        ValueViewRef::Char(v) => {
+            append_subject_bytes(out, b"char")?;
+            return append_subject_bytes(out, &(v as u32).to_le_bytes());
+        }
+        ValueViewRef::List(items) | ValueViewRef::Vector(items) => {
+            let tag: &[u8] = if value.is_list() { b"list" } else { b"vector" };
+            append_subject_bytes(out, tag)?;
+            append_subject_bytes(out, &(items.len() as u64).to_le_bytes())?;
+            for item in items {
+                encode_approval_subject(item, out, depth + 1)?;
+            }
+            return Ok(());
+        }
+        ValueViewRef::Map(map) => {
+            let mut entries = Vec::with_capacity(map.len());
+            let mut encoded_bytes = 0usize;
+            for (key, item) in map {
+                let mut encoded = Vec::new();
+                encode_approval_subject(key, &mut encoded, depth + 1)?;
+                encode_approval_subject(item, &mut encoded, depth + 1)?;
+                encoded_bytes = encoded_bytes
+                    .checked_add(encoded.len())
+                    .filter(|total| *total <= APPROVAL_SUBJECT_MAX_BYTES)
+                    .ok_or_else(|| {
+                        SemaError::eval(format!(
+                            "approval :subject canonical encoding must not exceed {APPROVAL_SUBJECT_MAX_BYTES} bytes"
+                        ))
+                    })?;
+                entries.push(encoded);
+            }
+            entries.sort();
+            append_subject_bytes(out, b"map")?;
+            append_subject_bytes(out, &(entries.len() as u64).to_le_bytes())?;
+            for entry in entries {
+                append_subject_bytes(out, &entry)?;
+            }
+            return Ok(());
+        }
+        ValueViewRef::HashMap(map) => {
+            let mut entries = Vec::with_capacity(map.len());
+            let mut encoded_bytes = 0usize;
+            for (key, item) in map {
+                let mut encoded = Vec::new();
+                encode_approval_subject(key, &mut encoded, depth + 1)?;
+                encode_approval_subject(item, &mut encoded, depth + 1)?;
+                encoded_bytes = encoded_bytes
+                    .checked_add(encoded.len())
+                    .filter(|total| *total <= APPROVAL_SUBJECT_MAX_BYTES)
+                    .ok_or_else(|| {
+                        SemaError::eval(format!(
+                            "approval :subject canonical encoding must not exceed {APPROVAL_SUBJECT_MAX_BYTES} bytes"
+                        ))
+                    })?;
+                entries.push(encoded);
+            }
+            entries.sort();
+            append_subject_bytes(out, b"hashmap")?;
+            append_subject_bytes(out, &(entries.len() as u64).to_le_bytes())?;
+            for entry in entries {
+                append_subject_bytes(out, &entry)?;
+            }
+            return Ok(());
+        }
+        ValueViewRef::Bytevector(bytes) => {
+            append_subject_bytes(out, b"bytevector")?;
+            return append_subject_bytes(out, bytes);
+        }
+        ValueViewRef::F64Array(values) => {
+            append_subject_bytes(out, b"f64-array")?;
+            append_subject_bytes(out, &(values.len() as u64).to_le_bytes())?;
+            for value in values {
+                append_subject_bytes(out, &value.to_bits().to_le_bytes())?;
+            }
+            return Ok(());
+        }
+        ValueViewRef::I64Array(values) => {
+            append_subject_bytes(out, b"i64-array")?;
+            append_subject_bytes(out, &(values.len() as u64).to_le_bytes())?;
+            for value in values {
+                append_subject_bytes(out, &value.to_le_bytes())?;
+            }
+            return Ok(());
+        }
+        _ => {
+            return Err(SemaError::eval(format!(
+                "approval :subject must be immutable canonical data, got {}",
+                value.type_name()
+            )));
+        }
+    };
+    append_subject_bytes(out, tag)
 }
 
 fn approval_resolution_value(resolution: ApprovalResolution) -> Value {
@@ -313,13 +507,14 @@ impl CompletionDecoder for ApprovalDecoder {
                 "workflow/approval",
             ) {
                 Ok(Ok(resolution)) => Ok(approval_resolution_value(resolution)),
-                Ok(Err(message)) => Err(SemaError::Io(message)),
-                Err(failure) => Err(SemaError::eval(failure.message().to_string())),
+                Ok(Err(message)) => Err(SemaError::WorkflowApprovalFailed { message }),
+                Err(failure) => Err(SemaError::WorkflowApprovalFailed {
+                    message: failure.message().to_string(),
+                }),
             },
-            Err(failure) => Err(SemaError::eval(format!(
-                "workflow/approval: {}",
-                failure.message()
-            ))),
+            Err(failure) => Err(SemaError::WorkflowApprovalFailed {
+                message: format!("workflow/approval: {}", failure.message()),
+            }),
         }
     }
 }
@@ -341,44 +536,32 @@ impl NativeContinuation for ApprovalContinuation {
         match input {
             ResumeInput::Returned(value) => {
                 let task_context = context.task_context.clone();
-                apply_approval_resolution(Some(&task_context), value).map(NativeOutcome::Return)
+                apply_approval_resolution(Some(&task_context), value)
+                    .map_err(|error| fail_approval(Some(&task_context), error))
+                    .map(NativeOutcome::Return)
             }
-            ResumeInput::Failed(error) => Err(error),
-            ResumeInput::Cancelled(reason) => Err(SemaError::eval(format!(
-                "workflow/approval was cancelled ({reason:?})"
-            ))),
-            ResumeInput::Runtime(_) => Err(SemaError::internal(
-                "workflow/approval received an unexpected runtime response",
+            ResumeInput::Failed(error) => Err(fail_approval(Some(&context.task_context), error)),
+            ResumeInput::Cancelled(reason) => Err(fail_approval(
+                Some(&context.task_context),
+                SemaError::eval(format!("workflow/approval was cancelled ({reason:?})")),
+            )),
+            ResumeInput::Runtime(_) => Err(fail_approval(
+                Some(&context.task_context),
+                SemaError::internal("workflow/approval received an unexpected runtime response"),
             )),
         }
-    }
-}
-
-struct ApprovalCancelHook;
-
-impl Trace for ApprovalCancelHook {
-    fn trace(&self, _sink: &mut dyn FnMut(GcEdge<'_>)) -> bool {
-        true
-    }
-}
-
-impl CancelHook for ApprovalCancelHook {
-    fn cancel(&mut self) -> Result<CancelDisposition, CancelHookError> {
-        Ok(CancelDisposition::Reaped)
-    }
-
-    fn reap(&mut self) -> Result<CancelDisposition, CancelHookError> {
-        Ok(CancelDisposition::Reaped)
     }
 }
 
 fn approval_suspend(run_dir: PathBuf, request: ApprovalRequest) -> NativeResult {
     let kind = CompletionKind::try_from_raw(APPROVAL_COMPLETION_KIND)
         .expect("approval completion kind is nonzero");
-    let prepared = PreparedExternalOperation::interruptible_blocking(
+    let bound = QuarantineBound::hard_deadline(Duration::from_secs(5))
+        .expect("approval store cleanup deadline is nonzero");
+    let prepared = PreparedExternalOperation::quarantined_blocking(
         kind,
         Box::new(ApprovalDecoder),
-        InterruptibleResource::new("workflow/approval-store", Box::new(ApprovalCancelHook)),
+        bound,
         move || {
             let result = sema_workflow::approval::ensure_request(&run_dir, &request)
                 .map_err(|error| error.to_string());
@@ -1315,9 +1498,23 @@ impl Drop for RunTeardown {
 fn finish_run(
     task_context: Option<&TaskContextHandle>,
     mut teardown: RunTeardown,
-    result: Result<Value, SemaError>,
+    mut result: Result<Value, SemaError>,
     durable: bool,
 ) -> NativeResult {
+    if result.is_ok() {
+        if let Some(message) =
+            context::current_for(task_context).and_then(|ctx| ctx.approval_failure())
+        {
+            result = Err(SemaError::WorkflowApprovalFailed { message });
+        }
+    }
+    let approval_control = result
+        .as_ref()
+        .err()
+        .filter(|error| error.is_uncatchable())
+        .cloned();
+    let propagate_to_outer =
+        approval_control.is_some() && context::scope_depth_for(task_context) > 1;
     let (mut status, mut envelope, mut reason) = match &result {
         Ok(v) => {
             let envelope = success_envelope(v.clone());
@@ -1398,6 +1595,9 @@ fn finish_run(
     // Dropping the teardown removes the exact scope token (its `guard`) and is a no-op
     // second MCP close.
     drop(teardown);
+    if propagate_to_outer {
+        return Err(approval_control.expect("checked above"));
+    }
     match ack {
         // Runtime (quantum) normal completion: park on the External flush-ack so the task
         // resumes — returning the envelope — only once the writer has flushed to disk.
@@ -1571,8 +1771,12 @@ fn run_plan(
     let thunk = args[3].clone();
     let policy = compile_policy(&meta)?;
     validate_required_metadata(policy.as_deref(), &meta)?;
-    let workspace_root = std::env::current_dir()
-        .map_err(|error| SemaError::eval(format!("workflow/run: current directory: {error}")))?;
+    let workspace_root = match context::host_workspace_root() {
+        Some(root) => root,
+        None => std::env::current_dir().map_err(|error| {
+            SemaError::eval(format!("workflow/run: current directory: {error}"))
+        })?,
+    };
 
     // Open the run scope: sets up the journal sink under ./.sema/runs/<run-id>/, installs
     // the thread-local WorkflowCtx, and returns a panic-safe Drop guard that reaps the
@@ -1956,8 +2160,9 @@ pub fn register(env: &sema_core::Env) {
             |args| {
                 let (run_dir, request) = approval_request(None, args)?;
                 let resolution = sema_workflow::approval::ensure_request(&run_dir, &request)
-                    .map_err(|error| SemaError::Io(error.to_string()))?;
+                    .map_err(|error| fail_approval(None, SemaError::Io(error.to_string())))?;
                 apply_approval_resolution(None, approval_resolution_value(resolution))
+                    .map_err(|error| fail_approval(None, error))
             },
             |context, args| {
                 let task_context = context.task_context.clone();
@@ -2237,5 +2442,44 @@ mod continuation_tests {
         let mut edges = 0usize;
         assert!(checkpoint.trace(&mut |_| edges += 1));
         assert_eq!(edges, 0, "checkpoint teardown must expose no Value edges");
+    }
+
+    #[test]
+    fn approval_subject_encoding_is_type_preserving_and_rejects_mutability() {
+        let string = canonical_approval_subject_digest(&Value::string("x")).unwrap();
+        let keyword = canonical_approval_subject_digest(&Value::keyword("x")).unwrap();
+        let symbol = canonical_approval_subject_digest(&Value::symbol("x")).unwrap();
+        assert_ne!(string, keyword);
+        assert_ne!(keyword, symbol);
+
+        let mutable = Value::mutable_cell(Value::int(1));
+        let error = canonical_approval_subject_digest(&mutable).unwrap_err();
+        assert!(error.to_string().contains("immutable canonical data"));
+    }
+
+    #[test]
+    fn approval_subject_hashmap_digest_is_insertion_order_independent() {
+        let first = Value::hashmap(vec![
+            (Value::string("a"), Value::int(1)),
+            (Value::string("b"), Value::int(2)),
+        ]);
+        let second = Value::hashmap(vec![
+            (Value::string("b"), Value::int(2)),
+            (Value::string("a"), Value::int(1)),
+        ]);
+        assert_eq!(
+            canonical_approval_subject_digest(&first).unwrap(),
+            canonical_approval_subject_digest(&second).unwrap()
+        );
+    }
+
+    #[test]
+    fn approval_infrastructure_failures_are_uncatchable() {
+        let error = fail_approval(None, SemaError::eval("approval store unavailable"));
+        assert!(error.is_uncatchable());
+        assert!(matches!(
+            error.inner(),
+            SemaError::WorkflowApprovalFailed { .. }
+        ));
     }
 }

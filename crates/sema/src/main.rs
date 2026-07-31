@@ -558,7 +558,7 @@ enum PkgCommands {
     },
 }
 
-#[derive(Debug, Clone, Copy, ValueEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum ApprovalMode {
     /// Prompt on a real terminal; otherwise pause with exit code 3.
     Auto,
@@ -617,6 +617,12 @@ enum WorkflowCommands {
         /// How a pending human approval is handled.
         #[arg(long, value_enum, default_value = "auto")]
         approval_mode: ApprovalMode,
+
+        /// File containing the base64 Ed25519 public key authorized to decide headless
+        /// approval requests. Interactive prompt mode generates an in-memory key when
+        /// this is omitted.
+        #[arg(long)]
+        approval_public_key_file: Option<String>,
     },
     /// List durable approval requests and decisions for one run.
     Approvals {
@@ -646,6 +652,10 @@ enum WorkflowCommands {
         /// Actor recorded in the decision (defaults to SEMA_APPROVAL_ACTOR/USER).
         #[arg(long)]
         actor: Option<String>,
+
+        /// Private Ed25519 PKCS#8 key created by `workflow approval-keygen`.
+        #[arg(long)]
+        signing_key_file: String,
     },
     /// Reject one pending workflow request.
     Reject {
@@ -662,6 +672,20 @@ enum WorkflowCommands {
         /// Actor recorded in the decision (defaults to SEMA_APPROVAL_ACTOR/USER).
         #[arg(long)]
         actor: Option<String>,
+
+        /// Private Ed25519 PKCS#8 key created by `workflow approval-keygen`.
+        #[arg(long)]
+        signing_key_file: String,
+    },
+    /// Generate an Ed25519 approval authority key pair.
+    ApprovalKeygen {
+        /// New private-key file (created with mode 0600 on Unix).
+        #[arg(long)]
+        private_key_file: String,
+
+        /// New public-key file safe to pass to workflow runs.
+        #[arg(long)]
+        public_key_file: String,
     },
     /// Backfill the cross-run SQLite index (`<run-dir>/index.db`) from every run's
     /// journal — for offline/CI use; the viewer also syncs lazily on request.
@@ -815,27 +839,85 @@ fn build_interpreter(sandbox: &sema_core::Sandbox) -> Interpreter {
 /// Ctrl-C keypress at the REPL prompt itself never reaches this handler as a
 /// real `SIGINT` — it is delivered to reedline as a raw key event and handled
 /// entirely by the REPL's own `Signal::CtrlC` branch, unchanged.
+struct CliCtrlCState {
+    handle: std::sync::Mutex<Option<sema_vm::runtime::RuntimeCommandHandle>>,
+    prompt_active: std::sync::atomic::AtomicBool,
+    started: std::time::Instant,
+    last_sigint_ms: std::sync::atomic::AtomicU64,
+}
+
+static CLI_CTRLC_STATE: std::sync::OnceLock<CliCtrlCState> = std::sync::OnceLock::new();
+static CLI_CTRLC_HANDLER: std::sync::OnceLock<Result<(), String>> = std::sync::OnceLock::new();
+
 fn install_ctrlc_handler(interpreter: &Interpreter) {
-    let handle = interpreter.command_handle();
-    let start = std::time::Instant::now();
-    let last_sigint_ms = std::sync::atomic::AtomicU64::new(0);
-    // A second interpreter in the same process would hit MultipleHandlers here,
-    // leaving Ctrl-C pinned to the FIRST interpreter's (possibly dead) handle —
-    // single-press would then no-op (double-press still hard-exits). Every
-    // current build_interpreter call site is a mutually exclusive subcommand
-    // path, so the install runs once per process.
-    let _ = ctrlc::set_handler(move || {
-        let now_ms = start.elapsed().as_millis() as u64;
-        let previous_ms = last_sigint_ms.swap(now_ms, std::sync::atomic::Ordering::SeqCst);
-        if is_double_interrupt(previous_ms, now_ms) {
-            // Exit code 130 = 128 + SIGINT(2), the shell convention for
-            // "killed by Ctrl-C" (matches what the OS default SIGINT
-            // disposition would have produced had we never installed a
-            // handler).
-            std::process::exit(130);
-        }
-        handle.cancel_all();
+    let state = CLI_CTRLC_STATE.get_or_init(|| CliCtrlCState {
+        handle: std::sync::Mutex::new(None),
+        prompt_active: std::sync::atomic::AtomicBool::new(false),
+        started: std::time::Instant::now(),
+        last_sigint_ms: std::sync::atomic::AtomicU64::new(0),
     });
+    *state
+        .handle
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(interpreter.command_handle());
+    let result = CLI_CTRLC_HANDLER.get_or_init(|| {
+        ctrlc::set_handler(|| {
+            let Some(state) = CLI_CTRLC_STATE.get() else {
+                return;
+            };
+            // `read_line` may be restarted by the OS. Exiting is the only portable way
+            // to make a prompt Ctrl-C immediate; the request was already durably
+            // published, so this deliberately leaves it pending.
+            if state
+                .prompt_active
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                std::process::exit(130);
+            }
+            let now_ms = state.started.elapsed().as_millis() as u64;
+            let previous_ms = state
+                .last_sigint_ms
+                .swap(now_ms, std::sync::atomic::Ordering::SeqCst);
+            if is_double_interrupt(previous_ms, now_ms) {
+                std::process::exit(130);
+            }
+            if let Some(handle) = state
+                .handle
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .as_ref()
+            {
+                handle.cancel_all();
+            }
+        })
+        .map_err(|error| error.to_string())
+    });
+    if let Err(error) = result {
+        print_cli_warning(format!("cannot install Ctrl-C handler: {error}"));
+    }
+}
+
+struct ApprovalPromptCtrlCGuard;
+
+impl ApprovalPromptCtrlCGuard {
+    fn enter() -> Self {
+        if let Some(state) = CLI_CTRLC_STATE.get() {
+            state
+                .prompt_active
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        Self
+    }
+}
+
+impl Drop for ApprovalPromptCtrlCGuard {
+    fn drop(&mut self) {
+        if let Some(state) = CLI_CTRLC_STATE.get() {
+            state
+                .prompt_active
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
 }
 
 /// The double-interrupt decision `install_ctrlc_handler` applies on every
@@ -856,7 +938,10 @@ fn is_double_interrupt(previous_ms: u64, now_ms: u64) -> bool {
 
 #[cfg(test)]
 mod ctrlc_tests {
-    use super::is_double_interrupt;
+    use super::{
+        format_needs_approval_guidance, is_double_interrupt, shell_quote, terminal_safe, Value,
+    };
+    use std::collections::BTreeMap;
 
     #[test]
     fn first_signal_never_hard_exits() {
@@ -876,6 +961,42 @@ mod ctrlc_tests {
     fn second_signal_outside_window_is_treated_as_independent() {
         assert!(!is_double_interrupt(1_000, 3_000));
         assert!(!is_double_interrupt(1_000, 60_000));
+    }
+
+    #[test]
+    fn approval_terminal_text_escapes_control_and_bidi_characters() {
+        let rendered = terminal_safe("ok\n\u{1b}[31mspoof\u{061c}\u{202e}");
+        assert_eq!(rendered, "ok\\u{a}\\u{1b}[31mspoof\\u{61c}\\u{202e}");
+        assert!(!rendered.contains('\u{1b}'));
+        assert!(!rendered.contains('\n'));
+
+        #[cfg(not(windows))]
+        {
+            let quoted = shell_quote("line\n\u{202e}tail");
+            assert_eq!(quoted, "$'line\\x0a\\u202etail'");
+            assert!(!quoted.contains('\n'));
+            assert!(!quoted.contains('\u{202e}'));
+        }
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn approval_guidance_is_copy_safe_and_preserves_exact_resume_inputs() {
+        let mut envelope = BTreeMap::new();
+        envelope.insert(Value::keyword("run-id"), Value::string("run one"));
+        envelope.insert(Value::keyword("approval-id"), Value::string("apr one"));
+        let rendered = format_needs_approval_guidance(
+            &Value::map(envelope),
+            "/tmp/run dir",
+            "/tmp/work flow.sema",
+            r#"{"target":"a b"}"#,
+            Some("/tmp/key file.public"),
+        );
+        assert!(rendered.contains("--signing-key-file \"$SEMA_APPROVAL_PRIVATE_KEY\""));
+        assert!(!rendered.contains("<private-key-file>"));
+        assert!(rendered.contains(
+            r#"sema workflow run $'/tmp/work flow.sema' --args $'{"target":"a b"}' --resume $'run one' --run-dir $'/tmp/run dir' --approval-public-key-file $'/tmp/key file.public'"#
+        ));
     }
 }
 
@@ -1363,24 +1484,271 @@ fn default_approval_actor() -> String {
         .unwrap_or_else(|_| "local-user".to_string())
 }
 
-fn write_workflow_approval(
-    runs_root: &Path,
-    run_id: &str,
-    approval_id: &str,
+fn read_approval_key_file(path: &Path, private: bool) -> Result<String, String> {
+    use std::io::Read as _;
+
+    const MAX_KEY_BYTES: u64 = 16 * 1024;
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let file = options
+        .open(path)
+        .map_err(|error| format!("cannot open approval key {}: {error}", path.display()))?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| format!("cannot inspect approval key {}: {error}", path.display()))?;
+    if !metadata.is_file() {
+        return Err(format!("{} is not a regular file", path.display()));
+    }
+    if metadata.len() > MAX_KEY_BYTES {
+        return Err(format!(
+            "{} is too large to be an approval key",
+            path.display()
+        ));
+    }
+    #[cfg(unix)]
+    if private {
+        use std::os::unix::fs::PermissionsExt as _;
+        if metadata.permissions().mode() & 0o077 != 0 {
+            return Err(format!(
+                "private approval key {} must not be accessible by group or other users (chmod 600)",
+                path.display()
+            ));
+        }
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.take(MAX_KEY_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("cannot read approval key {}: {error}", path.display()))?;
+    if bytes.len() as u64 > MAX_KEY_BYTES {
+        return Err(format!(
+            "{} is too large to be an approval key",
+            path.display()
+        ));
+    }
+    let value = String::from_utf8(bytes)
+        .map_err(|_| format!("approval key {} is not UTF-8", path.display()))?;
+    if private && value.trim().is_empty() {
+        return Err("approval signing key file is empty".to_string());
+    }
+    Ok(value.trim().to_string())
+}
+
+fn load_approval_signing_key(
+    path: &Path,
+) -> Result<sema_workflow::approval::ApprovalSigningKey, String> {
+    let encoded = read_approval_key_file(path, true)?;
+    sema_workflow::approval::ApprovalSigningKey::from_base64(&encoded)
+        .map_err(|error| error.to_string())
+}
+
+fn create_approval_key_pair(private_path: &Path, public_path: &Path) -> Result<(), String> {
+    use std::io::Write as _;
+
+    #[cfg(not(unix))]
+    {
+        let _ = (private_path, public_path);
+        return Err(
+            "approval key generation is unavailable until this platform has private ACL support"
+                .to_string(),
+        );
+    }
+    if private_path == public_path {
+        return Err("private and public approval key paths must differ".to_string());
+    }
+    let key = sema_workflow::approval::ApprovalSigningKey::generate()
+        .map_err(|error| error.to_string())?;
+    let mut private_options = std::fs::OpenOptions::new();
+    private_options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        private_options.mode(0o600);
+    }
+    let mut private = private_options
+        .open(private_path)
+        .map_err(|error| format!("cannot create {}: {error}", private_path.display()))?;
+    let mut public_file = match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(public_path)
+    {
+        Ok(file) => file,
+        Err(error) => {
+            drop(private);
+            let _ = std::fs::remove_file(private_path);
+            return Err(format!("cannot create {}: {error}", public_path.display()));
+        }
+    };
+    let write_result = private
+        .write_all(format!("{}\n", key.to_base64()).as_bytes())
+        .and_then(|()| private.sync_all())
+        .map_err(|error| format!("cannot write {}: {error}", private_path.display()))
+        .and_then(|()| {
+            let public = key.public_key_base64().map_err(|error| error.to_string())?;
+            public_file
+                .write_all(format!("{public}\n").as_bytes())
+                .and_then(|()| public_file.sync_all())
+                .map_err(|error| format!("cannot write {}: {error}", public_path.display()))
+        });
+    drop(private);
+    drop(public_file);
+    if let Err(error) = write_result {
+        let _ = std::fs::remove_file(public_path);
+        let _ = std::fs::remove_file(private_path);
+        return Err(error);
+    }
+    Ok(())
+}
+
+struct WorkflowApprovalRevision {
+    digest: String,
+    embedded_dependencies: Vec<(PathBuf, Vec<u8>)>,
+}
+
+fn workflow_approval_revision(
+    file: &Path,
+    content: &[u8],
+) -> Result<WorkflowApprovalRevision, String> {
+    use sha2::{Digest as _, Sha256};
+
+    const MAX_FILES: usize = 4096;
+    const MAX_BYTES: usize = 64 * 1024 * 1024;
+
+    let snapshot = import_tracer::trace_imports_strict(file)?;
+    let mut dependencies = snapshot.files.into_iter().collect::<Vec<_>>();
+    dependencies.sort_by(|left, right| left.0.cmp(&right.0));
+    if dependencies.len() > MAX_FILES {
+        return Err(format!(
+            "workflow dependency closure exceeds {MAX_FILES} files"
+        ));
+    }
+
+    let mut manifests = Vec::with_capacity(2);
+
+    let mut ancestor = file
+        .canonicalize()
+        .map_err(|error| format!("cannot canonicalize {}: {error}", file.display()))?
+        .parent()
+        .map(Path::to_path_buf);
+    while let Some(directory) = ancestor {
+        for name in ["sema.toml", "sema.lock"] {
+            let path = directory.join(name);
+            if path.is_file()
+                && !dependencies.iter().any(|(key, _)| key == name)
+                && !manifests.iter().any(|(key, _)| key == name)
+            {
+                let bytes = std::fs::read(&path)
+                    .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+                manifests.push((name.to_string(), bytes));
+            }
+        }
+        ancestor = directory.parent().map(Path::to_path_buf);
+    }
+
+    let mut inputs = Vec::with_capacity(dependencies.len() + manifests.len() + 1);
+    inputs.push(("<entry>", content));
+    inputs.extend(
+        dependencies
+            .iter()
+            .map(|(name, bytes)| (name.as_str(), bytes.as_slice())),
+    );
+    inputs.extend(
+        manifests
+            .iter()
+            .map(|(name, bytes)| (name.as_str(), bytes.as_slice())),
+    );
+    inputs.sort_by(|left, right| left.0.cmp(right.0));
+
+    let total_bytes = inputs.iter().try_fold(0usize, |total, (_, bytes)| {
+        total
+            .checked_add(bytes.len())
+            .ok_or_else(|| "workflow dependency closure byte count overflowed".to_string())
+    })?;
+    if total_bytes > MAX_BYTES {
+        return Err(format!(
+            "workflow dependency closure exceeds {MAX_BYTES} bytes"
+        ));
+    }
+
+    let mut digest = Sha256::new();
+    digest.update(b"sema-workflow-approval-revision-v1");
+    for (name, bytes) in inputs {
+        digest.update((name.len() as u64).to_le_bytes());
+        digest.update(name.as_bytes());
+        digest.update((bytes.len() as u64).to_le_bytes());
+        digest.update(bytes);
+    }
+
+    let mut embedded_dependencies = std::collections::BTreeMap::new();
+    for (name, bytes) in dependencies {
+        embedded_dependencies.insert(PathBuf::from(name), bytes);
+    }
+    for (filesystem_path, bytes) in snapshot.filesystem_files {
+        match embedded_dependencies.entry(filesystem_path.clone()) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(bytes.clone());
+            }
+            std::collections::btree_map::Entry::Occupied(entry) if entry.get() == &bytes => {}
+            std::collections::btree_map::Entry::Occupied(entry) => {
+                return Err(format!(
+                    "dependency snapshot key collision at {}",
+                    entry.key().display()
+                ));
+            }
+        }
+        let alias = sema_core::vfs::normalize_path(&filesystem_path).ok_or_else(|| {
+            format!(
+                "cannot normalize imported file identity {}",
+                filesystem_path.display()
+            )
+        })?;
+        match embedded_dependencies.entry(PathBuf::from(alias)) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(bytes);
+            }
+            std::collections::btree_map::Entry::Occupied(entry) if entry.get() == &bytes => {}
+            std::collections::btree_map::Entry::Occupied(entry) => {
+                return Err(format!(
+                    "dependency snapshot key collision at {}",
+                    entry.key().display()
+                ));
+            }
+        }
+    }
+
+    Ok(WorkflowApprovalRevision {
+        digest: format!("{:x}", digest.finalize()),
+        embedded_dependencies: embedded_dependencies.into_iter().collect(),
+    })
+}
+
+struct WorkflowApprovalInput<'a> {
+    runs_root: &'a Path,
+    run_id: &'a str,
+    approval_id: &'a str,
+    signing_key: &'a sema_workflow::approval::ApprovalSigningKey,
     kind: sema_workflow::approval::ApprovalDecisionKind,
     actor: String,
     comment: Option<String>,
     reason: Option<String>,
-) {
+}
+
+fn write_workflow_approval(input: WorkflowApprovalInput<'_>) {
     match sema_workflow::approval::decide(
-        runs_root,
-        run_id,
-        approval_id,
-        kind,
-        actor,
+        input.runs_root,
+        input.run_id,
+        input.approval_id,
+        input.signing_key,
+        input.kind,
+        input.actor,
         "cli".to_string(),
-        comment,
-        reason,
+        input.comment,
+        input.reason,
     ) {
         Ok(sema_workflow::approval::DecisionWrite::Created(decision)) => println!(
             "{} {} ({})",
@@ -1395,7 +1763,10 @@ fn write_workflow_approval(
             decision.decision_id
         ),
         Err(error) => {
-            print_cli_error(format!("cannot {kind} approval {approval_id}: {error}"));
+            print_cli_error(format!(
+                "cannot {} approval {}: {error}",
+                input.kind, input.approval_id
+            ));
             std::process::exit(1);
         }
     }
@@ -1458,10 +1829,10 @@ fn list_workflow_approvals(runs_root: &Path, run_id: &str, json: bool) {
             "{}  {:<8}  {}",
             request["approval_id"].as_str().unwrap_or(""),
             json["status"].as_str().unwrap_or("unknown"),
-            request["reason"].as_str().unwrap_or("")
+            terminal_safe(request["reason"].as_str().unwrap_or(""))
         );
         if let Some(preview) = request["preview"].as_str() {
-            println!("  {preview}");
+            println!("  {}", terminal_safe(preview));
         }
     }
 }
@@ -1469,7 +1840,33 @@ fn list_workflow_approvals(runs_root: &Path, run_id: &str, json: bool) {
 enum ApprovalPromptAction {
     Approve,
     Reject(String),
+    AlreadyDecided,
     LeavePending,
+}
+
+fn is_terminal_control(ch: char) -> bool {
+    ch.is_control()
+        || matches!(
+            ch,
+            '\u{061c}'
+                | '\u{200e}'
+                | '\u{200f}'
+                | '\u{202a}'..='\u{202e}'
+                | '\u{2066}'..='\u{206f}'
+        )
+}
+
+fn terminal_safe(value: &str) -> String {
+    let mut safe = String::with_capacity(value.len());
+    for ch in value.chars() {
+        if is_terminal_control(ch) {
+            use std::fmt::Write as _;
+            let _ = write!(safe, "\\u{{{:x}}}", ch as u32);
+        } else {
+            safe.push(ch);
+        }
+    }
+    safe
 }
 
 fn prompt_for_workflow_approval(
@@ -1479,24 +1876,37 @@ fn prompt_for_workflow_approval(
 ) -> Result<ApprovalPromptAction, String> {
     use std::io::Write;
 
-    let request = sema_workflow::approval::list_requests(runs_root, run_id)
+    let resolution = sema_workflow::approval::list_requests(runs_root, run_id)
         .map_err(|error| error.to_string())?
         .into_iter()
-        .find_map(|resolution| match resolution {
-            sema_workflow::approval::ApprovalResolution::Pending(request)
-                if request.approval_id == approval_id =>
-            {
-                Some(request)
-            }
-            _ => None,
+        .find(|resolution| {
+            let request = match resolution {
+                sema_workflow::approval::ApprovalResolution::Pending(request)
+                | sema_workflow::approval::ApprovalResolution::Approved(request, _)
+                | sema_workflow::approval::ApprovalResolution::Rejected(request, _) => request,
+            };
+            request.approval_id == approval_id
         })
-        .ok_or_else(|| format!("pending approval {approval_id} was not found"))?;
+        .ok_or_else(|| format!("approval {approval_id} was not found"))?;
+    let request = match resolution {
+        sema_workflow::approval::ApprovalResolution::Pending(request) => request,
+        sema_workflow::approval::ApprovalResolution::Approved(_, decision)
+        | sema_workflow::approval::ApprovalResolution::Rejected(_, decision) => {
+            eprintln!(
+                "approval {approval_id} was already {} by {}",
+                decision.decision,
+                terminal_safe(&decision.actor)
+            );
+            return Ok(ApprovalPromptAction::AlreadyDecided);
+        }
+    };
 
+    let _ctrlc_guard = ApprovalPromptCtrlCGuard::enter();
     eprintln!("\nHuman approval required");
     eprintln!("  id:      {}", request.approval_id);
-    eprintln!("  reason:  {}", request.reason);
+    eprintln!("  reason:  {}", terminal_safe(&request.reason));
     if let Some(preview) = request.preview {
-        eprintln!("  preview: {preview}");
+        eprintln!("  preview: {}", terminal_safe(&preview));
     }
     loop {
         eprint!("Approve? [y]es / [n]o / [q]uit pending: ");
@@ -1537,6 +1947,20 @@ fn prompt_for_workflow_approval(
     }
 }
 
+fn approval_was_decided(runs_root: &Path, run_id: &str, approval_id: &str) -> bool {
+    sema_workflow::approval::list_requests(runs_root, run_id)
+        .ok()
+        .is_some_and(|resolutions| {
+            resolutions.into_iter().any(|resolution| match resolution {
+                sema_workflow::approval::ApprovalResolution::Pending(_) => false,
+                sema_workflow::approval::ApprovalResolution::Approved(request, _)
+                | sema_workflow::approval::ApprovalResolution::Rejected(request, _) => {
+                    request.approval_id == approval_id
+                }
+            })
+        })
+}
+
 fn approval_envelope_field(envelope: &Value, key: &str) -> Option<String> {
     envelope
         .as_map_rc()?
@@ -1545,154 +1969,284 @@ fn approval_envelope_field(envelope: &Value, key: &str) -> Option<String> {
         .map(str::to_string)
 }
 
-fn format_needs_approval_guidance(envelope: &Value, run_dir: &str) -> String {
+fn shell_quote(value: &str) -> String {
+    #[cfg(windows)]
+    {
+        return format!("\"{}\"", value.replace('"', "\\\""));
+    }
+    #[cfg(not(windows))]
+    {
+        use std::fmt::Write as _;
+
+        // ANSI-C quotes preserve exact control/bidi characters without rendering them
+        // into the terminal. Sema's supported Unix shells (bash/zsh) understand this
+        // form, including \xHH/\uHHHH/\UHHHHHHHH escapes.
+        let mut quoted = String::with_capacity(value.len() + 3);
+        quoted.push_str("$'");
+        for ch in value.chars() {
+            match ch {
+                '\\' => quoted.push_str("\\\\"),
+                '\'' => quoted.push_str("\\'"),
+                _ if is_terminal_control(ch) => {
+                    let scalar = ch as u32;
+                    if scalar <= 0xff {
+                        let _ = write!(quoted, "\\x{scalar:02x}");
+                    } else if scalar <= 0xffff {
+                        let _ = write!(quoted, "\\u{scalar:04x}");
+                    } else {
+                        let _ = write!(quoted, "\\U{scalar:08x}");
+                    }
+                }
+                _ => quoted.push(ch),
+            }
+        }
+        quoted.push('\'');
+        quoted
+    }
+}
+
+fn format_needs_approval_guidance(
+    envelope: &Value,
+    run_dir: &str,
+    file: &str,
+    args: &str,
+    public_key_file: Option<&str>,
+) -> String {
     let run_id = approval_envelope_field(envelope, "run-id").unwrap_or_default();
     let approval_id = approval_envelope_field(envelope, "approval-id").unwrap_or_default();
-    format!(
-        "run needs human approval {approval_id}:\n  sema workflow approve {run_id} {approval_id} --run-dir {run_dir}\n  sema workflow reject {run_id} {approval_id} --run-dir {run_dir} --reason <reason>\nthen resume with the same file and args: sema workflow run <file> --resume {run_id} --run-dir {run_dir}\n"
-    )
+    let mut out = format!(
+        "run needs human approval {approval_id}:\n  sema workflow approve {} {} --run-dir {} --signing-key-file \"$SEMA_APPROVAL_PRIVATE_KEY\"\n  sema workflow reject {} {} --run-dir {} --reason 'explain why' --signing-key-file \"$SEMA_APPROVAL_PRIVATE_KEY\"\n",
+        shell_quote(&run_id),
+        shell_quote(&approval_id),
+        shell_quote(run_dir),
+        shell_quote(&run_id),
+        shell_quote(&approval_id),
+        shell_quote(run_dir),
+    );
+    if let Some(public_key_file) = public_key_file {
+        out.push_str(&format!(
+            "then resume exactly:\n  sema workflow run {} --args {} --resume {} --run-dir {} --approval-public-key-file {}\n",
+            shell_quote(file),
+            shell_quote(args),
+            shell_quote(&run_id),
+            shell_quote(run_dir),
+            shell_quote(public_key_file),
+        ));
+    } else {
+        out.push_str(
+            "this interactive request used an ephemeral authority; if left pending, start a fresh run instead of resuming it.\n",
+        );
+    }
+    out
 }
 
 /// `sema workflow run <file>` — evaluate a workflow `.sema` file (which
 /// `defworkflow`s and runs it) with the run-directory + args seams wired, then
 /// exit non-zero if the run's `{:status …}` envelope reports failure.
 fn run_workflow_command(command: WorkflowCommands, sandbox: &sema_core::Sandbox) {
-    let (file, args, run_dir, view, view_port, resume, no_auth_prompt, approval_mode) =
-        match command {
-            WorkflowCommands::Run {
-                file,
-                args,
-                run_dir,
-                view,
-                port,
-                resume,
-                no_auth_prompt,
-                approval_mode,
-            } => (
-                file,
-                args,
-                run_dir,
-                view,
-                port,
-                resume,
-                no_auth_prompt,
-                approval_mode,
-            ),
-            WorkflowCommands::Approvals {
-                run_id,
-                run_dir,
-                json,
-            } => {
-                list_workflow_approvals(Path::new(&run_dir), &run_id, json);
-                return;
-            }
-            WorkflowCommands::Approve {
-                run_id,
-                approval_id,
-                run_dir,
+    let (
+        file,
+        args,
+        run_dir,
+        view,
+        view_port,
+        resume,
+        no_auth_prompt,
+        approval_mode,
+        approval_public_key_file,
+    ) = match command {
+        WorkflowCommands::Run {
+            file,
+            args,
+            run_dir,
+            view,
+            port,
+            resume,
+            no_auth_prompt,
+            approval_mode,
+            approval_public_key_file,
+        } => (
+            file,
+            args,
+            run_dir,
+            view,
+            port,
+            resume,
+            no_auth_prompt,
+            approval_mode,
+            approval_public_key_file,
+        ),
+        WorkflowCommands::Approvals {
+            run_id,
+            run_dir,
+            json,
+        } => {
+            list_workflow_approvals(Path::new(&run_dir), &run_id, json);
+            return;
+        }
+        WorkflowCommands::Approve {
+            run_id,
+            approval_id,
+            run_dir,
+            comment,
+            actor,
+            signing_key_file,
+        } => {
+            let signing_key = load_approval_signing_key(Path::new(&signing_key_file))
+                .unwrap_or_else(|error| {
+                    print_cli_error(error);
+                    std::process::exit(1);
+                });
+            write_workflow_approval(WorkflowApprovalInput {
+                runs_root: Path::new(&run_dir),
+                run_id: &run_id,
+                approval_id: &approval_id,
+                signing_key: &signing_key,
+                kind: sema_workflow::approval::ApprovalDecisionKind::Approve,
+                actor: actor.unwrap_or_else(default_approval_actor),
                 comment,
-                actor,
-            } => {
-                write_workflow_approval(
-                    Path::new(&run_dir),
-                    &run_id,
-                    &approval_id,
-                    sema_workflow::approval::ApprovalDecisionKind::Approve,
-                    actor.unwrap_or_else(default_approval_actor),
-                    comment,
-                    None,
-                );
-                return;
+                reason: None,
+            });
+            return;
+        }
+        WorkflowCommands::Reject {
+            run_id,
+            approval_id,
+            run_dir,
+            reason,
+            actor,
+            signing_key_file,
+        } => {
+            let signing_key = load_approval_signing_key(Path::new(&signing_key_file))
+                .unwrap_or_else(|error| {
+                    print_cli_error(error);
+                    std::process::exit(1);
+                });
+            write_workflow_approval(WorkflowApprovalInput {
+                runs_root: Path::new(&run_dir),
+                run_id: &run_id,
+                approval_id: &approval_id,
+                signing_key: &signing_key,
+                kind: sema_workflow::approval::ApprovalDecisionKind::Reject,
+                actor: actor.unwrap_or_else(default_approval_actor),
+                comment: None,
+                reason: Some(reason),
+            });
+            return;
+        }
+        WorkflowCommands::ApprovalKeygen {
+            private_key_file,
+            public_key_file,
+        } => {
+            if let Err(error) =
+                create_approval_key_pair(Path::new(&private_key_file), Path::new(&public_key_file))
+            {
+                print_cli_error(error);
+                std::process::exit(1);
             }
-            WorkflowCommands::Reject {
-                run_id,
-                approval_id,
-                run_dir,
-                reason,
-                actor,
-            } => {
-                write_workflow_approval(
-                    Path::new(&run_dir),
-                    &run_id,
-                    &approval_id,
-                    sema_workflow::approval::ApprovalDecisionKind::Reject,
-                    actor.unwrap_or_else(default_approval_actor),
-                    None,
-                    Some(reason),
-                );
-                return;
-            }
-            WorkflowCommands::View {
-                run_dir,
-                host,
-                port,
-            } => {
-                tokio::runtime::Builder::new_multi_thread()
-                    .enable_all()
-                    .build()
-                    .expect("Failed to create tokio runtime")
-                    .block_on(workflow_view::serve(PathBuf::from(run_dir), &host, port));
-                return;
-            }
-            WorkflowCommands::Index { run_dir } => {
-                let root = PathBuf::from(&run_dir);
-                match workflow_view::ingest::open(&root.join(sema_workflow::INDEX_DB)) {
-                    Ok(conn) => {
-                        workflow_view::ingest::backfill_all(&conn, &root);
-                        match workflow_view::ingest::runs_summary(&conn) {
-                            Ok(rows) => println!(
-                                "indexed {} run(s) → {}",
-                                rows.len(),
-                                root.join(sema_workflow::INDEX_DB).display()
-                            ),
-                            Err(e) => print_cli_warning(format!("could not summarize index: {e}")),
-                        }
-                    }
-                    Err(e) => {
-                        print_cli_error(format!("cannot open index database: {e}"));
-                        std::process::exit(1);
-                    }
-                }
-                return;
-            }
-            WorkflowCommands::Export {
-                run_id,
-                run_dir,
-                out_dir,
-            } => {
-                match sema::workflow_evidence::export(
-                    &PathBuf::from(run_dir),
-                    &run_id,
-                    out_dir.as_deref().map(std::path::Path::new),
-                ) {
-                    Ok(bundle) => {
-                        println!(
-                            "exported workflow evidence → {}",
-                            bundle.directory.display()
-                        );
-                        println!("  {}", bundle.evidence_json.display());
-                        println!("  {}", bundle.evidence_markdown.display());
-                        println!("  {}", bundle.manifest_json.display());
-                    }
-                    Err(error) => {
-                        print_cli_error(format!("cannot export workflow evidence: {error}"));
-                        std::process::exit(1);
+            println!("created private approval key {private_key_file}");
+            println!("created public approval key  {public_key_file}");
+            return;
+        }
+        WorkflowCommands::View {
+            run_dir,
+            host,
+            port,
+        } => {
+            tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .expect("Failed to create tokio runtime")
+                .block_on(workflow_view::serve(PathBuf::from(run_dir), &host, port));
+            return;
+        }
+        WorkflowCommands::Index { run_dir } => {
+            let root = PathBuf::from(&run_dir);
+            match workflow_view::ingest::open(&root.join(sema_workflow::INDEX_DB)) {
+                Ok(conn) => {
+                    workflow_view::ingest::backfill_all(&conn, &root);
+                    match workflow_view::ingest::runs_summary(&conn) {
+                        Ok(rows) => println!(
+                            "indexed {} run(s) → {}",
+                            rows.len(),
+                            root.join(sema_workflow::INDEX_DB).display()
+                        ),
+                        Err(e) => print_cli_warning(format!("could not summarize index: {e}")),
                     }
                 }
-                return;
+                Err(e) => {
+                    print_cli_error(format!("cannot open index database: {e}"));
+                    std::process::exit(1);
+                }
             }
-            WorkflowCommands::Check { file, strict, json } => {
-                let src = match read_source_file(&file) {
-                    Ok(s) => s,
-                    Err(msg) => {
-                        print_cli_error(msg);
-                        std::process::exit(2);
-                    }
-                };
-                let diags = workflow_check::check_source(&src);
-                std::process::exit(workflow_check::report(&file, &diags, strict, json));
+            return;
+        }
+        WorkflowCommands::Export {
+            run_id,
+            run_dir,
+            out_dir,
+        } => {
+            match sema::workflow_evidence::export(
+                &PathBuf::from(run_dir),
+                &run_id,
+                out_dir.as_deref().map(std::path::Path::new),
+            ) {
+                Ok(bundle) => {
+                    println!(
+                        "exported workflow evidence → {}",
+                        bundle.directory.display()
+                    );
+                    println!("  {}", bundle.evidence_json.display());
+                    println!("  {}", bundle.evidence_markdown.display());
+                    println!("  {}", bundle.manifest_json.display());
+                }
+                Err(error) => {
+                    print_cli_error(format!("cannot export workflow evidence: {error}"));
+                    std::process::exit(1);
+                }
             }
+            return;
+        }
+        WorkflowCommands::Check { file, strict, json } => {
+            let src = match read_source_file(&file) {
+                Ok(s) => s,
+                Err(msg) => {
+                    print_cli_error(msg);
+                    std::process::exit(2);
+                }
+            };
+            let diags = workflow_check::check_run_source(&src);
+            std::process::exit(workflow_check::report(&file, &diags, strict, json));
+        }
+    };
+
+    let workspace_root = std::env::current_dir().unwrap_or_else(|error| {
+        print_cli_error(format!("cannot resolve workflow workspace: {error}"));
+        std::process::exit(1);
+    });
+    let run_dir = {
+        let path = PathBuf::from(&run_dir);
+        let absolute = if path.is_absolute() {
+            path
+        } else {
+            workspace_root.join(path)
         };
+        absolute.to_string_lossy().to_string()
+    };
+    let file = std::fs::canonicalize(&file).unwrap_or_else(|error| {
+        print_cli_error(format!("cannot resolve workflow file {file}: {error}"));
+        std::process::exit(1);
+    });
+    let file = file.to_string_lossy().to_string();
+    let approval_public_key_file = approval_public_key_file.map(|value| {
+        let path = PathBuf::from(value);
+        let absolute = if path.is_absolute() {
+            path
+        } else {
+            workspace_root.join(path)
+        };
+        absolute.to_string_lossy().to_string()
+    });
 
     // Interactive MCP auth (docs/plans/2026-06-24-workflow-mcp-auth.md §3): on a
     // real terminal, a needs-auth gate logs in inline instead of exiting 2. See
@@ -1705,13 +2259,25 @@ fn run_workflow_command(command: WorkflowCommands, sandbox: &sema_core::Sandbox)
         no_auth_prompt,
     ));
 
-    // The workflow runtime (sema-workflow) reads this seam to choose the run-dir
-    // base; the run lands in `<run-dir>/<run-id>/`.
-    std::env::set_var("SEMA_WORKFLOW_RUN_DIR", &run_dir);
+    // Backward-compatible host seam for deterministic tests/embedders. Read exactly
+    // once before evaluation and copy into host-owned state; a workflow's later
+    // `sys/set-env` calls cannot alter it.
+    let fresh_run_id = std::env::var("SEMA_WORKFLOW_RUN_ID")
+        .ok()
+        .filter(|value| !value.is_empty());
+    if let Some(run_id) = &fresh_run_id {
+        if run_id.contains('/') || run_id.contains('\\') || run_id.contains("..") {
+            print_cli_error(
+                "SEMA_WORKFLOW_RUN_ID must be a bare directory name without path separators",
+            );
+            std::process::exit(1);
+        }
+    }
 
     // `--resume <run-id>`: reuse that run's dir + memo cache. Sanitize the operator-
-    // supplied id against path traversal (it joins into a filesystem path), require the
-    // prior run's events.jsonl to exist, then set the seams the runtime reads.
+    // supplied id against path traversal (it joins into a filesystem path) and require
+    // the prior run's events.jsonl to exist. The values are installed below in immutable
+    // host state rather than mutable process environment variables.
     if let Some(run_id) = &resume {
         if run_id.is_empty()
             || run_id.contains('/')
@@ -1728,11 +2294,7 @@ fn run_workflow_command(command: WorkflowCommands, sandbox: &sema_core::Sandbox)
             print_cli_error(format!("no prior run to resume at {}", prior.display()));
             std::process::exit(1);
         }
-        std::env::set_var("SEMA_WORKFLOW_RUN_ID", run_id);
-        std::env::set_var("SEMA_WORKFLOW_RESUME", "1");
     }
-    // Recorded verbatim on the run.started event (shown in the viewer's stream/meta).
-    std::env::set_var("SEMA_WORKFLOW_ARGS_JSON", &args);
 
     let content = match read_source_file(&file) {
         Ok(c) => c,
@@ -1741,6 +2303,23 @@ fn run_workflow_command(command: WorkflowCommands, sandbox: &sema_core::Sandbox)
             std::process::exit(1);
         }
     };
+    let run_diags = workflow_check::check_run_source(&content);
+    if run_diags
+        .iter()
+        .any(|diag| diag.severity == workflow_check::Severity::Error)
+    {
+        let code = workflow_check::report(&file, &run_diags, false, false);
+        std::process::exit(code.max(1));
+    }
+
+    let approval_revision = workflow_approval_revision(Path::new(&file), content.as_bytes())
+        .unwrap_or_else(|error| {
+            print_cli_error(format!(
+                "cannot bind workflow approval dependency closure: {error}"
+            ));
+            std::process::exit(1);
+        });
+    let approval_code_version = approval_revision.digest.clone();
 
     let mut effective_sandbox = sandbox.clone();
     let permission_specs = match workflow_check::declared_permission_specs(&content) {
@@ -1800,22 +2379,12 @@ fn run_workflow_command(command: WorkflowCommands, sandbox: &sema_core::Sandbox)
     };
     // Preserve the established short source hash for memo compatibility. Approval
     // decisions use a separate collision-resistant source binding below.
-    {
+    let code_version = {
         use std::hash::{Hash, Hasher};
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         content.hash(&mut hasher);
-        std::env::set_var(
-            "SEMA_WORKFLOW_CODE_VERSION",
-            format!("{:016x}", hasher.finish()),
-        );
-    }
-    {
-        use sha2::{Digest, Sha256};
-        std::env::set_var(
-            "SEMA_WORKFLOW_APPROVAL_CODE_VERSION",
-            format!("{:x}", Sha256::digest(content.as_bytes())),
-        );
-    }
+        format!("{:016x}", hasher.finish())
+    };
 
     // The file's last form is the `defworkflow` (which expands to `workflow/run`),
     // so eval returns the `{:status …}` envelope; journaling is its side effect. A TTY
@@ -1834,13 +2403,77 @@ fn run_workflow_command(command: WorkflowCommands, sandbox: &sema_core::Sandbox)
         ApprovalMode::Auto => ApprovalMode::Pause,
         mode => mode,
     };
+    let inline_signing_key = if (effective_approval_mode == ApprovalMode::Prompt
+        && interactive_approval)
+        || effective_approval_mode == ApprovalMode::Deny
+    {
+        Some(
+            sema_workflow::approval::ApprovalSigningKey::generate().unwrap_or_else(|error| {
+                print_cli_error(format!("cannot generate interactive approval key: {error}"));
+                std::process::exit(1);
+            }),
+        )
+    } else {
+        None
+    };
+    let approval_public_key = if let Some(key) = &inline_signing_key {
+        key.public_key_base64().unwrap_or_else(|error| {
+            print_cli_error(format!("cannot derive interactive approval key: {error}"));
+            std::process::exit(1);
+        })
+    } else if let Some(path) = &approval_public_key_file {
+        let encoded = read_approval_key_file(Path::new(path), false).unwrap_or_else(|error| {
+            print_cli_error(error);
+            std::process::exit(1);
+        });
+        sema_workflow::approval::normalize_public_key_base64(&encoded).unwrap_or_else(|error| {
+            print_cli_error(format!("invalid approval public key: {error}"));
+            std::process::exit(1);
+        })
+    } else {
+        String::new()
+    };
+    // A terminal prompt uses an ephemeral private authority held only by this process,
+    // even if a public-key file was also supplied. If the operator leaves that request
+    // pending it cannot be resumed with the unrelated file authority.
+    let resumable_public_key_file = inline_signing_key
+        .is_none()
+        .then_some(approval_public_key_file.as_deref())
+        .flatten();
+    // Snapshot audit identity before evaluating untrusted workflow code. A workflow may
+    // have env-write permission, but cannot rewrite the actor attached to a later host
+    // terminal decision.
+    let terminal_approval_actor = default_approval_actor();
+    let mut active_resume = resume.clone();
     let exit_code = loop {
         let interpreter = build_interpreter(&effective_sandbox);
+        for (path, bytes) in &approval_revision.embedded_dependencies {
+            interpreter
+                .ctx
+                .set_embedded_file(path.clone(), bytes.clone());
+        }
+        let _host_config = sema_workflow::context::install_host_config(
+            sema_workflow::context::WorkflowHostConfig {
+                runs_root: run_dir.clone(),
+                explicit_run_id: active_resume.clone().or_else(|| fresh_run_id.clone()),
+                resuming: active_resume.is_some(),
+                code_version: code_version.clone(),
+                approval_code_version: approval_code_version.clone(),
+                args_json: args.clone(),
+                approval_public_key: approval_public_key.clone(),
+                entry_file: file.clone(),
+                workspace_root: workspace_root.to_string_lossy().to_string(),
+            },
+        );
 
         // Auto-configure an LLM provider from the environment (mirrors the default run
         // path), so a workflow whose leaves call `llm/*` works without self-configuring.
         // Best-effort: a workflow with no LLM leaves needs no provider, so ignore errors.
         let _ = interpreter.eval_str("(llm/auto-configure)");
+        // Evaluate against the same complete static dependency snapshot that was
+        // hashed into the approval revision. Macro-generated or runtime-selected
+        // imports outside that closure fail closed instead of escaping the binding.
+        interpreter.ctx.set_embedded_files_only(true);
         interpreter
             .global_env
             .set(sema_core::intern("*workflow-args*"), args_value.clone());
@@ -1856,6 +2489,9 @@ fn run_workflow_command(command: WorkflowCommands, sandbox: &sema_core::Sandbox)
                 break 1;
             }
         };
+        // Tear down the evaluator (including detached descendants) before any private
+        // inline signing key is used at the terminal prompt.
+        drop(interpreter);
         let status = envelope
             .as_map_rc()
             .and_then(|m| m.get(&Value::keyword("status")).cloned())
@@ -1891,7 +2527,16 @@ fn run_workflow_command(command: WorkflowCommands, sandbox: &sema_core::Sandbox)
                 };
                 match effective_approval_mode {
                     ApprovalMode::Pause | ApprovalMode::Auto => {
-                        eprint!("{}", format_needs_approval_guidance(&envelope, &run_dir));
+                        eprint!(
+                            "{}",
+                            format_needs_approval_guidance(
+                                &envelope,
+                                &run_dir,
+                                &file,
+                                &args,
+                                resumable_public_key_file,
+                            )
+                        );
                         break 3;
                     }
                     ApprovalMode::Deny => {
@@ -1904,7 +2549,16 @@ fn run_workflow_command(command: WorkflowCommands, sandbox: &sema_core::Sandbox)
                         print_cli_error(
                             "--approval-mode prompt requires terminal stdin/stderr and is disabled in CI",
                         );
-                        eprint!("{}", format_needs_approval_guidance(&envelope, &run_dir));
+                        eprint!(
+                            "{}",
+                            format_needs_approval_guidance(
+                                &envelope,
+                                &run_dir,
+                                &file,
+                                &args,
+                                resumable_public_key_file,
+                            )
+                        );
                         break 3;
                     }
                     ApprovalMode::Prompt => {
@@ -1924,8 +2578,9 @@ fn run_workflow_command(command: WorkflowCommands, sandbox: &sema_core::Sandbox)
                                 Path::new(&run_dir),
                                 &run_id,
                                 &approval_id,
+                                inline_signing_key.as_ref().expect("interactive key exists"),
                                 sema_workflow::approval::ApprovalDecisionKind::Approve,
-                                default_approval_actor(),
+                                terminal_approval_actor.clone(),
                                 "terminal-prompt".to_string(),
                                 None,
                                 None,
@@ -1935,24 +2590,44 @@ fn run_workflow_command(command: WorkflowCommands, sandbox: &sema_core::Sandbox)
                                     Path::new(&run_dir),
                                     &run_id,
                                     &approval_id,
+                                    inline_signing_key.as_ref().expect("interactive key exists"),
                                     sema_workflow::approval::ApprovalDecisionKind::Reject,
-                                    default_approval_actor(),
+                                    terminal_approval_actor.clone(),
                                     "terminal-prompt".to_string(),
                                     None,
                                     Some(reason),
                                 )
                             }
+                            ApprovalPromptAction::AlreadyDecided => {
+                                active_resume = Some(run_id);
+                                continue;
+                            }
                             ApprovalPromptAction::LeavePending => {
-                                eprint!("{}", format_needs_approval_guidance(&envelope, &run_dir));
+                                eprint!(
+                                    "{}",
+                                    format_needs_approval_guidance(
+                                        &envelope,
+                                        &run_dir,
+                                        &file,
+                                        &args,
+                                        resumable_public_key_file,
+                                    )
+                                );
                                 break 3;
                             }
                         };
                         if let Err(error) = decision {
+                            if approval_was_decided(Path::new(&run_dir), &run_id, &approval_id) {
+                                eprintln!(
+                                    "approval {approval_id} was decided concurrently; resuming with the recorded decision"
+                                );
+                                active_resume = Some(run_id);
+                                continue;
+                            }
                             print_cli_error(format!("cannot record approval decision: {error}"));
                             break 1;
                         }
-                        std::env::set_var("SEMA_WORKFLOW_RUN_ID", &run_id);
-                        std::env::set_var("SEMA_WORKFLOW_RESUME", "1");
+                        active_resume = Some(run_id);
                         continue;
                     }
                 }
@@ -4893,6 +5568,34 @@ fn install_completions(shell: Shell) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn approval_revision_embeds_absolute_import_identity() {
+        let root = std::env::temp_dir().join(format!(
+            "sema-approval-revision-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let helper = root.join("helper.sema");
+        let workflow = root.join("workflow.sema");
+        let helper_bytes = b"(define target \"v1\")\n";
+        std::fs::write(&helper, helper_bytes).unwrap();
+        let source = format!(
+            "(import \"helper.sema\")\n(import {})",
+            serde_json::to_string(&helper).unwrap()
+        );
+        std::fs::write(&workflow, &source).unwrap();
+
+        let revision = workflow_approval_revision(&workflow, source.as_bytes()).unwrap();
+        assert!(revision
+            .embedded_dependencies
+            .iter()
+            .any(|(path, bytes)| path == &helper && bytes == helper_bytes));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
 
     #[test]
     fn build_summary_helpers() {
