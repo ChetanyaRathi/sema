@@ -7,7 +7,9 @@ syntax: "(workflow/check src)"
 
 Static-analyse a workflow source string (or any value, which is pretty-printed to source)
 and return diagnostics as a list of maps — **no evaluation, no LLM calls, no I/O**. An
-empty list means the source is clean.
+empty list means the source is clean. The checker validates literal `defpolicy`,
+workflow `:policy`, step `:policy`, and `policy/without` forms in addition to workflow
+shape and marker rules.
 
 Each diagnostic map has the keys:
 
@@ -34,4 +36,4 @@ Each diagnostic map has the keys:
     (println (str "check failed: " (count diags) " issues"))))
 ```
 
-See also: `workflow/run-form`, `defworkflow`.
+See also: `workflow/run-form`, `defworkflow`, `defpolicy`, `policy/without`.

@@ -47,6 +47,7 @@ The `meta-map` supports:
 | `:phases` | `[:string …]` | Declared phase plan — the dashboard shows all phases up front |
 | `:budget` | `{:tokens N :usd M}` | Spend caps (see [Budget Enforcement](#budget-enforcement)) |
 | `:permissions` | string | Sandbox restrictions for `sema workflow run`, using the same syntax as `--sandbox` |
+| `:policy` | policy | Model/tool allowlist for this workflow (see [Model and tool policies](#model-and-tool-policies)) |
 | `:args` | map | Argument schema (informational; the actual args come from `--args`) |
 
 The body is ordinary Sema code. `phase` markers interleave with `def`,
@@ -109,6 +110,7 @@ The opts map supports:
 | `:schema` | schema spec | Typed extraction — the step returns a validated map, not text |
 | `:tools` | `[tool …]` | Tool-calling loop — the step runs `llm/chat` with tool dispatch |
 | `:agent` | `defagent` | Run a configured `defagent` as this step via `agent/run` |
+| `:policy` | policy | Additional restrictions for this step; it cannot loosen the workflow policy |
 
 When `:agent` is present, the defagent owns its own tools and model — inline
 `:tools`/`:model` are ignored (the static checker warns if both are given).
@@ -184,9 +186,9 @@ Every `sema workflow run` creates a run directory under `.sema/runs/<run-id>/`:
 
 ### Event vocabulary
 
-The event vocabulary is **frozen** — add fields (append-only, all
-`Option`/skippable) but never change existing ones. Old runs stay readable
-forever.
+Existing event shapes are **frozen** — add fields only as append-only,
+optional/skippable fields, and add new event kinds without changing old ones.
+Old runs stay readable forever.
 
 | Event | Key fields | Description |
 |-------|-----------|-------------|
@@ -196,6 +198,9 @@ forever.
 | `agent.started` | `agent_id`, `agent_name`, `model` | An agent leaf began |
 | `agent.result` | `agent_id`, `status`, `output`, `dur_ms`, `model` | An agent leaf produced a result |
 | `agent.tool_call` | `agent_id`, `tool_name`, `args_json` | An agent invoked a tool |
+| `policy.checked` | `policy`, `boundary`, `subject`, `rule`, `source` | A policy layer allowed a protected boundary |
+| `policy.violation` | `policy`, `boundary`, `subject`, `rule`, `action`, `source` | A policy layer denied a protected boundary |
+| `policy.bypassed` | `policy`, `boundary`, `subject`, `reason`, `source` | A lexical `policy/without` scope bypassed a protected boundary |
 | `checkpoint` | `key`, `content_key`, `value_digest`, `value` | A checkpoint was recorded |
 | `budget` | `agent_id`, `input_tokens`, `output_tokens`, `cost_usd`, `budget_limit` | A per-leaf budget observation |
 | `run.ended` | `status`, `reason`, `dur_ms` | Last line of every run |
@@ -213,9 +218,11 @@ memoized leaves — they replay for free.
 ### How content keys work
 
 Each step leaf's content key is a hash of `(kind, code-version, args, phase,
-step-name, prompt, schema)`. Checkpoints use `(kind, code-version, args,
-phase, key)`. Same inputs → same key → memo hit → no re-call. An occurrence
-ordinal distinguishes identical repeats in source order.
+step-name, prompt, schema, effective-policy)`. Checkpoints use `(kind,
+code-version, args, phase, key)`. Same inputs → same key → memo hit → no
+re-call. An occurrence ordinal distinguishes identical repeats in source
+order. Tightening or otherwise changing the effective step policy invalidates
+that step's memo.
 
 ### Automatic invalidation
 
@@ -311,11 +318,126 @@ denial list.
 Workflow permissions can only remove capabilities from the caller's sandbox;
 they cannot loosen a stricter `--sandbox` or `--allowed-paths` setting.
 
+## Model and tool policies
+
+Policies constrain the resolved model and model-requested tool calls inside a
+workflow. Define one with `defpolicy`, then attach it to a workflow:
+
+```sema
+(defpolicy safe-agent
+  {:models
+    {:default :deny
+     :allow ["openai/gpt-5" "anthropic/*"]
+     :deny ["anthropic/deprecated-model"]
+     :on-deny :fail}
+
+   :tools
+    {:default :deny
+     :allow
+      {"read-file"   {:paths ["src/**" "Cargo.toml"]}
+       "fetch-url"   {:domains {:allow ["api.example.com" "*.example.com"]
+                                :schemes ["https"]
+                                :ports [443]}}
+       "run-command" {:commands ["cargo test" "cargo check"]}}
+     :deny ["delete-file"]
+     :on-deny :tool-error}})
+
+(defworkflow guarded-audit
+  "Audit with a least-privilege model and tool envelope."
+  {:phases ["Audit"]
+   :permissions "no-fs-write"
+   :policy safe-agent}
+
+  (phase "Audit")
+  (def result
+    (step "Inspect the Rust sources."
+      {:name "auditor"
+       :tools [read-file fetch-url run-command]}))
+  {:status :success :result result})
+```
+
+Model rules use an exact `provider/model` identity. The only wildcard form is
+`provider/*`; provider wildcards and partial model globs are rejected. Deny
+rules win over allow rules. When `:models` or `:tools` is present,
+`:default` defaults to `:deny`.
+
+Tool allow entries may be unconstrained (`{}`) or constrain named JSON
+arguments:
+
+| Constraint | Shorthand argument | Match |
+|------------|--------------------|-------|
+| `:paths` | `"path"` | Workspace-relative literal, `*`, and `**` patterns; absolute paths and root/symlink escapes are denied |
+| `:domains` | `"url"` | Parsed HTTP(S) URLs matched by normalized hostname, scheme, and optional effective port |
+| `:commands` | `"command"` | Exact command strings only; no wildcard or shell-prefix matching |
+
+A leading `*.` matches subdomains only, so list both `"example.com"` and
+`"*.example.com"` when both the apex and its subdomains are allowed. URLs
+containing credentials are always denied.
+
+Use explicit selectors when a tool uses different argument names or has
+multiple path-like arguments:
+
+```sema
+{:tools
+ {:allow
+  {"copy-file"
+   {:paths [{:arg :source :allow ["src/**"]}
+            {:arg :destination
+             :allow ["generated/**"]
+             :deny ["generated/private/**"]}]}}}}
+```
+
+### Composition and denial behavior
+
+A step policy is combined with the workflow policy using logical AND: every
+active layer must allow the boundary. A step may tighten its workflow but
+cannot loosen it. The strictest denial action across active layers wins.
+
+| Boundary | `:on-deny` | Behavior |
+|----------|------------|----------|
+| Model | `:fail` (default) | Fail before cache, cassette, callback, or provider access |
+| Model | `:skip` | Skip a denied fallback target; a non-fallback call still fails |
+| Tool | `:fail` (default) | Preflight the whole requested batch and run none when any call is denied |
+| Tool | `:tool-error` | In an agent loop, return a correlated tool error for the denied call while allowed siblings run |
+
+The model gate covers completion, chat, extraction, classification, streaming,
+fallbacks, embeddings, and reranking. The tool gate covers `ToolDefinition`
+dispatch through agents and direct `tool/invoke`, including tools discovered
+through MCP. Checks happen before cache/cassette replay and before user
+callbacks, schema predicates, or tool handlers. Cache/cassette keys and resume
+keys include the effective policy fingerprint; replay also rechecks the stored
+provider identity.
+
+`policy.checked`, `policy.violation`, and `policy.bypassed` events identify the
+policy, boundary, matched rule, enforcement action, and whether the source was
+a request, cache, or cassette. Tool arguments are represented only by a digest in
+policy events; raw paths, URLs, and commands are not recorded there.
+
+### Trusted lexical bypass
+
+Trusted workflow code can bypass model/tool policy for a narrow lexical scope:
+
+```sema
+(policy/without "read the legacy migration fixture"
+  (step "Inspect the fixture." {:tools [read-file]}))
+```
+
+The reason must be a non-empty literal string of at most 256 characters. The
+bypass is task-local, applies only to its body, and emits `policy.bypassed` for
+each protected boundary. It never bypasses the outer sandbox.
+
+Policies govern LLM/model boundaries and model-invoked tools. Ordinary author
+code such as direct filesystem, shell, HTTP, or raw MCP calls remains governed
+by `:permissions`, the CLI sandbox, and allowed-path settings. Keep both:
+policy controls what the model may choose; the sandbox remains the hard outer
+capability ceiling.
+
 ## `sema workflow check`
 
 Statically validate a workflow file **without evaluating it or calling any
-LLM**. Catches arity traps, bad options, and layout issues before you spend a
-token.
+LLM**. Catches arity traps, bad options, invalid literal policy maps,
+`defpolicy` shape errors, unsafe matcher syntax, and invalid
+`policy/without` reasons before you spend a token.
 
 ```bash
 $ sema workflow check audit.sema

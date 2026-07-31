@@ -14,6 +14,8 @@ mod workflow_budget_test;
 mod workflow_cookbook_test;
 #[path = "suites/workflow_mcp_seam_test.rs"]
 mod workflow_mcp_seam_test;
+#[path = "suites/workflow_policy_test.rs"]
+mod workflow_policy_test;
 #[path = "suites/workflow_resume_test.rs"]
 mod workflow_resume_test;
 #[path = "suites/workflow_selfrewrite_test.rs"]
