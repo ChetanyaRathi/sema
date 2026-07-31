@@ -3,6 +3,7 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
+<link rel="icon" href="/favicon.svg" type="image/svg+xml" />
 <title>Sema · Workflow Run</title>
 <style>
   :root{
@@ -90,6 +91,94 @@
     white-space:nowrap;flex:0 0 auto;}
   .auth-action:hover{color:var(--gold);}
 
+  /* ---- APPROVAL PANEL — validated durable sidecars. A pending request blocks
+     the run, so it gets a full card with the request text and (when this viewer
+     holds the matching private key) the decision controls. A decided request is
+     history: it collapses to one ledger line, same idiom as the auth rows. ---- */
+  .approval-panel{border-bottom:1px solid var(--border);padding:9px 0 10px;}
+  .approval-panel[hidden]{display:none;}
+  .approval-label{display:flex;align-items:baseline;gap:8px;}
+  .approval-pending-count{color:var(--amber);letter-spacing:0;text-transform:none;
+    font-size:var(--fs-meta);}
+  .approval-status{margin:0 20px 8px;font-size:var(--fs-meta);color:var(--text-secondary);}
+  .approval-status:empty{display:none;}
+  .approval-status[data-tone="ok"]{color:var(--success);}
+  .approval-status[data-tone="error"]{color:var(--error);}
+
+  /* pending card */
+  .approval-card{margin:0 20px;border:1px solid var(--amber-dim);background:var(--bg-output);
+    box-shadow:inset 2px 0 0 var(--amber);}
+  .approval-card + .approval-card{margin-block-start:8px;}
+  .approval-head{display:flex;align-items:baseline;gap:10px;padding:8px 12px;min-width:0;
+    border-bottom:1px solid var(--border);background:var(--bg-elevated);}
+  .approval-head .aglyph{font-size:12px;line-height:1;flex:0 0 auto;}
+  .approval-key{margin:0;font-size:var(--fs-body);font-weight:600;color:var(--text-primary);
+    flex:0 0 auto;}
+  .approval-where{color:var(--text-tertiary);font-size:var(--fs-meta);min-width:0;
+    overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+  .approval-state{margin-left:auto;flex:0 0 auto;color:var(--amber);
+    font-size:var(--fs-micro);letter-spacing:.7px;text-transform:uppercase;}
+  .approval-body{padding:11px 12px;}
+  .approval-reason{color:var(--text-primary);text-wrap:pretty;max-inline-size:78ch;}
+  /* preview is operator-supplied text of unknown length — bound it so one long
+     preview cannot push the whole run view off screen. */
+  .approval-preview{margin-block-start:8px;padding:7px 10px;background:var(--bg-editor);
+    border-inline-start:2px solid var(--amber-dim);color:var(--text-secondary);
+    font-size:12px;line-height:1.6;white-space:pre-wrap;overflow-wrap:anywhere;
+    max-block-size:11em;overflow:auto;}
+  .approval-meta{margin-block-start:8px;color:var(--text-tertiary);font-size:var(--fs-meta);}
+
+  /* decision form — one note field at a time; rejecting is a two-step confirm
+     because the reason is mandatory and the first decision written wins. */
+  .approval-form{display:grid;grid-template-columns:minmax(10rem,14rem) minmax(0,1fr) auto;
+    gap:10px;align-items:end;margin-block-start:12px;padding-block-start:11px;
+    border-block-start:1px solid var(--border);}
+  .approval-field{display:grid;gap:4px;min-inline-size:0;}
+  .approval-field label{color:var(--text-tertiary);font-size:var(--fs-micro);letter-spacing:.5px;
+    text-transform:uppercase;}
+  .approval-field input,.approval-field textarea{inline-size:100%;min-inline-size:0;padding:7px 9px;
+    border:1px solid var(--border);background:var(--bg-editor);color:var(--text-primary);
+    font:inherit;font-size:var(--fs-small);line-height:1.45;}
+  .approval-field input::placeholder,.approval-field textarea::placeholder{color:var(--text-tertiary);}
+  .approval-field textarea{resize:vertical;min-block-size:2.6rem;max-block-size:9rem;}
+  .approval-field input:focus-visible,.approval-field textarea:focus-visible,
+  .approval-actions button:focus-visible{outline:2px solid var(--border-focus);outline-offset:2px;}
+  .approval-hint{grid-column:1 / -1;color:var(--text-tertiary);font-size:var(--fs-meta);}
+  .approval-actions{display:flex;gap:8px;align-items:end;}
+  .approval-actions button{min-block-size:38px;padding:0 14px;border:1px solid var(--border);
+    background:var(--bg-elevated);color:var(--text-secondary);font:inherit;font-size:var(--fs-small);
+    letter-spacing:.3px;cursor:pointer;white-space:nowrap;}
+  .approval-actions button:hover{background:var(--bg-editor);color:var(--text-primary);}
+  .approval-actions button:disabled{cursor:wait;opacity:.5;}
+  /* approve is the affirmative action — success green, matching .pill.success */
+  .approval-actions .approve{border-color:#33402a;background:rgba(106,153,85,.12);color:var(--success);}
+  .approval-actions .approve:hover{background:rgba(106,153,85,.2);color:var(--success);}
+  .approval-actions .reject-confirm{border-color:#4a2828;background:rgba(200,85,85,.12);color:var(--error);}
+  .approval-actions .reject-confirm:hover{background:rgba(200,85,85,.2);color:var(--error);}
+  /* mode toggle: default shows the approve note, reject mode shows the reason */
+  .approval-card[data-mode="reject"] .field-note,
+  .approval-card[data-mode="reject"] .approve,
+  .approval-card[data-mode="reject"] .reject-start,
+  .approval-card:not([data-mode="reject"]) .field-reason,
+  .approval-card:not([data-mode="reject"]) .approval-hint,
+  .approval-card:not([data-mode="reject"]) .reject-confirm,
+  .approval-card:not([data-mode="reject"]) .reject-cancel{display:none;}
+  .approval-readonly{margin-block-start:11px;padding-block-start:10px;
+    border-block-start:1px solid var(--border);color:var(--text-tertiary);font-size:var(--fs-meta);}
+
+  /* decided requests — one ledger line each, no chrome */
+  .approval-done{display:grid;grid-template-columns:16px auto minmax(0,1fr) auto;gap:10px;
+    align-items:baseline;padding:4px 20px;font-size:var(--fs-small);min-width:0;}
+  .approval-done .aglyph{text-align:center;font-size:12px;line-height:1;}
+  .approval-done .k{color:var(--text-secondary);}
+  .approval-done .d{color:var(--text-tertiary);min-width:0;
+    overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+  .approval-done .w{color:var(--text-tertiary);font-size:var(--fs-meta);
+    font-variant-numeric:tabular-nums;}
+  /* separates the acted-on block above from the decided history below */
+  .approval-done:first-child{margin-block-start:0;}
+  .approval-card + .approval-done{margin-block-start:9px;}
+
   /* ============================ BODY GRID ============================ */
   .body{flex:1;display:grid;grid-template-columns:230px minmax(0,1fr) 420px;min-height:0;}
 
@@ -149,8 +238,8 @@
   .g-ok{color:var(--success);}
   .g-fail{color:var(--error);}
   .g-pend{color:var(--text-tertiary);}
-  .pulse{animation:pulse 1.5s ease-in-out infinite;}
   @keyframes pulse{0%,100%{opacity:1}50%{opacity:.45}}
+  @media (prefers-reduced-motion:no-preference){.pulse{animation:pulse 1.5s ease-in-out infinite;}}
 
   /* ---- DRILL-IN (inline disclosure, square-cornered ledger panel) ---- */
   .drill{margin:8px 18px 20px;background:var(--bg-output);border:1px solid var(--border);}
@@ -235,6 +324,8 @@
     .header-bar{grid-template-columns:1fr auto;row-gap:8px;}
     .run-status{grid-column:2;justify-self:end;}
     .rollup{grid-column:1 / -1;justify-self:start;}
+    .approval-form{grid-template-columns:minmax(10rem,14rem) minmax(0,1fr);}
+    .approval-actions{grid-column:1 / -1;}
   }
   @media (max-width:720px){
     .body{display:flex;flex-direction:column;}
@@ -243,6 +334,13 @@
     .stream{display:flex;border-top:1px solid var(--border);min-height:40vh;}
     .footer{flex-wrap:wrap;gap:10px 14px;}
     .footer .heritage{display:none;}
+    .approval-card,.approval-status{margin-inline:14px;}
+    .approval-done{padding-inline:14px;}
+    .approval-form{grid-template-columns:1fr;}
+    .approval-actions{grid-column:auto;}
+    .approval-actions button{flex:1;min-block-size:46px;}
+    /* iOS zooms a focused control below 16px — keep the decision form at 1rem */
+    .approval-field input,.approval-field textarea{font-size:1rem;}
   }
   @media (max-width:520px){
     .meta-strip{grid-template-columns:1fr 1fr;}
@@ -300,6 +398,16 @@
     <div id="auth-rows"></div>
   </div>
 
+  <!-- APPROVAL PANEL — durable signed requests; controls require a matching viewer authority -->
+  <section class="approval-panel" id="approval-panel" data-testid="approval-panel" aria-labelledby="approval-heading" hidden>
+    <div class="col-label approval-label">
+      <span id="approval-heading">Human approvals</span>
+      <span class="approval-pending-count" id="approval-pending-count" data-testid="approval-pending-count"></span>
+    </div>
+    <div class="approval-status" id="approval-status" role="status" aria-live="polite"></div>
+    <div id="approval-rows"></div>
+  </section>
+
   <!-- BODY -->
   <div class="body">
     <div class="phases" id="phases"><div class="col-label">Phases</div></div>
@@ -342,6 +450,9 @@
 let EVENTS = [];
 let RESULT_ENVELOPE = {};
 let AUTH_ROWS = [];   // /api/run/<id>/auth — MCP auth manifest + status (journal + live flow)
+let APPROVAL_ROWS = []; // /api/run/<id>/approvals — validated request + signed decision summaries
+let APPROVAL_MESSAGE = { text:"", tone:"info" };
+const APPROVAL_BUSY = new Set();
 let SELECTED_RUN = null;
 // Session-hardening token (docs/plans/2026-06-24-workflow-mcp-auth.md §8):
 // substituted server-side at response time — see `workflow_view.rs`'s
@@ -357,6 +468,7 @@ let M = emptyModel();
 const G = { run:"◐", ok:"✓", fail:"✗", pend:"○", skip:"⊘", cp:"◇", bud:"·", twig:"└" };
 
 function esc(s){ return String(s==null?"":s).replace(/[&<>]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;"}[c])); }
+function escAttr(s){ return String(s==null?"":s).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c])); }
 function fmtTok(n){ if(n==null) return "—"; return n>=1000 ? (n/1000).toFixed(1)+"k" : String(n); }
 function fmtCost(c){ if(c==null) return "—"; return "$"+c.toFixed(4); }     // null => genuinely absent (unpriced)
 function fmtMs(ms){ if(ms==null) return ""; return ms===0 ? "0ms" : (ms/1000).toFixed(2)+"s"; }
@@ -702,7 +814,12 @@ function wireDrill(){
 function evGlyph(e){
   switch(e.event){
     case "run.started": return `<span class="eg g-pend" data-testid="ev-glyph">${G.cp}</span>`;
-    case "run.ended":   return `<span class="eg g-ok" data-testid="ev-glyph">${G.ok}</span>`;
+    case "run.ended": {
+      const cls = e.status==="failed" || e.status==="rejected" ? "g-fail"
+                : e.status==="needs-auth" || e.status==="needs-approval" ? "g-warn" : "g-ok";
+      const glyph = cls==="g-fail" ? G.fail : cls==="g-warn" ? G.pend : G.ok;
+      return `<span class="eg ${cls}" data-testid="ev-glyph">${glyph}</span>`;
+    }
     case "phase.started": return `<span class="eg g-run" data-testid="ev-glyph">${G.run}</span>`;
     case "phase.ended":   return `<span class="eg ${e.status==="failed"?"g-fail":"g-ok"}" data-testid="ev-glyph">${e.status==="failed"?G.fail:G.ok}</span>`;
     case "agent.started": {
@@ -718,6 +835,10 @@ function evGlyph(e){
     case "policy.checked": return `<span class="eg g-ok" data-testid="ev-glyph">${G.ok}</span>`;
     case "policy.violation": return `<span class="eg g-fail" data-testid="ev-glyph">${G.fail}</span>`;
     case "policy.bypassed": return `<span class="eg g-pend" data-testid="ev-glyph">${G.skip}</span>`;
+    case "approval.requested": return `<span class="eg g-warn" data-testid="ev-glyph">${G.pend}</span>`;
+    case "approval.granted": return `<span class="eg g-ok" data-testid="ev-glyph">${G.ok}</span>`;
+    case "approval.rejected": return `<span class="eg g-fail" data-testid="ev-glyph">${G.fail}</span>`;
+    case "approval.applied": return `<span class="eg g-ok" data-testid="ev-glyph">${G.ok}</span>`;
     default: return `<span class="eg g-pend" data-testid="ev-glyph">${G.bud}</span>`;
   }
 }
@@ -735,6 +856,10 @@ function evFields(e){
     case "policy.checked": return `<b>${esc(e.policy)}</b> allowed ${esc(e.boundary)} ${esc(e.subject)} · ${esc(e.rule)} · ${esc(e.source)}`;
     case "policy.violation": return `<b>${esc(e.policy)}</b> denied ${esc(e.boundary)} ${esc(e.subject)} · ${esc(e.action)} · ${esc(e.reason)}`;
     case "policy.bypassed": return `<b>${esc(e.policy)}</b> bypassed ${esc(e.boundary)} ${esc(e.subject)} · ${esc(e.reason)}`;
+    case "approval.requested": return `<b>${esc(e.approval_id)}</b> ${esc(e.key)} · ${esc(e.reason)}`;
+    case "approval.granted": return `<b>${esc(e.approval_id)}</b> approved by ${esc(e.actor)}`;
+    case "approval.rejected": return `<b>${esc(e.approval_id)}</b> rejected by ${esc(e.actor)} · ${esc(e.reason)}`;
+    case "approval.applied": return `<b>${esc(e.approval_id)}</b> decision ${esc(e.decision_id)}`;
     default: return "";
   }
 }
@@ -880,6 +1005,185 @@ async function triggerAuthAction(alias, action){
 }
 
 /* =========================================================================
+   APPROVAL PANEL — validated durable sidecars. A pending request blocks the
+   run, so it is shown in full and sorted to the top; a decided request is
+   history and collapses to one ledger line. Controls appear only when the
+   loopback viewer holds the matching private key. Native forms preserve a
+   functional no-JS POST fallback; JavaScript keeps the operator in context
+   and displays the winning decision after a race.
+   ========================================================================= */
+const APPROVAL_PAST = { approve:"approved", reject:"rejected" };
+function approvalUnavailable(row){
+  switch(row.decision_unavailable){
+    case "platform-unsupported": return "Inspect only — durable approval writes are unavailable on this platform.";
+    case "authority-mismatch": return "Inspect only — the viewer key does not match this request's authority.";
+    default: return "Inspect only — restart the loopback viewer with --approval-signing-key-file to decide.";
+  }
+}
+/* one ledger line per decided request: who decided, why, when */
+function approvalDoneRow(row){
+  const d = row.decision || {};
+  const detail = d.decision==="reject" ? d.reason : d.comment;
+  const glyph = row.status==="approved" ? `<span class="aglyph g-ok">${G.ok}</span>`
+                                        : `<span class="aglyph g-fail">${G.fail}</span>`;
+  return `<div class="approval-done" data-testid="approval-row" data-status="${escAttr(row.status)}">`+
+    `<span aria-hidden="true">${glyph}</span>`+
+    `<span class="k">${esc(row.key)}</span>`+
+    `<span class="d" data-testid="approval-decision">`+
+      `${esc(APPROVAL_PAST[d.decision] || row.status)} by ${esc(d.actor||"—")}`+
+      (detail ? ` · ${esc(detail)}` : "")+
+    `</span>`+
+    `<span class="w">${esc(d.decided_at||row.requested_at)}</span>`+
+  `</div>`;
+}
+function approvalForm(row){
+  if(!row.can_decide){
+    return `<div class="approval-readonly">${esc(approvalUnavailable(row))}</div>`;
+  }
+  const id = row.approval_id;
+  const encodedRun = encodeURIComponent(SELECTED_RUN);
+  const encodedApproval = encodeURIComponent(id);
+  const busy = APPROVAL_BUSY.has(id) ? "disabled" : "";
+  return `<form class="approval-form" method="post" `+
+    `action="/api/run/${encodedRun}/approvals/${encodedApproval}/decision" `+
+    `data-approval-id="${escAttr(id)}" data-testid="approval-form">`+
+    `<input type="hidden" name="view_token" value="${escAttr(VIEW_TOKEN)}">`+
+    `<div class="approval-field">`+
+      `<label for="actor-${escAttr(id)}">Actor</label>`+
+      `<input id="actor-${escAttr(id)}" name="actor" maxlength="1024" `+
+        `value="${escAttr(row.default_actor||"")}" required autocomplete="name">`+
+    `</div>`+
+    `<div class="approval-field field-note">`+
+      `<label for="comment-${escAttr(id)}">Note (optional)</label>`+
+      `<textarea id="comment-${escAttr(id)}" name="comment" maxlength="1024" rows="1" `+
+        `placeholder="What did you check?"></textarea>`+
+    `</div>`+
+    `<div class="approval-field field-reason">`+
+      `<label for="reason-${escAttr(id)}">Reason for rejection</label>`+
+      `<textarea id="reason-${escAttr(id)}" name="reason" maxlength="1024" rows="1" `+
+        `placeholder="Why is this not safe to run?"></textarea>`+
+    `</div>`+
+    `<div class="approval-actions">`+
+      `<button class="approve" type="submit" name="decision" value="approve" ${busy}>Approve</button>`+
+      `<button class="reject-start" type="button" ${busy}>Reject</button>`+
+      `<button class="reject-confirm" type="submit" name="decision" value="reject" ${busy}>Confirm rejection</button>`+
+      `<button class="reject-cancel" type="button" ${busy}>Cancel</button>`+
+    `</div>`+
+    `<p class="approval-hint">A reason is required. The first decision written wins and is never replaced.</p>`+
+  `</form>`;
+}
+function approvalCard(row){
+  return `<article class="approval-card" data-testid="approval-row" data-status="${escAttr(row.status)}">`+
+    `<div class="approval-head">`+
+      `<span class="aglyph g-warn" aria-hidden="true">${G.pend}</span>`+
+      `<h3 class="approval-key">${esc(row.key)}</h3>`+
+      `<span class="approval-where">phase ${esc(row.phase||"(root)")} · ${esc(row.requested_at)}</span>`+
+      `<span class="approval-state">${esc(row.status)}</span>`+
+    `</div>`+
+    `<div class="approval-body">`+
+      `<div class="approval-reason">${esc(row.reason)}</div>`+
+      (row.preview ? `<div class="approval-preview">${esc(row.preview)}</div>` : "")+
+      `<div class="approval-meta">${esc(row.approval_id)}</div>`+
+      approvalForm(row)+
+    `</div>`+
+  `</article>`;
+}
+/* Rebuild only when the rendered set actually changes: the live poll calls this
+   every second and must not wipe what the operator is typing (or drop them out
+   of reject mode) mid-decision. */
+function approvalSignature(){
+  return APPROVAL_ROWS.map(r=>`${r.approval_id}:${r.status}:${APPROVAL_BUSY.has(r.approval_id)?1:0}`).join("|");
+}
+let APPROVAL_RENDERED = null;
+function renderApprovals(){
+  const panel = document.getElementById("approval-panel");
+  const rowsEl = document.getElementById("approval-rows");
+  const statusEl = document.getElementById("approval-status");
+  statusEl.textContent = APPROVAL_MESSAGE.text || "";
+  statusEl.dataset.tone = APPROVAL_MESSAGE.tone || "info";
+  if(!APPROVAL_ROWS.length){
+    panel.hidden = true; rowsEl.innerHTML = ""; APPROVAL_RENDERED = null; return;
+  }
+  panel.hidden = false;
+  const pending = APPROVAL_ROWS.filter(r=>r.status==="pending");
+  document.getElementById("approval-pending-count").textContent =
+    pending.length ? `${pending.length} pending` : "all decided";
+
+  const signature = approvalSignature();
+  if(signature === APPROVAL_RENDERED) return;
+  APPROVAL_RENDERED = signature;
+
+  rowsEl.innerHTML = pending.map(approvalCard).join("")+
+    APPROVAL_ROWS.filter(r=>r.status!=="pending").map(approvalDoneRow).join("");
+  rowsEl.querySelectorAll(".approval-form").forEach(form=>{
+    const card = form.closest(".approval-card");
+    const reason = form.elements.reason;
+    form.addEventListener("submit", submitApproval);
+    reason.addEventListener("input", ()=>reason.setCustomValidity(""));
+    form.querySelector(".reject-start").addEventListener("click", ()=>{
+      card.dataset.mode = "reject"; reason.focus();
+    });
+    form.querySelector(".reject-cancel").addEventListener("click", ()=>{
+      delete card.dataset.mode; reason.setCustomValidity("");
+    });
+  });
+}
+async function submitApproval(event){
+  event.preventDefault();
+  const form = event.currentTarget;
+  const approvalId = form.dataset.approvalId;
+  const decision = event.submitter?.value;
+  const reason = form.elements.reason;
+  if(decision==="reject" && !reason.value.trim()){
+    reason.setCustomValidity("Enter a reason before rejecting this request.");
+    reason.reportValidity();
+    reason.focus();
+    return;
+  }
+  reason.setCustomValidity("");
+  const body = new URLSearchParams(new FormData(form));
+  body.set("decision", decision||"");
+  // only the field belonging to the chosen action is recorded, so a note typed
+  // before switching to reject (or the reverse) is never silently attached.
+  body.delete(decision==="reject" ? "comment" : "reason");
+  APPROVAL_BUSY.add(approvalId);
+  APPROVAL_MESSAGE = { text:`Recording ${decision||"decision"}…`, tone:"info" };
+  renderApprovals();
+  try{
+    const response = await fetch(form.action, {
+      method:"POST",
+      headers:{
+        "Content-Type":"application/x-www-form-urlencoded;charset=UTF-8",
+        "X-Sema-View-Token":VIEW_TOKEN
+      },
+      body:body.toString()
+    });
+    const payload = await response.json().catch(()=>({error:`HTTP ${response.status}`}));
+    if(payload.approval_id){
+      const index = APPROVAL_ROWS.findIndex(row=>row.approval_id===payload.approval_id);
+      if(index>=0) APPROVAL_ROWS[index] = payload;
+    }
+    if(response.ok){
+      // green only confirms an approval; a recorded rejection stays neutral so the
+      // message never contradicts the red ✗ on the row it just wrote.
+      APPROVAL_MESSAGE = { tone: payload.status==="approved" ? "ok" : "info",
+        text:`${payload.key||approvalId} is ${payload.status}. Resume the same run to apply it.` };
+    }else if(response.status===409 && payload.approval_id){
+      APPROVAL_MESSAGE = { tone:"error",
+        text:`Another operator decided first: ${payload.key||approvalId} is ${payload.status}.` };
+    }else{
+      APPROVAL_MESSAGE = { tone:"error",
+        text:payload.error || `Could not record the approval decision (HTTP ${response.status}).` };
+    }
+  }catch(error){
+    APPROVAL_MESSAGE = { tone:"error", text:`Could not reach the viewer: ${error.message||error}` };
+  }finally{
+    APPROVAL_BUSY.delete(approvalId);
+    renderApprovals();
+  }
+}
+
+/* =========================================================================
    HEADER + LIVE TICK
    ========================================================================= */
 function paintHeader(){
@@ -888,7 +1192,10 @@ function paintHeader(){
   const live = !M.run.ended;
   const pill = document.getElementById("status-pill");
   const st = M.run.status || (live?"running":"success");
-  const pillCls = live ? "running" : (st==="failed" ? "failed" : st==="needs-auth" ? "needs-auth" : "success");
+  const pillCls = live ? "running"
+    : (st==="failed" || st==="rejected") ? "failed"
+    : (st==="needs-auth" || st==="needs-approval") ? "needs-auth"
+    : "success";
   pill.className = "pill "+pillCls;
   pill.textContent = st;
 
@@ -923,6 +1230,7 @@ function tick(){
 
 /* keyboard */
 document.addEventListener("keydown",(e)=>{
+  if(e.target.closest?.("input, textarea, button, select, a")) return;
   if(e.key==="Tab"){ e.preventDefault();
     const i=M.phases.findIndex(p=>p.start_seq===selPhaseSeq);
     const np=M.phases[(i+(e.shiftKey?-1:1)+M.phases.length)%M.phases.length];
@@ -952,6 +1260,7 @@ async function loadRun(runId){
   EVENTS = text.split('\n').filter(l=>l.trim()).map(l=>{try{return JSON.parse(l);}catch(e){return null;}}).filter(Boolean);
   try{ const r=await fetch('/api/run/'+encodeURIComponent(runId)+'/result.json'); RESULT_ENVELOPE=await r.json(); }catch(e){ RESULT_ENVELOPE={}; }
   try{ const r=await fetch('/api/run/'+encodeURIComponent(runId)+'/auth'); AUTH_ROWS=await r.json(); }catch(e){ AUTH_ROWS=[]; }
+  try{ const r=await fetch('/api/run/'+encodeURIComponent(runId)+'/approvals'); APPROVAL_ROWS=await r.json(); if(!Array.isArray(APPROVAL_ROWS)) APPROVAL_ROWS=[]; }catch(e){ APPROVAL_ROWS=[]; }
   M = project(EVENTS);
   // Default selection: the open/live phase (or the last phase), and its live/first agent.
   if(selPhaseSeq==null || !M.phaseBySeq.has(selPhaseSeq)){
@@ -963,7 +1272,7 @@ async function loadRun(runId){
     selPhaseSeq = p ? p.start_seq : null;
     if(p){ const la=p.agents.find(x=>x.status==null); selAgent=(la||p.agents[0])?.agent_id||null; }
   }
-  paintHeader(); renderAuth(); renderPhases(); renderDetail(); renderStream();
+  paintHeader(); renderAuth(); renderApprovals(); renderPhases(); renderDetail(); renderStream();
   return !M.run.ended;
 }
 async function init(){
