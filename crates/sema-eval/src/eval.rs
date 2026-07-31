@@ -3923,24 +3923,30 @@ pub fn register_vm_delegates(env: &Rc<Env>, ctx: &Rc<EvalContext>) {
         })),
     );
 
-    // __vm-deftool: the VM has already evaluated description/parameters/handler
+    // __vm-deftool: the VM has already evaluated description/parameters/options/handler
     // and passes them as values, so build the tool directly.
     let tool_env = Rc::downgrade(env);
     env.set(
         intern("__vm-deftool"),
         Value::native_fn(NativeFn::simple("__vm-deftool", move |args| {
-            if args.len() != 4 {
-                return Err(SemaError::arity("deftool", "4", args.len()));
+            if !matches!(args.len(), 4 | 5) {
+                return Err(SemaError::arity("deftool", "4 or 5", args.len()));
             }
             let name = args[0]
                 .as_symbol()
                 .ok_or_else(|| SemaError::eval("deftool: name must be a symbol"))?;
+            let (options, handler) = if args.len() == 5 {
+                (args[3].clone(), args[4].clone())
+            } else {
+                (Value::nil(), args[3].clone())
+            };
             let tool_env = upgrade_delegate_env(&tool_env)?;
             special_forms::register_tool(
                 &name,
                 args[1].clone(),
                 args[2].clone(),
-                args[3].clone(),
+                options,
+                handler,
                 &tool_env,
             )
         })),

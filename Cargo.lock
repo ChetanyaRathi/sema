@@ -3684,6 +3684,7 @@ name = "sema-policy"
 version = "1.33.0"
 dependencies = [
  "globset",
+ "regex",
  "sema-core",
  "serde_json",
  "sha2 0.10.9",

@@ -138,6 +138,7 @@ pub enum Expr<V> {
         name: Spur,
         description: Box<Expr<V>>,
         parameters: Box<Expr<V>>,
+        options: Box<Expr<V>>,
         handler: Box<Expr<V>>,
     },
     /// Agent definition (LLM)

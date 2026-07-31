@@ -10,6 +10,7 @@ description = "Deterministic policy compiler and matcher for Sema workflows"
 [dependencies]
 sema-core.workspace = true
 globset.workspace = true
+regex.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 thiserror.workspace = true

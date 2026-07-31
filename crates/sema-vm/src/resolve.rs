@@ -407,11 +407,13 @@ fn resolve_expr_inner(expr: &CoreExpr, r: &mut Resolver) -> Result<ResolvedExpr,
             name,
             description,
             parameters,
+            options,
             handler,
         } => Ok(ResolvedExpr::Deftool {
             name: *name,
             description: Box::new(resolve_expr(description, r)?),
             parameters: Box::new(resolve_expr(parameters, r)?),
+            options: Box::new(resolve_expr(options, r)?),
             handler: Box::new(resolve_expr(handler, r)?),
         }),
 
@@ -580,11 +582,13 @@ fn collect_rebinds(
         CoreExpr::Deftool {
             description,
             parameters,
+            options,
             handler,
             ..
         } => {
             collect_rebinds(description, false, rebound, defined);
             collect_rebinds(parameters, false, rebound, defined);
+            collect_rebinds(options, false, rebound, defined);
             collect_rebinds(handler, false, rebound, defined);
         }
         CoreExpr::Defagent { options, .. } => collect_rebinds(options, false, rebound, defined),
@@ -895,11 +899,13 @@ fn scan_self_tail(e: &ResolvedExpr, self_uv: u16) -> bool {
         E::Deftool {
             description,
             parameters,
+            options,
             handler,
             ..
         } => {
             scan_self_tail(description, self_uv)
                 && scan_self_tail(parameters, self_uv)
+                && scan_self_tail(options, self_uv)
                 && scan_self_tail(handler, self_uv)
         }
         E::Defagent { options, .. } => scan_self_tail(options, self_uv),
@@ -1037,11 +1043,13 @@ fn rewrite_self_refs(e: &mut ResolvedExpr, self_uv: u16) {
         E::Deftool {
             description,
             parameters,
+            options,
             handler,
             ..
         } => {
             rewrite_self_refs(description, self_uv);
             rewrite_self_refs(parameters, self_uv);
+            rewrite_self_refs(options, self_uv);
             rewrite_self_refs(handler, self_uv);
         }
         E::Defagent { options, .. } => rewrite_self_refs(options, self_uv),

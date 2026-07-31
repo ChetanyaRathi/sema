@@ -253,6 +253,49 @@ pub enum WorkflowEvent {
         source: String,
     },
 
+    /// A deterministic policy rule observed content in audit-only mode.
+    #[serde(rename = "policy.flagged")]
+    PolicyFlagged {
+        seq: u64,
+        ts: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        phase_seq: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent_id: Option<String>,
+        policy: String,
+        policy_digest: String,
+        boundary: String,
+        subject: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        subject_digest: Option<String>,
+        rule: String,
+        label: String,
+        count: usize,
+        action: String,
+        source: String,
+    },
+
+    /// A deterministic policy rule mechanically redacted one or more spans.
+    #[serde(rename = "policy.redacted")]
+    PolicyRedacted {
+        seq: u64,
+        ts: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        phase_seq: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent_id: Option<String>,
+        policy: String,
+        policy_digest: String,
+        boundary: String,
+        subject: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        subject_digest: Option<String>,
+        rule: String,
+        label: String,
+        count: usize,
+        source: String,
+    },
+
     /// A policy layer denied one protected model or tool boundary.
     #[serde(rename = "policy.violation")]
     PolicyViolation {

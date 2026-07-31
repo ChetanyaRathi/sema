@@ -1968,17 +1968,22 @@ fn lower_message(args: &[Value]) -> Result<CoreExpr, SemaError> {
 }
 
 fn lower_deftool(args: &[Value]) -> Result<CoreExpr, SemaError> {
-    if args.len() < 4 {
-        return Err(SemaError::arity("deftool", "4", args.len()));
+    if !matches!(args.len(), 4 | 5) {
+        return Err(SemaError::arity("deftool", "4 or 5", args.len()));
     }
     let name = require_symbol(&args[0], "deftool")?;
     let description = lower_expr(&args[1], false)?;
     let parameters = lower_expr(&args[2], false)?;
-    let handler = lower_expr(&args[3], false)?;
+    let (options, handler) = if args.len() == 5 {
+        (lower_expr(&args[3], false)?, lower_expr(&args[4], false)?)
+    } else {
+        (CoreExpr::Const(Value::nil()), lower_expr(&args[3], false)?)
+    };
     Ok(CoreExpr::Deftool {
         name,
         description: Box::new(description),
         parameters: Box::new(parameters),
+        options: Box::new(options),
         handler: Box::new(handler),
     })
 }

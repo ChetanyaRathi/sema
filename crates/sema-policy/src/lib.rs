@@ -5,8 +5,11 @@
 //! model-supplied tool arguments, and returns decisions for the workflow/LLM
 //! integration layers to enforce and journal.
 
+pub mod content;
+
 use globset::{GlobBuilder, GlobMatcher};
-use sema_core::Value;
+use regex::Regex;
+use sema_core::{FileAccess, ToolPolicySubject, Value};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
@@ -69,6 +72,62 @@ impl PolicyCheck {
     }
 }
 
+/// Strictness lattice for deterministic content findings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ContentAction {
+    Allow,
+    Audit,
+    Redact,
+    Block,
+}
+
+impl ContentAction {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Allow => "allow",
+            Self::Audit => "audit",
+            Self::Redact => "redact",
+            Self::Block => "block",
+        }
+    }
+}
+
+/// Whether output validation is running on an intermediate tool-call round or
+/// the terminal assistant response.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutputStage {
+    Round,
+    Final,
+}
+
+/// Safe, aggregate content finding. It contains no matched text or byte offsets.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PolicyFinding {
+    pub rule_id: String,
+    pub label: String,
+    pub action: ContentAction,
+    pub count: usize,
+}
+
+/// Result of evaluating one policy layer against one original text value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContentOutcome {
+    pub action: ContentAction,
+    pub findings: Vec<PolicyFinding>,
+    /// Private transformation data for the enforcement layer; never journal it.
+    pub redactions: Vec<content::Finding>,
+}
+
+impl ContentOutcome {
+    fn allow() -> Self {
+        Self {
+            action: ContentAction::Allow,
+            findings: Vec::new(),
+            redactions: Vec::new(),
+        }
+    }
+}
+
 /// One compiled, named policy layer.
 #[derive(Debug)]
 pub struct CompiledPolicy {
@@ -76,6 +135,9 @@ pub struct CompiledPolicy {
     fingerprint: String,
     models: Option<ModelPolicy>,
     tools: Option<ToolPolicy>,
+    subjects: Option<SubjectPolicy>,
+    input: Option<DetectorPolicy>,
+    output: Option<OutputPolicy>,
 }
 
 impl CompiledPolicy {
@@ -84,7 +146,15 @@ impl CompiledPolicy {
         let map = require_map(value, "policy")?;
         reject_unknown_keys(
             map,
-            &["__policy-name", "__policy-version", "models", "tools"],
+            &[
+                "__policy-name",
+                "__policy-version",
+                "models",
+                "tools",
+                "subjects",
+                "input",
+                "output",
+            ],
             "policy",
         )?;
 
@@ -108,6 +178,13 @@ impl CompiledPolicy {
 
         let models = get(map, "models").map(ModelPolicy::compile).transpose()?;
         let tools = get(map, "tools").map(ToolPolicy::compile).transpose()?;
+        let subjects = get(map, "subjects")
+            .map(SubjectPolicy::compile)
+            .transpose()?;
+        let input = get(map, "input")
+            .map(|value| DetectorPolicy::compile(value, ":input", true))
+            .transpose()?;
+        let output = get(map, "output").map(OutputPolicy::compile).transpose()?;
         let fingerprint = fingerprint(value, &name);
 
         Ok(Self {
@@ -115,6 +192,9 @@ impl CompiledPolicy {
             fingerprint,
             models,
             tools,
+            subjects,
+            input,
+            output,
         })
     }
 
@@ -152,12 +232,40 @@ impl CompiledPolicy {
         &self,
         tool: &str,
         arguments: &serde_json::Value,
+        policy_subjects: &[ToolPolicySubject],
         workspace_root: &Path,
     ) -> PolicyCheck {
-        self.tools.as_ref().map_or_else(
+        let named = self.tools.as_ref().map_or_else(
             || PolicyCheck::allow("tools.unrestricted"),
             |policy| policy.check(tool, arguments, workspace_root),
+        );
+        if !named.allowed {
+            return named;
+        }
+        self.subjects.as_ref().map_or_else(
+            || PolicyCheck::allow("subjects.unrestricted"),
+            |policy| policy.check(policy_subjects, arguments, workspace_root),
         )
+    }
+
+    pub fn has_input_policy(&self) -> bool {
+        self.input.is_some()
+    }
+
+    pub fn has_output_policy(&self) -> bool {
+        self.output.is_some()
+    }
+
+    pub fn check_input(&self, text: &str) -> ContentOutcome {
+        self.input
+            .as_ref()
+            .map_or_else(ContentOutcome::allow, |policy| policy.check(text))
+    }
+
+    pub fn check_output(&self, text: &str, stage: OutputStage) -> ContentOutcome {
+        self.output
+            .as_ref()
+            .map_or_else(ContentOutcome::allow, |policy| policy.check(text, stage))
     }
 }
 
@@ -257,6 +365,472 @@ impl ModelPattern {
 }
 
 #[derive(Debug)]
+struct DetectorPolicy {
+    rules: Vec<(content::DetectorKind, ContentAction)>,
+    rule_prefix: &'static str,
+}
+
+impl DetectorPolicy {
+    fn compile(value: &Value, context: &'static str, input: bool) -> Result<Self, PolicyError> {
+        let map = require_map(value, context)?;
+        reject_unknown_keys(map, &["detect", "actions"], context)?;
+        Self::compile_from_map(map, context, input)
+    }
+
+    fn compile_from_map(
+        map: &BTreeMap<Value, Value>,
+        context: &'static str,
+        input: bool,
+    ) -> Result<Self, PolicyError> {
+        let detectors = parse_detectors(get(map, "detect"), &format!("{context} :detect"))?;
+        let actions = match get(map, "actions") {
+            None => BTreeMap::new(),
+            Some(value) => {
+                let action_map = require_map(value, &format!("{context} :actions"))?;
+                let mut actions = BTreeMap::new();
+                for (key, value) in action_map {
+                    let detector = parse_detector(key, &format!("{context} :actions"))?;
+                    if !detectors.contains(&detector) {
+                        return Err(invalid(format!(
+                            "{context} :actions key :{} is not declared in :detect",
+                            detector.as_str()
+                        )));
+                    }
+                    let action = parse_content_action(value, &format!("{context} :actions"))?;
+                    if action == ContentAction::Allow {
+                        return Err(invalid(format!(
+                            "{context} detector actions must be :audit, :redact, or :block"
+                        )));
+                    }
+                    actions.insert(detector, action);
+                }
+                actions
+            }
+        };
+        Ok(Self {
+            rules: detectors
+                .into_iter()
+                .map(|detector| {
+                    let action = actions
+                        .get(&detector)
+                        .copied()
+                        .unwrap_or(ContentAction::Block);
+                    (detector, action)
+                })
+                .collect(),
+            rule_prefix: if input {
+                "input.detect"
+            } else {
+                "output.detect"
+            },
+        })
+    }
+
+    fn check(&self, text: &str) -> ContentOutcome {
+        let mut outcome = ContentOutcome::allow();
+        for (detector, action) in &self.rules {
+            let findings = content::scan(text, *detector);
+            if findings.is_empty() {
+                continue;
+            }
+            outcome.action = outcome.action.max(*action);
+            let mut counts = BTreeMap::new();
+            for finding in &findings {
+                *counts.entry(finding.label).or_insert(0usize) += 1;
+            }
+            outcome
+                .findings
+                .extend(counts.into_iter().map(|(label, count)| PolicyFinding {
+                    rule_id: format!("{}.{}", self.rule_prefix, detector.as_str()),
+                    label: label.to_string(),
+                    action: *action,
+                    count,
+                }));
+            if *action == ContentAction::Redact {
+                outcome.redactions.extend(findings);
+            }
+        }
+        outcome
+    }
+}
+
+#[derive(Debug)]
+struct OutputPolicy {
+    detectors: DetectorPolicy,
+    schema: Option<OutputSchema>,
+    required: BTreeSet<String>,
+    max_length: Option<usize>,
+    forbid: Vec<ForbidRule>,
+    action: ContentAction,
+}
+
+impl OutputPolicy {
+    fn compile(value: &Value) -> Result<Self, PolicyError> {
+        let map = require_map(value, ":output")?;
+        reject_unknown_keys(
+            map,
+            &[
+                "detect",
+                "actions",
+                "schema",
+                "require",
+                "max-length",
+                "forbid",
+                "action",
+            ],
+            ":output",
+        )?;
+        let action = get(map, "action")
+            .map(|value| parse_content_action(value, ":output :action"))
+            .transpose()?
+            .unwrap_or(ContentAction::Block);
+        if !matches!(action, ContentAction::Audit | ContentAction::Block) {
+            return Err(invalid(
+                ":output :action must be :audit or :block; only detector spans may be redacted",
+            ));
+        }
+        let max_length = get(map, "max-length")
+            .map(|value| {
+                value
+                    .as_int()
+                    .and_then(|value| usize::try_from(value).ok())
+                    .filter(|value| *value > 0)
+                    .ok_or_else(|| invalid(":output :max-length must be a positive integer"))
+            })
+            .transpose()?;
+        Ok(Self {
+            detectors: DetectorPolicy::compile_from_map(map, ":output", false)?,
+            schema: get(map, "schema").map(OutputSchema::compile).transpose()?,
+            required: parse_name_set(get(map, "require"), ":output :require")?,
+            max_length,
+            forbid: parse_forbid_rules(get(map, "forbid"))?,
+            action,
+        })
+    }
+
+    fn check(&self, text: &str, stage: OutputStage) -> ContentOutcome {
+        let mut outcome = self.detectors.check(text);
+        for rule in &self.forbid {
+            let count = rule.count(text);
+            if count == 0 {
+                continue;
+            }
+            outcome.action = outcome.action.max(self.action);
+            outcome.findings.push(PolicyFinding {
+                rule_id: format!("output.forbid.{}", rule.id),
+                label: rule.id.clone(),
+                action: self.action,
+                count,
+            });
+        }
+        if stage == OutputStage::Round {
+            return outcome;
+        }
+
+        if self
+            .max_length
+            .is_some_and(|maximum| text.chars().count() > maximum)
+        {
+            push_structural_finding(&mut outcome, "output.max-length", "max-length", self.action);
+        }
+
+        if self.schema.is_none() && self.required.is_empty() {
+            return outcome;
+        }
+        let parsed = match serde_json::from_str::<serde_json::Value>(text) {
+            Ok(parsed) => parsed,
+            Err(_) => {
+                push_structural_finding(
+                    &mut outcome,
+                    "output.schema.json",
+                    "invalid-json",
+                    self.action,
+                );
+                return outcome;
+            }
+        };
+        if let Some(schema) = &self.schema {
+            for finding in schema.validate(&parsed) {
+                push_structural_finding(
+                    &mut outcome,
+                    &format!("output.schema.{finding}"),
+                    &finding,
+                    self.action,
+                );
+            }
+        }
+        let Some(object) = parsed.as_object() else {
+            if !self.required.is_empty() {
+                push_structural_finding(
+                    &mut outcome,
+                    "output.require.object",
+                    "required-fields",
+                    self.action,
+                );
+            }
+            return outcome;
+        };
+        for key in &self.required {
+            if object.get(key).is_none_or(is_empty_json) {
+                push_structural_finding(
+                    &mut outcome,
+                    &format!("output.require.{key}"),
+                    key,
+                    self.action,
+                );
+            }
+        }
+        outcome
+    }
+}
+
+fn push_structural_finding(
+    outcome: &mut ContentOutcome,
+    rule_id: &str,
+    label: &str,
+    action: ContentAction,
+) {
+    outcome.action = outcome.action.max(action);
+    outcome.findings.push(PolicyFinding {
+        rule_id: rule_id.to_string(),
+        label: label.to_string(),
+        action,
+        count: 1,
+    });
+}
+
+#[derive(Debug)]
+struct ForbidRule {
+    id: String,
+    matcher: ForbidMatcher,
+}
+
+impl ForbidRule {
+    fn compile(value: &Value, index: usize) -> Result<Self, PolicyError> {
+        let context = format!(":output :forbid[{index}]");
+        let map = require_map(value, &context)?;
+        reject_unknown_keys(map, &["id", "contains", "regex"], &context)?;
+        let id = get(map, "id")
+            .and_then(value_name)
+            .filter(|id| !id.trim().is_empty())
+            .ok_or_else(|| invalid(format!("{context} requires a nonempty :id")))?;
+        let contains = get(map, "contains").and_then(Value::as_str);
+        let regex = get(map, "regex").and_then(Value::as_str);
+        let matcher = match (contains, regex) {
+            (Some(literal), None) if !literal.is_empty() => {
+                ForbidMatcher::Contains(literal.to_string())
+            }
+            (None, Some(pattern)) if !pattern.is_empty() => ForbidMatcher::Regex(
+                Regex::new(pattern)
+                    .map_err(|error| invalid(format!("{context} invalid regex: {error}")))?,
+            ),
+            _ => {
+                return Err(invalid(format!(
+                    "{context} requires exactly one nonempty :contains or :regex"
+                )))
+            }
+        };
+        Ok(Self { id, matcher })
+    }
+
+    fn count(&self, text: &str) -> usize {
+        match &self.matcher {
+            ForbidMatcher::Contains(literal) => text.match_indices(literal).count(),
+            ForbidMatcher::Regex(regex) => regex.find_iter(text).count(),
+        }
+    }
+}
+
+#[derive(Debug)]
+enum ForbidMatcher {
+    Contains(String),
+    Regex(Regex),
+}
+
+fn parse_forbid_rules(value: Option<&Value>) -> Result<Vec<ForbidRule>, PolicyError> {
+    let Some(value) = value else {
+        return Ok(Vec::new());
+    };
+    let rules = require_seq(value, ":output :forbid")?;
+    let mut ids = BTreeSet::new();
+    rules
+        .iter()
+        .enumerate()
+        .map(|(index, value)| {
+            let rule = ForbidRule::compile(value, index)?;
+            if !ids.insert(rule.id.clone()) {
+                return Err(invalid(format!(
+                    ":output :forbid has duplicate :id {:?}",
+                    rule.id
+                )));
+            }
+            Ok(rule)
+        })
+        .collect()
+}
+
+#[derive(Debug)]
+struct OutputSchema {
+    fields: BTreeMap<String, SchemaField>,
+}
+
+impl OutputSchema {
+    fn compile(value: &Value) -> Result<Self, PolicyError> {
+        let map = require_map(value, ":output :schema")?;
+        let mut fields = BTreeMap::new();
+        for (key, value) in map {
+            let key = value_name(key)
+                .filter(|key| !key.is_empty())
+                .ok_or_else(|| invalid(":output :schema field names must be names or strings"))?;
+            if fields
+                .insert(key.clone(), SchemaField::compile(value, &key)?)
+                .is_some()
+            {
+                return Err(invalid(format!(
+                    ":output :schema has duplicate field {key:?}"
+                )));
+            }
+        }
+        Ok(Self { fields })
+    }
+
+    fn validate(&self, value: &serde_json::Value) -> Vec<String> {
+        let Some(object) = value.as_object() else {
+            return vec!["object".to_string()];
+        };
+        self.fields
+            .iter()
+            .filter_map(|(name, field)| match object.get(name) {
+                None if !field.optional => Some(format!("{name}.missing")),
+                Some(value) if !field.kind.matches(value) => Some(format!("{name}.type")),
+                _ => None,
+            })
+            .collect()
+    }
+}
+
+#[derive(Debug)]
+struct SchemaField {
+    kind: SchemaKind,
+    optional: bool,
+}
+
+impl SchemaField {
+    fn compile(value: &Value, name: &str) -> Result<Self, PolicyError> {
+        if let Some(kind) = value_name(value) {
+            return Ok(Self {
+                kind: SchemaKind::parse(&kind, name)?,
+                optional: false,
+            });
+        }
+        let map = require_map(value, &format!(":output :schema field {name:?}"))?;
+        reject_unknown_keys(
+            map,
+            &["type", "optional"],
+            &format!(":output :schema field {name:?}"),
+        )?;
+        let kind = get(map, "type")
+            .and_then(value_name)
+            .ok_or_else(|| invalid(format!(":output :schema field {name:?} requires :type")))?;
+        let optional = get(map, "optional")
+            .map(|value| {
+                value.as_bool().ok_or_else(|| {
+                    invalid(format!(
+                        ":output :schema field {name:?} :optional must be boolean"
+                    ))
+                })
+            })
+            .transpose()?
+            .unwrap_or(false);
+        Ok(Self {
+            kind: SchemaKind::parse(&kind, name)?,
+            optional,
+        })
+    }
+}
+
+#[derive(Debug)]
+enum SchemaKind {
+    String,
+    Number,
+    Boolean,
+    List,
+}
+
+impl SchemaKind {
+    fn parse(value: &str, name: &str) -> Result<Self, PolicyError> {
+        match value {
+            "string" => Ok(Self::String),
+            "number" => Ok(Self::Number),
+            "boolean" => Ok(Self::Boolean),
+            "list" | "array" => Ok(Self::List),
+            _ => Err(invalid(format!(
+                ":output :schema field {name:?} has unsupported type {value:?}"
+            ))),
+        }
+    }
+
+    fn matches(&self, value: &serde_json::Value) -> bool {
+        match self {
+            Self::String => value.is_string(),
+            Self::Number => value.is_number(),
+            Self::Boolean => value.is_boolean(),
+            Self::List => value.is_array(),
+        }
+    }
+}
+
+fn is_empty_json(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Null => true,
+        serde_json::Value::String(value) => value.trim().is_empty(),
+        serde_json::Value::Array(value) => value.is_empty(),
+        serde_json::Value::Object(value) => value.is_empty(),
+        serde_json::Value::Bool(_) | serde_json::Value::Number(_) => false,
+    }
+}
+
+fn parse_detectors(
+    value: Option<&Value>,
+    context: &str,
+) -> Result<BTreeSet<content::DetectorKind>, PolicyError> {
+    let Some(value) = value else {
+        return Ok(BTreeSet::new());
+    };
+    require_seq(value, context)?
+        .iter()
+        .map(|value| parse_detector(value, context))
+        .collect()
+}
+
+fn parse_detector(value: &Value, context: &str) -> Result<content::DetectorKind, PolicyError> {
+    match value_name(value).as_deref() {
+        Some("secret") => Ok(content::DetectorKind::Secret),
+        Some("email") => Ok(content::DetectorKind::Email),
+        Some("phone") => Ok(content::DetectorKind::Phone),
+        Some("ipv4") => Ok(content::DetectorKind::Ipv4),
+        Some("payment-card") => Ok(content::DetectorKind::PaymentCard),
+        Some(other) => Err(invalid(format!(
+            "{context} has unsupported detector {other:?}"
+        ))),
+        None => Err(invalid(format!("{context} entries must be detector names"))),
+    }
+}
+
+fn parse_content_action(value: &Value, context: &str) -> Result<ContentAction, PolicyError> {
+    match value_name(value).as_deref() {
+        Some("allow") => Ok(ContentAction::Allow),
+        Some("audit") => Ok(ContentAction::Audit),
+        Some("redact") => Ok(ContentAction::Redact),
+        Some("block") => Ok(ContentAction::Block),
+        Some(other) => Err(invalid(format!(
+            "{context} action must be :audit, :redact, or :block, got {other:?}"
+        ))),
+        None => Err(invalid(format!("{context} action must be a name"))),
+    }
+}
+
+#[derive(Debug)]
 struct ToolPolicy {
     default: DefaultEffect,
     allow: BTreeMap<String, ToolRule>,
@@ -325,6 +899,310 @@ impl ToolPolicy {
                 "tools.default-deny",
                 format!("tool {tool} is not allowlisted"),
             ),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct SubjectPolicy {
+    default: DefaultEffect,
+    allow: Vec<SubjectRule>,
+    deny: Vec<SubjectRule>,
+}
+
+impl SubjectPolicy {
+    fn compile(value: &Value) -> Result<Self, PolicyError> {
+        let map = require_map(value, ":subjects")?;
+        reject_unknown_keys(map, &["default", "allow", "deny"], ":subjects")?;
+        Ok(Self {
+            default: parse_default(get(map, "default"), ":subjects")?,
+            allow: parse_subject_rules(get(map, "allow"), ":subjects :allow")?,
+            deny: parse_subject_rules(get(map, "deny"), ":subjects :deny")?,
+        })
+    }
+
+    fn check(
+        &self,
+        specs: &[ToolPolicySubject],
+        arguments: &serde_json::Value,
+        workspace_root: &Path,
+    ) -> PolicyCheck {
+        let Some(arguments) = arguments.as_object() else {
+            return PolicyCheck::deny("subjects.arguments", "tool arguments must be a JSON object");
+        };
+        if specs.is_empty() {
+            return match self.default {
+                DefaultEffect::Allow => PolicyCheck::allow("subjects.default-allow"),
+                DefaultEffect::Deny => {
+                    PolicyCheck::deny("subjects.missing", "tool has no declared policy subjects")
+                }
+            };
+        }
+
+        for spec in specs {
+            let subject = match ResolvedSubject::resolve(spec, arguments) {
+                Ok(subject) => subject,
+                Err(reason) => {
+                    return PolicyCheck::deny("subjects.arguments", reason);
+                }
+            };
+            if self
+                .deny
+                .iter()
+                .any(|rule| rule.matches(&subject, workspace_root))
+            {
+                return PolicyCheck::deny(
+                    format!("subjects.{}.deny", subject.kind().as_str()),
+                    format!(
+                        "{} subject matches an explicit deny rule",
+                        subject.kind().as_str()
+                    ),
+                );
+            }
+            if self
+                .allow
+                .iter()
+                .any(|rule| rule.matches(&subject, workspace_root))
+            {
+                continue;
+            }
+            if self.default == DefaultEffect::Deny {
+                return PolicyCheck::deny(
+                    format!("subjects.{}.default-deny", subject.kind().as_str()),
+                    format!("{} subject is not allowlisted", subject.kind().as_str()),
+                );
+            }
+        }
+        PolicyCheck::allow("subjects.allow")
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SubjectKind {
+    FileRead,
+    FileWrite,
+    FileDelete,
+    NetworkRequest,
+    Command,
+    ExternalAction,
+}
+
+impl SubjectKind {
+    fn parse(value: &Value, context: &str) -> Result<Self, PolicyError> {
+        match value_name(value).as_deref() {
+            Some("file-read") => Ok(Self::FileRead),
+            Some("file-write") => Ok(Self::FileWrite),
+            Some("file-delete") => Ok(Self::FileDelete),
+            Some("network-request") => Ok(Self::NetworkRequest),
+            Some("command") => Ok(Self::Command),
+            Some("external-action") => Ok(Self::ExternalAction),
+            Some(other) => Err(invalid(format!(
+                "{context} has unsupported :kind {other:?}"
+            ))),
+            None => Err(invalid(format!(
+                "{context} :kind must be a keyword or string"
+            ))),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::FileRead => "file-read",
+            Self::FileWrite => "file-write",
+            Self::FileDelete => "file-delete",
+            Self::NetworkRequest => "network-request",
+            Self::Command => "command",
+            Self::ExternalAction => "external-action",
+        }
+    }
+}
+
+#[derive(Debug)]
+struct SubjectRule {
+    kind: SubjectKind,
+    constraint: Option<CompiledConstraint>,
+    methods: BTreeSet<String>,
+    actions: BTreeSet<String>,
+}
+
+impl SubjectRule {
+    fn compile(value: &Value, context: &str) -> Result<Self, PolicyError> {
+        let map = require_map(value, context)?;
+        reject_unknown_keys(
+            map,
+            &["kind", "paths", "domains", "commands", "methods", "actions"],
+            context,
+        )?;
+        let kind = SubjectKind::parse(
+            get(map, "kind").ok_or_else(|| invalid(format!("{context} requires :kind")))?,
+            context,
+        )?;
+        let constraint = match kind {
+            SubjectKind::FileRead | SubjectKind::FileWrite | SubjectKind::FileDelete => {
+                get(map, "paths")
+                    .map(|value| compile_subject_constraint(value, ConstraintKind::Path, context))
+                    .transpose()?
+            }
+            SubjectKind::NetworkRequest => get(map, "domains")
+                .map(|value| compile_subject_constraint(value, ConstraintKind::Domain, context))
+                .transpose()?,
+            SubjectKind::Command => get(map, "commands")
+                .map(|value| compile_subject_constraint(value, ConstraintKind::Command, context))
+                .transpose()?,
+            SubjectKind::ExternalAction => None,
+        };
+        if kind != SubjectKind::NetworkRequest && get(map, "methods").is_some() {
+            return Err(invalid(format!(
+                "{context} :methods is valid only for :network-request"
+            )));
+        }
+        if kind != SubjectKind::ExternalAction && get(map, "actions").is_some() {
+            return Err(invalid(format!(
+                "{context} :actions is valid only for :external-action"
+            )));
+        }
+        Ok(Self {
+            kind,
+            constraint,
+            methods: parse_name_set(get(map, "methods"), &format!("{context} :methods"))?
+                .into_iter()
+                .map(|method| method.to_ascii_uppercase())
+                .collect(),
+            actions: parse_name_set(get(map, "actions"), &format!("{context} :actions"))?,
+        })
+    }
+
+    fn matches(&self, subject: &ResolvedSubject, workspace_root: &Path) -> bool {
+        if self.kind != subject.kind() {
+            return false;
+        }
+        match subject {
+            ResolvedSubject::File { path, .. } => self
+                .constraint
+                .as_ref()
+                .is_none_or(|constraint| constraint.check(path, workspace_root).is_ok()),
+            ResolvedSubject::NetworkRequest { method, url } => {
+                (self.methods.is_empty()
+                    || method
+                        .as_deref()
+                        .is_some_and(|method| self.methods.contains(method)))
+                    && self
+                        .constraint
+                        .as_ref()
+                        .is_none_or(|constraint| constraint.check(url, workspace_root).is_ok())
+            }
+            ResolvedSubject::Command(command) => self
+                .constraint
+                .as_ref()
+                .is_none_or(|constraint| constraint.check(command, workspace_root).is_ok()),
+            ResolvedSubject::ExternalAction { action, .. } => {
+                self.actions.is_empty() || self.actions.contains(action)
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+enum ResolvedSubject {
+    File {
+        kind: SubjectKind,
+        path: serde_json::Value,
+    },
+    NetworkRequest {
+        method: Option<String>,
+        url: serde_json::Value,
+    },
+    Command(serde_json::Value),
+    ExternalAction {
+        action: String,
+        _target: Option<serde_json::Value>,
+    },
+}
+
+impl ResolvedSubject {
+    fn resolve(
+        spec: &ToolPolicySubject,
+        arguments: &serde_json::Map<String, serde_json::Value>,
+    ) -> Result<Self, String> {
+        let required = |name: &str| {
+            arguments
+                .get(name)
+                .cloned()
+                .ok_or_else(|| format!("required policy subject argument {name:?} is missing"))
+        };
+        match spec {
+            ToolPolicySubject::File { access, path_arg } => Ok(Self::File {
+                kind: match access {
+                    FileAccess::Read => SubjectKind::FileRead,
+                    FileAccess::Write => SubjectKind::FileWrite,
+                    FileAccess::Delete => SubjectKind::FileDelete,
+                },
+                path: required(path_arg)?,
+            }),
+            ToolPolicySubject::NetworkRequest { method, url_arg } => Ok(Self::NetworkRequest {
+                method: method.as_ref().map(|method| method.to_ascii_uppercase()),
+                url: required(url_arg)?,
+            }),
+            ToolPolicySubject::Command { command_arg } => Ok(Self::Command(required(command_arg)?)),
+            ToolPolicySubject::ExternalAction { action, target_arg } => Ok(Self::ExternalAction {
+                action: action.clone(),
+                _target: target_arg.as_deref().map(required).transpose()?,
+            }),
+        }
+    }
+
+    fn kind(&self) -> SubjectKind {
+        match self {
+            Self::File { kind, .. } => *kind,
+            Self::NetworkRequest { .. } => SubjectKind::NetworkRequest,
+            Self::Command(_) => SubjectKind::Command,
+            Self::ExternalAction { .. } => SubjectKind::ExternalAction,
+        }
+    }
+}
+
+fn parse_subject_rules(
+    value: Option<&Value>,
+    context: &str,
+) -> Result<Vec<SubjectRule>, PolicyError> {
+    let Some(value) = value else {
+        return Ok(Vec::new());
+    };
+    require_seq(value, context)?
+        .iter()
+        .enumerate()
+        .map(|(index, value)| SubjectRule::compile(value, &format!("{context}[{index}]")))
+        .collect()
+}
+
+fn compile_subject_constraint(
+    value: &Value,
+    kind: ConstraintKind,
+    context: &str,
+) -> Result<CompiledConstraint, PolicyError> {
+    let selector = if let Some(map) = value.as_map_ref() {
+        map.clone()
+    } else {
+        let values = require_seq(value, context)?;
+        if !values.iter().all(|value| value.as_str().is_some()) {
+            return Err(invalid(format!(
+                "{context} constraint must be a selector map or string sequence"
+            )));
+        }
+        shorthand_selector(&values)
+    };
+    let allowed_keys: &[&str] = match kind {
+        ConstraintKind::Path | ConstraintKind::Command => &["allow", "deny"],
+        ConstraintKind::Domain => &["allow", "deny", "schemes", "ports"],
+    };
+    reject_unknown_keys(&selector, allowed_keys, context)?;
+    match kind {
+        ConstraintKind::Path => PathConstraint::compile(&selector).map(CompiledConstraint::Path),
+        ConstraintKind::Domain => {
+            DomainConstraint::compile(&selector).map(CompiledConstraint::Domain)
+        }
+        ConstraintKind::Command => {
+            CommandConstraint::compile(&selector).map(CompiledConstraint::Command)
         }
     }
 }
@@ -899,6 +1777,19 @@ fn parse_string_set(value: Option<&Value>, context: &str) -> Result<BTreeSet<Str
     parse_string_list(value, context).map(|values| values.into_iter().collect())
 }
 
+fn parse_name_set(value: Option<&Value>, context: &str) -> Result<BTreeSet<String>, PolicyError> {
+    let Some(value) = value else {
+        return Ok(BTreeSet::new());
+    };
+    require_seq(value, context)?
+        .iter()
+        .map(|value| {
+            value_name(value)
+                .ok_or_else(|| invalid(format!("{context} entries must be names or strings")))
+        })
+        .collect()
+}
+
 fn parse_string_list(value: Option<&Value>, context: &str) -> Result<Vec<String>, PolicyError> {
     let Some(value) = value else {
         return Ok(Vec::new());
@@ -1039,10 +1930,147 @@ mod tests {
         assert_eq!(policy.model_action(), ModelDenyAction::Fail);
         assert!(
             !policy
-                .check_tool("read-file", &serde_json::json!({}), Path::new("."))
+                .check_tool("read-file", &serde_json::json!({}), &[], Path::new("."))
                 .allowed
         );
         assert_eq!(policy.tool_action(), ToolDenyAction::Fail);
+    }
+
+    #[test]
+    fn semantic_subject_rules_use_declared_argument_mappings() {
+        let root = std::env::temp_dir().join(format!("sema-policy-subject-{}", std::process::id()));
+        fs::create_dir_all(root.join("src")).unwrap();
+        let policy = CompiledPolicy::compile(&named_policy([(
+            "subjects",
+            map([(
+                "allow",
+                Value::vector(vec![map([
+                    ("kind", Value::keyword("file-read")),
+                    ("paths", strings(&["src/**"])),
+                ])]),
+            )]),
+        )]))
+        .unwrap();
+        let subjects = [ToolPolicySubject::File {
+            access: FileAccess::Read,
+            path_arg: "location".to_string(),
+        }];
+
+        assert!(
+            policy
+                .check_tool(
+                    "arbitrary-name",
+                    &serde_json::json!({"location":"src/lib.rs"}),
+                    &subjects,
+                    &root,
+                )
+                .allowed
+        );
+        assert!(
+            !policy
+                .check_tool(
+                    "arbitrary-name",
+                    &serde_json::json!({"location":"Cargo.toml"}),
+                    &subjects,
+                    &root,
+                )
+                .allowed
+        );
+        assert!(
+            !policy
+                .check_tool(
+                    "arbitrary-name",
+                    &serde_json::json!({"location":"src/lib.rs"}),
+                    &[],
+                    &root,
+                )
+                .allowed
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn input_detectors_compile_to_safe_aggregate_findings() {
+        let policy = CompiledPolicy::compile(&named_policy([(
+            "input",
+            map([
+                (
+                    "detect",
+                    Value::vector(vec![Value::keyword("secret"), Value::keyword("email")]),
+                ),
+                (
+                    "actions",
+                    map([
+                        ("secret", Value::keyword("block")),
+                        ("email", Value::keyword("redact")),
+                    ]),
+                ),
+            ]),
+        )]))
+        .unwrap();
+        let text = "send me@example.com and AKIAIOSFODNN7EXAMPLE";
+        let outcome = policy.check_input(text);
+
+        assert_eq!(outcome.action, ContentAction::Block);
+        assert!(outcome
+            .findings
+            .iter()
+            .all(|finding| !finding.label.contains('@')));
+        assert_eq!(
+            content::redact(text, &outcome.redactions),
+            "send «redacted:email» and AKIAIOSFODNN7EXAMPLE"
+        );
+    }
+
+    #[test]
+    fn terminal_output_enforces_schema_required_length_and_patterns() {
+        let policy = CompiledPolicy::compile(&named_policy([(
+            "output",
+            map([
+                (
+                    "schema",
+                    map([
+                        ("answer", Value::keyword("string")),
+                        (
+                            "citations",
+                            map([
+                                ("type", Value::keyword("list")),
+                                ("optional", Value::bool(true)),
+                            ]),
+                        ),
+                    ]),
+                ),
+                ("require", Value::vector(vec![Value::keyword("citations")])),
+                ("max-length", Value::int(120)),
+                (
+                    "forbid",
+                    Value::vector(vec![map([
+                        ("id", Value::keyword("absolute")),
+                        ("contains", Value::string("guaranteed")),
+                    ])]),
+                ),
+            ]),
+        )]))
+        .unwrap();
+
+        let round = policy.check_output("guaranteed", OutputStage::Round);
+        assert_eq!(round.action, ContentAction::Block);
+        let final_outcome =
+            policy.check_output(r#"{"answer":"ok","citations":[]}"#, OutputStage::Final);
+        assert_eq!(final_outcome.action, ContentAction::Block);
+        assert!(final_outcome
+            .findings
+            .iter()
+            .any(|finding| finding.rule_id == "output.require.citations"));
+        assert_eq!(
+            policy
+                .check_output(
+                    r#"{"answer":"ok","citations":["source-1"]}"#,
+                    OutputStage::Final,
+                )
+                .action,
+            ContentAction::Allow
+        );
     }
 
     #[test]
@@ -1087,6 +2115,7 @@ mod tests {
                 .check_tool(
                     "read-file",
                     &serde_json::json!({"path":"../outside"}),
+                    &[],
                     Path::new(".")
                 )
                 .allowed
@@ -1135,12 +2164,12 @@ mod tests {
         .unwrap();
         assert!(
             !policy
-                .check_tool("read-file", &serde_json::json!({}), Path::new("."))
+                .check_tool("read-file", &serde_json::json!({}), &[], Path::new("."))
                 .allowed
         );
         assert!(
             !policy
-                .check_tool("write-file", &serde_json::json!({}), Path::new("."))
+                .check_tool("write-file", &serde_json::json!({}), &[], Path::new("."))
                 .allowed
         );
     }
@@ -1184,6 +2213,7 @@ mod tests {
                 .check_tool(
                     "read-file",
                     &serde_json::json!({"path":"src/lib.rs"}),
+                    &[],
                     &root
                 )
                 .allowed
@@ -1193,6 +2223,7 @@ mod tests {
                 .check_tool(
                     "read-file",
                     &serde_json::json!({"path":"Cargo.toml"}),
+                    &[],
                     &root
                 )
                 .allowed
@@ -1202,6 +2233,7 @@ mod tests {
                 .check_tool(
                     "copy-file",
                     &serde_json::json!({"source":"src/lib.rs","destination":"tmp/lib.rs"}),
+                    &[],
                     &root
                 )
                 .allowed
@@ -1211,6 +2243,7 @@ mod tests {
                 .check_tool(
                     "copy-file",
                     &serde_json::json!({"source":"src/lib.rs"}),
+                    &[],
                     &root
                 )
                 .allowed

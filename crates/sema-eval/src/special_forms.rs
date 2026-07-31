@@ -1,7 +1,8 @@
 use std::rc::Rc;
 
 use sema_core::{
-    intern, resolve, Agent, Env, EvalContext, Record, SemaError, Spur, ToolDefinition, Value,
+    intern, resolve, Agent, Env, EvalContext, FileAccess, Record, SemaError, Spur, ToolDefinition,
+    ToolPolicySubject, Value,
 };
 
 use crate::eval::{self, Trampoline};
@@ -70,11 +71,12 @@ pub const SPECIAL_FORM_NAMES: &[&str] = &[
 
 /// Build a `ToolDefinition` from already-evaluated values and bind it in `env`.
 /// The VM's `__vm-deftool` native passes the pre-evaluated description /
-/// parameters / handler straight here.
+/// parameters / options / handler straight here.
 pub(crate) fn register_tool(
     name: &str,
     description: Value,
     parameters: Value,
+    options: Value,
     handler: Value,
     env: &Env,
 ) -> Result<Value, SemaError> {
@@ -82,14 +84,118 @@ pub(crate) fn register_tool(
         .as_str()
         .ok_or_else(|| SemaError::type_error("string", description.type_name()))?
         .to_string();
+    let policy_subjects = parse_tool_policy_subjects(&options)?;
     let tool = Value::tool_def(ToolDefinition {
         name: name.to_string(),
         description,
         parameters,
+        policy_subjects,
         handler,
     });
     env.set(intern(name), tool.clone());
     Ok(tool)
+}
+
+fn parse_tool_policy_subjects(options: &Value) -> Result<Vec<ToolPolicySubject>, SemaError> {
+    if options.is_nil() {
+        return Ok(Vec::new());
+    }
+    let map = options
+        .as_map_rc()
+        .ok_or_else(|| SemaError::type_error("map", options.type_name()))?;
+    for key in map.keys() {
+        if key.as_keyword().as_deref() != Some("policy-subjects") {
+            return Err(SemaError::eval(format!("deftool: unknown option {key}")));
+        }
+    }
+    let Some(subjects) = map.get(&Value::keyword("policy-subjects")) else {
+        return Ok(Vec::new());
+    };
+    let subjects = subjects
+        .as_seq()
+        .ok_or_else(|| SemaError::type_error("sequence", subjects.type_name()))?;
+    subjects
+        .iter()
+        .map(parse_tool_policy_subject)
+        .collect::<Result<Vec<_>, _>>()
+}
+
+fn parse_tool_policy_subject(value: &Value) -> Result<ToolPolicySubject, SemaError> {
+    let map = value
+        .as_map_rc()
+        .ok_or_else(|| SemaError::type_error("map", value.type_name()))?;
+    let kind = subject_name(map.get(&Value::keyword("kind")))
+        .ok_or_else(|| SemaError::eval("deftool: policy subject requires :kind"))?;
+    let required_arg = |key: &str| {
+        subject_name(map.get(&Value::keyword(key))).ok_or_else(|| {
+            SemaError::eval(format!("deftool: policy subject {kind:?} requires :{key}"))
+        })
+    };
+    match kind.as_str() {
+        "file-read" | "file-write" | "file-delete" => {
+            reject_subject_keys(&map, &["kind", "path-arg"])?;
+            let access = match kind.as_str() {
+                "file-read" => FileAccess::Read,
+                "file-write" => FileAccess::Write,
+                "file-delete" => FileAccess::Delete,
+                _ => unreachable!("matched file subject kind"),
+            };
+            Ok(ToolPolicySubject::File {
+                access,
+                path_arg: required_arg("path-arg")?,
+            })
+        }
+        "network-request" => {
+            reject_subject_keys(&map, &["kind", "url-arg", "method"])?;
+            Ok(ToolPolicySubject::NetworkRequest {
+                method: subject_name(map.get(&Value::keyword("method"))),
+                url_arg: required_arg("url-arg")?,
+            })
+        }
+        "command" => {
+            reject_subject_keys(&map, &["kind", "command-arg"])?;
+            Ok(ToolPolicySubject::Command {
+                command_arg: required_arg("command-arg")?,
+            })
+        }
+        "external-action" => {
+            reject_subject_keys(&map, &["kind", "action", "target-arg"])?;
+            Ok(ToolPolicySubject::ExternalAction {
+                action: required_arg("action")?,
+                target_arg: subject_name(map.get(&Value::keyword("target-arg"))),
+            })
+        }
+        _ => Err(SemaError::eval(format!(
+            "deftool: unsupported policy subject kind {kind:?}"
+        ))),
+    }
+}
+
+fn subject_name(value: Option<&Value>) -> Option<String> {
+    value.and_then(|value| {
+        value
+            .as_keyword()
+            .or_else(|| value.as_str().map(str::to_string))
+    })
+}
+
+fn reject_subject_keys(
+    map: &std::collections::BTreeMap<Value, Value>,
+    allowed: &[&str],
+) -> Result<(), SemaError> {
+    for key in map.keys() {
+        let Some(key) = key.as_keyword() else {
+            return Err(SemaError::eval(
+                "deftool: policy subject keys must be keywords",
+            ));
+        };
+        if !allowed.contains(&key.as_str()) {
+            return Err(SemaError::eval(format!(
+                "deftool: unknown policy subject option :{key}"
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Build an `Agent` from an already-evaluated options map and bind it in `env`.

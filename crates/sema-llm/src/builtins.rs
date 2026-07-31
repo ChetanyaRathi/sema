@@ -21,7 +21,7 @@ use crate::pricing;
 use crate::provider::{LlmProvider, ProviderRegistry};
 use crate::types::{
     ChatMessage, ChatRequest, ChatResponse, ContentBlock, EmbedRequest, EmbedResponse, LlmError,
-    RerankRequest, RerankResponse, ToolCall, ToolSchema, Usage,
+    MessageContent, RerankRequest, RerankResponse, ToolCall, ToolSchema, Usage,
 };
 use crate::vector_store::{VectorDocument, VectorStore};
 
@@ -114,6 +114,8 @@ pub struct LastUsage {
 pub enum PolicyBoundary {
     Model,
     Tool,
+    LlmInput,
+    LlmOutput,
 }
 
 impl PolicyBoundary {
@@ -121,6 +123,8 @@ impl PolicyBoundary {
         match self {
             Self::Model => "model",
             Self::Tool => "tool",
+            Self::LlmInput => "llm.input",
+            Self::LlmOutput => "llm.output",
         }
     }
 }
@@ -153,6 +157,8 @@ pub struct PolicyObservation {
     pub subject: String,
     pub subject_digest: Option<String>,
     pub rule: String,
+    pub label: Option<String>,
+    pub count: Option<usize>,
     pub action: Option<String>,
     pub reason: Option<String>,
     pub source: PolicySource,
@@ -162,6 +168,8 @@ pub struct PolicyObservation {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PolicyObservationKind {
     Checked,
+    Flagged,
+    Redacted,
     Violation,
     Bypassed,
 }
@@ -377,13 +385,24 @@ fn enforce_stored_model_policy(
     model_target_allowed(provider, model, source, false).map(|_| ())
 }
 
-fn preflight_tool_calls(calls: &[ToolCall]) -> Result<BTreeMap<String, String>, SemaError> {
+fn preflight_tool_calls(
+    calls: &[ToolCall],
+    tools: &[Value],
+) -> Result<BTreeMap<String, String>, SemaError> {
     let mut denied = BTreeMap::new();
     let mut hard_denial = None;
     for call in calls {
+        let definition = tools.iter().find_map(|tool| {
+            tool.as_tool_def_rc()
+                .filter(|definition| definition.name == call.name)
+        });
+        let policy_subjects = definition
+            .as_deref()
+            .map_or(&[][..], |definition| definition.policy_subjects.as_slice());
         match check_tool_policy(
             &call.name,
             &call.arguments,
+            policy_subjects,
             sema_policy::ToolDenyAction::ToolError,
         ) {
             PolicyGate::Allow => {}
@@ -404,8 +423,17 @@ fn preflight_tool_calls(calls: &[ToolCall]) -> Result<BTreeMap<String, String>, 
     Ok(denied)
 }
 
-fn enforce_direct_tool_policy(tool: &str, arguments: &serde_json::Value) -> Result<(), SemaError> {
-    match check_tool_policy(tool, arguments, sema_policy::ToolDenyAction::Fail) {
+fn enforce_direct_tool_policy(
+    tool: &str,
+    arguments: &serde_json::Value,
+    policy_subjects: &[sema_core::ToolPolicySubject],
+) -> Result<(), SemaError> {
+    match check_tool_policy(
+        tool,
+        arguments,
+        policy_subjects,
+        sema_policy::ToolDenyAction::Fail,
+    ) {
         PolicyGate::Allow => Ok(()),
         PolicyGate::Deny(_) => Err(policy_denied(PolicyBoundary::Tool, tool, "tools.denied")),
     }
@@ -415,6 +443,7 @@ fn enforce_direct_tool_policy(tool: &str, arguments: &serde_json::Value) -> Resu
 fn check_tool_policy(
     tool: &str,
     arguments: &serde_json::Value,
+    policy_subjects: &[sema_core::ToolPolicySubject],
     minimum_action: sema_policy::ToolDenyAction,
 ) -> PolicyGate<sema_policy::ToolDenyAction> {
     let subject_digest = policy_value_digest(arguments);
@@ -426,7 +455,7 @@ fn check_tool_policy(
         |layer| {
             layer
                 .policy
-                .check_tool(tool, arguments, &layer.workspace_root)
+                .check_tool(tool, arguments, policy_subjects, &layer.workspace_root)
         },
         |layer| layer.policy.tool_action().max(minimum_action),
     )
@@ -477,6 +506,8 @@ fn check_active_policies<T: PolicyAction>(
             subject: subject.to_string(),
             subject_digest,
             rule: "policy.without".to_string(),
+            label: None,
+            count: None,
             action: Some("bypass".to_string()),
             reason: Some(reason),
             source,
@@ -509,6 +540,8 @@ fn check_active_policies<T: PolicyAction>(
             subject: subject.to_string(),
             subject_digest: subject_digest.clone(),
             rule: result.rule,
+            label: None,
+            count: None,
             // Journal what the boundary will actually do. A stricter denial in
             // any active layer upgrades every violation observation to that
             // effective action.
@@ -528,6 +561,212 @@ fn policy_value_digest(value: &serde_json::Value) -> String {
     let mut hasher = Sha256::new();
     hasher.update(serde_json::to_vec(value).unwrap_or_default());
     format!("sha256:{:x}", hasher.finalize())
+}
+
+fn policy_text_digest(text: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(text.as_bytes());
+    format!("sha256:{:x}", hasher.finalize())
+}
+
+fn apply_text_policy(
+    text: &str,
+    boundary: PolicyBoundary,
+    subject: &str,
+    source: PolicySource,
+    output_stage: Option<sema_policy::OutputStage>,
+) -> Result<String, SemaError> {
+    let policies = ACTIVE_POLICIES.with(|policies| policies.borrow().clone());
+    let policies: Vec<_> = policies
+        .into_iter()
+        .filter(|layer| match boundary {
+            PolicyBoundary::LlmInput => layer.policy.has_input_policy(),
+            PolicyBoundary::LlmOutput => layer.policy.has_output_policy(),
+            PolicyBoundary::Model | PolicyBoundary::Tool => false,
+        })
+        .collect();
+    if policies.is_empty() {
+        return Ok(text.to_string());
+    }
+    if text.len() > sema_policy::content::INPUT_BYTE_CAP {
+        return Err(policy_denied(boundary, subject, "content.input-too-large"));
+    }
+    let subject_digest = Some(policy_text_digest(text));
+    let agent_id = POLICY_AGENT_ID.with(|agent| agent.borrow().clone());
+    if let Some(reason) = POLICY_BYPASS.with(|bypass| bypass.borrow().last().cloned()) {
+        let observation = PolicyObservation {
+            kind: PolicyObservationKind::Bypassed,
+            policy: "effective-policy".to_string(),
+            policy_digest: effective_policy_fingerprint(),
+            boundary,
+            subject: subject.to_string(),
+            subject_digest,
+            rule: "policy.without".to_string(),
+            label: None,
+            count: None,
+            action: Some("bypass".to_string()),
+            reason: Some(reason),
+            source,
+            agent_id,
+        };
+        (policies.last().expect("nonempty content policy stack").sink)(observation);
+        return Ok(text.to_string());
+    }
+
+    let outcomes: Vec<_> = policies
+        .iter()
+        .map(|layer| {
+            let outcome = match boundary {
+                PolicyBoundary::LlmInput => layer.policy.check_input(text),
+                PolicyBoundary::LlmOutput => layer.policy.check_output(
+                    text,
+                    output_stage.unwrap_or(sema_policy::OutputStage::Final),
+                ),
+                PolicyBoundary::Model | PolicyBoundary::Tool => {
+                    unreachable!("content policy called for non-content boundary")
+                }
+            };
+            (layer, outcome)
+        })
+        .collect();
+    let effective_action = outcomes
+        .iter()
+        .map(|(_, outcome)| outcome.action)
+        .max()
+        .unwrap_or(sema_policy::ContentAction::Allow);
+
+    for (layer, outcome) in &outcomes {
+        if outcome.findings.is_empty() {
+            (layer.sink)(PolicyObservation {
+                kind: PolicyObservationKind::Checked,
+                policy: layer.policy.name().to_string(),
+                policy_digest: layer.policy.fingerprint().to_string(),
+                boundary,
+                subject: subject.to_string(),
+                subject_digest: subject_digest.clone(),
+                rule: format!("{}.checked", boundary.as_str()),
+                label: None,
+                count: None,
+                action: None,
+                reason: None,
+                source,
+                agent_id: agent_id.clone(),
+            });
+            continue;
+        }
+        for finding in &outcome.findings {
+            let kind = match effective_action {
+                sema_policy::ContentAction::Block => PolicyObservationKind::Violation,
+                sema_policy::ContentAction::Redact => PolicyObservationKind::Redacted,
+                sema_policy::ContentAction::Audit => PolicyObservationKind::Flagged,
+                sema_policy::ContentAction::Allow => PolicyObservationKind::Checked,
+            };
+            (layer.sink)(PolicyObservation {
+                kind,
+                policy: layer.policy.name().to_string(),
+                policy_digest: layer.policy.fingerprint().to_string(),
+                boundary,
+                subject: subject.to_string(),
+                subject_digest: subject_digest.clone(),
+                rule: finding.rule_id.clone(),
+                label: Some(finding.label.clone()),
+                count: Some(finding.count),
+                action: Some(effective_action.as_str().to_string()),
+                reason: (effective_action == sema_policy::ContentAction::Block)
+                    .then(|| "deterministic content policy matched".to_string()),
+                source,
+                agent_id: agent_id.clone(),
+            });
+        }
+    }
+
+    match effective_action {
+        sema_policy::ContentAction::Block => {
+            let rule = outcomes
+                .iter()
+                .flat_map(|(_, outcome)| &outcome.findings)
+                .next()
+                .map_or("content.denied", |finding| finding.rule_id.as_str());
+            Err(policy_denied(boundary, subject, rule))
+        }
+        sema_policy::ContentAction::Redact => {
+            let redactions = outcomes
+                .iter()
+                .flat_map(|(_, outcome)| outcome.redactions.iter().cloned())
+                .collect::<Vec<_>>();
+            Ok(sema_policy::content::redact(text, &redactions))
+        }
+        sema_policy::ContentAction::Allow | sema_policy::ContentAction::Audit => {
+            Ok(text.to_string())
+        }
+    }
+}
+
+fn apply_input_policy_to_request(request: &mut ChatRequest) -> Result<(), SemaError> {
+    let mut system = request.system.clone();
+    if let Some(value) = &mut system {
+        *value = apply_text_policy(
+            value,
+            PolicyBoundary::LlmInput,
+            "system",
+            PolicySource::Request,
+            None,
+        )?;
+    }
+    let mut messages = request.messages.clone();
+    for (message_index, message) in messages.iter_mut().enumerate() {
+        let subject = format!("message.{message_index}.{}", message.role);
+        match &mut message.content {
+            MessageContent::Text(text) => {
+                *text = apply_text_policy(
+                    text,
+                    PolicyBoundary::LlmInput,
+                    &subject,
+                    PolicySource::Request,
+                    None,
+                )?;
+            }
+            MessageContent::Blocks(blocks) => {
+                for (block_index, block) in blocks.iter_mut().enumerate() {
+                    if let ContentBlock::Text { text } = block {
+                        *text = apply_text_policy(
+                            text,
+                            PolicyBoundary::LlmInput,
+                            &format!("{subject}.block.{block_index}"),
+                            PolicySource::Request,
+                            None,
+                        )?;
+                    }
+                }
+            }
+        }
+    }
+    request.system = system;
+    request.messages = messages;
+    Ok(())
+}
+
+fn apply_output_policy_to_response(
+    response: &mut ChatResponse,
+    source: PolicySource,
+) -> Result<(), SemaError> {
+    let stage = if response.tool_calls.is_empty() {
+        sema_policy::OutputStage::Final
+    } else {
+        sema_policy::OutputStage::Round
+    };
+    let subject = match stage {
+        sema_policy::OutputStage::Round => "assistant.round",
+        sema_policy::OutputStage::Final => "assistant.final",
+    };
+    response.content = apply_text_policy(
+        &response.content,
+        PolicyBoundary::LlmOutput,
+        subject,
+        source,
+        Some(stage),
+    )?;
+    Ok(())
 }
 
 /// Clear the per-thread last-usage slot. The workflow runtime calls this at the START
@@ -5564,6 +5803,21 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
         Ok(t.parameters.clone())
     });
 
+    register_fn(env, "tool/policy-subjects", |args| {
+        if args.len() != 1 {
+            return Err(SemaError::arity("tool/policy-subjects", "1", args.len()));
+        }
+        let tool = args[0]
+            .as_tool_def_rc()
+            .ok_or_else(|| SemaError::type_error("tool", args[0].type_name()))?;
+        Ok(Value::vector(
+            tool.policy_subjects
+                .iter()
+                .map(tool_policy_subject_to_value)
+                .collect(),
+        ))
+    });
+
     // (agent {:system "…" :tools […] :model "…" :max-turns N}) — build an anonymous,
     // reusable actor value (system prompt + tools + model + max-turns) without binding
     // it. The named form is `defagent`; this is the plain constructor used inline (e.g.
@@ -7168,7 +7422,7 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
         // JSON-coerce the arguments (lossily) so a direct invocation hands the
         // handler exactly what an agent-driven tool call would.
         let json_args = sema_core::value_to_json_lossy(&args[1]);
-        enforce_direct_tool_policy(&tool_def.name, &json_args)?;
+        enforce_direct_tool_policy(&tool_def.name, &json_args, &tool_def.policy_subjects)?;
         let handler_args = json_args_to_sema(&tool_def.parameters, &json_args, &tool_def.handler);
         Box::new(ToolInvokeContinuation {
             tool_name: tool_def.name.clone(),
@@ -7829,7 +8083,8 @@ fn apply_call_telemetry_agent(span: &sema_otel::AgentSpan) {
     });
 }
 
-fn do_complete(request: ChatRequest) -> Result<ChatResponse, SemaError> {
+fn do_complete(mut request: ChatRequest) -> Result<ChatResponse, SemaError> {
+    apply_input_policy_to_request(&mut request)?;
     // Standalone completions get their own conversation id so every chat span carries
     // gen_ai.conversation.id; agent-nested completions inherit the agent's scope.
     let _conv = if sema_otel::current_conversation_id().is_none() {
@@ -7891,7 +8146,8 @@ fn do_complete(request: ChatRequest) -> Result<ChatResponse, SemaError> {
             // A cache hit makes no provider call: no tokens are consumed and no money
             // is spent. Report ZERO usage so the caller's `track_usage` does not
             // re-charge session cost or burn the budget for a cached response.
-            let resp = cache_hit_response(cached, key_request.model.clone());
+            let mut resp = cache_hit_response(cached, key_request.model.clone());
+            apply_output_policy_to_response(&mut resp, PolicySource::Cache)?;
             // Cache-hit span: no provider served it; tag gen_ai.cache.hit=true with
             // zero usage (matches the zero-usage accounting invariant).
             span.set_dispatch("", &resp.model);
@@ -9457,7 +9713,13 @@ fn run_completion(
     span: &sema_otel::LlmSpan,
 ) -> Result<ChatResponse, SemaError> {
     if current_cassette_scope().is_none() {
-        return do_complete_inner(request, span);
+        let mut response = do_complete_inner(request.clone(), span)?;
+        if let Err(error) = apply_output_policy_to_response(&mut response, PolicySource::Request) {
+            track_usage(&response.usage)?;
+            return Err(error);
+        }
+        set_guarded_response_telemetry(span, &request, "", &response);
+        return Ok(response);
     }
     // Key by the request as-is (no default-model resolution) so record and replay
     // produce the same key for an identical call, even with no provider configured
@@ -9470,14 +9732,19 @@ fn run_completion(
             // A replayed call is a stand-in for a real one: emit the span with the
             // recorded facts and let the caller's usage/cost accounting run on the
             // recorded tokens (distinct from a cache hit, which reports zero usage).
-            let resp = entry.to_response();
-            span.set_dispatch("cassette", &resp.model);
-            span.set_response(&response_facts("cassette", &resp));
-            Ok(resp)
+            let mut response = entry.to_response();
+            apply_output_policy_to_response(&mut response, PolicySource::Cassette)?;
+            set_guarded_response_telemetry(span, &request, "cassette", &response);
+            Ok(response)
         }
         crate::cassette::Decision::Miss(k) => Err(cassette_miss_error(&k)),
         crate::cassette::Decision::Record => {
-            let resp = do_complete_inner(request, span)?;
+            let mut resp = do_complete_inner(request.clone(), span)?;
+            if let Err(error) = apply_output_policy_to_response(&mut resp, PolicySource::Request) {
+                track_usage(&resp.usage)?;
+                return Err(error);
+            }
+            set_guarded_response_telemetry(span, &request, "", &resp);
             let provider = LAST_SERVING_PROVIDER.with(|p| p.borrow().clone().unwrap_or_default());
             cassette_record(crate::cassette::TapeEntry::from_response(
                 &key, &provider, &resp,
@@ -9485,6 +9752,30 @@ fn run_completion(
             Ok(resp)
         }
     }
+}
+
+fn set_guarded_response_telemetry(
+    span: &sema_otel::LlmSpan,
+    request: &ChatRequest,
+    provider_override: &str,
+    response: &ChatResponse,
+) {
+    let provider = if provider_override.is_empty() {
+        LAST_SERVING_PROVIDER.with(|provider| provider.borrow().clone().unwrap_or_default())
+    } else {
+        provider_override.to_string()
+    };
+    span.set_dispatch(&provider, &response.model);
+    span.set_response(&response_facts(&provider, response));
+    span.set_messages(
+        &messages_json(&request.messages),
+        &content_json("assistant", &response.content),
+        request
+            .system
+            .as_deref()
+            .map(|system| content_json("system", system))
+            .as_deref(),
+    );
 }
 
 /// The hard error raised on a `:replay`-mode cassette miss (no recorded interaction
@@ -10333,16 +10624,6 @@ fn do_complete_with_provider(
         // Provider + model + response are all in scope here, before track_usage
         // consumes the serving-provider stamp.
         span.set_dispatch(&entry.provider, &request.model);
-        span.set_response(&response_facts(&entry.provider, &resp));
-        span.set_messages(
-            &messages_json(&request.messages),
-            &content_json("assistant", &resp.content),
-            request
-                .system
-                .as_deref()
-                .map(|s| content_json("system", s))
-                .as_deref(),
-        );
         Ok(Some(resp))
     })
 }
@@ -10549,16 +10830,6 @@ fn do_complete_uncached(
         set_serving_provider(p.name());
         // Capture provider/model/response before track_usage consumes the stamp.
         span.set_dispatch(p.name(), &request.model);
-        span.set_response(&response_facts(p.name(), &resp));
-        span.set_messages(
-            &messages_json(&request.messages),
-            &content_json("assistant", &resp.content),
-            request
-                .system
-                .as_deref()
-                .map(|s| content_json("system", s))
-                .as_deref(),
-        );
         Ok(resp)
     })
 }
@@ -10667,6 +10938,40 @@ fn build_tool_schemas(tools: &[Value]) -> Result<Vec<ToolSchema>, SemaError> {
         });
     }
     Ok(schemas)
+}
+
+fn tool_policy_subject_to_value(subject: &sema_core::ToolPolicySubject) -> Value {
+    let mut map = BTreeMap::new();
+    match subject {
+        sema_core::ToolPolicySubject::File { access, path_arg } => {
+            let kind = match access {
+                sema_core::FileAccess::Read => "file-read",
+                sema_core::FileAccess::Write => "file-write",
+                sema_core::FileAccess::Delete => "file-delete",
+            };
+            map.insert(Value::keyword("kind"), Value::keyword(kind));
+            map.insert(Value::keyword("path-arg"), Value::keyword(path_arg));
+        }
+        sema_core::ToolPolicySubject::NetworkRequest { method, url_arg } => {
+            map.insert(Value::keyword("kind"), Value::keyword("network-request"));
+            map.insert(Value::keyword("url-arg"), Value::keyword(url_arg));
+            if let Some(method) = method {
+                map.insert(Value::keyword("method"), Value::string(method));
+            }
+        }
+        sema_core::ToolPolicySubject::Command { command_arg } => {
+            map.insert(Value::keyword("kind"), Value::keyword("command"));
+            map.insert(Value::keyword("command-arg"), Value::keyword(command_arg));
+        }
+        sema_core::ToolPolicySubject::ExternalAction { action, target_arg } => {
+            map.insert(Value::keyword("kind"), Value::keyword("external-action"));
+            map.insert(Value::keyword("action"), Value::keyword(action));
+            if let Some(target_arg) = target_arg {
+                map.insert(Value::keyword("target-arg"), Value::keyword(target_arg));
+            }
+        }
+    }
+    Value::map(map)
 }
 
 /// Convert a Sema schema map into a JSON Schema object for the LLM API.
@@ -11483,7 +11788,7 @@ fn agent_exec_tools(ctx: &EvalContext, token: u64) -> sema_core::runtime::Native
             let pending = std::mem::take(&mut st.pending_tool_calls);
             Ok::<_, SemaError>((pending, st.tools.clone(), st.on_tool_call.clone()))
         })?;
-    let denied = preflight_tool_calls(&pending)?;
+    let denied = preflight_tool_calls(&pending, &tools)?;
 
     // Cooperative runtime path (Task 04/06): a tool handler may SUSPEND (e.g.
     // `mcp/call`'s runtime external wait, or an `async/await` inside the handler),
@@ -13214,7 +13519,7 @@ fn run_tool_loop(
         // Gate the entire batch before any callback, validation predicate, or handler.
         // A hard denial aborts the round with zero tool side effects; `:tool-error`
         // denials become correlated tool results while allowed siblings may proceed.
-        let denied = preflight_tool_calls(&response.tool_calls)?;
+        let denied = preflight_tool_calls(&response.tool_calls, tools)?;
 
         // Echo the assistant turn that invoked the tools, carrying the tool_calls
         // so the provider can correlate the tool results that follow. This MUST be

@@ -2493,6 +2493,7 @@ fn tool_defs_to_value(
             name: tool.name,
             description: tool.description,
             parameters,
+            policy_subjects: Vec::new(),
             handler,
         }));
     }

@@ -434,6 +434,48 @@ fn direct_tool_invoke_is_gated_before_the_handler() {
 }
 
 #[test]
+fn semantic_tool_subjects_are_name_and_argument_independent() {
+    let src = r#"
+        (deftool arbitrary-reader
+          "read through a deployment-specific argument"
+          {:location {:type :string}}
+          {:policy-subjects [{:kind :file-read :path-arg :location}]}
+          (fn (_location) "read-ok"))
+        (deftool arbitrary-writer
+          "write through a deployment-specific argument"
+          {:destination {:type :string}}
+          {:policy-subjects [{:kind :file-write :path-arg :destination}]}
+          (fn (_destination) "write-ran"))
+        (defpolicy readonly
+          {:subjects
+           {:default :deny
+            :allow [{:kind :file-read :paths ["src/**"]}]}})
+        (defworkflow guarded "semantic subjects" {:policy readonly}
+          (def read-result
+            (tool/invoke arbitrary-reader {:location "src/lib.rs"}))
+          (def write-result
+            (try
+              (tool/invoke arbitrary-writer {:destination "src/lib.rs"})
+              (catch error (:type error))))
+          {:status :success
+           :read read-result
+           :write write-result
+           :subjects (tool/policy-subjects arbitrary-reader)})
+    "#;
+
+    let out = wc::run_once(
+        src,
+        fake_with_reply("unused"),
+        "wf_policy_semantic_subjects",
+    );
+    assert_eq!(out.result["status"], "success");
+    assert_eq!(out.result["read"], "read-ok");
+    assert_eq!(out.result["write"], "policy-denied");
+    assert_eq!(out.result["subjects"][0]["kind"], "file-read");
+    assert_eq!(out.result["subjects"][0]["path-arg"], "location");
+}
+
+#[test]
 fn step_policy_can_tighten_but_not_loosen_the_workflow_policy() {
     let src = r#"
         (defpolicy workflow-safe
