@@ -335,6 +335,28 @@ fn model_target_allowed(
     }
 }
 
+/// Resolve and check every batch target before the provider starts any request.
+fn resolve_batch_models(
+    provider: &dyn LlmProvider,
+    requests: impl IntoIterator<Item = ChatRequest>,
+) -> Result<Vec<ChatRequest>, SemaError> {
+    requests
+        .into_iter()
+        .map(|mut request| {
+            if request.model.is_empty() {
+                request.model = provider.default_model().to_string();
+            }
+            model_target_allowed(
+                provider.name(),
+                &request.model,
+                PolicySource::Request,
+                false,
+            )?;
+            Ok(request)
+        })
+        .collect()
+}
+
 fn enforce_stored_model_policy(
     provider: &str,
     model: &str,
@@ -4555,15 +4577,7 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
             .collect::<Vec<_>>();
 
         let responses = with_provider(|provider| {
-            let requests = requests
-                .into_iter()
-                .map(|mut request| {
-                    if request.model.is_empty() {
-                        request.model = provider.default_model().to_string();
-                    }
-                    request
-                })
-                .collect();
+            let requests = resolve_batch_models(provider, requests)?;
             Ok(provider.batch_complete(requests))
         })?;
         responses
@@ -4653,12 +4667,13 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
                         .to_string(),
                 ));
             };
+            let resolved_requests = resolve_batch_models(&*provider, requests.iter().cloned())?;
 
             if provider.runs_on_vm_thread() {
                 return Box::new(SemaBatchDriver {
                     provider: provider.name().to_string(),
                     default_model: provider.default_model().to_string(),
-                    requests,
+                    requests: resolved_requests,
                     next_request: 0,
                     active_model: None,
                     responses: Vec::new(),
@@ -4667,17 +4682,6 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
                 })
                 .advance();
             }
-
-            let reqs: Vec<ChatRequest> = requests
-                .iter()
-                .cloned()
-                .map(|mut r| {
-                    if r.model.is_empty() {
-                        r.model = provider.default_model().to_string();
-                    }
-                    r
-                })
-                .collect();
 
             // Capture the dispatch-time budget + leaf-usage frames (ASYNC-1), so the
             // decoder charges the frames active now, not whatever scope is installed
@@ -4707,7 +4711,7 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
                     kind,
                     decoder,
                     resource,
-                    move || Ok(Box::new(p_job.batch_complete(reqs)) as SendPayload),
+                    move || Ok(Box::new(p_job.batch_complete(resolved_requests)) as SendPayload),
                 );
                 return Ok(NativeOutcome::Suspend(NativeSuspend {
                     wait: WaitKind::External(Box::new(prepared)),
@@ -4717,15 +4721,7 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
         }
 
         let responses = with_provider(|p| {
-            let reqs: Vec<ChatRequest> = requests
-                .into_iter()
-                .map(|mut r| {
-                    if r.model.is_empty() {
-                        r.model = p.default_model().to_string();
-                    }
-                    r
-                })
-                .collect();
+            let reqs = resolve_batch_models(p, requests)?;
             Ok(p.batch_complete(reqs))
         })?;
 
@@ -8029,6 +8025,8 @@ enum CompletePrep {
 #[cfg(not(target_arch = "wasm32"))]
 struct CompleteOffloadPlan {
     chain: Vec<ResolvedProvider>,
+    /// Model `:skip` applies to every explicit fallback chain, including one entry.
+    explicit_fallback: bool,
     request: ChatRequest,
     max_retries: u32,
     retry_base_ms: u64,
@@ -8152,9 +8150,10 @@ fn complete_offload_prep(request: ChatRequest) -> Result<CompletePrep, SemaError
     // Capture the retry-backoff base on the VM thread so each native provider
     // attempt honors it (pool workers have their own RETRY_BASE_MS TLS copies).
     let retry_base_ms = RETRY_BASE_MS.with(|c| c.get());
+    let fallback = FALLBACK_CHAIN.with(|c| c.borrow().clone());
+    let explicit_fallback = fallback.as_ref().is_some_and(|entries| !entries.is_empty());
     let chain: Vec<ResolvedProvider> = PROVIDER_REGISTRY.with(|reg| {
         let reg = reg.borrow();
-        let fallback = FALLBACK_CHAIN.with(|c| c.borrow().clone());
         match fallback {
             Some(entries) if !entries.is_empty() => entries
                 .iter()
@@ -8191,6 +8190,7 @@ fn complete_offload_prep(request: ChatRequest) -> Result<CompletePrep, SemaError
     let request_for_messages = request.clone();
     Ok(CompletePrep::Offload(Box::new(CompleteOffloadPlan {
         chain,
+        explicit_fallback,
         request,
         max_retries,
         retry_base_ms,
@@ -8471,7 +8471,7 @@ impl RuntimeCompleteDriver {
                 &provider_name,
                 &request.model,
                 PolicySource::Request,
-                self.plan.chain.len() > 1,
+                self.plan.explicit_fallback,
             )? {
                 continue;
             }
@@ -12125,6 +12125,8 @@ struct StreamDone {
 #[cfg(not(target_arch = "wasm32"))]
 struct StreamDispatchState {
     chain: Vec<ResolvedProvider>,
+    /// Model `:skip` applies to every explicit fallback chain, including one entry.
+    explicit_fallback: bool,
     request: ChatRequest,
     next_provider: usize,
     last_error: Option<(LlmError, String)>,
@@ -12286,11 +12288,13 @@ fn stream_wire_attempt(
 }
 
 /// Resolve the active fallback chain (or the default provider) into owned `Arc`
-/// clones on the VM thread, so the offloaded wire walk touches no thread-locals.
-fn resolve_stream_chain() -> Result<Vec<ResolvedProvider>, SemaError> {
-    PROVIDER_REGISTRY.with(|reg| {
+/// clones on the VM thread. The boolean records whether the chain was explicit,
+/// so the offloaded wire walk touches no thread-locals.
+fn resolve_stream_chain() -> Result<(Vec<ResolvedProvider>, bool), SemaError> {
+    let fallback = FALLBACK_CHAIN.with(|c| c.borrow().clone());
+    let explicit_fallback = fallback.as_ref().is_some_and(|entries| !entries.is_empty());
+    let chain = PROVIDER_REGISTRY.with(|reg| {
         let reg = reg.borrow();
-        let fallback = FALLBACK_CHAIN.with(|c| c.borrow().clone());
         match fallback {
             Some(entries) if !entries.is_empty() => entries
                 .iter()
@@ -12322,7 +12326,8 @@ fn resolve_stream_chain() -> Result<Vec<ResolvedProvider>, SemaError> {
                 }])
             }
         }
-    })
+    })?;
+    Ok((chain, explicit_fallback))
 }
 
 /// Start a non-blocking stream run. Cassette replay does not reserve a rate-limit slot.
@@ -12358,8 +12363,10 @@ fn stream_run_begin(request: ChatRequest, span: sema_otel::LlmSpan) -> Result<Va
     let dispatch = if prefilled {
         None
     } else {
+        let (chain, explicit_fallback) = resolve_stream_chain()?;
         Some(StreamDispatchState {
-            chain: resolve_stream_chain()?,
+            chain,
+            explicit_fallback,
             request,
             next_provider: 0,
             last_error: None,
@@ -12375,7 +12382,7 @@ fn stream_run_begin(request: ChatRequest, span: sema_otel::LlmSpan) -> Result<Va
         None
     } else {
         let rate_limit_wait_ms = reserve_rate_limit_wait_ms();
-        let chain = resolve_stream_chain()?;
+        let (chain, _) = resolve_stream_chain()?;
         let (tx, rx) = std::sync::mpsc::channel::<StreamEvent>();
         if rate_limit_wait_ms > 0 {
             sema_core::blocking_sleep_ms(rate_limit_wait_ms);
@@ -12499,7 +12506,7 @@ impl RuntimeStreamDriver {
                     &entry.name,
                     &request.model,
                     PolicySource::Request,
-                    dispatch.chain.len() > 1,
+                    dispatch.explicit_fallback,
                 )? {
                     return Ok(Action::Skip);
                 }
@@ -14192,6 +14199,7 @@ mod tests {
         let driver = RuntimeCompleteDriver {
             plan: CompleteOffloadPlan {
                 chain: Vec::new(),
+                explicit_fallback: false,
                 request: ChatRequest::new(String::new(), Vec::new()),
                 max_retries: 0,
                 retry_base_ms: 0,

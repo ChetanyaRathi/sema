@@ -120,6 +120,104 @@ fn model_skip_skips_only_denied_fallback_targets() {
 }
 
 #[test]
+fn single_entry_fallback_preserves_skip_for_completion_and_stream() {
+    let src = r#"
+        (defpolicy fallback-safe
+          {:models {:default :deny :on-deny :skip}})
+        (defworkflow guarded "single fallback skip" {:policy fallback-safe}
+          (phase "Run")
+          (def completion-type
+            (try
+              (llm/with-fallback [:fake]
+                (lambda () (llm/complete "complete")))
+              (catch error (:type error))))
+          (def stream-type
+            (try
+              (llm/with-fallback [:fake]
+                (lambda ()
+                  (llm/stream "stream" (lambda (_chunk) nil))))
+              (catch error (:type error))))
+          {:status :success
+           :types (list completion-type stream-type)})
+    "#;
+
+    let fake = FakeProvider::builder("fake").model("fake-model").build();
+    let out = wc::run_once(src, fake, "wf_policy_single_fallback_skip");
+    assert_eq!(out.result["status"], "success");
+    assert_eq!(out.result["types"], serde_json::json!(["llm", "llm"]));
+    assert_eq!(
+        out.recorder.call_count(),
+        0,
+        "a denied fallback target must not reach the provider"
+    );
+
+    let violations = wc::events_of(&out.events, "policy.violation");
+    assert_eq!(
+        violations.len(),
+        2,
+        "completion and stream should each audit one denial"
+    );
+    assert!(
+        violations
+            .iter()
+            .all(|event| { event["subject"] == "fake/fake-model" && event["action"] == "skip" }),
+        "a one-entry fallback must retain fallback skip behavior: {violations:?}"
+    );
+}
+
+#[test]
+fn batch_and_pmap_check_model_policy_before_provider_access() {
+    let src = r#"
+        (defpolicy locked {:models {:default :deny}})
+        (defworkflow guarded "batch model policy" {:policy locked}
+          (phase "Run")
+          (def batch-result
+            (try
+              (llm/batch (list "batch"))
+              (catch _ :denied)))
+          (def pmap-result
+            (try
+              (llm/pmap str (list "pmap"))
+              (catch _ :denied)))
+          {:status :success
+           :results (list batch-result pmap-result)})
+    "#;
+
+    let out = wc::run_once(
+        src,
+        FakeProvider::builder("fake")
+            .model("fake-model")
+            .reply("unexpected")
+            .reply("unexpected")
+            .build(),
+        "wf_policy_batch_pmap",
+    );
+    assert_eq!(out.result["status"], "success");
+    assert_eq!(
+        out.result["results"],
+        serde_json::json!(["denied", "denied"])
+    );
+    assert_eq!(
+        out.recorder.call_count(),
+        0,
+        "denied batch requests must not reach the provider"
+    );
+
+    let violations = wc::events_of(&out.events, "policy.violation");
+    assert_eq!(
+        violations.len(),
+        2,
+        "llm/batch and llm/pmap should each audit one denial"
+    );
+    assert!(
+        violations
+            .iter()
+            .all(|event| { event["subject"] == "fake/fake-model" && event["action"] == "fail" }),
+        "batch model denials should be hard failures: {violations:?}"
+    );
+}
+
+#[test]
 fn stream_embed_and_rerank_are_denied_before_provider_or_callback() {
     let base = temp_run_dir("policy-model-surfaces");
     let marker = base.join("stream-callback");
