@@ -344,6 +344,10 @@ impl CompletionPolicy {
             "auth.required",
             "auth.granted",
             "auth.failed",
+            "approval.requested",
+            "approval.granted",
+            "approval.rejected",
+            "approval.applied",
             "policy.checked",
             "policy.flagged",
             "policy.redacted",
@@ -2261,7 +2265,7 @@ mod tests {
                 "completion",
                 map([(
                     "require-events",
-                    strings(&["agent.tool_result", "checkpoint"]),
+                    strings(&["agent.tool_result", "approval.applied", "checkpoint"]),
                 )]),
             ),
         ]))
@@ -2272,7 +2276,7 @@ mod tests {
         );
         assert_eq!(
             policy.required_completion_events().collect::<Vec<_>>(),
-            vec!["agent.tool_result", "checkpoint"]
+            vec!["agent.tool_result", "approval.applied", "checkpoint"]
         );
 
         let error = CompiledPolicy::compile(&named_policy([(

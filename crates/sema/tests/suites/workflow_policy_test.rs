@@ -458,6 +458,23 @@ fn completion_policy_fails_a_nominal_success_when_evidence_is_missing() {
 }
 
 #[test]
+fn approval_completion_policy_fails_without_an_applied_gate() {
+    let src = r#"
+        (defpolicy human-reviewed
+          {:completion {:require-events [:approval.applied]}})
+        (defworkflow guarded "approval evidence" {:policy human-reviewed}
+          (phase "Review")
+          {:status :success})
+    "#;
+    let out = wc::run_once(src, fake_with_reply("unused"), "wf_policy_approval_missing");
+
+    assert_eq!(out.result["status"], "failed");
+    assert!(out.result["error"]
+        .as_str()
+        .is_some_and(|message| message.contains("approval.applied")));
+}
+
+#[test]
 fn successful_tool_results_satisfy_completion_evidence() {
     let src = r#"
         (deftool ping "Return pong" {} (lambda () "pong"))

@@ -85,7 +85,10 @@ fn write_workflow(root: &Path, run_id: &str) -> (PathBuf, PathBuf, PathBuf) {
         &workflow,
         format!(
             r#"
-            (defworkflow approval-demo "approval test" {{:phases ["Release"]}}
+            (defpolicy human-reviewed
+              {{:completion {{:require-events [:approval.applied]}}}})
+            (defworkflow approval-demo "approval test"
+              {{:phases ["Release"] :policy human-reviewed}}
               (phase "Release")
               (checkpoint :prepared 1)
               (approval :release-signoff

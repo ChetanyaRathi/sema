@@ -272,6 +272,19 @@ those placements before execution. Pending, rejected, malformed, cancelled,
 and authority-invalid gates are uncatchable by Sema `try`/`catch`, so later
 protected forms cannot run.
 
+A workflow-level completion policy can require proof that an approved gate was
+crossed before the run reports success:
+
+```sema
+(defpolicy human-reviewed
+  {:completion {:require-events [:approval.applied]}})
+```
+
+This is run-wide evidence. It proves that an approval was applied during the
+successful invocation, but it does not associate that approval with an
+arbitrary later tool call. Keep the gate immediately before the protected
+action and bind its `:subject` to that action's stable identity.
+
 Durable approval storage and approval key generation support Unix permission
 modes and protected Windows ACLs. Other targets fail closed if Sema cannot
 enforce private approval files.
@@ -354,6 +367,22 @@ Old runs stay readable forever.
 Each event carries a monotonic `seq` (0-based) and a `ts` (RFC3339 UTC
 instant). The journal is flushed per event, so a crash mid-run leaves a valid
 JSONL prefix.
+
+### Evidence export
+
+Export a run into a machine-readable ledger, Markdown summary, and integrity
+manifest:
+
+```bash
+sema workflow export <run-id>
+```
+
+The exporter reads approval requests and decisions through the same digest and
+Ed25519 signature validation used by the CLI and viewer. `evidence.json` and
+`evidence.md` include approval summaries. `manifest.json` includes SHA-256
+entries for the authoritative request and decision sidecars as well as the run
+journals, metadata, result, and generated evidence files. Export fails if a
+listed approval request or decision is invalid.
 
 ## Resume
 
@@ -599,17 +628,36 @@ sema pkg add sema-policies
 (import "sema-policies")
 
 (define project-policy
-  (list
-    (policies/model-allowlist ["openai/gpt-5"])
-    (policies/read-only-repository ["src/**" "Cargo.toml"])
-    policies/no-sensitive-data-to-models))
+  (policies/safe-code-agent
+    {:models ["openai/gpt-5" "ollama/*"]
+     :read ["src/**" "tests/**" "Cargo.toml"]
+     :write ["src/**" "tests/**"]
+     :commands ["cargo test" "git diff"]
+     :domains ["docs.rs"]}))
 ```
 
-The pack also includes tool allowlists, output contracts, a no-tools profile,
-public-content controls, and evidence baselines for public-sector RAG and AI
-documentation. These are deterministic runtime controls, not compliance
-certifications. Policy lists compose as an intersection, so every layer must
-allow an operation.
+The pack includes:
+
+- model, named-tool, and semantic-subject allowlist constructors;
+- file, network, exact-command, and external-action rule builders;
+- configurable input detectors and evidence requirements;
+- composable denials for tool-requested writes, network access, commands, and
+  external actions;
+- safe-code-agent and draft-only customer-support profiles;
+- reviewable-output, certainty-audit, and placeholder-output controls;
+- explicit human-review and change-control completion profiles;
+- public-sector RAG, employment-assistance, and AI documentation baselines.
+
+For a reviewed run, put the explicit gate before the protected action and add
+`policies/human-reviewed-run` or `policies/change-controlled` to the workflow
+policy. The latter also requires `:owner`, `:change-id`, and `:environment`
+metadata. These profiles require an `approval.applied` event; they do not
+automatically pause a matching tool call.
+
+The standard profiles are deterministic runtime controls, not compliance
+certifications. `certainty-audit` is advisory and uses a small independently
+authored pattern set; it is not semantic fact checking. Policy lists compose as
+an intersection, so every layer must allow an operation.
 
 ### Trusted lexical bypass
 
