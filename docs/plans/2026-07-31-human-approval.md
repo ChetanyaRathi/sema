@@ -67,8 +67,9 @@ sema workflow approve RUN_ID APPROVAL_ID --signing-key-file PRIVATE [--comment T
 sema workflow reject RUN_ID APPROVAL_ID --signing-key-file PRIVATE --reason TEXT
 ```
 
-- `auto` prompts only when stdin and stderr are terminals and `CI` is unset;
-  otherwise it behaves as `pause`.
+- `auto` prompts only when stdin and stderr are terminals, `CI` is unset, and
+  no durable public or signing authority was supplied; otherwise it behaves as
+  `pause`.
 - `prompt` requests an interactive approve/reject choice. It requires a TTY.
 - `pause` requires `--approval-public-key-file PUBLIC` when a gate is reached,
   then returns exit code 3 with exact resolve/resume commands.

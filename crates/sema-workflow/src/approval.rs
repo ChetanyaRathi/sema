@@ -95,6 +95,7 @@ pub fn normalize_public_key_base64(encoded: &str) -> io::Result<String> {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct ApprovalRequest {
     pub schema_version: u32,
     pub approval_id: String,
@@ -149,6 +150,7 @@ impl fmt::Display for ApprovalDecisionKind {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct ApprovalDecision {
     pub schema_version: u32,
     pub decision_id: String,
@@ -1537,6 +1539,57 @@ mod tests {
             ensure_request(&run_dir, &request).unwrap_err().kind(),
             io::ErrorKind::InvalidData
         );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn unsigned_unknown_sidecar_fields_are_rejected() {
+        let root = temp_root("unknown-fields");
+        let run_dir = run_dir(&root);
+        let request = request();
+        ensure_request(&run_dir, &request).unwrap();
+
+        let request_path = request_path(&run_dir, &request.approval_id);
+        let mut request_json: serde_json::Value =
+            serde_json::from_slice(&fs::read(&request_path).unwrap()).unwrap();
+        request_json["unsigned_annotation"] = serde_json::json!("misleading");
+        fs::write(
+            &request_path,
+            serde_json::to_vec_pretty(&request_json).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            ensure_request(&run_dir, &request).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+
+        fs::write(&request_path, serde_json::to_vec_pretty(&request).unwrap()).unwrap();
+        decide(
+            &root,
+            "run-1",
+            &request.approval_id,
+            &test_key(),
+            ApprovalDecisionKind::Approve,
+            "alice".into(),
+            "cli".into(),
+            None,
+            None,
+        )
+        .unwrap();
+        let decision_path = decision_path(&run_dir, &request.approval_id);
+        let mut decision_json: serde_json::Value =
+            serde_json::from_slice(&fs::read(&decision_path).unwrap()).unwrap();
+        decision_json["unsigned_annotation"] = serde_json::json!("misleading");
+        fs::write(
+            decision_path,
+            serde_json::to_vec_pretty(&decision_json).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            ensure_request(&run_dir, &request).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+
         let _ = fs::remove_dir_all(root);
     }
 

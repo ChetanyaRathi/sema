@@ -560,7 +560,8 @@ enum PkgCommands {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum ApprovalMode {
-    /// Prompt on a real terminal; otherwise pause with exit code 3.
+    /// Prompt on a real terminal unless a durable authority is configured;
+    /// otherwise pause with exit code 3.
     Auto,
     /// Require an interactive terminal prompt.
     Prompt,
@@ -568,6 +569,34 @@ enum ApprovalMode {
     Pause,
     /// Do not prompt; fail the command when a gate is reached.
     Deny,
+}
+
+fn resolve_approval_mode(
+    requested: ApprovalMode,
+    interactive: bool,
+    has_durable_authority: bool,
+) -> ApprovalMode {
+    match requested {
+        ApprovalMode::Auto if has_durable_authority => ApprovalMode::Pause,
+        ApprovalMode::Auto if interactive => ApprovalMode::Prompt,
+        ApprovalMode::Auto => ApprovalMode::Pause,
+        mode => mode,
+    }
+}
+
+fn validate_interactive_approval_authority(
+    mode: ApprovalMode,
+    interactive: bool,
+    has_public_key: bool,
+    has_signing_key: bool,
+) -> Result<(), &'static str> {
+    if mode == ApprovalMode::Prompt && interactive && has_public_key && !has_signing_key {
+        Err(
+            "--approval-mode prompt cannot sign with --approval-public-key-file; omit the public key for an ephemeral terminal authority, or use --view with the matching --approval-signing-key-file",
+        )
+    } else {
+        Ok(())
+    }
 }
 
 #[derive(Subcommand)]
@@ -957,7 +986,8 @@ fn is_double_interrupt(previous_ms: u64, now_ms: u64) -> bool {
 #[cfg(test)]
 mod ctrlc_tests {
     use super::{
-        format_needs_approval_guidance, is_double_interrupt, shell_quote, terminal_safe, Value,
+        format_needs_approval_guidance, is_double_interrupt, resolve_approval_mode, shell_quote,
+        terminal_safe, validate_interactive_approval_authority, ApprovalMode, Value,
     };
     use std::collections::BTreeMap;
 
@@ -979,6 +1009,37 @@ mod ctrlc_tests {
     fn second_signal_outside_window_is_treated_as_independent() {
         assert!(!is_double_interrupt(1_000, 3_000));
         assert!(!is_double_interrupt(1_000, 60_000));
+    }
+
+    #[test]
+    fn auto_approval_preserves_a_configured_durable_authority() {
+        assert_eq!(
+            resolve_approval_mode(ApprovalMode::Auto, true, true),
+            ApprovalMode::Pause
+        );
+        assert_eq!(
+            resolve_approval_mode(ApprovalMode::Auto, true, false),
+            ApprovalMode::Prompt
+        );
+        assert_eq!(
+            resolve_approval_mode(ApprovalMode::Auto, false, false),
+            ApprovalMode::Pause
+        );
+    }
+
+    #[test]
+    fn interactive_prompt_rejects_a_public_only_authority() {
+        assert!(
+            validate_interactive_approval_authority(ApprovalMode::Prompt, true, true, false)
+                .is_err()
+        );
+        assert!(
+            validate_interactive_approval_authority(ApprovalMode::Prompt, true, true, true).is_ok()
+        );
+        assert!(
+            validate_interactive_approval_authority(ApprovalMode::Prompt, false, true, false)
+                .is_ok()
+        );
     }
 
     #[test]
@@ -2435,16 +2496,22 @@ fn run_workflow_command(command: WorkflowCommands, sandbox: &sema_core::Sandbox)
         print_cli_error("--approval-signing-key-file does not match --approval-public-key-file");
         std::process::exit(1);
     }
-    let effective_approval_mode = match approval_mode {
-        ApprovalMode::Auto if viewer_signing_key.is_some() => ApprovalMode::Pause,
-        ApprovalMode::Auto if interactive_approval => ApprovalMode::Prompt,
-        ApprovalMode::Auto => ApprovalMode::Pause,
-        mode => mode,
-    };
-    let inline_signing_key = if (effective_approval_mode == ApprovalMode::Prompt
+    let has_durable_authority = viewer_signing_key.is_some() || configured_public_key.is_some();
+    let effective_approval_mode =
+        resolve_approval_mode(approval_mode, interactive_approval, has_durable_authority);
+    if let Err(error) = validate_interactive_approval_authority(
+        effective_approval_mode,
+        interactive_approval,
+        configured_public_key.is_some(),
+        viewer_signing_key.is_some(),
+    ) {
+        print_cli_error(error);
+        std::process::exit(1);
+    }
+    let needs_ephemeral_authority = (effective_approval_mode == ApprovalMode::Prompt
         && interactive_approval)
-        || effective_approval_mode == ApprovalMode::Deny
-    {
+        || (effective_approval_mode == ApprovalMode::Deny && !has_durable_authority);
+    let inline_signing_key = if needs_ephemeral_authority {
         Some(viewer_signing_key.clone().unwrap_or_else(|| {
             sema_workflow::approval::ApprovalSigningKey::generate().unwrap_or_else(|error| {
                 print_cli_error(format!("cannot generate interactive approval key: {error}"));
@@ -2454,15 +2521,15 @@ fn run_workflow_command(command: WorkflowCommands, sandbox: &sema_core::Sandbox)
     } else {
         None
     };
-    let approval_public_key = if let Some(key) = &inline_signing_key {
+    let approval_public_key = if let Some(key) = &viewer_public_key {
+        key.clone()
+    } else if let Some(key) = &configured_public_key {
+        key.clone()
+    } else if let Some(key) = &inline_signing_key {
         key.public_key_base64().unwrap_or_else(|error| {
             print_cli_error(format!("cannot derive interactive approval key: {error}"));
             std::process::exit(1);
         })
-    } else if let Some(key) = &viewer_public_key {
-        key.clone()
-    } else if let Some(key) = &configured_public_key {
-        key.clone()
     } else {
         String::new()
     };

@@ -157,8 +157,10 @@ stores its SHA-256 digest, not the raw value. Put only operator-safe text in
 (publish-package)
 ```
 
-The default `auto` mode prompts when stdin and stderr are terminals and `CI`
-is unset. The prompt accepts approve, reject with a reason, or quit-pending.
+The default `auto` mode prompts when stdin and stderr are terminals, `CI` is
+unset, and no durable approval authority was supplied. Passing an approval
+public or signing key selects durable `pause` behavior instead. The prompt
+accepts approve, reject with a reason, or quit-pending.
 Ctrl-C exits with code 130 and leaves the durable request pending; it never
 turns an interrupted prompt into a rejection.
 
@@ -240,10 +242,15 @@ when another process wins the compare-and-set race.
 
 | Mode | Behavior |
 |------|----------|
-| `auto` | Prompt on a real terminal outside CI; otherwise use `pause` behavior |
+| `auto` | Prompt on a real terminal outside CI when no durable authority is configured; otherwise use `pause` behavior |
 | `prompt` | Require terminal stdin/stderr and ask approve, reject, or leave pending |
 | `pause` | Publish a request and exit 3; a durable gate requires `--approval-public-key-file` |
 | `deny` | Refuse the gate without recording an approval decision and exit 1 |
+
+An explicit interactive `prompt` cannot use a public-key file by itself because
+the terminal process cannot sign the decision. Omit the public key to use an
+ephemeral terminal authority, or run with `--view` and the matching
+`--approval-signing-key-file`.
 
 The request and decision JSON files under the run's `approvals/` directory are
 the protocol authority; journal events are audit evidence. Decisions use
