@@ -430,6 +430,39 @@ fn output_policy_returns_only_redacted_content() {
 }
 
 #[test]
+fn composed_output_policies_report_each_layer_action() {
+    let src = r#"
+        (defpolicy audit-email
+          {:output {:detect [:email]
+                    :actions {:email :audit}}})
+        (defpolicy redact-phone
+          {:output {:detect [:phone]
+                    :actions {:phone :redact}}})
+        (defworkflow guarded "composed output actions"
+          {:policy [audit-email redact-phone]}
+          (phase "Run")
+          (def result (step "answer"))
+          {:status :success :result result})
+    "#;
+    let out = wc::run_once(
+        src,
+        fake_with_reply("alice@example.com +1 212-555-0199"),
+        "wf_policy_composed_output_actions",
+    );
+
+    assert_eq!(out.result["result"], "alice@example.com «redacted:phone»");
+    assert!(wc::events_of(&out.events, "policy.flagged")
+        .iter()
+        .any(|event| event["policy"] == "audit-email" && event["label"] == "email"));
+    assert!(wc::events_of(&out.events, "policy.redacted")
+        .iter()
+        .any(|event| event["policy"] == "redact-phone" && event["label"] == "phone"));
+    assert!(!wc::events_of(&out.events, "policy.redacted")
+        .iter()
+        .any(|event| event["policy"] == "audit-email" && event["label"] == "email"));
+}
+
+#[test]
 fn completion_policy_fails_a_nominal_success_when_evidence_is_missing() {
     let src = r#"
         (defpolicy evidenced

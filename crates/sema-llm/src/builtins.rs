@@ -728,7 +728,7 @@ fn apply_text_policy(
             continue;
         }
         for finding in &outcome.findings {
-            let kind = match effective_action {
+            let kind = match outcome.action {
                 sema_policy::ContentAction::Block => PolicyObservationKind::Violation,
                 sema_policy::ContentAction::Redact => PolicyObservationKind::Redacted,
                 sema_policy::ContentAction::Audit => PolicyObservationKind::Flagged,
@@ -744,8 +744,8 @@ fn apply_text_policy(
                 rule: finding.rule_id.clone(),
                 label: Some(finding.label.clone()),
                 count: Some(finding.count),
-                action: Some(effective_action.as_str().to_string()),
-                reason: (effective_action == sema_policy::ContentAction::Block)
+                action: Some(outcome.action.as_str().to_string()),
+                reason: (outcome.action == sema_policy::ContentAction::Block)
                     .then(|| "deterministic content policy matched".to_string()),
                 source,
                 agent_id: agent_id.clone(),
