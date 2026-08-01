@@ -107,8 +107,8 @@ on resume. `approval.applied` records that execution crossed an approved gate.
   and full static dependency-closure binding.
 - Approval gates are sequential. Gates nested in concurrency, cleanup/retry,
   steps, or nested workflows are rejected before execution.
-- Durable approval sidecars currently fail closed on non-Unix platforms until a
-  private platform ACL implementation is available.
+- Durable approval sidecars use Unix permission modes or protected Windows
+  ACLs. Other targets fail closed when private files cannot be enforced.
 
 ### Phase 2 — web client
 

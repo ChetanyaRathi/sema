@@ -742,6 +742,29 @@ fn step_policy_can_tighten_but_not_loosen_the_workflow_policy() {
 }
 
 #[test]
+fn step_policy_rejects_workflow_evidence_sections_before_calling_a_model() {
+    let src = r#"
+        (defworkflow guarded "step evidence scope" {}
+          (phase "Run")
+          (step "must not run"
+            {:policy {:metadata {:require [:owner]}
+                      :completion {:require-events [:checkpoint]}}})
+          {:status :success})
+    "#;
+
+    let out = wc::run_once(
+        src,
+        fake_with_reply("unexpected"),
+        "wf_policy_step_evidence",
+    );
+    assert_eq!(out.recorder.call_count(), 0);
+    assert_eq!(out.result["status"], "failed");
+    assert!(out.result["error"]
+        .as_str()
+        .is_some_and(|message| message.contains("evidence requirements")));
+}
+
+#[test]
 fn workflow_policy_sequence_composes_without_loosening() {
     let src = r#"
         (defpolicy models

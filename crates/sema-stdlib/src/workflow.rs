@@ -685,6 +685,28 @@ fn required_completion_events(policies: Option<&[Rc<sema_policy::CompiledPolicy>
         .collect()
 }
 
+fn validate_step_policy_sections(
+    policies: Option<&[Rc<sema_policy::CompiledPolicy>]>,
+) -> Result<(), SemaError> {
+    for policy in policies.into_iter().flatten() {
+        let has_metadata = policy.required_metadata().next().is_some();
+        let has_completion = policy.required_completion_events().next().is_some();
+        if has_metadata || has_completion {
+            let sections = match (has_metadata, has_completion) {
+                (true, true) => ":metadata and :completion",
+                (true, false) => ":metadata",
+                (false, true) => ":completion",
+                (false, false) => unreachable!("checked above"),
+            };
+            return Err(SemaError::eval(format!(
+                "workflow/step: policy {:?} uses {sections}; evidence requirements must be attached to the enclosing workflow",
+                policy.name()
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn policy_sink(ctx: &Rc<context::WorkflowCtx>) -> PolicyDecisionSink {
     let weak = Rc::downgrade(ctx);
     Rc::new(move |observation| {
@@ -1320,6 +1342,7 @@ fn step_plan(
         });
     };
     let step_policy = compile_policy(&args[0])?;
+    validate_step_policy_sections(step_policy.as_deref())?;
     let workspace_root = std::env::current_dir()
         .map_err(|error| SemaError::eval(format!("workflow/step: current directory: {error}")))?;
     let policy_scope = open_compiled_policy(step_policy, &ctx, &workspace_root);

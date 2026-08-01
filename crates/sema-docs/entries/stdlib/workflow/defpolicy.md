@@ -30,6 +30,11 @@ Attach a policy with workflow or step `:policy`. Active workflow and step
 policies compose with logical AND. `:permissions` and the CLI sandbox remain the
 outer capability limit.
 
+Step policies may contain model, tool, subject, input, and output controls.
+`:metadata` and `:completion` describe evidence for the whole run and must be
+attached to the enclosing workflow. The runtime and `workflow check` reject
+those sections on a step instead of silently ignoring them.
+
 Policy denials raise a `:policy-denied` condition. The condition contains
 `:message`, `:policy`, `:boundary`, `:subject`, `:rule`, `:reason`, `:action`,
 and `:source`. This lets a `catch` handler use the exact deciding policy layer:

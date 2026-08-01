@@ -1,7 +1,5 @@
 //! End-to-end tests for durable explicit workflow approvals at the CLI boundary.
 
-#![cfg(unix)]
-
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -87,20 +85,16 @@ fn write_workflow(root: &Path, run_id: &str) -> (PathBuf, PathBuf, PathBuf) {
         &workflow,
         format!(
             r#"
-            (define approval-gate workflow/approval)
             (defworkflow approval-demo "approval test" {{:phases ["Release"]}}
               (phase "Release")
               (checkpoint :prepared 1)
-              (try
-                (approval-gate :release-signoff
-                  {{:reason "Publish the release"
-                    :subject {{:kind :external-action :secret "do-not-store-raw"}}
-                    :preview "Publish package@1.0.0"}})
-                (catch e (file/write "{}" "caught")))
+              (approval :release-signoff
+                {{:reason "Publish the release"
+                  :subject {{:kind :external-action :secret "do-not-store-raw"}}
+                  :preview "Publish package@1.0.0"}})
               (file/write "{}" "crossed")
               {{:status :success}})
             "#,
-            path(&bypassed),
             path(&crossed),
         ),
     )
@@ -427,6 +421,7 @@ fn terminal_auto_mode_prompts_approves_and_resumes_inline() {
     let _ = fs::remove_dir_all(root);
 }
 
+#[cfg(unix)]
 #[test]
 fn ctrl_c_at_terminal_prompt_exits_and_leaves_request_pending() {
     use portable_pty::{native_pty_system, CommandBuilder, PtySize};
@@ -692,7 +687,7 @@ fn a_trailing_top_level_form_is_rejected_without_execution() {
 }
 
 #[test]
-fn nested_and_detached_aliases_fail_closed() {
+fn nested_and_detached_approval_aliases_are_rejected_before_execution() {
     for (label, body) in [
         (
             "nested",
@@ -703,8 +698,7 @@ fn nested_and_detached_aliases_fail_closed() {
             "detached",
             r#"(async/spawn (fn ()
                    (approval-gate :child {:reason "detached" :subject 1})
-                   (file/write protected-path "crossed")))
-               (async/sleep 25)"#,
+                   (file/write protected-path "crossed")))"#,
         ),
     ] {
         let root = temp_root(label);
@@ -737,6 +731,10 @@ fn nested_and_detached_aliases_fail_closed() {
             public_key.to_str().unwrap(),
         ]);
         assert_eq!(output.status.code(), Some(1), "{label}: {output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("E-APPROVAL-VALUE"),
+            "{label}: {output:?}"
+        );
         assert!(!crossed.exists(), "{label}: protected side effect ran");
         let _ = fs::remove_dir_all(root);
     }

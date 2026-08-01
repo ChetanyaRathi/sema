@@ -112,7 +112,14 @@ fn lower_expr(expr: &Value, tail: bool) -> Result<CoreExpr, SemaError> {
 
 fn lower_expr_inner(expr: &Value, tail: bool) -> Result<CoreExpr, SemaError> {
     match expr.view() {
-        ValueView::Symbol(spur) => Ok(CoreExpr::Var(spur)),
+        ValueView::Symbol(spur) => {
+            if spur == intern("workflow/approval") {
+                return Err(SemaError::eval(
+                    "workflow/approval is a control-flow gate and cannot be used as a value; call (approval key opts) directly",
+                ));
+            }
+            Ok(CoreExpr::Var(spur))
+        }
 
         ValueView::Vector(items) => {
             let exprs = items
@@ -156,6 +163,20 @@ fn lower_list(items: &[Value], tail: bool) -> Result<CoreExpr, SemaError> {
     let args = &items[1..];
 
     if let Some(spur) = head.as_symbol_spur() {
+        // `workflow/approval` transfers control to the host when no decision
+        // exists. It must stay in direct call position so it cannot run later
+        // in a detached task after the owning workflow has continued.
+        if spur == intern("workflow/approval") {
+            let call_args = args
+                .iter()
+                .map(|arg| lower_expr(arg, false))
+                .collect::<Result<_, _>>()?;
+            return Ok(CoreExpr::Call {
+                func: Box::new(CoreExpr::Var(spur)),
+                args: call_args,
+                tail,
+            });
+        }
         if let Some(form) = special_form_for(spur) {
             return match form {
                 SpecialForm::Quote => lower_quote(args),
@@ -2651,6 +2672,28 @@ mod tests {
     fn test_lower_force() {
         // force now lowers to a Call to __vm-force
         assert!(matches!(lower_str("(force p)"), CoreExpr::Call { .. }));
+    }
+
+    #[test]
+    fn workflow_approval_is_only_valid_in_direct_call_position() {
+        assert!(matches!(
+            lower_str("(workflow/approval :ship {:reason \"r\" :subject 1})"),
+            CoreExpr::Call { .. }
+        ));
+
+        for input in [
+            "(define gate workflow/approval)",
+            "(list workflow/approval)",
+            "[workflow/approval]",
+            "{:gate workflow/approval}",
+        ] {
+            let value = parse(input);
+            let error = lower(&value, None).expect_err(input);
+            assert!(
+                error.to_string().contains("cannot be used as a value"),
+                "{error}"
+            );
+        }
     }
 
     #[test]

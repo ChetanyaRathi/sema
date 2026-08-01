@@ -20,6 +20,9 @@
 //! POST to them blind. At startup this server mints a random 32-hex session token
 //! (`sema_mcp::random_hex_token`) and substitutes it into the served HTML in
 //! place of the `__SEMA_VIEW_TOKEN__` placeholder (see `route`'s `"/"` case).
+//! Every request must also carry a `Host` header for the configured loopback
+//! listener. This blocks DNS rebinding through an attacker-controlled hostname.
+//! Browser writes must be same-origin when `Origin` or Fetch Metadata is present.
 //! Every write route requires `X-Sema-View-Token: <token>` matching exactly;
 //! approval forms may carry the same token in a hidden form field so they still
 //! work without JavaScript. Missing or wrong tokens get a `403` with no side
@@ -33,7 +36,7 @@
 //! the binary already pulls in (the notebook uses axum; a handful of routes does
 //! not need it).
 
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -59,6 +62,7 @@ const FAVICON_SVG: &[u8] = include_bytes!("workflow_view/favicon.svg");
 /// the module doc's §8 note). Must match the placeholder literal embedded in
 /// `workflow_view/index.html`'s `<script>`.
 const VIEW_TOKEN_PLACEHOLDER: &str = "__SEMA_VIEW_TOKEN__";
+const VIEW_NONCE_PLACEHOLDER: &str = "__SEMA_VIEW_NONCE__";
 const MAX_HTTP_HEADER_BYTES: usize = 16 * 1024;
 const MAX_HTTP_BODY_BYTES: usize = 64 * 1024;
 
@@ -134,7 +138,8 @@ pub async fn serve_result_with_approval(
         ));
     }
     let listener = TcpListener::bind((host, port)).await?;
-    let addr = format_host_port(host, port);
+    let listener_addr = listener.local_addr()?;
+    let addr = format_host_port(host, listener_addr.port());
     if announce {
         println!("Sema workflow viewer:  http://{addr}");
         println!("  runs: {}", run_dir.display());
@@ -142,6 +147,7 @@ pub async fn serve_result_with_approval(
     let state = Arc::new(ServerState::new(
         run_dir,
         sema_mcp::random_hex_token(),
+        allowed_host_authorities(host, listener_addr),
         None,
         approval_authority,
     ));
@@ -180,6 +186,7 @@ pub async fn serve_test_with_approval(
     let state = Arc::new(ServerState::new(
         run_dir,
         token.clone(),
+        vec![addr.to_string().to_ascii_lowercase()],
         opener,
         approval_authority,
     ));
@@ -216,6 +223,7 @@ async fn handle(mut stream: TcpStream, state: Arc<ServerState>) -> std::io::Resu
                     "text/plain",
                     b"incomplete request".to_vec(),
                 ),
+                &state.csp_nonce,
             )
             .await;
         }
@@ -223,12 +231,12 @@ async fn handle(mut stream: TcpStream, state: Arc<ServerState>) -> std::io::Resu
         if let Some(offset) = buf.windows(4).position(|window| window == b"\r\n\r\n") {
             let header_end = offset + 4;
             if header_end > MAX_HTTP_HEADER_BYTES {
-                return request_headers_too_large(&mut stream).await;
+                return request_headers_too_large(&mut stream, &state.csp_nonce).await;
             }
             break header_end;
         }
         if buf.len() > MAX_HTTP_HEADER_BYTES {
-            return request_headers_too_large(&mut stream).await;
+            return request_headers_too_large(&mut stream, &state.csp_nonce).await;
         }
     };
     let head = String::from_utf8_lossy(&buf[..header_end]);
@@ -238,6 +246,7 @@ async fn handle(mut stream: TcpStream, state: Arc<ServerState>) -> std::io::Resu
             return write_response(
                 &mut stream,
                 ("400 Bad Request", "text/plain", message.as_bytes().to_vec()),
+                &state.csp_nonce,
             )
             .await;
         }
@@ -249,10 +258,14 @@ async fn handle(mut stream: TcpStream, state: Arc<ServerState>) -> std::io::Resu
                     "text/plain",
                     b"request body is too large".to_vec(),
                 ),
+                &state.csp_nonce,
             )
             .await;
         }
     };
+    if let Some(response) = request_authority_error(&parsed, &state) {
+        return write_response(&mut stream, response, &state.csp_nonce).await;
+    }
     let request_end = header_end + parsed.content_length;
     while buf.len() < request_end {
         let n = stream.read(&mut tmp).await?;
@@ -264,6 +277,7 @@ async fn handle(mut stream: TcpStream, state: Arc<ServerState>) -> std::io::Resu
                     "text/plain",
                     b"incomplete request body".to_vec(),
                 ),
+                &state.csp_nonce,
             )
             .await;
         }
@@ -280,10 +294,10 @@ async fn handle(mut stream: TcpStream, state: Arc<ServerState>) -> std::io::Resu
         body,
         &state,
     );
-    write_response(&mut stream, response).await
+    write_response(&mut stream, response, &state.csp_nonce).await
 }
 
-async fn request_headers_too_large(stream: &mut TcpStream) -> std::io::Result<()> {
+async fn request_headers_too_large(stream: &mut TcpStream, nonce: &str) -> std::io::Result<()> {
     write_response(
         stream,
         (
@@ -291,14 +305,19 @@ async fn request_headers_too_large(stream: &mut TcpStream) -> std::io::Result<()
             "text/plain",
             b"request headers are too large".to_vec(),
         ),
+        nonce,
     )
     .await
 }
 
-async fn write_response(stream: &mut TcpStream, response: JsonResponse) -> std::io::Result<()> {
+async fn write_response(
+    stream: &mut TcpStream,
+    response: JsonResponse,
+    nonce: &str,
+) -> std::io::Result<()> {
     let (status, content_type, body) = response;
     let resp = format!(
-        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\nCache-Control: no-store\r\n\r\n",
+        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\nCache-Control: no-store\r\nContent-Security-Policy: default-src 'self'; script-src 'self' 'nonce-{nonce}'; style-src 'self' 'unsafe-inline'; img-src 'self'; connect-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'; object-src 'none'\r\nCross-Origin-Opener-Policy: same-origin\r\nCross-Origin-Resource-Policy: same-origin\r\nPermissions-Policy: camera=(), geolocation=(), microphone=()\r\nReferrer-Policy: no-referrer\r\nX-Content-Type-Options: nosniff\r\nX-Frame-Options: DENY\r\n\r\n",
         body.len()
     );
     stream.write_all(resp.as_bytes()).await?;
@@ -309,16 +328,20 @@ async fn write_response(stream: &mut TcpStream, response: JsonResponse) -> std::
 struct ParsedRequest {
     method: String,
     path: String,
+    host_header: Option<String>,
+    origin_header: Option<String>,
+    fetch_site_header: Option<String>,
     token_header: Option<String>,
     content_length: usize,
 }
 
+#[derive(Debug)]
 enum RequestParseError {
     BadRequest(&'static str),
     PayloadTooLarge,
 }
 
-/// Parse the request line plus the two headers the viewer uses. Ambiguous
+/// Parse the request line plus the security and framing headers the viewer uses. Ambiguous
 /// framing is rejected because write routes accept request bodies.
 fn parse_request(head: &str) -> Result<ParsedRequest, RequestParseError> {
     let mut lines = head.lines();
@@ -338,20 +361,41 @@ fn parse_request(head: &str) -> Result<ParsedRequest, RequestParseError> {
     }
 
     let mut token = None;
+    let mut host = None;
+    let mut origin = None;
+    let mut fetch_site = None;
     let mut content_length = None;
     for line in lines {
         if line.is_empty() {
             break;
         }
         if let Some((name, value)) = line.split_once(':') {
-            if name.trim().eq_ignore_ascii_case("x-sema-view-token") {
+            let name = name.trim();
+            if name.eq_ignore_ascii_case("host") {
+                if host.is_some() {
+                    return Err(RequestParseError::BadRequest("duplicate Host header"));
+                }
+                host = Some(value.trim().to_string());
+            } else if name.eq_ignore_ascii_case("origin") {
+                if origin.is_some() {
+                    return Err(RequestParseError::BadRequest("duplicate Origin header"));
+                }
+                origin = Some(value.trim().to_string());
+            } else if name.eq_ignore_ascii_case("sec-fetch-site") {
+                if fetch_site.is_some() {
+                    return Err(RequestParseError::BadRequest(
+                        "duplicate Sec-Fetch-Site header",
+                    ));
+                }
+                fetch_site = Some(value.trim().to_string());
+            } else if name.eq_ignore_ascii_case("x-sema-view-token") {
                 if token.is_some() {
                     return Err(RequestParseError::BadRequest(
                         "duplicate X-Sema-View-Token header",
                     ));
                 }
                 token = Some(value.trim().to_string());
-            } else if name.trim().eq_ignore_ascii_case("content-length") {
+            } else if name.eq_ignore_ascii_case("content-length") {
                 if content_length.is_some() {
                     return Err(RequestParseError::BadRequest(
                         "duplicate Content-Length header",
@@ -365,7 +409,7 @@ fn parse_request(head: &str) -> Result<ParsedRequest, RequestParseError> {
                     return Err(RequestParseError::PayloadTooLarge);
                 }
                 content_length = Some(parsed);
-            } else if name.trim().eq_ignore_ascii_case("transfer-encoding") {
+            } else if name.eq_ignore_ascii_case("transfer-encoding") {
                 return Err(RequestParseError::BadRequest(
                     "Transfer-Encoding is not supported",
                 ));
@@ -375,9 +419,51 @@ fn parse_request(head: &str) -> Result<ParsedRequest, RequestParseError> {
     Ok(ParsedRequest {
         method: method.to_string(),
         path: path.to_string(),
+        host_header: host,
+        origin_header: origin,
+        fetch_site_header: fetch_site,
         token_header: token,
         content_length: content_length.unwrap_or(0),
     })
+}
+
+fn request_authority_error(request: &ParsedRequest, state: &ServerState) -> Option<JsonResponse> {
+    let Some(host) = request.host_header.as_deref() else {
+        return Some((
+            "400 Bad Request",
+            "text/plain",
+            b"missing Host header".to_vec(),
+        ));
+    };
+    if !state.allowed_hosts.is_empty()
+        && !state
+            .allowed_hosts
+            .iter()
+            .any(|allowed| allowed.eq_ignore_ascii_case(host))
+    {
+        return Some((
+            "421 Misdirected Request",
+            "text/plain",
+            b"request Host does not match the loopback viewer".to_vec(),
+        ));
+    }
+    if request.method != "POST" {
+        return None;
+    }
+    if let Some(origin) = request.origin_header.as_deref() {
+        let expected = format!("http://{host}");
+        if !origin.eq_ignore_ascii_case(&expected) {
+            return Some(forbidden());
+        }
+    }
+    if request
+        .fetch_site_header
+        .as_deref()
+        .is_some_and(|site| !matches!(site, "same-origin" | "none"))
+    {
+        return Some(forbidden());
+    }
+    None
 }
 
 fn not_found() -> JsonResponse {
@@ -417,7 +503,9 @@ fn route(
     state: &Arc<ServerState>,
 ) -> JsonResponse {
     if method == "GET" && path == "/" {
-        let body = INDEX_HTML.replacen(VIEW_TOKEN_PLACEHOLDER, &state.token, 1);
+        let body = INDEX_HTML
+            .replacen(VIEW_TOKEN_PLACEHOLDER, &state.token, 1)
+            .replace(VIEW_NONCE_PLACEHOLDER, &state.csp_nonce);
         return ("200 OK", "text/html; charset=utf-8", body.into_bytes());
     }
     if method == "GET" && path == "/alpine.min.js" {
@@ -535,6 +623,18 @@ fn is_loopback_host(host: &str) -> bool {
             .is_ok_and(|address| address.is_loopback())
 }
 
+fn allowed_host_authorities(host: &str, listener_addr: SocketAddr) -> Vec<String> {
+    if !is_loopback_host(host) {
+        return Vec::new();
+    }
+    let mut authorities = vec![format_host_port(host, listener_addr.port()).to_ascii_lowercase()];
+    let bound = listener_addr.to_string().to_ascii_lowercase();
+    if !authorities.contains(&bound) {
+        authorities.push(bound);
+    }
+    authorities
+}
+
 fn format_host_port(host: &str, port: u16) -> String {
     if host.contains(':') && !host.starts_with('[') {
         format!("[{host}]:{port}")
@@ -604,6 +704,7 @@ mod tests {
         Arc::new(ServerState::new(
             dir.to_path_buf(),
             TEST_TOKEN.to_string(),
+            vec!["127.0.0.1:8899".to_string()],
             None,
             None,
         ))
@@ -634,6 +735,7 @@ mod tests {
         let text1 = String::from_utf8(b1).unwrap();
         assert!(text1.contains(TEST_TOKEN), "{text1}");
         assert!(!text1.contains("__SEMA_VIEW_TOKEN__"), "{text1}");
+        assert!(!text1.contains("__SEMA_VIEW_NONCE__"), "{text1}");
 
         let (s2, ct2, _) = route("GET", "/alpine.min.js", None, b"", &state);
         assert_eq!(s2, "200 OK");
@@ -797,6 +899,53 @@ mod tests {
             parse_request("GET / HTTP/1.1 trailing\r\n\r\n"),
             Err(RequestParseError::BadRequest(_))
         ));
+        assert!(matches!(
+            parse_request("GET / HTTP/1.1\r\nHost: 127.0.0.1:8899\r\nHost: evil.test\r\n\r\n"),
+            Err(RequestParseError::BadRequest(_))
+        ));
+    }
+
+    #[test]
+    fn request_authority_rejects_dns_rebinding_and_cross_origin_writes() {
+        let state = test_state(Path::new("/nonexistent-run-dir"));
+        let parse = |request| parse_request(request).expect("valid request syntax");
+
+        let missing = parse("GET / HTTP/1.1\r\n\r\n");
+        assert!(matches!(
+            request_authority_error(&missing, &state),
+            Some(("400 Bad Request", _, _))
+        ));
+
+        let rebound = parse("GET / HTTP/1.1\r\nHost: attacker.example:8899\r\n\r\n");
+        assert!(matches!(
+            request_authority_error(&rebound, &state),
+            Some(("421 Misdirected Request", _, _))
+        ));
+
+        let cross_origin = parse(
+            "POST /api/run/r/approvals/a/decision HTTP/1.1\r\nHost: 127.0.0.1:8899\r\nOrigin: https://attacker.example\r\n\r\n",
+        );
+        assert!(matches!(
+            request_authority_error(&cross_origin, &state),
+            Some(("403 Forbidden", _, _))
+        ));
+
+        let cross_site = parse(
+            "POST /api/run/r/approvals/a/decision HTTP/1.1\r\nHost: 127.0.0.1:8899\r\nSec-Fetch-Site: cross-site\r\n\r\n",
+        );
+        assert!(matches!(
+            request_authority_error(&cross_site, &state),
+            Some(("403 Forbidden", _, _))
+        ));
+
+        let same_origin = parse(
+            "POST /api/run/r/approvals/a/decision HTTP/1.1\r\nHost: 127.0.0.1:8899\r\nOrigin: http://127.0.0.1:8899\r\nSec-Fetch-Site: same-origin\r\n\r\n",
+        );
+        assert!(request_authority_error(&same_origin, &state).is_none());
+
+        let cli =
+            parse("POST /api/run/r/approvals/a/decision HTTP/1.1\r\nHost: 127.0.0.1:8899\r\n\r\n");
+        assert!(request_authority_error(&cli, &state).is_none());
     }
 
     #[tokio::test]
@@ -811,6 +960,37 @@ mod tests {
         let mut response = Vec::new();
         stream.read_to_end(&mut response).await.unwrap();
         assert!(response.starts_with(b"HTTP/1.1 431 Request Header Fields Too Large\r\n"));
+    }
+
+    #[tokio::test]
+    async fn server_rejects_rebound_host_and_emits_browser_security_headers() {
+        let (addr, token) = serve_test(PathBuf::from("unused"), None).await.unwrap();
+
+        let mut rebound = TcpStream::connect(addr).await.unwrap();
+        rebound
+            .write_all(b"GET / HTTP/1.1\r\nHost: attacker.example\r\n\r\n")
+            .await
+            .unwrap();
+        let mut response = Vec::new();
+        rebound.read_to_end(&mut response).await.unwrap();
+        assert!(response.starts_with(b"HTTP/1.1 421 Misdirected Request\r\n"));
+        assert!(!String::from_utf8_lossy(&response).contains(&token));
+
+        let mut valid = TcpStream::connect(addr).await.unwrap();
+        let request = format!("GET / HTTP/1.1\r\nHost: {addr}\r\n\r\n");
+        valid.write_all(request.as_bytes()).await.unwrap();
+        let mut response = Vec::new();
+        valid.read_to_end(&mut response).await.unwrap();
+        let response = String::from_utf8(response).unwrap();
+        assert!(response.starts_with("HTTP/1.1 200 OK\r\n"), "{response}");
+        assert!(response.contains("Content-Security-Policy:"), "{response}");
+        assert!(response.contains("frame-ancestors 'none'"), "{response}");
+        assert!(response.contains("X-Frame-Options: DENY"), "{response}");
+        assert!(response.contains("nonce=\""), "{response}");
+        assert!(
+            !response.contains(&format!("nonce=\"{token}\"")),
+            "{response}"
+        );
     }
 
     #[test]

@@ -1507,16 +1507,12 @@ fn read_approval_key_file(path: &Path, private: bool) -> Result<String, String> 
     use std::io::Read as _;
 
     const MAX_KEY_BYTES: u64 = 16 * 1024;
-    let mut options = std::fs::OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    let file = if private {
+        sema_workflow::approval::open_private_file(path)
+    } else {
+        std::fs::OpenOptions::new().read(true).open(path)
     }
-    let file = options
-        .open(path)
-        .map_err(|error| format!("cannot open approval key {}: {error}", path.display()))?;
+    .map_err(|error| format!("cannot open approval key {}: {error}", path.display()))?;
     let metadata = file
         .metadata()
         .map_err(|error| format!("cannot inspect approval key {}: {error}", path.display()))?;
@@ -1528,16 +1524,6 @@ fn read_approval_key_file(path: &Path, private: bool) -> Result<String, String> 
             "{} is too large to be an approval key",
             path.display()
         ));
-    }
-    #[cfg(unix)]
-    if private {
-        use std::os::unix::fs::PermissionsExt as _;
-        if metadata.permissions().mode() & 0o077 != 0 {
-            return Err(format!(
-                "private approval key {} must not be accessible by group or other users (chmod 600)",
-                path.display()
-            ));
-        }
     }
     let mut bytes = Vec::with_capacity(metadata.len() as usize);
     file.take(MAX_KEY_BYTES + 1)
@@ -1568,28 +1554,12 @@ fn load_approval_signing_key(
 fn create_approval_key_pair(private_path: &Path, public_path: &Path) -> Result<(), String> {
     use std::io::Write as _;
 
-    #[cfg(not(unix))]
-    {
-        let _ = (private_path, public_path);
-        return Err(
-            "approval key generation is unavailable until this platform has private ACL support"
-                .to_string(),
-        );
-    }
     if private_path == public_path {
         return Err("private and public approval key paths must differ".to_string());
     }
     let key = sema_workflow::approval::ApprovalSigningKey::generate()
         .map_err(|error| error.to_string())?;
-    let mut private_options = std::fs::OpenOptions::new();
-    private_options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        private_options.mode(0o600);
-    }
-    let mut private = private_options
-        .open(private_path)
+    let mut private = sema_workflow::approval::create_private_file_new(private_path)
         .map_err(|error| format!("cannot create {}: {error}", private_path.display()))?;
     let mut public_file = match std::fs::OpenOptions::new()
         .write(true)

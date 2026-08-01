@@ -23,7 +23,7 @@ const APPROVAL_TEXT_MAX_CHARS: usize = 1024;
 /// Whether this build can enforce the private-directory guarantees required
 /// before publishing durable approval sidecars.
 pub const fn durable_writes_supported() -> bool {
-    cfg!(unix)
+    cfg!(any(unix, windows))
 }
 
 /// Host-held Ed25519 authority used to sign immutable approval decisions. The private
@@ -666,6 +666,12 @@ fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> io::Result<T> {
         use std::os::unix::fs::OpenOptionsExt as _;
         options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK);
     }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
     let file = options.open(path)?;
     let metadata = file.metadata()?;
     if !metadata.is_file() {
@@ -772,7 +778,336 @@ fn create_private_dir(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+mod windows_private {
+    use super::{invalid_data, path_entry_exists};
+    use std::ffi::c_void;
+    use std::fs::{self, File};
+    use std::io;
+    use std::mem::size_of;
+    use std::os::windows::ffi::OsStrExt as _;
+    use std::os::windows::fs::MetadataExt as _;
+    use std::os::windows::io::FromRawHandle as _;
+    use std::path::Path;
+    use std::ptr::{null, null_mut};
+
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, LocalFree, GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE,
+    };
+    use windows_sys::Win32::Security::Authorization::{
+        ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
+        SetSecurityInfo, SDDL_REVISION_1, SE_FILE_OBJECT,
+    };
+    use windows_sys::Win32::Security::{
+        GetSecurityDescriptorDacl, GetTokenInformation, SetFileSecurityW, TokenUser, ACL,
+        DACL_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, SECURITY_ATTRIBUTES,
+        TOKEN_QUERY, TOKEN_USER,
+    };
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateDirectoryW, CreateFileW, CREATE_NEW, FILE_ATTRIBUTE_NORMAL,
+        FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT, FILE_FLAG_WRITE_THROUGH,
+        OPEN_EXISTING, WRITE_DAC,
+    };
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    struct OwnedHandle(HANDLE);
+
+    impl Drop for OwnedHandle {
+        fn drop(&mut self) {
+            // SAFETY: this guard owns the real token handle returned by
+            // OpenProcessToken. Pseudo handles are not stored here.
+            unsafe {
+                CloseHandle(self.0);
+            }
+        }
+    }
+
+    struct LocalMemory(*mut c_void);
+
+    impl Drop for LocalMemory {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                // SAFETY: the pointer was allocated by an API documented to
+                // transfer ownership to LocalFree.
+                unsafe {
+                    LocalFree(self.0);
+                }
+            }
+        }
+    }
+
+    fn wide_path(path: &Path) -> io::Result<Vec<u16>> {
+        let mut wide = path.as_os_str().encode_wide().collect::<Vec<_>>();
+        if wide.contains(&0) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "approval path contains a NUL code unit",
+            ));
+        }
+        wide.push(0);
+        Ok(wide)
+    }
+
+    fn wide_text(text: &str) -> io::Result<Vec<u16>> {
+        let mut wide = text.encode_utf16().collect::<Vec<_>>();
+        if wide.contains(&0) {
+            return Err(invalid_data("security descriptor contains a NUL code unit"));
+        }
+        wide.push(0);
+        Ok(wide)
+    }
+
+    fn current_user_sid_string() -> io::Result<String> {
+        let mut token = null_mut();
+        // SAFETY: token points to writable storage and GetCurrentProcess
+        // returns the documented process pseudo handle.
+        if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let _token = OwnedHandle(token);
+
+        let mut required = 0;
+        // SAFETY: a null buffer with length zero is the documented size query.
+        unsafe {
+            GetTokenInformation(token, TokenUser, null_mut(), 0, &mut required);
+        }
+        if required == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let words = (required as usize).div_ceil(size_of::<usize>());
+        let mut buffer = vec![0usize; words];
+        // SAFETY: the aligned buffer has at least `required` writable bytes and
+        // remains alive while TOKEN_USER and its embedded SID are inspected.
+        if unsafe {
+            GetTokenInformation(
+                token,
+                TokenUser,
+                buffer.as_mut_ptr().cast(),
+                required,
+                &mut required,
+            )
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: GetTokenInformation(TokenUser) initialized the buffer as a
+        // TOKEN_USER and keeps its SID pointer within the same live buffer.
+        let token_user = unsafe { &*buffer.as_ptr().cast::<TOKEN_USER>() };
+        let mut string_sid = null_mut();
+        // SAFETY: the SID comes from the current token and string_sid points to
+        // writable output storage. The returned string is owned by LocalFree.
+        if unsafe { ConvertSidToStringSidW(token_user.User.Sid, &mut string_sid) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let _string_sid = LocalMemory(string_sid.cast());
+        let mut len = 0usize;
+        // A textual SID is bounded by the Windows SID component limits. The
+        // API guarantees a NUL terminator; the explicit cap rejects corruption.
+        while len < 256 {
+            // SAFETY: ConvertSidToStringSidW returned a NUL-terminated SID
+            // string whose documented maximum is below this bound.
+            if unsafe { *string_sid.add(len) } == 0 {
+                // SAFETY: the preceding loop verified that these code units are
+                // within the returned NUL-terminated allocation.
+                let units = unsafe { std::slice::from_raw_parts(string_sid, len) };
+                return String::from_utf16(units)
+                    .map_err(|_| invalid_data("current user SID is not valid UTF-16"));
+            }
+            len += 1;
+        }
+        Err(invalid_data("current user SID string is too long"))
+    }
+
+    fn security_descriptor(directory: bool) -> io::Result<LocalMemory> {
+        let user_sid = current_user_sid_string()?;
+        let inheritance = if directory { "OICI" } else { "" };
+        let sddl = format!("D:P(A;{inheritance};FA;;;{user_sid})(A;{inheritance};FA;;;SY)");
+        let wide = wide_text(&sddl)?;
+        let mut descriptor = null_mut();
+        // SAFETY: wide is NUL-terminated and descriptor points to writable
+        // output storage. The returned descriptor is owned by LocalFree.
+        if unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                wide.as_ptr(),
+                SDDL_REVISION_1,
+                &mut descriptor,
+                null_mut(),
+            )
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(LocalMemory(descriptor))
+    }
+
+    fn security_attributes(descriptor: &LocalMemory) -> SECURITY_ATTRIBUTES {
+        SECURITY_ATTRIBUTES {
+            nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: descriptor.0,
+            bInheritHandle: 0,
+        }
+    }
+
+    fn validate_directory(path: &Path) -> io::Result<()> {
+        let metadata = fs::symlink_metadata(path)?;
+        if !metadata.is_dir() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(invalid_data(format!(
+                "approval path {} is not a regular directory",
+                path.display()
+            )));
+        }
+        Ok(())
+    }
+
+    fn apply_private_directory_acl(path: &Path) -> io::Result<()> {
+        let wide = wide_path(path)?;
+        let descriptor = security_descriptor(true)?;
+        // SAFETY: wide and descriptor remain alive for this call. The security
+        // information flags request only the DACL contained in the descriptor.
+        if unsafe {
+            SetFileSecurityW(
+                wide.as_ptr(),
+                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                descriptor.0,
+            )
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    pub(super) fn create_private_dir(path: &Path) -> io::Result<()> {
+        let mut created = false;
+        if !path_entry_exists(path)? {
+            let parent = path
+                .parent()
+                .ok_or_else(|| invalid_data("approval directory has no parent"))?;
+            let wide = wide_path(path)?;
+            let descriptor = security_descriptor(true)?;
+            let attributes = security_attributes(&descriptor);
+            // SAFETY: the path and security descriptor remain alive for the
+            // call. The descriptor creates a protected current-user/SYSTEM DACL.
+            if unsafe { CreateDirectoryW(wide.as_ptr(), &attributes) } == 0 {
+                let error = io::Error::last_os_error();
+                if error.kind() != io::ErrorKind::AlreadyExists {
+                    return Err(error);
+                }
+            } else {
+                created = true;
+                super::sync_dir(parent)?;
+            }
+        }
+        validate_directory(path)?;
+        if !created {
+            apply_private_directory_acl(path)?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn create_private_file(path: &Path) -> io::Result<File> {
+        let wide = wide_path(path)?;
+        let descriptor = security_descriptor(false)?;
+        let attributes = security_attributes(&descriptor);
+        // SAFETY: all pointers remain alive for the call. CREATE_NEW prevents
+        // replacement, and the protected DACL is applied at object creation.
+        let handle = unsafe {
+            CreateFileW(
+                wide.as_ptr(),
+                GENERIC_WRITE,
+                0,
+                &attributes,
+                CREATE_NEW,
+                FILE_ATTRIBUTE_NORMAL | FILE_FLAG_WRITE_THROUGH,
+                null_mut(),
+            )
+        };
+        if handle == INVALID_HANDLE_VALUE {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: CreateFileW returned a new owned handle. File assumes sole
+        // ownership and closes it on drop.
+        Ok(unsafe { File::from_raw_handle(handle) })
+    }
+
+    pub(super) fn open_private_file(path: &Path) -> io::Result<File> {
+        let wide = wide_path(path)?;
+        // SAFETY: wide is a live NUL-terminated path. Denying all sharing keeps
+        // the opened object from being replaced while it is inspected and read.
+        let handle = unsafe {
+            CreateFileW(
+                wide.as_ptr(),
+                GENERIC_READ | WRITE_DAC,
+                0,
+                null(),
+                OPEN_EXISTING,
+                FILE_FLAG_OPEN_REPARSE_POINT,
+                null_mut(),
+            )
+        };
+        if handle == INVALID_HANDLE_VALUE {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: CreateFileW returned a new owned handle. File assumes sole
+        // ownership immediately so every later error closes it.
+        let file = unsafe { File::from_raw_handle(handle) };
+        let metadata = file.metadata()?;
+        if !metadata.is_file() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(invalid_data(format!(
+                "private approval key {} is not a regular file",
+                path.display()
+            )));
+        }
+
+        let descriptor = security_descriptor(false)?;
+        let mut dacl_present = 0;
+        let mut dacl_defaulted = 0;
+        let mut dacl: *mut ACL = null_mut();
+        // SAFETY: descriptor is a valid self-relative descriptor and all output
+        // pointers refer to live writable storage.
+        if unsafe {
+            GetSecurityDescriptorDacl(
+                descriptor.0,
+                &mut dacl_present,
+                &mut dacl,
+                &mut dacl_defaulted,
+            )
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        if dacl_present == 0 || dacl.is_null() {
+            return Err(invalid_data(
+                "private approval key security descriptor has no DACL",
+            ));
+        }
+        // SAFETY: file owns the live handle and dacl points into descriptor,
+        // which remains alive for the call. The new protected DACL grants only
+        // the current user and SYSTEM access.
+        let status = unsafe {
+            SetSecurityInfo(
+                handle,
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                null_mut(),
+                null_mut(),
+                dacl,
+                null(),
+            )
+        };
+        if status != 0 {
+            return Err(io::Error::from_raw_os_error(status as i32));
+        }
+        Ok(file)
+    }
+}
+
+#[cfg(windows)]
+fn create_private_dir(path: &Path) -> io::Result<()> {
+    windows_private::create_private_dir(path)
+}
+
+#[cfg(not(any(unix, windows)))]
 fn create_private_dir(_path: &Path) -> io::Result<()> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
@@ -780,6 +1115,7 @@ fn create_private_dir(_path: &Path) -> io::Result<()> {
     ))
 }
 
+#[cfg(unix)]
 fn private_create_new(path: &Path) -> io::Result<File> {
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
@@ -791,8 +1127,89 @@ fn private_create_new(path: &Path) -> io::Result<File> {
     options.open(path)
 }
 
+#[cfg(windows)]
+fn private_create_new(path: &Path) -> io::Result<File> {
+    windows_private::create_private_file(path)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn private_create_new(_path: &Path) -> io::Result<File> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "private approval files are unavailable on this platform",
+    ))
+}
+
+/// Create a new file whose contents are readable and writable only by the
+/// current user and the operating system account. The call fails if the path
+/// already exists.
+pub fn create_private_file_new(path: &Path) -> io::Result<File> {
+    private_create_new(path)
+}
+
+/// Open an existing private key without following links and verify or enforce
+/// that only the current user (and the operating system account on Windows)
+/// can access it.
+pub fn open_private_file(path: &Path) -> io::Result<File> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+
+        let mut options = OpenOptions::new();
+        options
+            .read(true)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        let file = options.open(path)?;
+        let metadata = file.metadata()?;
+        if !metadata.is_file() {
+            return Err(invalid_data(format!(
+                "private approval key {} is not a regular file",
+                path.display()
+            )));
+        }
+        if metadata.permissions().mode() & 0o077 != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "private approval key {} must not be accessible by group or other users (chmod 600)",
+                    path.display()
+                ),
+            ));
+        }
+        Ok(file)
+    }
+    #[cfg(windows)]
+    {
+        windows_private::open_private_file(path)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = path;
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "private approval files are unavailable on this platform",
+        ))
+    }
+}
+
+#[cfg(unix)]
 fn sync_dir(path: &Path) -> io::Result<()> {
     File::open(path)?.sync_all()
+}
+
+#[cfg(windows)]
+fn sync_dir(_path: &Path) -> io::Result<()> {
+    // Windows does not expose a stable directory-fsync operation. Each sidecar
+    // file is flushed before its create-if-absent hard link is published.
+    Ok(())
+}
+
+#[cfg(not(any(unix, windows)))]
+fn sync_dir(_path: &Path) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "durable approvals are unavailable on this platform",
+    ))
 }
 
 fn validate_component(value: &str, label: &str) -> io::Result<()> {
@@ -836,10 +1253,8 @@ fn invalid_data(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message.into())
 }
 
-// Approval storage intentionally fails closed on non-Unix platforms until a
-// private-directory ACL implementation is available there.
 #[cfg(test)]
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 mod tests {
     use super::*;
     use std::sync::{Arc, Barrier, OnceLock};
@@ -970,6 +1385,7 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    #[cfg(unix)]
     #[test]
     fn sidecar_symlinks_are_never_followed() {
         use std::os::unix::fs::symlink;

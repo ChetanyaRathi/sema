@@ -111,6 +111,41 @@ test('event stream → click jumps to the agent in the detail pane', async ({ pa
   ).toHaveCount(1);
 });
 
+test('workflow-controlled labels cannot create markup or event handlers', async ({ page }) => {
+  await page.addInitScript(() => {
+    (globalThis as any).__semaXss = 0;
+  });
+  await page.goto('/?run=xss-hostile', { waitUntil: 'networkidle' });
+  await page.getByTestId('phase').first().waitFor({ timeout: 15000 });
+
+  const hostilePhase = 'pending"><img src=x onerror="globalThis.__semaXss=1">';
+  const phases = page.getByTestId('phase');
+  await expect(phases).toHaveCount(2);
+  await expect(phases.nth(1)).toHaveAttribute('data-phase-name', hostilePhase);
+  await expect(page.locator('img[src="x"]')).toHaveCount(0);
+
+  await phases.first().click();
+  await expect(page.getByTestId('agent-row')).toHaveAttribute(
+    'data-agent',
+    'agent" onpointerenter="globalThis.__semaXss=2'
+  );
+  await expect(page.getByTestId('agent-row')).not.toHaveAttribute('onpointerenter', /.+/);
+
+  const auth = page.getByTestId('auth-row');
+  await expect(auth).toHaveAttribute(
+    'data-alias',
+    'alias" onpointerenter="globalThis.__semaXss=3'
+  );
+  await expect(auth).not.toHaveAttribute('onpointerenter', /.+/);
+
+  await page.locator('[data-testid]').evaluateAll((elements) => {
+    for (const element of elements) {
+      element.dispatchEvent(new PointerEvent('pointerenter'));
+    }
+  });
+  expect(await page.evaluate(() => (globalThis as any).__semaXss)).toBe(0);
+});
+
 // all-phases-upfront (S5): a run that declares 4 phases (run.started.phases) but has
 // only started 2 shows the whole plan — Inventory done, Audit running, Verify+Report
 // pending (dimmed, NOT a misleading ✓). Order preserved.

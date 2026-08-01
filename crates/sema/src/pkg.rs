@@ -117,30 +117,47 @@ fn validate_package_manifest_sema_content(
     }
 }
 
-fn validate_git_ref_manifest(dir: &Path, git_ref: &str, package: &str) -> Result<(), String> {
+fn resolve_git_ref_commit(dir: &Path, git_ref: &str) -> Result<String, String> {
     let candidates = [
         format!("refs/remotes/origin/{git_ref}"),
         format!("refs/tags/{git_ref}"),
         git_ref.to_string(),
     ];
-    let Some(resolved) = candidates
-        .iter()
-        .find(|candidate| run_git(Some(dir), &["rev-parse", "--verify", candidate]).is_ok())
-        .cloned()
-    else {
-        // Checkout reports a missing ref with the normal git diagnostic.
-        return Ok(());
-    };
-    let object = format!("{resolved}:sema.toml");
+    for candidate in candidates {
+        let commit = format!("{candidate}^{{commit}}");
+        if let Ok(resolved) = run_git(Some(dir), &["rev-parse", "--verify", &commit]) {
+            return Ok(resolved);
+        }
+    }
+    Err(format!("git ref {git_ref:?} does not resolve to a commit"))
+}
+
+fn validate_git_commit_manifest(
+    dir: &Path,
+    commit: &str,
+    display_ref: &str,
+    package: &str,
+) -> Result<(), String> {
+    let object = format!("{commit}:sema.toml");
     if run_git(Some(dir), &["cat-file", "-e", &object]).is_err() {
         return Ok(());
     }
     let content = run_git(Some(dir), &["show", &object])?;
     validate_package_manifest_sema_content(
         &content,
-        &format!("{package}@{git_ref}:sema.toml"),
+        &format!("{package}@{display_ref}:sema.toml"),
         package,
     )
+}
+
+fn resolve_and_validate_git_ref(
+    dir: &Path,
+    git_ref: &str,
+    package: &str,
+) -> Result<String, String> {
+    let commit = resolve_git_ref_commit(dir, git_ref)?;
+    validate_git_commit_manifest(dir, &commit, git_ref, package)?;
+    Ok(commit)
 }
 
 fn collect_packages(dir: &Path, packages: &mut Vec<PathBuf>) {
@@ -199,16 +216,17 @@ fn install_git(spec: &sema_core::resolve::PackageSpec) -> Result<(String, String
         run_git(None, &["clone", &spec.clone_url(), &dest.to_string_lossy()])?;
     }
 
-    if let Err(error) = validate_git_ref_manifest(&dest, &spec.git_ref, spec.path.as_str()) {
-        if !existed {
-            let _ = std::fs::remove_dir_all(&dest);
+    let commit = match resolve_and_validate_git_ref(&dest, &spec.git_ref, spec.path.as_str()) {
+        Ok(commit) => commit,
+        Err(error) => {
+            if !existed {
+                let _ = std::fs::remove_dir_all(&dest);
+            }
+            return Err(error);
         }
-        return Err(error);
-    }
-    run_git(Some(&dest), &["checkout", &spec.git_ref])?;
-    let current = current_git_ref(&dest);
-    println!("✓ Installed {} → {current}", spec.path);
-    let commit = run_git(Some(&dest), &["rev-parse", "HEAD"])?;
+    };
+    run_git(Some(&dest), &["checkout", "--detach", &commit])?;
+    println!("✓ Installed {} → {} ({commit})", spec.path, spec.git_ref);
     let git_ref = spec.git_ref.clone();
     Ok((git_ref, commit))
 }
@@ -233,13 +251,16 @@ fn install_git_locked(
         run_git(None, &["clone", &spec.clone_url(), &dest.to_string_lossy()])?;
     }
 
-    if let Err(error) = validate_git_ref_manifest(&dest, expected_commit, spec.path.as_str()) {
-        if !existed {
-            let _ = std::fs::remove_dir_all(&dest);
+    let commit = match resolve_and_validate_git_ref(&dest, expected_commit, spec.path.as_str()) {
+        Ok(commit) => commit,
+        Err(error) => {
+            if !existed {
+                let _ = std::fs::remove_dir_all(&dest);
+            }
+            return Err(error);
         }
-        return Err(error);
-    }
-    run_git(Some(&dest), &["checkout", "--detach", expected_commit])?;
+    };
+    run_git(Some(&dest), &["checkout", "--detach", &commit])?;
     let actual = run_git(Some(&dest), &["rev-parse", "HEAD"])?;
     if actual != expected_commit {
         return Err(format!(
@@ -901,20 +922,14 @@ fn update_single_package(pkg_dir: &Path, dir: &Path) -> Result<(), String> {
 
         // Read the tracking ref from sema.toml (needed if HEAD is detached after --locked install)
         let tracking_ref = read_dep_ref_from_toml(&rel_str);
-        validate_git_ref_manifest(
-            dir,
-            tracking_ref.as_deref().unwrap_or("FETCH_HEAD"),
-            &rel_str,
-        )?;
-        if let Some(ref git_ref) = tracking_ref {
-            // Checkout the branch/tag first so pull works
-            let _ = run_git(Some(dir), &["checkout", git_ref]);
-        }
-
-        run_git(Some(dir), &["pull"])?;
         let current_ref = tracking_ref.unwrap_or_else(|| current_git_ref(dir));
-        let commit =
-            run_git(Some(dir), &["rev-parse", "HEAD"]).unwrap_or_else(|_| "unknown".to_string());
+        let resolve_ref = if current_ref == "HEAD" {
+            "FETCH_HEAD"
+        } else {
+            current_ref.as_str()
+        };
+        let commit = resolve_and_validate_git_ref(dir, resolve_ref, &rel_str)?;
+        run_git(Some(dir), &["checkout", "--detach", &commit])?;
         println!("✓ Updated {} → {current_ref}", rel.display());
 
         let _ = update_lock_entry(
@@ -2511,9 +2526,53 @@ mod tests {
         run_git(Some(&dir), &["commit", "-m", "incompatible"]).unwrap();
         run_git(Some(&dir), &["checkout", "main"]).unwrap();
 
-        let error = validate_git_ref_manifest(&dir, "incompatible", "policies").unwrap_err();
+        let error = resolve_and_validate_git_ref(&dir, "incompatible", "policies").unwrap_err();
         assert!(error.contains("requires Sema"));
         assert_eq!(current_git_ref(&dir), "main");
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn git_ref_validation_and_checkout_use_the_same_remote_commit() {
+        let dir = tmpdir("git-remote-ref-snapshot");
+        run_git(Some(&dir), &["init"]).unwrap();
+        run_git(Some(&dir), &["config", "user.email", "test@test.com"]).unwrap();
+        run_git(Some(&dir), &["config", "user.name", "Test"]).unwrap();
+        run_git(Some(&dir), &["checkout", "-b", "main"]).unwrap();
+        fs::write(
+            dir.join("sema.toml"),
+            "[package]\nname = \"policies\"\nsema_version_req = \"*\"\n",
+        )
+        .unwrap();
+        fs::write(dir.join("package.sema"), "old").unwrap();
+        run_git(Some(&dir), &["add", "."]).unwrap();
+        run_git(Some(&dir), &["commit", "-m", "old local main"]).unwrap();
+
+        run_git(Some(&dir), &["checkout", "-b", "remote-main"]).unwrap();
+        fs::write(dir.join("package.sema"), "new remote main").unwrap();
+        run_git(Some(&dir), &["add", "package.sema"]).unwrap();
+        run_git(Some(&dir), &["commit", "-m", "new remote main"]).unwrap();
+        let remote_commit = run_git(Some(&dir), &["rev-parse", "HEAD"]).unwrap();
+        run_git(
+            Some(&dir),
+            &["update-ref", "refs/remotes/origin/main", &remote_commit],
+        )
+        .unwrap();
+        run_git(Some(&dir), &["checkout", "main"]).unwrap();
+        assert_eq!(fs::read_to_string(dir.join("package.sema")).unwrap(), "old");
+
+        let validated = resolve_and_validate_git_ref(&dir, "main", "policies").unwrap();
+        assert_eq!(validated, remote_commit);
+        run_git(Some(&dir), &["checkout", "--detach", &validated]).unwrap();
+        assert_eq!(
+            fs::read_to_string(dir.join("package.sema")).unwrap(),
+            "new remote main"
+        );
+        assert_eq!(
+            run_git(Some(&dir), &["rev-parse", "HEAD"]).unwrap(),
+            validated
+        );
 
         fs::remove_dir_all(&dir).unwrap();
     }

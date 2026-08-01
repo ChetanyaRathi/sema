@@ -108,9 +108,59 @@ pub fn check_source(src: &str) -> Vec<Diag> {
         diags.push(Diag::error(span, "E-PARSE", message));
     }
     for form in &forms {
+        check_first_class_approval(form, &spans, &mut diags);
         find_workflows_and_policies(form, &spans, &mut diags);
     }
     diags
+}
+
+/// `workflow/approval` is a control-flow operation, not a value. A direct call
+/// is valid; aliasing, storing, or passing the native function would allow a
+/// detached task to reach the gate after its owner has continued.
+fn check_first_class_approval(form: &Value, spans: &SpanMap, out: &mut Vec<Diag>) {
+    if form.as_symbol().as_deref() == Some("workflow/approval") {
+        out.push(
+            Diag::error(
+                span_of(form, spans),
+                "E-APPROVAL-VALUE",
+                "workflow/approval cannot be used as a value",
+            )
+            .with_hint("call (approval key opts) directly in the owning workflow task"),
+        );
+        return;
+    }
+    if let Some(items) = form.as_seq() {
+        let head = items.first().and_then(name_of_symbol);
+        if matches!(head.as_deref(), Some("quote" | "quasiquote")) {
+            return;
+        }
+        let children = if head.as_deref() == Some("workflow/approval") {
+            &items[1..]
+        } else {
+            items
+        };
+        for child in children {
+            if child.as_symbol().as_deref() == Some("workflow/approval") {
+                out.push(
+                    Diag::error(
+                        span_of(child, spans),
+                        "E-APPROVAL-VALUE",
+                        "workflow/approval cannot be used as a value",
+                    )
+                    .with_hint("call (approval key opts) directly in the owning workflow task"),
+                );
+            } else {
+                check_first_class_approval(child, spans, out);
+            }
+        }
+        return;
+    }
+    if let Some(map) = form.as_map_ref() {
+        for (key, value) in map {
+            check_first_class_approval(key, spans, out);
+            check_first_class_approval(value, spans, out);
+        }
+    }
 }
 
 /// Workflow-run contract: exactly one top-level `defworkflow`, and it must be the
@@ -231,7 +281,7 @@ fn find_workflows_and_policies(form: &Value, spans: &SpanMap, out: &mut Vec<Diag
                 .with_hint("(defpolicy safe {:models {...} :tools {...}})"),
             );
         } else if let Some(policy) = items[2].as_map_ref() {
-            check_literal_policy(&Value::map(policy.clone()), span, out);
+            let _ = check_literal_policy(&Value::map(policy.clone()), span, out);
         } else {
             out.push(Diag::error(
                 span,
@@ -248,14 +298,22 @@ fn find_workflows_and_policies(form: &Value, spans: &SpanMap, out: &mut Vec<Diag
     }
 }
 
-fn check_literal_policy(policy: &Value, span: Option<Span>, out: &mut Vec<Diag>) {
-    if let Err(error) = sema_policy::CompiledPolicy::compile(policy) {
-        let hint = error.hint().map(str::to_string);
-        let diagnostic = Diag::error(span, "E-POLICY", format!("invalid policy: {error}"));
-        out.push(match hint {
-            Some(hint) => diagnostic.with_hint(hint),
-            None => diagnostic,
-        });
+fn check_literal_policy(
+    policy: &Value,
+    span: Option<Span>,
+    out: &mut Vec<Diag>,
+) -> Option<sema_policy::CompiledPolicy> {
+    match sema_policy::CompiledPolicy::compile(policy) {
+        Ok(policy) => Some(policy),
+        Err(error) => {
+            let hint = error.hint().map(str::to_string);
+            let diagnostic = Diag::error(span, "E-POLICY", format!("invalid policy: {error}"));
+            out.push(match hint {
+                Some(hint) => diagnostic.with_hint(hint),
+                None => diagnostic,
+            });
+            None
+        }
     }
 }
 
@@ -375,7 +433,7 @@ fn check_workflow(items: &[Value], form: &Value, spans: &SpanMap, out: &mut Vec<
             .get(&Value::keyword("policy"))
             .filter(|value| value.as_map_ref().is_some())
         {
-            check_literal_policy(policy, wf_span, out);
+            let _ = check_literal_policy(policy, wf_span, out);
         }
     }
 
@@ -674,7 +732,23 @@ fn walk_markers(form: &Value, spans: &SpanMap, out: &mut Vec<Diag>) {
                         .get(&Value::keyword("policy"))
                         .filter(|value| value.as_map_ref().is_some())
                     {
-                        check_literal_policy(policy, span, out);
+                        if let Some(policy) = check_literal_policy(policy, span, out) {
+                            let has_metadata = policy.required_metadata().next().is_some();
+                            let has_completion =
+                                policy.required_completion_events().next().is_some();
+                            if has_metadata || has_completion {
+                                out.push(
+                                    Diag::error(
+                                        span,
+                                        "E-STEP-POLICY-SCOPE",
+                                        "step policies cannot contain :metadata or :completion requirements",
+                                    )
+                                    .with_hint(
+                                        "attach workflow evidence requirements to defworkflow :policy",
+                                    ),
+                                );
+                            }
+                        }
                     }
                     // :agent runs a configured defagent and owns its own tools/model; the
                     // step must not also declare inline :tools/:model (they'd be ignored —
@@ -975,6 +1049,35 @@ mod tests {
                 .count(),
             6
         );
+    }
+
+    #[test]
+    fn approval_native_cannot_be_aliased_or_stored() {
+        let src = r#"
+          (define gate workflow/approval)
+          (defworkflow d "d" {}
+            (list workflow/approval)
+            {:status :success})
+        "#;
+        assert_eq!(
+            codes(src)
+                .into_iter()
+                .filter(|code| *code == "E-APPROVAL-VALUE")
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn step_policy_rejects_workflow_evidence_sections() {
+        let src = r#"
+          (defworkflow d "d" {}
+            (step "inspect"
+              {:policy {:metadata {:require [:owner]}
+                        :completion {:require-events [:checkpoint]}}})
+            {:status :success})
+        "#;
+        assert!(codes(src).contains(&"E-STEP-POLICY-SCOPE"));
     }
 
     #[test]

@@ -744,19 +744,19 @@ R18C	crates/sema-stdlib/src/system.rs:930:    // VM thread — two `async/spawn`
 R18C	crates/sema-stdlib/src/system.rs:931:    // on the VM thread (unlike `async/sleep`, which is a virtual timer). Outside
 R18C	crates/sema-stdlib/src/system.rs:944:                std::thread::sleep(std::time::Duration::from_millis(ms as u64));
 R19	crates/sema-stdlib/src/terminal.rs:84:    /// bare `thread::sleep` frame loop, whose sleeping thread could only be
-R23B	crates/sema-stdlib/src/workflow.rs:1024:/// `async/spawn`, an offloaded `llm/chat` tool loop, `channel/*`) parks on the active
-R23B	crates/sema-stdlib/src/workflow.rs:1058:                // The host arm resolves `:mcp` synchronously (its `io_block_on` is legal
-R23B	crates/sema-stdlib/src/workflow.rs:1609:            let _ = ack_rx.recv_timeout(HOST_FLUSH_ACK_TIMEOUT);
-R23B	crates/sema-stdlib/src/workflow.rs:1623:// awaits the writer's ack on a blocking-tier worker (no `io_block_on`, no fs on the VM
-R23B	crates/sema-stdlib/src/workflow.rs:1651:            let _ = ack_rx.recv();
-R23B	crates/sema-stdlib/src/workflow.rs:1672:        let _ = ack.recv_timeout(HOST_FLUSH_ACK_TIMEOUT);
-R23B	crates/sema-stdlib/src/workflow.rs:1861:        // `io_block_on`'s active-quantum guard, so offload it structurally — the blocking
-R23B	crates/sema-stdlib/src/workflow.rs:1877:    // Host arm (outside a runtime quantum): `io_block_on` is legal — resolve inline.
-C12	crates/sema-stdlib/src/workflow_check.rs:419:        "async/spawn",
-C12	crates/sema-stdlib/src/workflow_check.rs:420:        "async/spawn-all",
-C12	crates/sema-stdlib/src/workflow_check.rs:423:        "async/race",
-C12	crates/sema-stdlib/src/workflow_check.rs:424:        "async/race-owned",
-C12	crates/sema-stdlib/src/workflow_check.rs:965:            (async/race-owned (list (fn ()
+R23B	crates/sema-stdlib/src/workflow.rs:1046:/// `async/spawn`, an offloaded `llm/chat` tool loop, `channel/*`) parks on the active
+R23B	crates/sema-stdlib/src/workflow.rs:1080:                // The host arm resolves `:mcp` synchronously (its `io_block_on` is legal
+R23B	crates/sema-stdlib/src/workflow.rs:1632:            let _ = ack_rx.recv_timeout(HOST_FLUSH_ACK_TIMEOUT);
+R23B	crates/sema-stdlib/src/workflow.rs:1646:// awaits the writer's ack on a blocking-tier worker (no `io_block_on`, no fs on the VM
+R23B	crates/sema-stdlib/src/workflow.rs:1674:            let _ = ack_rx.recv();
+R23B	crates/sema-stdlib/src/workflow.rs:1695:        let _ = ack.recv_timeout(HOST_FLUSH_ACK_TIMEOUT);
+R23B	crates/sema-stdlib/src/workflow.rs:1884:        // `io_block_on`'s active-quantum guard, so offload it structurally — the blocking
+R23B	crates/sema-stdlib/src/workflow.rs:1900:    // Host arm (outside a runtime quantum): `io_block_on` is legal — resolve inline.
+C12	crates/sema-stdlib/src/workflow_check.rs:1039:            (async/race-owned (list (fn ()
+C12	crates/sema-stdlib/src/workflow_check.rs:477:        "async/spawn",
+C12	crates/sema-stdlib/src/workflow_check.rs:478:        "async/spawn-all",
+C12	crates/sema-stdlib/src/workflow_check.rs:481:        "async/race",
+C12	crates/sema-stdlib/src/workflow_check.rs:482:        "async/race-owned",
 R23B	crates/sema-stdlib/src/workflow_mcp.rs:473:    /// I/O through `io_block_on`, which rejects an active runtime quantum. Inside
 R23B	crates/sema-stdlib/src/workflow_mcp.rs:480:    /// synchronous [`resolve`](Self::resolve) would hit `io_block_on`'s
 R23B	crates/sema-stdlib/src/workflow_mcp.rs:482:    /// resolve off the VM thread (a plain worker where `io_block_on` is legal);
@@ -776,14 +776,14 @@ R20A	crates/sema-stdlib/src/ws.rs:921:        sema_io::io_block_on(async {
 R20A	crates/sema-stdlib/src/ws.rs:935:        sema_io::io_block_on(async {
 R20A	crates/sema-stdlib/src/ws.rs:971:        sema_io::io_block_on(async {
 C19	crates/sema-vm/src/hof_sync.rs:97:thread_local! {
-C16	crates/sema-vm/src/lower.rs:1040:/// (async body ...) → wrap body in zero-arg lambda, call async/spawn
-C16	crates/sema-vm/src/lower.rs:1059:        func: Box::new(CoreExpr::Var(intern("async/spawn"))),
-C16	crates/sema-vm/src/lower.rs:1065:/// (await expr) → call async/await with the expression
-C16	crates/sema-vm/src/lower.rs:1072:        func: Box::new(CoreExpr::Var(intern("async/await"))),
+C16	crates/sema-vm/src/lower.rs:1061:/// (async body ...) → wrap body in zero-arg lambda, call async/spawn
+C16	crates/sema-vm/src/lower.rs:1080:        func: Box::new(CoreExpr::Var(intern("async/spawn"))),
+C16	crates/sema-vm/src/lower.rs:1086:/// (await expr) → call async/await with the expression
+C16	crates/sema-vm/src/lower.rs:1093:        func: Box::new(CoreExpr::Var(intern("async/await"))),
 C16	crates/sema-vm/src/lower.rs:15:thread_local! {
-C16	crates/sema-vm/src/lower.rs:325:thread_local! {
-C16	crates/sema-vm/src/lower.rs:328:    /// `Spur` ids are only meaningful within the `thread_local!` interner that
-C16	crates/sema-vm/src/lower.rs:391:    thread_local! {
+C16	crates/sema-vm/src/lower.rs:346:thread_local! {
+C16	crates/sema-vm/src/lower.rs:349:    /// `Spur` ids are only meaningful within the `thread_local!` interner that
+C16	crates/sema-vm/src/lower.rs:412:    thread_local! {
 F28	crates/sema-vm/src/restricted.rs:1687:                    std::thread::sleep(Duration::from_millis(150));
 F28	crates/sema-vm/src/restricted.rs:1763:                std::thread::sleep(Duration::from_millis(150));
 F09B	crates/sema-vm/src/runtime/host.rs:306:            match guard.recv() {
@@ -910,15 +910,15 @@ H02	crates/sema/src/main.rs:107:thread_local! {
 H02	crates/sema/src/main.rs:1201:                    .block_on(sema_lsp::run_server());
 H02	crates/sema/src/main.rs:1208:                    .block_on(sema_dap::run_server());
 H02	crates/sema/src/main.rs:1283:                // runtime, llm/* builtins hit io_block_on's runtime-in-runtime
-H02	crates/sema/src/main.rs:2212:                .block_on(workflow_view::serve_with_approval(
-H02	crates/sema/src/main.rs:2533:                .block_on(async {
-H02	crates/sema/src/main.rs:2551:        std::thread::sleep(std::time::Duration::from_millis(250));
-H02	crates/sema/src/main.rs:2756:            std::thread::sleep(std::time::Duration::from_secs(3600));
-H02	crates/sema/src/main.rs:2861:                .block_on(sema_notebook::serve(path, &host, port));
-H02	crates/sema/src/main.rs:3411:        // Same no-ambient-runtime rule as the CLI mcp arm (llm/* + io_block_on).
-H02	crates/sema/src/main.rs:4851:    // runtime, the sole async engine, so async/await, channels, and timers work
-H02	crates/sema/src/pkg.rs:1637:                std::thread::sleep(jittered(wait));
-H02	crates/sema/src/pkg.rs:1650:                std::thread::sleep(jittered(backoff));
+H02	crates/sema/src/main.rs:2182:                .block_on(workflow_view::serve_with_approval(
+H02	crates/sema/src/main.rs:2503:                .block_on(async {
+H02	crates/sema/src/main.rs:2521:        std::thread::sleep(std::time::Duration::from_millis(250));
+H02	crates/sema/src/main.rs:2726:            std::thread::sleep(std::time::Duration::from_secs(3600));
+H02	crates/sema/src/main.rs:2831:                .block_on(sema_notebook::serve(path, &host, port));
+H02	crates/sema/src/main.rs:3381:        // Same no-ambient-runtime rule as the CLI mcp arm (llm/* + io_block_on).
+H02	crates/sema/src/main.rs:4821:    // runtime, the sole async engine, so async/await, channels, and timers work
+H02	crates/sema/src/pkg.rs:1652:                std::thread::sleep(jittered(wait));
+H02	crates/sema/src/pkg.rs:1665:                std::thread::sleep(jittered(backoff));
 H03	crates/sema/src/repl/completer.rs:16:thread_local! {
 H08	crates/sema/src/web/mod.rs:154:            std::thread::sleep(std::time::Duration::from_millis(100));
 H13	crates/sema/src/web/runtime.rs:414:            "installAtomicsSleep",

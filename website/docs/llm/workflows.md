@@ -263,19 +263,18 @@ hashed through an ambiguous display string. The raw subject is never stored;
 only its digest is. Treat `:preview`, `:reason`, comments, and actor names as
 operator-visible text.
 
-An approval is a sequential gate in the owning workflow task. Put it before,
-not inside, `parallel`, `pipeline`, async task combinators, steps, retry/timeout forms,
-resource-cleanup forms, or a nested `workflow/run`. `sema workflow check` and
-`sema workflow run` reject those placements before execution. Pending,
-rejected, malformed, cancelled, and authority-invalid gates are uncatchable by
-Sema `try`/`catch`, so later protected forms cannot run.
+An approval is a sequential gate in the owning workflow task. Call `approval`
+directly; `workflow/approval` cannot be aliased, stored, or passed as a
+first-class value. Put the gate before, not inside, `parallel`, `pipeline`,
+async task combinators, steps, retry/timeout forms, resource-cleanup forms, or a
+nested `workflow/run`. `sema workflow check` and `sema workflow run` reject
+those placements before execution. Pending, rejected, malformed, cancelled,
+and authority-invalid gates are uncatchable by Sema `try`/`catch`, so later
+protected forms cannot run.
 
-::: warning Platform support
-Durable approval storage and approval key generation currently fail closed on
-non-Unix platforms until Sema has a native private-directory ACL
-implementation. The workflow viewer remains available there, but approval
-requests are inspect-only because the store refuses unsafe writes.
-:::
+Durable approval storage and approval key generation support Unix permission
+modes and protected Windows ACLs. Other targets fail closed if Sema cannot
+enforce private approval files.
 
 ### `parallel`
 
@@ -539,6 +538,9 @@ multiple path-like arguments:
 A step policy is combined with the workflow policy using logical AND: every
 active layer must allow the boundary. A step may tighten its workflow but
 cannot loosen it. The strictest denial action across active layers wins.
+Step policies may contain model, tool, subject, input, and output controls.
+Run-wide `:metadata` and `:completion` evidence requirements must be attached
+to the workflow policy; `workflow check` and the runtime reject them on steps.
 
 | Boundary | `:on-deny` | Behavior |
 |----------|------------|----------|
@@ -582,6 +584,32 @@ provider identity.
 policy, boundary, matched rule, enforcement action, and whether the source was
 a request, cache, or cassette. Tool arguments are represented only by a digest in
 policy events; raw paths, URLs, and commands are not recorded there.
+
+### First-party standard policy pack
+
+The [`sema-policies`](https://github.com/sema-lisp/packages/tree/main/sema-policies)
+package provides reusable least-privilege, content-safety, output-contract, and
+workflow-evidence policies for Sema 1.34 or newer:
+
+```bash
+sema pkg add sema-policies
+```
+
+```sema
+(import "sema-policies")
+
+(define project-policy
+  (list
+    (policies/model-allowlist ["openai/gpt-5"])
+    (policies/read-only-repository ["src/**" "Cargo.toml"])
+    policies/no-sensitive-data-to-models))
+```
+
+The pack also includes tool allowlists, output contracts, a no-tools profile,
+public-content controls, and evidence baselines for public-sector RAG and AI
+documentation. These are deterministic runtime controls, not compliance
+certifications. Policy lists compose as an intersection, so every layer must
+allow an operation.
 
 ### Trusted lexical bypass
 

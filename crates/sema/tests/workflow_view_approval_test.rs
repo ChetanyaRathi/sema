@@ -1,5 +1,3 @@
-#![cfg(unix)]
-
 //! End-to-end coverage for workflow-viewer approval reads and signed writes.
 
 use std::fs;

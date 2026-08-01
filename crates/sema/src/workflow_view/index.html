@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
 <title>Sema · Workflow Run</title>
-<style>
+<style nonce="__SEMA_VIEW_NONCE__">
   :root{
     --gold:#c8a855; --gold-dim:rgba(200,168,85,.5); --gold-glow:rgba(200,168,85,.08); --gold-soft:rgba(200,168,85,.14);
     --bg:#131110; --bg-elevated:#181512; --bg-editor:#1c1916; --bg-output:#0f0d0c;
@@ -432,7 +432,7 @@
 
 </div>
 
-<script>
+<script nonce="__SEMA_VIEW_NONCE__">
 /* =========================================================================
    MOCK DATA = events.jsonl for the audit-auth run, matching audit_run_shape.
    Each line is one frozen-vocabulary event (serde tag="event"), seq monotonic,
@@ -625,7 +625,7 @@ function renderPhases(){
     const key = p.start_seq!=null ? String(p.start_seq) : `pending:${p.phase}`;
     const dstatus = p.status==="pending" ? "pending" : p.status==="skipped" ? "skipped"
                   : phaseOpen(p) ? "running" : phaseHasFail(p) ? "failed" : "done";
-    html += `<div class="${cls}" data-seq="${key}" data-status="${dstatus}" data-testid="phase" data-phase-name="${esc(p.phase)}">`+
+    html += `<div class="${cls}" data-seq="${escAttr(key)}" data-status="${dstatus}" data-testid="phase" data-phase-name="${escAttr(p.phase)}">`+
             pGlyph(p)+
             `<span class="pname ell">${esc(p.phase)}</span>`+
             `<span class="count tnum" data-testid="phase-count">${count}</span></div>`;
@@ -708,7 +708,7 @@ function renderDetail(){
     const dur = a.dur_ms!=null ? `<span class="c tnum">${fmtMs(a.dur_ms)}</span>`
                                : `<span class="c blank tnum">…</span>`;   // blank while running
     html +=
-      `<div class="${cls}" data-agent="${a.agent_id}" data-testid="agent-row" data-status="${st}" data-selected="${sel}">`+
+      `<div class="${cls}" data-agent="${escAttr(a.agent_id)}" data-testid="agent-row" data-status="${st}" data-selected="${sel}">`+
       aGlyph(st,"aglyph")+
       `<span class="albl"><span class="aname">${esc(a.agent_id)}</span>`+
         `<span class="amodel" data-testid="agent-model">${esc(a.model)}</span></span>`+
@@ -889,8 +889,8 @@ function renderStream(){
     const agentId = e.agent_id || null;              // agent.* / budget jump to that agent
     const phaseId = agentId ? null : phaseSeqForEvent(e);  // phase.* / checkpoint jump to the phase
     const clk = (agentId || phaseId!=null) ? " clk" : "";
-    const data = agentId ? ` data-ev-agent="${esc(agentId)}"`
-                         : (phaseId!=null ? ` data-ev-phase="${phaseId}"` : "");
+    const data = agentId ? ` data-ev-agent="${escAttr(agentId)}"`
+                         : (phaseId!=null ? ` data-ev-phase="${escAttr(phaseId)}"` : "");
     html += `<div class="ev${live?" run":""}${clk}" data-testid="ev-row"${data}>`+
       `<span class="seq tnum">${e.seq}</span>`+
       evGlyph(e)+
@@ -958,8 +958,8 @@ function renderAuth(){
   panel.hidden = false;
   let html = "";
   for(const row of AUTH_ROWS){
-    html += `<div class="arow auth-row" data-testid="auth-row" data-alias="${esc(row.alias)}" `+
-              `data-status="${esc(row.status)}" style="grid-template-columns:16px 1fr auto">`+
+    html += `<div class="arow auth-row" data-testid="auth-row" data-alias="${escAttr(row.alias)}" `+
+              `data-status="${escAttr(row.status)}" style="grid-template-columns:16px 1fr auto">`+
             authGlyph(row.status)+
             `<span class="albl ell">${esc(authText(row))}</span>`+
             authAction(row)+
