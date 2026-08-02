@@ -226,16 +226,14 @@ impl CompiledPolicy {
         &self.fingerprint
     }
 
-    pub fn model_action(&self) -> ModelDenyAction {
-        self.models
-            .as_ref()
-            .map_or(ModelDenyAction::Fail, |policy| policy.on_deny)
+    /// The configured deny action, or `None` when no models section is present.
+    pub fn model_action(&self) -> Option<ModelDenyAction> {
+        self.models.as_ref().map(|policy| policy.on_deny)
     }
 
-    pub fn tool_action(&self) -> ToolDenyAction {
-        self.tools
-            .as_ref()
-            .map_or(ToolDenyAction::Fail, |policy| policy.on_deny)
+    /// The configured deny action, or `None` when no tools section is present.
+    pub fn tool_action(&self) -> Option<ToolDenyAction> {
+        self.tools.as_ref().map(|policy| policy.on_deny)
     }
 
     /// Check a fully resolved provider/model pair.
@@ -2090,7 +2088,7 @@ mod tests {
         assert!(policy.check_model("ollama", "qwen").allowed);
         assert!(!policy.check_model("ollama", "unsafe").allowed);
         assert!(!policy.check_model("openai", "gpt-4").allowed);
-        assert_eq!(policy.model_action(), ModelDenyAction::Skip);
+        assert_eq!(policy.model_action(), Some(ModelDenyAction::Skip));
     }
 
     #[test]
@@ -2109,13 +2107,13 @@ mod tests {
             CompiledPolicy::compile(&named_policy([("models", map([])), ("tools", map([]))]))
                 .unwrap();
         assert!(!policy.check_model("fake", "model").allowed);
-        assert_eq!(policy.model_action(), ModelDenyAction::Fail);
+        assert_eq!(policy.model_action(), Some(ModelDenyAction::Fail));
         assert!(
             !policy
                 .check_tool("read-file", &serde_json::json!({}), &[], Path::new("."))
                 .allowed
         );
-        assert_eq!(policy.tool_action(), ToolDenyAction::Fail);
+        assert_eq!(policy.tool_action(), Some(ToolDenyAction::Fail));
     }
 
     #[test]

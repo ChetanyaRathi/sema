@@ -316,7 +316,7 @@ fn check_model_policy(
         None,
         source,
         |layer| layer.policy.check_model(provider, model),
-        |layer| layer.policy.model_action().max(minimum_action),
+        |layer| layer.policy.model_action().max(Some(minimum_action)),
     )
 }
 
@@ -488,7 +488,7 @@ fn check_tool_policy(
                 .policy
                 .check_tool(tool, arguments, policy_subjects, &layer.workspace_root)
         },
-        |layer| layer.policy.tool_action().max(minimum_action),
+        |layer| layer.policy.tool_action().max(Some(minimum_action)),
     )
 }
 
@@ -520,7 +520,7 @@ fn check_active_policies<T: PolicyAction>(
     subject_digest: Option<String>,
     source: PolicySource,
     check: impl Fn(&ActivePolicy) -> sema_policy::PolicyCheck,
-    action: impl Fn(&ActivePolicy) -> T,
+    action: impl Fn(&ActivePolicy) -> Option<T>,
 ) -> PolicyGate<T> {
     let policies = ACTIVE_POLICIES.with(|policies| policies.borrow().clone());
     if policies.is_empty() {
@@ -552,7 +552,7 @@ fn check_active_policies<T: PolicyAction>(
         .iter()
         .map(|layer| {
             let result = check(layer);
-            let configured_action = (!result.allowed).then(|| action(layer));
+            let configured_action = (!result.allowed).then(|| action(layer)).flatten();
             (result, configured_action)
         })
         .collect();

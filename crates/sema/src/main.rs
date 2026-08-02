@@ -1571,7 +1571,14 @@ fn read_approval_key_file(path: &Path, private: bool) -> Result<String, String> 
     let file = if private {
         sema_workflow::approval::open_private_file(path)
     } else {
-        std::fs::OpenOptions::new().read(true).open(path)
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.custom_flags(libc::O_NOFOLLOW);
+        }
+        options.open(path)
     }
     .map_err(|error| format!("cannot open approval key {}: {error}", path.display()))?;
     let metadata = file

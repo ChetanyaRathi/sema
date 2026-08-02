@@ -261,7 +261,9 @@ gate key and occurrence, canonical subject digest, request timestamp, request
 revision, and public authority. Editing a binding invalidates the decision.
 The evaluator reads imports and loads from those exact snapshotted bytes;
 runtime-selected or macro-generated files outside the preflight closure fail
-closed instead of escaping the approval revision.
+closed instead of escaping the approval revision. Files introduced by macro
+expansion at eval time (not parse time) are not traced during preflight and
+will fail at runtime with a missing-dependency error.
 
 Approval subjects must be canonical immutable data: scalars, lists, vectors,
 maps, bytevectors, or typed numeric arrays. Mutable cells, records, functions,
@@ -616,6 +618,14 @@ callbacks, schema predicates, or tool handlers. Cache/cassette keys and resume
 keys include the effective policy fingerprint; replay also rechecks the stored
 provider identity.
 
+::: warning Streaming output policy
+When output policy defers a stream, the provider call is already in-flight and
+tokens are consumed before the accumulated response is checked. A blocked stream
+still charges the provider call against the budget and leaves an incomplete
+cassette record. For sensitive content use a non-streaming completion or gate
+the stream-open call with a model policy that precludes sensitive models.
+:::
+
 `policy.checked`, `policy.violation`, and `policy.bypassed` events identify the
 policy, boundary, matched rule, enforcement action, and whether the source was
 a request, cache, or cassette. Tool arguments are represented only by a digest in
@@ -678,6 +688,12 @@ Trusted workflow code can bypass model/tool policy for a narrow lexical scope:
 The reason must be a non-empty literal string of at most 256 characters. The
 bypass is task-local, applies only to its body, and emits `policy.bypassed` for
 each protected boundary. It never bypasses the outer sandbox.
+
+The bypass is gated by the static checker and rejects non-literal reasons at
+check time. A workflow that disables the sandbox can construct and evaluate
+dynamic `policy/without` calls; always run policy-gated workflows with the
+default sandbox to prevent this. A sandboxed workflow cannot use `eval`,
+`load`, or `import` to construct unchecked bypass forms.
 
 Policies govern LLM/model boundaries and model-invoked tools. Ordinary author
 code such as direct filesystem, shell, HTTP, or raw MCP calls remains governed

@@ -477,7 +477,15 @@ pub fn ensure_request(
     create_private_dir(&dir)?;
     let request_path = request_path(run_dir, &candidate.approval_id);
     let request = if path_entry_exists(&request_path)? {
-        let existing: ApprovalRequest = read_json(&request_path)?;
+        let existing = match read_json::<ApprovalRequest>(&request_path) {
+            Ok(existing) => existing,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Err(invalid_data(
+                    "approval request was removed before it could be read",
+                ));
+            }
+            Err(error) => return Err(error),
+        };
         existing.validate(&candidate.run_id)?;
         if existing.identity_digest != candidate.identity_digest
             || existing.authority_public_key != candidate.authority_public_key
@@ -510,7 +518,13 @@ pub fn ensure_request(
     if !path_entry_exists(&decision_path)? {
         return Ok(ApprovalResolution::Pending(request));
     }
-    let decision: ApprovalDecision = read_json(&decision_path)?;
+    let decision: ApprovalDecision = match read_json(&decision_path) {
+        Ok(decision) => decision,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(ApprovalResolution::Pending(request));
+        }
+        Err(error) => return Err(error),
+    };
     decision.validate_for(&request)?;
     Ok(match decision.decision {
         ApprovalDecisionKind::Approve => ApprovalResolution::Approved(request, decision),
@@ -630,7 +644,13 @@ fn read_resolution(run_dir: &Path, request: ApprovalRequest) -> io::Result<Appro
     if !path_entry_exists(&path)? {
         return Ok(ApprovalResolution::Pending(request));
     }
-    let decision: ApprovalDecision = read_json(&path)?;
+    let decision: ApprovalDecision = match read_json(&path) {
+        Ok(decision) => decision,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(ApprovalResolution::Pending(request));
+        }
+        Err(error) => return Err(error),
+    };
     decision.validate_for(&request)?;
     Ok(match decision.decision {
         ApprovalDecisionKind::Approve => ApprovalResolution::Approved(request, decision),
