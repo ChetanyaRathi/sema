@@ -1832,9 +1832,10 @@ fn absolute_lexical(path: &Path) -> Result<PathBuf, String> {
     if path.is_absolute() {
         return Ok(normalize_lexical(path));
     }
-    std::env::current_dir()
-        .map(|cwd| normalize_lexical(&cwd.join(path)))
-        .map_err(|error| format!("cannot resolve workflow root: {error}"))
+    // The workspace root should always be provided as an absolute path by the enforcement
+    // layer. Resolving a relative path with `current_dir()` introduces CWD-dependent
+    // non-determinism, so we canonicalize it instead of accepting process-global state.
+    std::fs::canonicalize(path).map_err(|error| format!("cannot resolve workspace root: {error}"))
 }
 
 fn canonical_or_lexical(path: &Path) -> PathBuf {

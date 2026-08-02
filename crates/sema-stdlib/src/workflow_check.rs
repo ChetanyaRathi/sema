@@ -118,12 +118,18 @@ pub fn check_source(src: &str) -> Vec<Diag> {
 /// is valid; aliasing, storing, or passing the native function would allow a
 /// detached task to reach the gate after its owner has continued.
 fn check_first_class_approval(form: &Value, spans: &SpanMap, out: &mut Vec<Diag>) {
-    if form.as_symbol().as_deref() == Some("workflow/approval") {
+    if matches!(
+        form.as_symbol().as_deref(),
+        Some("workflow/approval" | "approval")
+    ) {
         out.push(
             Diag::error(
                 span_of(form, spans),
                 "E-APPROVAL-VALUE",
-                "workflow/approval cannot be used as a value",
+                format!(
+                    "{} cannot be used as a value",
+                    form.as_symbol().as_deref().unwrap_or("approval")
+                ),
             )
             .with_hint("call (approval key opts) directly in the owning workflow task"),
         );
@@ -134,18 +140,21 @@ fn check_first_class_approval(form: &Value, spans: &SpanMap, out: &mut Vec<Diag>
         if matches!(head.as_deref(), Some("quote" | "quasiquote")) {
             return;
         }
-        let children = if head.as_deref() == Some("workflow/approval") {
-            &items[1..]
-        } else {
-            items
-        };
+        let is_approval_head = matches!(head.as_deref(), Some("approval" | "workflow/approval"));
+        let children = if is_approval_head { &items[1..] } else { items };
         for child in children {
-            if child.as_symbol().as_deref() == Some("workflow/approval") {
+            if matches!(
+                child.as_symbol().as_deref(),
+                Some("workflow/approval" | "approval")
+            ) {
                 out.push(
                     Diag::error(
                         span_of(child, spans),
                         "E-APPROVAL-VALUE",
-                        "workflow/approval cannot be used as a value",
+                        format!(
+                            "{} cannot be used as a value",
+                            child.as_symbol().as_deref().unwrap_or("approval")
+                        ),
                     )
                     .with_hint("call (approval key opts) directly in the owning workflow task"),
                 );
@@ -453,54 +462,86 @@ fn walk_approval_placement(
     restricted_by: Option<&str>,
     out: &mut Vec<Diag>,
 ) {
-    let Some((head, items)) = head_symbol(form) else {
-        return;
-    };
-    if head == "quote" || head == "quasiquote" {
-        return;
-    }
-    if head == "approval" || head == "workflow/approval" {
-        if let Some(owner) = restricted_by {
-            out.push(
-                Diag::error(
-                    span_of(form, spans),
-                    "E-APPROVAL-PLACEMENT",
-                    format!("approval cannot be nested inside {owner}"),
-                )
-                .with_hint("place the approval as a sequential gate before this construct"),
-            );
+    if let Some((head, items)) = head_symbol(form) {
+        if head == "quote" || head == "quasiquote" {
+            return;
+        }
+        if head == "approval" || head == "workflow/approval" {
+            if let Some(owner) = restricted_by {
+                out.push(
+                    Diag::error(
+                        span_of(form, spans),
+                        "E-APPROVAL-PLACEMENT",
+                        format!("approval cannot be nested inside {owner}"),
+                    )
+                    .with_hint("place the approval as a sequential gate before this construct"),
+                );
+            }
+            return;
+        }
+        if head == "apply"
+            && items
+                .get(1)
+                .and_then(|v| v.as_symbol())
+                .is_some_and(|s| s.as_str() == "approval" || s.as_str() == "workflow/approval")
+        {
+            if let Some(owner) = restricted_by {
+                out.push(
+                    Diag::error(
+                        span_of(form, spans),
+                        "E-APPROVAL-PLACEMENT",
+                        format!("approval cannot be nested inside {owner}"),
+                    )
+                    .with_hint(
+                        "place the approval as a sequential gate before this construct; do not apply it inside a restricted context",
+                    ),
+                );
+            }
+            return;
+        }
+        const RESTRICTED: &[&str] = &[
+            "async",
+            "async/spawn",
+            "async/spawn-all",
+            "async/map",
+            "async/pool-map",
+            "async/race",
+            "async/race-owned",
+            "async/with-timeout",
+            "parallel",
+            "parallel-settled",
+            "pipeline",
+            "pipeline-settled",
+            "try",
+            "guard",
+            "retry",
+            "with-retry",
+            "with-timeout",
+            "with-open",
+            "with-stream",
+            "with-file",
+            "step",
+            "agent",
+            "workflow/run",
+        ];
+        let restricted =
+            restricted_by.or_else(|| RESTRICTED.contains(&head.as_str()).then_some(head.as_str()));
+        for sub in items.iter().skip(1) {
+            walk_approval_placement(sub, spans, restricted, out);
         }
         return;
     }
-    const RESTRICTED: &[&str] = &[
-        "async",
-        "async/spawn",
-        "async/spawn-all",
-        "async/map",
-        "async/pool-map",
-        "async/race",
-        "async/race-owned",
-        "async/with-timeout",
-        "parallel",
-        "parallel-settled",
-        "pipeline",
-        "pipeline-settled",
-        "try",
-        "guard",
-        "retry",
-        "with-retry",
-        "with-timeout",
-        "with-open",
-        "with-stream",
-        "with-file",
-        "step",
-        "agent",
-        "workflow/run",
-    ];
-    let restricted =
-        restricted_by.or_else(|| RESTRICTED.contains(&head.as_str()).then_some(head.as_str()));
-    for sub in items.iter().skip(1) {
-        walk_approval_placement(sub, spans, restricted, out);
+    if let Some(seq) = form.as_vector_rc() {
+        for sub in seq.iter() {
+            walk_approval_placement(sub, spans, restricted_by, out);
+        }
+        return;
+    }
+    if let Some(map) = form.as_map_ref() {
+        for (key, value) in map {
+            walk_approval_placement(key, spans, restricted_by, out);
+            walk_approval_placement(value, spans, restricted_by, out);
+        }
     }
 }
 
@@ -1049,6 +1090,40 @@ mod tests {
                 .count(),
             6
         );
+    }
+
+    #[test]
+    fn approval_in_vectors_and_let_bindings_is_caught() {
+        let src = r#"
+          (defworkflow d "d" {}
+            (parallel [(approval :a {:reason "r" :subject {:kind :external-action :secret "x"}})])
+            {:status :success})
+        "#;
+        assert!(codes(src).contains(&"E-APPROVAL-PLACEMENT"));
+
+        let let_src = r#"
+          (defworkflow d "d" {}
+            (parallel (let [x (approval :b {:reason "r" :subject {:kind :external-action :secret "y"}})] x))
+            {:status :success})
+        "#;
+        assert!(codes(let_src).contains(&"E-APPROVAL-PLACEMENT"));
+
+        let apply_src = r#"
+          (defworkflow d "d" {}
+            (parallel (apply approval :a {:reason "r" :subject {:kind :external-action :secret "x"}}))
+            {:status :success})
+        "#;
+        assert!(codes(apply_src).contains(&"E-APPROVAL-PLACEMENT"));
+    }
+
+    #[test]
+    fn approval_short_name_alias_is_caught() {
+        let src = r#"
+          (define gate approval)
+          (defworkflow d "d" {}
+            {:status :success})
+        "#;
+        assert!(codes(src).contains(&"E-APPROVAL-VALUE"));
     }
 
     #[test]

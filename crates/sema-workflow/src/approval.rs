@@ -720,12 +720,13 @@ fn publish_json_once(path: &Path, value: &impl Serialize) -> io::Result<bool> {
         .ok_or_else(|| invalid_data("approval sidecar has no parent directory"))?;
     create_private_dir(parent)?;
     let tmp = parent.join(format!(
-        ".approval-{}-{}-{}.tmp",
+        ".approval-{}-{}-{}-{}.tmp",
         std::process::id(),
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos(),
+        next_publish_nonce(),
         path.file_name()
             .and_then(|name| name.to_str())
             .unwrap_or("sidecar")
@@ -1253,6 +1254,12 @@ fn path_entry_exists(path: &Path) -> io::Result<bool> {
 
 fn invalid_data(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message.into())
+}
+
+fn next_publish_nonce() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NONCE: AtomicU64 = AtomicU64::new(0);
+    NONCE.fetch_add(1, Ordering::Relaxed)
 }
 
 #[cfg(test)]
