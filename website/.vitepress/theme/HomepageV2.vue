@@ -5,419 +5,449 @@ import CustomPageLayout from './CustomPageLayout.vue'
 <template>
   <CustomPageLayout v-slot="{ copyText }">
 
-    <!-- ============ HERO (homepage-only: distinct, wide, editorial) ============ -->
     <header class="hero home-hero">
+      <span class="hero-paren l" aria-hidden="true">(</span>
+      <span class="hero-paren r" aria-hidden="true">)</span>
       <div class="wrap">
-        <div class="hero-head">
-          <p class="eyebrow">Agent-native Lisp<span class="sep">·</span>LLM workflows<span class="sep">·</span>Rust<span class="sep">·</span>MIT</p>
-          <h1>Agent-native language.<br><em>Runtime you trust.</em></h1>
+        <p class="eyebrow">
+          Lisp<span class="sep">·</span>LLM primitives<span class="sep">·</span>Rust runtime
+        </p>
+        <h1>A Lisp with <em>LLM primitives.</em></h1>
+        <p class="lede">
+          Sema is a <strong>Scheme-like Lisp</strong> with built-in agents,
+          typed tools, budgets, replay, and tracing. It runs on a Rust bytecode
+          VM and builds to one standalone executable.
+        </p>
+        <div class="hero-actions">
+          <a class="btn btn-gold" href="/docs/quickstart">Get started</a>
+          <a class="btn btn-ghost" href="https://sema.run">Try the playground</a>
         </div>
-        <div class="hero-body">
-          <p class="lede">
-            Sema builds the agent plumbing into the language itself.
-            <strong>Model calls, typed tools, budgets, deterministic replay,
-            journaled runs, OpenTelemetry traces, and single-binary deploys</strong>
-            are primitives, not scaffolding — so the workflows your coding agent
-            writes stay small, inspectable, and easy to constrain, replay, and ship.
-          </p>
+        <div class="hero-install">
           <div class="hero-actions">
-            <a class="btn btn-gold" href="/docs/">Get started</a>
-            <a class="btn btn-ghost" href="https://sema.run">Try it in the browser</a>
-          </div>
-          <div class="hero-actions">
-          <span class="install">
-            <span class="cmd-text">
-              <span class="dollar">$</span>
-              <span id="i1">curl -fsSL https://sema-lang.com/install.sh | sh</span>
+            <span class="install">
+              <span class="cmd-text">
+                <span class="dollar">$</span>
+                <span id="home-install">curl -fsSL https://sema-lang.com/install.sh | sh</span>
+              </span>
+              <button
+                type="button"
+                class="copy"
+                aria-live="polite"
+                @click="copyText('home-install', $event)"
+              >
+                copy
+              </button>
             </span>
-            <button class="copy" @click="copyText('i1', $event)">copy</button>
-          </span>
           </div>
-          <p class="req">macOS · Linux · Windows · single static binary, no toolchain required</p>
+          <a class="install-alternatives" href="/docs/#installation">
+            Windows, Homebrew, Cargo, and other install methods
+            <span aria-hidden="true">&rarr;</span>
+          </a>
         </div>
+        <p class="req">v1.33.0 · MIT · macOS, Linux, and Windows</p>
       </div>
     </header>
 
-    <!-- ============ COMPARISON ============ -->
-    <section id="compare">
+    <section id="agent" aria-labelledby="agent-title">
       <div class="wrap">
-        <p class="kicker">The argument</p>
-        <h2>The same agent, twice.</h2>
-        <p class="sub">
-          A coding agent that reads files and runs commands, with a tool loop,
-          retries, and a spend limit. Once with an SDK, once in Sema.
-        </p>
-
-        <div class="compare">
-          <div class="pane python">
-            <div class="pane-head">
-              <span class="t">agent.py — Python + SDK</span>
-              <span class="n">you write the machinery</span>
-            </div>
-            <pre><span class="c-kw">import</span> anthropic, time
-
-client = anthropic.Anthropic()
-
-TOOLS = [{
-    <span class="c-str">"name"</span>: <span class="c-str">"read_file"</span>,
-    <span class="c-str">"description"</span>: <span class="c-str">"Read a file's contents"</span>,
-    <span class="c-str">"input_schema"</span>: {
-        <span class="c-str">"type"</span>: <span class="c-str">"object"</span>,
-        <span class="c-str">"properties"</span>: {<span class="c-str">"path"</span>: {<span class="c-str">"type"</span>: <span
-                class="c-str">"string"</span>}},
-        <span class="c-str">"required"</span>: [<span class="c-str">"path"</span>],
-    },
-}, {
-    <span class="c-str">"name"</span>: <span class="c-str">"run_command"</span>,
-    <span class="c-str">"description"</span>: <span class="c-str">"Run a shell command"</span>,
-    <span class="c-str">"input_schema"</span>: { <span class="c-com"># ...same again</span> },
-}]
-
-<span class="c-kw">def</span> <span class="c-fn">call_with_retry</span>(messages, attempt=0):
-    <span class="c-kw">try</span>:
-        <span class="c-kw">return</span> client.messages.create(
-            model=MODEL, max_tokens=4096,
-            tools=TOOLS, messages=messages)
-    <span class="c-kw">except</span> anthropic.RateLimitError:
-        <span class="c-kw">if</span> attempt > 5: <span class="c-kw">raise</span>
-        time.sleep(2 ** attempt)
-        <span class="c-kw">return</span> call_with_retry(messages, attempt + 1)
-
-<span class="c-kw">def</span> <span class="c-fn">dispatch</span>(name, args):
-    <span class="c-kw">if</span> name == <span class="c-str">"read_file"</span>:
-        <span class="c-kw">return</span> open(args[<span class="c-str">"path"</span>]).read()
-    <span class="c-kw">if</span> name == <span class="c-str">"run_command"</span>:
-        <span class="c-com"># subprocess, capture stdout+stderr...</span>
-
-messages = [{<span class="c-str">"role"</span>: <span class="c-str">"user"</span>, <span class="c-str">"content"</span>: task}]
-<span class="c-kw">for</span> turn <span class="c-kw">in</span> range(10):
-    resp = call_with_retry(messages)
-    track_cost(resp.usage)  <span class="c-com"># you wrote this too</span>
-    <span class="c-kw">if</span> resp.stop_reason != <span class="c-str">"tool_use"</span>:
-        <span class="c-kw">break</span>
-    results = []
-    <span class="c-kw">for</span> block <span class="c-kw">in</span> resp.content:
-        <span class="c-kw">if</span> block.type == <span class="c-str">"tool_use"</span>:
-            results.append({
-                <span class="c-str">"type"</span>: <span class="c-str">"tool_result"</span>,
-                <span class="c-str">"tool_use_id"</span>: block.id,
-                <span class="c-str">"content"</span>: dispatch(block.name, block.input),
-            })
-    messages.append(...)
-<div class="fade"></div></pre>
-            <div class="pane-foot">
-              And there's still no response cache, no hard spend cap, no fallback
-              provider. That's another dependency — or another hundred lines.
-            </div>
-          </div>
-
-          <div class="pane sema">
-            <div class="pane-head">
-              <span class="t">agent.sema — Sema</span>
-              <span class="n">the machinery is the language</span>
-            </div>
-            <pre>(<span class="c-kw">deftool</span> <span class="c-fn">read-file</span>
-  <span class="c-str">"Read a file's contents"</span>
-  {<span class="c-kwd">:path</span> {<span class="c-kwd">:type</span> <span class="c-kwd">:string</span>}}
-  (<span class="c-kw">lambda</span> (path) (file/read path)))
-
-(<span class="c-kw">deftool</span> <span class="c-fn">run-command</span>
-  <span class="c-str">"Run a shell command"</span>
-  {<span class="c-kwd">:command</span> {<span class="c-kwd">:type</span> <span class="c-kwd">:string</span>}}
-  (<span class="c-kw">lambda</span> (command)
-    (<span class="c-kwd">:stdout</span> (shell <span class="c-str">"sh"</span> <span class="c-str">"-c"</span> command))))
-
-(<span class="c-kw">defagent</span> <span class="c-fn">coder</span>
-  {<span class="c-kwd">:system</span>    <span class="c-str">"You are a coding assistant."</span>
-   <span class="c-kwd">:tools</span>     [read-file run-command]
-   <span class="c-kwd">:max-turns 10</span>})
-
-(llm/with-budget {<span class="c-kwd">:max-cost-usd</span> 0.50}
-  (<span class="c-kw">lambda</span> ()
-    (agent/run coder <span class="c-str">"Find TODOs in src/"</span>)))</pre>
-            <div class="pane-foot">
-              The tool loop, retries with backoff, rate limiting, and cost tracking
-              live in the runtime. The spend cap is a <em>scope</em> — it can't be
-              forgotten on the late-night code path.
-            </div>
-          </div>
-        </div>
-      </div>
-    </section>
-
-    <!-- ============ AGENT-NATIVE MEANS CHECKABLE ============ -->
-    <section id="checkable">
-      <div class="wrap">
-        <p class="kicker">Why agent-native matters</p>
-        <h2>Agent-native means checkable.</h2>
-        <p class="sub">
-          Generated code is only useful if you can constrain it. Sema workflows are
-          ordinary code, but the runtime sees the boundaries that matter:
-        </p>
-
-        <div class="checks">
-          <div class="check">
-            <span class="n">01</span>
-            <code>(agent/run coder task)</code>
-            <h3>Every call passes through the runtime</h3>
-            <p>Model calls, tool dispatches, results, and retries are all things the
-              runtime can observe — not logic buried inside an SDK.</p>
-          </div>
-          <div class="check">
-            <span class="n">02</span>
-            <code>(llm/with-budget {:max-cost-usd 1.00} f)</code>
-            <h3>Budgets and checkpoints are scopes</h3>
-            <p>A spend cap or a resume point is part of the run — not a comment the
-              late-night code path can forget.</p>
-          </div>
-          <div class="check">
-            <span class="n">03</span>
-            <code>(llm/extract {:amount :number} text)</code>
-            <h3>Outputs are values, not free text</h3>
-            <p>Schema-backed tools and extraction hand back typed data. Nothing
-              downstream has to re-parse a blob of prose.</p>
-          </div>
-        </div>
-
-        <p class="sub" style="margin-top:30px">
-          So a run can be replayed from cassettes, traced with OpenTelemetry, resumed
-          from a journal, and shipped as one binary — and, <em>coming soon</em>, guarded
-          by executable policies instead of “please be safe” prompt vibes.
-        </p>
-      </div>
-    </section>
-
-    <!-- ============ AGENT / LISP OBJECTION ============ -->
-    <section id="agents">
-      <div class="wrap">
-        <p class="kicker">Why Lisp?</p>
-        <h2>Because the agent has to write it.</h2>
-        <p class="sub">
-          Sema is built as a small, stable target for generated programs — the
-          language with the least surface for an agent to be wrong about. The code is
-          already data, so the runtime can inspect it, check it, journal it, and replay it.
-        </p>
-
-        <div class="agent-grid">
-          <ul class="claims">
-            <li>
-              <strong>Sixty years of training data.</strong>
-              Lisp predates nearly everything else in the corpus. Scheme, Common Lisp,
-              Clojure, Racket — your agent has read all of it, and a Lisp is a Lisp.
-            </li>
-            <li>
-              <strong>Nothing to hallucinate.</strong>
-              One syntax rule. No borrow checker, no venv, no lockfiles, no build
-              config, no framework versions that drifted since training. The agent
-              can't misremember machinery that doesn't exist.
-            </li>
-            <li>
-              <strong>The whole language fits in context.</strong>
-              Point your agent at <a href="/docs/for-agents"><mark>one short page</mark></a> —
-              where Sema diverges from the dialects it already knows, and nothing else.
-              Constraints, not a textbook.
-            </li>
-            <li>
-              <strong>Errors self-correct.</strong>
-              Dialect drift is the shallow kind of wrong: <em>“oh, it's
-              <code>equal?</code> here, not <code>string=?</code>”</em> — one check,
-              one fix, moving on.
-            </li>
-          </ul>
-
-          <div class="term">
-            <div class="head">claude — working in pipeline repo</div>
-            <div><span class="dollar">$</span> claude "add urgency classification to the ticket pipeline"</div>
-            <div><span class="dot">●</span> Read pipeline.sema, llms.txt</div>
-            <div><span class="dot">●</span> Edit pipeline.sema</div>
-            <div class="out">&nbsp;&nbsp;(llm/classify [:low :medium :urgent] (:body ticket))</div>
-            <div><span class="dot">●</span> Run sema check pipeline.sema</div>
-            <div class="err">&nbsp;&nbsp;✗ unbound symbol: string=?</div>
-            <div><span class="dot">●</span> llms.txt → "use equal? for all equality" — fixed, re-ran</div>
-            <div class="ok">&nbsp;&nbsp;✓ pipeline.sema ok</div>
-            <div class="out">one self-correction. zero questions for you.</div>
-          </div>
-        </div>
-
-        <p class="symmetry">
-          Sema is LLM-native in <span class="hl">both directions</span>: LLMs are
-          primitives in the language — and the language is a target LLMs write
-          without special training.
-        </p>
-      </div>
-    </section>
-
-    <!-- ============ OBJECTIONS ============ -->
-    <section id="why">
-      <div class="wrap">
-        <p class="kicker">The other fair questions</p>
-        <h2>“Why not just—”</h2>
-
-        <div class="objections">
-          <div class="obj">
-            <h3><span class="q">…a Python script</span> with the SDK?</h3>
-            <p>
-              That's where everyone starts, and it's fine — until the script matters.
-              Then you bolt on retries, then a cache so dev runs stop costing money,
-              then cost tracking, then the second provider. The scaffolding ends up
-              bigger than the idea.
-            </p>
-            <p>
-              In Sema those are forms, not code you maintain:
-              <code>llm/with-cache</code>, <code>llm/with-budget</code>,
-              <code>llm/with-fallback</code>, <code>defagent</code>.
-            </p>
-          </div>
-
-          <div class="obj">
-            <h3><span class="q">…a framework</span> like LangChain?</h3>
-            <p>
-              Frameworks stack abstractions on a language that wasn't built for them —
-              so a "chain" is a class, a prompt is a template object, a conversation
-              is hidden inside an opaque memory wrapper.
-            </p>
-            <p>
-              Sema makes them language constructs instead. A conversation is an
-              immutable value you can fork, diff, and inspect. A prompt is an
-              s-expression. A tool is a lambda with a schema. There's nothing to
-              wrap, because nothing is foreign.
-            </p>
-          </div>
-        </div>
-      </div>
-    </section>
-
-    <!-- ============ RUNTIME STRIP ============ -->
-    <section id="runtime">
-      <div class="wrap">
-        <p class="kicker">The runtime, in one screen</p>
-        <h2>The agent runtime, not another framework.</h2>
-
-        <div class="forms">
-          <div class="form-row"><code>(llm/with-budget {:max-cost-usd 1.00} f)</code><span>hard spend cap, scoped to a block</span>
-          </div>
-          <div class="form-row"><code>(llm/with-cache {:ttl 3600} f)</code><span>response cache — dev loops stop costing money</span>
-          </div>
-          <div class="form-row"><code>(llm/with-fallback [:anthropic :openai]
-            f)</code><span>provider failover, in order</span></div>
-          <div class="form-row"><code>(llm/extract {:amount {:type :number}} text)</code><span>typed maps back, not strings to re-parse</span>
-          </div>
-          <div class="form-row"><code>(conversation/say conv "...")</code><span>immutable history — fork it, replay it, inspect it</span>
-          </div>
-          <div class="form-row"><code>(llm/pmap prompt-fn items)</code><span>parallel batch over a collection</span>
-          </div>
-        </div>
-        <p class="sub" style="margin-top:22px">
-          Eight chat providers plus embedding providers, configured from environment variables — set the key and go.
-          <a href="/docs/llm/">Browse the LLM reference →</a>
-        </p>
-      </div>
-    </section>
-
-    <!-- ============ SHIP ============ -->
-    <section id="ship">
-      <div class="wrap">
-        <p class="kicker">Then ship it</p>
-        <div class="ship-grid">
-          <div>
-            <h2>One file out the other end.</h2>
+        <div class="feature-row">
+          <div class="feature-text">
+            <p class="kicker">The defining difference</p>
+            <h2 id="agent-title">The whole agent fits on one screen.</h2>
             <p class="sub">
-              The part Python never solved. No virtualenv on the server, no
-              dependency pinning, no container just to run a script.
+              Model calls, tools, conversations, and agents are language values.
+              The runtime owns the repetitive work around them, so the source
+              stays focused on the program you meant to write.
             </p>
-            <ul class="ship-list">
-              <li><span><strong>Standalone executables.</strong> <code
-                style="font-family:var(--font-mono);font-size:13px">sema build</code> traces your imports, bundles assets, and emits a self-contained binary.</span>
+            <ul class="feature-list">
+              <li>
+                <strong>Tools have schemas.</strong>
+                <code>deftool</code> connects a description and input schema to
+                an ordinary Sema function.
               </li>
-              <li><span><strong>Capability sandbox.</strong> <code style="font-family:var(--font-mono);font-size:13px">--sandbox</code> fences shell, filesystem, network, and LLM access per group.</span>
+              <li>
+                <strong>The agent loop is built in.</strong>
+                <code>defagent</code> declares the prompt, tools, and turn limit;
+                <code>agent/run</code> handles calls and tool results.
               </li>
-              <li><span><strong>Starts in milliseconds.</strong> Fast enough for a git hook, a cron job, or a CI step — no JVM tax, no import dance.</span>
+              <li>
+                <strong>Limits are scoped.</strong>
+                Token caps and known-price cost limits apply to every model call
+                inside <code>llm/with-budget</code>.
+              </li>
+              <li>
+                <strong>Runs can be replayed.</strong>
+                A cassette records provider traffic once, then reuses the exact
+                responses in local development and tests.
               </li>
             </ul>
+            <a class="section-link" href="/feature/agents">
+              Explore agents and tools <span aria-hidden="true">&rarr;</span>
+            </a>
           </div>
-          <div class="ship-term">
-            <div><span class="dollar">$</span> sema build agent.sema -o agent</div>
-            <div class="out">→ traced 3 imports, bundled 1 asset</div>
-            <div class="out">→ agent (self-contained, 12 MB)</div>
-            <div>&nbsp;</div>
-            <div><span class="dollar">$</span> scp agent prod: &amp;&amp; ssh prod ./agent</div>
-            <div class="out">→ runs. that's it.</div>
-          </div>
+
+          <figure class="feature-visual code-card">
+            <figcaption class="code-card-head">
+              <span class="t">weather.sema</span>
+              <span class="n">tool · agent · controls</span>
+            </figcaption>
+            <pre tabindex="0"><code>(<span class="c-kw">deftool</span> <span class="c-fn">get-weather</span>
+  <span class="c-str">"Get weather for a city"</span>
+  {<span class="c-kwd">:city</span> {<span class="c-kwd">:type</span> <span class="c-kwd">:string</span>}}
+  (<span class="c-kw">lambda</span> (city)
+    (http/get f<span class="c-str">"https://weather.test/${city}"</span>)))
+
+(<span class="c-kw">defagent</span> <span class="c-fn">guide</span>
+  {<span class="c-kwd">:system</span> <span class="c-str">"Give a short forecast."</span>
+   <span class="c-kwd">:tools</span> [get-weather]
+   <span class="c-kwd">:max-turns</span> 3})
+
+(llm/with-cassette
+  <span class="c-str">"weather.jsonl"</span> {<span class="c-kwd">:mode</span> <span class="c-kwd">:auto</span>}
+  (<span class="c-kw">lambda</span> ()
+    (llm/with-budget
+      {<span class="c-kwd">:max-cost-usd</span> 0.10}
+      (<span class="c-kw">lambda</span> ()
+        (agent/run guide
+          <span class="c-str">"Weather in Oslo?"</span>)))))</code></pre>
+          </figure>
         </div>
       </div>
     </section>
 
-    <!-- ============ HONEST ============ -->
-    <section class="honest" id="honest">
+    <section id="language" class="raised" aria-labelledby="language-title">
       <div class="wrap">
-        <p class="kicker">Read this before adopting</p>
-        <h2>Where Sema won't fit.</h2>
-        <p class="sub">Knowing the boundaries up front beats discovering them in production.</p>
-        <ul class="honest-list">
-          <li><strong>Single-threaded.</strong> Rc-based values, no cross-thread sharing. Parallelism is at the LLM-call
-            level, not the compute level.
-          </li>
-          <li><strong>No JIT.</strong> A bytecode compiler and a stack-based VM. If your bottleneck is number crunching, use Rust
-            — or embed Sema in it.
-          </li>
-          <li><strong>Not a full Scheme.</strong> No call/cc, auto-gensym instead of syntax-rules.
-          </li>
-          <li><strong>Young.</strong> Solid and tested, not battle-hardened at scale. Pin a version; read the <a
-            href="https://github.com/sema-lisp/sema/blob/main/CHANGELOG.md">changelog</a>.
-          </li>
-        </ul>
+        <p class="kicker">The language</p>
+        <h2 id="language-title">Small enough to learn. Complete enough to use.</h2>
+        <p class="sub">
+          Sema keeps Scheme's lexical scope, functions, macros, and tail calls,
+          then adds the data forms people expect in current programs.
+        </p>
+
+        <div class="language-split">
+          <figure class="code-card">
+            <figcaption class="code-card-head">
+              <span class="t">surface.sema</span>
+              <span class="n">one syntax rule</span>
+            </figcaption>
+            <pre tabindex="0"><code>(<span class="c-kw">define</span> tickets
+  [{<span class="c-kwd">:id</span> 101 <span class="c-kwd">:priority</span> <span class="c-kwd">:high</span>}
+   {<span class="c-kwd">:id</span> 102 <span class="c-kwd">:priority</span> <span class="c-kwd">:low</span>}])
+
+(<span class="c-kw">define</span> urgent-ids
+  (-&gt;&gt; tickets
+    (filter
+      #(<span class="c-kw">equal?</span> (<span class="c-kwd">:priority</span> %) <span class="c-kwd">:high</span>))
+    (map <span class="c-kwd">:id</span>)))
+
+(<span class="c-kw">match</span> urgent-ids
+  []       <span class="c-str">"nothing urgent"</span>
+  [id &amp; _] f<span class="c-str">"start with ticket ${id}"</span>)</code></pre>
+          </figure>
+
+          <dl class="language-notes">
+            <div>
+              <dt>Scheme core</dt>
+              <dd>
+                Lexical scope, first-class functions, tail-call optimization,
+                quasiquote macros, and structured exceptions.
+              </dd>
+            </div>
+            <div>
+              <dt>Clojure-flavored data</dt>
+              <dd>
+                Keywords, maps, vectors, short lambdas, threading macros,
+                destructuring, pattern matching, and f-strings.
+              </dd>
+            </div>
+            <div>
+              <dt>One runtime</dt>
+              <dd>
+                REPL, formatter, LSP, debugger, notebook, MCP server, compiler,
+                and executable builder ship in the <code>sema</code> binary.
+              </dd>
+            </div>
+            <div>
+              <dt>Designed for generated code</dt>
+              <dd>
+                A regular grammar and a concise agent guide give coding agents a
+                small, stable target.
+                <a href="/docs/for-agents">Read the guide &rarr;</a>
+              </dd>
+            </div>
+          </dl>
+        </div>
       </div>
     </section>
 
-    <!-- ============ CTA ============ -->
-    <section class="cta">
+    <section id="runtime" aria-labelledby="runtime-title">
       <div class="wrap">
-        <h2>Your next LLM script, without the scaffolding.</h2>
-        <p class="sub">Install it — or skip the tutorial and hand the docs to your agent.</p>
+        <p class="kicker">The runtime, in one screen</p>
+        <h2 id="runtime-title">Control is part of the program.</h2>
+        <p class="sub">
+          These forms wrap ordinary functions. They compose, nest, and clean up
+          when the scope exits.
+        </p>
+
+        <div class="forms">
+          <a class="form-row" href="/docs/llm/cost">
+            <code>(llm/with-budget limits f)</code>
+            <span>cap tokens or known-price cost for a block</span>
+          </a>
+          <a class="form-row" href="/docs/llm/caching">
+            <code>(llm/with-cache {:ttl 3600} f)</code>
+            <span>reuse responses during development</span>
+          </a>
+          <a class="form-row" href="/feature/cassettes">
+            <code>(llm/with-cassette path opts f)</code>
+            <span>record and replay provider traffic</span>
+          </a>
+          <a class="form-row" href="/docs/llm/resilience">
+            <code>(llm/with-fallback providers f)</code>
+            <span>try an ordered provider chain</span>
+          </a>
+          <a class="form-row" href="/feature/observability">
+            <code>(with-span "ingest" attrs body...)</code>
+            <span>emit OpenTelemetry spans around a run</span>
+          </a>
+          <a class="form-row" href="/feature/workflows">
+            <code>(checkpoint :result value)</code>
+            <span>journal work and resume completed phases</span>
+          </a>
+        </div>
+      </div>
+    </section>
+
+    <section id="uses" class="raised" aria-labelledby="uses-title">
+      <div class="wrap">
+        <div class="section-heading">
+          <div>
+            <p class="kicker">What it is for</p>
+            <h2 id="uses-title">From one model call to a complete workflow.</h2>
+          </div>
+          <p class="sub">
+            Start with a script. Add tools, structure, persistence, or an
+            interactive notebook without changing the language or runtime.
+          </p>
+        </div>
+
+        <div class="work-list">
+          <article class="work-row">
+            <span class="work-index">01</span>
+            <div>
+              <h3>Agents and tools</h3>
+              <p>Run bounded tool loops with typed inputs, callbacks, and recoverable tool errors.</p>
+            </div>
+            <a href="/feature/agents">Agents <span aria-hidden="true">&rarr;</span></a>
+          </article>
+          <article class="work-row">
+            <span class="work-index">02</span>
+            <div>
+              <h3>Structured extraction</h3>
+              <p>Turn unstructured model output into validated maps, lists, and scalar values.</p>
+            </div>
+            <a href="/feature/extraction">Extraction <span aria-hidden="true">&rarr;</span></a>
+          </article>
+          <article class="work-row">
+            <span class="work-index">03</span>
+            <div>
+              <h3>Journaled workflows</h3>
+              <p>Split long work into phases, record checkpoints, bound fan-out, and resume a run.</p>
+            </div>
+            <a href="/feature/workflows">Workflows <span aria-hidden="true">&rarr;</span></a>
+          </article>
+          <article class="work-row">
+            <span class="work-index">04</span>
+            <div>
+              <h3>Notebooks</h3>
+              <p>Develop in shared-state cells, inspect rich output, then run the same code as a script.</p>
+            </div>
+            <a href="/feature/notebook">Notebook <span aria-hidden="true">&rarr;</span></a>
+          </article>
+        </div>
+      </div>
+    </section>
+
+    <section id="ship" aria-labelledby="ship-title">
+      <div class="wrap">
+        <div class="feature-row reverse">
+          <div class="feature-text">
+            <p class="kicker">Then ship it</p>
+            <h2 id="ship-title">A script in. One executable out.</h2>
+            <p class="sub">
+              <code>sema build</code> traces imports, bundles declared assets,
+              and writes a standalone executable. The target machine does not
+              need Sema, Cargo, or another language runtime.
+            </p>
+            <ul class="feature-list">
+              <li>
+                <strong>Cross-platform builds.</strong>
+                Target macOS, Linux, and Windows from the same source.
+              </li>
+              <li>
+                <strong>Capability sandbox.</strong>
+                Restrict filesystem, network, shell, process, environment, and
+                LLM access at the CLI boundary.
+              </li>
+              <li>
+                <strong>Embeddable when needed.</strong>
+                Run Sema inside Rust, JavaScript, or a browser through the same VM.
+              </li>
+            </ul>
+            <a class="section-link" href="/feature/build">
+              See standalone executables <span aria-hidden="true">&rarr;</span>
+            </a>
+          </div>
+
+          <figure class="feature-visual term build-term">
+            <figcaption class="head">terminal</figcaption>
+            <pre tabindex="0"><code><span><span class="dollar">$</span> sema build weather.sema -o weather</span>
+<span class="out">  traced imports and bundled assets</span>
+<span class="ok">  built ./weather</span>
+
+<span><span class="dollar">$</span> scp weather server:</span>
+<span><span class="dollar">$</span> ssh server ./weather Oslo</span>
+<span class="out">  runs without a Sema installation</span></code></pre>
+          </figure>
+        </div>
+      </div>
+    </section>
+
+    <section id="providers" class="raised" aria-labelledby="providers-title">
+      <div class="wrap provider-layout">
+        <div class="provider-copy">
+          <p class="kicker">Provider choice</p>
+          <h2 id="providers-title">Switch models without rewriting the program.</h2>
+          <p class="sub">
+            Sema auto-configures providers from environment variables. Your
+            tools, agents, budgets, and traces stay the same whether a run uses
+            a hosted model, a local model, or an ordered fallback chain.
+          </p>
+          <a class="section-link" href="/docs/llm/providers">
+            See all providers <span aria-hidden="true">&rarr;</span>
+          </a>
+        </div>
+
+        <div class="provider-details">
+          <dl class="provider-list">
+            <div>
+              <dt>Built-in chat</dt>
+              <dd>
+                <ul class="provider-tags" aria-label="Built-in chat providers">
+                  <li>Anthropic</li>
+                  <li>OpenAI</li>
+                  <li>Gemini</li>
+                  <li>Ollama</li>
+                </ul>
+              </dd>
+            </div>
+            <div>
+              <dt>Compatible chat</dt>
+              <dd>
+                <ul class="provider-tags" aria-label="OpenAI-compatible chat providers">
+                  <li>Groq</li>
+                  <li>xAI</li>
+                  <li>Mistral</li>
+                  <li>DeepSeek</li>
+                  <li>OpenRouter</li>
+                  <li>Together</li>
+                  <li class="provider-more">and more</li>
+                </ul>
+              </dd>
+            </div>
+            <div>
+              <dt>Embed &amp; rerank</dt>
+              <dd>
+                <ul class="provider-tags" aria-label="Embedding and reranking providers">
+                  <li>OpenAI</li>
+                  <li>Jina</li>
+                  <li>Voyage</li>
+                  <li>Cohere</li>
+                  <li>Nomic</li>
+                  <li>Fireworks</li>
+                </ul>
+              </dd>
+            </div>
+          </dl>
+
+          <figure class="provider-code code-card">
+            <figcaption class="code-card-head">
+              <span class="t">provider.sema</span>
+              <span class="n">ordered fallback</span>
+            </figcaption>
+            <pre tabindex="0"><code>(llm/with-fallback
+  [<span class="c-kwd">:anthropic</span> <span class="c-kwd">:openai</span> <span class="c-kwd">:ollama</span>]
+  (<span class="c-kw">lambda</span> ()
+    (agent/run guide question)))</code></pre>
+          </figure>
+        </div>
+      </div>
+    </section>
+
+    <section class="cta" aria-labelledby="cta-title">
+      <div class="wrap">
+        <p class="kicker">Start with one file</p>
+        <h2 id="cta-title">Build your next LLM program in Sema.</h2>
+        <p class="sub">
+          Try it in the browser, follow the quickstart, or give the concise
+          language guide to your coding agent.
+        </p>
+
         <div class="install-stack">
           <div class="install-row">
             <span class="badge">curl</span>
             <span class="install">
-            <span class="cmd-text">
-              <span class="dollar">$</span>
-              <span id="i2">curl -fsSL https://sema-lang.com/install.sh | sh</span>
+              <span class="cmd-text">
+                <span class="dollar">$</span>
+                <span id="cta-curl">curl -fsSL https://sema-lang.com/install.sh | sh</span>
+              </span>
+              <button
+                type="button"
+                class="copy"
+                aria-live="polite"
+                @click="copyText('cta-curl', $event)"
+              >
+                copy
+              </button>
             </span>
-            <button class="copy" @click="copyText('i2', $event)">copy</button>
-          </span>
           </div>
           <div class="install-row">
             <span class="badge">brew</span>
             <span class="install">
-            <span class="cmd-text">
-              <span class="dollar">$</span>
-              <span id="i3">brew install helgesverre/tap/sema-lang</span>
+              <span class="cmd-text">
+                <span class="dollar">$</span>
+                <span id="cta-brew">brew install helgesverre/tap/sema-lang</span>
+              </span>
+              <button
+                type="button"
+                class="copy"
+                aria-live="polite"
+                @click="copyText('cta-brew', $event)"
+              >
+                copy
+              </button>
             </span>
-            <button class="copy" @click="copyText('i3', $event)">copy</button>
-          </span>
-          </div>
-          <div class="install-row">
-            <span class="badge">cargo</span>
-            <span class="install">
-            <span class="cmd-text">
-              <span class="dollar">$</span>
-              <span id="i4">cargo install sema-lang</span>
-            </span>
-            <button class="copy" @click="copyText('i4', $event)">copy</button>
-          </span>
           </div>
           <div class="install-row">
             <span class="badge agent">agent</span>
             <span class="install">
-            <span class="cmd-text">
-              <span class="dollar">$</span>
-              <span id="i5">curl -fsSL https://sema-lang.com/docs/for-agents.md >> AGENTS.md</span>
+              <span class="cmd-text">
+                <span class="dollar">$</span>
+                <span id="cta-agent">curl -fsSL https://sema-lang.com/docs/for-agents.md &gt;&gt; AGENTS.md</span>
+              </span>
+              <button
+                type="button"
+                class="copy"
+                aria-live="polite"
+                @click="copyText('cta-agent', $event)"
+              >
+                copy
+              </button>
             </span>
-            <button class="copy" @click="copyText('i5', $event)">copy</button>
-          </span>
           </div>
-          <div class="hero-actions" style="justify-content:center; margin-top:24px">
+          <div class="hero-actions cta-actions">
             <a class="btn btn-gold" href="https://sema.run">Open the playground</a>
-            <a class="btn btn-ghost" href="https://github.com/sema-lisp/sema">View source</a>
+            <a class="btn btn-ghost" href="/docs/quickstart">Read the quickstart</a>
           </div>
         </div>
       </div>
@@ -427,101 +457,122 @@ messages = [{<span class="c-str">"role"</span>: <span class="c-str">"user"</span
 </template>
 
 <style scoped>
-/* ---------- hero (homepage-only: distinct raised band, wide, two-column) ---------- */
+/* ---------- hero ---------- */
 .home-hero {
-  background: var(--bg-raise);
-  border-bottom: 1px solid var(--border);
-  padding: clamp(76px, 9vw, 124px) 0;
-}
-.home-hero .wrap {
-  max-width: 1280px;
-  display: grid;
-  grid-template-columns: 1.12fr 0.88fr;
-  gap: clamp(40px, 5.5vw, 92px);
-  align-items: center;
-}
-.home-hero .hero-head { min-width: 0; }
-.home-hero .hero-head .eyebrow { margin-bottom: 24px; }
-.home-hero .hero-head h1 {
-  font-size: clamp(46px, 5.2vw, 88px);
-  line-height: 1.03;
-  max-width: 15ch;
-  margin-bottom: 0;
-}
-.home-hero .hero-body { min-width: 0; max-width: 52ch; }
-.home-hero .hero-body .lede { font-size: 18px; max-width: none; margin-bottom: 30px; }
-.home-hero .hero-body .hero-actions { margin-bottom: 16px; }
-.home-hero .hero-body .req { margin-top: 8px; }
-
-@media (max-width: 900px) {
-  .home-hero { padding: 64px 0 56px; }
-  .home-hero .wrap { grid-template-columns: 1fr; gap: 34px; align-items: start; }
-  .home-hero .hero-head h1 { max-width: 20ch; }
-  .home-hero .hero-body { max-width: 60ch; }
+  padding: 118px 0 92px;
+  border-bottom: 1px solid var(--border-lo);
 }
 
-/* ---------- checkable cards ---------- */
-.checks {
-  display: grid;
-  grid-template-columns: repeat(3, 1fr);
-  gap: 20px;
-  margin-top: 44px;
+.home-hero h1 {
+  max-width: 12ch;
+  font-size: clamp(48px, 7.2vw, 82px);
+  text-wrap: balance;
 }
-.check {
-  background: var(--bg-raise);
-  border: 1px solid var(--border);
-  border-radius: 12px;
-  padding: 24px 22px 26px;
-  transition: border-color .18s var(--ease);
+
+.home-hero .lede {
+  max-width: 59ch;
+  text-wrap: pretty;
 }
-.check:hover { border-color: var(--gold-line); }
-.check .n {
-  font-family: var(--font-mono); font-size: 12px;
-  letter-spacing: .12em; color: var(--gold);
+
+.hero-install {
+  max-width: fit-content;
+  margin-bottom: 22px;
 }
-.check code {
-  display: block; margin: 12px 0 18px;
-  font-family: var(--font-mono); font-size: 12.5px;
+
+.hero-install .hero-actions {
+  margin-bottom: 8px;
+}
+
+.install-alternatives {
+  display: inline-block;
+  max-width: 100%;
   color: var(--gold-bright);
-  background: var(--gold-fade);
-  border: 1px solid var(--gold-line);
-  border-radius: 7px;
-  padding: 9px 11px;
-  overflow-x: auto; white-space: nowrap;
-}
-.check h3 {
-  font-family: var(--font-display); font-weight: 400;
-  font-size: 21px; line-height: 1.2; margin: 0 0 9px;
-}
-.check p {
-  color: var(--muted); font-size: 14.5px; line-height: 1.55; margin: 0;
-}
-@media (max-width: 860px) {
-  .checks { grid-template-columns: 1fr; }
+  font-family: var(--font-mono);
+  font-size: 12px;
+  text-wrap: pretty;
 }
 
-/* ---------- comparison ---------- */
-.compare {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 22px;
-  margin-top: 46px;
-  align-items: start;
-}
-
-.pane {
+/* ---------- shared editorial rows ---------- */
+.raised {
   background: var(--bg-raise);
+}
+
+.feature-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 56px;
+  align-items: center;
+  margin-top: 20px;
+}
+
+.feature-row.reverse .feature-text {
+  order: 2;
+}
+
+.feature-row.reverse .feature-visual {
+  order: 1;
+}
+
+.feature-text h2,
+.section-heading h2 {
+  text-wrap: balance;
+}
+
+.feature-text .sub,
+.section-heading .sub {
+  text-wrap: pretty;
+}
+
+.feature-list {
+  margin-top: 24px;
+}
+
+.feature-list li {
+  padding: 10px 0;
+  border-bottom: 1px solid var(--border-lo);
+  color: var(--muted);
+  font-size: 14.5px;
+  line-height: 1.65;
+}
+
+.feature-list li:last-child {
+  border-bottom: 0;
+}
+
+.feature-list strong {
+  display: block;
+  margin-bottom: 2px;
+  color: var(--text);
+  font-weight: 500;
+}
+
+.feature-list code,
+.language-notes code {
+  padding: 1px 5px;
+  border-radius: 4px;
+  background: var(--gold-fade);
+  color: var(--gold-bright);
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+}
+
+.section-link {
+  display: inline-block;
+  margin-top: 22px;
+  font-size: 14px;
+}
+
+/* ---------- code ---------- */
+.code-card {
+  min-width: 0;
+  margin: 0;
+  overflow: hidden;
   border: 1px solid var(--border);
   border-radius: 12px;
-  overflow: hidden;
+  background: var(--bg-raise);
 }
 
-.pane.sema {
-  border-color: var(--gold-line);
-  box-shadow: 0 0 0 1px rgba(200, 168, 85, .08), 0 24px 60px -30px rgba(200, 168, 85, .12);
-}
-
-.pane-head {
+.code-card-head {
   display: flex;
   justify-content: space-between;
   align-items: baseline;
@@ -532,288 +583,306 @@ messages = [{<span class="c-str">"role"</span>: <span class="c-str">"user"</span
   font-size: 12px;
 }
 
-.pane-head .t {
-  color: var(--text);
-}
-
-.pane.sema .pane-head .t {
+.code-card-head .t {
   color: var(--gold-bright);
 }
 
-.pane-head .n {
+.code-card-head .n {
   color: var(--dim);
 }
 
-.pane pre {
+.code-card pre {
+  overflow-x: auto;
+  padding: 20px 22px;
+  color: #c9c2b4;
   font-family: var(--font-mono);
   font-size: 12.5px;
   line-height: 1.62;
-  padding: 18px 20px;
-  overflow-x: auto;
-  color: #c9c2b4;
 }
 
-.pane.python pre {
-  position: relative;
-  max-height: 560px;
-  overflow-y: hidden;
-  color: #9b9486;
+.code-card code {
+  font-family: inherit;
 }
 
-.pane.python .fade {
-  position: absolute;
-  left: 0;
-  right: 0;
-  bottom: 0;
-  height: 140px;
-  background: linear-gradient(transparent, var(--bg-raise));
-  pointer-events: none;
-}
-
-.pane-foot {
-  padding: 13px 18px;
-  border-top: 1px solid var(--border-lo);
-  font-size: 13px;
-  color: var(--muted);
-  line-height: 1.55;
-}
-
-.pane.sema .pane-foot {
-  color: var(--text);
-}
-
-/* ---------- agent section ---------- */
-.agent-grid {
+/* ---------- language ---------- */
+.language-split {
   display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 48px;
-  margin-top: 46px;
+  grid-template-columns: minmax(0, 1.08fr) minmax(0, .92fr);
+  gap: 42px;
   align-items: start;
+  margin-top: 42px;
 }
 
-.claims {
-  list-style: none;
+.language-notes {
+  margin: 0;
+  border-top: 1px solid var(--border);
 }
 
-.claims li {
-  padding: 16px 0;
+.language-notes > div {
+  padding: 17px 0;
   border-bottom: 1px solid var(--border-lo);
-  font-size: 15px;
-  color: var(--muted);
-  line-height: 1.65;
 }
 
-.claims li:first-child {
-  padding-top: 4px;
-}
-
-.claims strong {
+.language-notes dt {
+  margin-bottom: 5px;
   color: var(--text);
-  font-weight: 500;
-  display: block;
-  margin-bottom: 3px;
-}
-
-.claims code, .claims mark {
   font-family: var(--font-mono);
   font-size: 12.5px;
-  color: var(--gold-bright);
-  background: var(--gold-fade);
-  padding: 1px 5px;
-  border-radius: 4px;
 }
 
-.symmetry {
-  margin-top: 54px;
-  padding: 30px 34px;
-  border: 1px solid var(--gold-line);
-  border-radius: 12px;
-  background: var(--gold-fade);
-  font-family: var(--font-display);
-  font-style: italic;
-  font-size: clamp(19px, 2.3vw, 24px);
-  line-height: 1.45;
-  color: var(--text);
-  max-width: 880px;
-}
-
-.symmetry .hl {
-  color: var(--gold-bright);
-}
-
-/* ---------- objections ---------- */
-.objections {
-  display: grid;
-  grid-template-columns: repeat(2, 1fr);
-  gap: 22px;
-  margin-top: 46px;
-}
-
-.obj {
-  background: var(--bg-raise);
-  border: 1px solid var(--border);
-  border-radius: 12px;
-  padding: 26px 24px;
-}
-
-.obj h3 {
-  font-family: var(--font-display);
-  font-style: italic;
-  font-weight: 400;
-  font-size: 22px;
-  line-height: 1.25;
-  margin-bottom: 14px;
-  color: var(--text);
-}
-
-.obj h3 .q {
-  color: var(--gold);
-}
-
-.obj p {
-  font-size: 14.5px;
+.language-notes dd {
+  margin: 0;
   color: var(--muted);
-  line-height: 1.65;
+  font-size: 13.5px;
+  line-height: 1.6;
 }
 
-.obj p + p {
-  margin-top: 10px;
-}
-
-.obj code {
-  font-family: var(--font-mono);
-  font-size: 12.5px;
-  color: var(--gold-bright);
-  background: var(--gold-fade);
-  padding: 1px 5px;
-  border-radius: 4px;
-}
-
-/* ---------- runtime strip ---------- */
+/* ---------- runtime forms ---------- */
 .forms {
   display: grid;
-  grid-template-columns: repeat(2, 1fr);
+  grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 1px;
-  background: var(--border-lo);
+  margin-top: 46px;
+  overflow: hidden;
   border: 1px solid var(--border-lo);
   border-radius: 12px;
-  overflow: hidden;
-  margin-top: 46px;
+  background: var(--border-lo);
 }
 
 .form-row {
-  background: var(--bg-raise);
   display: flex;
   flex-wrap: wrap;
   align-items: baseline;
   gap: 6px 18px;
   padding: 18px 22px;
+  background: var(--bg-raise);
+  transition: background .15s var(--ease);
+}
+
+.form-row:hover {
+  background: var(--surface);
+  text-decoration: none;
 }
 
 .form-row code {
+  color: var(--gold-bright);
   font-family: var(--font-mono);
   font-size: 13px;
-  color: var(--gold-bright);
   white-space: nowrap;
 }
 
 .form-row span {
+  color: var(--muted);
   font-size: 13.5px;
-  color: var(--muted);
 }
 
-/* ---------- ship ---------- */
-.ship-grid {
+/* ---------- work list ---------- */
+.section-heading {
   display: grid;
-  grid-template-columns: 1.1fr .9fr;
-  gap: 48px;
+  grid-template-columns: minmax(0, 1fr) minmax(18rem, .72fr);
+  gap: 64px;
+  align-items: end;
+  margin-bottom: 42px;
+}
+
+.work-list {
+  border-top: 1px solid var(--border);
+}
+
+.work-row {
+  display: grid;
+  grid-template-columns: 52px minmax(0, 1fr) 110px;
+  gap: 24px;
   align-items: center;
-  margin-top: 8px;
-}
-
-.ship-term {
-  background: var(--bg-raise);
-  border: 1px solid var(--border);
-  border-radius: 12px;
-  font-family: var(--font-mono);
-  font-size: 13px;
-  line-height: 1.9;
-  padding: 22px 24px;
-  color: #c9c2b4;
-}
-
-.ship-term .dollar {
-  color: var(--gold);
-}
-
-.ship-term .out {
-  color: var(--dim);
-}
-
-.ship-list {
-  list-style: none;
-  margin-top: 28px;
-}
-
-.ship-list li {
-  display: flex;
-  gap: 14px;
-  padding: 10px 0;
-  font-size: 15px;
-  color: var(--muted);
-}
-
-.ship-list li::before {
-  content: "›";
-  color: var(--gold);
-  font-family: var(--font-mono);
-}
-
-.ship-list strong {
-  color: var(--text);
-  font-weight: 500;
-}
-
-/* ---------- honest ---------- */
-.honest {
-  background: var(--bg-raise);
-}
-
-.honest-list {
-  columns: 2;
-  column-gap: 60px;
-  margin-top: 30px;
-  max-width: 880px;
-}
-
-.honest-list li {
-  break-inside: avoid;
-  list-style: none;
-  padding: 8px 0;
-  font-size: 15px;
-  color: var(--muted);
+  padding: 24px 0;
   border-bottom: 1px solid var(--border-lo);
 }
 
-.honest-list li strong {
+.work-index {
+  color: var(--gold);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  letter-spacing: .1em;
+}
+
+.work-row h3 {
+  margin-bottom: 4px !important;
   color: var(--text);
-  font-weight: 500;
+  font-family: var(--font-display);
+  font-size: 24px;
+  font-weight: 400;
+  line-height: 1.2;
+}
+
+.work-row p {
+  max-width: 60ch;
+  color: var(--muted);
+  font-size: 14px;
+}
+
+.work-row > a {
+  justify-self: end;
+  font-size: 13px;
+  white-space: nowrap;
+}
+
+/* ---------- build terminal ---------- */
+.build-term {
+  margin: 0;
+  padding: 0;
+}
+
+.build-term pre {
+  overflow-x: auto;
+  padding: 20px 22px;
+  font-family: var(--font-mono);
+  white-space: pre;
+}
+
+.build-term code {
+  display: grid;
+  font-family: inherit;
+}
+
+/* ---------- providers ---------- */
+.provider-layout {
+  display: grid;
+  grid-template-columns: minmax(0, .82fr) minmax(0, 1.18fr);
+  gap: 72px;
+  align-items: start;
+}
+
+.provider-copy h2 {
+  text-wrap: balance;
+}
+
+.provider-copy .sub {
+  text-wrap: pretty;
+}
+
+.provider-list {
+  margin: 0;
+  border-top: 1px solid var(--border);
+}
+
+.provider-list > div {
+  display: grid;
+  grid-template-columns: 140px minmax(0, 1fr);
+  gap: 18px;
+  align-items: start;
+  padding: 16px 0;
+  border-bottom: 1px solid var(--border-lo);
+}
+
+.provider-list dt {
+  padding-top: 5px;
+  color: var(--gold);
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+
+.provider-list dd {
+  margin: 0;
+}
+
+.provider-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.provider-tags li {
+  display: inline-flex;
+  align-items: center;
+  padding: 5px 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--surface);
+  color: var(--text);
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+
+.provider-tags .provider-more {
+  color: var(--muted);
+}
+
+.provider-code {
+  margin-top: 24px;
+}
+
+/* ---------- CTA ---------- */
+.cta .kicker {
+  margin-bottom: 14px;
+}
+
+.cta-actions {
+  justify-content: center;
+  margin: 24px 0 0 !important;
 }
 
 /* ---------- responsive ---------- */
 @media (max-width: 880px) {
-  .hero { padding: 72px 0 60px; }
+  .home-hero {
+    padding: 76px 0 64px;
+  }
 
-  .compare, .objections, .ship-grid, .agent-grid {
+  .feature-row,
+  .feature-row.reverse,
+  .language-split,
+  .section-heading,
+  .provider-layout {
     grid-template-columns: 1fr;
+  }
+
+  .feature-row.reverse .feature-text,
+  .feature-row.reverse .feature-visual {
+    order: unset;
+  }
+
+  .section-heading {
+    gap: 10px;
   }
 
   .forms {
     grid-template-columns: 1fr;
   }
 
-  .honest-list {
-    columns: 1;
+}
+
+@media (max-width: 640px) {
+  .home-hero h1 {
+    font-size: clamp(44px, 14vw, 62px);
+  }
+
+  .work-row {
+    grid-template-columns: 36px minmax(0, 1fr);
+    gap: 16px;
+  }
+
+  .work-row > a {
+    grid-column: 2;
+    justify-self: start;
+  }
+
+  .provider-list > div {
+    grid-template-columns: 1fr;
+    gap: 8px;
+  }
+
+  .provider-list dt {
+    padding-top: 0;
+  }
+
+  .code-card pre {
+    padding: 17px 18px;
+    font-size: 11.5px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .form-row {
+    transition: none;
   }
 }
 </style>
