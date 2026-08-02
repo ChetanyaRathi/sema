@@ -44,14 +44,14 @@ This prevents **variable capture** — a common bug where macro-introduced bindi
 ```sema
 ;; Without auto-gensym — BUG if user has a variable named "tmp"
 (defmacro bad-inc (x)
-  `(let ((tmp ,x)) (+ tmp 1)))
+  `(let ((tmp 1)) (+ tmp ,x)))
 
 (let ((tmp 100))
-  (bad-inc tmp))   ; => 2, not 101! "tmp" is captured
+  (bad-inc tmp))   ; => 2, not 101! the macro's "tmp" captures the user's "tmp"
 
 ;; With auto-gensym — always correct
 (defmacro good-inc (x)
-  `(let ((tmp# ,x)) (+ tmp# 1)))
+  `(let ((tmp# 1)) (+ tmp# ,x)))
 
 (let ((tmp 100))
   (good-inc tmp))  ; => 101 ✓
@@ -143,7 +143,7 @@ Every *other* template identifier — free references to user-defined globals, b
 **Caveats** (the hygiene is an approximation, not full R7RS referential transparency):
 
 - Only template-introduced *binders* are renamed. The other direction isn't covered: if the use site shadows a global or special form that the template references freely, the template sees the shadowing binding.
-- Templates support a single level of ellipsis; a template with ellipsis depth > 1 (`x ... ...`) is rejected with a clear error rather than mis-expanded.
+- A template may use nested ellipsis (`x ... ...`) when the pattern binds the variable at the same depth — e.g. pattern `((x ...) ...)` with template `(list (list x ...) ...)`. Using more levels than the pattern provides is rejected with `syntax-rules: unsupported nested ellipsis depth in template` rather than mis-expanded.
 - Like `defmacro`, `define-syntax` must appear at the top level (or inside a top-level `begin`) to be visible to sibling forms — one nested inside a lambda or `let` body is not.
 - `syntax-case` is not supported.
 
