@@ -111,6 +111,13 @@ jobs:
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       BUILD_MANIFEST_NAME: target/distrib/${{ join(matrix.targets, '-') }}-dist-manifest.json
+      CODESIGN_CERTIFICATE: ${{ secrets.CODESIGN_CERTIFICATE }}
+      CODESIGN_CERTIFICATE_PASSWORD: ${{ secrets.CODESIGN_CERTIFICATE_PASSWORD }}
+      CODESIGN_IDENTITY: ${{ secrets.CODESIGN_IDENTITY }}
+    permissions:
+      "attestations": "write"
+      "contents": "read"
+      "id-token": "write"
     steps:
       - name: enable windows longpaths
         run: |
@@ -129,6 +136,12 @@ jobs:
       - name: "Gate: committed web runtime is fresh"
         if: "runner.os != 'Windows'"
         run: "./scripts/check-web-runtime-fresh.sh"
+        shell: "bash"
+      - name: "codesign: hardened runtime on macOS signatures"
+        run: |
+          if [ "$(uname -s)" = "Darwin" ]; then
+            echo "CODESIGN_OPTIONS=runtime" >> "$GITHUB_ENV"
+          fi
         shell: "bash"
       - name: "PGO: generate profile (native targets only)"
         run: |
@@ -182,6 +195,10 @@ jobs:
           # Actually do builds and make zips and whatnot
           dist build ${{ needs.plan.outputs.tag-flag }} --print=linkage --output-format=json ${{ matrix.dist_args }} > dist-manifest.json
           echo "dist ran successfully"
+      - name: Attest
+        uses: actions/attest-build-provenance@v3
+        with:
+          subject-path: "target/distrib/*${{ join(matrix.targets, ', ') }}*"
       - id: cargo-dist
         name: Post-build
         # We force bash here just because github makes it really hard to get values up
@@ -379,3 +396,12 @@ jobs:
         with:
           persist-credentials: false
           submodules: recursive
+
+  custom-notarize:
+    needs:
+      - plan
+      - announce
+    uses: ./.github/workflows/notarize.yml
+    with:
+      plan: ${{ needs.plan.outputs.val }}
+    secrets: inherit
