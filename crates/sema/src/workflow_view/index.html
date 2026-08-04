@@ -666,7 +666,7 @@ function renderDetail(){
   const { done, total } = phaseProgress(p);
   const sub = [];
   if(phaseOpen(p)) sub.push(`live`);
-  else sub.push(`${p.status}`);
+  else sub.push(`${esc(p.status)}`);
   if(!phaseOpen(p)) sub.push(fmtMs(p.dur_ms));
   if(p.checkpoints.length) sub.push(`${p.checkpoints.length} checkpoint${p.checkpoints.length>1?"s":""}`);
 
