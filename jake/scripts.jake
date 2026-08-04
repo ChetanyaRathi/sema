@@ -28,6 +28,11 @@ task fmt:
     echo "shfmt: formatted scripts/*.sh"
 
 @group scripts
-@desc "Shell sanity gate: shellcheck + shfmt formatting check"
-task check: [lint, fmt-check]
+@desc "Check grammar-fuzz CLI argument validation"
+task grammar-fuzz-args-test:
+    bash scripts/grammar-fuzz-args-test.sh
+
+@group scripts
+@desc "Shell sanity gate: shellcheck + shfmt + argument tests"
+task check: [lint, fmt-check, grammar-fuzz-args-test]
     echo "scripts: clean"

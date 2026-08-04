@@ -82,7 +82,66 @@ while getopts "n:d:s:o:b:t:v" opt; do
   esac
 done
 
-# Locate (or build) the sema binary.
+# Default counts per mode.
+if [ -z "$COUNT" ]; then
+  if [ "$MODE" = "emit" ]; then COUNT="20"; else COUNT="5000"; fi
+fi
+
+# Random seed if not pinned.
+if [ -z "$SEED" ]; then
+  SEED=$((($(date +%s) ^ ($$ << 13) ^ ${RANDOM:-0}) % 1000000000))
+fi
+
+# Parse an unsigned decimal integer and remove leading zeroes. Normalizing is
+# required because Bash arithmetic otherwise treats values such as 08 as octal.
+normalize_uint() {
+  local label="$1"
+  local value="$2"
+  local allow_zero="$3"
+  case "$value" in
+    "" | *[!0-9]*)
+      echo "$label must be a non-negative decimal integer (got '$value')" >&2
+      return 1
+      ;;
+  esac
+  while [ "${value#0}" != "$value" ]; do
+    value="${value#0}"
+  done
+  [ -n "$value" ] || value="0"
+  if [ "$allow_zero" != "1" ] && [ "$value" = "0" ]; then
+    echo "$label must be greater than zero" >&2
+    return 1
+  fi
+  printf '%s\n' "$value"
+}
+
+normalize_int() {
+  local label="$1"
+  local value="$2"
+  local sign=""
+  case "$value" in
+    -*)
+      sign="-"
+      value="${value#-}"
+      ;;
+    +*) value="${value#+}" ;;
+  esac
+  value="$(normalize_uint "$label" "$value" 1)" || return 1
+  if [ "$sign" = "-" ] && [ "$value" != "0" ]; then
+    printf -- '-%s\n' "$value"
+  else
+    printf '%s\n' "$value"
+  fi
+}
+
+COUNT="$(normalize_uint COUNT "$COUNT" 0)" || exit 64
+DEPTH="$(normalize_uint DEPTH "$DEPTH" 1)" || exit 64
+SEED="$(normalize_int SEED "$SEED")" || exit 64
+BATCH="$(normalize_uint BATCH "$BATCH" 0)" || exit 64
+BUDGET="$(normalize_uint BUDGET "$BUDGET" 0)" || exit 64
+
+# Locate (or build) the sema binary after validation, so invalid input fails
+# promptly without starting a release build.
 BIN=""
 for cand in "$ROOT/target/release/sema" "$ROOT/target/debug/sema" "$(command -v sema 2>/dev/null || true)"; do
   if [ -n "$cand" ] && [ -x "$cand" ]; then
@@ -97,16 +156,6 @@ if [ -z "$BIN" ]; then
     exit 70
   }
   BIN="$ROOT/target/release/sema"
-fi
-
-# Default counts per mode.
-if [ -z "$COUNT" ]; then
-  if [ "$MODE" = "emit" ]; then COUNT="20"; else COUNT="5000"; fi
-fi
-
-# Random seed if not pinned.
-if [ -z "$SEED" ]; then
-  SEED=$((($(date +%s) ^ ($$ << 13) ^ ${RANDOM:-0}) % 1000000000))
 fi
 
 export SEMA_FUZZ_COUNT="$COUNT"
