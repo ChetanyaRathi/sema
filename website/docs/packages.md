@@ -25,6 +25,7 @@ name = "my-package"
 version = "0.1.0"
 description = "A useful Sema library"
 entrypoint = "lib.sema"
+sema_version_req = ">=1.34.0"
 
 [deps]
 # Registry packages — short name = version
@@ -37,12 +38,55 @@ json-schema = "2.1.0"
 
 The `[package]` section defines metadata:
 
-| Field         | Description                                       |
-| ------------- | ------------------------------------------------- |
-| `name`        | Package name                                      |
-| `version`     | Semver version string (required for publishing)   |
-| `description` | Short description of the package                  |
-| `entrypoint`  | File loaded on import (default: `package.sema`)   |
+| Field              | Description                                            |
+| ------------------ | ------------------------------------------------------ |
+| `name`             | Package name                                           |
+| `version`          | Semver version string (required for publishing)        |
+| `description`      | Short description of the package                       |
+| `entrypoint`       | File loaded on import (default: `package.sema`)        |
+| `repository`       | Source repository URL (sent to the registry)           |
+| `sema_version_req` | Semver requirement for the Sema versions this supports |
+
+#### `sema_version_req`
+
+Declares which Sema versions a package works with. It is optional; a package
+without it installs on any version.
+
+```toml
+[package]
+sema_version_req = ">=1.34.0"
+```
+
+The value is a semver requirement (at most 128 characters), the same syntax
+Cargo uses:
+
+| Requirement      | Matches                                    |
+| ---------------- | ------------------------------------------ |
+| `>=1.34.0`       | 1.34.0 and every later version             |
+| `>=1.34, <2.0`   | the 1.x line from 1.34 on                  |
+| `1.34`           | **1.34.0 up to but excluding 2.0.0** — a bare version is a caret requirement, not an exact pin |
+| `=1.34.0`        | exactly 1.34.0                             |
+| `*`              | any version                                |
+
+Sema enforces it when installing:
+
+- `sema pkg add <name>` and `sema pkg update` pick the highest published
+  version that this Sema satisfies, and skip the rest.
+- `sema pkg add <name>@<version>` and `sema pkg install` refuse an
+  incompatible version rather than installing it, and say which requirement
+  failed.
+- Git dependencies are checked at the resolved commit before checkout.
+
+If no published version matches, the error lists what each version wanted:
+
+```
+No version of 'policies' supports Sema 1.33.0:
+  1.0.0 requires Sema >=1.34.0
+  2.0.0 requires Sema >=2.0.0
+```
+
+A prerelease Sema is matched as its release version, so `1.34.0-rc.1` counts
+as `1.34.0` and can install packages that ask for `>=1.34.0`.
 
 The `[deps]` section maps package identifiers to versions or git refs:
 

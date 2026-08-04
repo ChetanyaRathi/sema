@@ -108,7 +108,7 @@ fn validate_package_manifest_sema_content(
         format!("{package} has invalid sema_version_req {requirement:?}: {error}")
     })?;
     let current = current_sema_version();
-    if parsed.matches(&current) {
+    if sema_version_matches(&parsed, &current) {
         Ok(())
     } else {
         Err(format!(
@@ -315,7 +315,7 @@ fn cmd_add_registry(spec: &str, registry: Option<&str>) -> Result<(), String> {
         None => {
             let info = registry_package_info(&name, &registry_url)?;
             latest_compatible_version(&name, &info)?.ok_or_else(|| {
-                format!("No non-yanked version of '{name}' supports this Sema release")
+                format!("'{name}' has no installable versions (none published, or all yanked)")
             })?
         }
     };
@@ -721,6 +721,17 @@ pub fn cmd_install(locked: bool) -> Result<(), String> {
         std::fs::read_to_string(toml_path).map_err(|e| format!("Failed to read sema.toml: {e}"))?;
     let doc: toml::Value =
         toml::from_str(&content).map_err(|e| format!("Failed to parse sema.toml: {e}"))?;
+
+    // The project's own sema_version_req applies to the project: do not install
+    // dependencies into a checkout this Sema cannot run. `sema pkg publish` deliberately
+    // does not check this — a package may be published from CI on a different Sema than
+    // the one it targets.
+    let project = doc
+        .get("package")
+        .and_then(|package| package.get("name"))
+        .and_then(toml::Value::as_str)
+        .unwrap_or("this project");
+    validate_package_manifest_sema_content(&content, "sema.toml", project)?;
 
     let deps_table = match doc.get("deps").and_then(|d| d.as_table()) {
         Some(table) => table,
@@ -1795,11 +1806,34 @@ fn version_metadata<'a>(
         .ok_or_else(|| format!("Registry metadata has no version '{package}@{version}'"))
 }
 
-fn ensure_version_supports_sema(
+/// Match a package requirement against the running Sema version.
+///
+/// A prerelease Sema is compared as its release version: `1.34.0-rc.1` is matched as
+/// `1.34.0`. `semver::VersionReq` excludes every prerelease unless the requirement
+/// itself names one, so a prerelease build otherwise fails every requirement — even
+/// `"*"` — and could install no package that declares one.
+fn sema_version_matches(requirement: &semver::VersionReq, current: &semver::Version) -> bool {
+    if requirement.matches(current) {
+        return true;
+    }
+    if current.pre.is_empty() {
+        return false;
+    }
+    requirement.matches(&semver::Version::new(
+        current.major,
+        current.minor,
+        current.patch,
+    ))
+}
+
+/// Read the `sema_version_req` recorded for one registry version.
+///
+/// An absent, null, or blank value means the version declares no requirement.
+fn registry_version_requirement(
     package: &str,
     version: &str,
     metadata: &serde_json::Value,
-) -> Result<Option<String>, String> {
+) -> Result<Option<(String, semver::VersionReq)>, String> {
     let requirement = match metadata.get("sema_version_req") {
         None | Some(serde_json::Value::Null) => None,
         Some(serde_json::Value::String(requirement)) => {
@@ -1828,13 +1862,25 @@ fn ensure_version_supports_sema(
              {requirement:?}: {error}"
         )
     })?;
+    Ok(Some((requirement.to_string(), parsed)))
+}
+
+fn ensure_version_supports_sema(
+    package: &str,
+    version: &str,
+    metadata: &serde_json::Value,
+) -> Result<Option<String>, String> {
+    let Some((requirement, parsed)) = registry_version_requirement(package, version, metadata)?
+    else {
+        return Ok(None);
+    };
     let current = current_sema_version();
-    if !parsed.matches(&current) {
+    if !sema_version_matches(&parsed, &current) {
         return Err(format!(
             "{package}@{version} requires Sema {requirement}, but this is Sema {current}"
         ));
     }
-    Ok(Some(requirement.to_string()))
+    Ok(Some(requirement))
 }
 
 fn validate_registry_version(
@@ -1847,7 +1893,12 @@ fn validate_registry_version(
     ensure_version_supports_sema(package, version, metadata)
 }
 
-/// Select the latest non-yanked version compatible with this Sema release.
+/// Select the highest non-yanked version compatible with this Sema release.
+///
+/// The registry orders `versions` by publish time, not by semver, so a patch
+/// backported after a newer major is served first. Compare parsed versions instead of
+/// taking the first entry, or `sema pkg add` installs the most recently published
+/// version and `sema pkg update` walks backwards across a major.
 fn latest_compatible_version(
     package: &str,
     info: &serde_json::Value,
@@ -1855,7 +1906,10 @@ fn latest_compatible_version(
     let Some(versions) = info.get("versions").and_then(serde_json::Value::as_array) else {
         return Ok(None);
     };
+    let current = current_sema_version();
+    let mut best: Option<(semver::Version, String)> = None;
     let mut invalid_requirement = None;
+    let mut incompatible = Vec::new();
     for metadata in versions.iter().filter(|version| {
         !version
             .get("yanked")
@@ -1865,16 +1919,42 @@ fn latest_compatible_version(
         let Some(version) = metadata.get("version").and_then(serde_json::Value::as_str) else {
             continue;
         };
-        match ensure_version_supports_sema(package, version, metadata) {
-            Ok(_) => return Ok(Some(version.to_string())),
-            Err(error) if error.contains("invalid sema_version_req") => {
+        let Ok(parsed_version) = semver::Version::parse(version) else {
+            continue;
+        };
+        match registry_version_requirement(package, version, metadata) {
+            Ok(Some((requirement, parsed))) if !sema_version_matches(&parsed, &current) => {
+                incompatible.push(format!("{version} requires Sema {requirement}"));
+            }
+            Ok(_) => {
+                if best.as_ref().is_none_or(|(best, _)| parsed_version > *best) {
+                    best = Some((parsed_version, version.to_string()));
+                }
+            }
+            Err(error) => {
                 invalid_requirement.get_or_insert(error);
             }
-            Err(_) => {}
         }
+    }
+    if let Some((_, version)) = best {
+        return Ok(Some(version));
     }
     if let Some(error) = invalid_requirement {
         return Err(error);
+    }
+    if !incompatible.is_empty() {
+        // Report why each candidate was rejected; "no compatible version" alone leaves
+        // the user with no requirement to act on.
+        incompatible.sort();
+        let mut message = format!("No version of '{package}' supports Sema {current}:");
+        for reason in incompatible.iter().take(5) {
+            message.push_str(&format!("\n  {reason}"));
+        }
+        if incompatible.len() > 5 {
+            let rest = incompatible.len() - 5;
+            message.push_str(&format!("\n  … and {rest} more"));
+        }
+        return Err(message);
     }
     Ok(None)
 }
@@ -2407,6 +2487,56 @@ mod tests {
             latest_compatible_version("policies", &info).unwrap(),
             Some("1.0.0".to_string())
         );
+    }
+
+    #[test]
+    fn latest_compatible_version_picks_the_highest_not_the_first() {
+        // The registry serves versions newest-published first, so a patch backported
+        // after a newer major arrives ahead of it. Selection must compare versions.
+        let info = serde_json::json!({
+            "versions": [
+                {"version": "1.0.1", "yanked": false, "sema_version_req": "*"},
+                {"version": "2.0.0", "yanked": false, "sema_version_req": "*"},
+                {"version": "1.0.0", "yanked": false, "sema_version_req": "*"}
+            ]
+        });
+        assert_eq!(
+            latest_compatible_version("policies", &info).unwrap(),
+            Some("2.0.0".to_string())
+        );
+    }
+
+    #[test]
+    fn latest_compatible_version_reports_why_every_version_was_rejected() {
+        let current = current_sema_version();
+        let incompatible = format!(">{}.0.0", current.major + 1);
+        let info = serde_json::json!({
+            "versions": [
+                {"version": "2.0.0", "yanked": false, "sema_version_req": incompatible},
+                {"version": "1.0.0", "yanked": false, "sema_version_req": incompatible}
+            ]
+        });
+        let error = latest_compatible_version("policies", &info).unwrap_err();
+        assert!(error.contains("1.0.0 requires Sema"), "{error}");
+        assert!(error.contains("2.0.0 requires Sema"), "{error}");
+        assert!(error.contains(&current.to_string()), "{error}");
+    }
+
+    #[test]
+    fn a_prerelease_sema_still_satisfies_a_release_requirement() {
+        // VersionReq excludes every prerelease unless the requirement names one, so a
+        // prerelease build would otherwise match nothing at all — not even "*".
+        let prerelease = semver::Version::parse("1.34.0-rc.1").unwrap();
+        for requirement in ["*", ">=1.34.0", ">=1.33.0", "1.34"] {
+            let parsed = semver::VersionReq::parse(requirement).unwrap();
+            assert!(
+                sema_version_matches(&parsed, &prerelease),
+                "{requirement} rejected a prerelease Sema"
+            );
+        }
+        // A requirement the release version genuinely fails is still refused.
+        let parsed = semver::VersionReq::parse(">=2.0.0").unwrap();
+        assert!(!sema_version_matches(&parsed, &prerelease));
     }
 
     #[test]
