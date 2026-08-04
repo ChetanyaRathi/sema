@@ -1,5 +1,23 @@
 # Changelog
 
+## 1.34.2
+
+### Fixed
+
+- **macOS Apple Silicon binaries are signed and published again.** The
+  `aarch64-apple-darwin` build failed importing the Developer ID certificate
+  with `MAC verification failed during PKCS12 import`. The credentials are
+  correct — the same secrets import in the Intel job. dist assigned that target
+  to a `macos-14-arm64` runner, and macOS 14's `security import` cannot verify
+  a PKCS#12 MAC that uses SHA-256 (the OpenSSL 3 export default). The target is
+  now pinned to `macos-15`. One failed target skips the release's `host` and
+  `announce` jobs, so 1.34.1 produced no GitHub release, archives, installer,
+  or Homebrew formula either.
+
+**1.34.0, 1.34.1, and 1.34.2 are the same library and CLI.** 1.34.0 and 1.34.1
+reached crates.io and npm but shipped no binaries; install 1.34.2 for the
+archives, the shell/PowerShell installer, and Homebrew.
+
 ## 1.34.1
 
 ### Fixed
