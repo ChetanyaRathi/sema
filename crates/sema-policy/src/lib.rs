@@ -1077,7 +1077,7 @@ impl SubjectPolicy {
             if self
                 .deny
                 .iter()
-                .any(|rule| rule.matches(&subject, workspace_root))
+                .any(|rule| rule.matches(&subject, workspace_root, true))
             {
                 return PolicyCheck::deny(
                     format!("subjects.{}.deny", subject.kind().as_str()),
@@ -1090,7 +1090,7 @@ impl SubjectPolicy {
             if self
                 .allow
                 .iter()
-                .any(|rule| rule.matches(&subject, workspace_root))
+                .any(|rule| rule.matches(&subject, workspace_root, false))
             {
                 continue;
             }
@@ -1202,29 +1202,47 @@ impl SubjectRule {
         })
     }
 
-    fn matches(&self, subject: &ResolvedSubject, workspace_root: &Path) -> bool {
+    /// Decide whether this rule covers `subject`.
+    ///
+    /// `on_unevaluatable` is the answer for a subject the rule cannot inspect at all
+    /// (`ConstraintMiss::evaluated` false): an unparsable or non-allowlisted-scheme URL,
+    /// a path that escapes the workspace, or an absent request method. A deny rule
+    /// passes `true` so an argument it cannot read still denies; an allow rule passes
+    /// `false` so that argument is never allowlisted. Both directions fail closed.
+    ///
+    /// A value that *was* compared and simply is not covered stays a non-match for both
+    /// polarities, so a deny rule naming one host does not deny every other host.
+    ///
+    /// Treating an un-evaluatable subject as a plain non-match made deny rules fail
+    /// open: a `:domains` rule defaults `:schemes` to `["https"]`, so an `http://` URL
+    /// produced a scheme error, did not match, and was allowed by `:default :allow`.
+    fn matches(
+        &self,
+        subject: &ResolvedSubject,
+        workspace_root: &Path,
+        on_unevaluatable: bool,
+    ) -> bool {
         if self.kind != subject.kind() {
             return false;
         }
+        let constraint_matches = |value: &serde_json::Value| {
+            self.constraint.as_ref().is_none_or(|constraint| {
+                constraint
+                    .check(value, workspace_root)
+                    .map_or_else(|miss| !miss.evaluated && on_unevaluatable, |()| true)
+            })
+        };
         match subject {
-            ResolvedSubject::File { path, .. } => self
-                .constraint
-                .as_ref()
-                .is_none_or(|constraint| constraint.check(path, workspace_root).is_ok()),
+            ResolvedSubject::File { path, .. } => constraint_matches(path),
             ResolvedSubject::NetworkRequest { method, url } => {
-                (self.methods.is_empty()
-                    || method
-                        .as_deref()
-                        .is_some_and(|method| self.methods.contains(method)))
-                    && self
-                        .constraint
-                        .as_ref()
-                        .is_none_or(|constraint| constraint.check(url, workspace_root).is_ok())
+                let method_matches = self.methods.is_empty()
+                    || match method.as_deref() {
+                        Some(method) => self.methods.contains(method),
+                        None => on_unevaluatable,
+                    };
+                method_matches && constraint_matches(url)
             }
-            ResolvedSubject::Command(command) => self
-                .constraint
-                .as_ref()
-                .is_none_or(|constraint| constraint.check(command, workspace_root).is_ok()),
+            ResolvedSubject::Command(command) => constraint_matches(command),
             ResolvedSubject::ExternalAction { action, .. } => {
                 self.actions.is_empty() || self.actions.contains(action)
             }
@@ -1438,7 +1456,10 @@ impl ArgumentConstraint {
         let value = arguments
             .get(&self.argument)
             .ok_or_else(|| format!("required argument {:?} is missing", self.argument))?;
-        self.kind.check(value, workspace_root)
+        // The tools section is an allowlist: every miss denies, so only the reason matters.
+        self.kind
+            .check(value, workspace_root)
+            .map_err(|miss| miss.reason)
     }
 }
 
@@ -1447,6 +1468,41 @@ enum CompiledConstraint {
     Path(PathConstraint),
     Domain(DomainConstraint),
     Command(CommandConstraint),
+}
+
+/// Why a constraint did not accept a value.
+///
+/// `evaluated` is false when the value could not be compared against the rule's lists
+/// at all: a non-string argument, an unparsable URL, a scheme or port outside the
+/// selector, or a path that escapes the workspace. It is true when the comparison ran
+/// and the value is simply not covered.
+///
+/// Subject matching needs the distinction. An allow rule must not allowlist a value it
+/// could not read, and a deny rule must still deny one. Collapsing both cases into
+/// "does not match" let an `http://` URL evade a `:domains` deny rule, because
+/// `:schemes` defaults to `["https"]` and the scheme error read as "no match".
+#[derive(Debug)]
+struct ConstraintMiss {
+    reason: String,
+    evaluated: bool,
+}
+
+impl ConstraintMiss {
+    /// The value could not be compared against the rule's lists.
+    fn unevaluatable(reason: impl Into<String>) -> Self {
+        Self {
+            reason: reason.into(),
+            evaluated: false,
+        }
+    }
+
+    /// The comparison ran; the value is not covered by the rule.
+    fn no_match(reason: impl Into<String>) -> Self {
+        Self {
+            reason: reason.into(),
+            evaluated: true,
+        }
+    }
 }
 
 impl CompiledConstraint {
@@ -1458,7 +1514,11 @@ impl CompiledConstraint {
         }
     }
 
-    fn check(&self, value: &serde_json::Value, workspace_root: &Path) -> Result<(), String> {
+    fn check(
+        &self,
+        value: &serde_json::Value,
+        workspace_root: &Path,
+    ) -> Result<(), ConstraintMiss> {
         match self {
             Self::Path(rule) => rule.check(value, workspace_root),
             Self::Domain(rule) => rule.check(value),
@@ -1486,19 +1546,24 @@ impl PathConstraint {
         })
     }
 
-    fn check(&self, value: &serde_json::Value, workspace_root: &Path) -> Result<(), String> {
+    fn check(
+        &self,
+        value: &serde_json::Value,
+        workspace_root: &Path,
+    ) -> Result<(), ConstraintMiss> {
         let path = value
             .as_str()
-            .ok_or_else(|| "path argument must be a string".to_string())?;
-        let relative = normalize_policy_path(workspace_root, path)?;
+            .ok_or_else(|| ConstraintMiss::unevaluatable("path argument must be a string"))?;
+        let relative =
+            normalize_policy_path(workspace_root, path).map_err(ConstraintMiss::unevaluatable)?;
         if self.deny.iter().any(|pattern| pattern.is_match(&relative)) {
-            return Err("path matches a deny pattern".to_string());
+            return Err(ConstraintMiss::no_match("path matches a deny pattern"));
         }
         self.allow
             .iter()
             .any(|pattern| pattern.is_match(&relative))
             .then_some(())
-            .ok_or_else(|| "path is not allowlisted".to_string())
+            .ok_or_else(|| ConstraintMiss::no_match("path is not allowlisted"))
     }
 }
 
@@ -1565,39 +1630,44 @@ impl DomainConstraint {
         })
     }
 
-    fn check(&self, value: &serde_json::Value) -> Result<(), String> {
+    fn check(&self, value: &serde_json::Value) -> Result<(), ConstraintMiss> {
         let raw = value
             .as_str()
-            .ok_or_else(|| "URL argument must be a string".to_string())?;
-        let url = Url::parse(raw).map_err(|_| "URL argument is invalid".to_string())?;
+            .ok_or_else(|| ConstraintMiss::unevaluatable("URL argument must be a string"))?;
+        let url = Url::parse(raw)
+            .map_err(|_| ConstraintMiss::unevaluatable("URL argument is invalid"))?;
         if !self.schemes.contains(url.scheme()) {
-            return Err("URL scheme is not allowlisted".to_string());
+            return Err(ConstraintMiss::unevaluatable(
+                "URL scheme is not allowlisted",
+            ));
         }
         if !url.username().is_empty() || url.password().is_some() {
-            return Err("URL credentials are not allowed".to_string());
+            return Err(ConstraintMiss::unevaluatable(
+                "URL credentials are not allowed",
+            ));
         }
         let host = match url.host() {
             Some(Host::Domain(domain)) => domain.to_ascii_lowercase(),
             Some(Host::Ipv4(ip)) => ip.to_string(),
             Some(Host::Ipv6(ip)) => ip.to_string(),
-            None => return Err("URL must have a host".to_string()),
+            None => return Err(ConstraintMiss::unevaluatable("URL must have a host")),
         };
         if let Some(ports) = &self.ports {
             let port = url
                 .port_or_known_default()
-                .ok_or_else(|| "URL port cannot be resolved".to_string())?;
+                .ok_or_else(|| ConstraintMiss::unevaluatable("URL port cannot be resolved"))?;
             if !ports.contains(&port) {
-                return Err("URL port is not allowlisted".to_string());
+                return Err(ConstraintMiss::unevaluatable("URL port is not allowlisted"));
             }
         }
         if self.deny.iter().any(|pattern| pattern.matches(&host)) {
-            return Err("URL host matches a deny rule".to_string());
+            return Err(ConstraintMiss::no_match("URL host matches a deny rule"));
         }
         self.allow
             .iter()
             .any(|pattern| pattern.matches(&host))
             .then_some(())
-            .ok_or_else(|| "URL host is not allowlisted".to_string())
+            .ok_or_else(|| ConstraintMiss::no_match("URL host is not allowlisted"))
     }
 }
 
@@ -1676,17 +1746,19 @@ impl CommandConstraint {
         Ok(Self { allow, deny })
     }
 
-    fn check(&self, value: &serde_json::Value) -> Result<(), String> {
+    fn check(&self, value: &serde_json::Value) -> Result<(), ConstraintMiss> {
         let command = value
             .as_str()
-            .ok_or_else(|| "command argument must be a string".to_string())?;
+            .ok_or_else(|| ConstraintMiss::unevaluatable("command argument must be a string"))?;
         if self.deny.contains(command) {
-            return Err("command matches an explicit deny rule".to_string());
+            return Err(ConstraintMiss::no_match(
+                "command matches an explicit deny rule",
+            ));
         }
         self.allow
             .contains(command)
             .then_some(())
-            .ok_or_else(|| "command is not allowlisted".to_string())
+            .ok_or_else(|| ConstraintMiss::no_match("command is not allowlisted"))
     }
 }
 
@@ -2364,6 +2436,93 @@ mod tests {
                 )
                 .allowed
         );
+    }
+
+    #[test]
+    fn subject_deny_rules_fail_closed_on_unevaluatable_arguments() {
+        // A deny rule must still deny an argument it cannot inspect. `:domains` defaults
+        // `:schemes` to ["https"], so an `http://` URL cannot be evaluated against the
+        // rule; treating that as "no match" let plain HTTP evade the deny list.
+        let subjects = Value::map(BTreeMap::from([
+            (Value::string("default"), Value::keyword("allow")),
+            (
+                Value::string("deny"),
+                Value::vector(vec![Value::map(BTreeMap::from([
+                    (Value::string("kind"), Value::keyword("network-request")),
+                    (Value::string("domains"), strings(&["evil.example.com"])),
+                ]))]),
+            ),
+        ]));
+        let policy = CompiledPolicy::compile(&Value::map(BTreeMap::from([(
+            Value::string("subjects"),
+            subjects,
+        )])))
+        .unwrap();
+        let spec = [ToolPolicySubject::NetworkRequest {
+            method: None,
+            url_arg: "url".to_string(),
+        }];
+
+        for url in [
+            "https://evil.example.com/x",
+            // Same host, scheme the rule cannot evaluate — must not become an allow.
+            "http://evil.example.com/x",
+        ] {
+            let check = policy.check_tool(
+                "fetch",
+                &serde_json::json!({ "url": url }),
+                &spec,
+                Path::new("."),
+            );
+            assert!(!check.allowed, "{url} was allowed by a deny rule");
+        }
+
+        // A host the rule does not name is still allowed by `:default :allow`.
+        assert!(
+            policy
+                .check_tool(
+                    "fetch",
+                    &serde_json::json!({"url":"https://ok.example.com/x"}),
+                    &spec,
+                    Path::new(".")
+                )
+                .allowed
+        );
+    }
+
+    #[test]
+    fn subject_deny_paths_fail_closed_outside_the_workspace() {
+        // `normalize_policy_path` errors for absolute and root-escaping paths, so a
+        // `:paths` deny rule could not evaluate them and let them through.
+        let subjects = Value::map(BTreeMap::from([
+            (Value::string("default"), Value::keyword("allow")),
+            (
+                Value::string("deny"),
+                Value::vector(vec![Value::map(BTreeMap::from([
+                    (Value::string("kind"), Value::keyword("file-write")),
+                    (Value::string("paths"), strings(&["**"])),
+                ]))]),
+            ),
+        ]));
+        let policy = CompiledPolicy::compile(&Value::map(BTreeMap::from([(
+            Value::string("subjects"),
+            subjects,
+        )])))
+        .unwrap();
+        let spec = [ToolPolicySubject::File {
+            access: FileAccess::Write,
+            path_arg: "path".to_string(),
+        }];
+
+        for path in ["src/x.rs", "/tmp/evil.txt", "../evil.txt"] {
+            let check = policy.check_tool(
+                "write-file",
+                &serde_json::json!({ "path": path }),
+                &spec,
+                Path::new("."),
+            );
+            assert!(!check.allowed, "{path} was allowed by a deny rule");
+        }
     }
 
     #[test]
