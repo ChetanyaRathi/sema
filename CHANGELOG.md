@@ -4,6 +4,35 @@
 
 ### Added
 
+- **Workflow policies — `defpolicy` (#50).** A policy is a compiled, immutable
+  map that guards a workflow at its boundaries: `:models` (which
+  provider/model a call may use), `:tools` (per-tool argument constraints over
+  paths, domains, and commands), `:subjects` (semantic allow/deny rules for the
+  file, network, command, and external-action a tool actually performs),
+  `:input` and `:output` (content scanning, with `:redact` and `:block`
+  actions). Install one with `:policy` in a `defworkflow` or `step` meta map.
+  Layers compose: any layer may deny, a later layer can only tighten an earlier
+  one, and the strictest action wins. Every decision is journaled to the run
+  directory as evidence. `policy/without` is a lexical, audited bypass that
+  emits a `policy.bypassed` event and never widens the workflow's `:permissions`
+  sandbox. `sema workflow check` rejects a source file whose policy or approval
+  use is malformed before the run starts.
+- **Durable human approval gates — `approval` (#50).** `(approval :key {…})`
+  stops a workflow before a sensitive action until a human records a decision.
+  In `auto` mode on a terminal it prompts; with an approval authority it writes
+  a request sidecar, exits 3, and waits. A separate trusted process decides with
+  `sema workflow approve` / `sema workflow reject`, signing with an Ed25519 key
+  that is never passed to the workflow process; `sema workflow run --resume`
+  then applies it. Decisions are bound to the run, workflow, code version,
+  arguments, phase, key, occurrence, and subject digest, so a decision cannot be
+  replayed onto a different gate or run. `sema workflow approvals` lists pending
+  requests as text or JSON, and the loopback `sema workflow view` viewer can
+  record the same signed decision. `sema workflow approval-keygen` creates the
+  authority.
+- **`sema_version_req` in `sema.toml`** — a package can declare the Sema
+  versions it supports, and `sema pkg` refuses an incompatible install with the
+  requirement in the error.
+
 - **macOS release binaries are now Developer-ID signed, notarized, and
   Sigstore-attested (#109, #107, #133).** Every `*-apple-darwin.tar.xz`
   carries a hardened-runtime signature and a GitHub Artifact Attestation
