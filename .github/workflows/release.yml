@@ -133,15 +133,15 @@ jobs:
             curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
             echo "$HOME/.cargo/bin" >> $GITHUB_PATH
           fi
-      - name: "Gate: committed web runtime is fresh"
-        if: "runner.os != 'Windows'"
-        run: "./scripts/check-web-runtime-fresh.sh"
-        shell: "bash"
       - name: "codesign: hardened runtime on macOS signatures"
         run: |
           if [ "$(uname -s)" = "Darwin" ]; then
             echo "CODESIGN_OPTIONS=runtime" >> "$GITHUB_ENV"
           fi
+        shell: "bash"
+      - name: "Gate: committed web runtime is fresh"
+        if: "runner.os != 'Windows'"
+        run: "./scripts/check-web-runtime-fresh.sh"
         shell: "bash"
       - name: "PGO: generate profile (native targets only)"
         run: |
