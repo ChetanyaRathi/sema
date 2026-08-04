@@ -1,5 +1,19 @@
 # Changelog
 
+## 1.34.1
+
+### Fixed
+
+- **Release binaries and installers are built again.** The cargo-dist `plan`
+  job compares `.github/workflows/release.yml` against what `dist` generates
+  and fails when they differ. The macOS signing change edited
+  `.github/build-setup.yml` without re-running `dist generate`, leaving the
+  codesign step and the web-runtime gate in opposite orders in the two files,
+  so 1.34.0's release workflow stopped before building anything. 1.34.0 is on
+  crates.io and npm but has no archives, shell/PowerShell installer, or
+  Homebrew formula — use 1.34.1 for those. No library or CLI behaviour differs
+  between the two.
+
 ## 1.34.0
 
 ### Added
