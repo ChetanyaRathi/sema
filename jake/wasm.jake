@@ -13,10 +13,8 @@ example_dir = "examples/sema-web-app"
 
 # Compile the WASM VM. Depends on the wasm crate + every workspace crate it
 # pulls in; the broad glob is correct (sema-wasm re-exports the whole stack).
-# NOTE: jake directives (@needs, …) are not processed inside `file` recipes —
-# they'd run as shell commands — so the tool check is an inline guard here.
 file packages/sema-wasm/pkg/sema_wasm_bg.wasm: crates/**/*.rs Cargo.toml Cargo.lock
-    @command -v wasm-pack >/dev/null || { echo "wasm-pack not found — cargo install wasm-pack" >&2; exit 1; }
+    @needs wasm-pack "cargo install wasm-pack"
     npm run build:wasm
 
 @group wasm

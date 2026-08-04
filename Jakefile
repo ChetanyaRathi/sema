@@ -39,6 +39,7 @@
 @import "jake/release.jake" as release
 @import "jake/mcpb.jake" as mcpb
 @import "jake/scripts.jake" as scripts
+@import "jake/icons.jake"
 
 # Load .env so LLM/provider tasks pick up API keys (ANTHROPIC_API_KEY, …)
 # without polluting the shell. No-op when there's no .env.

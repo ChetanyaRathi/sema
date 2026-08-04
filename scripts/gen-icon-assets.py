@@ -59,6 +59,10 @@ SVG_CONSUMERS = {
 # rendered PNG (name-SIZE) -> consumer path.
 PNG_CONSUMERS = {
     "sema-mark-square-512": "website/public/avatar.png",
+    # Raster twin of website/public/logo.svg, at 2x its 366px width. Needed
+    # wherever SVG is rejected — the VS Marketplace strips <img> SVGs from a
+    # README, so vscode-sema points at https://sema-lang.com/logo.png.
+    "sema-logotype-732": "website/public/logo.png",
     # `crates/sema` embeds this as the Windows executable icon for `sema build`.
     # It needs a copy INSIDE the crate: `cargo package` ships only files under
     # the package root, so an `include_bytes!` reaching up to the repo-root

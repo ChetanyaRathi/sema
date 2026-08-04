@@ -16,7 +16,7 @@ those copies by hand.
 | --- | --- | --- |
 | `sema-mark-rounded.svg` | `(s)` mark on a rounded dark tile | favicons, VS Code / Open VSX marketplace icon, IntelliJ plugin icon |
 | `sema-mark-square.svg` | `(s)` mark, full-bleed square (no rounding) | avatars / org logos where the slot applies its own mask |
-| `sema-logotype.svg` | `(sema)` wordmark | website `themeConfig.logo` (`website/public/logo.svg`), `playground/logo.svg`, headers, marketing |
+| `sema-logotype.svg` | `(sema)` wordmark | website `themeConfig.logo` (`website/public/logo.svg`), `website/public/logo.png` (raster twin, for readers that reject SVG such as the VS Marketplace), `playground/logo.svg`, headers, marketing |
 | `sema-file-light.svg` / `sema-file-dark.svg` | `.sema` file icon (light-/dark-theme glyph) | VS Code + IntelliJ file-type icons |
 | `semac-file.svg` | `.semac` compiled-file icon | IntelliJ file-type icon |
 | `sema-notebook-file-light.svg` / `-dark.svg` | `.sema-nb` notebook file icon | VS Code + IntelliJ file-type icons |
@@ -25,6 +25,7 @@ those copies by hand.
 
 ```bash
 jake icons-assets     # render png/ + sync every consumer copy
+jake brand-assets     # refresh the website /icons showcase (brandAssets.js)
 ```
 
 This runs `scripts/gen-icon-assets.py`: it verifies each SVG is flattened,
