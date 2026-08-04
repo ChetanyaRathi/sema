@@ -1,5 +1,18 @@
 # Changelog
 
+## Unpublished
+
+### Added
+
+- **macOS release binaries are now Developer-ID signed, notarized, and
+  Sigstore-attested (#109, #107, #133).** Every `*-apple-darwin.tar.xz`
+  carries a hardened-runtime signature and a GitHub Artifact Attestation
+  (verifiable with `gh attestation verify`); binaries are submitted to Apple's
+  notary service after the release is published. Gatekeeper fetches the
+  notarization ticket online on first launch — no "unidentified developer"
+  dialog. Degrades gracefully without secrets; see `docs/release-signing.md`
+  for setup.
+
 ## 1.33.0
 
 ### Added
@@ -9,6 +22,14 @@
   Reads only the local credential store (never the network); the keychain
   backend, which has no enumeration API, says so and points at
   `SEMA_MCP_TOKEN_STORE=file` instead of pretending the store is empty.
+- **macOS release binaries are now Developer-ID signed, notarized, and
+  Sigstore-attested (#109, #107, #133).** Every `*-apple-darwin.tar.xz`
+  carries a hardened-runtime signature and a GitHub Artifact Attestation
+  (verifiable with `gh attestation verify`); binaries are submitted to Apple's
+  notary service after the release is published. Gatekeeper fetches the
+  notarization ticket online on first launch — no "unidentified developer"
+  dialog. Degrades gracefully without secrets; see `docs/release-signing.md`
+  for setup.
 
 ### Improved
 
