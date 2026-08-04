@@ -15,6 +15,11 @@ contain at least one body expression. Each protected boundary emits a
   (step "Inspect the legacy fixture." {:tools [read-file]}))
 ```
 
+The form requires an enclosing `workflow/run` with at least one active policy.
+Without one it raises `policy/without requires an active workflow policy`, so
+the example above only works inside a workflow whose `:policy` (or an enclosing
+step's `:policy`) is set.
+
 The bypass is task-local and applies only to its body. It does not bypass
 workflow `:permissions`, the CLI sandbox, or allowed-path limits.
 

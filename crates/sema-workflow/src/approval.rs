@@ -1676,6 +1676,125 @@ mod tests {
     }
 
     #[test]
+    fn a_forged_decision_with_a_recomputed_id_is_rejected() {
+        // `decision_id` is sha256 over the binding and the signature, with no secret in
+        // it, so anyone who can write the run directory can recompute it. That makes the
+        // Ed25519 check the only thing standing between a hostile workflow and a forged
+        // approval. Every other tampering test mutates a bound field, which the
+        // decision-id derivation rejects on its own, so this is the only case that fails
+        // if signature verification stops happening.
+        let root = temp_root("forged-decision");
+        let run_dir = run_dir(&root);
+        let request = request();
+        ensure_request(&run_dir, &request).unwrap();
+
+        let attacker = ApprovalSigningKey::generate().unwrap();
+        let binding = DecisionBinding {
+            schema_version: APPROVAL_SCHEMA_VERSION,
+            approval_id: &request.approval_id,
+            request_digest: &request.request_digest,
+            request_revision: request.revision,
+            decision: ApprovalDecisionKind::Approve,
+            actor: "mallory",
+            provenance: "forged",
+            comment: None,
+            reason: None,
+            decided_at: "2026-08-04T00:00:00Z",
+        };
+        let binding_bytes = binding_bytes(&binding);
+        let signature = attacker.sign(&binding_bytes).unwrap();
+        // Derived exactly as ApprovalDecision::new does, so the id itself is consistent.
+        let decision_id = format!(
+            "dec_{}",
+            &sha256_fields(&[&sha256_bytes(&binding_bytes), &signature])[..24]
+        );
+        let forged = ApprovalDecision {
+            schema_version: APPROVAL_SCHEMA_VERSION,
+            decision_id,
+            approval_id: request.approval_id.clone(),
+            request_digest: request.request_digest.clone(),
+            request_revision: request.revision,
+            decision: ApprovalDecisionKind::Approve,
+            actor: "mallory".into(),
+            provenance: "forged".into(),
+            comment: None,
+            reason: None,
+            decided_at: "2026-08-04T00:00:00Z".into(),
+            signature,
+        };
+        fs::write(
+            decision_path(&run_dir, &request.approval_id),
+            serde_json::to_vec_pretty(&forged).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            ensure_request(&run_dir, &request).unwrap_err().kind(),
+            io::ErrorKind::InvalidData,
+            "a decision signed by a key that is not the request authority was accepted"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_decision_bound_to_a_different_request_is_rejected() {
+        // Same authority and a self-consistent decision, but it carries another
+        // request's digest and revision. Only the request/revision binding check in
+        // validate_for rejects this.
+        let root = temp_root("cross-request-decision");
+        let run_dir = run_dir(&root);
+        let request = request();
+        ensure_request(&run_dir, &request).unwrap();
+
+        let other_digest =
+            "sha256:0000000000000000000000000000000000000000000000000000000000000000";
+        let binding = DecisionBinding {
+            schema_version: APPROVAL_SCHEMA_VERSION,
+            approval_id: &request.approval_id,
+            request_digest: other_digest,
+            request_revision: request.revision + 7,
+            decision: ApprovalDecisionKind::Approve,
+            actor: "alice",
+            provenance: "cli",
+            comment: None,
+            reason: None,
+            decided_at: "2026-08-04T00:00:00Z",
+        };
+        let binding_bytes = binding_bytes(&binding);
+        let signature = test_key().sign(&binding_bytes).unwrap();
+        let decision_id = format!(
+            "dec_{}",
+            &sha256_fields(&[&sha256_bytes(&binding_bytes), &signature])[..24]
+        );
+        let stale = ApprovalDecision {
+            schema_version: APPROVAL_SCHEMA_VERSION,
+            decision_id,
+            approval_id: request.approval_id.clone(),
+            request_digest: other_digest.to_string(),
+            request_revision: request.revision + 7,
+            decision: ApprovalDecisionKind::Approve,
+            actor: "alice".into(),
+            provenance: "cli".into(),
+            comment: None,
+            reason: None,
+            decided_at: "2026-08-04T00:00:00Z".into(),
+            signature,
+        };
+        fs::write(
+            decision_path(&run_dir, &request.approval_id),
+            serde_json::to_vec_pretty(&stale).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            ensure_request(&run_dir, &request).unwrap_err().kind(),
+            io::ErrorKind::InvalidData,
+            "a decision bound to a different request digest/revision was accepted"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn tampered_decision_is_rejected() {
         let root = temp_root("tampered-decision");
         let run_dir = run_dir(&root);

@@ -1,5 +1,10 @@
 <script setup>
 import CustomPageLayout from './CustomPageLayout.vue'
+
+// __SEMA_VERSION__ is inlined from the workspace Cargo.toml by vite.define in
+// .vitepress/config.ts, so a release does not leave a stale number in the hero.
+// Omitted if the file could not be read.
+const versionLabel = __SEMA_VERSION__ ? `v${__SEMA_VERSION__} · ` : ''
 </script>
 
 <template>
@@ -44,7 +49,7 @@ import CustomPageLayout from './CustomPageLayout.vue'
             <span aria-hidden="true">&rarr;</span>
           </a>
         </div>
-        <p class="req">v1.33.0 · MIT · macOS, Linux, and Windows</p>
+        <p class="req">{{ versionLabel }}MIT · macOS, Linux, and Windows</p>
       </div>
     </header>
 
@@ -141,8 +146,8 @@ import CustomPageLayout from './CustomPageLayout.vue'
     (map <span class="c-kwd">:id</span>)))
 
 (<span class="c-kw">match</span> urgent-ids
-  []       <span class="c-str">"nothing urgent"</span>
-  [id &amp; _] f<span class="c-str">"start with ticket ${id}"</span>)</code></pre>
+  ([]       <span class="c-str">"nothing urgent"</span>)
+  ([id &amp; _] f<span class="c-str">"start with ticket ${id}"</span>))</code></pre>
           </figure>
 
           <dl class="language-notes">
@@ -170,7 +175,7 @@ import CustomPageLayout from './CustomPageLayout.vue'
             <div>
               <dt>Designed for generated code</dt>
               <dd>
-                A regular grammar and a concise agent guide give coding agents a
+                A uniform syntax and a concise agent guide give coding agents a
                 small, stable target.
                 <a href="/docs/for-agents">Read the guide &rarr;</a>
               </dd>

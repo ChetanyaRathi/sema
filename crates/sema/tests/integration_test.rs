@@ -16295,3 +16295,66 @@ fn test_mcp_list_reads_the_file_store() {
 
     let _ = std::fs::remove_dir_all(&home);
 }
+
+/// `sema pkg install` must refuse to install into a project whose own
+/// `[package].sema_version_req` this Sema does not satisfy, the way Cargo refuses on
+/// `rust-version`. Mutation testing found the check had no coverage: deleting the call
+/// in `cmd_install` left every `pkg::` unit test green, because they all exercise the
+/// helper directly and none go through the command.
+#[test]
+fn pkg_install_refuses_a_project_requiring_another_sema() {
+    let dir = std::env::temp_dir().join(format!(
+        "sema-pkg-install-req-{}-{}",
+        std::process::id(),
+        line!()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let current = env!("CARGO_PKG_VERSION");
+    let major: u64 = current.split('.').next().unwrap().parse().unwrap();
+    let unsatisfiable = format!(">{}.0.0", major + 1);
+    std::fs::write(
+        dir.join("sema.toml"),
+        format!(
+            "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nsema_version_req = \"{unsatisfiable}\"\n\n[deps]\n"
+        ),
+    )
+    .unwrap();
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_sema"))
+        .args(["pkg", "install"])
+        .current_dir(&dir)
+        .output()
+        .expect("failed to run sema pkg install");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "install succeeded despite an unsatisfiable sema_version_req; stdout: {} stderr: {stderr}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(
+        stderr.contains("requires Sema") && stderr.contains(current),
+        "error should name the requirement and the running version; got: {stderr}"
+    );
+
+    // A satisfiable requirement is accepted (empty [deps] installs nothing).
+    std::fs::write(
+        dir.join("sema.toml"),
+        "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nsema_version_req = \"*\"\n\n[deps]\n",
+    )
+    .unwrap();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_sema"))
+        .args(["pkg", "install"])
+        .current_dir(&dir)
+        .output()
+        .expect("failed to run sema pkg install");
+    assert!(
+        output.status.success(),
+        "install rejected a satisfiable requirement: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

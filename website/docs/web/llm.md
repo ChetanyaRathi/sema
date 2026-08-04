@@ -238,7 +238,7 @@ Here is a complete example that builds a chat interface with progressive token d
           [:div {:class "msg assistant"}
             [:p (:text s)]
             (unless (:done s)
-              [:span {:class "typing"} "..."]]))))])
+              [:span {:class "typing"} "..."])])))])
 
 (define (chat-input)
   [:div {:class "input-row"}

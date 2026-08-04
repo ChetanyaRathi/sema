@@ -23,6 +23,20 @@ Define a tool with a name, description, parameter schema, and handler function.
       (else "Unknown"))))
 ```
 
+An optional options map goes between the parameter schema and the handler. It
+accepts one key, `:policy-subjects`, which declares the file, network, command,
+or external action the tool performs. A workflow policy `:subjects` rule matches
+those declarations — see
+[Semantic subjects](/docs/llm/workflows#semantic-subjects).
+
+```sema
+(deftool read-source
+  "Read a source file."
+  {:path {:type :string}}
+  {:policy-subjects [{:kind :file-read :path-arg :path}]}
+  (lambda (path) (file/read path)))
+```
+
 ### Using Tools with Chat
 
 Pass tools to `llm/chat` — the LLM will call them automatically when needed.
@@ -51,6 +65,13 @@ Pass tools to `llm/chat` — the LLM will call them automatically when needed.
 
 ```sema
 (tool/parameters lookup-capital)        ; => {:country {:type :string ...}}
+```
+
+### `tool/policy-subjects`
+
+```sema
+(tool/policy-subjects read-source)      ; => [{:kind :file-read :path-arg :path}]
+(tool/policy-subjects lookup-capital)   ; => []
 ```
 
 ### `tool?`
