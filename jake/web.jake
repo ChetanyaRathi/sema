@@ -43,5 +43,8 @@ task og: [deps]
 @needs npx
 task deploy: [build]
     @confirm "Deploy the docs site to production?"
+    # Vercel uploads only `website/`, so the workspace Cargo.toml is absent during the
+    # remote build and config.ts cannot read the version from it. Pass it explicitly;
+    # without this the hero silently renders without a version.
     @cd website
-    npx vercel --prod --yes
+    npx vercel --prod --yes --build-env SEMA_VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' ../Cargo.toml | head -1)"

@@ -11,11 +11,17 @@ import { SITE, OG_WIDTH, OG_HEIGHT, OG_EXT, ogSlug } from './og.shared.mjs'
 // so they never go stale. Replaces the old hand-maintained public/llms*.txt.
 import llmstxt from 'vitepress-plugin-llms'
 
-// The version shown in the homepage hero, read from the workspace Cargo.toml at
-// build time. It was hardcoded in HomepageV2.vue and went stale on every release;
-// scripts/generate-og.mjs already reads the same file for the docs-card badge.
-// Returns '' when the file cannot be read, and the hero then omits the segment.
+// The version shown in the homepage hero. It was hardcoded in HomepageV2.vue and
+// went stale on every release; scripts/generate-og.mjs reads the same value from
+// Cargo.toml for the docs-card badge.
+//
+// SEMA_VERSION is required on Vercel. The project is CLI-deployed and uploads only
+// `website/`, so the workspace Cargo.toml does not exist during a remote build —
+// `jake site.deploy` passes the value with `--build-env`. Reading Cargo.toml is the
+// local path (dev server, `jake site.build`), where the file is one level up.
 function semaVersion(): string {
+  const fromEnv = process.env.SEMA_VERSION?.trim()
+  if (fromEnv) return fromEnv
   try {
     const cargo = readFileSync(
       fileURLToPath(new URL('../../Cargo.toml', import.meta.url)),
