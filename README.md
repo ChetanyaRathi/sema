@@ -1,27 +1,24 @@
-<p align="center">
-  <img src="https://raw.githubusercontent.com/sema-lisp/sema/main/assets/og-github.jpg" alt="Sema — Stop rewriting the agent loop." width="800">
-</p>
+<div align="center">
 
-<p align="center">
-  A Lisp where LLM agents are language primitives, not an SDK —<br>
-  compiled to a fast bytecode VM, shipped as a single binary.
-</p>
+<img src="https://sema-lang.com/logo.svg" alt="Sema" height="64">
 
-<p align="center">
-  <a href="https://sema.run"><img src="https://img.shields.io/badge/try_it-sema.run-c8a855?style=flat" alt="Playground"></a>
-  <a href="https://sema-lang.com/docs/"><img src="https://img.shields.io/badge/docs-sema--lang.com-c8a855?style=flat" alt="Docs"></a>
-  <a href="https://github.com/sema-lisp/sema/releases/latest"><img src="https://img.shields.io/github/v/tag/sema-lisp/sema?label=version&color=c8a855&style=flat" alt="Version"></a>
-  <a href="https://codecov.io/gh/sema-lisp/sema"><img src="https://codecov.io/gh/sema-lisp/sema/graph/badge.svg" alt="Coverage"></a>
-  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-c8a855?style=flat" alt="License"></a>
-</p>
+# Sema
 
-<p align="center">
-  <a href="https://sema-lang.com/docs/"><b>Docs</b></a> ·
-  <a href="https://sema.run"><b>Playground</b></a> ·
-  <a href="https://sema-lang.com/docs/for-agents"><b>For Agents</b></a> ·
-  <a href="https://github.com/sema-lisp/sema/tree/main/examples"><b>Examples</b></a> ·
-  <a href="https://github.com/sema-lisp/sema/issues"><b>Issues</b></a>
-</p>
+**A Lisp where LLM agents are language primitives, not an SDK** — compiled to a fast bytecode VM, shipped as a single binary.
+
+[![Playground](https://img.shields.io/badge/try_it-sema.run-c8a855?style=flat)](https://sema.run)
+[![Docs](https://img.shields.io/badge/docs-sema--lang.com-c8a855?style=flat)](https://sema-lang.com/docs/)
+[![Version](https://img.shields.io/github/v/tag/sema-lisp/sema?label=version&color=c8a855&style=flat)](https://github.com/sema-lisp/sema/releases/latest)
+[![Coverage](https://codecov.io/gh/sema-lisp/sema/graph/badge.svg)](https://codecov.io/gh/sema-lisp/sema)
+[![License](https://img.shields.io/badge/license-MIT-c8a855?style=flat)](LICENSE)
+
+[**Docs**](https://sema-lang.com/docs/) ·
+[**Playground**](https://sema.run) ·
+[**For Agents**](https://sema-lang.com/docs/for-agents) ·
+[**Examples**](https://github.com/sema-lisp/sema/tree/main/examples) ·
+[**Issues**](https://github.com/sema-lisp/sema/issues)
+
+</div>
 
 **Stop rewriting the agent loop.** Every LLM script grows the same scaffolding — retries, caching, cost caps, rate limits, tool dispatch, conversation state. Sema makes that scaffolding the runtime: your script stays the size of its idea, ships as a single binary, and your coding agent already speaks the language.
 
