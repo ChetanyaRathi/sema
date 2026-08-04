@@ -47,8 +47,11 @@ The `meta-map` supports:
 | `:phases` | `[:string …]` | Declared phase plan — the dashboard shows all phases up front |
 | `:budget` | `{:tokens N :usd M}` | Spend caps (see [Budget Enforcement](#budget-enforcement)) |
 | `:permissions` | string | Sandbox restrictions for `sema workflow run`, using the same syntax as `--sandbox` |
-| `:policy` | policy | Model/tool allowlist for this workflow (see [Model and tool policies](#model-and-tool-policies)) |
+| `:policy` | policy | Model, tool, subject, and content guards for this workflow (see [Model and tool policies](#model-and-tool-policies)) |
 | `:args` | map | Argument schema (informational; the actual args come from `--args`) |
+
+Any other key in the meta map is recorded in `metadata.json` and is available to a
+policy `:metadata :require` rule (see [Run-wide evidence](#run-wide-evidence)).
 
 The body is ordinary Sema code. `phase` markers interleave with `def`,
 `step`, `checkpoint`, `parallel`, `pipeline`, and any other Sema forms. The
@@ -364,6 +367,8 @@ Old runs stay readable forever.
 | `agent.tool_result` | `agent_id`, `tool_name` | An agent tool call completed successfully |
 | `policy.checked` | `policy`, `boundary`, `subject`, `rule`, `source` | A policy layer allowed a protected boundary |
 | `policy.violation` | `policy`, `boundary`, `subject`, `rule`, `action`, `source` | A policy layer denied a protected boundary |
+| `policy.flagged` | `policy`, `boundary`, `subject`, `rule`, `label`, `count`, `action`, `source` | A content detector matched under the `:audit` action; the value was not changed |
+| `policy.redacted` | `policy`, `boundary`, `subject`, `rule`, `label`, `count`, `source` | A content detector matched under the `:redact` action; the matched spans were replaced |
 | `policy.bypassed` | `policy`, `boundary`, `subject`, `reason`, `source` | A lexical `policy/without` scope bypassed a protected boundary |
 | `approval.requested` | `approval_id`, `request_digest`, `key`, `reason`, `subject_digest` | A durable request stopped the run |
 | `approval.granted` | `approval_id`, `decision_id`, `actor`, `provenance` | An approved decision was observed on resume |
@@ -504,8 +509,22 @@ they cannot loosen a stricter `--sandbox` or `--allowed-paths` setting.
 
 ## Model and tool policies
 
-Policies constrain the resolved model and model-requested tool calls inside a
-workflow. Define one with `defpolicy`, then attach it to a workflow:
+A policy is a compiled, immutable map that guards a workflow at its boundaries.
+Define one with `defpolicy`, then attach it to a workflow or a step with
+`:policy`. A policy map accepts seven sections, and every section is optional:
+
+| Section | Guards |
+|---------|--------|
+| `:models` | Which `provider/model` a call may resolve to |
+| `:tools` | Which tool names a model may call, and the values of their named arguments |
+| `:subjects` | The file, network, command, or external action a tool actually performs (see [Semantic subjects](#semantic-subjects)) |
+| `:input` | Text sent to a model (see [Content guards](#content-guards)) |
+| `:output` | Text returned by a model (see [Content guards](#content-guards)) |
+| `:metadata` | Workflow metadata keys the run must declare (see [Run-wide evidence](#run-wide-evidence)) |
+| `:completion` | Journal events the run must produce before it reports success (see [Run-wide evidence](#run-wide-evidence)) |
+
+Any other key is rejected when the policy compiles, with the closest valid key
+as a hint.
 
 ```sema
 (defpolicy safe-agent
@@ -556,7 +575,9 @@ arguments:
 
 A leading `*.` matches subdomains only, so list both `"example.com"` and
 `"*.example.com"` when both the apex and its subdomains are allowed. URLs
-containing credentials are always denied.
+containing credentials are always denied. `:domains` defaults `:schemes` to
+`["https"]`; add `:schemes ["http" "https"]` to accept plain HTTP. The only
+accepted schemes are `"http"` and `"https"`.
 
 Use explicit selectors when a tool uses different argument names or has
 multiple path-like arguments:
@@ -570,6 +591,167 @@ multiple path-like arguments:
              :allow ["generated/**"]
              :deny ["generated/private/**"]}]}}}}
 ```
+
+### Semantic subjects
+
+A `:tools` rule matches a tool by name and inspects the arguments that rule
+names. A `:subjects` rule matches what the tool actually does, so one rule
+covers every tool that performs that action. The tool declares its own
+subjects; the policy matches them.
+
+Declare subjects in the optional options map of `deftool`, between the
+parameter schema and the handler:
+
+```sema
+(deftool read-source
+  "Read a source file."
+  {:path {:type :string}}
+  {:policy-subjects [{:kind :file-read :path-arg :path}]}
+  (fn (path) (file/read path)))
+
+(tool/policy-subjects read-source)
+; => [{:kind :file-read :path-arg :path}]
+```
+
+`:policy-subjects` is the only option `deftool` accepts. A tool without an
+options map declares no subjects.
+
+| `:kind` | Required keys | Optional keys |
+|---------|---------------|---------------|
+| `:file-read` | `:path-arg` | — |
+| `:file-write` | `:path-arg` | — |
+| `:file-delete` | `:path-arg` | — |
+| `:network-request` | `:url-arg` | `:method` |
+| `:command` | `:command-arg` | — |
+| `:external-action` | `:action` | `:target-arg` |
+
+`:path-arg`, `:url-arg`, `:command-arg`, and `:target-arg` name a parameter of
+that tool. The runtime reads the model-supplied value of that argument and
+matches it against the policy.
+
+A `:subjects` section holds `:default`, `:allow`, and `:deny` lists of rules.
+Each rule needs a `:kind` and may add one constraint:
+
+```sema
+(defpolicy sandboxed-actions
+  {:subjects
+   {:default :deny
+    :allow [{:kind :file-read  :paths ["src/**" "tests/**"]}
+            {:kind :file-write :paths ["generated/**"]}
+            {:kind :network-request
+             :domains {:allow ["docs.rs" "*.docs.rs"]}
+             :methods [:get]}
+            {:kind :command :commands ["cargo test"]}
+            {:kind :external-action :actions ["publish-draft"]}]
+    :deny  [{:kind :file-write :paths ["src/secrets/**"]}]}})
+```
+
+- `:paths`, `:domains`, and `:commands` take the same selector shapes as the
+  `:tools` constraints above, without the `:arg` key — the argument is already
+  named by the tool's subject declaration.
+- `:methods` is valid only on `:network-request`. An empty or absent list
+  matches any method.
+- `:actions` is valid only on `:external-action`. An empty or absent list
+  matches any action.
+- `:default` defaults to `:deny`, like `:models` and `:tools`.
+- Under `:default :deny`, a tool that declares no subjects is denied with the
+  rule `subjects.missing`. Declare subjects on every tool such a policy allows.
+
+Deny rules fail closed. A deny rule denies any value it cannot evaluate: a
+non-string argument, an unparsable URL, a URL whose scheme or port is outside
+the rule's selector, a path that escapes the workspace, or an absent request
+method. `:domains` defaults `:schemes` to `["https"]`, so a `:network-request`
+deny rule denies every `http://` URL, not only the hosts in its `:allow` list.
+Allow rules fail closed the same way: a value the rule cannot evaluate is never
+allowlisted. A value that *was* compared and is simply not covered stays a
+non-match for both, so a deny rule naming one host does not deny every other
+host.
+
+### Content guards
+
+`:input` scans every system prompt, message, embedding input, and rerank
+document before the provider call. `:output` scans the assistant response,
+including a response replayed from the cache or a cassette. Both take a
+`:detect` list and an optional `:actions` map:
+
+```sema
+(defpolicy no-pii
+  {:input  {:detect [:secret :email :phone :ipv4 :payment-card]
+            :actions {:email :redact :phone :redact}}
+   :output {:detect [:secret]
+            :max-length 4000
+            :require [:summary]
+            :schema {:summary :string :confidence {:type :number :optional true}}
+            :forbid [{:id "no-placeholder" :contains "TODO"}
+                     {:id "no-lorem" :regex "(?i)lorem ipsum"}]
+            :action :block}})
+```
+
+The detectors are `:secret`, `:email`, `:phone`, `:ipv4`, and `:payment-card`.
+Each detector's action defaults to `:block`; `:actions` overrides it with
+`:audit`, `:redact`, or `:block`. An `:actions` key that is not listed in
+`:detect` is a compile error, and `:allow` is not a valid detector action.
+
+| Action | Effect |
+|--------|--------|
+| `:audit` | The value passes through unchanged and a `policy.flagged` event records the rule, label, and match count |
+| `:redact` | Each matched span is replaced with `«redacted:<label>»` and a `policy.redacted` event is emitted |
+| `:block` | The call raises `:policy-denied` before the provider is contacted, and a `policy.violation` event is emitted |
+
+The strictest action across all matching detectors and all active layers wins.
+Text over 16 MiB is blocked without being scanned.
+
+`:output` adds four more checks on top of the detectors:
+
+| Key | Check | Stage |
+|-----|-------|-------|
+| `:forbid` | No entry matches. Each entry needs a unique `:id` and exactly one of `:contains` (literal) or `:regex` | Every assistant response |
+| `:schema` | The response parses as a JSON object and each named field is present and has the declared type (`:string`, `:number`, `:boolean`, `:list`). A field may be written `{:type :string :optional true}` | Final response only |
+| `:require` | The named JSON fields are present and not empty | Final response only |
+| `:max-length` | The response is at most N characters | Final response only |
+
+The detectors and `:forbid` run on every assistant response, including the
+intermediate rounds of a tool loop. The three structural checks run only on the
+final response, because an intermediate round carries tool calls rather than the
+answer.
+
+`:action` selects what a structural or `:forbid` failure does: `:block` (the
+default) or `:audit`. It does not accept `:redact`, because only detector spans
+have a position to replace.
+
+### Run-wide evidence
+
+`:metadata` and `:completion` describe the run as a whole. Both must be
+attached to the workflow policy; `sema workflow check` and the runtime reject
+them on a step policy.
+
+`:metadata {:require [...]}` names keys the `defworkflow` meta map must declare
+with a non-empty value. A missing key denies the run at its start, before any
+step:
+
+```sema
+(defpolicy change-controlled
+  {:metadata {:require [:owner :change-id :environment]}})
+
+(defworkflow deploy
+  "Deploy the service."
+  {:phases ["Ship"]
+   :policy change-controlled
+   :owner "platform-team"
+   :change-id "CHG-1042"
+   :environment "production"}
+
+  (phase "Ship")
+  {:status :success})
+```
+
+`:completion {:require-events [...]}` names journal events the run must have
+produced before it may report success. A run that never emitted one of them
+ends `{:status :failed :error "completion policy missing required events: …"}`.
+The accepted names are every event in the
+[event vocabulary](#event-vocabulary) except `run.ended`, plus `auth.required`,
+`auth.granted`, and `auth.failed`. Any other name is a compile error that lists
+the valid set.
 
 ### Composition and denial behavior
 
@@ -708,9 +890,12 @@ LLM**. Catches arity traps, bad options, invalid literal policy maps,
 `defpolicy` shape errors, unsafe matcher syntax, and invalid
 `policy/without` reasons before you spend a token.
 
-Policy diagnostics identify the invalid field or one-based list entry. Unknown
-keys include a suggested replacement when one is close, or list the valid keys.
-Invalid enum values list the accepted Sema keywords.
+Policy diagnostics identify the invalid field and, for a list, the entry that
+failed. Detector and `:forbid` lists count entries from one (`:input :detect
+entry 2`, `:output :forbid entry 2`); `:subjects :allow` and `:subjects :deny`
+use a zero-based index (`:subjects :deny[0]`). Unknown keys include a suggested
+replacement when one is close, or list the valid keys. Invalid enum values list
+the accepted Sema keywords.
 
 ```bash
 $ sema workflow check audit.sema
@@ -764,9 +949,11 @@ not run workflow code in the viewer; resume the same run to apply it.
 ## Macro cookbook
 
 The workflow DSL is homoiconic — agent patterns from the literature are
-macros that expand into `parallel`, `pipeline`, and `step` forms. These are
-from `examples/workflows/cookbook.sema` — load and use them inside any
-`defworkflow` body.
+macros that expand into `parallel`, `pipeline`, and `step` forms. The versions
+below are shortened for reading. `examples/workflows/cookbook.sema` holds the
+versions to load and use inside a `defworkflow` body; they are the same
+patterns with gensym-suffixed (`name#`) bindings, so a caller's own variables
+cannot be captured.
 
 ### ReAct
 
@@ -800,7 +987,7 @@ Attempt → self-critique → retry with critique, bounded.
                        {:name "actor"})))
        (if (>= try ,max-tries)
          attempt
-         (let ((critique (agent
+         (let ((critique (step
            (str "Critique this attempt. If it is good, reply exactly "
                 "\"OK\". Otherwise list concrete fixes.\n\n" attempt)
            {:name "critic"})))
@@ -818,11 +1005,12 @@ Fan out N candidates in parallel, score, keep the best.
   `(let ((cands (filter (fn (c) (not (nil? c)))
                   (parallel
                     (map (fn (i)
-                           (fn () (agent
+                           (fn () (step
                              (str ,prompt "\n(Give one distinct candidate, "
                                   "attempt #" i ".)")
                              {:name "thought"})))
-                         (range ,n))))))
+                         (range ,n))
+                    ,n))))
      (if (null? cands)
        nil
        (foldl (fn (best c)
@@ -878,7 +1066,7 @@ sema workflow run examples/workflows/content-pipeline.sema --view
 
 ```bash
 # Run a workflow file
-sema workflow run <file> [--args <json>] [--run-dir <dir>] [--view] [--port <n>] [--resume <run-id>] [--approval-mode auto|prompt|pause|deny] [--approval-public-key-file <file>] [--approval-signing-key-file <file>] [--approval-actor <name>]
+sema workflow run <file> [--args <json>] [--run-dir <dir>] [--view] [--port <n>] [--resume <run-id>] [--no-auth-prompt] [--approval-mode auto|prompt|pause|deny] [--approval-public-key-file <file>] [--approval-signing-key-file <file>] [--approval-actor <name>]
 
 # Inspect or decide durable approval requests
 sema workflow approval-keygen --private-key-file <file> --public-key-file <file>
@@ -892,9 +1080,25 @@ sema workflow check <file> [--strict] [--json]
 # Backfill the cross-run SQLite index
 sema workflow index [--run-dir <dir>]
 
+# Export the evidence bundle for one completed run
+sema workflow export <run-id> [--run-dir <dir>] [--out-dir <dir>]
+
 # Open the web viewer; signing-key and actor enable loopback decision controls
 sema workflow view [--run-dir <dir>] [--host <addr>] [--port <n>] [--approval-signing-key-file <file>] [--approval-actor <name>]
 ```
+
+`--approval-signing-key-file` on `run` requires `--view`; `--approval-actor`
+requires `--approval-signing-key-file`. `--no-auth-prompt` disables the inline
+MCP login on a needs-auth gate, so the run exits 2 even on a terminal.
+
+`sema workflow run` exit codes:
+
+| Code | Meaning |
+|------|---------|
+| 0 | The run reported `{:status :success …}` |
+| 1 | The run failed, an approval was rejected, or `--approval-mode deny` refused a gate |
+| 2 | A declared `:mcp` server needs authentication; run `sema mcp login` and re-run |
+| 3 | A human approval is pending; decide it, then re-run with `--resume` |
 
 ## Internal API
 

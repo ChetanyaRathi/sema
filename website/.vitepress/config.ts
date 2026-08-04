@@ -1,3 +1,5 @@
+import { readFileSync } from 'node:fs'
+import { fileURLToPath } from 'node:url'
 import { defineConfig } from 'vitepress'
 // Vendored copy of the canonical grammar in sema-lisp/vscode-sema (syntaxes/sema.tmLanguage.json)
 import semaLang from './sema.tmLanguage.json'
@@ -8,6 +10,22 @@ import { SITE, OG_WIDTH, OG_HEIGHT, OG_EXT, ogSlug } from './og.shared.mjs'
 // Auto-generates /llms.txt (index) and /llms-full.txt (all docs) at build time,
 // so they never go stale. Replaces the old hand-maintained public/llms*.txt.
 import llmstxt from 'vitepress-plugin-llms'
+
+// The version shown in the homepage hero, read from the workspace Cargo.toml at
+// build time. It was hardcoded in HomepageV2.vue and went stale on every release;
+// scripts/generate-og.mjs already reads the same file for the docs-card badge.
+// Returns '' when the file cannot be read, and the hero then omits the segment.
+function semaVersion(): string {
+  try {
+    const cargo = readFileSync(
+      fileURLToPath(new URL('../../Cargo.toml', import.meta.url)),
+      'utf8',
+    )
+    return cargo.match(/^\s*version\s*=\s*"([^"]+)"/m)?.[1] ?? ''
+  } catch {
+    return ''
+  }
+}
 
 export default defineConfig({
   title: 'Sema',
@@ -31,6 +49,9 @@ export default defineConfig({
 
   // Allow importing the built @sema/ui bundle + example sources from the repo root.
   vite: {
+    // Inlined at build time so the hero version cannot go stale. Not themeConfig:
+    // that type rejects unknown keys.
+    define: { __SEMA_VERSION__: JSON.stringify(semaVersion()) },
     server: { fs: { allow: ['../..'] } },
     plugins: [
       llmstxt({

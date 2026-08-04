@@ -76,6 +76,13 @@ Sema enforces it when installing:
   incompatible version rather than installing it, and say which requirement
   failed.
 - Git dependencies are checked at the resolved commit before checkout.
+- `sema pkg install` also enforces the **current project's own**
+  `sema_version_req` from its `sema.toml`, before it reads `[deps]`. This
+  Sema will not install dependencies into a checkout it cannot run.
+- `sema pkg publish` does **not** enforce `sema_version_req`; it only checks
+  that the value is a string, is non-blank, is at most 128 characters, and
+  parses as a semver requirement. A package can therefore be published from
+  CI on a different Sema than the one it targets.
 
 If no published version matches, the error lists what each version wanted:
 
@@ -85,8 +92,11 @@ No version of 'policies' supports Sema 1.33.0:
   2.0.0 requires Sema >=2.0.0
 ```
 
+The list is sorted and capped at five entries, followed by `… and N more`.
+
 A prerelease Sema is matched as its release version, so `1.34.0-rc.1` counts
-as `1.34.0` and can install packages that ask for `>=1.34.0`.
+as `1.34.0` and can install packages that ask for `>=1.34.0`. The requirement
+still applies at the release level: `1.34.0-rc.1` does not satisfy `>=2.0.0`.
 
 The `[deps]` section maps package identifiers to versions or git refs:
 
@@ -580,7 +590,11 @@ sema pkg add my-internal-lib --registry https://registry.mycompany.com
 sema pkg publish --registry https://registry.mycompany.com
 ```
 
-All `sema pkg` commands that interact with the registry accept a `--registry` flag to override the default.
+`sema pkg add`, `search`, `info`, `publish`, `login`, and `yank` accept a
+`--registry` flag to override the default. `sema pkg install` and
+`sema pkg update` do not. `install` uses the configured default
+(`SEMA_REGISTRY_URL`, then `registry.url`); `update` uses the registry recorded
+with each installed package.
 
 ## Troubleshooting
 
