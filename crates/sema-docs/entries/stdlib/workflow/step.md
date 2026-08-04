@@ -11,7 +11,8 @@ site; the named, reusable counterpart is an `agent`. Runs `prompt` through the c
 provider and returns **typed data** when `opts` carries a `:schema` (validated via
 `llm/extract`), or the completion text otherwise — so the next stage of a `pipeline`
 can consume the result directly without re-parsing. `opts` also carries `:name`, the role
-label shown in the dashboard (default `"step"`).
+label shown in the dashboard (default `"step"`), and `:policy`, which adds a policy layer
+for this step. A step policy can tighten an enclosing workflow policy but cannot loosen it.
 
 The call is wrapped by `workflow/step`, which emits `agent.started`/`agent.result`
 plus a per-step `budget` event, so each invocation becomes a correlated row under the
@@ -32,6 +33,7 @@ owns those):
   validated. Per-step budget for a multi-round tool loop is best-effort (the Budget event
   reflects the final round's usage).
 - `:schema S` — `llm/extract` (typed data).
+- `:policy P` — add model and tool restrictions for this step.
 - otherwise — `llm/complete` (text).
 
 ```sema
@@ -51,4 +53,4 @@ owns those):
   (fn (x) (step (str "Verify " (:claim x)) {:name "verifier" :schema verdict})))
 ```
 
-See also: `agent`, `workflow/step`, `pipeline`, `parallel`, `defworkflow`, `checkpoint`.
+See also: `agent`, `workflow/step`, `pipeline`, `parallel`, `defworkflow`, `defpolicy`, `checkpoint`.

@@ -14,8 +14,9 @@
 //! Field ordering convention: `seq` then `ts` lead every variant (so a human or
 //! `jq` scan sees ordering+time first), followed by the variant-specific payload.
 //!
-//! This vocabulary is FROZEN. Add fields to existing variants (append-only, all
-//! `Option`/skippable to keep old goldens valid) rather than inventing new variants.
+//! Existing variants are FROZEN. Additive variants are allowed. Fields added to an
+//! existing variant must be append-only and optional/skippable so old goldens remain
+//! valid.
 
 use serde::Serialize;
 
@@ -116,6 +117,17 @@ pub enum WorkflowEvent {
         args_json: String,
     },
 
+    /// A tool handler returned successfully. The result is an opaque digest or
+    /// gated sentinel; raw tool output never enters the workflow journal.
+    #[serde(rename = "agent.tool_result")]
+    AgentToolResult {
+        seq: u64,
+        ts: String,
+        agent_id: String,
+        tool_name: String,
+        result_digest: String,
+    },
+
     /// A `checkpoint` recorded a keyed step value. The value itself is NOT stored in
     /// the event stream — only a (lossy) digest — and a `content_key` resume hash.
     #[serde(rename = "checkpoint")]
@@ -159,8 +171,8 @@ pub enum WorkflowEvent {
     },
 
     /// Last line of every run. `status` mirrors the `{:status …}` envelope's status
-    /// (`"success"` / `"failed"` / `"needs-auth"`); `reason` carries the failure
-    /// reason when failed.
+    /// (`"success"`, `"failed"`, `"needs-auth"`, `"needs-approval"`, or
+    /// `"rejected"`); `reason` carries the terminal reason when present.
     #[serde(rename = "run.ended")]
     RunEnded {
         seq: u64,
@@ -232,6 +244,193 @@ pub enum WorkflowEvent {
         /// material.
         reason: String,
     },
+
+    /// A policy layer allowed one protected model or tool boundary.
+    #[serde(rename = "policy.checked")]
+    PolicyChecked {
+        seq: u64,
+        ts: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        phase_seq: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent_id: Option<String>,
+        policy: String,
+        policy_digest: String,
+        boundary: String,
+        subject: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        subject_digest: Option<String>,
+        rule: String,
+        source: String,
+    },
+
+    /// A deterministic policy rule observed content in audit-only mode.
+    #[serde(rename = "policy.flagged")]
+    PolicyFlagged {
+        seq: u64,
+        ts: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        phase_seq: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent_id: Option<String>,
+        policy: String,
+        policy_digest: String,
+        boundary: String,
+        subject: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        subject_digest: Option<String>,
+        rule: String,
+        label: String,
+        count: usize,
+        action: String,
+        source: String,
+    },
+
+    /// A deterministic policy rule mechanically redacted one or more spans.
+    #[serde(rename = "policy.redacted")]
+    PolicyRedacted {
+        seq: u64,
+        ts: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        phase_seq: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent_id: Option<String>,
+        policy: String,
+        policy_digest: String,
+        boundary: String,
+        subject: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        subject_digest: Option<String>,
+        rule: String,
+        label: String,
+        count: usize,
+        source: String,
+    },
+
+    /// A policy layer denied one protected model or tool boundary.
+    #[serde(rename = "policy.violation")]
+    PolicyViolation {
+        seq: u64,
+        ts: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        phase_seq: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent_id: Option<String>,
+        policy: String,
+        policy_digest: String,
+        boundary: String,
+        subject: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        subject_digest: Option<String>,
+        rule: String,
+        action: String,
+        reason: String,
+        source: String,
+    },
+
+    /// A trusted lexical `policy/without` scope bypassed the effective policy stack.
+    #[serde(rename = "policy.bypassed")]
+    PolicyBypassed {
+        seq: u64,
+        ts: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        phase_seq: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent_id: Option<String>,
+        policy: String,
+        policy_digest: String,
+        boundary: String,
+        subject: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        subject_digest: Option<String>,
+        rule: String,
+        reason: String,
+        source: String,
+    },
+
+    /// A durable explicit approval request stopped workflow evaluation.
+    #[serde(rename = "approval.requested")]
+    ApprovalRequested {
+        seq: u64,
+        ts: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        phase_seq: Option<u64>,
+        approval_id: String,
+        request_digest: String,
+        key: String,
+        reason: String,
+        subject_digest: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        preview: Option<String>,
+    },
+
+    /// An approved durable decision was observed while replaying the gate.
+    #[serde(rename = "approval.granted")]
+    ApprovalGranted {
+        seq: u64,
+        ts: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        phase_seq: Option<u64>,
+        approval_id: String,
+        decision_id: String,
+        actor: String,
+        provenance: String,
+    },
+
+    /// A rejected durable decision was observed while replaying the gate.
+    #[serde(rename = "approval.rejected")]
+    ApprovalRejected {
+        seq: u64,
+        ts: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        phase_seq: Option<u64>,
+        approval_id: String,
+        decision_id: String,
+        actor: String,
+        provenance: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
+
+    /// Execution crossed an explicit gate after observing an approved decision.
+    #[serde(rename = "approval.applied")]
+    ApprovalApplied {
+        seq: u64,
+        ts: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        phase_seq: Option<u64>,
+        approval_id: String,
+        decision_id: String,
+    },
+}
+
+impl WorkflowEvent {
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::RunStarted { .. } => "run.started",
+            Self::PhaseStarted { .. } => "phase.started",
+            Self::PhaseEnded { .. } => "phase.ended",
+            Self::AgentStarted { .. } => "agent.started",
+            Self::AgentResult { .. } => "agent.result",
+            Self::AgentToolCall { .. } => "agent.tool_call",
+            Self::AgentToolResult { .. } => "agent.tool_result",
+            Self::Checkpoint { .. } => "checkpoint",
+            Self::Budget { .. } => "budget",
+            Self::RunEnded { .. } => "run.ended",
+            Self::AuthRequired { .. } => "auth.required",
+            Self::AuthGranted { .. } => "auth.granted",
+            Self::AuthFailed { .. } => "auth.failed",
+            Self::PolicyChecked { .. } => "policy.checked",
+            Self::PolicyFlagged { .. } => "policy.flagged",
+            Self::PolicyRedacted { .. } => "policy.redacted",
+            Self::PolicyViolation { .. } => "policy.violation",
+            Self::PolicyBypassed { .. } => "policy.bypassed",
+            Self::ApprovalRequested { .. } => "approval.requested",
+            Self::ApprovalGranted { .. } => "approval.granted",
+            Self::ApprovalRejected { .. } => "approval.rejected",
+            Self::ApprovalApplied { .. } => "approval.applied",
+        }
+    }
 }
 
 #[cfg(test)]
@@ -404,6 +603,52 @@ mod tests {
         assert_eq!(
             line,
             r#"{"event":"auth.failed","seq":7,"ts":"0","server":"asana","reason":"consent_denied"}"#
+        );
+    }
+
+    #[test]
+    fn policy_events_are_additive_and_keep_tool_arguments_opaque() {
+        let checked = WorkflowEvent::PolicyChecked {
+            seq: 8,
+            ts: "0".into(),
+            phase_seq: Some(2),
+            agent_id: Some("coder_1".into()),
+            policy: "safe".into(),
+            policy_digest: "policy-sha".into(),
+            boundary: "tool".into(),
+            subject: "read-file".into(),
+            subject_digest: Some("args-sha".into()),
+            rule: "tools.read-file.allow".into(),
+            source: "live".into(),
+        };
+        assert_eq!(
+            serde_json::to_string(&checked).unwrap(),
+            r#"{"event":"policy.checked","seq":8,"ts":"0","phase_seq":2,"agent_id":"coder_1","policy":"safe","policy_digest":"policy-sha","boundary":"tool","subject":"read-file","subject_digest":"args-sha","rule":"tools.read-file.allow","source":"live"}"#
+        );
+
+        let violation = WorkflowEvent::PolicyViolation {
+            seq: 9,
+            ts: "0".into(),
+            phase_seq: None,
+            agent_id: None,
+            policy: "safe".into(),
+            policy_digest: "policy-sha".into(),
+            boundary: "model".into(),
+            subject: "openai/gpt-5".into(),
+            subject_digest: None,
+            rule: "models.default-deny".into(),
+            action: "fail".into(),
+            reason: "not allowlisted".into(),
+            source: "cache".into(),
+        };
+        let line = serde_json::to_string(&violation).unwrap();
+        assert_eq!(
+            line,
+            r#"{"event":"policy.violation","seq":9,"ts":"0","policy":"safe","policy_digest":"policy-sha","boundary":"model","subject":"openai/gpt-5","rule":"models.default-deny","action":"fail","reason":"not allowlisted","source":"cache"}"#
+        );
+        assert!(
+            !line.contains("args_json"),
+            "policy events must never expose raw tool arguments"
         );
     }
 }

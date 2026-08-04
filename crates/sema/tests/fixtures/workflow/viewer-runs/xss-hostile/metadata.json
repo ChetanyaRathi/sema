@@ -1,0 +1,10 @@
+{
+  "workflow": "xss-hostile",
+  "meta": {
+    "mcp": {
+      "alias\" onpointerenter=\"globalThis.__semaXss=3": {
+        "command": "test-server"
+      }
+    }
+  }
+}

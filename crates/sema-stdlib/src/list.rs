@@ -2010,7 +2010,7 @@ pub fn register(env: &sema_core::Env) {
             } else {
                 "nth: argument order is (nth collection index); the index must be an integer"
             };
-            SemaError::type_error("int", args[1].type_name()).with_hint(hint)
+            SemaError::argument_type("nth", 2, "int", &args[1]).with_hint(hint)
         })?;
         if idx_i < 0 {
             return Err(
@@ -2036,8 +2036,10 @@ pub fn register(env: &sema_core::Env) {
                 ))
             })
         } else {
-            Err(SemaError::type_error("list or vector", args[0].type_name())
-                .with_hint("nth: argument 1 must be a list, vector, or mutable-array"))
+            Err(
+                SemaError::argument_type("nth", 1, "list, vector, or mutable-array", &args[0])
+                    .with_hint("nth: argument 1 must be a list, vector, or mutable-array"),
+            )
         }
     });
 

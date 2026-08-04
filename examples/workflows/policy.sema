@@ -1,0 +1,60 @@
+;; Least-privilege workflow policy example.
+;;
+;; The names in :tools :allow must match ToolDefinitions passed to an agent.
+;; Replace the example model identities with providers/models configured in your
+;; environment before running this workflow.
+
+(deftool read-file
+  "Read one repository file."
+  {:path {:type :string :description "Workspace-relative path"}}
+  (lambda (path) (file/read path)))
+
+(deftool fetch-url
+  "Fetch one HTTPS URL."
+  {:url {:type :string :description "Absolute HTTPS URL"}}
+  (lambda (url) (http/get url)))
+
+(deftool run-command
+  "Run one exact allowlisted command."
+  {:command {:type :string :description "Exact command string"}}
+  (lambda (command) (shell command)))
+
+(defpolicy repository-auditor
+  {:models
+   {:default :deny
+    :allow ["openai/gpt-5" "anthropic/*"]
+    :on-deny :fail}
+
+   :tools
+   {:default :deny
+    :allow
+    {"read-file"
+     {:paths ["Cargo.toml" "src/**" "crates/**"]}
+
+     "fetch-url"
+     {:domains {:allow ["api.example.com" "*.example.com"]
+                :schemes ["https"]
+                :ports [443]}}
+
+     "run-command"
+     {:commands ["cargo check" "cargo test"]}}
+    :deny ["delete-file"]
+    :on-deny :tool-error}})
+
+(defworkflow policy-demo
+  "Demonstrate model/tool policy composition."
+  {:phases ["Audit"]
+   :permissions "no-fs-write"
+   :policy repository-auditor}
+
+  (phase "Audit")
+  (def report
+    (step "Inspect this repository without modifying it."
+      {:name "auditor"
+       :tools [read-file fetch-url run-command]
+       ;; A step policy can only tighten the workflow policy.
+       :policy {:tools
+                {:default :deny
+                 :allow
+                 {"read-file" {:paths ["src/**" "crates/**"]}}}}}))
+  {:status :success :report report})

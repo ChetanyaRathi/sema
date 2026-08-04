@@ -14,6 +14,7 @@
 
 use std::rc::Rc;
 
+pub mod workflow_evidence;
 pub mod workflow_mcp;
 // `sema workflow view` — the dashboard server. Lives in the library (not just
 // `main.rs`) so `crates/sema/tests/*.rs` integration tests can drive it

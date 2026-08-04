@@ -5,12 +5,20 @@ use std::rc::Rc;
 use hashbrown::HashMap;
 
 use crate::cycle::GcEdge;
+use crate::SemaError;
 
 use super::Trace;
 
 pub trait TaskLocalValue: Trace + Any {
     fn inherit(&self) -> Rc<dyn TaskLocalValue>;
     fn as_any(&self) -> &dyn Any;
+
+    /// A task-local extension may fail a task before its next VM quantum. This is for
+    /// shared fail-closed state (for example, a workflow child invalidating its owner),
+    /// not ordinary language-level cancellation.
+    fn preflight_error(&self) -> Option<SemaError> {
+        None
+    }
 }
 
 #[derive(Default)]
@@ -75,6 +83,16 @@ impl TaskContext {
                 .collect(),
         }
     }
+
+    pub fn preflight_error(&self) -> Option<SemaError> {
+        let mut errors = self
+            .extensions
+            .values()
+            .filter_map(|value| value.preflight_error())
+            .collect::<Vec<_>>();
+        errors.sort_by_key(SemaError::user_message);
+        errors.into_iter().next()
+    }
 }
 
 impl Trace for TaskContext {
@@ -101,6 +119,10 @@ impl TaskContextHandle {
 
     pub fn inherit_for_child(&self) -> Self {
         Self(Rc::new(RefCell::new(self.borrow().inherit_for_child())))
+    }
+
+    pub fn preflight_error(&self) -> Option<SemaError> {
+        self.borrow().preflight_error()
     }
 }
 

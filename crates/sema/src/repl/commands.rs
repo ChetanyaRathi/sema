@@ -91,7 +91,7 @@ pub fn dispatch(
         match interpreter.eval_str_in_global(rest) {
             Ok(val) => {
                 if let Err(e) = super::inspector::run(val, rest) {
-                    eprintln!("inspector error: {e}");
+                    crate::print_cli_error(format!("inspector failed: {e}"));
                 }
             }
             Err(e) => print_error(&e),

@@ -284,10 +284,27 @@ pub const PRELUDE: &str = r#"
 (defmacro with-session (id config . body)
   `(otel/with-session ,id ,config (lambda () ,@body)))
 
+;; defpolicy: name a reusable workflow policy. The runtime compiles the resulting
+;; immutable map before entering a protected workflow/step body.
+(defmacro defpolicy (name rules)
+  `(define ,name
+     (assoc (assoc ,rules
+              :__policy-name (symbol->string (quote ,name)))
+       :__policy-version 1)))
+
+;; policy/without: trusted, lexical, audited policy bypass. It never changes the
+;; workflow's outer :permissions sandbox ceiling.
+(defmacro policy/without (reason . body)
+  (if (or (not (string? reason)) (null? body))
+    (error "policy/without requires a literal reason string and at least one body form")
+    `(workflow/policy-without ,reason (fn () ,@body))))
+
 ;; defworkflow: define + run a sequential, journaled workflow.
 ;; (defworkflow audit-auth "doc" {:phases [...] :budget {:tokens N :usd N}} (phase ...) ...)
 ;; The meta map's `:budget` submap caps spend: `:tokens` (deterministic) and/or `:usd`
-;; (best-effort, pricing-table dependent). Exceeding a cap latches the run and refuses
+;; (best-effort, pricing-table dependent). `:policy` installs a model/tool policy for
+;; the full workflow body; a step's own `:policy` can only tighten it. Exceeding a cap
+;; latches the run and refuses
 ;; to launch further `step` leaves; the run ends {:status :failed :reason "budget
 ;; exceeded"}. Concurrent fan-out shares the aggregate budget while each task keeps
 ;; its own last-usage snapshot and leaf accumulator.
@@ -343,6 +360,12 @@ pub const PRELUDE: &str = r#"
 (defmacro phase (label)
   `(workflow/phase ,label))
 
+;; approval: a durable host-controlled workflow gate. `opts` requires a human-readable
+;; :reason and an identity-only :subject; optional :preview is the only subject text
+;; written to the request sidecar. Pending/rejected gates stop the enclosing workflow.
+(defmacro approval (key opts)
+  `(workflow/approval ,key ,opts))
+
 ;; checkpoint: a run-scoped state write/read. The write form delays its value
 ;; expression so `workflow/checkpoint` can return a resume memo before evaluating
 ;; expensive or side-effecting work.
@@ -357,7 +380,8 @@ pub const PRELUDE: &str = r#"
 ;; named/reusable actor). Runs the prompt through the configured provider and returns
 ;; TYPED DATA when `:schema` is supplied (validated via `llm/extract`), or the
 ;; completion text otherwise. The optional opts map carries `:name` (the role label
-;; shown in the dashboard, default "step"), `:schema`, `:tools`, and `:agent`. The
+;; shown in the dashboard, default "step"), `:schema`, `:tools`, `:agent`, and
+;; tightening `:policy`. The
 ;; call is wrapped by `workflow/step`, which emits agent.started/agent.result + a
 ;; per-step budget event. (The `agent.*` event names are the FROZEN internal journal
 ;; contract — they predate the step rename and stay; `agent_name` carries the step's
@@ -443,10 +467,15 @@ pub const PRELUDE: &str = r#"
                                                  (keys s#)))
                                           #t)))
                    ;; the `:on-tool-call` shim — journals each genuine tool call as an
-                   ;; agent.tool_call event. Shared by the `:agent` and `:tools` branches.
+                   ;; agent.tool_call event and each successful completion as
+                   ;; agent.tool_result. Shared by the `:agent` and `:tools` branches.
                    (st-on-tool# (fn (ev#)
-                                  (when (= (:event ev#) "start")
-                                    (workflow/tool-call (:tool ev#) (:args ev#))))))
+                                  (cond
+                                    ((= (:event ev#) "start")
+                                     (workflow/tool-call (:tool ev#) (:args ev#)))
+                                    ((and (= (:event ev#) "end")
+                                          (not (:error ev#)))
+                                     (workflow/tool-result (:tool ev#)))))))
                ;; validate the final text against `:schema` (no-op text passthrough when
                ;; no schema). Shared by the `:agent` and `:tools` branches.
                (let ((st-validate# (fn (txt# sch#)

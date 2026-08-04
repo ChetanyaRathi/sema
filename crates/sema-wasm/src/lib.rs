@@ -1901,16 +1901,7 @@ impl WasmInterpreter {
             }
             Err(e) => {
                 let output = take_output();
-                let mut err_str = format!("{}", e.inner());
-                if let Some(trace) = e.stack_trace() {
-                    err_str.push_str(&format!("\n{trace}"));
-                }
-                if let Some(hint) = e.hint() {
-                    err_str.push_str(&format!("\n  hint: {hint}"));
-                }
-                if let Some(note) = e.note() {
-                    err_str.push_str(&format!("\n  note: {note}"));
-                }
+                let err_str = e.format_plain();
                 format!(
                     "{{\"value\":null,\"output\":[{}],\"error\":\"{}\"}}",
                     output
@@ -2072,16 +2063,7 @@ impl WasmInterpreter {
             }
             Err(e) => {
                 let output = take_output();
-                let mut err_str = format!("{}", e.inner());
-                if let Some(trace) = e.stack_trace() {
-                    err_str.push_str(&format!("\n{trace}"));
-                }
-                if let Some(hint) = e.hint() {
-                    err_str.push_str(&format!("\n  hint: {hint}"));
-                }
-                if let Some(note) = e.note() {
-                    err_str.push_str(&format!("\n  note: {note}"));
-                }
+                let err_str = e.format_plain();
                 format!(
                     "{{\"value\":null,\"output\":[{}],\"error\":\"{}\"}}",
                     output
@@ -2122,16 +2104,7 @@ impl WasmInterpreter {
             }
             Err(e) => {
                 let output = take_output();
-                let mut err_str = format!("{}", e.inner());
-                if let Some(trace) = e.stack_trace() {
-                    err_str.push_str(&format!("\n{trace}"));
-                }
-                if let Some(hint) = e.hint() {
-                    err_str.push_str(&format!("\n  hint: {hint}"));
-                }
-                if let Some(note) = e.note() {
-                    err_str.push_str(&format!("\n  note: {note}"));
-                }
+                let err_str = e.format_plain();
                 format!(
                     "{{\"value\":null,\"output\":[{}],\"error\":\"{}\"}}",
                     output
@@ -2955,7 +2928,7 @@ impl WasmInterpreter {
                 &self.callback_ids_by_value,
                 &self.next_callback_id,
             )),
-            Err(e) => Err(JsValue::from_str(&format!("{}", e.inner()))),
+            Err(e) => Err(JsValue::from_str(&e.format_plain())),
         }
     }
 
@@ -2988,7 +2961,7 @@ impl WasmInterpreter {
                 &self.callback_ids_by_value,
                 &self.next_callback_id,
             )),
-            Err(e) => Err(JsValue::from_str(&format!("{}", e.inner()))),
+            Err(e) => Err(JsValue::from_str(&e.format_plain())),
         }
     }
 
@@ -3054,7 +3027,7 @@ impl WasmInterpreter {
             Ok(()) => r#"{"ok":true,"error":null}"#.to_string(),
             Err(e) => format!(
                 r#"{{"ok":false,"error":"{}"}}"#,
-                escape_json(&format!("{}", e.inner()))
+                escape_json(&e.format_plain())
             ),
         };
         js_sys::JSON::parse(&json_str).unwrap_or(JsValue::NULL)
@@ -3109,7 +3082,7 @@ impl WasmInterpreter {
             ),
             Err(e) => format!(
                 "{{\"ok\":false,\"entryPoint\":null,\"fileCount\":0,\"semaVersion\":null,\"buildTarget\":null,\"buildTimestamp\":null,\"error\":\"{}\"}}",
-                escape_json(&format!("{}", e.inner()))
+                escape_json(&e.format_plain())
             ),
         };
         js_sys::JSON::parse(&json_str).unwrap_or(JsValue::NULL)
@@ -3246,7 +3219,7 @@ impl WasmInterpreter {
     pub fn write_file(&self, path: &str, content: &str) -> JsValue {
         let path = match normalize_path(path) {
             Ok(p) => p,
-            Err(e) => return JsValue::from_str(&format!("{}", e.inner())),
+            Err(e) => return JsValue::from_str(&e.format_plain()),
         };
         match vfs_check_quota(&path, content.len()) {
             Ok(()) => {
@@ -3264,10 +3237,7 @@ impl WasmInterpreter {
                 });
                 JsValue::NULL
             }
-            Err(e) => {
-                let msg = format!("{}", e.inner());
-                JsValue::from_str(&msg)
-            }
+            Err(e) => JsValue::from_str(&e.format_plain()),
         }
     }
 
@@ -3493,16 +3463,7 @@ impl WasmInterpreter {
 
     fn eval_error_result(&self, e: &sema_core::SemaError) -> JsValue {
         let output = take_output();
-        let mut err_str = format!("{}", e.inner());
-        if let Some(trace) = e.stack_trace() {
-            err_str.push_str(&format!("\n{trace}"));
-        }
-        if let Some(hint) = e.hint() {
-            err_str.push_str(&format!("\n  hint: {hint}"));
-        }
-        if let Some(note) = e.note() {
-            err_str.push_str(&format!("\n  note: {note}"));
-        }
+        let err_str = e.format_plain();
         let json_str = format!(
             "{{\"value\":null,\"output\":[{}],\"error\":\"{}\"}}",
             output
@@ -3641,13 +3602,7 @@ impl WasmInterpreter {
 
     fn debug_error_result(&self, e: &sema_core::SemaError) -> JsValue {
         let output = take_output();
-        let mut err_str = format!("{}", e.inner());
-        if let Some(trace) = e.stack_trace() {
-            err_str.push_str(&format!("\n{trace}"));
-        }
-        if let Some(hint) = e.hint() {
-            err_str.push_str(&format!("\n  hint: {hint}"));
-        }
+        let err_str = e.format_plain();
         let output_json = output
             .iter()
             .map(|s| format!("\"{}\"", escape_json(s)))
@@ -3831,7 +3786,7 @@ pub fn format_code(code: &str, width: usize, indent: usize, align: bool) -> JsVa
         Err(e) => {
             let json_str = format!(
                 "{{\"formatted\":null,\"error\":\"{}\"}}",
-                escape_json(&format!("{}", e.inner()))
+                escape_json(&e.format_plain())
             );
             js_sys::JSON::parse(&json_str).unwrap_or(JsValue::NULL)
         }

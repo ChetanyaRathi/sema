@@ -38,6 +38,7 @@ fn diagnostic(e: &SemaError) -> Value {
         SemaError::Unbound(_) => "unbound-symbol",
         SemaError::Arity { .. } => "arity",
         SemaError::Type { .. } => "type",
+        SemaError::Internal(_) => "internal",
         _ => "error",
     };
     m.insert(kw("code"), Value::string(code));

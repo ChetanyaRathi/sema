@@ -50,7 +50,7 @@ pub use cycle::{
     GcPassEvent, GcStats, GcTrigger, NodePtr, OpaqueSeverFn, OpaqueTraceFn, PayloadTracer,
     RuntimeInteriorHooks,
 };
-pub use error::{CallFrame, SemaError, Span, SpanMap, StackTrace};
+pub use error::{suggest_similar, CallFrame, PolicyDenial, SemaError, Span, SpanMap, StackTrace};
 pub use home::sema_home;
 pub use io_backend::{
     io_backend, io_block_on, io_spawn, io_spawn_blocking, set_io_backend, AbortHook, BoxIoFuture,
@@ -73,11 +73,11 @@ pub use text_util::truncate_chars;
 pub use value::{
     bits_to_spur, compare_spurs, intern, interner_stats, next_gensym, pretty_print, resolve,
     resolve_multimethod_handler, select_multimethod_handler, spur_to_bits, with_resolved, Agent,
-    AsyncPromise, Channel, Conversation, Env, ImageAttachment, Lambda, Macro, Message, MultiMethod,
-    MutableArray, MutableCell, NativeFn, NativeSuspensionClass, PromiseState, Prompt, Record, Role,
-    SemaStream, StreamBox, SyntaxRules, Thunk, ToolDefinition, Value, ValueView, ValueViewRef,
-    NAN_INT_SIGN_BIT, NAN_INT_SMALL_PATTERN, NAN_PAYLOAD_BITS, NAN_PAYLOAD_MASK, NAN_TAG_MASK,
-    TAG_NATIVE_FN,
+    AsyncPromise, Channel, Conversation, Env, FileAccess, ImageAttachment, Lambda, Macro, Message,
+    MultiMethod, MutableArray, MutableCell, NativeFn, NativeSuspensionClass, PromiseState, Prompt,
+    Record, Role, SemaStream, StreamBox, SyntaxRules, Thunk, ToolDefinition, ToolPolicySubject,
+    Value, ValueView, ValueViewRef, NAN_INT_SIGN_BIT, NAN_INT_SMALL_PATTERN, NAN_PAYLOAD_BITS,
+    NAN_PAYLOAD_MASK, NAN_TAG_MASK, TAG_NATIVE_FN,
 };
 
 pub mod runtime;

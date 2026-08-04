@@ -63,6 +63,7 @@ toml.workspace = true
 toml_edit.workspace = true
 serde.workspace = true
 reqwest.workspace = true
+url.workspace = true
 directories.workspace = true
 sha2.workspace = true
 semver.workspace = true

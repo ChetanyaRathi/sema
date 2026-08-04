@@ -320,11 +320,13 @@ fn optimize_inner(expr: CoreExpr, shadowed: &[String]) -> CoreExpr {
             name,
             description,
             parameters,
+            options,
             handler,
         } => CoreExpr::Deftool {
             name,
             description: Box::new(optimize_inner(*description, shadowed)),
             parameters: Box::new(optimize_inner(*parameters, shadowed)),
+            options: Box::new(optimize_inner(*options, shadowed)),
             handler: Box::new(optimize_inner(*handler, shadowed)),
         },
         CoreExpr::Defagent { name, options } => CoreExpr::Defagent {

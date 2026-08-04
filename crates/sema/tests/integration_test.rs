@@ -5323,7 +5323,7 @@ fn test_ast_parse_error() {
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("Parse error"),
+        stderr.contains("parsing failed") && stderr.contains("unterminated list"),
         "expected parse error: {stderr}"
     );
 }

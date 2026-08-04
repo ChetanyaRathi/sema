@@ -1,7 +1,8 @@
 use std::rc::Rc;
 
 use sema_core::{
-    intern, resolve, Agent, Env, EvalContext, Record, SemaError, Spur, ToolDefinition, Value,
+    intern, resolve, suggest_similar, Agent, Env, EvalContext, FileAccess, Record, SemaError, Spur,
+    ToolDefinition, ToolPolicySubject, Value,
 };
 
 use crate::eval::{self, Trampoline};
@@ -70,26 +71,187 @@ pub const SPECIAL_FORM_NAMES: &[&str] = &[
 
 /// Build a `ToolDefinition` from already-evaluated values and bind it in `env`.
 /// The VM's `__vm-deftool` native passes the pre-evaluated description /
-/// parameters / handler straight here.
+/// parameters / options / handler straight here.
 pub(crate) fn register_tool(
     name: &str,
     description: Value,
     parameters: Value,
+    options: Value,
     handler: Value,
     env: &Env,
 ) -> Result<Value, SemaError> {
     let description = description
         .as_str()
-        .ok_or_else(|| SemaError::type_error("string", description.type_name()))?
+        .ok_or_else(|| SemaError::argument_type("deftool", 2, "string", &description))?
         .to_string();
+    let policy_subjects = parse_tool_policy_subjects(&options)?;
     let tool = Value::tool_def(ToolDefinition {
         name: name.to_string(),
         description,
         parameters,
+        policy_subjects,
         handler,
     });
     env.set(intern(name), tool.clone());
     Ok(tool)
+}
+
+fn parse_tool_policy_subjects(options: &Value) -> Result<Vec<ToolPolicySubject>, SemaError> {
+    if options.is_nil() {
+        return Ok(Vec::new());
+    }
+    let map = options.as_map_rc().ok_or_else(|| {
+        SemaError::eval(format!(
+            "deftool: options must be a map, got {}",
+            options.type_name()
+        ))
+    })?;
+    for key in map.keys() {
+        let Some(key) = key.as_keyword() else {
+            return Err(SemaError::eval(format!(
+                "deftool: option keys must be keywords, got {}",
+                key.type_name()
+            )));
+        };
+        if key != "policy-subjects" {
+            let error = SemaError::eval(format!("deftool: unknown option :{key}"));
+            return Err(match suggest_similar(&key, &["policy-subjects"]) {
+                Some(candidate) => error.with_hint(format!("did you mean :{candidate}?")),
+                None => error.with_hint("the valid option is :policy-subjects"),
+            });
+        }
+    }
+    let Some(subjects) = map.get(&Value::keyword("policy-subjects")) else {
+        return Ok(Vec::new());
+    };
+    let subjects = subjects.as_seq().ok_or_else(|| {
+        SemaError::eval(format!(
+            "deftool: :policy-subjects must be a list or vector, got {}",
+            subjects.type_name()
+        ))
+    })?;
+    subjects
+        .iter()
+        .enumerate()
+        .map(|(index, value)| parse_tool_policy_subject(value, index + 1))
+        .collect::<Result<Vec<_>, _>>()
+}
+
+fn parse_tool_policy_subject(
+    value: &Value,
+    subject_index: usize,
+) -> Result<ToolPolicySubject, SemaError> {
+    let context = format!("deftool: policy subject {subject_index}");
+    let map = value.as_map_rc().ok_or_else(|| {
+        SemaError::eval(format!(
+            "{context} must be a map, got {}",
+            value.type_name()
+        ))
+    })?;
+    let kind = required_subject_name(&map, "kind", &context)?;
+    match kind.as_str() {
+        "file-read" | "file-write" | "file-delete" => {
+            reject_subject_keys(&map, &["kind", "path-arg"], &context)?;
+            let access = match kind.as_str() {
+                "file-read" => FileAccess::Read,
+                "file-write" => FileAccess::Write,
+                "file-delete" => FileAccess::Delete,
+                _ => unreachable!("matched file subject kind"),
+            };
+            Ok(ToolPolicySubject::File {
+                access,
+                path_arg: required_subject_name(&map, "path-arg", &context)?,
+            })
+        }
+        "network-request" => {
+            reject_subject_keys(&map, &["kind", "url-arg", "method"], &context)?;
+            Ok(ToolPolicySubject::NetworkRequest {
+                method: optional_subject_name(&map, "method", &context)?,
+                url_arg: required_subject_name(&map, "url-arg", &context)?,
+            })
+        }
+        "command" => {
+            reject_subject_keys(&map, &["kind", "command-arg"], &context)?;
+            Ok(ToolPolicySubject::Command {
+                command_arg: required_subject_name(&map, "command-arg", &context)?,
+            })
+        }
+        "external-action" => {
+            reject_subject_keys(&map, &["kind", "action", "target-arg"], &context)?;
+            Ok(ToolPolicySubject::ExternalAction {
+                action: required_subject_name(&map, "action", &context)?,
+                target_arg: optional_subject_name(&map, "target-arg", &context)?,
+            })
+        }
+        _ => Err(SemaError::eval(format!(
+            "{context} has unsupported :kind :{kind}"
+        ))
+        .with_hint(
+            "valid kinds are :file-read, :file-write, :file-delete, :network-request, :command, and :external-action",
+        )),
+    }
+}
+
+fn required_subject_name(
+    map: &std::collections::BTreeMap<Value, Value>,
+    key: &str,
+    context: &str,
+) -> Result<String, SemaError> {
+    map.get(&Value::keyword(key))
+        .ok_or_else(|| SemaError::eval(format!("{context} is missing :{key}")))
+        .and_then(|value| subject_name(value, key, context))
+}
+
+fn optional_subject_name(
+    map: &std::collections::BTreeMap<Value, Value>,
+    key: &str,
+    context: &str,
+) -> Result<Option<String>, SemaError> {
+    map.get(&Value::keyword(key))
+        .map(|value| subject_name(value, key, context))
+        .transpose()
+}
+
+fn subject_name(value: &Value, key: &str, context: &str) -> Result<String, SemaError> {
+    value
+        .as_keyword()
+        .or_else(|| value.as_str().map(str::to_string))
+        .ok_or_else(|| {
+            SemaError::eval(format!(
+                "{context} :{key} must be a keyword or string, got {}",
+                value.type_name()
+            ))
+        })
+}
+
+fn reject_subject_keys(
+    map: &std::collections::BTreeMap<Value, Value>,
+    allowed: &[&str],
+    context: &str,
+) -> Result<(), SemaError> {
+    for key in map.keys() {
+        let Some(key) = key.as_keyword() else {
+            return Err(SemaError::eval(format!(
+                "{context} keys must be keywords, got {}",
+                key.type_name()
+            )));
+        };
+        if !allowed.contains(&key.as_str()) {
+            let error = SemaError::eval(format!("{context} has unknown key :{key}"));
+            return Err(match suggest_similar(&key, allowed) {
+                Some(candidate) => error.with_hint(format!("did you mean :{candidate}?")),
+                None => error.with_hint(format!(
+                    "valid keys are {}",
+                    allowed
+                        .iter()
+                        .map(|key| format!(":{key}"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )),
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Build an `Agent` from an already-evaluated options map and bind it in `env`.
@@ -162,6 +324,16 @@ fn resolve_embedded_file(
     ctx: &EvalContext,
     spec: &str,
 ) -> Option<(std::path::PathBuf, std::path::PathBuf, Vec<u8>)> {
+    // Approval runs may snapshot a literal absolute import under its canonical
+    // filesystem identity. Hosts choose the embedded keys, so an exact absolute
+    // key is safe to consult before applying the portable VFS normalization.
+    let spec_path = std::path::PathBuf::from(spec);
+    if spec_path.is_absolute() {
+        if let Some(bytes) = ctx.get_embedded_file(&spec_path) {
+            return Some((spec_path.clone(), spec_path, bytes));
+        }
+    }
+
     // Archive keys are clean, lexically-normalized, root-relative paths (e.g.
     // "util.sema", "lib/util.sema"). Look the spec up in the same normalized form
     // — resolving "./", "../", and interior "." — so every spelling that names
@@ -228,6 +400,11 @@ pub(crate) fn prepare_load(
             file_path,
             bytes,
         });
+    }
+    if ctx.embedded_files_only() {
+        return Err(SemaError::Io(format!(
+            "load {path_str}: file is not in the host dependency snapshot"
+        )));
     }
 
     if sema_core::vfs::is_vfs_active() {
@@ -318,6 +495,11 @@ pub(crate) fn prepare_import(
         return Ok(prepared_import(
             path_str, identity, file_path, bytes, selective, ctx,
         ));
+    }
+    if ctx.embedded_files_only() {
+        return Err(SemaError::Io(format!(
+            "import {path_str}: file is not in the host dependency snapshot"
+        )));
     }
 
     if sema_core::vfs::is_vfs_active() {
@@ -742,6 +924,35 @@ mod tests {
         assert_eq!(
             interp.eval_str(r#"(import "./lib/u.sema") v"#).unwrap(),
             Value::int(8)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn embedded_import_absolute_identity() {
+        let interp = Interpreter::new();
+        let key = PathBuf::from("/snapshots/u.sema");
+        embed(
+            &interp,
+            key.to_str().unwrap(),
+            "(module u (export v) (define v 11))",
+        );
+        assert_eq!(
+            interp.eval_str(&format!("(import {key:?}) v")).unwrap(),
+            Value::int(11)
+        );
+    }
+
+    #[test]
+    fn embedded_only_mode_rejects_unlisted_imports() {
+        let interp = Interpreter::new();
+        interp.ctx.set_embedded_files_only(true);
+        let error = interp.eval_str(r#"(import "unlisted.sema")"#).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("file is not in the host dependency snapshot"),
+            "{error}"
         );
     }
 

@@ -101,6 +101,7 @@ impl Drop for ContextStacksMut<'_> {
 pub struct EvalContext {
     pub module_cache: RefCell<BTreeMap<PathBuf, BTreeMap<String, Value>>>,
     pub embedded_files: RefCell<BTreeMap<PathBuf, Vec<u8>>>,
+    embedded_files_only: Cell<bool>,
     pub current_file: RefCell<Vec<PathBuf>>,
     pub module_exports: RefCell<Vec<Option<Vec<String>>>>,
     pub module_load_stack: RefCell<Vec<PathBuf>>,
@@ -235,6 +236,7 @@ impl EvalContext {
         EvalContext {
             module_cache: RefCell::new(BTreeMap::new()),
             embedded_files: RefCell::new(BTreeMap::new()),
+            embedded_files_only: Cell::new(false),
             current_file: RefCell::new(Vec::new()),
             module_exports: RefCell::new(Vec::new()),
             module_load_stack: RefCell::new(Vec::new()),
@@ -266,6 +268,7 @@ impl EvalContext {
         EvalContext {
             module_cache: RefCell::new(BTreeMap::new()),
             embedded_files: RefCell::new(BTreeMap::new()),
+            embedded_files_only: Cell::new(false),
             current_file: RefCell::new(Vec::new()),
             module_exports: RefCell::new(Vec::new()),
             module_load_stack: RefCell::new(Vec::new()),
@@ -482,6 +485,15 @@ impl EvalContext {
 
     pub fn clear_embedded_files(&self) {
         self.embedded_files.borrow_mut().clear();
+    }
+
+    /// When enabled, `import` and `load` may only resolve host-provided embedded files.
+    pub fn set_embedded_files_only(&self, enabled: bool) {
+        self.embedded_files_only.set(enabled);
+    }
+
+    pub fn embedded_files_only(&self) -> bool {
+        self.embedded_files_only.get()
     }
 
     pub fn set_module_exports(&self, names: Vec<String>) {

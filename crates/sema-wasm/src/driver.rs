@@ -1281,17 +1281,7 @@ fn resolve_debug_immediately(resolve: &Function, result: JsValue) {
 }
 
 fn format_debug_error(error: &SemaError) -> String {
-    let mut message = format!("{}", error.inner());
-    if let Some(trace) = error.stack_trace() {
-        message.push_str(&format!("\n{trace}"));
-    }
-    if let Some(hint) = error.hint() {
-        message.push_str(&format!("\n  hint: {hint}"));
-    }
-    if let Some(note) = error.note() {
-        message.push_str(&format!("\n  note: {note}"));
-    }
-    message
+    error.format_plain()
 }
 
 fn resolve_with_value(resolve: &Function, value: &Value) {
@@ -1311,17 +1301,7 @@ fn resolve_with_value(resolve: &Function, value: &Value) {
 /// wrapper can recover full fidelity from a plain `JsFuture` rejection
 /// without a second, parallel error-detail channel.
 fn reject_with_error(reject: &Function, error: &SemaError) {
-    let mut message = format!("{}", error.inner());
-    if let Some(trace) = error.stack_trace() {
-        message.push_str(&format!("\n{trace}"));
-    }
-    if let Some(hint) = error.hint() {
-        message.push_str(&format!("\n  hint: {hint}"));
-    }
-    if let Some(note) = error.note() {
-        message.push_str(&format!("\n  note: {note}"));
-    }
-    reject_with_message(reject, &message);
+    reject_with_message(reject, &error.format_plain());
 }
 
 fn reject_with_message(reject: &Function, message: &str) {

@@ -147,6 +147,42 @@ impl fmt::Display for StackTrace {
 /// Maps Rc pointer addresses to source spans for expression tracking.
 pub type SpanMap = HashMap<usize, Span>;
 
+/// Structured details for a policy denial.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PolicyDenial {
+    pub policy: Option<String>,
+    pub boundary: String,
+    pub subject: String,
+    pub rule: String,
+    pub reason: String,
+    pub action: String,
+    pub source: String,
+}
+
+impl fmt::Display for PolicyDenial {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let Some(policy) = &self.policy {
+            write!(
+                f,
+                "Policy '{policy}' denied {} '{}': {}",
+                self.boundary, self.subject, self.reason
+            )
+        } else {
+            write!(
+                f,
+                "Policy denied {} '{}': {}",
+                self.boundary, self.subject, self.reason
+            )
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TypeContext {
+    pub function: String,
+    pub argument: Option<usize>,
+}
+
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum SemaError {
     #[error("Reader error at {span}: {message}")]
@@ -155,14 +191,18 @@ pub enum SemaError {
     #[error("Eval error: {0}")]
     Eval(String),
 
-    #[error("Type error: expected {expected}, got {got}{}", got_value.as_ref().map(|v| format!(" ({v})")).unwrap_or_default())]
+    #[error("Type error: {}expected {expected}, got {got}{}", type_context(context.as_deref()), got_value.as_ref().map(|v| format!(" ({v})")).unwrap_or_default())]
     Type {
+        context: Option<Box<TypeContext>>,
         expected: String,
         got: String,
         got_value: Option<String>,
     },
 
-    #[error("Arity error: {name} expects {expected} args, got {got}")]
+    #[error(
+        "Arity error: {name} expects {}, got {got}",
+        format_expected_arity(expected)
+    )]
     Arity {
         name: String,
         expected: String,
@@ -186,6 +226,33 @@ pub enum SemaError {
 
     #[error("Permission denied: {function} — path '{path}' is outside allowed directories")]
     PathDenied { function: String, path: String },
+
+    #[error("{0}")]
+    PolicyDenied(Box<PolicyDenial>),
+
+    /// Internal workflow control transfer emitted after a durable approval request has
+    /// been created. This is deliberately not catchable by Sema `try`/`catch`; only the
+    /// enclosing `workflow/run` consumes it and returns a `:needs-approval` envelope.
+    #[error("workflow approval required: {approval_id}")]
+    WorkflowApprovalRequired { approval_id: String },
+
+    /// Internal workflow control transfer emitted when a durable rejection is observed.
+    /// Like [`Self::WorkflowApprovalRequired`], user code cannot catch it and continue
+    /// past the protected action.
+    #[error("workflow approval rejected: {approval_id}")]
+    WorkflowApprovalRejected {
+        approval_id: String,
+        reason: Option<String>,
+    },
+
+    /// Fail-closed approval infrastructure or placement error. It is host-owned and
+    /// uncatchable for the same reason as pending/rejected controls: user code must not
+    /// continue to the protected action after authority validation fails.
+    #[error("workflow approval failed: {message}")]
+    WorkflowApprovalFailed { message: String },
+
+    #[error("Internal error: {0}")]
+    Internal(String),
 
     #[error("User exception: {0}")]
     UserException(Value),
@@ -211,6 +278,50 @@ pub enum SemaError {
         hint: Option<String>,
         note: Option<String>,
     },
+}
+
+fn type_context(context: Option<&TypeContext>) -> String {
+    match context {
+        Some(TypeContext {
+            function,
+            argument: Some(argument),
+        }) => format!("{function} argument {argument} "),
+        Some(TypeContext {
+            function,
+            argument: None,
+        }) => format!("{function} "),
+        None => String::new(),
+    }
+}
+
+fn format_expected_arity(expected: &str) -> String {
+    if let Some(minimum) = expected.strip_suffix('+') {
+        return format!("{minimum} or more arguments");
+    }
+    if let Some((minimum, maximum)) = expected.split_once('-') {
+        return format!("{minimum} to {maximum} arguments");
+    }
+    if expected.contains(" or ") {
+        return format!("{expected} arguments");
+    }
+    match expected {
+        "0" => "no arguments".to_string(),
+        "1" => "1 argument".to_string(),
+        _ => format!("{expected} arguments"),
+    }
+}
+
+fn type_message(
+    context: Option<&TypeContext>,
+    expected: &str,
+    got: &str,
+    got_value: Option<&str>,
+) -> String {
+    let value = got_value.map_or_else(String::new, |value| format!(" ({value})"));
+    format!(
+        "{}expected {expected}, got {got}{value}",
+        type_context(context)
+    )
 }
 
 /// Compute the Levenshtein edit distance between two strings.
@@ -330,6 +441,8 @@ const CONDITION_TYPES: &[&str] = &[
     "llm",
     "reader",
     "permission-denied",
+    "policy-denied",
+    "internal",
     "cancelled",
     "timeout",
 ];
@@ -387,6 +500,27 @@ fn insert_optional_string(condition: &mut BTreeMap<Value, Value>, key: &str, val
 impl SemaError {
     pub fn eval(msg: impl Into<String>) -> Self {
         SemaError::Eval(msg.into())
+    }
+
+    pub fn policy_denied(denial: PolicyDenial) -> Self {
+        let rule = denial.rule.clone();
+        SemaError::PolicyDenied(Box::new(denial)).with_note(format!("policy rule: {rule}"))
+    }
+
+    /// Whether this error is a host-owned control transfer that language-level exception
+    /// handlers must not intercept.
+    pub fn is_uncatchable(&self) -> bool {
+        matches!(
+            self.inner(),
+            SemaError::WorkflowApprovalRequired { .. }
+                | SemaError::WorkflowApprovalRejected { .. }
+                | SemaError::WorkflowApprovalFailed { .. }
+        )
+    }
+
+    pub fn internal(message: impl Into<String>) -> Self {
+        SemaError::Internal(message.into())
+            .with_hint("report this as a Sema bug and include the stack trace")
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -457,6 +591,7 @@ impl SemaError {
 
     pub fn type_error(expected: impl Into<String>, got: impl Into<String>) -> Self {
         SemaError::Type {
+            context: None,
             expected: expected.into(),
             got: got.into(),
             got_value: None,
@@ -468,16 +603,50 @@ impl SemaError {
         got: impl Into<String>,
         value: &Value,
     ) -> Self {
+        SemaError::Type {
+            context: None,
+            expected: expected.into(),
+            got: got.into(),
+            got_value: Some(Self::value_preview(value)),
+        }
+    }
+
+    pub fn argument_type(
+        function: impl Into<String>,
+        argument: usize,
+        expected: impl Into<String>,
+        value: &Value,
+    ) -> Self {
+        SemaError::Type {
+            context: Some(Box::new(TypeContext {
+                function: function.into(),
+                argument: Some(argument),
+            })),
+            expected: expected.into(),
+            got: value.type_name().to_string(),
+            got_value: None,
+        }
+    }
+
+    pub fn argument_type_with_value(
+        function: impl Into<String>,
+        argument: usize,
+        expected: impl Into<String>,
+        value: &Value,
+    ) -> Self {
+        let mut error = Self::argument_type(function, argument, expected, value);
+        if let SemaError::Type { got_value, .. } = &mut error {
+            *got_value = Some(Self::value_preview(value));
+        }
+        error
+    }
+
+    fn value_preview(value: &Value) -> String {
         let display = format!("{value}");
-        let truncated = if display.len() > 40 {
+        if display.len() > 40 {
             format!("{}…", crate::text_util::truncate_chars(&display, 39))
         } else {
             display
-        };
-        SemaError::Type {
-            expected: expected.into(),
-            got: got.into(),
-            got_value: Some(truncated),
         }
     }
 
@@ -598,6 +767,92 @@ impl SemaError {
             other => other,
         }
     }
+
+    /// Return the primary user-facing message without wrapper prefixes.
+    pub fn user_message(&self) -> String {
+        match self.inner() {
+            SemaError::Reader { message, .. } | SemaError::Eval(message) => message.clone(),
+            SemaError::Type {
+                context,
+                expected,
+                got,
+                got_value,
+            } => type_message(context.as_deref(), expected, got, got_value.as_deref()),
+            SemaError::Arity {
+                name,
+                expected,
+                got,
+            } => format!(
+                "{name} expects {}, got {got}",
+                format_expected_arity(expected)
+            ),
+            SemaError::Unbound(name) => format!("Unbound variable: {name}"),
+            SemaError::Llm(message) => format!("LLM error: {message}"),
+            SemaError::Io(message) => format!("I/O error: {message}"),
+            SemaError::PermissionDenied {
+                function,
+                capability,
+            } => format!("Permission denied: {function} requires '{capability}' capability"),
+            SemaError::PathDenied { function, path } => format!(
+                "Permission denied: {function} — path '{path}' is outside allowed directories"
+            ),
+            SemaError::PolicyDenied(denial) => denial.to_string(),
+            SemaError::WorkflowApprovalRequired { approval_id } => {
+                format!("workflow approval required: {approval_id}")
+            }
+            SemaError::WorkflowApprovalRejected {
+                approval_id,
+                reason,
+            } => reason.as_ref().map_or_else(
+                || format!("workflow approval rejected: {approval_id}"),
+                |reason| format!("workflow approval rejected: {approval_id}: {reason}"),
+            ),
+            SemaError::WorkflowApprovalFailed { message } => {
+                format!("workflow approval failed: {message}")
+            }
+            SemaError::Internal(message) => format!("Internal error: {message}"),
+            SemaError::UserException(value) => format!("User exception: {value}"),
+            SemaError::Condition(condition) => condition_message(condition),
+            SemaError::WithTrace { .. } | SemaError::WithContext { .. } => {
+                unreachable!("inner() already unwraps wrappers")
+            }
+        }
+    }
+
+    /// Format a diagnostic message without source location or stack frames.
+    pub fn format_diagnostic(&self) -> String {
+        let mut message = self.user_message();
+        if let Some(hint) = self.hint() {
+            message.push_str("\n  hint: ");
+            message.push_str(hint);
+        }
+        if let Some(note) = self.note() {
+            message.push_str("\n  note: ");
+            message.push_str(note);
+        }
+        message
+    }
+
+    /// Format an error for a plain-text channel.
+    pub fn format_plain(&self) -> String {
+        let mut message = self.user_message();
+        if let SemaError::Reader { span, .. } = self.inner() {
+            message.push_str(&format!("\n  at <input>:{span}"));
+        }
+        if let Some(trace) = self.stack_trace() {
+            message.push('\n');
+            message.push_str(trace.to_string().trim_end());
+        }
+        if let Some(hint) = self.hint() {
+            message.push_str("\n  hint: ");
+            message.push_str(hint);
+        }
+        if let Some(note) = self.note() {
+            message.push_str("\n  note: ");
+            message.push_str(note);
+        }
+        message
+    }
 }
 
 #[cfg(test)]
@@ -683,7 +938,7 @@ mod tests {
         assert!(
             matches!(
                 &e,
-                SemaError::Type { expected, got, got_value }
+                SemaError::Type { expected, got, got_value, .. }
                 if expected == "string" && got == "integer" && got_value.is_none()
             ),
             "expected Type variant with expected='string', got='integer', got_value=None, got {e:?}"
@@ -706,7 +961,10 @@ mod tests {
             "expected Arity variant with name='my-fn', expected='2', got=5, got {e:?}"
         );
         // Display check (intentionally testing Display format)
-        assert_eq!(e.to_string(), "Arity error: my-fn expects 2 args, got 5");
+        assert_eq!(
+            e.to_string(),
+            "Arity error: my-fn expects 2 arguments, got 5"
+        );
     }
 
     // 6. with_hint attaches hint retrievable via .hint()
@@ -943,7 +1201,7 @@ mod tests {
         assert!(
             matches!(
                 &e,
-                SemaError::Type { expected, got, got_value }
+                SemaError::Type { expected, got, got_value, .. }
                 if expected == "string" && got == "integer" && got_value.as_deref() == Some("42")
             ),
             "expected Type variant with expected='string', got='integer', got_value=Some(\"42\"), got {e:?}"
@@ -969,5 +1227,63 @@ mod tests {
         );
         // Display check (intentionally testing Display format)
         assert_eq!(e.to_string(), "Type error: expected string, got integer");
+    }
+
+    #[test]
+    fn argument_type_includes_call_context() {
+        let e = SemaError::argument_type_with_value("string/split", 1, "string", &Value::int(42));
+        assert_eq!(
+            e.user_message(),
+            "string/split argument 1 expected string, got int (42)"
+        );
+    }
+
+    #[test]
+    fn arity_expectations_use_readable_grammar() {
+        let cases = [
+            ("0", "f expects no arguments, got 9"),
+            ("1", "f expects 1 argument, got 9"),
+            ("2", "f expects 2 arguments, got 9"),
+            ("1+", "f expects 1 or more arguments, got 9"),
+            ("2-4", "f expects 2 to 4 arguments, got 9"),
+            ("2 or 3", "f expects 2 or 3 arguments, got 9"),
+        ];
+        for (expected, message) in cases {
+            assert_eq!(SemaError::arity("f", expected, 9).user_message(), message);
+        }
+    }
+
+    #[test]
+    fn policy_denial_preserves_details_and_renders_context() {
+        let e = SemaError::policy_denied(PolicyDenial {
+            policy: Some("safe-agent".to_string()),
+            boundary: "tool".to_string(),
+            subject: "shell/run".to_string(),
+            rule: "tools.shell.deny".to_string(),
+            reason: "command execution is not allowed".to_string(),
+            action: "fail".to_string(),
+            source: "request".to_string(),
+        });
+        assert_eq!(
+            e.user_message(),
+            "Policy 'safe-agent' denied tool 'shell/run': command execution is not allowed"
+        );
+        assert_eq!(e.note(), Some("policy rule: tools.shell.deny"));
+    }
+
+    #[test]
+    fn plain_format_orders_trace_hint_and_note() {
+        let e = SemaError::eval("failed")
+            .with_stack_trace(StackTrace(vec![CallFrame {
+                name: "main".to_string(),
+                file: None,
+                span: Some(Span::point(2, 3)),
+            }]))
+            .with_hint("try again")
+            .with_note("extra context");
+        assert_eq!(
+            e.format_plain(),
+            "failed\n  at main (<input>:2:3)\n  hint: try again\n  note: extra context"
+        );
     }
 }

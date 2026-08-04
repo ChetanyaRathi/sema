@@ -5,7 +5,7 @@
 //! it is instant, side-effect-free, and safe to run on untrusted source. It exists to give
 //! a workflow author (often a coding agent) a fast feedback loop that catches the traps the
 //! runtime only surfaces at eval time — chiefly the `(phase "x" body…)` arity trap, since
-//! `phase` is a one-argument marker.
+//! `phase` is a one-argument marker, plus malformed literal workflow policies.
 //!
 //! Design (kept deliberately simple): one recursive visitor carries an `in_workflow` flag.
 //! Marker checks (`phase`/`checkpoint`/`step`/`parallel`/`pipeline`) fire ONLY inside a
@@ -108,7 +108,108 @@ pub fn check_source(src: &str) -> Vec<Diag> {
         diags.push(Diag::error(span, "E-PARSE", message));
     }
     for form in &forms {
-        find_workflows(form, &spans, &mut diags);
+        check_first_class_approval(form, &spans, &mut diags);
+        find_workflows_and_policies(form, &spans, &mut diags);
+    }
+    diags
+}
+
+/// `workflow/approval` is a control-flow operation, not a value. A direct call
+/// is valid; aliasing, storing, or passing the native function would allow a
+/// detached task to reach the gate after its owner has continued.
+fn check_first_class_approval(form: &Value, spans: &SpanMap, out: &mut Vec<Diag>) {
+    if matches!(
+        form.as_symbol().as_deref(),
+        Some("workflow/approval" | "approval")
+    ) {
+        out.push(
+            Diag::error(
+                span_of(form, spans),
+                "E-APPROVAL-VALUE",
+                format!(
+                    "{} cannot be used as a value",
+                    form.as_symbol().as_deref().unwrap_or("approval")
+                ),
+            )
+            .with_hint("call (approval key opts) directly in the owning workflow task"),
+        );
+        return;
+    }
+    if let Some(items) = form.as_seq() {
+        let head = items.first().and_then(name_of_symbol);
+        if matches!(head.as_deref(), Some("quote" | "quasiquote")) {
+            return;
+        }
+        let is_approval_head = matches!(head.as_deref(), Some("approval" | "workflow/approval"));
+        let children = if is_approval_head { &items[1..] } else { items };
+        for child in children {
+            if matches!(
+                child.as_symbol().as_deref(),
+                Some("workflow/approval" | "approval")
+            ) {
+                out.push(
+                    Diag::error(
+                        span_of(child, spans),
+                        "E-APPROVAL-VALUE",
+                        format!(
+                            "{} cannot be used as a value",
+                            child.as_symbol().as_deref().unwrap_or("approval")
+                        ),
+                    )
+                    .with_hint("call (approval key opts) directly in the owning workflow task"),
+                );
+            } else {
+                check_first_class_approval(child, spans, out);
+            }
+        }
+        return;
+    }
+    if let Some(map) = form.as_map_ref() {
+        for (key, value) in map {
+            check_first_class_approval(key, spans, out);
+            check_first_class_approval(value, spans, out);
+        }
+    }
+}
+
+/// Workflow-run contract: exactly one top-level `defworkflow`, and it must be the
+/// final executable form. This makes the host-observed envelope authoritative; later
+/// top-level forms cannot replace `:needs-approval` with an unrelated value.
+pub fn check_run_source(src: &str) -> Vec<Diag> {
+    let mut diags = check_source(src);
+    let (forms, spans, _symbol_spans, parse_errors) =
+        sema_reader::read_many_with_spans_recover(src);
+    if !parse_errors.is_empty() {
+        return diags;
+    }
+    let workflows = forms
+        .iter()
+        .filter(|form| list_head(form, "defworkflow").is_some())
+        .collect::<Vec<_>>();
+    if workflows.len() != 1 {
+        diags.push(Diag::error(
+            forms.last().and_then(|form| span_of(form, &spans)),
+            "E-WF-ENTRY",
+            format!(
+                "workflow run requires exactly one top-level defworkflow, found {}",
+                workflows.len()
+            ),
+        ));
+    }
+    if forms
+        .last()
+        .is_none_or(|form| list_head(form, "defworkflow").is_none())
+    {
+        diags.push(
+            Diag::error(
+                forms.last().and_then(|form| span_of(form, &spans)),
+                "E-WF-FINAL",
+                "defworkflow must be the final top-level form",
+            )
+            .with_hint(
+                "move helper definitions/imports before defworkflow and remove forms after it",
+            ),
+        );
     }
     diags
 }
@@ -167,16 +268,60 @@ fn permission_spec_string(key: &str, value: &Value) -> Result<String, String> {
         .ok_or_else(|| format!("defworkflow {key} must be a sandbox string"))
 }
 
-/// Walk the top-level forms looking for `(defworkflow …)` (which may be nested inside a
-/// `(do …)` or similar), and check each one. Non-workflow code is left untouched.
-fn find_workflows(form: &Value, spans: &SpanMap, out: &mut Vec<Diag>) {
+/// Walk executable forms looking for `defworkflow`/`defpolicy` declarations (which may
+/// be nested inside a `(do …)` or similar). Quoted data is left untouched.
+fn find_workflows_and_policies(form: &Value, spans: &SpanMap, out: &mut Vec<Diag>) {
+    if head_symbol(form).is_some_and(|(head, _)| head == "quote" || head == "quasiquote") {
+        return;
+    }
     if let Some(items) = list_head(form, "defworkflow") {
         check_workflow(&items, form, spans, out);
         return;
     }
+    if let Some(items) = list_head(form, "defpolicy") {
+        let span = span_of(form, spans);
+        if items.len() != 3 || items[1].as_symbol().is_none() {
+            out.push(
+                Diag::error(
+                    span,
+                    "E-POLICY-SHAPE",
+                    "defpolicy needs a bare name and one literal policy map",
+                )
+                .with_hint("(defpolicy safe {:models {...} :tools {...}})"),
+            );
+        } else if let Some(policy) = items[2].as_map_ref() {
+            let _ = check_literal_policy(&Value::map(policy.clone()), span, out);
+        } else {
+            out.push(Diag::error(
+                span,
+                "E-POLICY-SHAPE",
+                "defpolicy rules must be a literal map",
+            ));
+        }
+        return;
+    }
     if let Some(seq) = form.as_seq() {
         for sub in seq {
-            find_workflows(sub, spans, out);
+            find_workflows_and_policies(sub, spans, out);
+        }
+    }
+}
+
+fn check_literal_policy(
+    policy: &Value,
+    span: Option<Span>,
+    out: &mut Vec<Diag>,
+) -> Option<sema_policy::CompiledPolicy> {
+    match sema_policy::CompiledPolicy::compile(policy) {
+        Ok(policy) => Some(policy),
+        Err(error) => {
+            let hint = error.hint().map(str::to_string);
+            let diagnostic = Diag::error(span, "E-POLICY", format!("invalid policy: {error}"));
+            out.push(match hint {
+                Some(hint) => diagnostic.with_hint(hint),
+                None => diagnostic,
+            });
+            None
         }
     }
 }
@@ -293,11 +438,110 @@ fn check_workflow(items: &[Value], form: &Value, spans: &SpanMap, out: &mut Vec<
     // tolerance as (b)/(c) above; a computed :mcp value is left to the runtime).
     if let Some(meta) = &meta {
         check_mcp_decls(meta, wf_span, out);
+        if let Some(policy) = meta
+            .get(&Value::keyword("policy"))
+            .filter(|value| value.as_map_ref().is_some())
+        {
+            let _ = check_literal_policy(policy, wf_span, out);
+        }
     }
 
     // Marker arity/opts checks across the whole body (including nested forms).
     for f in body {
         walk_markers(f, spans, out);
+        walk_approval_placement(f, spans, None, out);
+    }
+}
+
+/// A gate may be nested in ordinary sequential control flow, but not in a construct
+/// that owns cleanup, retries, a child task, or a nested workflow. Those constructs can
+/// either skip cleanup on an uncatchable control transfer or let an outer task continue.
+fn walk_approval_placement(
+    form: &Value,
+    spans: &SpanMap,
+    restricted_by: Option<&str>,
+    out: &mut Vec<Diag>,
+) {
+    if let Some((head, items)) = head_symbol(form) {
+        if head == "quote" || head == "quasiquote" {
+            return;
+        }
+        if head == "approval" || head == "workflow/approval" {
+            if let Some(owner) = restricted_by {
+                out.push(
+                    Diag::error(
+                        span_of(form, spans),
+                        "E-APPROVAL-PLACEMENT",
+                        format!("approval cannot be nested inside {owner}"),
+                    )
+                    .with_hint("place the approval as a sequential gate before this construct"),
+                );
+            }
+            return;
+        }
+        if head == "apply"
+            && items
+                .get(1)
+                .and_then(|v| v.as_symbol())
+                .is_some_and(|s| s.as_str() == "approval" || s.as_str() == "workflow/approval")
+        {
+            if let Some(owner) = restricted_by {
+                out.push(
+                    Diag::error(
+                        span_of(form, spans),
+                        "E-APPROVAL-PLACEMENT",
+                        format!("approval cannot be nested inside {owner}"),
+                    )
+                    .with_hint(
+                        "place the approval as a sequential gate before this construct; do not apply it inside a restricted context",
+                    ),
+                );
+            }
+            return;
+        }
+        const RESTRICTED: &[&str] = &[
+            "async",
+            "async/spawn",
+            "async/spawn-all",
+            "async/map",
+            "async/pool-map",
+            "async/race",
+            "async/race-owned",
+            "async/with-timeout",
+            "parallel",
+            "parallel-settled",
+            "pipeline",
+            "pipeline-settled",
+            "try",
+            "guard",
+            "retry",
+            "with-retry",
+            "with-timeout",
+            "with-open",
+            "with-stream",
+            "with-file",
+            "step",
+            "agent",
+            "workflow/run",
+        ];
+        let restricted =
+            restricted_by.or_else(|| RESTRICTED.contains(&head.as_str()).then_some(head.as_str()));
+        for sub in items.iter().skip(1) {
+            walk_approval_placement(sub, spans, restricted, out);
+        }
+        return;
+    }
+    if let Some(seq) = form.as_vector_rc() {
+        for sub in seq.iter() {
+            walk_approval_placement(sub, spans, restricted_by, out);
+        }
+        return;
+    }
+    if let Some(map) = form.as_map_ref() {
+        for (key, value) in map {
+            walk_approval_placement(key, spans, restricted_by, out);
+            walk_approval_placement(value, spans, restricted_by, out);
+        }
     }
 }
 
@@ -401,6 +645,9 @@ fn check_mcp_decls(meta: &BTreeMap<Value, Value>, span: Option<Span>, out: &mut 
 /// Recursively check marker arities/opts. Only reached from within a workflow body.
 fn walk_markers(form: &Value, spans: &SpanMap, out: &mut Vec<Diag>) {
     if let Some((head, items)) = head_symbol(form) {
+        if head == "quote" || head == "quasiquote" {
+            return;
+        }
         let span = span_of(form, spans);
         match head.as_str() {
             // phase is a ONE-arg marker — the #1 trap. (phase "x" body) is an arity error.
@@ -438,6 +685,63 @@ fn walk_markers(form: &Value, spans: &SpanMap, out: &mut Vec<Diag>) {
                     ));
                 }
             }
+            "approval" | "workflow/approval" => {
+                if items.len() != 3 {
+                    out.push(Diag::error(
+                        span,
+                        "E-APPROVAL-ARITY",
+                        format!(
+                            "approval takes a key and an options map, got {} arguments",
+                            items.len() - 1
+                        ),
+                    ));
+                } else {
+                    if items[1].as_keyword().is_none() && items[1].as_str().is_none() {
+                        out.push(Diag::warn(
+                            span,
+                            "W-APPROVAL-KEY",
+                            "approval key should be a keyword or string",
+                        ));
+                    }
+                    match items[2].as_map_ref() {
+                        Some(opts) => {
+                            if opts
+                                .get(&Value::keyword("reason"))
+                                .and_then(|value| value.as_str())
+                                .is_none_or(|reason| reason.trim().is_empty())
+                            {
+                                out.push(Diag::error(
+                                    span,
+                                    "E-APPROVAL-REASON",
+                                    "approval :reason must be a nonempty string",
+                                ));
+                            }
+                            if !opts.contains_key(&Value::keyword("subject")) {
+                                out.push(Diag::error(
+                                    span,
+                                    "E-APPROVAL-SUBJECT",
+                                    "approval requires a :subject value",
+                                ));
+                            }
+                            if opts
+                                .get(&Value::keyword("preview"))
+                                .is_some_and(|value| value.as_str().is_none())
+                            {
+                                out.push(Diag::error(
+                                    span,
+                                    "E-APPROVAL-PREVIEW",
+                                    "approval :preview must be a string",
+                                ));
+                            }
+                        }
+                        None => out.push(Diag::error(
+                            span,
+                            "E-APPROVAL-OPTS",
+                            "approval options must be a literal map",
+                        )),
+                    }
+                }
+            }
             // step needs at least a prompt; if opts are given, validate the map.
             "step" => {
                 if items.len() < 2 {
@@ -465,6 +769,28 @@ fn walk_markers(form: &Value, spans: &SpanMap, out: &mut Vec<Diag>) {
                             ));
                         }
                     }
+                    if let Some(policy) = opts
+                        .get(&Value::keyword("policy"))
+                        .filter(|value| value.as_map_ref().is_some())
+                    {
+                        if let Some(policy) = check_literal_policy(policy, span, out) {
+                            let has_metadata = policy.required_metadata().next().is_some();
+                            let has_completion =
+                                policy.required_completion_events().next().is_some();
+                            if has_metadata || has_completion {
+                                out.push(
+                                    Diag::error(
+                                        span,
+                                        "E-STEP-POLICY-SCOPE",
+                                        "step policies cannot contain :metadata or :completion requirements",
+                                    )
+                                    .with_hint(
+                                        "attach workflow evidence requirements to defworkflow :policy",
+                                    ),
+                                );
+                            }
+                        }
+                    }
                     // :agent runs a configured defagent and owns its own tools/model; the
                     // step must not also declare inline :tools/:model (they'd be ignored —
                     // the routing takes the :agent branch). Warn so the author picks one.
@@ -485,6 +811,24 @@ fn walk_markers(form: &Value, spans: &SpanMap, out: &mut Vec<Diag>) {
                             ));
                         }
                     }
+                }
+            }
+            "policy/without" => {
+                if items.len() < 3 {
+                    out.push(Diag::error(
+                        span,
+                        "E-POLICY-BYPASS",
+                        "policy/without needs a reason string and at least one body form",
+                    ));
+                } else if items[1]
+                    .as_str()
+                    .is_none_or(|reason| reason.trim().is_empty() || reason.chars().count() > 256)
+                {
+                    out.push(Diag::error(
+                        span,
+                        "E-POLICY-BYPASS",
+                        "policy/without reason must be a non-empty string of at most 256 characters",
+                    ));
                 }
             }
             // parallel/pipeline are structural — at least one argument beyond the head.
@@ -698,6 +1042,120 @@ mod tests {
     }
 
     #[test]
+    fn approval_shape_is_checked() {
+        let c = codes(
+            r#"(defworkflow d "d" {}
+                  (approval 42 {:reason "" :preview 1})
+                  {:status :ok})"#,
+        );
+        assert!(c.contains(&"W-APPROVAL-KEY"));
+        assert!(c.contains(&"E-APPROVAL-REASON"));
+        assert!(c.contains(&"E-APPROVAL-SUBJECT"));
+        assert!(c.contains(&"E-APPROVAL-PREVIEW"));
+    }
+
+    #[test]
+    fn workflow_run_requires_one_final_top_level_entrypoint() {
+        let trailing =
+            check_run_source(r#"(defworkflow d "d" {} {:status :success}) (file/write "x" "y")"#);
+        assert!(trailing.iter().any(|diag| diag.code == "E-WF-FINAL"));
+
+        let multiple = check_run_source(
+            r#"(defworkflow a "a" {} {:status :success})
+               (defworkflow b "b" {} {:status :success})"#,
+        );
+        assert!(multiple.iter().any(|diag| diag.code == "E-WF-ENTRY"));
+    }
+
+    #[test]
+    fn approval_rejects_concurrent_cleanup_and_nested_workflow_placement() {
+        let src = r#"
+          (defworkflow d "d" {}
+            (parallel (list (fn ()
+              (approval :a {:reason "r" :subject 1}))))
+            (try (workflow/approval :b {:reason "r" :subject 2}) (catch e e))
+            (workflow/run "nested" "n" {} (fn ()
+              (approval :c {:reason "r" :subject 3})))
+            (async (approval :d {:reason "r" :subject 4}))
+            (async/race-owned (list (fn ()
+              (approval :e {:reason "r" :subject 5}))))
+            (async/with-timeout 10 (fn ()
+              (approval :f {:reason "r" :subject 6})))
+            {:status :success})
+        "#;
+        assert_eq!(
+            codes(src)
+                .into_iter()
+                .filter(|code| *code == "E-APPROVAL-PLACEMENT")
+                .count(),
+            6
+        );
+    }
+
+    #[test]
+    fn approval_in_vectors_and_let_bindings_is_caught() {
+        let src = r#"
+          (defworkflow d "d" {}
+            (parallel [(approval :a {:reason "r" :subject {:kind :external-action :secret "x"}})])
+            {:status :success})
+        "#;
+        assert!(codes(src).contains(&"E-APPROVAL-PLACEMENT"));
+
+        let let_src = r#"
+          (defworkflow d "d" {}
+            (parallel (let [x (approval :b {:reason "r" :subject {:kind :external-action :secret "y"}})] x))
+            {:status :success})
+        "#;
+        assert!(codes(let_src).contains(&"E-APPROVAL-PLACEMENT"));
+
+        let apply_src = r#"
+          (defworkflow d "d" {}
+            (parallel (apply approval :a {:reason "r" :subject {:kind :external-action :secret "x"}}))
+            {:status :success})
+        "#;
+        assert!(codes(apply_src).contains(&"E-APPROVAL-PLACEMENT"));
+    }
+
+    #[test]
+    fn approval_short_name_alias_is_caught() {
+        let src = r#"
+          (define gate approval)
+          (defworkflow d "d" {}
+            {:status :success})
+        "#;
+        assert!(codes(src).contains(&"E-APPROVAL-VALUE"));
+    }
+
+    #[test]
+    fn approval_native_cannot_be_aliased_or_stored() {
+        let src = r#"
+          (define gate workflow/approval)
+          (defworkflow d "d" {}
+            (list workflow/approval)
+            {:status :success})
+        "#;
+        assert_eq!(
+            codes(src)
+                .into_iter()
+                .filter(|code| *code == "E-APPROVAL-VALUE")
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn step_policy_rejects_workflow_evidence_sections() {
+        let src = r#"
+          (defworkflow d "d" {}
+            (step "inspect"
+              {:policy {:metadata {:require [:owner]}
+                        :completion {:require-events [:checkpoint]}}})
+            {:status :success})
+        "#;
+        assert!(codes(src).contains(&"E-STEP-POLICY-SCOPE"));
+    }
+
+    #[test]
     fn bare_top_level_markers_outside_a_workflow_are_ignored() {
         // (phase …) with wrong arity in a plain library file is NOT a workflow — no diag.
         let src = r#"(define (phase a b c) (+ a b c)) (phase 1 2 3)"#;
@@ -788,6 +1246,81 @@ mod tests {
         );
         assert!(c.contains(&"W-STEP-AGENT-TOOLS"), "got {c:?}");
         assert!(c.contains(&"W-STEP-AGENT-MODEL"), "got {c:?}");
+    }
+
+    #[test]
+    fn valid_policy_declarations_and_inline_policies_are_checked() {
+        let src = r#"
+            (defpolicy safe
+              {:models {:default :deny
+                        :allow ["fake/fake-model"]}
+               :tools {:default :deny
+                       :allow {"read-file" {:paths ["src/**"]}}}})
+            (defworkflow d "d"
+              {:policy {:models {:default :deny :allow ["fake/*"]}}}
+              (phase "P")
+              (step "go"
+                {:policy {:tools {:default :deny
+                                  :allow {"read-file" {:paths ["src/**"]}}}}})
+              {:status :ok})
+        "#;
+        let c = codes(src);
+        assert!(
+            !c.iter().any(|code| code.starts_with("E-POLICY")),
+            "got {c:?}"
+        );
+    }
+
+    #[test]
+    fn malformed_policy_declarations_and_rules_error() {
+        let bad_shape = codes("(defpolicy \"safe\" [])");
+        assert!(bad_shape.contains(&"E-POLICY-SHAPE"), "got {bad_shape:?}");
+
+        let bad_rule = codes(
+            r#"(defpolicy bad
+                 {:models {:allow ["*/model"]}})
+               (defworkflow d "d" {} {:status :ok})"#,
+        );
+        assert!(bad_rule.contains(&"E-POLICY"), "got {bad_rule:?}");
+    }
+
+    #[test]
+    fn quoted_policy_forms_are_not_checked_as_declarations_or_bypasses() {
+        let c = codes(
+            r#"
+            '(defpolicy "not-a-name" {:models {:allow ["*/bad"]}})
+            (defworkflow d "d" {}
+              '(policy/without "")
+              {:status :ok})
+            "#,
+        );
+        assert!(
+            !c.iter().any(|code| code.starts_with("E-POLICY")),
+            "quoted data is not executable syntax: {c:?}"
+        );
+    }
+
+    #[test]
+    fn policy_without_requires_a_bounded_literal_reason_and_body() {
+        let missing_body = codes(
+            r#"(defworkflow d "d" {}
+                 (policy/without "maintenance")
+                 {:status :ok})"#,
+        );
+        assert!(
+            missing_body.contains(&"E-POLICY-BYPASS"),
+            "got {missing_body:?}"
+        );
+
+        let computed_reason = codes(
+            r#"(defworkflow d "d" {}
+                 (policy/without reason (step "go"))
+                 {:status :ok})"#,
+        );
+        assert!(
+            computed_reason.contains(&"E-POLICY-BYPASS"),
+            "got {computed_reason:?}"
+        );
     }
 
     #[test]

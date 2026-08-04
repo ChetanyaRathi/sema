@@ -11,6 +11,7 @@
 //! The builtins that invoke Sema thunks (`workflow/run`, `workflow/phase`,
 //! `checkpoint`, `workflow/agent`) live in `sema-stdlib`, which depends on this crate.
 
+pub mod approval;
 pub mod context;
 pub mod event;
 mod journal;

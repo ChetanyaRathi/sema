@@ -796,7 +796,7 @@ fn blocking_stream_compatibility_native_preserves_public_arity_error() {
         .expect("arity error message")
         .to_string();
     assert!(
-        message.contains("llm/stream expects 1-3 args, got 0"),
+        message.contains("llm/stream expects 1 to 3 arguments, got 0"),
         "unexpected zero-arity error: {message}"
     );
     assert_eq!(

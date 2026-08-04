@@ -2985,7 +2985,7 @@ eval_tests! {
 
 eval_error_tests! {
     // Arity is still checked on the self-call frame path.
-    call_self_arity_error: "(define (f n) (if (= n 0) 0 (+ 1 (f)))) (f 1)" => "expects 1 args, got 0",
+    call_self_arity_error: "(define (f n) (if (= n 0) 0 (+ 1 (f)))) (f 1)" => "expects 1 argument, got 0",
 }
 
 // ============================================================

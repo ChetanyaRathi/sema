@@ -124,7 +124,7 @@ impl ScopeTree {
             "define" | "def" => self.walk_define(items, expr, parent_scope, span_map, symbol_spans),
             "defun" | "defn" => self.walk_defun(items, expr, parent_scope, span_map, symbol_spans),
             "defmacro" => self.walk_defmacro(items, expr, parent_scope, span_map, symbol_spans),
-            "defagent" | "deftool" => {
+            "defagent" | "deftool" | "defpolicy" => {
                 // These define a name at the parent scope level.
                 if items.len() >= 2 {
                     if let Some(name) = items[1].as_symbol() {
@@ -1371,7 +1371,7 @@ mod tests {
         assert_ne!(a_resolved.scope_idx, b_resolved.scope_idx);
     }
 
-    // ── defagent/deftool scoping ─────────────────────────────────
+    // ── named host form scoping ──────────────────────────────────
 
     #[test]
     fn defagent_name_is_top_level() {
@@ -1387,6 +1387,15 @@ mod tests {
         let src = "(deftool weather (loc) \"Get weather\" loc)";
         let (tree, _) = build_scope(src);
         let resolved = tree.resolve_at("weather", 1, 10);
+        assert!(resolved.is_some());
+        assert!(resolved.unwrap().is_top_level);
+    }
+
+    #[test]
+    fn defpolicy_name_is_top_level() {
+        let src = "(defpolicy safe {:models {:default :deny}})";
+        let (tree, _) = build_scope(src);
+        let resolved = tree.resolve_at("safe", 1, 12);
         assert!(resolved.is_some());
         assert!(resolved.unwrap().is_top_level);
     }

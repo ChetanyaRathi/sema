@@ -81,6 +81,7 @@ jobs:
           publish sema-fmt
           publish sema-vm
           publish sema-otel
+          publish sema-policy
           publish sema-workflow
           publish sema-llm
           publish sema-stdlib

@@ -727,7 +727,39 @@ pub struct ToolDefinition {
     pub name: String,
     pub description: String,
     pub parameters: Value,
+    pub policy_subjects: Vec<ToolPolicySubject>,
     pub handler: Value,
+}
+
+/// Static, inspectable description of the security-relevant subject a tool acts on.
+///
+/// Argument names refer to the tool's JSON schema. The policy runtime resolves
+/// them before invoking the handler and never infers authority from the tool name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ToolPolicySubject {
+    File {
+        access: FileAccess,
+        path_arg: String,
+    },
+    NetworkRequest {
+        method: Option<String>,
+        url_arg: String,
+    },
+    Command {
+        command_arg: String,
+    },
+    ExternalAction {
+        action: String,
+        target_arg: Option<String>,
+    },
+}
+
+/// File-system authority represented by a tool policy subject.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileAccess {
+    Read,
+    Write,
+    Delete,
 }
 
 /// An agent: system prompt + tools + config for autonomous loops.

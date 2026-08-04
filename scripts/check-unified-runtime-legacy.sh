@@ -439,10 +439,10 @@ check_workflow_journal_file() {
 }
 
 # ── A3 workflow-writer filesystem policy ────────────────────────────────────
-# Every `write_all`/`fs::write` in the sema-workflow crate must live on the per-run journal
-# WRITER thread (writer.rs); the VM-thread `Journal` methods only enqueue, so journal.rs
-# stays write-free. Comment-strip + drop the #[cfg(test)] block, then count write_all /
-# fs::write per file.
+# Journal writes live on the per-run writer thread. Separately reviewed bounded host or
+# quarantined-worker sidecars (currently approval.rs) require exact allowlist rows; an
+# unreviewed write in any sema-workflow file fails. Comment-strip + drop the #[cfg(test)]
+# block, then count write_all / fs::write per file.
 
 # Emit "TOKEN<TAB>LINE" for each write_all / fs::write in one file's production module.
 scan_workflow_writer_file() {
@@ -474,8 +474,8 @@ scan_workflow_writer_dir() {
   done < <(rg --files -g '*.rs' "$workflow_writer_src_dir" | LC_ALL=C sort -u)
 }
 
-# Production gate: pin write_all/fs::write to the exact writer.rs counts; a write in ANY
-# other sema-workflow file (a regressed synchronous Journal write) is unallowlisted.
+# Production gate: pin write_all/fs::write to exact reviewed file counts. A regressed
+# synchronous Journal write or a new unreviewed sidecar is unallowlisted.
 check_workflow_writer_dir() {
   local allowlist="$1"
   if [[ ! -f "$allowlist" ]]; then
@@ -501,8 +501,8 @@ check_workflow_writer_dir() {
       for (key in actual) {
         split(key, part, SUBSEP)
         if (!(key in expected)) {
-          print "forbidden workflow-writer fs write " part[1] " at " sample[key] \
-            " (journal writes belong on the writer.rs thread)" > "/dev/stderr"
+          print "forbidden workflow fs write " part[1] " at " sample[key] \
+            " (writes require an exact reviewed execution-context row)" > "/dev/stderr"
           invalid = 1
         } else if (actual[key] != expected[key]) {
           print "workflow-writer fs count changed for " part[1] " in " part[2] \

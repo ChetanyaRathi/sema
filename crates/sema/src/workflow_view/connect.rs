@@ -29,7 +29,7 @@ use std::sync::{Arc, Mutex};
 use sema_mcp::oauth::loopback::BrowserOpener;
 use sema_stdlib::workflow_mcp::McpPersist;
 
-use super::{is_safe_segment, JsonResponse};
+use super::{is_safe_segment, ApprovalAuthority, JsonResponse};
 
 /// `(run_id, alias)` — a flow is scoped to one declared server within one run.
 pub(crate) type FlowKey = (String, String);
@@ -65,24 +65,37 @@ pub type TestOpenerFn = fn(&str) -> Result<(), String>;
 pub(crate) struct ServerState {
     pub run_dir: std::path::PathBuf,
     pub token: String,
+    /// Per-process CSP nonce, deliberately distinct from the write capability
+    /// token so security headers on rejected requests cannot disclose it.
+    pub csp_nonce: String,
+    /// Authorities accepted from the HTTP `Host` header. This list contains
+    /// only the configured loopback name/address and the listener's bound
+    /// address, both with the actual port.
+    pub allowed_hosts: Vec<String>,
     /// `Arc<Mutex<HashMap<(run_id, alias), FlowState>>>` — shared between
     /// every connection's `connect`/`forget`/`GET …/auth` handler via the
     /// single `Arc<ServerState>` each accepted connection clones.
     flows: Mutex<HashMap<FlowKey, FlowState>>,
     test_opener: Option<TestOpenerFn>,
+    pub(crate) approval_authority: Option<ApprovalAuthority>,
 }
 
 impl ServerState {
     pub fn new(
         run_dir: std::path::PathBuf,
         token: String,
+        allowed_hosts: Vec<String>,
         test_opener: Option<TestOpenerFn>,
+        approval_authority: Option<ApprovalAuthority>,
     ) -> Self {
         Self {
             run_dir,
             token,
+            csp_nonce: sema_mcp::random_hex_token(),
+            allowed_hosts,
             flows: Mutex::new(HashMap::new()),
             test_opener,
+            approval_authority,
         }
     }
 

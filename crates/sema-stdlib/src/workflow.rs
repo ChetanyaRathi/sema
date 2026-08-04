@@ -22,15 +22,22 @@
 
 use sema_core::cycle::GcEdge;
 use sema_core::runtime::{
-    CancelDisposition, CancelHook, CancelHookError, CompletionDecoder, CompletionKind,
-    DecodedCompletion, ExternalFailure, InterruptibleResource, NativeCall, NativeCallContext,
-    NativeContinuation, NativeOutcome, NativeResult, NativeSuspend, PreparedExternalOperation,
-    ResumeInput, SendPayload, TaskContextHandle, Trace, WaitKind,
+    downcast_send_payload, CancelDisposition, CancelHook, CancelHookError, CompletionDecoder,
+    CompletionKind, DecodedCompletion, ExternalFailure, InterruptibleResource, NativeCall,
+    NativeCallContext, NativeContinuation, NativeOutcome, NativeResult, NativeSuspend,
+    PreparedExternalOperation, QuarantineBound, ResumeInput, SendPayload, TaskContextHandle, Trace,
+    WaitKind,
 };
-use sema_core::{SemaError, Value};
+use sema_core::{PolicyDenial, SemaError, Value, ValueViewRef};
+use sema_llm::builtins::{
+    PolicyAttributionScope, PolicyBypassScope, PolicyDecisionSink, PolicyObservation,
+    PolicyObservationKind, PolicyScope,
+};
+use sema_workflow::approval::{ApprovalRequest, ApprovalResolution, NewApprovalRequest};
 use sema_workflow::context;
 use sema_workflow::event::WorkflowEvent;
 use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
@@ -52,6 +59,776 @@ fn opt_str(v: &Value, key: &str) -> String {
                 .and_then(|x| x.as_str().map(String::from))
         })
         .unwrap_or_default()
+}
+
+fn opt_value(v: &Value, key: &str) -> Option<Value> {
+    v.as_map_rc()
+        .and_then(|m| m.get(&Value::keyword(key)).cloned())
+}
+
+const APPROVAL_TEXT_MAX_CHARS: usize = 1024;
+const APPROVAL_SUBJECT_MAX_BYTES: usize = 1 << 20;
+
+fn approval_request(
+    task_context: Option<&TaskContextHandle>,
+    args: &[Value],
+) -> Result<(std::path::PathBuf, ApprovalRequest), SemaError> {
+    approval_request_inner(task_context, args).map_err(|error| fail_approval(task_context, error))
+}
+
+fn fail_approval(task_context: Option<&TaskContextHandle>, error: SemaError) -> SemaError {
+    let should_latch = !matches!(
+        error.inner(),
+        SemaError::WorkflowApprovalRequired { .. } | SemaError::WorkflowApprovalRejected { .. }
+    );
+    let error = match error.inner() {
+        SemaError::WorkflowApprovalRequired { .. }
+        | SemaError::WorkflowApprovalRejected { .. }
+        | SemaError::WorkflowApprovalFailed { .. } => error,
+        _ => SemaError::WorkflowApprovalFailed {
+            message: error.to_string(),
+        },
+    };
+    if should_latch {
+        let message = match error.inner() {
+            SemaError::WorkflowApprovalFailed { message } => message.clone(),
+            _ => error.to_string(),
+        };
+        if let Some(ctx) = context::current_for(task_context) {
+            ctx.fail_approval(message);
+        }
+    }
+    error
+}
+
+fn approval_request_inner(
+    task_context: Option<&TaskContextHandle>,
+    args: &[Value],
+) -> Result<(std::path::PathBuf, ApprovalRequest), SemaError> {
+    if args.len() != 2 {
+        return Err(SemaError::arity("workflow/approval", "2", args.len()));
+    }
+    let key = as_name(&args[0]).ok_or_else(|| {
+        SemaError::argument_type_with_value("workflow/approval", 1, "keyword or string", &args[0])
+    })?;
+    let opts = args[1].as_map_rc().ok_or_else(|| {
+        SemaError::argument_type_with_value("workflow/approval", 2, "map", &args[1])
+    })?;
+    let reason = opts
+        .get(&Value::keyword("reason"))
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| SemaError::eval("approval :reason must be a nonempty string"))?
+        .to_string();
+    if reason.chars().count() > APPROVAL_TEXT_MAX_CHARS {
+        return Err(SemaError::eval(format!(
+            "approval :reason must not exceed {APPROVAL_TEXT_MAX_CHARS} characters"
+        )));
+    }
+    let subject = opts
+        .get(&Value::keyword("subject"))
+        .ok_or_else(|| SemaError::eval("approval requires a :subject value"))?;
+    let subject_digest = canonical_approval_subject_digest(subject)?;
+    let preview = opts
+        .get(&Value::keyword("preview"))
+        .map(|value| {
+            value
+                .as_str()
+                .ok_or_else(|| SemaError::eval("approval :preview must be a string"))
+                .map(str::trim)
+                .map(str::to_string)
+        })
+        .transpose()?;
+    if preview
+        .as_ref()
+        .is_some_and(|value| value.chars().count() > APPROVAL_TEXT_MAX_CHARS)
+    {
+        return Err(SemaError::eval(format!(
+            "approval :preview must not exceed {APPROVAL_TEXT_MAX_CHARS} characters"
+        )));
+    }
+    let ctx = context::current_for(task_context)
+        .ok_or_else(|| SemaError::eval("approval outside a workflow/run"))?;
+    if !context::approval_scope_is_root_owner(task_context) {
+        return Err(SemaError::eval(
+            "approval must be a sequential gate in the owning workflow task; nested, spawned, and concurrent approval gates are not supported",
+        ));
+    }
+    let code_version = ctx.approval_code_version();
+    if code_version.trim().is_empty() {
+        return Err(SemaError::eval(
+            "approval requires a stable workflow code version; run the file with `sema workflow run` or set SEMA_WORKFLOW_APPROVAL_CODE_VERSION",
+        ));
+    }
+    let authority_public_key = ctx.approval_public_key();
+    if authority_public_key.trim().is_empty() {
+        return Err(SemaError::eval(
+            "approval requires a host-selected Ed25519 public key; use --approval-public-key-file for headless runs",
+        ));
+    }
+    let phase = ctx.cur_phase_label();
+    let occurrence = ctx.approval_occurrence(&key, &subject_digest, &phase);
+    let request = ApprovalRequest::new(NewApprovalRequest {
+        run_id: ctx.run_id(),
+        workflow: ctx.workflow_name(),
+        code_version,
+        args_digest: ctx.approval_args_digest(),
+        phase,
+        key,
+        occurrence,
+        subject_digest,
+        reason,
+        preview,
+        requested_at: ctx.ts(),
+        authority_public_key,
+    });
+    Ok((ctx.run_dir(), request))
+}
+
+fn canonical_approval_subject_digest(subject: &Value) -> Result<String, SemaError> {
+    let mut bytes = Vec::new();
+    encode_approval_subject(subject, &mut bytes, 0)?;
+    Ok(sema_workflow::approval::sha256_bytes(&bytes))
+}
+
+fn append_subject_bytes(out: &mut Vec<u8>, bytes: &[u8]) -> Result<(), SemaError> {
+    let needed = 8usize.saturating_add(bytes.len());
+    if out.len().saturating_add(needed) > APPROVAL_SUBJECT_MAX_BYTES {
+        return Err(SemaError::eval(format!(
+            "approval :subject canonical encoding must not exceed {APPROVAL_SUBJECT_MAX_BYTES} bytes"
+        )));
+    }
+    out.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+    out.extend_from_slice(bytes);
+    Ok(())
+}
+
+fn encode_approval_subject(
+    value: &Value,
+    out: &mut Vec<u8>,
+    depth: usize,
+) -> Result<(), SemaError> {
+    if depth > 128 {
+        return Err(SemaError::eval(
+            "approval :subject nesting exceeds 128 levels",
+        ));
+    }
+    let tag = match value.view_ref() {
+        ValueViewRef::Nil => b"nil".as_slice(),
+        ValueViewRef::Bool(v) => {
+            append_subject_bytes(out, b"bool")?;
+            return append_subject_bytes(out, if v { b"1" } else { b"0" });
+        }
+        ValueViewRef::Int(v) => {
+            append_subject_bytes(out, b"int")?;
+            return append_subject_bytes(out, v.to_string().as_bytes());
+        }
+        ValueViewRef::BigInt(v) => {
+            append_subject_bytes(out, b"int")?;
+            return append_subject_bytes(out, v.to_string().as_bytes());
+        }
+        ValueViewRef::Rational(v) => {
+            append_subject_bytes(out, b"rational")?;
+            return append_subject_bytes(out, v.to_string().as_bytes());
+        }
+        ValueViewRef::Float(v) => {
+            append_subject_bytes(out, b"float")?;
+            return append_subject_bytes(out, &v.to_bits().to_le_bytes());
+        }
+        ValueViewRef::String(v) => {
+            append_subject_bytes(out, b"string")?;
+            return append_subject_bytes(out, v.as_bytes());
+        }
+        ValueViewRef::Symbol(_) => {
+            append_subject_bytes(out, b"symbol")?;
+            return append_subject_bytes(out, value.as_symbol().unwrap_or_default().as_bytes());
+        }
+        ValueViewRef::Keyword(_) => {
+            append_subject_bytes(out, b"keyword")?;
+            return append_subject_bytes(out, value.as_keyword().unwrap_or_default().as_bytes());
+        }
+        ValueViewRef::Char(v) => {
+            append_subject_bytes(out, b"char")?;
+            return append_subject_bytes(out, &(v as u32).to_le_bytes());
+        }
+        ValueViewRef::List(items) | ValueViewRef::Vector(items) => {
+            let tag: &[u8] = if value.is_list() { b"list" } else { b"vector" };
+            append_subject_bytes(out, tag)?;
+            append_subject_bytes(out, &(items.len() as u64).to_le_bytes())?;
+            for item in items {
+                encode_approval_subject(item, out, depth + 1)?;
+            }
+            return Ok(());
+        }
+        ValueViewRef::Map(map) => {
+            let mut entries = Vec::with_capacity(map.len());
+            let mut encoded_bytes = 0usize;
+            for (key, item) in map {
+                let mut encoded = Vec::new();
+                encode_approval_subject(key, &mut encoded, depth + 1)?;
+                encode_approval_subject(item, &mut encoded, depth + 1)?;
+                encoded_bytes = encoded_bytes
+                    .checked_add(encoded.len())
+                    .filter(|total| *total <= APPROVAL_SUBJECT_MAX_BYTES)
+                    .ok_or_else(|| {
+                        SemaError::eval(format!(
+                            "approval :subject canonical encoding must not exceed {APPROVAL_SUBJECT_MAX_BYTES} bytes"
+                        ))
+                    })?;
+                entries.push(encoded);
+            }
+            entries.sort();
+            append_subject_bytes(out, b"map")?;
+            append_subject_bytes(out, &(entries.len() as u64).to_le_bytes())?;
+            for entry in entries {
+                append_subject_bytes(out, &entry)?;
+            }
+            return Ok(());
+        }
+        ValueViewRef::HashMap(map) => {
+            let mut entries = Vec::with_capacity(map.len());
+            let mut encoded_bytes = 0usize;
+            for (key, item) in map {
+                let mut encoded = Vec::new();
+                encode_approval_subject(key, &mut encoded, depth + 1)?;
+                encode_approval_subject(item, &mut encoded, depth + 1)?;
+                encoded_bytes = encoded_bytes
+                    .checked_add(encoded.len())
+                    .filter(|total| *total <= APPROVAL_SUBJECT_MAX_BYTES)
+                    .ok_or_else(|| {
+                        SemaError::eval(format!(
+                            "approval :subject canonical encoding must not exceed {APPROVAL_SUBJECT_MAX_BYTES} bytes"
+                        ))
+                    })?;
+                entries.push(encoded);
+            }
+            entries.sort();
+            append_subject_bytes(out, b"hashmap")?;
+            append_subject_bytes(out, &(entries.len() as u64).to_le_bytes())?;
+            for entry in entries {
+                append_subject_bytes(out, &entry)?;
+            }
+            return Ok(());
+        }
+        ValueViewRef::Bytevector(bytes) => {
+            append_subject_bytes(out, b"bytevector")?;
+            return append_subject_bytes(out, bytes);
+        }
+        ValueViewRef::F64Array(values) => {
+            append_subject_bytes(out, b"f64-array")?;
+            append_subject_bytes(out, &(values.len() as u64).to_le_bytes())?;
+            for value in values {
+                append_subject_bytes(out, &value.to_bits().to_le_bytes())?;
+            }
+            return Ok(());
+        }
+        ValueViewRef::I64Array(values) => {
+            append_subject_bytes(out, b"i64-array")?;
+            append_subject_bytes(out, &(values.len() as u64).to_le_bytes())?;
+            for value in values {
+                append_subject_bytes(out, &value.to_le_bytes())?;
+            }
+            return Ok(());
+        }
+        _ => {
+            return Err(SemaError::eval(format!(
+                "approval :subject must be immutable canonical data, got {}",
+                value.type_name()
+            )));
+        }
+    };
+    append_subject_bytes(out, tag)
+}
+
+fn approval_resolution_value(resolution: ApprovalResolution) -> Value {
+    let mut map = BTreeMap::new();
+    match resolution {
+        ApprovalResolution::Pending(request) => {
+            map.insert(Value::keyword("status"), Value::keyword("pending"));
+            insert_approval_request_fields(&mut map, &request);
+        }
+        ApprovalResolution::Approved(request, decision) => {
+            map.insert(Value::keyword("status"), Value::keyword("approved"));
+            insert_approval_request_fields(&mut map, &request);
+            insert_approval_decision_fields(&mut map, &decision);
+        }
+        ApprovalResolution::Rejected(request, decision) => {
+            map.insert(Value::keyword("status"), Value::keyword("rejected"));
+            insert_approval_request_fields(&mut map, &request);
+            insert_approval_decision_fields(&mut map, &decision);
+        }
+    }
+    Value::map(map)
+}
+
+fn insert_approval_request_fields(map: &mut BTreeMap<Value, Value>, request: &ApprovalRequest) {
+    map.insert(
+        Value::keyword("approval-id"),
+        Value::string(&request.approval_id),
+    );
+    map.insert(
+        Value::keyword("request-digest"),
+        Value::string(&request.request_digest),
+    );
+    map.insert(Value::keyword("key"), Value::string(&request.key));
+    map.insert(Value::keyword("reason"), Value::string(&request.reason));
+    map.insert(
+        Value::keyword("subject-digest"),
+        Value::string(&request.subject_digest),
+    );
+    if let Some(preview) = &request.preview {
+        map.insert(Value::keyword("preview"), Value::string(preview));
+    }
+}
+
+fn insert_approval_decision_fields(
+    map: &mut BTreeMap<Value, Value>,
+    decision: &sema_workflow::approval::ApprovalDecision,
+) {
+    map.insert(
+        Value::keyword("decision-id"),
+        Value::string(&decision.decision_id),
+    );
+    map.insert(Value::keyword("actor"), Value::string(&decision.actor));
+    map.insert(
+        Value::keyword("provenance"),
+        Value::string(&decision.provenance),
+    );
+    if let Some(reason) = &decision.reason {
+        map.insert(Value::keyword("decision-reason"), Value::string(reason));
+    }
+}
+
+fn approval_field(map: &BTreeMap<Value, Value>, key: &str) -> String {
+    map.get(&Value::keyword(key))
+        .and_then(|value| value.as_str())
+        .unwrap_or_default()
+        .to_string()
+}
+
+fn apply_approval_resolution(
+    task_context: Option<&TaskContextHandle>,
+    value: Value,
+) -> Result<Value, SemaError> {
+    let map = value
+        .as_map_rc()
+        .ok_or_else(|| SemaError::internal("approval worker returned a non-map result"))?;
+    let status = map
+        .get(&Value::keyword("status"))
+        .and_then(|value| value.as_keyword())
+        .unwrap_or_default();
+    let approval_id = approval_field(&map, "approval-id");
+    let ctx = context::current_for(task_context)
+        .ok_or_else(|| SemaError::eval("approval outside a workflow/run"))?;
+    match status.as_str() {
+        "pending" => {
+            ctx.emit(WorkflowEvent::ApprovalRequested {
+                seq: ctx.next_seq(),
+                ts: ctx.ts(),
+                phase_seq: ctx.phase_seq(),
+                approval_id: approval_id.clone(),
+                request_digest: approval_field(&map, "request-digest"),
+                key: approval_field(&map, "key"),
+                reason: approval_field(&map, "reason"),
+                subject_digest: approval_field(&map, "subject-digest"),
+                preview: map
+                    .get(&Value::keyword("preview"))
+                    .and_then(|value| value.as_str())
+                    .map(str::to_string),
+            });
+            Err(SemaError::WorkflowApprovalRequired { approval_id })
+        }
+        "approved" => {
+            let decision_id = approval_field(&map, "decision-id");
+            ctx.emit(WorkflowEvent::ApprovalGranted {
+                seq: ctx.next_seq(),
+                ts: ctx.ts(),
+                phase_seq: ctx.phase_seq(),
+                approval_id: approval_id.clone(),
+                decision_id: decision_id.clone(),
+                actor: approval_field(&map, "actor"),
+                provenance: approval_field(&map, "provenance"),
+            });
+            ctx.emit(WorkflowEvent::ApprovalApplied {
+                seq: ctx.next_seq(),
+                ts: ctx.ts(),
+                phase_seq: ctx.phase_seq(),
+                approval_id,
+                decision_id,
+            });
+            Ok(Value::bool(true))
+        }
+        "rejected" => {
+            let reason = map
+                .get(&Value::keyword("decision-reason"))
+                .and_then(|value| value.as_str())
+                .map(str::to_string);
+            ctx.emit(WorkflowEvent::ApprovalRejected {
+                seq: ctx.next_seq(),
+                ts: ctx.ts(),
+                phase_seq: ctx.phase_seq(),
+                approval_id: approval_id.clone(),
+                decision_id: approval_field(&map, "decision-id"),
+                actor: approval_field(&map, "actor"),
+                provenance: approval_field(&map, "provenance"),
+                reason: reason.clone(),
+            });
+            Err(SemaError::WorkflowApprovalRejected {
+                approval_id,
+                reason,
+            })
+        }
+        _ => Err(SemaError::internal(format!(
+            "approval worker returned unknown status {status:?}"
+        ))),
+    }
+}
+
+const APPROVAL_COMPLETION_KIND: u64 = 0x7761_7070; // "wapp"
+
+struct ApprovalDecoder;
+
+impl Trace for ApprovalDecoder {
+    fn trace(&self, _sink: &mut dyn FnMut(GcEdge<'_>)) -> bool {
+        true
+    }
+}
+
+impl CompletionDecoder for ApprovalDecoder {
+    fn decode(
+        self: Box<Self>,
+        _context: &mut NativeCallContext<'_>,
+        result: Result<SendPayload, ExternalFailure>,
+    ) -> DecodedCompletion {
+        match result {
+            Ok(payload) => match downcast_send_payload::<Result<ApprovalResolution, String>>(
+                payload,
+                "workflow/approval",
+            ) {
+                Ok(Ok(resolution)) => Ok(approval_resolution_value(resolution)),
+                Ok(Err(message)) => Err(SemaError::WorkflowApprovalFailed { message }),
+                Err(failure) => Err(SemaError::WorkflowApprovalFailed {
+                    message: failure.message().to_string(),
+                }),
+            },
+            Err(failure) => Err(SemaError::WorkflowApprovalFailed {
+                message: format!("workflow/approval: {}", failure.message()),
+            }),
+        }
+    }
+}
+
+struct ApprovalContinuation;
+
+impl Trace for ApprovalContinuation {
+    fn trace(&self, _sink: &mut dyn FnMut(GcEdge<'_>)) -> bool {
+        true
+    }
+}
+
+impl NativeContinuation for ApprovalContinuation {
+    fn resume(
+        self: Box<Self>,
+        context: &mut NativeCallContext<'_>,
+        input: ResumeInput,
+    ) -> NativeResult {
+        match input {
+            ResumeInput::Returned(value) => {
+                let task_context = context.task_context.clone();
+                apply_approval_resolution(Some(&task_context), value)
+                    .map_err(|error| fail_approval(Some(&task_context), error))
+                    .map(NativeOutcome::Return)
+            }
+            ResumeInput::Failed(error) => Err(fail_approval(Some(&context.task_context), error)),
+            ResumeInput::Cancelled(reason) => Err(fail_approval(
+                Some(&context.task_context),
+                SemaError::eval(format!("workflow/approval was cancelled ({reason:?})")),
+            )),
+            ResumeInput::Runtime(_) => Err(fail_approval(
+                Some(&context.task_context),
+                SemaError::internal("workflow/approval received an unexpected runtime response"),
+            )),
+        }
+    }
+}
+
+fn approval_suspend(run_dir: PathBuf, request: ApprovalRequest) -> NativeResult {
+    let kind = CompletionKind::try_from_raw(APPROVAL_COMPLETION_KIND)
+        .expect("approval completion kind is nonzero");
+    let bound = QuarantineBound::hard_deadline(Duration::from_secs(5))
+        .expect("approval store cleanup deadline is nonzero");
+    let prepared = PreparedExternalOperation::quarantined_blocking(
+        kind,
+        Box::new(ApprovalDecoder),
+        bound,
+        move || {
+            let result = sema_workflow::approval::ensure_request(&run_dir, &request)
+                .map_err(|error| error.to_string());
+            Ok(Box::new(result) as SendPayload)
+        },
+    );
+    Ok(NativeOutcome::Suspend(NativeSuspend {
+        wait: WaitKind::External(Box::new(prepared)),
+        continuation: Box::new(ApprovalContinuation),
+    }))
+}
+
+fn compile_policy(
+    container: &Value,
+) -> Result<Option<Vec<Rc<sema_policy::CompiledPolicy>>>, SemaError> {
+    opt_value(container, "policy")
+        .map(|policy| {
+            let values = if policy.as_map_rc().is_some() {
+                vec![policy]
+            } else {
+                let policies = policy.as_seq().ok_or_else(|| {
+                    SemaError::eval(format!(
+                        "invalid workflow policy: :policy must be a map or nonempty sequence of maps, got {}",
+                        policy.type_name()
+                    ))
+                })?;
+                if policies.is_empty() {
+                    return Err(SemaError::eval(
+                        "invalid workflow policy: :policy sequence must not be empty",
+                    ));
+                }
+                policies.to_vec()
+            };
+
+            values
+                .iter()
+                .enumerate()
+                .map(|(index, value)| {
+                    sema_policy::CompiledPolicy::compile(value)
+                        .map(Rc::new)
+                        .map_err(|error| {
+                            let hint = error.hint().map(str::to_string);
+                            let error = SemaError::eval(format!(
+                                "invalid workflow policy layer {}: {error}",
+                                index + 1
+                            ));
+                            if let Some(hint) = hint {
+                                error.with_hint(hint)
+                            } else {
+                                error
+                            }
+                        })
+                })
+                .collect()
+        })
+        .transpose()
+}
+
+fn value_is_present(value: &Value) -> bool {
+    if value.is_nil() {
+        return false;
+    }
+    if let Some(text) = value.as_str() {
+        return !text.trim().is_empty();
+    }
+    if let Some(items) = value.as_seq() {
+        return !items.is_empty();
+    }
+    if let Some(map) = value.as_map_rc() {
+        return !map.is_empty();
+    }
+    true
+}
+
+fn validate_required_metadata(
+    policies: Option<&[Rc<sema_policy::CompiledPolicy>]>,
+    meta: &Value,
+) -> Result<(), SemaError> {
+    let map = meta.as_map_rc();
+    for policy in policies.into_iter().flatten() {
+        let missing = policy
+            .required_metadata()
+            .filter(|key| {
+                map.as_ref()
+                    .and_then(|metadata| metadata.get(&Value::keyword(key)))
+                    .is_none_or(|value| !value_is_present(value))
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        if missing.is_empty() {
+            continue;
+        }
+        let missing = missing.into_iter().collect::<Vec<_>>();
+        return Err(SemaError::policy_denied(PolicyDenial {
+            policy: Some(policy.name().to_string()),
+            boundary: "workflow.metadata".to_string(),
+            subject: "workflow".to_string(),
+            rule: format!("metadata.missing.{}", missing.join(",")),
+            reason: format!(
+                "required workflow metadata is missing: {}",
+                missing
+                    .iter()
+                    .map(|key| format!(":{key}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            action: "fail".to_string(),
+            source: "request".to_string(),
+        }));
+    }
+    Ok(())
+}
+
+fn required_completion_events(policies: Option<&[Rc<sema_policy::CompiledPolicy>]>) -> Vec<String> {
+    policies
+        .into_iter()
+        .flatten()
+        .flat_map(|policy| policy.required_completion_events())
+        .map(str::to_string)
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+fn validate_step_policy_sections(
+    policies: Option<&[Rc<sema_policy::CompiledPolicy>]>,
+) -> Result<(), SemaError> {
+    for policy in policies.into_iter().flatten() {
+        let has_metadata = policy.required_metadata().next().is_some();
+        let has_completion = policy.required_completion_events().next().is_some();
+        if has_metadata || has_completion {
+            let sections = match (has_metadata, has_completion) {
+                (true, true) => ":metadata and :completion",
+                (true, false) => ":metadata",
+                (false, true) => ":completion",
+                (false, false) => unreachable!("checked above"),
+            };
+            return Err(SemaError::eval(format!(
+                "workflow/step: policy {:?} uses {sections}; evidence requirements must be attached to the enclosing workflow",
+                policy.name()
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn policy_sink(ctx: &Rc<context::WorkflowCtx>) -> PolicyDecisionSink {
+    let weak = Rc::downgrade(ctx);
+    Rc::new(move |observation| {
+        let Some(ctx) = weak.upgrade() else {
+            return;
+        };
+        emit_policy_observation(&ctx, observation);
+    })
+}
+
+fn emit_policy_observation(ctx: &context::WorkflowCtx, observation: PolicyObservation) {
+    let PolicyObservation {
+        kind,
+        policy,
+        policy_digest,
+        boundary,
+        subject,
+        subject_digest,
+        rule,
+        label,
+        count,
+        action,
+        reason,
+        source,
+        agent_id,
+    } = observation;
+    let seq = ctx.next_seq();
+    let ts = ctx.ts();
+    let phase_seq = ctx.phase_seq();
+    let boundary = boundary.as_str().to_string();
+    let source = source.as_str().to_string();
+
+    let event = match kind {
+        PolicyObservationKind::Checked => WorkflowEvent::PolicyChecked {
+            seq,
+            ts,
+            phase_seq,
+            agent_id,
+            policy,
+            policy_digest,
+            boundary,
+            subject,
+            subject_digest,
+            rule,
+            source,
+        },
+        PolicyObservationKind::Flagged => WorkflowEvent::PolicyFlagged {
+            seq,
+            ts,
+            phase_seq,
+            agent_id,
+            policy,
+            policy_digest,
+            boundary,
+            subject,
+            subject_digest,
+            rule,
+            label: label.unwrap_or_else(|| "finding".to_string()),
+            count: count.unwrap_or(1),
+            action: action.unwrap_or_else(|| "audit".to_string()),
+            source,
+        },
+        PolicyObservationKind::Redacted => WorkflowEvent::PolicyRedacted {
+            seq,
+            ts,
+            phase_seq,
+            agent_id,
+            policy,
+            policy_digest,
+            boundary,
+            subject,
+            subject_digest,
+            rule,
+            label: label.unwrap_or_else(|| "finding".to_string()),
+            count: count.unwrap_or(1),
+            source,
+        },
+        PolicyObservationKind::Violation => WorkflowEvent::PolicyViolation {
+            seq,
+            ts,
+            phase_seq,
+            agent_id,
+            policy,
+            policy_digest,
+            boundary,
+            subject,
+            subject_digest,
+            rule,
+            action: action.unwrap_or_else(|| "fail".to_string()),
+            reason: reason.unwrap_or_else(|| "denied".to_string()),
+            source,
+        },
+        PolicyObservationKind::Bypassed => WorkflowEvent::PolicyBypassed {
+            seq,
+            ts,
+            phase_seq,
+            agent_id,
+            policy,
+            policy_digest,
+            boundary,
+            subject,
+            subject_digest,
+            rule,
+            reason: reason.unwrap_or_else(|| "unspecified".to_string()),
+            source,
+        },
+    };
+    ctx.emit(event);
+}
+
+fn open_compiled_policy(
+    policies: Option<Vec<Rc<sema_policy::CompiledPolicy>>>,
+    ctx: &Rc<context::WorkflowCtx>,
+    workspace_root: &Path,
+) -> Option<PolicyScope> {
+    policies.map(|policies| {
+        sema_llm::builtins::open_policy_scopes(
+            policies,
+            workspace_root.to_path_buf(),
+            policy_sink(ctx),
+        )
+    })
 }
 
 /// The workflow's declared phase plan from `defworkflow` meta `:phases` (a list or
@@ -93,18 +870,13 @@ fn cap_text(s: &str) -> String {
     }
 }
 
-/// Max bytes of a value's compact form the journal renders inline before truncating.
-/// Golden values are tiny (far below this), so [`capped_render`] returns `pretty_print`
-/// verbatim for them and the goldens stay byte-identical; only a pathologically large
-/// value is truncated — and it is NEVER materialized in full (the compact form is
-/// bounded-checked via `context::compact_capped`, which aborts at the cap).
+/// Maximum size of a compact journal value before truncation. The bounded
+/// renderer does not materialize an over-limit value in full.
 const RENDERED_VALUE_MAX_BYTES: usize = 8192;
 
 /// Render a value for the journal so the dashboard can show the real data, byte-budgeted
-/// so one huge value can't materialize a multi-MB string on the VM thread. A value that
-/// fits renders exactly as before (`pretty_print(v, 100)`) — keeping goldens
-/// byte-identical; an over-cap value is rendered from its bounded compact prefix + a
-/// truncation marker.
+/// so one huge value cannot materialize a multi-MB string on the VM thread. Small values
+/// use `pretty_print`; larger values use a bounded compact prefix and a truncation marker.
 fn capped_render(v: &Value) -> String {
     let (compact, truncated) = sema_workflow::context::compact_capped(v, RENDERED_VALUE_MAX_BYTES);
     if truncated {
@@ -133,6 +905,13 @@ fn success_envelope(value: Value) -> Value {
     Value::map(m)
 }
 
+fn envelope_status(envelope: &Value) -> Option<String> {
+    envelope
+        .as_map_rc()?
+        .get(&Value::keyword("status"))
+        .and_then(as_name)
+}
+
 /// Close the currently-open marker phase, if any, emitting its `phase.ended` with the
 /// given status. No-op when no phase is open (a workflow with no `(phase …)` markers,
 /// or after the last phase already closed). Called both by the `(phase …)` marker (to
@@ -154,6 +933,24 @@ fn failed_envelope(msg: &str) -> Value {
     m.insert(Value::keyword("status"), Value::keyword("failed"));
     m.insert(Value::keyword("error"), Value::string(msg));
     Value::map(m)
+}
+
+fn needs_approval_envelope(approval_id: &str) -> Value {
+    Value::map(BTreeMap::from([
+        (Value::keyword("status"), Value::keyword("needs-approval")),
+        (Value::keyword("approval-id"), Value::string(approval_id)),
+    ]))
+}
+
+fn rejected_approval_envelope(approval_id: &str, reason: Option<&str>) -> Value {
+    let mut map = BTreeMap::from([
+        (Value::keyword("status"), Value::keyword("rejected")),
+        (Value::keyword("approval-id"), Value::string(approval_id)),
+    ]);
+    if let Some(reason) = reason {
+        map.insert(Value::keyword("reason"), Value::string(reason));
+    }
+    Value::map(map)
 }
 
 /// The envelope for a run that a budget cap stopped. Distinct `:reason` (not `:error`)
@@ -413,6 +1210,8 @@ struct StepTeardown {
     content_key: String,
     start: Instant,
     usage_scope: sema_llm::builtins::UsageScope,
+    _policy_scope: Option<PolicyScope>,
+    _attribution_scope: PolicyAttributionScope,
 }
 
 /// Journal a `workflow/step` leaf's result: emit `agent.result`, attribute usage via a
@@ -475,8 +1274,49 @@ fn finish_step(
     result.map(NativeOutcome::Return)
 }
 
-/// Pre-thunk work for `workflow/step` — see the original inline documentation preserved
-/// in `finish_step` and the event emissions below.
+struct PolicyBypassTeardown {
+    _bypass_scope: PolicyBypassScope,
+}
+
+fn policy_bypass_plan(
+    task_context: Option<&TaskContextHandle>,
+    args: &[Value],
+) -> Result<ThunkPlan<PolicyBypassTeardown>, SemaError> {
+    if args.len() != 2 {
+        return Err(SemaError::arity("workflow/policy-without", "2", args.len()));
+    }
+    if context::current_for(task_context).is_none() || !sema_llm::builtins::policy_active() {
+        return Err(SemaError::eval(
+            "policy/without requires an active workflow policy",
+        ));
+    }
+    let reason = args[0]
+        .as_str()
+        .ok_or_else(|| SemaError::argument_type("policy/without", 1, "string", &args[0]))?
+        .trim()
+        .to_string();
+    if reason.is_empty() || reason.chars().count() > 256 {
+        return Err(SemaError::eval(
+            "policy/without reason must contain 1 to 256 characters",
+        ));
+    }
+    Ok(ThunkPlan::Run {
+        thunk: args[1].clone(),
+        teardown: PolicyBypassTeardown {
+            _bypass_scope: sema_llm::builtins::open_policy_bypass(reason),
+        },
+    })
+}
+
+fn finish_policy_bypass(
+    _task_context: Option<&TaskContextHandle>,
+    _teardown: PolicyBypassTeardown,
+    result: Result<Value, SemaError>,
+    _durable: bool,
+) -> NativeResult {
+    result.map(NativeOutcome::Return)
+}
+
 fn step_plan(
     task_context: Option<&TaskContextHandle>,
     args: &[Value],
@@ -489,6 +1329,11 @@ fn step_plan(
     let label = agent_role(&args[0]);
     let thunk = args[1].clone();
     let Some(ctx) = context::current_for(task_context) else {
+        if opt_value(&args[0], "policy").is_some() {
+            return Err(SemaError::eval(
+                "workflow/step: :policy requires an enclosing workflow/run",
+            ));
+        }
         // Outside a run: transparent — just call the thunk (still cooperatively, so an
         // async op inside it works), with no journaling teardown.
         return Ok(ThunkPlan::Run {
@@ -496,6 +1341,11 @@ fn step_plan(
             teardown: None,
         });
     };
+    let step_policy = compile_policy(&args[0])?;
+    validate_step_policy_sections(step_policy.as_deref())?;
+    let workspace_root = std::env::current_dir()
+        .map_err(|error| SemaError::eval(format!("workflow/step: current directory: {error}")))?;
+    let policy_scope = open_compiled_policy(step_policy, &ctx, &workspace_root);
     // Resume short-circuit FIRST (before the budget latch): a memoized leaf replays for
     // FREE. This MUST precede the budget check: a replay makes no provider call, so a
     // tripped cap must not refuse it. The key is computed on EVERY leaf so its occurrence
@@ -513,6 +1363,7 @@ fn step_plan(
         &opt_str(&args[0], "__schema-repr"),
         &label,
         &ctx.cur_phase_label(),
+        &sema_llm::builtins::effective_policy_fingerprint(),
     );
     if ctx.resuming() {
         if let Some(v) = ctx.memo_lookup(&content_key) {
@@ -525,6 +1376,7 @@ fn step_plan(
     }
     // Unique per-invocation id (the dashboard correlates started→result→budget by it).
     let agent_id = ctx.next_agent_id(&label);
+    let attribution_scope = sema_llm::builtins::open_policy_attribution(agent_id.clone());
     ctx.emit(WorkflowEvent::AgentStarted {
         seq: ctx.next_seq(),
         ts: ctx.ts(),
@@ -550,6 +1402,8 @@ fn step_plan(
             content_key,
             start,
             usage_scope,
+            _policy_scope: policy_scope,
+            _attribution_scope: attribution_scope,
         }),
     })
 }
@@ -621,16 +1475,10 @@ fn finish_checkpoint(
     Ok(NativeOutcome::Return(value))
 }
 
-/// Post-thunk teardown state for `workflow/run`. Holds the scope guard (whose Drop
-/// removes the exact scope token, LAST — after `run.ended` + `result.json`) and, until
-/// closed exactly once, the resolver + open MCP handles (the handles are `Value`s —
-/// traced).
 struct RunTeardown {
-    // A pure RAII drop guard: never read by name (a type with a manual `Drop` cannot be
-    // destructured), it exists solely so its own `Drop` removes the exact scope token
-    // whenever the `RunTeardown` is dropped — on `finish_run`, or via the backstop.
-    #[allow(dead_code)]
-    guard: context::WorkflowGuard,
+    _guard: context::WorkflowGuard,
+    _policy_scope: Option<PolicyScope>,
+    required_events: Vec<String>,
     mcp: Option<McpClose>,
 }
 
@@ -673,32 +1521,90 @@ impl Drop for RunTeardown {
 fn finish_run(
     task_context: Option<&TaskContextHandle>,
     mut teardown: RunTeardown,
-    result: Result<Value, SemaError>,
+    mut result: Result<Value, SemaError>,
     durable: bool,
 ) -> NativeResult {
+    if result.is_ok() {
+        if let Some(message) =
+            context::current_for(task_context).and_then(|ctx| ctx.approval_failure())
+        {
+            result = Err(SemaError::WorkflowApprovalFailed { message });
+        }
+    }
+    let approval_control = result
+        .as_ref()
+        .err()
+        .filter(|error| error.is_uncatchable())
+        .cloned();
+    let propagate_to_outer =
+        approval_control.is_some() && context::scope_depth_for(task_context) > 1;
     let (mut status, mut envelope, mut reason) = match &result {
-        Ok(v) => ("success", success_envelope(v.clone()), None),
-        Err(e) => (
-            "failed",
-            failed_envelope(&e.to_string()),
-            Some("workflow body returned an error".to_string()),
-        ),
+        Ok(v) => {
+            let envelope = success_envelope(v.clone());
+            let status = envelope_status(&envelope).unwrap_or_else(|| "success".to_string());
+            (status, envelope, None)
+        }
+        Err(e) => match e.inner() {
+            SemaError::WorkflowApprovalRequired { approval_id } => (
+                "needs-approval".to_string(),
+                needs_approval_envelope(approval_id),
+                Some("human approval required".to_string()),
+            ),
+            SemaError::WorkflowApprovalRejected {
+                approval_id,
+                reason,
+            } => (
+                "rejected".to_string(),
+                rejected_approval_envelope(approval_id, reason.as_deref()),
+                Some("human approval rejected".to_string()),
+            ),
+            _ => (
+                "failed".to_string(),
+                failed_envelope(&e.to_string()),
+                Some("workflow body returned an error".to_string()),
+            ),
+        },
     };
     // Close any resolved MCP handles exactly once, regardless of how the body exited.
     teardown.close_mcp();
     let ctx = context::current_for(task_context);
     let ack = if let Some(ctx) = &ctx {
+        if matches!(status.as_str(), "needs-approval" | "rejected") {
+            let mut map = envelope
+                .as_map_rc()
+                .map(|map| (*map).clone())
+                .unwrap_or_default();
+            map.insert(Value::keyword("run-id"), Value::string(&ctx.run_id()));
+            envelope = Value::map(map);
+        }
         // A tripped budget cap fails the run regardless of the body's own outcome.
         if ctx.over_budget() {
-            status = "failed";
+            status = "failed".to_string();
             envelope = budget_failed_envelope();
             reason = Some("budget exceeded".to_string());
         }
-        close_open_phase(ctx, status);
+        if status == "success" {
+            let missing = teardown
+                .required_events
+                .iter()
+                .filter(|event| !ctx.has_event(event))
+                .cloned()
+                .collect::<Vec<_>>();
+            if !missing.is_empty() {
+                status = "failed".to_string();
+                let message = format!(
+                    "completion policy missing required events: {}",
+                    missing.join(", ")
+                );
+                envelope = failed_envelope(&message);
+                reason = Some(message);
+            }
+        }
+        close_open_phase(ctx, &status);
         ctx.emit(WorkflowEvent::RunEnded {
             seq: ctx.next_seq(),
             ts: ctx.ts(),
-            status: status.into(),
+            status,
             reason,
             dur_ms: ctx.dur_ms(),
         });
@@ -712,6 +1618,9 @@ fn finish_run(
     // Dropping the teardown removes the exact scope token (its `guard`) and is a no-op
     // second MCP close.
     drop(teardown);
+    if propagate_to_outer {
+        return Err(approval_control.expect("checked above"));
+    }
     match ack {
         // Runtime (quantum) normal completion: park on the External flush-ack so the task
         // resumes — returning the envelope — only once the writer has flushed to disk.
@@ -866,10 +1775,7 @@ impl CancelHook for FlushCancelHook {
     }
 }
 
-/// Pre-thunk work for `workflow/run`: open the run scope, journal `run.started`, resolve
-/// any declared `:mcp` servers (a pre-body gate that can end the run before the body ever
-/// runs), and hand back the body thunk plus the teardown state. Mirrors the original
-/// inline builtin; the post-body work moved to `finish_run`.
+/// Open the run scope, journal `run.started`, and resolve declared MCP servers.
 fn run_plan(
     task_context: Option<&TaskContextHandle>,
     args: &[Value],
@@ -886,6 +1792,14 @@ fn run_plan(
     let doc = args[1].as_str().unwrap_or("").to_string();
     let meta = args[2].clone();
     let thunk = args[3].clone();
+    let policy = compile_policy(&meta)?;
+    validate_required_metadata(policy.as_deref(), &meta)?;
+    let workspace_root = match context::host_workspace_root() {
+        Some(root) => root,
+        None => std::env::current_dir().map_err(|error| {
+            SemaError::eval(format!("workflow/run: current directory: {error}"))
+        })?,
+    };
 
     // Open the run scope: sets up the journal sink under ./.sema/runs/<run-id>/, installs
     // the thread-local WorkflowCtx, and returns a panic-safe Drop guard that reaps the
@@ -909,10 +1823,6 @@ fn run_plan(
         });
     }
 
-    // ── Implicit :mcp auth-resolution step, before the body thunk ─────────
-    // A workflow with no :mcp meta key parses to an empty Vec here (O(1) on the absent
-    // key), so every branch below is skipped and the body runs exactly as it did before
-    // this feature — byte-identical for the no-:mcp case.
     let decls = match workflow_mcp::declared_mcp(&meta) {
         Ok(d) => d,
         Err(e) => {
@@ -930,12 +1840,19 @@ fn run_plan(
         }
     };
 
-    // A workflow with no `:mcp` runs the body straight away — byte-identical to the
-    // pre-feature path.
     if decls.is_empty() {
+        let ctx = context::current_for(task_context)
+            .ok_or_else(|| SemaError::eval("workflow/run: scope not established"))?;
+        let required_events = required_completion_events(policy.as_deref());
+        let policy_scope = open_compiled_policy(policy, &ctx, &workspace_root);
         return Ok(ThunkPlan::Run {
             thunk,
-            teardown: RunTeardown { guard, mcp: None },
+            teardown: RunTeardown {
+                _guard: guard,
+                _policy_scope: policy_scope,
+                required_events,
+                mcp: None,
+            },
         });
     }
 
@@ -974,13 +1891,23 @@ fn run_plan(
                 guard,
                 thunk,
                 resolver,
+                policy,
+                workspace_root,
             }),
         }));
     }
 
     // Host arm (outside a runtime quantum): `io_block_on` is legal — resolve inline.
     let resolutions = resolver.resolve(&decls, &name, &run_id);
-    match apply_resolutions(task_context, guard, thunk, resolver, resolutions)? {
+    match apply_resolutions(
+        task_context,
+        guard,
+        thunk,
+        resolver,
+        resolutions,
+        policy,
+        workspace_root,
+    )? {
         ResolveGate::Exit { envelope, ack } => Ok(terminal_plan(task_context, envelope, ack)),
         ResolveGate::Proceed { thunk, teardown } => Ok(ThunkPlan::Run { thunk, teardown }),
     }
@@ -1006,6 +1933,8 @@ fn apply_resolutions(
     thunk: Value,
     resolver: Rc<dyn WorkflowMcpResolver>,
     resolutions: Vec<ServerResolution>,
+    policy: Option<Vec<Rc<sema_policy::CompiledPolicy>>>,
+    workspace_root: PathBuf,
 ) -> Result<ResolveGate, SemaError> {
     let ctx = context::current_for(task_context)
         .ok_or_else(|| SemaError::eval("workflow/run: scope not established"))?;
@@ -1101,10 +2030,14 @@ fn apply_resolutions(
     // Every declared server connected: publish handles for workflow/mcp-handle, and
     // remember (resolver, handles) so `finish_run` closes them EXACTLY once.
     ctx.set_mcp_handles(connected);
+    let required_events = required_completion_events(policy.as_deref());
+    let policy_scope = open_compiled_policy(policy, &ctx, &workspace_root);
     Ok(ResolveGate::Proceed {
         thunk,
         teardown: RunTeardown {
-            guard,
+            _guard: guard,
+            _policy_scope: policy_scope,
+            required_events,
             mcp: Some(McpClose {
                 resolver,
                 handles: connected_handles,
@@ -1137,6 +2070,8 @@ struct ResolveContinuation {
     guard: context::WorkflowGuard,
     thunk: Value,
     resolver: Rc<dyn WorkflowMcpResolver>,
+    policy: Option<Vec<Rc<sema_policy::CompiledPolicy>>>,
+    workspace_root: PathBuf,
 }
 
 impl Trace for ResolveContinuation {
@@ -1157,11 +2092,21 @@ impl NativeContinuation for ResolveContinuation {
             guard,
             thunk,
             resolver,
+            policy,
+            workspace_root,
         } = *self;
         match input {
             ResumeInput::Returned(value) => {
                 let resolutions = workflow_mcp::decode_resolutions(&value);
-                match apply_resolutions(Some(&task_context), guard, thunk, resolver, resolutions)? {
+                match apply_resolutions(
+                    Some(&task_context),
+                    guard,
+                    thunk,
+                    resolver,
+                    resolutions,
+                    policy,
+                    workspace_root,
+                )? {
                     ResolveGate::Exit { envelope, ack } => Ok(NativeOutcome::Suspend(
                         build_flush_ack_suspend(envelope, ack),
                     )),
@@ -1228,6 +2173,28 @@ pub fn register(env: &sema_core::Env) {
         trace_run_teardown,
     );
 
+    // (workflow/approval key opts) — atomically create/read the host-owned request and
+    // decision sidecars. The runtime arm offloads filesystem I/O; pending/rejected
+    // outcomes raise uncatchable workflow control transfers consumed by workflow/run.
+    env.set(
+        sema_core::intern("workflow/approval"),
+        Value::native_fn(sema_core::NativeFn::simple_with_runtime(
+            "workflow/approval",
+            |args| {
+                let (run_dir, request) = approval_request(None, args)?;
+                let resolution = sema_workflow::approval::ensure_request(&run_dir, &request)
+                    .map_err(|error| fail_approval(None, SemaError::Io(error.to_string())))?;
+                apply_approval_resolution(None, approval_resolution_value(resolution))
+                    .map_err(|error| fail_approval(None, error))
+            },
+            |context, args| {
+                let task_context = context.task_context.clone();
+                let (run_dir, request) = approval_request(Some(&task_context), args)?;
+                approval_suspend(run_dir, request)
+            },
+        )),
+    );
+
     // (workflow/phase label) — a MARKER (workflow.js semantics), not a wrapper. Closes
     // the previously-open phase (emitting its phase.ended) then opens `label`. The
     // checkpoints/agents that follow attribute to this phase until the next marker or
@@ -1275,6 +2242,14 @@ pub fn register(env: &sema_core::Env) {
         },
     );
 
+    register_thunk_fn(
+        env,
+        "workflow/policy-without",
+        policy_bypass_plan,
+        finish_policy_bypass,
+        |_teardown, _sink| {},
+    );
+
     // (workflow/tool-call tool-name [args]) — journal a tool call by the current
     // agent (the dashboard renders these as tool twigs in the agent's drill-in).
     // No-op (returns nil) outside a workflow/step. `args` is an opaque/gated
@@ -1303,6 +2278,28 @@ pub fn register(env: &sema_core::Env) {
                     agent_id,
                     tool_name,
                     args_json,
+                });
+            }
+        }
+        Ok(Value::nil())
+    });
+
+    // Successful tool completion evidence. The event deliberately carries only
+    // a gated sentinel, never the callback's result preview.
+    register_scoped_fn(env, "workflow/tool-result", |task_context, args| {
+        if args.len() != 1 {
+            return Err(SemaError::arity("workflow/tool-result", "1", args.len()));
+        }
+        let tool_name = as_name(&args[0])
+            .ok_or_else(|| SemaError::type_error("keyword or string", args[0].type_name()))?;
+        if let Some(ctx) = context::current_for(task_context) {
+            if let Some(agent_id) = context::cur_agent_for(task_context) {
+                ctx.emit(WorkflowEvent::AgentToolResult {
+                    seq: ctx.next_seq(),
+                    ts: ctx.ts(),
+                    agent_id,
+                    tool_name,
+                    result_digest: "gated".to_string(),
                 });
             }
         }
@@ -1468,5 +2465,44 @@ mod continuation_tests {
         let mut edges = 0usize;
         assert!(checkpoint.trace(&mut |_| edges += 1));
         assert_eq!(edges, 0, "checkpoint teardown must expose no Value edges");
+    }
+
+    #[test]
+    fn approval_subject_encoding_is_type_preserving_and_rejects_mutability() {
+        let string = canonical_approval_subject_digest(&Value::string("x")).unwrap();
+        let keyword = canonical_approval_subject_digest(&Value::keyword("x")).unwrap();
+        let symbol = canonical_approval_subject_digest(&Value::symbol("x")).unwrap();
+        assert_ne!(string, keyword);
+        assert_ne!(keyword, symbol);
+
+        let mutable = Value::mutable_cell(Value::int(1));
+        let error = canonical_approval_subject_digest(&mutable).unwrap_err();
+        assert!(error.to_string().contains("immutable canonical data"));
+    }
+
+    #[test]
+    fn approval_subject_hashmap_digest_is_insertion_order_independent() {
+        let first = Value::hashmap(vec![
+            (Value::string("a"), Value::int(1)),
+            (Value::string("b"), Value::int(2)),
+        ]);
+        let second = Value::hashmap(vec![
+            (Value::string("b"), Value::int(2)),
+            (Value::string("a"), Value::int(1)),
+        ]);
+        assert_eq!(
+            canonical_approval_subject_digest(&first).unwrap(),
+            canonical_approval_subject_digest(&second).unwrap()
+        );
+    }
+
+    #[test]
+    fn approval_infrastructure_failures_are_uncatchable() {
+        let error = fail_approval(None, SemaError::eval("approval store unavailable"));
+        assert!(error.is_uncatchable());
+        assert!(matches!(
+            error.inner(),
+            SemaError::WorkflowApprovalFailed { .. }
+        ));
     }
 }

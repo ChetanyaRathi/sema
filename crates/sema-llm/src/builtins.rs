@@ -1,12 +1,13 @@
 use std::cell::Cell;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, VecDeque};
+use std::path::PathBuf;
 use std::rc::Rc;
 
 use sema_core::runtime::RuntimeTaskId;
 use sema_core::{
-    resolve, Agent, Conversation, Env, EvalContext, ImageAttachment, Message, NativeFn, Prompt,
-    Role, SemaError, Value, ValueView,
+    resolve, Agent, Conversation, Env, EvalContext, ImageAttachment, Message, NativeFn,
+    PolicyDenial, Prompt, Role, SemaError, Value, ValueView,
 };
 
 use sha2::{Digest, Sha256};
@@ -20,7 +21,7 @@ use crate::pricing;
 use crate::provider::{LlmProvider, ProviderRegistry};
 use crate::types::{
     ChatMessage, ChatRequest, ChatResponse, ContentBlock, EmbedRequest, EmbedResponse, LlmError,
-    RerankRequest, RerankResponse, ToolCall, ToolSchema, Usage,
+    MessageContent, RerankRequest, RerankResponse, ToolCall, ToolSchema, Usage,
 };
 use crate::vector_store::{VectorDocument, VectorStore};
 
@@ -61,6 +62,16 @@ thread_local! {
     /// module. Allows `agent/run` to seed from and append to a memory handle without
     /// depending on `sema-stdlib` (which would be circular).
     static MEMORY_CALLBACKS: RefCell<Option<MemoryCbs>> = const { RefCell::new(None) };
+    /// Ordered policy layers active for the current task. The LLM
+    /// dynamic-scope mechanism captures and swaps these with cache/budget/cassette
+    /// state, so workflow and step policies remain isolated across sibling tasks.
+    static ACTIVE_POLICIES: RefCell<Vec<ActivePolicy>> = const { RefCell::new(Vec::new()) };
+    /// Trusted lexical policy bypass reasons. A nonempty stack suppresses policy
+    /// enforcement but still emits a `policy.bypassed` observation per boundary.
+    static POLICY_BYPASS: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+    /// Workflow step attribution carried with the policy scope, independent of
+    /// the workflow crate's task-local state.
+    static POLICY_AGENT_ID: RefCell<Option<String>> = const { RefCell::new(None) };
 }
 
 /// Function-pointer table injected by `sema-stdlib/memory.rs` via
@@ -96,6 +107,790 @@ pub struct LastUsage {
     pub model: String,
     /// `None` when pricing is unknown for the model (genuinely absent, not 0).
     pub cost_usd: Option<f64>,
+}
+
+/// Policy boundary recorded by the workflow journal sink.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PolicyBoundary {
+    Model,
+    Tool,
+    LlmInput,
+    LlmOutput,
+}
+
+impl PolicyBoundary {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Model => "model",
+            Self::Tool => "tool",
+            Self::LlmInput => "llm.input",
+            Self::LlmOutput => "llm.output",
+        }
+    }
+}
+
+/// Where a policy-checked model result is about to come from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PolicySource {
+    Request,
+    Cache,
+    Cassette,
+}
+
+impl PolicySource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Request => "request",
+            Self::Cache => "cache",
+            Self::Cassette => "cassette",
+        }
+    }
+}
+
+/// The journal-facing result of checking or bypassing one policy layer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PolicyObservation {
+    pub kind: PolicyObservationKind,
+    pub policy: String,
+    pub policy_digest: String,
+    pub boundary: PolicyBoundary,
+    pub subject: String,
+    pub subject_digest: Option<String>,
+    pub rule: String,
+    pub label: Option<String>,
+    pub count: Option<usize>,
+    pub action: Option<String>,
+    pub reason: Option<String>,
+    pub source: PolicySource,
+    pub agent_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PolicyObservationKind {
+    Checked,
+    Flagged,
+    Redacted,
+    Violation,
+    Bypassed,
+}
+
+/// Sink installed by `workflow/run`; it captures only a weak workflow context.
+pub type PolicyDecisionSink = Rc<dyn Fn(PolicyObservation)>;
+
+#[derive(Clone)]
+struct ActivePolicy {
+    policy: Rc<sema_policy::CompiledPolicy>,
+    workspace_root: PathBuf,
+    sink: PolicyDecisionSink,
+}
+
+/// Effective result of checking all active policy layers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PolicyGate<T> {
+    Allow,
+    Deny(PolicyDecision<T>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PolicyDecision<T> {
+    action: T,
+    denial: PolicyDenial,
+}
+
+/// RAII guard for one workflow or step policy layer.
+pub struct PolicyScope {
+    previous: Option<Vec<ActivePolicy>>,
+}
+
+impl Drop for PolicyScope {
+    fn drop(&mut self) {
+        if let Some(previous) = self.previous.take() {
+            ACTIVE_POLICIES.with(|policies| *policies.borrow_mut() = previous);
+        }
+    }
+}
+
+/// RAII guard for a trusted lexical policy bypass.
+pub struct PolicyBypassScope {
+    previous: Option<Vec<String>>,
+}
+
+impl Drop for PolicyBypassScope {
+    fn drop(&mut self) {
+        if let Some(previous) = self.previous.take() {
+            POLICY_BYPASS.with(|bypass| *bypass.borrow_mut() = previous);
+        }
+    }
+}
+
+/// RAII guard for step-level journal attribution.
+pub struct PolicyAttributionScope {
+    previous: Option<String>,
+}
+
+impl Drop for PolicyAttributionScope {
+    fn drop(&mut self) {
+        POLICY_AGENT_ID.with(|agent| *agent.borrow_mut() = self.previous.take());
+    }
+}
+
+/// Install compiled policy layers atomically for the dynamic extent of a workflow or step.
+pub fn open_policy_scopes(
+    policies_to_add: Vec<Rc<sema_policy::CompiledPolicy>>,
+    workspace_root: PathBuf,
+    sink: PolicyDecisionSink,
+) -> PolicyScope {
+    let previous = ACTIVE_POLICIES.with(|policies| {
+        let previous = policies.borrow().clone();
+        policies
+            .borrow_mut()
+            .extend(policies_to_add.into_iter().map(|policy| ActivePolicy {
+                policy,
+                workspace_root: workspace_root.clone(),
+                sink: sink.clone(),
+            }));
+        previous
+    });
+    PolicyScope {
+        previous: Some(previous),
+    }
+}
+
+/// Disable active policies for a trusted lexical extent while retaining audit
+/// observations and all sandbox capability checks.
+pub fn open_policy_bypass(reason: String) -> PolicyBypassScope {
+    let previous = POLICY_BYPASS.with(|bypass| {
+        let previous = bypass.borrow().clone();
+        bypass.borrow_mut().push(reason);
+        previous
+    });
+    PolicyBypassScope {
+        previous: Some(previous),
+    }
+}
+
+/// Attribute policy observations to one workflow step.
+pub fn open_policy_attribution(agent_id: String) -> PolicyAttributionScope {
+    let previous = POLICY_AGENT_ID.with(|agent| agent.borrow_mut().replace(agent_id));
+    PolicyAttributionScope { previous }
+}
+
+/// Whether at least one policy layer is currently active.
+pub fn policy_active() -> bool {
+    ACTIVE_POLICIES.with(|policies| !policies.borrow().is_empty())
+}
+
+/// Stable digest of the ordered effective policy stack and bypass state.
+pub fn effective_policy_fingerprint() -> String {
+    let policies = ACTIVE_POLICIES.with(|policies| policies.borrow().clone());
+    if policies.is_empty() {
+        return String::new();
+    }
+    let bypass = POLICY_BYPASS.with(|bypass| bypass.borrow().last().cloned());
+    let mut hasher = Sha256::new();
+    hasher.update(b"sema-effective-policy-v1\0");
+    for layer in policies {
+        hasher.update(layer.policy.fingerprint().as_bytes());
+        hasher.update(b"\0");
+    }
+    if let Some(reason) = bypass {
+        hasher.update(b"bypass\0");
+        hasher.update(reason.as_bytes());
+    }
+    format!("sha256:{:x}", hasher.finalize())
+}
+
+/// Check all active model policy layers. `minimum_action` upgrades `:skip`
+/// outside a real fallback selection so the journal records the action that
+/// enforcement will actually take.
+fn check_model_policy(
+    provider: &str,
+    model: &str,
+    source: PolicySource,
+    minimum_action: sema_policy::ModelDenyAction,
+) -> PolicyGate<sema_policy::ModelDenyAction> {
+    let subject = format!("{provider}/{model}");
+    check_active_policies(
+        PolicyBoundary::Model,
+        &subject,
+        None,
+        source,
+        |layer| layer.policy.check_model(provider, model),
+        |layer| layer.policy.model_action().max(Some(minimum_action)),
+    )
+}
+
+fn policy_denied(denial: PolicyDenial) -> SemaError {
+    SemaError::policy_denied(denial)
+}
+
+fn unnamed_policy_denial(
+    boundary: PolicyBoundary,
+    subject: impl Into<String>,
+    rule: impl Into<String>,
+    reason: impl Into<String>,
+    action: impl Into<String>,
+    source: PolicySource,
+) -> PolicyDenial {
+    PolicyDenial {
+        policy: None,
+        boundary: boundary.as_str().to_string(),
+        subject: subject.into(),
+        rule: rule.into(),
+        reason: reason.into(),
+        action: action.into(),
+        source: source.as_str().to_string(),
+    }
+}
+
+/// Check a resolved model target. `Ok(false)` means a fallback-only `:skip`
+/// denial; every other denial is a hard error.
+fn model_target_allowed(
+    provider: &str,
+    model: &str,
+    source: PolicySource,
+    fallback_target: bool,
+) -> Result<bool, SemaError> {
+    let minimum_action = if fallback_target {
+        sema_policy::ModelDenyAction::Skip
+    } else {
+        sema_policy::ModelDenyAction::Fail
+    };
+    match check_model_policy(provider, model, source, minimum_action) {
+        PolicyGate::Allow => Ok(true),
+        PolicyGate::Deny(decision)
+            if decision.action == sema_policy::ModelDenyAction::Skip && fallback_target =>
+        {
+            Ok(false)
+        }
+        PolicyGate::Deny(decision) => Err(policy_denied(decision.denial)),
+    }
+}
+
+/// Resolve and check every batch target before the provider starts any request.
+fn resolve_batch_models(
+    provider: &dyn LlmProvider,
+    requests: impl IntoIterator<Item = ChatRequest>,
+) -> Result<Vec<ChatRequest>, SemaError> {
+    requests
+        .into_iter()
+        .map(|mut request| {
+            apply_input_policy_to_request(&mut request)?;
+            if request.model.is_empty() {
+                request.model = provider.default_model().to_string();
+            }
+            model_target_allowed(
+                provider.name(),
+                &request.model,
+                PolicySource::Request,
+                false,
+            )?;
+            Ok(request)
+        })
+        .collect()
+}
+
+fn enforce_stored_model_policy(
+    provider: &str,
+    model: &str,
+    source: PolicySource,
+) -> Result<(), SemaError> {
+    if !policy_active() {
+        return Ok(());
+    }
+    if provider.is_empty() {
+        return Err(policy_denied(unnamed_policy_denial(
+            PolicyBoundary::Model,
+            model,
+            format!("{}.missing-provider", source.as_str()),
+            "stored model metadata does not identify a provider",
+            "fail",
+            source,
+        )));
+    }
+    model_target_allowed(provider, model, source, false).map(|_| ())
+}
+
+fn preflight_tool_calls(
+    calls: &[ToolCall],
+    tools: &[Value],
+) -> Result<BTreeMap<String, String>, SemaError> {
+    let mut denied = BTreeMap::new();
+    let mut hard_denial = None;
+    for call in calls {
+        let definition = tools.iter().find_map(|tool| {
+            tool.as_tool_def_rc()
+                .filter(|definition| definition.name == call.name)
+        });
+        let policy_subjects = definition
+            .as_deref()
+            .map_or(&[][..], |definition| definition.policy_subjects.as_slice());
+        match check_tool_policy(
+            &call.name,
+            &call.arguments,
+            policy_subjects,
+            sema_policy::ToolDenyAction::ToolError,
+        ) {
+            PolicyGate::Allow => {}
+            PolicyGate::Deny(decision)
+                if decision.action == sema_policy::ToolDenyAction::ToolError =>
+            {
+                denied.insert(
+                    call.id.clone(),
+                    format!(
+                        "tool '{}' was blocked: {}",
+                        call.name, decision.denial.reason
+                    ),
+                );
+            }
+            PolicyGate::Deny(decision) => {
+                hard_denial.get_or_insert(decision.denial);
+            }
+        }
+    }
+    if let Some(denial) = hard_denial {
+        return Err(policy_denied(denial));
+    }
+    Ok(denied)
+}
+
+fn enforce_direct_tool_policy(
+    tool: &str,
+    arguments: &serde_json::Value,
+    policy_subjects: &[sema_core::ToolPolicySubject],
+) -> Result<(), SemaError> {
+    match check_tool_policy(
+        tool,
+        arguments,
+        policy_subjects,
+        sema_policy::ToolDenyAction::Fail,
+    ) {
+        PolicyGate::Allow => Ok(()),
+        PolicyGate::Deny(decision) => Err(policy_denied(decision.denial)),
+    }
+}
+
+/// Check all active tool policy layers.
+fn check_tool_policy(
+    tool: &str,
+    arguments: &serde_json::Value,
+    policy_subjects: &[sema_core::ToolPolicySubject],
+    minimum_action: sema_policy::ToolDenyAction,
+) -> PolicyGate<sema_policy::ToolDenyAction> {
+    let subject_digest = policy_value_digest(arguments);
+    check_active_policies(
+        PolicyBoundary::Tool,
+        tool,
+        Some(subject_digest),
+        PolicySource::Request,
+        |layer| {
+            layer
+                .policy
+                .check_tool(tool, arguments, policy_subjects, &layer.workspace_root)
+        },
+        |layer| layer.policy.tool_action().max(Some(minimum_action)),
+    )
+}
+
+trait PolicyAction: Copy + Ord {
+    fn name(self) -> &'static str;
+}
+
+impl PolicyAction for sema_policy::ModelDenyAction {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Skip => "skip",
+            Self::Fail => "fail",
+        }
+    }
+}
+
+impl PolicyAction for sema_policy::ToolDenyAction {
+    fn name(self) -> &'static str {
+        match self {
+            Self::ToolError => "tool-error",
+            Self::Fail => "fail",
+        }
+    }
+}
+
+fn check_active_policies<T: PolicyAction>(
+    boundary: PolicyBoundary,
+    subject: &str,
+    subject_digest: Option<String>,
+    source: PolicySource,
+    check: impl Fn(&ActivePolicy) -> sema_policy::PolicyCheck,
+    action: impl Fn(&ActivePolicy) -> Option<T>,
+) -> PolicyGate<T> {
+    let policies = ACTIVE_POLICIES.with(|policies| policies.borrow().clone());
+    if policies.is_empty() {
+        return PolicyGate::Allow;
+    }
+    let agent_id = POLICY_AGENT_ID.with(|agent| agent.borrow().clone());
+    if let Some(reason) = POLICY_BYPASS.with(|bypass| bypass.borrow().last().cloned()) {
+        let fingerprint = effective_policy_fingerprint();
+        let observation = PolicyObservation {
+            kind: PolicyObservationKind::Bypassed,
+            policy: "effective-policy".to_string(),
+            policy_digest: fingerprint,
+            boundary,
+            subject: subject.to_string(),
+            subject_digest,
+            rule: "policy.without".to_string(),
+            label: None,
+            count: None,
+            action: Some("bypass".to_string()),
+            reason: Some(reason),
+            source,
+            agent_id,
+        };
+        (policies.last().expect("nonempty policy stack").sink)(observation);
+        return PolicyGate::Allow;
+    }
+
+    let decisions: Vec<_> = policies
+        .iter()
+        .map(|layer| {
+            let result = check(layer);
+            let configured_action = (!result.allowed).then(|| action(layer)).flatten();
+            (result, configured_action)
+        })
+        .collect();
+    let denied_action = decisions.iter().filter_map(|(_, action)| *action).max();
+    let denial = denied_action.and_then(|effective_action| {
+        policies
+            .iter()
+            .zip(&decisions)
+            .find(|(_, (result, configured_action))| {
+                !result.allowed && *configured_action == Some(effective_action)
+            })
+            .map(|(layer, (result, _))| PolicyDecision {
+                action: effective_action,
+                denial: PolicyDenial {
+                    policy: Some(layer.policy.name().to_string()),
+                    boundary: boundary.as_str().to_string(),
+                    subject: subject.to_string(),
+                    rule: result.rule.clone(),
+                    reason: result
+                        .reason
+                        .clone()
+                        .unwrap_or_else(|| "the active policy denied this operation".to_string()),
+                    action: effective_action.name().to_string(),
+                    source: source.as_str().to_string(),
+                },
+            })
+    });
+
+    for (layer, (result, configured_action)) in policies.iter().zip(decisions) {
+        let observation = PolicyObservation {
+            kind: if result.allowed {
+                PolicyObservationKind::Checked
+            } else {
+                PolicyObservationKind::Violation
+            },
+            policy: layer.policy.name().to_string(),
+            policy_digest: layer.policy.fingerprint().to_string(),
+            boundary,
+            subject: subject.to_string(),
+            subject_digest: subject_digest.clone(),
+            rule: result.rule,
+            label: None,
+            count: None,
+            // Journal what the boundary will actually do. A stricter denial in
+            // any active layer upgrades every violation observation to that
+            // effective action.
+            action: configured_action
+                .and(denied_action)
+                .map(|action| action.name().to_string()),
+            reason: result.reason,
+            source,
+            agent_id: agent_id.clone(),
+        };
+        (layer.sink)(observation);
+    }
+    denial.map_or(PolicyGate::Allow, PolicyGate::Deny)
+}
+
+fn policy_value_digest(value: &serde_json::Value) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(serde_json::to_vec(value).unwrap_or_default());
+    format!("sha256:{:x}", hasher.finalize())
+}
+
+fn policy_text_digest(text: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(text.as_bytes());
+    format!("sha256:{:x}", hasher.finalize())
+}
+
+fn output_policy_active() -> bool {
+    ACTIVE_POLICIES.with(|policies| {
+        policies
+            .borrow()
+            .iter()
+            .any(|layer| layer.policy.has_output_policy())
+    })
+}
+
+fn apply_text_policy(
+    text: &str,
+    boundary: PolicyBoundary,
+    subject: &str,
+    source: PolicySource,
+    output_stage: Option<sema_policy::OutputStage>,
+) -> Result<String, SemaError> {
+    let policies = ACTIVE_POLICIES.with(|policies| policies.borrow().clone());
+    let policies: Vec<_> = policies
+        .into_iter()
+        .filter(|layer| match boundary {
+            PolicyBoundary::LlmInput => layer.policy.has_input_policy(),
+            PolicyBoundary::LlmOutput => layer.policy.has_output_policy(),
+            PolicyBoundary::Model | PolicyBoundary::Tool => false,
+        })
+        .collect();
+    if policies.is_empty() {
+        return Ok(text.to_string());
+    }
+    if text.len() > sema_policy::content::INPUT_BYTE_CAP {
+        return Err(policy_denied(unnamed_policy_denial(
+            boundary,
+            subject,
+            "content.input-too-large",
+            format!(
+                "content exceeds the {}-byte policy limit",
+                sema_policy::content::INPUT_BYTE_CAP
+            ),
+            "block",
+            source,
+        )));
+    }
+    let subject_digest = Some(policy_text_digest(text));
+    let agent_id = POLICY_AGENT_ID.with(|agent| agent.borrow().clone());
+    if let Some(reason) = POLICY_BYPASS.with(|bypass| bypass.borrow().last().cloned()) {
+        let observation = PolicyObservation {
+            kind: PolicyObservationKind::Bypassed,
+            policy: "effective-policy".to_string(),
+            policy_digest: effective_policy_fingerprint(),
+            boundary,
+            subject: subject.to_string(),
+            subject_digest,
+            rule: "policy.without".to_string(),
+            label: None,
+            count: None,
+            action: Some("bypass".to_string()),
+            reason: Some(reason),
+            source,
+            agent_id,
+        };
+        (policies.last().expect("nonempty content policy stack").sink)(observation);
+        return Ok(text.to_string());
+    }
+
+    let outcomes: Vec<_> = policies
+        .iter()
+        .map(|layer| {
+            let outcome = match boundary {
+                PolicyBoundary::LlmInput => layer.policy.check_input(text),
+                PolicyBoundary::LlmOutput => layer.policy.check_output(
+                    text,
+                    output_stage.unwrap_or(sema_policy::OutputStage::Final),
+                ),
+                PolicyBoundary::Model | PolicyBoundary::Tool => {
+                    unreachable!("content policy called for non-content boundary")
+                }
+            };
+            (layer, outcome)
+        })
+        .collect();
+    let effective_action = outcomes
+        .iter()
+        .map(|(_, outcome)| outcome.action)
+        .max()
+        .unwrap_or(sema_policy::ContentAction::Allow);
+
+    for (layer, outcome) in &outcomes {
+        if outcome.findings.is_empty() {
+            (layer.sink)(PolicyObservation {
+                kind: PolicyObservationKind::Checked,
+                policy: layer.policy.name().to_string(),
+                policy_digest: layer.policy.fingerprint().to_string(),
+                boundary,
+                subject: subject.to_string(),
+                subject_digest: subject_digest.clone(),
+                rule: format!("{}.checked", boundary.as_str()),
+                label: None,
+                count: None,
+                action: None,
+                reason: None,
+                source,
+                agent_id: agent_id.clone(),
+            });
+            continue;
+        }
+        for finding in &outcome.findings {
+            let kind = match outcome.action {
+                sema_policy::ContentAction::Block => PolicyObservationKind::Violation,
+                sema_policy::ContentAction::Redact => PolicyObservationKind::Redacted,
+                sema_policy::ContentAction::Audit => PolicyObservationKind::Flagged,
+                sema_policy::ContentAction::Allow => PolicyObservationKind::Checked,
+            };
+            (layer.sink)(PolicyObservation {
+                kind,
+                policy: layer.policy.name().to_string(),
+                policy_digest: layer.policy.fingerprint().to_string(),
+                boundary,
+                subject: subject.to_string(),
+                subject_digest: subject_digest.clone(),
+                rule: finding.rule_id.clone(),
+                label: Some(finding.label.clone()),
+                count: Some(finding.count),
+                action: Some(outcome.action.as_str().to_string()),
+                reason: (outcome.action == sema_policy::ContentAction::Block)
+                    .then(|| "deterministic content policy matched".to_string()),
+                source,
+                agent_id: agent_id.clone(),
+            });
+        }
+    }
+
+    match effective_action {
+        sema_policy::ContentAction::Block => {
+            let denial = outcomes
+                .iter()
+                .filter(|(_, outcome)| outcome.action == sema_policy::ContentAction::Block)
+                .find_map(|(layer, outcome)| {
+                    outcome.findings.first().map(|finding| PolicyDenial {
+                        policy: Some(layer.policy.name().to_string()),
+                        boundary: boundary.as_str().to_string(),
+                        subject: subject.to_string(),
+                        rule: finding.rule_id.clone(),
+                        reason: format!(
+                            "content matched {} ({} {})",
+                            finding.label,
+                            finding.count,
+                            if finding.count == 1 {
+                                "finding"
+                            } else {
+                                "findings"
+                            }
+                        ),
+                        action: effective_action.as_str().to_string(),
+                        source: source.as_str().to_string(),
+                    })
+                })
+                .unwrap_or_else(|| {
+                    unnamed_policy_denial(
+                        boundary,
+                        subject,
+                        "content.denied",
+                        "content policy blocked this value",
+                        effective_action.as_str(),
+                        source,
+                    )
+                });
+            Err(policy_denied(denial))
+        }
+        sema_policy::ContentAction::Redact => {
+            let redactions = outcomes
+                .iter()
+                .flat_map(|(_, outcome)| outcome.redactions.iter().cloned())
+                .collect::<Vec<_>>();
+            Ok(sema_policy::content::redact(text, &redactions))
+        }
+        sema_policy::ContentAction::Allow | sema_policy::ContentAction::Audit => {
+            Ok(text.to_string())
+        }
+    }
+}
+
+fn apply_input_policy_to_request(request: &mut ChatRequest) -> Result<(), SemaError> {
+    let mut system = request.system.clone();
+    if let Some(value) = &mut system {
+        *value = apply_text_policy(
+            value,
+            PolicyBoundary::LlmInput,
+            "system",
+            PolicySource::Request,
+            None,
+        )?;
+    }
+    let mut messages = request.messages.clone();
+    for (message_index, message) in messages.iter_mut().enumerate() {
+        let subject = format!("message.{message_index}.{}", message.role);
+        match &mut message.content {
+            MessageContent::Text(text) => {
+                *text = apply_text_policy(
+                    text,
+                    PolicyBoundary::LlmInput,
+                    &subject,
+                    PolicySource::Request,
+                    None,
+                )?;
+            }
+            MessageContent::Blocks(blocks) => {
+                for (block_index, block) in blocks.iter_mut().enumerate() {
+                    if let ContentBlock::Text { text } = block {
+                        *text = apply_text_policy(
+                            text,
+                            PolicyBoundary::LlmInput,
+                            &format!("{subject}.block.{block_index}"),
+                            PolicySource::Request,
+                            None,
+                        )?;
+                    }
+                }
+            }
+        }
+    }
+    request.system = system;
+    request.messages = messages;
+    Ok(())
+}
+
+fn apply_output_policy_to_response(
+    response: &mut ChatResponse,
+    source: PolicySource,
+) -> Result<(), SemaError> {
+    let stage = if response.tool_calls.is_empty() {
+        sema_policy::OutputStage::Final
+    } else {
+        sema_policy::OutputStage::Round
+    };
+    let subject = match stage {
+        sema_policy::OutputStage::Round => "assistant.round",
+        sema_policy::OutputStage::Final => "assistant.final",
+    };
+    response.content = apply_text_policy(
+        &response.content,
+        PolicyBoundary::LlmOutput,
+        subject,
+        source,
+        Some(stage),
+    )?;
+    Ok(())
+}
+
+fn apply_input_policy_to_texts(
+    texts: &mut [String],
+    subject_prefix: &str,
+) -> Result<(), SemaError> {
+    let transformed = texts
+        .iter()
+        .enumerate()
+        .map(|(index, text)| {
+            apply_text_policy(
+                text,
+                PolicyBoundary::LlmInput,
+                &format!("{subject_prefix}[{index}]"),
+                PolicySource::Request,
+                None,
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    for (text, safe) in texts.iter_mut().zip(transformed) {
+        *text = safe;
+    }
+    Ok(())
 }
 
 /// Clear the per-thread last-usage slot. The workflow runtime calls this at the START
@@ -141,16 +936,8 @@ pub struct LeafUsage {
 fn accumulate_into(slot: &Rc<RefCell<LeafUsage>>, usage: &Usage, cost: Option<f64>) {
     let input = usage.prompt_tokens as u64;
     let output = usage.completion_tokens as u64;
-    // Cache-hit-zero-usage invariant: an all-zero completion is a cache hit;
-    // don't count it as a call (no phantom zero Budget event for a cached leaf).
-    //
-    // Cost is deliberately NOT part of this test. The only caller prices the
-    // usage first, and pricing a zero-token usage against a model that IS in the
-    // snapshot yields `Some(0.0)`, not `None` — so requiring `cost.is_none()`
-    // let every cache hit on a priced model (gpt-5.5, claude-*, …) fall through
-    // and book a call at $0.00, flipping a purely-cached leaf's cost from
-    // "unknown" to "free". Only fakes and unpriced models took the intended
-    // path, which is why nothing caught it.
+    // A cache hit reports no tokens and no cost. Priced models can report the
+    // cost as `Some(0.0)`, so `cost.is_none()` cannot identify cache hits.
     if input == 0 && output == 0 && cost.unwrap_or(0.0) == 0.0 {
         return;
     }
@@ -344,6 +1131,9 @@ struct LlmDynScope {
     /// The cassette selected by this scope. Spawned siblings share one tape so
     /// replay and recording remain coherent across quantum boundaries.
     cassette: Option<CassetteScope>,
+    policies: Vec<ActivePolicy>,
+    policy_bypass: Vec<String>,
+    policy_agent_id: Option<String>,
 }
 
 impl Default for LlmDynScope {
@@ -364,6 +1154,9 @@ impl Default for LlmDynScope {
             budget_stack: Vec::new(),
             custom_pricing: std::collections::HashMap::new(),
             cassette: None,
+            policies: Vec::new(),
+            policy_bypass: Vec::new(),
+            policy_agent_id: None,
         }
     }
 }
@@ -386,6 +1179,9 @@ fn read_llm_scope() -> LlmDynScope {
         budget_stack: BUDGET_STACK.with(|s| s.borrow().clone()),
         custom_pricing: pricing::snapshot_custom_pricing(),
         cassette: CASSETTE.with(|c| c.borrow().clone()),
+        policies: ACTIVE_POLICIES.with(|policies| policies.borrow().clone()),
+        policy_bypass: POLICY_BYPASS.with(|bypass| bypass.borrow().clone()),
+        policy_agent_id: POLICY_AGENT_ID.with(|agent| agent.borrow().clone()),
     }
 }
 
@@ -407,6 +1203,9 @@ fn write_llm_scope(s: LlmDynScope) -> LlmDynScope {
     BUDGET_STACK.with(|stack| *stack.borrow_mut() = s.budget_stack);
     pricing::restore_custom_pricing(s.custom_pricing);
     CASSETTE.with(|c| *c.borrow_mut() = s.cassette);
+    ACTIVE_POLICIES.with(|policies| *policies.borrow_mut() = s.policies);
+    POLICY_BYPASS.with(|bypass| *bypass.borrow_mut() = s.policy_bypass);
+    POLICY_AGENT_ID.with(|agent| *agent.borrow_mut() = s.policy_agent_id);
     prev
 }
 
@@ -464,6 +1263,9 @@ fn llm_scope_ambient_is_empty() -> bool {
         && RETRY_BASE_MS.with(|base| base.get() == 500)
         && NETWORK_MAX_RETRIES.with(|retries| retries.get() == 3)
         && CASSETTE.with(|c| c.borrow().is_none())
+        && ACTIVE_POLICIES.with(|policies| policies.borrow().is_empty())
+        && POLICY_BYPASS.with(|bypass| bypass.borrow().is_empty())
+        && POLICY_AGENT_ID.with(|agent| agent.borrow().is_none())
 }
 
 /// Shared field-by-field default check for [`LlmDynScope`] (avoids requiring
@@ -485,6 +1287,9 @@ fn llm_dyn_scope_is_default(s: &LlmDynScope) -> bool {
         && s.rate_limit_rps.is_none()
         && s.retry_base_ms == 500
         && s.network_max_retries == 3
+        && s.policies.is_empty()
+        && s.policy_bypass.is_empty()
+        && s.policy_agent_id.is_none()
 }
 
 /// Register the per-task LLM dynamic-scope callbacks with sema-core. Called once at startup.
@@ -507,19 +1312,15 @@ struct BudgetFrame {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct CachedResponse {
     content: String,
+    /// Provider that served this response. An empty value marks a legacy cache
+    /// entry, which an active policy rejects.
+    #[serde(default)]
+    provider: String,
     model: String,
     prompt_tokens: u32,
     completion_tokens: u32,
     cached_at: i64,
-    /// The assistant turn's tool calls, if any.
-    ///
-    /// Omitting these made caching silently break agents: a tool-call turn has
-    /// empty `content` and N tool calls, so it was stored as an empty string
-    /// and replayed as a *final* answer. `run_tool_loop` sees no tool calls,
-    /// stops, and returns "" — no tool ever runs, no error is raised. Since
-    /// entries persist to disk, that poisoned every later run within the TTL,
-    /// which is exactly the "re-run the script cheaply" workflow `with-cache`
-    /// exists for. Defaulted so entries written before this field still load.
+    /// Assistant tool calls retained for agent-loop cache replay.
     #[serde(default)]
     tool_calls: Vec<ToolCall>,
 }
@@ -875,6 +1676,9 @@ pub fn reset_runtime_state() {
     RATE_LIMIT_RPS.with(|r| r.set(None));
     RATE_LIMIT_LAST.with(|r| *r.borrow_mut() = None);
     install_cassette_scope(None);
+    ACTIVE_POLICIES.with(|policies| policies.borrow_mut().clear());
+    POLICY_BYPASS.with(|bypass| bypass.borrow_mut().clear());
+    POLICY_AGENT_ID.with(|agent| *agent.borrow_mut() = None);
     LAST_SERVING_PROVIDER.with(|p| *p.borrow_mut() = None);
     RETRY_BASE_MS.with(|c| c.set(500));
     NETWORK_MAX_RETRIES.with(|c| c.set(3));
@@ -4138,21 +4942,19 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
             .collect::<Vec<_>>();
 
         let responses = with_provider(|provider| {
-            let requests = requests
-                .into_iter()
-                .map(|mut request| {
-                    if request.model.is_empty() {
-                        request.model = provider.default_model().to_string();
-                    }
-                    request
-                })
-                .collect();
+            let requests = resolve_batch_models(provider, requests)?;
             Ok(provider.batch_complete(requests))
         })?;
         responses
             .into_iter()
             .map(|response| {
-                let response = response.map_err(|error| SemaError::Llm(error.to_string()))?;
+                let mut response = response.map_err(|error| SemaError::Llm(error.to_string()))?;
+                if let Err(error) =
+                    apply_output_policy_to_response(&mut response, PolicySource::Request)
+                {
+                    track_usage(&response.usage)?;
+                    return Err(error);
+                }
                 track_usage(&response.usage)?;
                 Ok(Value::string(&response.content))
             })
@@ -4236,12 +5038,13 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
                         .to_string(),
                 ));
             };
+            let resolved_requests = resolve_batch_models(&*provider, requests.iter().cloned())?;
 
             if provider.runs_on_vm_thread() {
                 return Box::new(SemaBatchDriver {
                     provider: provider.name().to_string(),
                     default_model: provider.default_model().to_string(),
-                    requests,
+                    requests: resolved_requests,
                     next_request: 0,
                     active_model: None,
                     responses: Vec::new(),
@@ -4250,17 +5053,6 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
                 })
                 .advance();
             }
-
-            let reqs: Vec<ChatRequest> = requests
-                .iter()
-                .cloned()
-                .map(|mut r| {
-                    if r.model.is_empty() {
-                        r.model = provider.default_model().to_string();
-                    }
-                    r
-                })
-                .collect();
 
             // Capture the dispatch-time budget + leaf-usage frames (ASYNC-1), so the
             // decoder charges the frames active now, not whatever scope is installed
@@ -4290,7 +5082,7 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
                     kind,
                     decoder,
                     resource,
-                    move || Ok(Box::new(p_job.batch_complete(reqs)) as SendPayload),
+                    move || Ok(Box::new(p_job.batch_complete(resolved_requests)) as SendPayload),
                 );
                 return Ok(NativeOutcome::Suspend(NativeSuspend {
                     wait: WaitKind::External(Box::new(prepared)),
@@ -4299,23 +5091,18 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
             }
         }
 
-        // ── SYNC path: inline provider call (byte-identical to before) ─────
         let responses = with_provider(|p| {
-            let reqs: Vec<ChatRequest> = requests
-                .into_iter()
-                .map(|mut r| {
-                    if r.model.is_empty() {
-                        r.model = p.default_model().to_string();
-                    }
-                    r
-                })
-                .collect();
+            let reqs = resolve_batch_models(p, requests)?;
             Ok(p.batch_complete(reqs))
         })?;
 
         let mut results = Vec::with_capacity(responses.len());
         for resp_result in responses {
-            let resp = resp_result.map_err(|e| SemaError::Llm(e.to_string()))?;
+            let mut resp = resp_result.map_err(|e| SemaError::Llm(e.to_string()))?;
+            if let Err(error) = apply_output_policy_to_response(&mut resp, PolicySource::Request) {
+                track_usage(&resp.usage)?;
+                return Err(error);
+            }
             track_usage(&resp.usage)?;
             results.push(Value::string(&resp.content));
         }
@@ -4474,7 +5261,8 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
             None
         };
 
-        let request = EmbedRequest { texts, model };
+        let mut request = EmbedRequest { texts, model };
+        apply_input_policy_to_texts(&mut request.texts, "embedding.input")?;
         let req_model = request.model.clone().unwrap_or_default();
         let cassette_key = compute_embed_key(&request);
 
@@ -4497,6 +5285,11 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
                 .map(|scope| scope.borrow().decide(&cassette_key));
             match decision {
                 Some(crate::cassette::Decision::Replay(entry)) => {
+                    enforce_stored_model_policy(
+                        &entry.provider,
+                        &entry.model,
+                        PolicySource::Cassette,
+                    )?;
                     // Replay made no provider call: finalize the span inline,
                     // account, and return without suspending.
                     let resp = EmbedResponse {
@@ -4526,8 +5319,6 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
             }
             let recording = matches!(decision, Some(crate::cassette::Decision::Record));
 
-            // Clone an Arc<provider> off the thread-local registry on THIS thread,
-            // release the borrow, and move it into the offloaded future.
             let provider = PROVIDER_REGISTRY.with(|reg| {
                 let reg = reg.borrow();
                 reg.embedding_provider().or_else(|| reg.default_provider())
@@ -4538,6 +5329,11 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
                         .to_string(),
                 ));
             };
+            let model = request
+                .model
+                .as_deref()
+                .unwrap_or_else(|| provider.default_model());
+            model_target_allowed(provider.name(), model, PolicySource::Request, false)?;
 
             // The provider name + canonical price are needed on the VM thread in
             // the decoder; capture them before the Arc is moved into the worker.
@@ -4608,15 +5404,13 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
             }
         }
 
-        // ── SYNC path: inline provider call (byte-identical to before) ─────
-        // CLIENT embeddings span (bypasses do_complete). Input tokens only.
+        // Synchronous embedding calls bypass do_complete.
         let span = sema_otel::llm_span("embeddings");
-        // Advertise the input texts (content-gated; OpenInference embedding.* keys).
         span.set_embedding_input(&request.texts);
-        // Cassette interception (mirrors run_completion, for the embeddings seam).
         let decision = cassette_decide(&cassette_key);
         let response = match decision {
             Some(crate::cassette::Decision::Replay(entry)) => {
+                enforce_stored_model_policy(&entry.provider, &entry.model, PolicySource::Cassette)?;
                 let resp = EmbedResponse {
                     embeddings: entry.embeddings,
                     model: entry.model.clone(),
@@ -4638,7 +5432,12 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
             Some(crate::cassette::Decision::Miss(k)) => return Err(cassette_miss_error(&k)),
             other => {
                 let recording = matches!(other, Some(crate::cassette::Decision::Record));
-                let resp = with_embedding_provider(|p| {
+                let (resp, provider_name) = with_embedding_provider(|p| {
+                    let model = request
+                        .model
+                        .as_deref()
+                        .unwrap_or_else(|| p.default_model());
+                    model_target_allowed(p.name(), model, PolicySource::Request, false)?;
                     let resp = match p.embed(request) {
                         Ok(r) => r,
                         Err(e) => {
@@ -4654,11 +5453,12 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
                         cost_usd: pricing::calculate_cost_for(p.name(), &resp.usage),
                         ..Default::default()
                     });
-                    Ok(resp)
+                    Ok((resp, p.name().to_string()))
                 })?;
                 if recording {
                     cassette_record(crate::cassette::TapeEntry::from_embed(
                         &cassette_key,
+                        &provider_name,
                         &resp.model,
                         &resp.embeddings,
                         resp.usage.prompt_tokens,
@@ -4683,33 +5483,85 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
         if args.len() < 2 || args.len() > 3 {
             return Err(SemaError::arity("llm/rerank", "2-3", args.len()));
         }
-        let query = args[0]
+        let mut query = args[0]
             .as_str()
-            .ok_or_else(|| SemaError::type_error("string query", args[0].type_name()))?
+            .ok_or_else(|| SemaError::argument_type("llm/rerank", 1, "string query", &args[0]))?
             .to_string();
-        let documents: Vec<String> = args[1]
+        let mut documents: Vec<String> = args[1]
             .as_seq()
-            .ok_or_else(|| SemaError::type_error("list of strings", args[1].type_name()))?
+            .ok_or_else(|| {
+                SemaError::argument_type("llm/rerank", 2, "list or vector of strings", &args[1])
+            })?
             .iter()
-            .map(|d| {
-                d.as_str()
-                    .map(|s| s.to_string())
-                    .ok_or_else(|| SemaError::type_error("string document", d.type_name()))
+            .enumerate()
+            .map(|(index, document)| {
+                document.as_str().map(str::to_string).ok_or_else(|| {
+                    SemaError::eval(format!(
+                        "llm/rerank argument 2 entry {} must be a string, got {}",
+                        index + 1,
+                        document.type_name()
+                    ))
+                })
             })
             .collect::<Result<_, _>>()?;
         if documents.is_empty() {
             return Ok(NativeOutcome::Return(Value::list(vec![])));
         }
+        query = apply_text_policy(
+            &query,
+            PolicyBoundary::LlmInput,
+            "rerank.query",
+            PolicySource::Request,
+            None,
+        )?;
+        apply_input_policy_to_texts(&mut documents, "rerank.document")?;
 
         let mut top_k = None;
         let mut model = None;
         let mut provider = None;
-        if let Some(opts) = args.get(2).and_then(|v| v.as_map_rc()) {
-            top_k = get_opt_u32(&opts, "top-k").map(|n| n as usize);
-            model = get_opt_string(&opts, "model");
+        if let Some(options) = args.get(2) {
+            let opts = options
+                .as_map_rc()
+                .ok_or_else(|| SemaError::argument_type("llm/rerank", 3, "map", options))?;
+            top_k = opts
+                .get(&Value::keyword("top-k"))
+                .map(|value| {
+                    value
+                        .as_int()
+                        .and_then(|value| usize::try_from(value).ok())
+                        .filter(|value| *value > 0)
+                        .ok_or_else(|| {
+                            SemaError::eval(format!(
+                                "llm/rerank option :top-k must be a positive integer, got {value}"
+                            ))
+                        })
+                })
+                .transpose()?;
+            model = opts
+                .get(&Value::keyword("model"))
+                .map(|value| {
+                    value.as_str().map(str::to_string).ok_or_else(|| {
+                        SemaError::eval(format!(
+                            "llm/rerank option :model must be a string, got {}",
+                            value.type_name()
+                        ))
+                    })
+                })
+                .transpose()?;
             provider = opts
                 .get(&Value::keyword("provider"))
-                .and_then(|p| p.as_keyword().or_else(|| p.as_str().map(|s| s.to_string())));
+                .map(|value| {
+                    value
+                        .as_keyword()
+                        .or_else(|| value.as_str().map(str::to_string))
+                        .ok_or_else(|| {
+                            SemaError::eval(format!(
+                                "llm/rerank option :provider must be a keyword or string, got {}",
+                                value.type_name()
+                            ))
+                        })
+                })
+                .transpose()?;
         }
 
         let request = RerankRequest {
@@ -4752,6 +5604,16 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
                         }),
                 }
             })?;
+            let resolved_model = request
+                .model
+                .as_deref()
+                .unwrap_or_else(|| resolved_provider.default_model());
+            model_target_allowed(
+                resolved_provider.name(),
+                resolved_model,
+                PolicySource::Request,
+                false,
+            )?;
 
             // Root-main and spawned tasks suspend on an External wait; the decoder
             // builds the reordered output on the VM thread when it lands.
@@ -4806,12 +5668,16 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
             }
         }
 
-        // ── SYNC path: inline provider call (byte-identical to before) ─────
         // OpenInference RERANKER span (no-op unless telemetry + compat are on).
         let span = sema_otel::reranker_span(&query, model.as_deref().unwrap_or(""), top_k);
         span.set_input(&documents);
 
         let resp = with_rerank_provider(provider.as_deref(), |p| {
+            let resolved_model = request
+                .model
+                .as_deref()
+                .unwrap_or_else(|| p.default_model());
+            model_target_allowed(p.name(), resolved_model, PolicySource::Request, false)?;
             p.rerank(request).map_err(|e| {
                 span.record_error(llm_error_kind(&e), &e.to_string());
                 SemaError::Llm(e.to_string())
@@ -5122,6 +5988,21 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
             .as_tool_def_rc()
             .ok_or_else(|| SemaError::type_error("tool", args[0].type_name()))?;
         Ok(t.parameters.clone())
+    });
+
+    register_fn(env, "tool/policy-subjects", |args| {
+        if args.len() != 1 {
+            return Err(SemaError::arity("tool/policy-subjects", "1", args.len()));
+        }
+        let tool = args[0]
+            .as_tool_def_rc()
+            .ok_or_else(|| SemaError::type_error("tool", args[0].type_name()))?;
+        Ok(Value::vector(
+            tool.policy_subjects
+                .iter()
+                .map(tool_policy_subject_to_value)
+                .collect(),
+        ))
     });
 
     // (agent {:system "…" :tools […] :model "…" :max-turns N}) — build an anonymous,
@@ -6728,6 +7609,7 @@ pub fn register_llm_builtins(env: &Env, sandbox: &sema_core::Sandbox) {
         // JSON-coerce the arguments (lossily) so a direct invocation hands the
         // handler exactly what an agent-driven tool call would.
         let json_args = sema_core::value_to_json_lossy(&args[1]);
+        enforce_direct_tool_policy(&tool_def.name, &json_args, &tool_def.policy_subjects)?;
         let handler_args = json_args_to_sema(&tool_def.parameters, &json_args, &tool_def.handler);
         Box::new(ToolInvokeContinuation {
             tool_name: tool_def.name.clone(),
@@ -7083,6 +7965,11 @@ fn compute_cache_key(request: &ChatRequest) -> String {
             hasher.update(schema.as_bytes());
         }
     }
+    let policy_fingerprint = effective_policy_fingerprint();
+    if !policy_fingerprint.is_empty() {
+        hasher.update(b"\x00policy\x00");
+        hasher.update(policy_fingerprint.as_bytes());
+    }
     format!("{:x}", hasher.finalize())
 }
 
@@ -7132,9 +8019,10 @@ fn read_cached_from_disk(path: &std::path::Path) -> Option<CachedResponse> {
     serde_json::from_str(&data).ok()
 }
 
-fn store_cached(key: &str, response: &ChatResponse) {
+fn store_cached(key: &str, response: &ChatResponse, provider: &str) {
     let cached = CachedResponse {
         content: response.content.clone(),
+        provider: provider.to_string(),
         model: response.model.clone(),
         prompt_tokens: response.usage.prompt_tokens,
         completion_tokens: response.usage.completion_tokens,
@@ -7382,7 +8270,8 @@ fn apply_call_telemetry_agent(span: &sema_otel::AgentSpan) {
     });
 }
 
-fn do_complete(request: ChatRequest) -> Result<ChatResponse, SemaError> {
+fn do_complete(mut request: ChatRequest) -> Result<ChatResponse, SemaError> {
+    apply_input_policy_to_request(&mut request)?;
     // Standalone completions get their own conversation id so every chat span carries
     // gen_ai.conversation.id; agent-nested completions inherit the agent's scope.
     let _conv = if sema_otel::current_conversation_id().is_none() {
@@ -7428,11 +8317,7 @@ fn do_complete(request: ChatRequest) -> Result<ChatResponse, SemaError> {
     if !cache_enabled {
         return run_completion(request, &span);
     }
-    // Compute the cache key from the model the request will *logically* use, but
-    // without mutating the request that flows into the fallback loop. Pre-filling
-    // `request.model` here would make it non-empty and defeat the per-provider
-    // default/override substitution in `do_complete_with_provider` — sending the
-    // wrong provider's model id down the chain (the original cache+fallback bug).
+    // Keep request.model unchanged so fallback entries can apply their own model.
     let key_model = if request.model.is_empty() {
         primary_model_for_cache()?
     } else {
@@ -7443,11 +8328,13 @@ fn do_complete(request: ChatRequest) -> Result<ChatResponse, SemaError> {
     let cache_key = compute_cache_key(&key_request);
     if let Some(cached) = load_cached(&cache_key) {
         if is_cache_valid(&cached) {
+            enforce_stored_model_policy(&cached.provider, &cached.model, PolicySource::Cache)?;
             CACHE_HITS.with(|c| c.set(c.get() + 1));
             // A cache hit makes no provider call: no tokens are consumed and no money
             // is spent. Report ZERO usage so the caller's `track_usage` does not
             // re-charge session cost or burn the budget for a cached response.
-            let resp = cache_hit_response(cached, key_request.model.clone());
+            let mut resp = cache_hit_response(cached, key_request.model.clone());
+            apply_output_policy_to_response(&mut resp, PolicySource::Cache)?;
             // Cache-hit span: no provider served it; tag gen_ai.cache.hit=true with
             // zero usage (matches the zero-usage accounting invariant).
             span.set_dispatch("", &resp.model);
@@ -7457,7 +8344,8 @@ fn do_complete(request: ChatRequest) -> Result<ChatResponse, SemaError> {
     }
     CACHE_MISSES.with(|c| c.set(c.get() + 1));
     let response = run_completion(request, &span)?;
-    store_cached(&cache_key, &response);
+    let serving_provider = LAST_SERVING_PROVIDER.with(|p| p.borrow().clone().unwrap_or_default());
+    store_cached(&cache_key, &response, &serving_provider);
     Ok(response)
 }
 
@@ -7465,8 +8353,8 @@ fn do_complete(request: ChatRequest) -> Result<ChatResponse, SemaError> {
 /// option. Opens the same per-completion `chat` span/scope, but drives
 /// `stream_with_dispatch` and delivers each text delta to the Sema `on_text`
 /// callback. Returns the assembled [`ChatResponse`] so the loop's tool-call
-/// handling and `track_usage` accounting are byte-identical to the non-streaming
-/// path. Streaming bypasses the completion cache (like `llm/stream`).
+/// handling and `track_usage` accounting match the non-streaming path. Streaming
+/// bypasses the completion cache (like `llm/stream`).
 fn do_complete_streaming(
     ctx: &EvalContext,
     request: ChatRequest,
@@ -7582,6 +8470,8 @@ enum CompletePrep {
 #[cfg(not(target_arch = "wasm32"))]
 struct CompleteOffloadPlan {
     chain: Vec<ResolvedProvider>,
+    /// Model `:skip` applies to every explicit fallback chain, including one entry.
+    explicit_fallback: bool,
     request: ChatRequest,
     max_retries: u32,
     retry_base_ms: u64,
@@ -7600,7 +8490,8 @@ struct CompleteOffloadPlan {
 /// runtime completion paths use this stage to keep cache, cassette, and retry
 /// behavior aligned.
 #[cfg(not(target_arch = "wasm32"))]
-fn complete_offload_prep(request: ChatRequest) -> Result<CompletePrep, SemaError> {
+fn complete_offload_prep(mut request: ChatRequest) -> Result<CompletePrep, SemaError> {
+    apply_input_policy_to_request(&mut request)?;
     // Standalone completions get their own conversation scope (so the chat span
     // carries gen_ai.conversation.id); agent-nested ones inherit. The detached span
     // captures the conversation id at creation, so the guard need only live across
@@ -7639,7 +8530,6 @@ fn complete_offload_prep(request: ChatRequest) -> Result<CompletePrep, SemaError
         span.set_tools(&views);
     }
     apply_call_telemetry_llm(&span);
-
     // ── Cache lookup (hit → Inline, zero usage) ──────────────────────────
     let cache_enabled = CACHE_ENABLED.with(|c| c.get());
     let cache_key = if cache_enabled {
@@ -7657,10 +8547,11 @@ fn complete_offload_prep(request: ChatRequest) -> Result<CompletePrep, SemaError
         // are bumped once the disk result lands.
         if let Some(cached) = load_cached_mem(&key) {
             if is_cache_valid(&cached) {
+                enforce_stored_model_policy(&cached.provider, &cached.model, PolicySource::Cache)?;
                 CACHE_HITS.with(|c| c.set(c.get() + 1));
-                let resp = cache_hit_response(cached, key_request.model.clone());
-                span.set_dispatch("", &resp.model);
-                span.set_response(&response_facts("", &resp));
+                let mut resp = cache_hit_response(cached, key_request.model.clone());
+                apply_output_policy_to_response(&mut resp, PolicySource::Cache)?;
+                set_guarded_response_telemetry(&span, &request, "", &resp);
                 drop(span);
                 return Ok(CompletePrep::Inline(resp));
             }
@@ -7680,9 +8571,10 @@ fn complete_offload_prep(request: ChatRequest) -> Result<CompletePrep, SemaError
     });
     match cassette_decision {
         Some((_, crate::cassette::Decision::Replay(entry))) => {
-            let resp = entry.to_response();
-            span.set_dispatch("cassette", &resp.model);
-            span.set_response(&response_facts("cassette", &resp));
+            enforce_stored_model_policy(&entry.provider, &entry.model, PolicySource::Cassette)?;
+            let mut resp = entry.to_response();
+            apply_output_policy_to_response(&mut resp, PolicySource::Cassette)?;
+            set_guarded_response_telemetry(&span, &request, "cassette", &resp);
             drop(span);
             return Ok(CompletePrep::Inline(resp));
         }
@@ -7704,9 +8596,10 @@ fn complete_offload_prep(request: ChatRequest) -> Result<CompletePrep, SemaError
     // Capture the retry-backoff base on the VM thread so each native provider
     // attempt honors it (pool workers have their own RETRY_BASE_MS TLS copies).
     let retry_base_ms = RETRY_BASE_MS.with(|c| c.get());
+    let fallback = FALLBACK_CHAIN.with(|c| c.borrow().clone());
+    let explicit_fallback = fallback.as_ref().is_some_and(|entries| !entries.is_empty());
     let chain: Vec<ResolvedProvider> = PROVIDER_REGISTRY.with(|reg| {
         let reg = reg.borrow();
-        let fallback = FALLBACK_CHAIN.with(|c| c.borrow().clone());
         match fallback {
             Some(entries) if !entries.is_empty() => entries
                 .iter()
@@ -7743,6 +8636,7 @@ fn complete_offload_prep(request: ChatRequest) -> Result<CompletePrep, SemaError
     let request_for_messages = request.clone();
     Ok(CompletePrep::Offload(Box::new(CompleteOffloadPlan {
         chain,
+        explicit_fallback,
         request,
         max_retries,
         retry_base_ms,
@@ -7775,7 +8669,7 @@ fn finalize_complete_success(
     finalize: CompleteFinalize,
 ) -> sema_core::runtime::NativeResult {
     let CompleteOutcome {
-        resp,
+        mut resp,
         serving_provider,
         serving_model,
         retry_events,
@@ -7787,6 +8681,17 @@ fn finalize_complete_success(
         emit_retry_spans(&retry_events);
     });
     span.set_dispatch(&serving_provider, &serving_model);
+    if let Err(error) = apply_output_policy_to_response(&mut resp, PolicySource::Request) {
+        span.record_error("policy", &error.to_string());
+        drop(span);
+        account_complete_usage(
+            &serving_provider,
+            &resp.usage,
+            usage_accum_slot.as_ref(),
+            budget_slot,
+        )?;
+        return Err(error);
+    }
     span.set_response(&response_facts(&serving_provider, &resp));
     span.set_messages(
         &messages_json(&request_for_messages.messages),
@@ -7800,41 +8705,48 @@ fn finalize_complete_success(
     drop(span); // ends the span
     set_serving_provider(&serving_provider);
     if let Some(key) = &cache_key {
-        store_cached(key, &resp);
+        store_cached(key, &resp, &serving_provider);
     }
     if let Some(key) = &cassette_record_key {
         cassette_scope_record(
             &cassette_scope,
-            crate::cassette::TapeEntry::from_response(key, &resp),
+            crate::cassette::TapeEntry::from_response(key, &serving_provider, &resp),
         );
     }
+    account_complete_usage(
+        &serving_provider,
+        &resp.usage,
+        usage_accum_slot.as_ref(),
+        budget_slot,
+    )?;
+    finalize.finish(resp)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn account_complete_usage(
+    serving_provider: &str,
+    usage: &Usage,
+    usage_accum_slot: Option<&Rc<RefCell<LeafUsage>>>,
+    budget_slot: Option<Rc<RefCell<BudgetFrame>>>,
+) -> Result<(), SemaError> {
     // Fold this completion into the LEAF'S OWN captured accumulator frame — the
     // `Rc` snapshotted at dispatch, not whatever scope is active when the offload
-    // lands (the finalize runs outside the per-task install boundary). Price it the
-    // same way `track_usage` does, then suppress `track_usage`'s own active-frame
-    // fold so this completion is counted exactly once.
-    if let Some(slot) = &usage_accum_slot {
-        let cost = pricing::calculate_cost_for(&serving_provider, &resp.usage);
-        accumulate_into(slot, &resp.usage, cost);
+    // lands. Suppress `track_usage`'s ambient accumulator fold so the completion
+    // is counted exactly once.
+    if let Some(slot) = usage_accum_slot {
+        let cost = pricing::calculate_cost_for(serving_provider, usage);
+        accumulate_into(slot, usage, cost);
     }
-    // Account on the VM thread, then shape the value. Install THIS completion's
-    // captured budget frame as active around `track_usage` so the charge + limit
-    // check land on the dispatch-time frame (shared by `Rc` across the fan-out),
-    // then restore whatever was active.
-    let track_result = {
-        let prev_budget =
-            ACTIVE_BUDGET.with(|b| std::mem::replace(&mut *b.borrow_mut(), budget_slot.clone()));
-        let r = USAGE_ACCUM_SUPPRESS.with(|s| {
-            s.set(true);
-            let r = track_usage(&resp.usage);
-            s.set(false);
-            r
-        });
-        ACTIVE_BUDGET.with(|b| *b.borrow_mut() = prev_budget);
-        r
-    };
-    track_result?;
-    finalize.finish(resp)
+    let previous_budget =
+        ACTIVE_BUDGET.with(|active| std::mem::replace(&mut *active.borrow_mut(), budget_slot));
+    let result = USAGE_ACCUM_SUPPRESS.with(|suppress| {
+        suppress.set(true);
+        let result = track_usage(usage);
+        suppress.set(false);
+        result
+    });
+    ACTIVE_BUDGET.with(|active| *active.borrow_mut() = previous_budget);
+    result
 }
 
 /// Completion-kind tag for an agent/chat provider round offloaded through the
@@ -8019,6 +8931,14 @@ impl RuntimeCompleteDriver {
             } else if request.model.is_empty() {
                 request.model = provider.default_model().to_string();
             }
+            if !model_target_allowed(
+                &provider_name,
+                &request.model,
+                PolicySource::Request,
+                self.plan.explicit_fallback,
+            )? {
+                continue;
+            }
 
             if provider.runs_on_vm_thread() {
                 let callback = match lisp_provider_complete_callback(&provider_name) {
@@ -8085,15 +9005,16 @@ impl RuntimeCompleteDriver {
     ) -> sema_core::runtime::NativeResult {
         if let Some(cached) = disk {
             if is_cache_valid(&cached) {
+                enforce_stored_model_policy(&cached.provider, &cached.model, PolicySource::Cache)?;
                 CACHE_HITS.with(|c| c.set(c.get() + 1));
                 let Self { plan, finalize, .. } = *self;
                 if let Some(key) = &plan.cache_key {
                     CACHE_MEM.with(|c| c.borrow_mut().insert(key.clone(), cached.clone()));
                 }
                 let usage_model = cached.model.clone();
-                let resp = cache_hit_response(cached, usage_model);
-                plan.span.set_dispatch("", &resp.model);
-                plan.span.set_response(&response_facts("", &resp));
+                let mut resp = cache_hit_response(cached, usage_model);
+                apply_output_policy_to_response(&mut resp, PolicySource::Cache)?;
+                set_guarded_response_telemetry(&plan.span, &plan.request_for_messages, "", &resp);
                 drop(plan.span);
                 track_usage(&resp.usage)?;
                 return finalize.finish(resp);
@@ -8677,6 +9598,7 @@ impl sema_core::runtime::CompletionDecoder for EmbedDecoder {
                         &self.cassette_scope,
                         crate::cassette::TapeEntry::from_embed(
                             &self.key,
+                            &self.provider_name,
                             &resp.model,
                             &resp.embeddings,
                             resp.usage.prompt_tokens,
@@ -8889,7 +9811,8 @@ fn finalize_batch_responses(
 ) -> Result<Value, SemaError> {
     let mut results = Vec::with_capacity(responses.len());
     for resp_result in responses {
-        let resp = resp_result.map_err(|error| SemaError::Llm(error.to_string()))?;
+        let mut resp = resp_result.map_err(|error| SemaError::Llm(error.to_string()))?;
+        let policy_result = apply_output_policy_to_response(&mut resp, PolicySource::Request);
         // Priced with an empty provider, matching the sync path (which never
         // stamps a serving provider for `llm/batch`).
         if let Some(slot) = &usage_accum_slot {
@@ -8906,6 +9829,7 @@ fn finalize_batch_responses(
         });
         ACTIVE_BUDGET.with(|active| *active.borrow_mut() = prev_budget);
         track_result?;
+        policy_result?;
         results.push(Value::string(&resp.content));
     }
     Ok(Value::list(results))
@@ -8997,7 +9921,13 @@ fn run_completion(
     span: &sema_otel::LlmSpan,
 ) -> Result<ChatResponse, SemaError> {
     if current_cassette_scope().is_none() {
-        return do_complete_inner(request, span);
+        let mut response = do_complete_inner(request.clone(), span)?;
+        if let Err(error) = apply_output_policy_to_response(&mut response, PolicySource::Request) {
+            track_usage(&response.usage)?;
+            return Err(error);
+        }
+        set_guarded_response_telemetry(span, &request, "", &response);
+        return Ok(response);
     }
     // Key by the request as-is (no default-model resolution) so record and replay
     // produce the same key for an identical call, even with no provider configured
@@ -9006,21 +9936,54 @@ fn run_completion(
     let decision = cassette_decide(&key).expect("cassette scope checked above");
     match decision {
         crate::cassette::Decision::Replay(entry) => {
+            enforce_stored_model_policy(&entry.provider, &entry.model, PolicySource::Cassette)?;
             // A replayed call is a stand-in for a real one: emit the span with the
             // recorded facts and let the caller's usage/cost accounting run on the
             // recorded tokens (distinct from a cache hit, which reports zero usage).
-            let resp = entry.to_response();
-            span.set_dispatch("cassette", &resp.model);
-            span.set_response(&response_facts("cassette", &resp));
-            Ok(resp)
+            let mut response = entry.to_response();
+            apply_output_policy_to_response(&mut response, PolicySource::Cassette)?;
+            set_guarded_response_telemetry(span, &request, "cassette", &response);
+            Ok(response)
         }
         crate::cassette::Decision::Miss(k) => Err(cassette_miss_error(&k)),
         crate::cassette::Decision::Record => {
-            let resp = do_complete_inner(request, span)?;
-            cassette_record(crate::cassette::TapeEntry::from_response(&key, &resp));
+            let mut resp = do_complete_inner(request.clone(), span)?;
+            if let Err(error) = apply_output_policy_to_response(&mut resp, PolicySource::Request) {
+                track_usage(&resp.usage)?;
+                return Err(error);
+            }
+            set_guarded_response_telemetry(span, &request, "", &resp);
+            let provider = LAST_SERVING_PROVIDER.with(|p| p.borrow().clone().unwrap_or_default());
+            cassette_record(crate::cassette::TapeEntry::from_response(
+                &key, &provider, &resp,
+            ));
             Ok(resp)
         }
     }
+}
+
+fn set_guarded_response_telemetry(
+    span: &sema_otel::LlmSpan,
+    request: &ChatRequest,
+    provider_override: &str,
+    response: &ChatResponse,
+) {
+    let provider = if provider_override.is_empty() {
+        LAST_SERVING_PROVIDER.with(|provider| provider.borrow().clone().unwrap_or_default())
+    } else {
+        provider_override.to_string()
+    };
+    span.set_dispatch(&provider, &response.model);
+    span.set_response(&response_facts(&provider, response));
+    span.set_messages(
+        &messages_json(&request.messages),
+        &content_json("assistant", &response.content),
+        request
+            .system
+            .as_deref()
+            .map(|system| content_json("system", system))
+            .as_deref(),
+    );
 }
 
 /// The hard error raised on a `:replay`-mode cassette miss (no recorded interaction
@@ -9032,13 +9995,53 @@ fn cassette_miss_error(key: &str) -> SemaError {
     ))
 }
 
-/// Streaming counterpart to `run_completion`: replays the recorded chunk sequence
-/// (feeding the caller's `on_chunk` so boundaries match) and final response, or
-/// records a fresh stream by capturing chunks as they arrive. Transparent
-/// passthrough with no active cassette. Sits below the otel span, above the provider.
-fn stream_with_cassette(
+enum StreamCassettePlan {
+    Replay(ChatResponse),
+    Live { record_key: Option<String> },
+}
+
+fn prepare_stream_cassette(
+    request: &ChatRequest,
+    chunk_cb: &mut dyn FnMut(&str) -> Result<(), crate::types::LlmError>,
+    span: &sema_otel::LlmSpan,
+) -> Result<StreamCassettePlan, SemaError> {
+    if current_cassette_scope().is_none() {
+        return Ok(StreamCassettePlan::Live { record_key: None });
+    }
+
+    let key = compute_cache_key(request);
+    match cassette_decide(&key).expect("cassette scope checked above") {
+        crate::cassette::Decision::Replay(entry) => {
+            enforce_stored_model_policy(&entry.provider, &entry.model, PolicySource::Cassette)?;
+            let provider = entry.provider.clone();
+            let mut response = entry.to_response();
+            if output_policy_active() {
+                apply_output_policy_to_response(&mut response, PolicySource::Cassette)?;
+                if !response.content.is_empty() {
+                    chunk_cb(&response.content)
+                        .map_err(|error| SemaError::Llm(error.to_string()))?;
+                }
+            } else {
+                for chunk in &entry.chunks {
+                    chunk_cb(chunk).map_err(|error| SemaError::Llm(error.to_string()))?;
+                }
+            }
+            span.set_dispatch("cassette", &response.model);
+            span.set_response(&response_facts("cassette", &response));
+            set_serving_provider(&provider);
+            Ok(StreamCassettePlan::Replay(response))
+        }
+        crate::cassette::Decision::Miss(key) => Err(cassette_miss_error(&key)),
+        crate::cassette::Decision::Record => Ok(StreamCassettePlan::Live {
+            record_key: Some(key),
+        }),
+    }
+}
+
+fn stream_live(
     p: &dyn LlmProvider,
     request: ChatRequest,
+    record_key: Option<&str>,
     chunk_cb: &mut dyn FnMut(&str) -> Result<(), crate::types::LlmError>,
     span: &sema_otel::LlmSpan,
 ) -> Result<ChatResponse, SemaError> {
@@ -9061,41 +10064,52 @@ fn stream_with_cassette(
         })
     };
 
-    if current_cassette_scope().is_none() {
-        let resp = stream_real(request.clone(), chunk_cb)?;
-        span.set_dispatch(p.name(), &request.model);
-        span.set_response(&response_facts(p.name(), &resp));
-        return Ok(resp);
-    }
-
-    let key = compute_cache_key(&request);
-    let decision = cassette_decide(&key).expect("cassette scope checked above");
-    match decision {
-        crate::cassette::Decision::Replay(entry) => {
-            for ch in &entry.chunks {
-                chunk_cb(ch).map_err(|e| SemaError::Llm(e.to_string()))?;
-            }
-            let resp = entry.to_response();
-            span.set_dispatch("cassette", &resp.model);
-            span.set_response(&response_facts("cassette", &resp));
-            Ok(resp)
+    let defer_output = output_policy_active();
+    let mut response = if defer_output {
+        let mut discarded = |_chunk: &str| -> Result<(), crate::types::LlmError> { Ok(()) };
+        stream_real(request.clone(), &mut discarded)?
+    } else if let Some(key) = record_key {
+        let mut chunks = Vec::new();
+        let mut collect = |chunk: &str| -> Result<(), crate::types::LlmError> {
+            chunks.push(chunk.to_string());
+            chunk_cb(chunk)
+        };
+        let response = stream_real(request.clone(), &mut collect)?;
+        cassette_record(crate::cassette::TapeEntry::from_stream(
+            key,
+            p.name(),
+            &chunks,
+            &response,
+        ));
+        response
+    } else {
+        stream_real(request.clone(), chunk_cb)?
+    };
+    if defer_output {
+        if let Err(error) = apply_output_policy_to_response(&mut response, PolicySource::Request) {
+            track_usage(&response.usage)?;
+            return Err(error);
         }
-        crate::cassette::Decision::Miss(k) => Err(cassette_miss_error(&k)),
-        crate::cassette::Decision::Record => {
-            let mut collected: Vec<String> = Vec::new();
-            let mut wrap = |chunk: &str| -> Result<(), crate::types::LlmError> {
-                collected.push(chunk.to_string());
-                chunk_cb(chunk)
+        if let Some(key) = record_key {
+            let chunks = if response.content.is_empty() {
+                Vec::new()
+            } else {
+                vec![response.content.clone()]
             };
-            let resp = stream_real(request.clone(), &mut wrap)?;
             cassette_record(crate::cassette::TapeEntry::from_stream(
-                &key, &collected, &resp,
+                key,
+                p.name(),
+                &chunks,
+                &response,
             ));
-            span.set_dispatch(p.name(), &request.model);
-            span.set_response(&response_facts(p.name(), &resp));
-            Ok(resp)
+        }
+        if !response.content.is_empty() {
+            chunk_cb(&response.content).map_err(|error| SemaError::Llm(error.to_string()))?;
         }
     }
+    span.set_dispatch(p.name(), &request.model);
+    span.set_response(&response_facts(p.name(), &response));
+    Ok(response)
 }
 
 /// Cassette key for an embeddings request (model + the input texts).
@@ -9109,12 +10123,16 @@ fn compute_embed_key(request: &EmbedRequest) -> String {
         hasher.update(t.as_bytes());
         hasher.update(b"\0");
     }
+    let policy_fingerprint = effective_policy_fingerprint();
+    if !policy_fingerprint.is_empty() {
+        hasher.update(b"\0policy\0");
+        hasher.update(policy_fingerprint.as_bytes());
+    }
     format!("{:x}", hasher.finalize())
 }
 
-/// Encode an `EmbedResponse`'s vectors into the SAME `Value` the synchronous
-/// `llm/embed` returns (single → bytevector; multi → list of bytevectors), so the
-/// concurrent (async) and sync paths are byte-identical: both decode through here.
+/// Encode an `EmbedResponse` for both synchronous and async calls. A single
+/// vector becomes a bytevector; multiple vectors become a list of bytevectors.
 fn embed_value_from_response(resp: &EmbedResponse, single: bool) -> Value {
     if single {
         let embedding = resp.embeddings.first().cloned().unwrap_or_default();
@@ -9133,10 +10151,8 @@ fn embed_value_from_response(resp: &EmbedResponse, single: bool) -> Value {
     }
 }
 
-/// Encode a `RerankResponse`'s reordered results into the SAME `Value` the
-/// synchronous `llm/rerank` returns (a list of `{:index :score :document}`, highest
-/// relevance first), so the concurrent (async) and sync paths are byte-identical:
-/// both decode through here.
+/// Encode a `RerankResponse` for both synchronous and async calls. Results are
+/// ordered by relevance and contain `:index`, `:score`, and `:document`.
 fn rerank_value_from_response(resp: &RerankResponse, documents: &[String]) -> Value {
     Value::list(
         resp.results
@@ -9527,7 +10543,8 @@ fn do_complete_inner(
             let mut last_error = None;
             for entry in &chain {
                 match do_complete_with_provider(entry, request.clone(), span) {
-                    Ok(resp) => return Ok(resp),
+                    Ok(Some(resp)) => return Ok(resp),
+                    Ok(None) => continue,
                     Err(e) => {
                         eprintln!(
                             "Provider '{}' failed: {}, trying next...",
@@ -9824,7 +10841,7 @@ fn do_complete_with_provider(
     entry: &FallbackEntry,
     mut request: ChatRequest,
     span: &sema_otel::LlmSpan,
-) -> Result<ChatResponse, SemaError> {
+) -> Result<Option<ChatResponse>, SemaError> {
     PROVIDER_REGISTRY.with(|reg| {
         let reg = reg.borrow();
         let provider = reg.get(&entry.provider).ok_or_else(|| {
@@ -9839,6 +10856,9 @@ fn do_complete_with_provider(
         } else if request.model.is_empty() {
             request.model = provider.default_model().to_string();
         }
+        if !model_target_allowed(&entry.provider, &request.model, PolicySource::Request, true)? {
+            return Ok(None);
+        }
         let max_retries = NETWORK_MAX_RETRIES.with(|c| c.get());
         let resp = complete_with_retry(&*provider, &request, max_retries)
             .map_err(|e| SemaError::Llm(e.to_string()))?;
@@ -9846,17 +10866,7 @@ fn do_complete_with_provider(
         // Provider + model + response are all in scope here, before track_usage
         // consumes the serving-provider stamp.
         span.set_dispatch(&entry.provider, &request.model);
-        span.set_response(&response_facts(&entry.provider, &resp));
-        span.set_messages(
-            &messages_json(&request.messages),
-            &content_json("assistant", &resp.content),
-            request
-                .system
-                .as_deref()
-                .map(|s| content_json("system", s))
-                .as_deref(),
-        );
-        Ok(resp)
+        Ok(Some(resp))
     })
 }
 
@@ -9871,8 +10881,7 @@ type StreamArgs = (
 /// Parse `llm/stream`-shaped args — prompt/messages, then an optional callback
 /// (any procedure) and an optional opts map in either order — into the
 /// `ChatRequest` plus the raw callback/opts. Shared by the blocking native
-/// (`__llm-stream-blocking`) and the non-blocking `__stream-begin`, so both
-/// paths accept byte-identical calls.
+/// (`__llm-stream-blocking`) and the non-blocking `__stream-begin`.
 fn parse_stream_args(args: &[Value]) -> Result<StreamArgs, SemaError> {
     if args.is_empty() || args.len() > 3 {
         return Err(SemaError::arity("llm/stream", "1-3", args.len()));
@@ -9961,7 +10970,7 @@ fn stream_one_provider(
     mut request: ChatRequest,
     chunk_cb: &mut dyn FnMut(&str) -> Result<(), crate::types::LlmError>,
     span: &sema_otel::LlmSpan,
-) -> Result<ChatResponse, SemaError> {
+) -> Result<Option<ChatResponse>, SemaError> {
     PROVIDER_REGISTRY.with(|reg| {
         let reg = reg.borrow();
         let provider = reg.get(&entry.provider).ok_or_else(|| {
@@ -9972,9 +10981,16 @@ fn stream_one_provider(
         } else if request.model.is_empty() {
             request.model = provider.default_model().to_string();
         }
-        let resp = stream_with_cassette(&*provider, request, chunk_cb, span)?;
+        let record_key = match prepare_stream_cassette(&request, chunk_cb, span)? {
+            StreamCassettePlan::Replay(response) => return Ok(Some(response)),
+            StreamCassettePlan::Live { record_key } => record_key,
+        };
+        if !model_target_allowed(&entry.provider, &request.model, PolicySource::Request, true)? {
+            return Ok(None);
+        }
+        let resp = stream_live(&*provider, request, record_key.as_deref(), chunk_cb, span)?;
         set_serving_provider(&entry.provider);
-        Ok(resp)
+        Ok(Some(resp))
     })
 }
 
@@ -9984,10 +11000,11 @@ fn stream_one_provider(
 /// surfaces (failing over would re-emit the already-delivered partial — see the spike test
 /// `spike_mid_stream_failure_behaviour`).
 fn stream_with_dispatch(
-    request: ChatRequest,
+    mut request: ChatRequest,
     chunk_cb: &mut dyn FnMut(&str) -> Result<(), crate::types::LlmError>,
     span: &sema_otel::LlmSpan,
 ) -> Result<ChatResponse, SemaError> {
+    apply_input_policy_to_request(&mut request)?;
     stream_budget_pregate()?;
     enforce_rate_limit();
 
@@ -10005,7 +11022,8 @@ fn stream_with_dispatch(
                     stream_one_provider(entry, request.clone(), &mut wrapped, span)
                 };
                 match result {
-                    Ok(resp) => return Ok(resp),
+                    Ok(Some(resp)) => return Ok(resp),
+                    Ok(None) => continue,
                     Err(e) if emitted => {
                         // Mid-stream failure: surface; do NOT fail over (would duplicate).
                         span.record_error("provider_error", &e.to_string());
@@ -10029,12 +11047,16 @@ fn stream_with_dispatch(
             if req.model.is_empty() {
                 req.model = p.default_model().to_string();
             }
-            stream_with_cassette(p, req, chunk_cb, span)
+            let record_key = match prepare_stream_cassette(&req, chunk_cb, span)? {
+                StreamCassettePlan::Replay(response) => return Ok(response),
+                StreamCassettePlan::Live { record_key } => record_key,
+            };
+            model_target_allowed(p.name(), &req.model, PolicySource::Request, false)?;
+            stream_live(p, req, record_key.as_deref(), chunk_cb, span)
         }),
     }
 }
 
-/// Original do_complete logic (provider dispatch + rate-limit retry).
 fn do_complete_uncached(
     mut request: ChatRequest,
     span: &sema_otel::LlmSpan,
@@ -10045,21 +11067,12 @@ fn do_complete_uncached(
         if request.model.is_empty() {
             request.model = p.default_model().to_string();
         }
+        model_target_allowed(p.name(), &request.model, PolicySource::Request, false)?;
         let resp = complete_with_retry(p, &request, max_retries)
             .map_err(|e| SemaError::Llm(e.to_string()))?;
         set_serving_provider(p.name());
         // Capture provider/model/response before track_usage consumes the stamp.
         span.set_dispatch(p.name(), &request.model);
-        span.set_response(&response_facts(p.name(), &resp));
-        span.set_messages(
-            &messages_json(&request.messages),
-            &content_json("assistant", &resp.content),
-            request
-                .system
-                .as_deref()
-                .map(|s| content_json("system", s))
-                .as_deref(),
-        );
         Ok(resp)
     })
 }
@@ -10168,6 +11181,40 @@ fn build_tool_schemas(tools: &[Value]) -> Result<Vec<ToolSchema>, SemaError> {
         });
     }
     Ok(schemas)
+}
+
+fn tool_policy_subject_to_value(subject: &sema_core::ToolPolicySubject) -> Value {
+    let mut map = BTreeMap::new();
+    match subject {
+        sema_core::ToolPolicySubject::File { access, path_arg } => {
+            let kind = match access {
+                sema_core::FileAccess::Read => "file-read",
+                sema_core::FileAccess::Write => "file-write",
+                sema_core::FileAccess::Delete => "file-delete",
+            };
+            map.insert(Value::keyword("kind"), Value::keyword(kind));
+            map.insert(Value::keyword("path-arg"), Value::keyword(path_arg));
+        }
+        sema_core::ToolPolicySubject::NetworkRequest { method, url_arg } => {
+            map.insert(Value::keyword("kind"), Value::keyword("network-request"));
+            map.insert(Value::keyword("url-arg"), Value::keyword(url_arg));
+            if let Some(method) = method {
+                map.insert(Value::keyword("method"), Value::string(method));
+            }
+        }
+        sema_core::ToolPolicySubject::Command { command_arg } => {
+            map.insert(Value::keyword("kind"), Value::keyword("command"));
+            map.insert(Value::keyword("command-arg"), Value::keyword(command_arg));
+        }
+        sema_core::ToolPolicySubject::ExternalAction { action, target_arg } => {
+            map.insert(Value::keyword("kind"), Value::keyword("external-action"));
+            map.insert(Value::keyword("action"), Value::keyword(action));
+            if let Some(target_arg) = target_arg {
+                map.insert(Value::keyword("target-arg"), Value::keyword(target_arg));
+            }
+        }
+    }
+    Value::map(map)
 }
 
 /// Convert a Sema schema map into a JSON Schema object for the LLM API.
@@ -10714,7 +11761,7 @@ fn agent_begin(args: &[Value]) -> Result<Value, SemaError> {
 /// mirroring `run_tool_loop`'s own setup (a caller-id-or-fresh conversation scope +
 /// a nameless agent span) rather than `agent_begin`'s (which threads a defagent's
 /// identity + `:session`/`:memory` resolution through). The options parsing below
-/// is intentionally byte-identical to `__llm-chat-blocking`'s.
+/// matches `__llm-chat-blocking`.
 ///
 /// Returns nil when no tool loop is needed — the same `tools.is_empty() ||
 /// tool_mode == "none"` condition `__llm-chat-blocking` checks — so the prelude
@@ -10984,6 +12031,7 @@ fn agent_exec_tools(ctx: &EvalContext, token: u64) -> sema_core::runtime::Native
             let pending = std::mem::take(&mut st.pending_tool_calls);
             Ok::<_, SemaError>((pending, st.tools.clone(), st.on_tool_call.clone()))
         })?;
+    let denied = preflight_tool_calls(&pending, &tools)?;
 
     // Cooperative runtime path (Task 04/06): a tool handler may SUSPEND (e.g.
     // `mcp/call`'s runtime external wait, or an `async/await` inside the handler),
@@ -10996,10 +12044,14 @@ fn agent_exec_tools(ctx: &EvalContext, token: u64) -> sema_core::runtime::Native
     // per-tool OTel span + `:on-tool-call` start/end events + correlated tool
     // results (with the same error-recovery) the synchronous `run_tool_loop` does.
     if sema_core::in_runtime_quantum() {
-        return exec_tools_cooperative_start(token, tools, on_tool_call, pending);
+        return exec_tools_cooperative_start(token, tools, on_tool_call, pending, denied);
     }
 
     for tc in &pending {
+        if let Some(error) = denied.get(&tc.id) {
+            record_tool_result(token, tc, error.clone(), true);
+            continue;
+        }
         let args_value = sema_core::json_to_value(&tc.arguments);
 
         if let Some(callback) = on_tool_call.as_ref() {
@@ -11137,6 +12189,7 @@ struct ExecToolsContinuation {
     on_tool_call: Option<Value>,
     /// Tool calls not yet dispatched (front = next).
     remaining: std::collections::VecDeque<ToolCall>,
+    denied: BTreeMap<String, String>,
     /// The call currently in flight, plus which `Call` the next `resume` settles.
     active: Option<ActiveCall>,
     phase: ToolPhase,
@@ -11327,6 +12380,10 @@ impl ExecToolsContinuation {
         let Some(tc) = self.remaining.pop_front() else {
             return Ok(NativeOutcome::Return(Value::nil()));
         };
+        if let Some(error) = self.denied.remove(&tc.id) {
+            record_tool_result(self.token, &tc, error, true);
+            return self.advance();
+        }
         let args_value = sema_core::json_to_value(&tc.arguments);
         let prepared = prepare_tool_call_cooperative(&self.tools, &tc.name, &tc.arguments);
         let (pending_handler, pending_error, validation_steps) = match prepared {
@@ -11475,12 +12532,14 @@ fn exec_tools_cooperative_start(
     tools: Vec<Value>,
     on_tool_call: Option<Value>,
     pending: Vec<ToolCall>,
+    denied: BTreeMap<String, String>,
 ) -> sema_core::runtime::NativeResult {
     let continuation = Box::new(ExecToolsContinuation {
         token,
         tools,
         on_tool_call,
         remaining: pending.into(),
+        denied,
         active: None,
         phase: ToolPhase::Handler,
     });
@@ -11616,6 +12675,8 @@ struct StreamDone {
 #[cfg(not(target_arch = "wasm32"))]
 struct StreamDispatchState {
     chain: Vec<ResolvedProvider>,
+    /// Model `:skip` applies to every explicit fallback chain, including one entry.
+    explicit_fallback: bool,
     request: ChatRequest,
     next_provider: usize,
     last_error: Option<(LlmError, String)>,
@@ -11652,6 +12713,9 @@ struct StreamRunState {
     cassette_scope: Option<CassetteScope>,
     /// Every delta drained so far (cassette recording preserves boundaries).
     collected: Vec<String>,
+    /// Output policies require terminal buffering so an unsafe prefix can never
+    /// escape before the assembled response is checked.
+    defer_deltas: bool,
     first_token_seen: bool,
     /// The assembled response, set once `Done(Ok)` has been finalized.
     response: Option<ChatResponse>,
@@ -11663,7 +12727,7 @@ struct StreamRunState {
     /// A failure that arrived in a batch that still carried deltas: stored so the
     /// driver delivers those deltas to the callback first, then raised (and the
     /// entry dropped) on the next `__stream-next`/`__stream-finish`.
-    pending_error: Option<String>,
+    pending_error: Option<SemaError>,
 }
 
 impl Drop for StreamRunState {
@@ -11777,11 +12841,13 @@ fn stream_wire_attempt(
 }
 
 /// Resolve the active fallback chain (or the default provider) into owned `Arc`
-/// clones on the VM thread, so the offloaded wire walk touches no thread-locals.
-fn resolve_stream_chain() -> Result<Vec<ResolvedProvider>, SemaError> {
-    PROVIDER_REGISTRY.with(|reg| {
+/// clones on the VM thread. The boolean records whether the chain was explicit,
+/// so the offloaded wire walk touches no thread-locals.
+fn resolve_stream_chain() -> Result<(Vec<ResolvedProvider>, bool), SemaError> {
+    let fallback = FALLBACK_CHAIN.with(|c| c.borrow().clone());
+    let explicit_fallback = fallback.as_ref().is_some_and(|entries| !entries.is_empty());
+    let chain = PROVIDER_REGISTRY.with(|reg| {
         let reg = reg.borrow();
-        let fallback = FALLBACK_CHAIN.with(|c| c.borrow().clone());
         match fallback {
             Some(entries) if !entries.is_empty() => entries
                 .iter()
@@ -11813,22 +12879,19 @@ fn resolve_stream_chain() -> Result<Vec<ResolvedProvider>, SemaError> {
                 }])
             }
         }
-    })
+    })?;
+    Ok((chain, explicit_fallback))
 }
 
-/// Start a non-blocking stream run: budget pre-gate and cassette decision happen
-/// on the VM thread. Replay pre-fills the run; a real dispatch stores an owned
-/// provider plan for `__stream-next` to drive one provider at a time. `span` is
-/// the caller's detached chat span and is finalized when `Done` lands.
-///
-/// The rate-limit gate sits AFTER the cassette decision (unlike the sync
-/// `stream_with_dispatch`, which always calls `enforce_rate_limit` up front):
-/// a replay makes no provider call, so it does not consume a pacing slot.
-fn stream_run_begin(request: ChatRequest, span: sema_otel::LlmSpan) -> Result<Value, SemaError> {
+/// Start a non-blocking stream run. Cassette replay does not reserve a rate-limit slot.
+fn stream_run_begin(
+    mut request: ChatRequest,
+    span: sema_otel::LlmSpan,
+) -> Result<Value, SemaError> {
+    apply_input_policy_to_request(&mut request)?;
     stream_budget_pregate()?;
+    let defer_deltas = output_policy_active();
 
-    // Keyed by the request as-is (no default-model resolution), matching the
-    // synchronous `stream_with_cassette` so record/replay agree across paths.
     let cassette_scope = current_cassette_scope();
     let cassette_decision = cassette_scope.as_ref().map(|scope| {
         let key = compute_cache_key(&request);
@@ -11839,6 +12902,7 @@ fn stream_run_begin(request: ChatRequest, span: sema_otel::LlmSpan) -> Result<Va
     let mut prefilled = false;
     match cassette_decision {
         Some((_, crate::cassette::Decision::Replay(entry))) => {
+            enforce_stored_model_policy(&entry.provider, &entry.model, PolicySource::Cassette)?;
             for ch in &entry.chunks {
                 buffered.push_back(StreamEvent::Delta(ch.clone()));
             }
@@ -11857,8 +12921,10 @@ fn stream_run_begin(request: ChatRequest, span: sema_otel::LlmSpan) -> Result<Va
     let dispatch = if prefilled {
         None
     } else {
+        let (chain, explicit_fallback) = resolve_stream_chain()?;
         Some(StreamDispatchState {
-            chain: resolve_stream_chain()?,
+            chain,
+            explicit_fallback,
             request,
             next_provider: 0,
             last_error: None,
@@ -11874,7 +12940,7 @@ fn stream_run_begin(request: ChatRequest, span: sema_otel::LlmSpan) -> Result<Va
         None
     } else {
         let rate_limit_wait_ms = reserve_rate_limit_wait_ms();
-        let chain = resolve_stream_chain()?;
+        let (chain, _) = resolve_stream_chain()?;
         let (tx, rx) = std::sync::mpsc::channel::<StreamEvent>();
         if rate_limit_wait_ms > 0 {
             sema_core::blocking_sleep_ms(rate_limit_wait_ms);
@@ -11897,6 +12963,7 @@ fn stream_run_begin(request: ChatRequest, span: sema_otel::LlmSpan) -> Result<Va
         cassette_record_key,
         cassette_scope,
         collected: Vec::new(),
+        defer_deltas,
         first_token_seen: false,
         response: None,
         done: false,
@@ -11942,6 +13009,7 @@ impl RuntimeStreamDriver {
 
         enum Action {
             Pace(u64),
+            Skip,
             Sema {
                 provider: String,
                 model: String,
@@ -11993,6 +13061,14 @@ impl RuntimeStreamDriver {
                 } else if request.model.is_empty() {
                     request.model = entry.provider.default_model().to_string();
                 }
+                if !model_target_allowed(
+                    &entry.name,
+                    &request.model,
+                    PolicySource::Request,
+                    dispatch.explicit_fallback,
+                )? {
+                    return Ok(Action::Skip);
+                }
 
                 if entry.provider.runs_on_vm_thread() {
                     Ok(Action::Sema {
@@ -12006,6 +13082,7 @@ impl RuntimeStreamDriver {
             })?;
 
             match action {
+                Action::Skip => continue,
                 Action::Pace(wait_ms) => {
                     self.phase = RuntimeStreamPhase::Pacing;
                     return Ok(NativeOutcome::Suspend(NativeSuspend {
@@ -12169,17 +13246,59 @@ fn stream_dispatch_ready(token: u64) -> Result<bool, SemaError> {
 /// serving-provider stamp, cassette record, per-leaf usage fold, and
 /// budget-installed `track_usage` (exactly once per streamed completion).
 /// Returns the response, or the error message to surface.
-fn stream_finalize(
-    done: StreamDone,
+struct StreamFinalizeContext {
     span: Option<sema_otel::LlmSpan>,
     usage_accum_slot: Option<Rc<RefCell<LeafUsage>>>,
     budget_slot: Option<Rc<RefCell<BudgetFrame>>>,
     cassette_record_key: Option<String>,
     cassette_scope: Option<CassetteScope>,
-    collected: &[String],
-) -> Result<ChatResponse, String> {
+    collected: Vec<String>,
+    defer_deltas: bool,
+}
+
+fn stream_finalize(
+    done: StreamDone,
+    context: StreamFinalizeContext,
+) -> Result<ChatResponse, SemaError> {
+    let StreamFinalizeContext {
+        span,
+        usage_accum_slot,
+        budget_slot,
+        cassette_record_key,
+        cassette_scope,
+        collected,
+        defer_deltas,
+    } = context;
     match done.result {
-        Ok(resp) => {
+        Ok(mut resp) => {
+            if defer_deltas {
+                let source = if done.provider == "cassette" {
+                    PolicySource::Cassette
+                } else {
+                    PolicySource::Request
+                };
+                if let Err(error) = apply_output_policy_to_response(&mut resp, source) {
+                    if let Some(span) = span {
+                        span.set_dispatch(&done.provider, &resp.model);
+                        span.record_error("policy", &error.to_string());
+                    }
+                    if let Some(slot) = &usage_accum_slot {
+                        let cost = pricing::calculate_cost_for(&done.provider, &resp.usage);
+                        accumulate_into(slot, &resp.usage, cost);
+                    }
+                    let previous_budget = ACTIVE_BUDGET
+                        .with(|active| std::mem::replace(&mut *active.borrow_mut(), budget_slot));
+                    let track_result = USAGE_ACCUM_SUPPRESS.with(|suppress| {
+                        suppress.set(true);
+                        let result = track_usage(&resp.usage);
+                        suppress.set(false);
+                        result
+                    });
+                    ACTIVE_BUDGET.with(|active| *active.borrow_mut() = previous_budget);
+                    track_result?;
+                    return Err(error);
+                }
+            }
             if let Some(span) = span {
                 span.set_dispatch(&done.provider, &resp.model);
                 span.set_response(&response_facts(&done.provider, &resp));
@@ -12191,9 +13310,25 @@ fn stream_finalize(
                 set_serving_provider(&done.provider);
             }
             if let Some(key) = &cassette_record_key {
+                let guarded_chunks;
+                let recorded_chunks = if defer_deltas {
+                    guarded_chunks = if resp.content.is_empty() {
+                        Vec::new()
+                    } else {
+                        vec![resp.content.clone()]
+                    };
+                    guarded_chunks.as_slice()
+                } else {
+                    &collected
+                };
                 cassette_scope_record(
                     &cassette_scope,
-                    crate::cassette::TapeEntry::from_stream(key, collected, &resp),
+                    crate::cassette::TapeEntry::from_stream(
+                        key,
+                        &done.provider,
+                        recorded_chunks,
+                        &resp,
+                    ),
                 );
             }
             // Fold into THIS run's captured accumulator frame, then suppress
@@ -12215,16 +13350,13 @@ fn stream_finalize(
                 ACTIVE_BUDGET.with(|b| *b.borrow_mut() = prev_budget);
                 r
             };
-            match track_result {
-                Ok(()) => Ok(resp),
-                Err(e) => Err(e.to_string()),
-            }
+            track_result.map(|()| resp)
         }
         Err(e) => {
             if let Some(span) = span {
                 span.record_error(llm_error_kind(&e), &e.to_string());
             }
-            Err(e.to_string())
+            Err(SemaError::Llm(e.to_string()))
         }
     }
 }
@@ -12292,7 +13424,9 @@ fn stream_poll_batch(token: u64, blocking: bool) -> Result<Option<Value>, SemaEr
                             span.mark_first_token();
                         }
                     }
-                    batch.push(Value::string(&s));
+                    if !st.defer_deltas {
+                        batch.push(Value::string(&s));
+                    }
                     st.collected.push(s);
                 }
                 Some(StreamEvent::Done(d)) => {
@@ -12353,22 +13487,31 @@ fn stream_poll_batch(token: u64, blocking: bool) -> Result<Option<Value>, SemaEr
                 st.cassette_record_key.take(),
                 st.cassette_scope.take(),
                 std::mem::take(&mut st.collected),
+                st.defer_deltas,
             )
         })
     });
-    let Some((span, usage_slot, budget_slot, record_key, cassette_scope, collected)) = ctx else {
+    let Some((span, usage_slot, budget_slot, record_key, cassette_scope, collected, defer_deltas)) =
+        ctx
+    else {
         return Err(SemaError::Llm("stream-run handle not found".to_string()));
     };
     match stream_finalize(
         *done,
-        span,
-        usage_slot,
-        budget_slot,
-        record_key,
-        cassette_scope,
-        &collected,
+        StreamFinalizeContext {
+            span,
+            usage_accum_slot: usage_slot,
+            budget_slot,
+            cassette_record_key: record_key,
+            cassette_scope,
+            collected,
+            defer_deltas,
+        },
     ) {
         Ok(resp) => {
+            if defer_deltas && !resp.content.is_empty() {
+                batch.push(Value::string(&resp.content));
+            }
             STREAM_RUNS.with(|r| {
                 if let Some(st) = r.borrow_mut().get_mut(&token) {
                     st.response = Some(resp);
@@ -12377,10 +13520,10 @@ fn stream_poll_batch(token: u64, blocking: bool) -> Result<Option<Value>, SemaEr
             });
             Ok(Some(stream_batch_map(batch, true)))
         }
-        Err(msg) => {
+        Err(error) => {
             STREAM_RUNS.with(|r| {
                 if let Some(st) = r.borrow_mut().get_mut(&token) {
-                    st.pending_error = Some(msg);
+                    st.pending_error = Some(error);
                 }
             });
             Ok(Some(stream_batch_map(batch, false)))
@@ -12509,7 +13652,7 @@ fn stream_next(token: u64) -> sema_core::runtime::NativeResult {
     use sema_core::runtime::NativeOutcome;
 
     enum Pre {
-        Err(String),
+        Err(SemaError),
         Done,
         Run { prefilled: bool },
     }
@@ -12518,11 +13661,11 @@ fn stream_next(token: u64) -> sema_core::runtime::NativeResult {
         let st = slab
             .get_mut(&token)
             .ok_or_else(|| SemaError::Llm("stream-run handle not found".to_string()))?;
-        if let Some(msg) = st.pending_error.take() {
+        if let Some(error) = st.pending_error.take() {
             // The deltas that preceded this failure were delivered last batch;
             // the run is over — drop the entry and surface.
             slab.remove(&token);
-            return Ok(Pre::Err(msg));
+            return Ok(Pre::Err(error));
         }
         if st.done {
             return Ok(Pre::Done);
@@ -12535,7 +13678,7 @@ fn stream_next(token: u64) -> sema_core::runtime::NativeResult {
     })?;
 
     let prefilled = match pre {
-        Pre::Err(msg) => return Err(SemaError::Llm(msg)),
+        Pre::Err(error) => return Err(error),
         Pre::Done => return Ok(NativeOutcome::Return(stream_batch_map(Vec::new(), true))),
         Pre::Run { prefilled } => prefilled,
     };
@@ -12580,8 +13723,8 @@ fn stream_finish(token: u64) -> Result<Value, SemaError> {
     let mut st = STREAM_RUNS
         .with(|r| r.borrow_mut().remove(&token))
         .ok_or_else(|| SemaError::Llm("stream-run handle not found".to_string()))?;
-    if let Some(msg) = st.pending_error.take() {
-        return Err(SemaError::Llm(msg));
+    if let Some(error) = st.pending_error.take() {
+        return Err(error);
     }
     let resp = st
         .response
@@ -12599,8 +13742,8 @@ fn agent_stream_apply(agent_token: u64, stream_token: u64) -> Result<Value, Sema
     let mut st = STREAM_RUNS
         .with(|r| r.borrow_mut().remove(&stream_token))
         .ok_or_else(|| SemaError::Llm("stream-run handle not found".to_string()))?;
-    if let Some(msg) = st.pending_error.take() {
-        return Err(SemaError::Llm(msg));
+    if let Some(error) = st.pending_error.take() {
+        return Err(error);
     }
     let resp = st
         .response
@@ -12691,6 +13834,10 @@ fn run_tool_loop(
             _agent_span.set_trace_io(&first_input, &last_content);
             return Ok((last_content, messages));
         }
+        // Gate the entire batch before any callback, validation predicate, or handler.
+        // A hard denial aborts the round with zero tool side effects; `:tool-error`
+        // denials become correlated tool results while allowed siblings may proceed.
+        let denied = preflight_tool_calls(&response.tool_calls, tools)?;
 
         // Echo the assistant turn that invoked the tools, carrying the tool_calls
         // so the provider can correlate the tool results that follow. This MUST be
@@ -12703,6 +13850,22 @@ fn run_tool_loop(
 
         // Execute each tool call and add results
         for tc in &response.tool_calls {
+            if let Some(error) = denied.get(&tc.id) {
+                consecutive_errors += 1;
+                messages.push(ChatMessage::tool_result(
+                    tc.id.clone(),
+                    tc.name.clone(),
+                    error.clone(),
+                ));
+                if consecutive_errors >= MAX_CONSECUTIVE_TOOL_ERRORS {
+                    let msg = format!(
+                        "aborting agent run after {consecutive_errors} consecutive tool errors"
+                    );
+                    _agent_span.record_error("tool_error", &msg);
+                    return Err(SemaError::Llm(msg));
+                }
+                continue;
+            }
             // Build args map for callback
             let args_value = sema_core::json_to_value(&tc.arguments);
 
@@ -13241,6 +14404,7 @@ mod tests {
             tools: vec![Value::int(1), Value::int(2)],
             on_tool_call: Some(Value::int(3)),
             remaining: std::collections::VecDeque::new(),
+            denied: BTreeMap::new(),
             active: None,
             phase: ToolPhase::Handler,
         };
@@ -13660,6 +14824,7 @@ mod tests {
         let driver = RuntimeCompleteDriver {
             plan: CompleteOffloadPlan {
                 chain: Vec::new(),
+                explicit_fallback: false,
                 request: ChatRequest::new(String::new(), Vec::new()),
                 max_retries: 0,
                 retry_base_ms: 0,
@@ -14060,7 +15225,7 @@ mod tests {
             usage: Usage::default(),
             stop_reason: Some("tool_use".to_string()),
         };
-        store_cached(key, &response);
+        store_cached(key, &response, "fake");
 
         let cached = CACHE_MEM
             .with(|c| c.borrow().get(key).cloned())

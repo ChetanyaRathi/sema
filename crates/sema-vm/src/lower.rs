@@ -112,7 +112,14 @@ fn lower_expr(expr: &Value, tail: bool) -> Result<CoreExpr, SemaError> {
 
 fn lower_expr_inner(expr: &Value, tail: bool) -> Result<CoreExpr, SemaError> {
     match expr.view() {
-        ValueView::Symbol(spur) => Ok(CoreExpr::Var(spur)),
+        ValueView::Symbol(spur) => {
+            if spur == intern("workflow/approval") {
+                return Err(SemaError::eval(
+                    "workflow/approval is a control-flow gate and cannot be used as a value; call (approval key opts) directly",
+                ));
+            }
+            Ok(CoreExpr::Var(spur))
+        }
 
         ValueView::Vector(items) => {
             let exprs = items
@@ -156,6 +163,20 @@ fn lower_list(items: &[Value], tail: bool) -> Result<CoreExpr, SemaError> {
     let args = &items[1..];
 
     if let Some(spur) = head.as_symbol_spur() {
+        // `workflow/approval` transfers control to the host when no decision
+        // exists. It must stay in direct call position so it cannot run later
+        // in a detached task after the owning workflow has continued.
+        if spur == intern("workflow/approval") {
+            let call_args = args
+                .iter()
+                .map(|arg| lower_expr(arg, false))
+                .collect::<Result<_, _>>()?;
+            return Ok(CoreExpr::Call {
+                func: Box::new(CoreExpr::Var(spur)),
+                args: call_args,
+                tail,
+            });
+        }
         if let Some(form) = special_form_for(spur) {
             return match form {
                 SpecialForm::Quote => lower_quote(args),
@@ -1968,17 +1989,22 @@ fn lower_message(args: &[Value]) -> Result<CoreExpr, SemaError> {
 }
 
 fn lower_deftool(args: &[Value]) -> Result<CoreExpr, SemaError> {
-    if args.len() < 4 {
-        return Err(SemaError::arity("deftool", "4", args.len()));
+    if !matches!(args.len(), 4 | 5) {
+        return Err(SemaError::arity("deftool", "4 or 5", args.len()));
     }
     let name = require_symbol(&args[0], "deftool")?;
     let description = lower_expr(&args[1], false)?;
     let parameters = lower_expr(&args[2], false)?;
-    let handler = lower_expr(&args[3], false)?;
+    let (options, handler) = if args.len() == 5 {
+        (lower_expr(&args[3], false)?, lower_expr(&args[4], false)?)
+    } else {
+        (CoreExpr::Const(Value::nil()), lower_expr(&args[3], false)?)
+    };
     Ok(CoreExpr::Deftool {
         name,
         description: Box::new(description),
         parameters: Box::new(parameters),
+        options: Box::new(options),
         handler: Box::new(handler),
     })
 }
@@ -2649,6 +2675,28 @@ mod tests {
     }
 
     #[test]
+    fn workflow_approval_is_only_valid_in_direct_call_position() {
+        assert!(matches!(
+            lower_str("(workflow/approval :ship {:reason \"r\" :subject 1})"),
+            CoreExpr::Call { .. }
+        ));
+
+        for input in [
+            "(define gate workflow/approval)",
+            "(list workflow/approval)",
+            "[workflow/approval]",
+            "{:gate workflow/approval}",
+        ] {
+            let value = parse(input);
+            let error = lower(&value, None).expect_err(input);
+            assert!(
+                error.to_string().contains("cannot be used as a value"),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
     fn test_lower_defmacro() {
         // defmacro now lowers to a Call to __vm-defmacro-form with the full form as a constant
         match lower_str("(defmacro my-if (test then else) (list 'if test then else))") {
@@ -2798,7 +2846,9 @@ mod tests {
         let err = lower(&vals[0], Some(&span_map)).expect_err("define with 3 args should fail");
 
         // Message is unchanged (WithTrace displays its inner error).
-        assert!(err.to_string().contains("define expects 2 args, got 3"));
+        assert!(err
+            .to_string()
+            .contains("define expects 2 arguments, got 3"));
 
         let trace = err.stack_trace().expect("error should carry a stack trace");
         let frame = trace.0.first().expect("trace should have a frame");
@@ -2814,7 +2864,9 @@ mod tests {
         let (vals, _span_map) = sema_reader::read_many_with_spans(input).unwrap();
         let err = lower(&vals[0], None).expect_err("define with 3 args should fail");
         assert!(err.stack_trace().is_none());
-        assert!(err.to_string().contains("define expects 2 args, got 3"));
+        assert!(err
+            .to_string()
+            .contains("define expects 2 arguments, got 3"));
     }
 
     #[test]

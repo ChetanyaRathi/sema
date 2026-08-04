@@ -228,11 +228,13 @@ fn scan_global_rebinds(expr: &ResolvedExpr, f: &mut impl FnMut(Spur, bool)) {
         E::Deftool {
             description,
             parameters,
+            options,
             handler,
             ..
         } => {
             scan_global_rebinds(description, f);
             scan_global_rebinds(parameters, f);
+            scan_global_rebinds(options, f);
             scan_global_rebinds(handler, f);
         }
         E::Defagent { options, .. } => scan_global_rebinds(options, f),
@@ -546,8 +548,9 @@ impl Compiler {
                 name,
                 description,
                 parameters,
+                options,
                 handler,
-            } => self.compile_deftool(*name, description, parameters, handler),
+            } => self.compile_deftool(*name, description, parameters, options, handler),
             ResolvedExpr::Defagent { name, options } => self.compile_defagent(*name, options),
             ResolvedExpr::Delay(expr) => self.compile_delay(expr),
             ResolvedExpr::Force(expr) => self.compile_force(expr),
@@ -1491,15 +1494,17 @@ impl Compiler {
         name: Spur,
         description: &ResolvedExpr,
         parameters: &ResolvedExpr,
+        options: &ResolvedExpr,
         handler: &ResolvedExpr,
     ) -> Result<(), SemaError> {
         self.emit_load_global(intern("__vm-deftool"))?;
         self.emit.emit_const(Value::symbol_from_spur(name))?;
         self.compile_expr(description)?;
         self.compile_expr(parameters)?;
+        self.compile_expr(options)?;
         self.compile_expr(handler)?;
         self.emit.emit_op(Op::Call);
-        self.emit.emit_u16(4);
+        self.emit.emit_u16(5);
         Ok(())
     }
 

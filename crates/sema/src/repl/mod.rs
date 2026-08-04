@@ -70,7 +70,7 @@ pub fn run(interpreter: Interpreter, quiet: bool, sandbox_mode: Option<&str>) {
                 println!("Goodbye!");
             }
             Err(msg) => {
-                eprintln!("error: {msg}");
+                crate::print_cli_error(msg);
                 std::process::exit(1);
             }
         }
@@ -131,7 +131,7 @@ pub fn run(interpreter: Interpreter, quiet: bool, sandbox_mode: Option<&str>) {
                 continue;
             }
             Err(e) => {
-                eprintln!("Error: {e}");
+                crate::print_cli_error(e);
                 break;
             }
         }

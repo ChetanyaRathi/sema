@@ -82,6 +82,13 @@ pub fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
             input_tokens INTEGER, output_tokens INTEGER, cost_usd REAL, -- nullable!
             PRIMARY KEY (run_id, seg, seq)
         );
+        CREATE TABLE IF NOT EXISTS policy_events (
+            run_id TEXT, seg INTEGER, seq INTEGER, event TEXT, phase_seq INTEGER,
+            agent_id TEXT, policy TEXT, policy_digest TEXT, boundary TEXT,
+            subject TEXT, subject_digest TEXT, rule TEXT, action TEXT, reason TEXT,
+            source TEXT,
+            PRIMARY KEY (run_id, seg, seq)
+        );
         -- One cursor per journal FILE (key = run_id for the primary, run_id::resume-n
         -- for a segment), so each file resumes from its own byte offset.
         CREATE TABLE IF NOT EXISTS ingest_cursor (
@@ -194,6 +201,7 @@ fn wipe_run(conn: &Connection, run_id: &str) -> rusqlite::Result<()> {
         "tool_calls",
         "checkpoints",
         "usage",
+        "policy_events",
         "ingest_cursor",
     ] {
         conn.execute(&format!("DELETE FROM {t} WHERE run_id=?1"), params![run_id])?;
@@ -331,6 +339,31 @@ fn project_event(
                     i(e, "input_tokens"),
                     i(e, "output_tokens"),
                     cost,
+                ],
+            )?;
+        }
+        event @ ("policy.checked" | "policy.violation" | "policy.bypassed") => {
+            conn.execute(
+                "INSERT OR IGNORE INTO policy_events(
+                   run_id,seg,seq,event,phase_seq,agent_id,policy,policy_digest,boundary,
+                   subject,subject_digest,rule,action,reason,source
+                 ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",
+                params![
+                    run_id,
+                    seg,
+                    seq,
+                    event,
+                    i(e, "phase_seq"),
+                    s(e, "agent_id"),
+                    s(e, "policy"),
+                    s(e, "policy_digest"),
+                    s(e, "boundary"),
+                    s(e, "subject"),
+                    s(e, "subject_digest"),
+                    s(e, "rule"),
+                    s(e, "action"),
+                    s(e, "reason"),
+                    s(e, "source"),
                 ],
             )?;
         }
@@ -553,5 +586,52 @@ mod tests {
         let third: Vec<i64> = tables.iter().map(|t| count(&conn, t)).collect();
 
         assert_eq!(first, third, "re-ingest must not change row counts");
+    }
+
+    #[test]
+    fn ingests_policy_events_without_requiring_raw_arguments() {
+        let mut dir = std::env::temp_dir();
+        dir.push(format!("sema-wf-policy-ingest-{}", std::process::id()));
+        let run = dir.join("policy-run");
+        std::fs::create_dir_all(&run).unwrap();
+        std::fs::write(
+            run.join("events.jsonl"),
+            concat!(
+                r#"{"event":"run.started","seq":0,"ts":"0","workflow":"wf","run_id":"embedded"}"#,
+                "\n",
+                r#"{"event":"policy.checked","seq":1,"ts":"0","policy":"safe","policy_digest":"p","boundary":"tool","subject":"read-file","subject_digest":"args-sha","rule":"tools.read-file.allow","source":"request"}"#,
+                "\n",
+                r#"{"event":"policy.violation","seq":2,"ts":"0","policy":"safe","policy_digest":"p","boundary":"model","subject":"other/model","rule":"models.default-deny","action":"fail","reason":"not allowlisted","source":"cache"}"#,
+                "\n",
+                r#"{"event":"policy.bypassed","seq":3,"ts":"0","policy":"effective-policy","policy_digest":"p","boundary":"tool","subject":"legacy-tool","subject_digest":"legacy-sha","rule":"policy.without","reason":"migration","source":"request"}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn).unwrap();
+        sync_run(&conn, &dir, "policy-run").unwrap();
+
+        assert_eq!(count(&conn, "policy_events"), 3);
+        let checked: (String, String, String, Option<String>) = conn
+            .query_row(
+                "SELECT event,subject,rule,subject_digest
+                 FROM policy_events WHERE seq=1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            checked,
+            (
+                "policy.checked".into(),
+                "read-file".into(),
+                "tools.read-file.allow".into(),
+                Some("args-sha".into())
+            )
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

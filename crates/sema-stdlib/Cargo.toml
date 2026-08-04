@@ -12,6 +12,7 @@ readme = "README.md"
 sema-core.workspace = true
 sema-reader.workspace = true
 sema-otel.workspace = true
+sema-policy.workspace = true
 num-bigint = "0.4"
 num-integer = "0.1"
 regex.workspace = true
