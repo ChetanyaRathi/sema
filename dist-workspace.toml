@@ -38,6 +38,15 @@ github-build-setup = "../build-setup.yml"
 # dist config changes are rare enough to be exercised at tag time.
 pr-run-mode = "skip"
 
+# Build the Apple Silicon target on macos-15 rather than dist's default
+# macos-14-arm64. The signing certificate is a PKCS#12 file whose MAC uses SHA-256
+# (the OpenSSL 3 default); macOS 14's `security import` cannot verify that MAC and
+# fails with "MAC verification failed during PKCS12 import (wrong password?)", which
+# stopped the v1.34.1 aarch64-apple-darwin build. The same secrets import correctly
+# on macos-15, which already builds the x86_64 target.
+[dist.github-custom-runners]
+aarch64-apple-darwin = "macos-15"
+
 # System dependencies — libudev is required by `serialport` (transitively libudev-sys) on Linux.
 [dist.dependencies.apt]
 libudev-dev = "*"
