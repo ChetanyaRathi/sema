@@ -131,6 +131,11 @@ test('workflow-controlled labels cannot create markup or event handlers', async 
   );
   await expect(page.getByTestId('agent-row')).not.toHaveAttribute('onpointerenter', /.+/);
 
+  // phase.ended.status is attacker-influenced too: json_to_value turns LLM JSON keys
+  // into keywords, so a returned {"status": ...} reaches this field verbatim. It is
+  // rendered in the detail sub-line of the selected phase.
+  await expect(page.locator('img[src="y"]')).toHaveCount(0);
+
   const auth = page.getByTestId('auth-row');
   await expect(auth).toHaveAttribute(
     'data-alias',
