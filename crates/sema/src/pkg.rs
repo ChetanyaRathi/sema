@@ -722,6 +722,17 @@ pub fn cmd_install(locked: bool) -> Result<(), String> {
     let doc: toml::Value =
         toml::from_str(&content).map_err(|e| format!("Failed to parse sema.toml: {e}"))?;
 
+    // The project's own sema_version_req applies to the project: do not install
+    // dependencies into a checkout this Sema cannot run. `sema pkg publish` deliberately
+    // does not check this — a package may be published from CI on a different Sema than
+    // the one it targets.
+    let project = doc
+        .get("package")
+        .and_then(|package| package.get("name"))
+        .and_then(toml::Value::as_str)
+        .unwrap_or("this project");
+    validate_package_manifest_sema_content(&content, "sema.toml", project)?;
+
     let deps_table = match doc.get("deps").and_then(|d| d.as_table()) {
         Some(table) => table,
         None => {
