@@ -1,6 +1,6 @@
 # Changelog
 
-## Unpublished
+## 1.34.0
 
 ### Added
 
@@ -41,6 +41,36 @@
   notarization ticket online on first launch — no "unidentified developer"
   dialog. Degrades gracefully without secrets; see `docs/release-signing.md`
   for setup.
+
+### Fixed
+
+- **A policy `:subjects` deny rule now fails closed on an argument it cannot
+  evaluate.** A constraint reports the same error for "compared and not
+  covered" and "could not be compared", and the deny and allow lists shared
+  that predicate, so a subject a deny rule could not read was reported as
+  unmatched and then allowed by `:default :allow`. Because a domain selector
+  defaults `:schemes` to `["https"]`, a deny rule for `evil.example.com`
+  denied `https://` but allowed `http://`; a `:paths` deny rule likewise
+  allowed absolute and root-escaping paths. A deny rule now counts an
+  un-evaluatable subject as a match and an allow rule counts it as a
+  non-match. A subject that *was* compared and is not covered still does not
+  match, so a deny rule naming one host does not deny every other host.
+- **`sema pkg add` and `sema pkg update` pick the highest compatible version.**
+  The registry orders versions by publish time, not by semver, so a patch
+  backported after a newer major was served first and selected — `sema pkg
+  update` could report `2.0.0 -> 1.0.1` and walk backwards across a major.
+- **A prerelease Sema no longer fails every `sema_version_req`.** A
+  requirement excludes prereleases unless it names one, so a `1.34.0-rc.1`
+  build matched nothing at all — not even `*`. A prerelease Sema is now
+  matched as its release version.
+- **`sema pkg install` enforces the project's own `sema_version_req`**, which
+  it previously read only for `[deps]`. `sema pkg publish` still validates the
+  requirement's syntax only, so a package can be published from CI on a
+  different Sema than it targets.
+- When no published version is compatible, the error now lists what each
+  version required instead of only saying none matched.
+- The workflow viewer escapes the phase status before rendering it; it was the
+  one agent-controlled field that reached the DOM unescaped.
 
 ## 1.33.0
 
